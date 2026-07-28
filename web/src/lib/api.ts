@@ -164,6 +164,7 @@ export async function fetchJSON<T>(
     // handled above, so reaching here in gated mode means a real
     // middleware failure that should not reload-loop.
     if (!window.__HERMES_AUTH_REQUIRED__ && !options?.allowUnauthorized) {
+      showSessionExpiredBanner();
       if (attemptDashboardTokenReloadOnce()) {
         return new Promise<T>(() => {});
       }
@@ -180,6 +181,46 @@ export async function fetchJSON<T>(
     throw new Error(`${res.status}: ${text}`);
   }
   return res.json();
+}
+
+/**
+ * Show a fixed, dismissible banner when a stale session token forces a reload.
+ *
+ * A dashboard tab left open across a `hermes gateway restart` / `hermes update`
+ * keeps the previous `window.__HERMES_SESSION_TOKEN__`, so every `fetchJSON`
+ * 401s. The loopback 401 handler below triggers a silent `window.location.reload()`
+ * (or, if the reload guard is already set, falls through and throws) — making a
+ * button click look like a dead no-op. This banner explains the cause. It is
+ * rendered directly into `document.body` because `fetchJSON` is a plain-TS module
+ * with no access to the React toast store. SSR-safe; no-op when `document` is
+ * unavailable. See hermes-agent#73599.
+ */
+function showSessionExpiredBanner(): void {
+  if (typeof document === "undefined" || !document.body) return;
+  const id = "hermes-session-expired-banner";
+  if (document.getElementById(id)) return;
+  const el = document.createElement("div");
+  el.id = id;
+  el.setAttribute(
+    "style",
+    [
+      "position:fixed",
+      "left:50%",
+      "bottom:24px",
+      "transform:translateX(-50%)",
+      "z-index:2147483647",
+      "padding:12px 18px",
+      "border-radius:8px",
+      "background:#7f1d1d",
+      "color:#fff",
+      "font:14px/1.4 system-ui,sans-serif",
+      "box-shadow:0 4px 16px rgba(0,0,0,.35)",
+      "max-width:90vw",
+      "text-align:center",
+    ].join("; "),
+  );
+  el.textContent = "Session expired — reloading dashboard…";
+  document.body.appendChild(el);
 }
 
 /** Encode a plugin registry key for URL paths (preserves `/` segment separators). */
