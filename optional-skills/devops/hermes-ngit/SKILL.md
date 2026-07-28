@@ -142,6 +142,116 @@ git push   # now updates GitHub + Nostr (+ Radicle) natively
 whole `git push` (including GitHub) can abort. If that bites you, drop the `nostr://`
 pushurl and run `ngit sync` as a separate step instead.
 
+PITFALL — triple-push mirrors can silently DIVERGE and `git pull` will NOT warn you.
+When `origin` has only a `nostr://` FETCH url (set by `ngit init`) but three PUSH urls
+(GitHub + Radicle + Nostr), `git pull` fetches from Nostr only. If GitHub gains a commit
+(e.g. a merged PR) your local `main` lacks, `git pull` still reports "Already up to date"
+because Nostr already had your tip. The divergence only surfaces as a non-fast-forward on
+`git push` to GitHub — while the Nostr/Radicle pushurls print "Everything up-to-date" (they
+already had your commit), making it look like only GitHub is the problem.
+Diagnosis BEFORE any reset: fetch each remote into a throwaway ref and check ancestry —
+`git fetch -q git@github.com:rinchen/<repo>.git +refs/heads/main:refs/remotes/ghprobe/main`,
+then `git merge-base --is-ancestor main ghprobe/main` (is local an ancestor of GitHub?) and
+the reverse. If NEITHER is an ancestor, the histories diverged (parallel duplicate commits).
+Confirm the content is actually identical before assuming a reset is safe:
+`git diff <local> <remote> --stat` and compare trees with `git rev-parse <c>^{tree}`.
+Resolution: prefer `git merge --no-ff` of the GitHub tip into local. The merge commit descends
+from BOTH sides, so a plain `git push` fast-forwards all three mirrors with no force. A
+`git reset --hard` to GitHub LOOKS simpler but will NON-fast-forward Nostr/Radicle (they sit at
+the local tip, which is not an ancestor of GitHub) — it trades one rejected pushurl for two.
+Only force-push if you intend to rewrite GitHub history.
+
+## Links format (radicle-links hub convention)
+When adding a repo to `~/repos/radicle-links/README.md` (the hub):
+- GitHub cell: `[GitHub](https://github.com/rinchen/<repo>)`
+- **Radicle cell uses the SHORT `[rad]` text** linking to `app.radicle.xyz/.../rad:<rid>` — NOT the full `rad:z…` ID as the display text.
+- Nostr cell: `[ngit](https://gitworkshop.dev/npub…/relay.ngit.dev/<repo>)`
+- All three columns per repo.
+
+PITFALL — recurring correction (broken 3× across sessions, including this one): do NOT write
+`[rad:z3Y6…]` as the link text. The visible label must be literally `rad`; the full RID stays
+inside the URL: `[rad](https://app.radicle.xyz/nodes/rosa.radicle.network/rad:z3Y6…)`. Apply
+this to EVERY row you add or move in the hub README — if a pre-existing row violates it (e.g.
+the Hermes Radicle Skill row did), fix that too, not just the new one. Verify with
+`grep -cE '\[rad:z' README.md` → expect 0.
+
+## Recommended multi-mirror workflow (kill the blind `git pull`)
+
+The trap above happens because `ngit init` sets `origin` to FETCH from Nostr but PUSH to
+GitHub+Radicle+Nostr. PRs merge on **GitHub**, which `git pull` never consults — so divergence
+is invisible until `git push` rejects. Fix it by splitting the two directions with plain git
+config (no hook, no source edits):
+
+```bash
+# 1. Add GitHub as a FETCH-ONLY remote (PRs merge here)
+git remote add github git@github.com:rinchen/<repo>.git
+
+# 2. Make `git pull` sync from GitHub (where PRs land)
+git config branch.<main>.remote github
+git config branch.<main>.merge refs/heads/<main>
+
+# 3. Keep `git push` -> origin (the triple-mirror pushurls)
+git config remote.pushDefault origin
+git config push.default current   # per-repo: no-arg `git push` always hits origin (the triple mirror)
+```
+
+Now after a PR merges: `git pull` pulls it into local directly (FF, or a merge commit if you
+also have local commits). No silent "Already up to date", no surprise non-fast-forward.
+`git push` still propagates to GitHub+Radicle+Nostr via `origin` pushurls.
+
+Mechanics: `branch.<name>.remote` controls the `git pull` source; `remote.pushDefault` controls
+the `git push` target — two independent knobs. `git pull --dry-run` should show `From
+github.com:rinchen/<repo>`; `git push --dry-run` should target `origin`.
+
+Optional: scope GitHub's fetch to the main branch only (otherwise the first `git pull` registers
+all upstream branches as `github/*` tracking refs — harmless but noisy):
+```bash
+git config remote.github.fetch '+refs/heads/<main>:refs/remotes/github/<main>'
+```
+Run `git fetch --all` occasionally to refresh the Nostr/Radicle tracking refs; not required for
+the pull/push fix.
+
+### The full lifecycle (proven, no mirror divergence)
+
+With the config above, every enabled repo follows this loop and stays converged:
+
+```bash
+# 1. Feature branch (local)
+git checkout -b feat/x
+
+# 2. Open the PR: push the BRANCH to GitHub ONLY.
+#    Do NOT `git push` (no args) here — that would push to the triple mirror via origin.
+git push -u github feat/x        # <- github remote, branch only, never origin
+
+# 3. Someone merges the PR on GitHub (web UI / gh). No action needed locally yet.
+
+# 4. Bring it home: pull the merge from GitHub into local main.
+git checkout <main>
+git pull                         # branch.<main>.remote=github -> fetches the merged PR
+
+# 5. Propagate to Radicle + Nostr (and GitHub again, as one of origin's pushurls).
+git push                         # remote.pushDefault=origin -> triple mirror
+
+# 6. Cleanup
+git push -d github feat/x        # delete the remote PR branch
+git branch -d feat/x             # delete the local branch
+git pull                         # stays clean (github/main unchanged)
+```
+
+**Why it can't reproduce the old bug:** the PR branch is pushed to the `github` *remote* (not
+`origin`), so it never reaches Radicle/Nostr until merged. The merge lands on GitHub; `git pull`
+(now GitHub-aware) fetches it; `git push` carries that same commit to `origin`'s three pushurls
+(GitHub+Radicle+Nostr) as a clean fast-forward. Local main is always an ancestor of all three.
+
+**Rules that keep it safe on every repo:**
+- Open PRs: `git push -u github <branch>` (never `git push` to origin, never the branch name on
+  `git push` with no remote).
+- Sync main: `git pull` (= GitHub). Never assume "Already up to date" means GitHub is caught up
+  — verify with `git fetch github` if you suspect a stale Nostr `origin` confused you.
+- Publish: `git push` (= origin triple mirror). A non-fast-forward here means a real divergence
+  (someone pushed elsewhere); diagnose with `git fetch github main` + merge-base check, don't force.
+- The `github` remote is fetch-only by convention: never add it as an `origin` pushurl.
+
 ## Core Commands
 
 ### Detect a Nostr Repo
@@ -177,6 +287,21 @@ git remote set-url --add --push origin "$(git remote get-url origin)"
 Now `git push` updates GitHub, Radicle (if present), **and** Nostr. All three stay in sync
 natively. (This is exactly what `~/repos/ngit-enable-repo/ngit-enable-repo.sh` automates,
 and that script already captures the GitHub-pushurl-before-ngit-init ordering.)
+
+**Hardened enable (prevents the blind-`git-pull` trap):** `ngit init` leaves `origin.fetch`
+pointing at Nostr, so `git pull` never sees GitHub-merged PRs — the divergence stays invisible
+until `git push` rejects. The `ngit-enable-repo.sh` script now avoids this by splitting the two
+directions explicitly after the pushurl rebuild:
+- `git remote add github <github-url>` (FETCH-only source of truth; PRs merge here)
+- `git config branch.<main>.remote github`  → `git pull` consults GitHub
+- `git config remote.pushDefault origin`     → `git push` targets the triple mirror (never `github`)
+- `git config push.default current`          → no-arg `git push` hits `origin` even if your global
+  `push.default` is `upstream` (which would otherwise refuse, since `branch.<main>.remote=github`)
+- `git config remote.github.fetch '+refs/heads/<main>:refs/remotes/github/<main>'` (scoped, avoids registering every upstream branch)
+
+With this, `git pull` and `git push` point at different remotes and ngit's `origin` rewrite can't
+reintroduce the trap. Apply the same five lines to any existing triple-mirror repo that still has
+`origin.fetch = nostr://` (i.e. `git pull` is blind to GitHub).
 
 ### Clone a Nostr Repo
 
@@ -374,37 +499,50 @@ GitHub + Radicle + Nostr via `origin` pushurls. `git push` updates all three.
 
 ## Recovery: State-event "purgatory" accumulation (NIP-34 30617)
 
-**Symptom.** After you `git branch -D` old merged PR branches and later `git push`,
-the grasp server rejects the push with a `purgatory` error listing branches that no
-longer exist locally (seen on `cowx`).
+**Symptom.** After `git branch -D` old merged PR branches (or fixing remotes), `git push`
+(refs/heads/main doesn't exist and will be added as a new branch) → the grasp server
+rejects the push with `ERR authorisation failed: N state events in purgatory …` listing
+branches that no longer exist locally (seen on `cowx` and `persecutio`).
 
 **Root cause.** Each `ngit init` publishes a NIP-34 kind 30617 repository *state*
-event. Grasp servers (relay.ngit.dev, gitnostr.com) do **not** honor NIP-33
+event. Grasp servers (`relay.ngit.dev`, `gitnostr.com`) do **not** honor NIP-33
 replaceable semantics — old state events accumulate in "purgatory" instead of being
 replaced. The server checks every push against the **union of all purgatory events**,
 so every branch ever declared must still exist locally at its exact declared commit,
-even after you deleted it post-merge.
+even after you deleted it post-merge. Repeated `ngit init` runs *add* events without
+replacing them — purgatory can grow between attempts; don't re-run it once purgatory
+starts.
 
-**Probe first** — this tells you whether the server checks the latest state only or the
-union (the fix differs):
+**Probe first** — test with a non-main branch to confirm the server checks the union.
+`git push` to `origin` here will touch GitHub too — push to the `nostr://` URL directly
+so GitHub is not affected by a rejected probe.
 ```bash
 git branch enrich <declared-commit>
 git branch -f main <another-declared-commit>
 git push --force nostr://<npub>/relay.ngit.dev/<repo> main enrich
 ```
 - **Accepted** → server checks latest state only → just re-run `ngit init --clean -f -d`.
-- **Rejected** (lists other branches) → server checks the union → do the full reconcile.
+- **Rejected** (lists other branches) → server checks union → full reconcile below.
 
-**Full reconcile** (when the union is checked):
+**Full reconcile** (when the union is checked). IMPORTANT: this is invasive — force-pushes
+rewrite remote refs. Push to the **`nostr://` URL directly**; never `origin`. The push
+step in Phase 3 can succeed even while `gitnostr.com` still complains `No state events in
+purgatory` — that's a propagation lag, not a hard block. Treat `relay.ngit.dev` as primary.
 ```bash
 # Phase 1 — recreate every declared branch at its exact commit
 git branch <name1> <sha1>
 git branch <name2> <sha2>
-# … all N declared branches, including:
-git branch -f main <declared-main-sha>
+# … all N declared branches, including declared-missing ones like gh-pages if listed:
+git branch <name-with-slash> <sha>
+git branch -f main <declared-main-sha>       # use a temp ref or `git push` SHA→ref
+                                              # if main is checked out in the worktree
 
-# Phase 2 — satisfy the union so the push is accepted
-git push --force --all origin
+# Phase 1b — know your worktree: if `main` is checked out and you can't -f it,
+#               use `git push <nostr-url> <temp-branch>:refs/heads/main --force`
+#               or create a separate worktree before force-moving main.
+
+# Phase 2 — satisfy the union on the nostr URL only
+git push --force --all nostr://<npub>/relay.ngit.dev/<repo>
 
 # Phase 3 — publish a single combined state event
 ngit init --clean -f -d        # both relays should report "already in sync"
@@ -412,23 +550,38 @@ ngit init --clean -f -d        # both relays should report "already in sync"
 # Phase 4 — drop the stale branches, push the desired state
 git branch -f main <current-head-sha>
 git branch -D <stale-1> <stale-2> …
-git push --force --prune origin
+git push --force --prune nostr://<npub>/relay.ngit.dev/<repo>
 ngit init --clean -f -d
 ```
 
-**Caveats (observed on `cowx`, 2026-07-27):**
+**Hard rule from experience (cowx):** never let Phase 4's `--prune` target `origin` when
+`origin` also carries a GitHub or Radicle pushurl — that will delete real branches from
+those remotes too. Always push the purge step to the **`nostr://` URL directly**. If you
+need to prune `main` against the current state but preserve GitHub/Radicle, specify the
+nostr remote explicitly.
+
+**Caveats (observed on `cowx`, 2026-07-27 and `persecutio`):**
 - All declared commits must still exist in the local object store (they will, if
   they're ancestors of current `main`). If any are missing, the union can never be
   satisfied — then publish Nostr kind 5 deletion events (`nak event -k 5 -t e <id>
   --sec <nsec> -l relay.ngit.dev`) against the stale state-event IDs, or ask the grasp
   operator to clear purgatory.
+- Name/syntax gotcha: `git branch` accepts `<name> <sha>` but the `name <sha>` form
+  *inside* `< >` in a patch can be misread — here it's two separate arguments.
+  Equivalently you can use `git update-ref refs/heads/<name> <sha>` (not for checked-out
+  branches) or `git branch -f <name> <sha>`.
 - `gitnostr.com` is flaky: a direct push may fail with "No state events in purgatory"
   until `ngit init` has published a state event there. Treat **relay.ngit.dev as the
-  primary grasp server**; state events sync between grasp servers automatically.
+  primary grasp server**; state events sync between grasp servers automatically. If it
+  complains later during push-after-purge, re-run `ngit init --clean -f -d` and push
+  again.
 - A Radicle pushurl key-registration error means the `rad` node isn't running —
   `rad node start` then retry. (Unrelated to purgatory.)
 - If GitHub `main` is ahead after the fix (CI bots), recover with
   `git fetch git@github.com:rinchen/<repo>.git main && git rebase FETCH_HEAD && git push origin main`.
+- `gh-pages` is often listed in purgatory even if deleted locally; include it in Phase 1
+  if listed (the commit still exists in local object store). Do **not** prune it from
+  GitHub in Phase 4 — prune only to the nostr URL.
 
 ## Rationale
 
