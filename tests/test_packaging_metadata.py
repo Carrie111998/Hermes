@@ -69,6 +69,7 @@ _UPDATE_DOWNGRADE_GUARD_FLOORS = {
     # reviewed CVE pins must not slide back to stale versions that downgrade
     # already-patched user environments.
     "cryptography": (48, 0, 1),
+    "mcp": (1, 28, 1),
     "starlette": (1, 3, 1),
     "python-multipart": (0, 0, 32),
 }
