@@ -281,6 +281,31 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\restart-hermes-stack.ps
 
 ---
 
+## Git Submodules
+
+This fork uses the following git submodules under `vendor/` (and
+`vendor/openclaw-mirror/`) to keep upstream projects version-pinned and
+separately maintainable.
+
+| Path | Repository | What it is |
+| --- | --- | --- |
+| `vendor/openclaw-mirror/AI-Scientist` | `https://github.com/SakanaAI/AI-Scientist.git` | AI research automation framework for experiment-generation/evaluation loops. |
+| `vendor/openclaw-mirror/ATLAS` | `https://github.com/zapabob/ATLAS.git` | Fork-maintained ATLAS integration used by OpenClaw mirror workflows. |
+| `vendor/openclaw-mirror/ShinkaEvolve` | `https://github.com/SakanaAI/ShinkaEvolve.git` | Evolutionary optimization framework used for self-improving workflow experiments. |
+| `vendor/neuro-sdk` | `https://github.com/VedalAI/neuro-sdk.git` | VedalAI Neuro SDK integration surface for agent extensions. |
+| `vendor/openmanus` | `https://github.com/FoundationAgents/OpenManus.git` | OpenManus upstream code used via Hermes adapter/plugin boundaries. |
+| `vendor/SillyTavern` | `https://github.com/SillyTavern/SillyTavern.git` | SillyTavern upstream UI/runtime dependency for related integration workflows. |
+| `vendor/shinka-osint` | `https://github.com/zapabob/ShinkaEvolve-OSINT.git` | Fork OSINT + MILSPEC workflow stack (ShinkaEvolve-OSINT). |
+| `vendor/buzz` | `https://github.com/block/buzz.git` | Block Buzz relay/clients codebase vendored for interoperability and reference. |
+| `vendor/officecli` | `https://github.com/iOfficeAI/OfficeCLI.git` | OfficeCLI integration for productivity and office-task automation tooling. |
+| `vendor/akari-video` | `https://github.com/zapabob/akari-video` | AKARI Video monorepo used for video-workflow integrations. |
+
+Current local initialization state (`git submodule status`) may differ by
+checkout. Entries prefixed with `-` are present in `.gitmodules` but not
+initialized in the current working tree.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
