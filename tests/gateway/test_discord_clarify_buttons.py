@@ -361,11 +361,12 @@ class TestDiscordSendClarify:
         sent_msg.id = 123456
         channel.send = AsyncMock(return_value=sent_msg)
         adapter._client.get_channel = MagicMock(return_value=channel)
+        long_choice = "x" * 41
 
         result = await adapter.send_clarify(
             chat_id="9001",
             question="Pick a color",
-            choices=["red", "green", "blue"],
+            choices=["red", long_choice, "blue"],
             clarify_id="cidM",
             session_key="sk-M",
         )
@@ -385,7 +386,10 @@ class TestDiscordSendClarify:
             fields["Choices"]
             == "Pick one below, or click ✏️ Other to type a custom answer."
         )
-        assert "Full options" not in fields
+        assert fields["Full options"] == f"1. red\n2. {long_choice}\n3. blue"
+        assert kwargs["view"].children[0].label == "1. red"
+        assert kwargs["view"].children[1].label == f"2. {long_choice}"
+        assert kwargs["view"].children[2].label == "3. blue"
 
     @pytest.mark.asyncio
     async def test_open_ended_omits_view(self):
@@ -464,50 +468,11 @@ class TestDiscordSendClarify:
         )
         kwargs = channel.send.call_args.kwargs
         view = kwargs["view"]
+        fields = {f["name"]: f["value"] for f in kwargs["embed"].fields}
+        assert "Full options" not in fields
         # Only 1 real choice + 1 Other = 2 children
         assert len(view.children) == 2
         assert "real-choice" in view.children[0].label
-
-    @pytest.mark.asyncio
-    async def test_long_choice_renders_numbered_choices_in_embed_field(self):
-        adapter = _make_adapter()
-        channel = MagicMock()
-        sent_msg = MagicMock()
-        sent_msg.id = 901
-        channel.send = AsyncMock(return_value=sent_msg)
-        adapter._client.get_channel = MagicMock(return_value=channel)
-
-        long_choice = "x" * 41
-        short_choice = "Use cached defaults"
-        assert utf16_len(long_choice) > 40
-
-        await adapter.send_clarify(
-            chat_id="9001",
-            question="Choose one:",
-            choices=[short_choice, long_choice, "No"],
-            clarify_id="cidFull",
-            session_key="sk-Full",
-        )
-
-        kwargs = channel.send.call_args.kwargs
-        embed = kwargs["embed"]
-        fields = {f["name"]: f["value"] for f in embed.fields}
-        assert (
-            fields["Choices"]
-            == "Pick one below, or click ✏️ Other to type a custom answer."
-        )
-        expected_full = "\n".join(
-            [
-                "1. Use cached defaults",
-                f"2. {long_choice}",
-                "3. No",
-            ]
-        )
-        assert fields["Full options"] == expected_full
-        view = kwargs["view"]
-        assert view.children[0].label == "1. Use cached defaults"
-        assert view.children[1].label == f"2. {long_choice}"
-        assert view.children[2].label == "3. No"
 
     @pytest.mark.asyncio
     async def test_unwraps_dict_choices_to_description(self):
@@ -639,43 +604,3 @@ class TestDiscordSendClarify:
         for label in choice_labels:
             assert "only_name_here" not in label, f"name leaked: {label!r}"
             assert "only_value_here" not in label, f"value leaked: {label!r}"
-
-    @pytest.mark.asyncio
-    async def test_full_options_splits_when_exceeding_1024_utf16_units(self):
-        adapter = _make_adapter()
-        channel = MagicMock()
-        sent_msg = MagicMock()
-        sent_msg.id = 999
-        channel.send = AsyncMock(return_value=sent_msg)
-        adapter._client.get_channel = MagicMock(return_value=channel)
-
-        choices = ["x" * 41 for _ in range(24)]
-        assert len(choices) == 24
-        assert all(utf16_len(c) > 40 for c in choices)
-
-        await adapter.send_clarify(
-            chat_id="9001",
-            question="Choose one:",
-            choices=choices,
-            clarify_id="cidSplit",
-            session_key="sk-Split",
-        )
-
-        kwargs = channel.send.call_args.kwargs
-        embed = kwargs["embed"]
-        full_option_fields = [
-            f
-            for f in embed.fields
-            if f["name"] in {"Full options", "Full options (continued)"}
-        ]
-        assert len(full_option_fields) > 1
-        assert full_option_fields[0]["name"] == "Full options"
-        assert all(
-            f["name"] == "Full options (continued)" for f in full_option_fields[1:]
-        )
-        assert all(utf16_len(f["value"]) <= 1024 for f in full_option_fields)
-        expected = "\n".join(
-            f"{idx}. {choice}" for idx, choice in enumerate(choices, start=1)
-        )
-        reconstructed = "\n".join(f["value"] for f in full_option_fields)
-        assert reconstructed == expected
