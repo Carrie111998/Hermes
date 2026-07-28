@@ -1,0 +1,89 @@
+name: Postgres Authority Store
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'hermes_cli/postgres_authority.py'
+      - 'tests/test_postgres_authority.py'
+      - '.github/workflows/postgres-authority.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'hermes_cli/postgres_authority.py'
+      - 'tests/test_postgres_authority.py'
+      - '.github/workflows/postgres-authority.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: charterforge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.0"
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      
+      - name: Install dependencies
+        run: |
+          uv sync --extra dev --extra postgres
+      
+      - name: Run Postgres authority tests
+        env:
+          AUTHORITY_POSTGRES_TEST_URL: postgresql://test:test@localhost:5432/charterforge_test
+        run: |
+          uv run pytest -v tests/test_postgres_authority.py
+      
+      - name: Verify postgres_authority module
+        run: |
+          uv run python -c "
+          from hermes_cli.postgres_authority import (
+              connect, init_schema, claim_task, complete_task,
+              get_authority_backend, SCHEMA_VERSION
+          )
+          print(f'✓ postgres_authority module loaded')
+          print(f'  Schema version: {SCHEMA_VERSION}')
+          print(f'  Backend detection: {get_authority_backend()}')
+          "
+
+  build-with-postgres:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.0"
+      
+      - name: Build with postgres extra
+        run: |
+          uv build --wheel --sdist
+          uv pip install --python 3.12 dist/charterforge-0.*-py3-none-any.whl[postgres]
+      
+      - name: Verify psycopg installed
+        run: |
+          python -c "import psycopg; print(f'✓ psycopg {psycopg.__version__}')"
