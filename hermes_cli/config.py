@@ -3477,6 +3477,11 @@ DEFAULT_CONFIG = {
         # upstream installer is not appropriate for the machine, for example
         # on non-admin accounts where `/Applications` is not writable.
         "refresh_cua_driver": True,
+        # Optional opt-in escape hatches for supervised venv deployments.
+        # See issue #66933.
+        "pre_update_command": None,      # str or list, runs before venv guard
+        "pre_update_command_timeout": 60,  # seconds
+        "venv_holder_allowlist": [],       # case-insensitive substring list
     },
 
     # Language Server Protocol — semantic diagnostics from real

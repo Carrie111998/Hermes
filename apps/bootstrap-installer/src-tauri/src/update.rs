@@ -33,6 +33,7 @@ use anyhow::{anyhow, Result};
 use tauri::{AppHandle, Emitter};
 use tokio::io::BufReader;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 use crate::events::{BootstrapEvent, LogStream, StageInfo, StageState};
 use crate::powershell::read_decoded_line;
@@ -149,7 +150,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // Mutual exclusion (#50238): publish an "update in progress" marker for the
     // entire duration of this update. A desktop instance the user relaunches
     // mid-update consults this before spawning its own local backend — without
-    // it, that backend re-locks the venv shim, our `force_kill_other_hermes`
+    // it, that backend re-locks the venv shim, our `kill_venv_hermes_processes`
     // straggler-cleanup kills it, and the relaunch/kill cycle loops. The guard
     // removes the marker on every exit path (incl. early returns / panics).
     let _update_marker = UpdateMarkerGuard::acquire(crate::paths::update_in_progress_marker());
@@ -512,7 +513,7 @@ pub(crate) async fn wait_for_install_locks_free(install_root: &Path, app: &AppHa
                     format_locked_paths(&locked)
                 ),
             );
-            force_kill_other_hermes();
+            kill_venv_hermes_processes(install_root);
             tokio::time::sleep(Duration::from_millis(800)).await;
             let locked_after_kill = locked_paths(&lock_targets);
             if locked_after_kill.is_empty() {
@@ -528,10 +529,20 @@ pub(crate) async fn wait_for_install_locks_free(install_root: &Path, app: &AppHa
                     Some(stage),
                     LogStream::Stdout,
                     &format!(
-                        "[handoff] install files still locked ({}); proceeding (--force + quarantine will handle it)",
+                        "[handoff] install files still locked ({}); classifying venv holders…",
                         format_locked_paths(&locked_after_kill)
                     ),
                 );
+                let unknown_remain =
+                    classify_and_kill_venv_processes(install_root, app, stage);
+                if unknown_remain {
+                    emit_log(
+                        app,
+                        Some(stage),
+                        LogStream::Stdout,
+                        "[handoff] unknown venv-holder processes remain; proceeding (Python guard will handle)",
+                    );
+                }
             }
             return;
         }
@@ -570,28 +581,30 @@ fn format_locked_paths(paths: &[PathBuf]) -> String {
     paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
 }
 
-/// Force-kill any `hermes.exe` other than this process. Windows-only; a no-op
-/// elsewhere (POSIX has no mandatory-lock contention). We can't selectively
-/// target "the backend" by PID here — the desktop already exited and we never
-/// knew its children — so we kill the whole `hermes.exe` image tree via
-/// taskkill, excluding our own PID.
+/// Kill hermes.exe (excluding our own PID) AND python.exe/pythonw.exe
+/// processes whose executable path starts with `install_root/venv/Scripts/`,
+/// using PowerShell Get-CimInstance Win32_Process to match by path prefix
+/// (NOT blanket `taskkill /IM python*`). Logs every killed PID via
+/// `tracing::warn!` so the bootstrap log shows exactly what was killed.
 ///
 /// Safe w.r.t. our own update child: this runs inside the install-lock wait,
-/// which completes BEFORE we spawn `venv\Scripts\hermes.exe update`. And a
+/// which completes BEFORE we spawn `venv\\Scripts\\hermes.exe update`. And a
 /// desktop the user relaunches mid-update will NOT have spawned a backend —
 /// `startHermes()` in the desktop gates local-backend startup on our
 /// update-in-progress marker and parks until we finish (#50238). So the only
-/// hermes.exe images here are stragglers from the old desktop — exactly what
-/// we want gone. (`/FI PID ne <self>` also spares this Tauri process, though it
-/// isn't named hermes.exe.)
-fn force_kill_other_hermes() {
+/// hermes.exe / venv python images here are stragglers from the old desktop —
+/// exactly what we want gone.
+fn kill_venv_hermes_processes(install_root: &Path) {
     if !cfg!(target_os = "windows") {
         return;
     }
     #[cfg(target_os = "windows")]
     {
         let my_pid = std::process::id();
-        // /FI excludes our own PID; /T kills the tree; /F forces.
+        let venv_bin = install_root.join("venv").join("Scripts");
+        let venv_prefix = venv_bin.to_string_lossy().replace('/', "\\");
+
+        // 1. Kill hermes.exe (excluding self) — same taskkill approach as before.
         let _ = std::process::Command::new("taskkill")
             .args([
                 "/F",
@@ -604,6 +617,189 @@ fn force_kill_other_hermes() {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+
+        // 2. Kill venv python.exe / pythonw.exe via WMI path match.
+        //    We use Get-CimInstance and filter by executable path so we never
+        //    harm a system python or a different venv.
+        let ps_script = format!(
+            r#"Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" | Where-Object {{ $_.ExecutablePath -like '{venv_prefix}\*' }} | Select-Object ProcessId,ExecutablePath | ConvertTo-Json"#
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+        if let Ok(out) = output {
+            if let Ok(stdout) = String::from_utf8(out.stdout) {
+                let trimmed = stdout.trim();
+                if !trimmed.is_empty() && trimmed != "null" {
+                    use serde_json::Value;
+                    let processes = serde_json::from_str::<Value>(trimmed);
+                    match &processes {
+                        Ok(Value::Array(arr)) => {
+                            for proc in arr {
+                                if let Some(pid) =
+                                    proc.get("ProcessId").and_then(|v| v.as_u64())
+                                {
+                                    let pid = pid as u32;
+                                    if pid != my_pid {
+                                        let exe = proc
+                                            .get("ExecutablePath")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("?");
+                                        tracing::warn!(
+                                            pid,
+                                            exe,
+                                            "killing venv python process from update lock-wait"
+                                        );
+                                        let _ = std::process::Command::new("taskkill")
+                                            .args(["/F", "/PID", &pid.to_string()])
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .status();
+                                        std::thread::sleep(
+                                            std::time::Duration::from_millis(50),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Value::Object(obj)) => {
+                            if let Some(pid) =
+                                obj.get("ProcessId").and_then(|v| v.as_u64())
+                            {
+                                let pid = pid as u32;
+                                if pid != my_pid {
+                                    let exe = obj
+                                        .get("ExecutablePath")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
+                                    tracing::warn!(
+                                        pid,
+                                        exe,
+                                        "killing venv python process from update lock-wait"
+                                    );
+                                    let _ = std::process::Command::new("taskkill")
+                                        .args(["/F", "/PID", &pid.to_string()])
+                                        .stdout(std::process::Stdio::null())
+                                        .stderr(std::process::Stdio::null())
+                                        .status();
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Enumerate venv processes via PowerShell, classify each by its command-line
+/// pattern, kill known Hermes daemons, and log unknown holders (without killing
+/// them). Returns `true` if any unknown-venv-holder processes remain.
+///
+/// Classification targets:
+/// - `desktop-backend` — command line contains `hermes_cli.main serve`
+/// - `gateway`         — command line contains `hermes_cli.main gateway`
+/// - `memory-daemon`   — command line contains `hindsight_api.main`
+/// - `unknown-venv-holder` — anything else running from the venv
+///
+/// Known daemons are killed; unknown holders are logged but NOT killed so the
+/// Python-side venv-holder guard can decide (they may be user-initiated Python
+/// tasks inside the Hermes venv).
+pub(crate) fn classify_and_kill_venv_processes(
+    install_root: &Path,
+    app: &AppHandle,
+    stage: &str,
+) -> bool {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (install_root, app, stage);
+        return false;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let venv_path = install_root.join("venv");
+        let venv_prefix = venv_path.to_string_lossy().replace('/', "\\");
+
+        let ps_script = format!(
+            r#"Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" | Where-Object {{ $_.ExecutablePath -like '{venv_prefix}\*' }} | Select-Object ProcessId,ExecutablePath,CommandLine | ConvertTo-Json"#
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output();
+
+        let mut unknown_remain = false;
+
+        if let Ok(out) = output {
+            if let Ok(stdout) = String::from_utf8(out.stdout) {
+                let trimmed = stdout.trim();
+                if !trimmed.is_empty() && trimmed != "null" {
+                    use serde_json::Value;
+
+                    let classify_and_kill_single = |proc: &Value, unknown: &mut bool| {
+                        let pid = match proc.get("ProcessId").and_then(|v| v.as_u64()) {
+                            Some(p) => p as u32,
+                            None => return,
+                        };
+                        let cmdline = proc
+                            .get("CommandLine")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let exe = proc
+                            .get("ExecutablePath")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+
+                        let category = if cmdline.contains("hermes_cli.main serve") {
+                            "desktop-backend"
+                        } else if cmdline.contains("hermes_cli.main gateway") {
+                            "gateway"
+                        } else if cmdline.contains("hindsight_api.main") {
+                            "memory-daemon"
+                        } else {
+                            "unknown-venv-holder"
+                        };
+
+                        if category == "unknown-venv-holder" {
+                            tracing::warn!(
+                                pid,
+                                exe,
+                                cmdline,
+                                "unknown venv-holder process (not killed, Python guard will handle)"
+                            );
+                            *unknown = true;
+                        } else {
+                            tracing::warn!(pid, exe, category, "killing known venv-holder process");
+                            let _ = std::process::Command::new("taskkill")
+                                .args(["/F", "/PID", &pid.to_string()])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status();
+                        }
+                    };
+
+                    let processes = serde_json::from_str::<Value>(trimmed);
+                    match &processes {
+                        Ok(Value::Array(arr)) => {
+                            for proc in arr {
+                                classify_and_kill_single(proc, &mut unknown_remain);
+                            }
+                        }
+                        Ok(Value::Object(obj)) => {
+                            classify_and_kill_single(obj, &mut unknown_remain);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        return unknown_remain;
     }
 }
 
@@ -682,13 +878,31 @@ async fn run_streamed(
                 Ok(None) => {}
                 Err(e) => { tracing::warn!("stderr read error: {e}"); }
             },
+            _ = child.wait() => break,
         }
     }
-    while let Ok(Some(l)) = read_decoded_line(&mut out, &mut out_buf).await {
-        emit_log(app, stage_owned.as_deref(), LogStream::Stdout, &l);
+    // Drain remaining output. On Windows, cap with a timeout to avoid
+    // hanging on inherited pipe handles (PR #51216).
+    #[cfg(target_os = "windows")]
+    {
+        let drain = async {
+            while let Ok(Some(l)) = read_decoded_line(&mut out, &mut out_buf).await {
+                emit_log(app, stage_owned.as_deref(), LogStream::Stdout, &l);
+            }
+            while let Ok(Some(l)) = read_decoded_line(&mut err, &mut err_buf).await {
+                emit_log(app, stage_owned.as_deref(), LogStream::Stderr, &l);
+            }
+        };
+        let _ = timeout(Duration::from_millis(300), drain).await;
     }
-    while let Ok(Some(l)) = read_decoded_line(&mut err, &mut err_buf).await {
-        emit_log(app, stage_owned.as_deref(), LogStream::Stderr, &l);
+    #[cfg(not(target_os = "windows"))]
+    {
+        while let Ok(Some(l)) = read_decoded_line(&mut out, &mut out_buf).await {
+            emit_log(app, stage_owned.as_deref(), LogStream::Stdout, &l);
+        }
+        while let Ok(Some(l)) = read_decoded_line(&mut err, &mut err_buf).await {
+            emit_log(app, stage_owned.as_deref(), LogStream::Stderr, &l);
+        }
     }
 
     let status = child.wait().await.map_err(|e| anyhow!("waiting for child: {e}"))?;

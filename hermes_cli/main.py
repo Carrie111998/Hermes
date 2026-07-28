@@ -11353,7 +11353,7 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
 
 
 def _detect_venv_python_processes(
-    *, exclude_pids: set[int] | None = None
+    *, exclude_pids: set[int] | None = None, allowlist: list[str] | None = None
 ) -> list[tuple[int, str, str]]:
     """Find live processes running from the project venv's interpreter.
 
@@ -11434,6 +11434,15 @@ def _detect_venv_python_processes(
         if not is_holder:
             continue
         name = info.get("name") or Path(exe).name
+        # Skip processes that match the venv_holder_allowlist.
+        if allowlist:
+            _pid_name_low = str(name).lower()
+            _pid_cmd_low = cmdline_raw[:120].lower()
+            if any(
+                entry.lower() in _pid_name_low or entry.lower() in _pid_cmd_low
+                for entry in allowlist
+            ):
+                continue
         matches.append((int(pid), str(name), cmdline_raw[:120]))
     return matches
 
@@ -11450,6 +11459,8 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
             hint = "  ← Hermes Desktop backend (close the desktop app)"
         elif "gateway" in low:
             hint = "  ← gateway"
+        elif "hindsight_api.main" in low:
+            hint = "  ← Hindsight memory daemon"
         lines.append(f"  PID {pid}  {name}  {cmdline}{hint}")
     if len(matches) > 6:
         lines.append(f"  ... and {len(matches) - 6} more")
@@ -11898,6 +11909,65 @@ def cmd_update(args):
         _finalize_update_output(_update_io_state)
 
 
+def _run_pre_update_hook(args) -> None:
+    """Run the pre-update command if configured in updates.pre_update_command.
+
+    Reads the config, runs the command (string → shell=True, list → no shell),
+    and exits with a diagnostic message on timeout or non-zero return.
+    This is an opt-in escape hatch for supervised venv deployments.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        _cfg = load_config() or {}
+        _updates_cfg = _cfg.get("updates", {}) or {}
+        _cmd = _updates_cfg.get("pre_update_command")
+        _timeout = int(_updates_cfg.get("pre_update_command_timeout", 60))
+    except Exception as exc:
+        logger.debug("Could not read updates.pre_update_command config: %s", exc)
+        return
+
+    if not _cmd:
+        return
+
+    print(f"⚙ Running pre-update command...")
+    try:
+        if isinstance(_cmd, list):
+            _result = subprocess.run(
+                _cmd, timeout=_timeout, capture_output=True, text=True
+            )
+        else:
+            _result = subprocess.run(
+                str(_cmd),
+                timeout=_timeout,
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+    except subprocess.TimeoutExpired:
+        print(
+            f"✗ Pre-update command timed out after {_timeout}s. "
+            "Aborting update."
+        )
+        sys.exit(2)
+    except Exception as exc:
+        print(f"✗ Pre-update command failed to start: {exc}")
+        sys.exit(2)
+
+    if _result.returncode != 0:
+        print(
+            f"✗ Pre-update command exited with code {_result.returncode}. "
+            "Aborting update."
+        )
+        if _result.stdout:
+            print(_result.stdout.strip())
+        if _result.stderr:
+            print(_result.stderr.strip())
+        sys.exit(2)
+
+    print("✓ Pre-update command completed successfully.")
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -11963,6 +12033,25 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _windows_gateway_resume,
         )
 
+    # Optional pre-update hook — runs before the venv-holder guard so it
+    # can, for example, gracefully shut down known venv-holding processes
+    # in supervised deployments. Opt-in via updates.pre_update_command.
+    _run_pre_update_hook(args)
+
+    # Read venv_holder_allowlist from config so supervised deployments can
+    # exempt known processes from the venv-holder block (e.g. an external
+    # launcher managing the hindsight memory daemon).
+    _venv_allowlist: list[str] | None = None
+    try:
+        from hermes_cli.config import load_config
+
+        _ucfg = (load_config() or {}).get("updates", {}) or {}
+        _raw = _ucfg.get("venv_holder_allowlist")
+        if isinstance(_raw, list):
+            _venv_allowlist = [str(e) for e in _raw if e]
+    except Exception:
+        pass
+
     # With gateways paused, anything still running from the venv interpreter
     # (most commonly the Desktop app's `hermes serve` backend) will keep .pyd
     # files locked and corrupt the dependency sync below. Refuse rather than
@@ -11974,7 +12063,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # through and corrupt the sync (the exact failure this guard exists for).
     # --force-venv is the explicit escape hatch.
     if _is_windows() and not getattr(args, "force_venv", False):
-        _venv_holders = _detect_venv_python_processes()
+        _venv_holders = _detect_venv_python_processes(allowlist=_venv_allowlist)
         if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
             _resume_windows_gateways_after_update(_windows_gateway_resume)
