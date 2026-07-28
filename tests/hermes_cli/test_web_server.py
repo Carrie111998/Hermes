@@ -2262,6 +2262,24 @@ class TestWebServerEndpoints:
         assert payload["session_id"] == "desktop-tip"
         assert [m["content"] for m in payload["messages"]] == ["after compression"]
 
+    def test_get_session_messages_clamps_negative_pagination(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="negative-pagination", source="desktop")
+            db.append_message(session_id="negative-pagination", role="user", content="hidden")
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/sessions/negative-pagination/messages?limit=-1&offset=-7"
+        )
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["messages"] == []
+        assert payload["pagination"] == {"limit": 0, "offset": 0, "returned": 0}
+
     def test_get_sessions_archived_is_boolean(self):
         from hermes_state import SessionDB
 

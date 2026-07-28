@@ -2872,6 +2872,22 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
         server._sessions.pop("trunc-sid", None)
 
 
+@pytest.mark.parametrize("text", [None, [], 123, {"content": "hello"}])
+def test_prompt_submit_rejects_non_string_text(text):
+    resp = server.handle_request(
+        {
+            "id": "invalid-text",
+            "method": "prompt.submit",
+            "params": {"session_id": "unused", "text": text},
+        }
+    )
+
+    assert resp["error"] == {
+        "code": -32602,
+        "message": "invalid params: text must be a string",
+    }
+
+
 class _StopAfterOneNotificationPoll:
     def __init__(self):
         self._checks = 0
@@ -10072,6 +10088,77 @@ def test_image_attach_bytes_rejects_invalid_base64(monkeypatch, tmp_path):
     )
     assert "error" in resp
     assert resp["error"]["code"] == 4017
+
+
+def test_image_attach_bytes_rejects_spoofed_image_filename(monkeypatch, tmp_path):
+    import pybase64 as _b64
+
+    _attach_bytes_cli(monkeypatch)
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    server._sessions["abx-spoof"] = _session()
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "image.attach_bytes",
+            "params": {
+                "session_id": "abx-spoof",
+                "content_base64": _b64.b64encode(b"not an image").decode("ascii"),
+                "filename": "fake.png",
+            },
+        }
+    )
+
+    assert resp["error"]["code"] == 4016
+    assert "unrecognized magic bytes" in resp["error"]["message"]
+    assert server._sessions["abx-spoof"]["attached_images"] == []
+
+
+@pytest.mark.parametrize("action", ["add", "remove", "pause", "resume"])
+def test_cron_manage_surfaces_tool_failure_payload(monkeypatch, action):
+    monkeypatch.setattr(
+        "tools.cronjob_tools.cronjob",
+        lambda **_kwargs: orjson.dumps(
+            {"success": False, "error": f"{action} rejected"}
+        ).decode("utf-8"),
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "cron-failure",
+            "method": "cron.manage",
+            "params": {
+                "action": action,
+                "name": "bad-job",
+                "schedule": "not a schedule",
+                "prompt": "hello",
+            },
+        }
+    )
+
+    assert resp["error"] == {"code": 4023, "message": f"{action} rejected"}
+
+
+def test_cron_manage_classifies_value_error_as_client_error(monkeypatch):
+    def _reject(**_kwargs):
+        raise ValueError("invalid cron expression")
+
+    monkeypatch.setattr("tools.cronjob_tools.cronjob", _reject)
+
+    resp = server.handle_request(
+        {
+            "id": "cron-value-error",
+            "method": "cron.manage",
+            "params": {
+                "action": "add",
+                "name": "bad-job",
+                "schedule": "invalid",
+                "prompt": "hello",
+            },
+        }
+    )
+
+    assert resp["error"] == {"code": 4023, "message": "invalid cron expression"}
 
 
 def test_image_attach_bytes_rejects_oversize(monkeypatch, tmp_path):
