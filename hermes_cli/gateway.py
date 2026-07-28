@@ -2562,9 +2562,13 @@ def _build_wsl_interop_paths(path_entries: list[str]) -> list[str]:
         return []
 
     candidates: list[str] = []
-    for entry in os.environ.get("PATH", "").split(os.pathsep):
-        if entry.startswith("/mnt/"):
-            candidates.append(entry)
+    # Removed: indiscriminate scraping of /mnt/ paths from the current
+    # shell's PATH. The hardcoded Windows system paths below, combined
+    # with which() resolution, are sufficient for all WSL interop needs.
+    # Scraping shell PATH captures unrelated paths (Desktop app dirs,
+    # git, node, etc.) that cause excessive Plan 9 I/O, ultimately
+    # triggering p9io AcceptAsync disconnects that crash the WSL VM
+    # (#73163).
 
     for executable in ("powershell.exe", "cmd.exe", "explorer.exe", "wsl.exe"):
         resolved = shutil.which(executable)
