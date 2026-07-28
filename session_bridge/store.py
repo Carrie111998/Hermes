@@ -3805,8 +3805,46 @@ class SessionBridgeStore:
             provider,
             reason_code,
         )
+        launch_metadata = self.get_session_launch_metadata(source_session_id)
+        profile = (
+            launch_metadata.get("profile")
+            if isinstance(launch_metadata, Mapping)
+            else None
+        )
 
         def _write(conn):
+            source_row = conn.execute(
+                "SELECT source, model_config FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone()
+            if source_row is None:
+                if not isinstance(profile, str) or not profile.strip():
+                    raise KeyError(source_session_id)
+                model_config = json.dumps(
+                    {"_session_bridge_profile": profile.strip()},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    """INSERT INTO sessions (
+                           id, source, model_config, started_at, title, cwd
+                       ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        source_session_id,
+                        _PROFILE_SHADOW_SOURCE,
+                        model_config,
+                        excluded_at,
+                        launch_metadata.get("title") if launch_metadata else None,
+                        launch_metadata.get("cwd") if launch_metadata else None,
+                    ),
+                )
+            elif source_row["source"] == _PROFILE_SHADOW_SOURCE:
+                try:
+                    shadow_config = json.loads(source_row["model_config"] or "{}")
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError("invalid profile shadow identity") from exc
+                if shadow_config.get("_session_bridge_profile") != profile:
+                    raise ValueError("conflicting profile shadow identity")
             insert = conn.execute(
                 """INSERT OR IGNORE INTO session_sidebar_exclusions (
                    source_session_id, provider, reason_code,

@@ -6708,6 +6708,51 @@ def test_named_profile_hermes_session_is_a_sidebar_candidate_and_snapshot(db, tm
     assert read["messages"][0]["content"] == ("ship the cross-profile sidebar bridge")
 
 
+def test_named_profile_missing_cwd_can_be_durably_excluded(db, tmp_path):
+    profile_path = tmp_path / "profiles" / "main" / "state.db"
+    profile_path.parent.mkdir(parents=True)
+    profile_db = SessionDB(profile_path)
+    try:
+        profile_db.create_session("hermes-profile-missing-cwd", "tui", cwd=None)
+        profile_db.append_message(
+            "hermes-profile-missing-cwd",
+            "user",
+            "preserve this historical profile session",
+            timestamp=100.0,
+        )
+        profile_db._execute_write(
+            lambda conn: (
+                conn.execute("DROP TABLE external_sessions"),
+                conn.execute("DROP TABLE session_links"),
+            )
+        )
+    finally:
+        profile_db.close()
+
+    store = SessionBridgeStore(
+        db,
+        hermes_profile_db_paths=lambda: (("main", profile_path),),
+    )
+    assert [source.source_session_id for source in store.list_sidebar_candidates(0, 10)] == [
+        "hermes-profile-missing-cwd"
+    ]
+
+    result = store.record_sidebar_exclusion(
+        "hermes-profile-missing-cwd",
+        Provider.HERMES,
+        "source_cwd_missing",
+        now=200.0,
+    )
+
+    assert result["created"] is True
+    assert _rows(
+        db,
+        "SELECT source, cwd FROM sessions WHERE id = ?",
+        ("hermes-profile-missing-cwd",),
+    ) == [{"source": "session_bridge_profile", "cwd": None}]
+    assert list(store.list_sidebar_candidates(0, 10)) == []
+
+
 def test_native_hermes_snapshot_canonicalizes_binary_and_nonfinite_content(db):
     store = SessionBridgeStore(db)
     db.create_session("hermes-structured", "tui")
