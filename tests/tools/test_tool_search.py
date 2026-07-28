@@ -503,6 +503,34 @@ class TestDeferredCallSchemaProbe:
         # Unknown tool → no schema → dispatch (downstream scope gate handles it).
         assert validate_deferred_call_args("mcp_no_such_tool_xyz", {}) is None
 
+    def test_validator_no_required_list_dispatches(self):
+        from tools.tool_search import validate_deferred_call_args
+        from tools.registry import registry
+
+        registry.register(
+            name="mcp_probe_norequired",
+            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
+            schema={"type": "function",
+                    "function": {"name": "mcp_probe_norequired",
+                                 "description": "d",
+                                 "parameters": {"type": "object", "properties": {}}}},
+            toolset="mcp-probe",
+        )
+        assert validate_deferred_call_args("mcp_probe_norequired", {}) is None
+
+    def test_blind_tool_call_returns_schema_not_keyerror(self):
+        import model_tools
+
+        self._register("mcp_probe_blind_op", "mcp-probe-blind")
+        result = json.loads(model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": "mcp_probe_blind_op", "arguments": {}},
+            enabled_toolsets=["mcp-probe-blind"],
+        ))
+        assert "error" in result
+        assert "KeyError" not in result["error"]
+        assert "missing required field" in result["error"]
+        assert result["parameters"]["required"] == ["document_id"]
 
     def test_valid_tool_call_still_dispatches(self):
         import model_tools
@@ -516,3 +544,251 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+    def test_coercible_string_integer_is_not_rejected(self):
+        """A coerce-able "42" (string) must NOT be rejected by the validator
+        when the schema expects an integer — the coercion step runs first.
+        Regression test for #73302: the validator previously rejected
+        ``{"count": "42"}`` even though normal dispatch would coerce
+        it to ``{"count": 42}`` via ``coerce_tool_args``."""
+        from tools.tool_search import validate_deferred_call_args
+        from tools.registry import registry
+
+        registry.register(
+            name="mcp_probe_coerce_int",
+            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
+            schema={"type": "function",
+                    "function": {"name": "mcp_probe_coerce_int",
+                                 "description": "coerce test",
+                                 "parameters": {
+                                     "type": "object",
+                                     "properties": {
+                                         "count": {"type": "integer"},
+                                     },
+                                     "required": ["count"],
+                                 }}},
+            toolset="mcp-probe-coerce",
+        )
+        result = validate_deferred_call_args(
+            "mcp_probe_coerce_int", {"count": "42"}
+        )
+        assert result is None, (
+            f"coerce-able '42'→42 must pass validation; got: {result}"
+        )
+
+    @staticmethod
+    def _register_schema(name, toolset, params, handler=None):
+        from tools.registry import registry
+
+        if handler is None:
+            def handler(args, task_id=None, **kw):
+                return json.dumps({"ok": True, "received": args})
+
+        registry.register(
+            name=name,
+            handler=handler,
+            schema={"type": "function",
+                    "function": {"name": name, "description": f"desc {name}",
+                                 "parameters": params}},
+            toolset=toolset,
+        )
+
+    def test_validator_blocks_invalid_type(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register_schema("mcp_type_check", "mcp-type", {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["name", "count"],
+        })
+        err = validate_deferred_call_args(
+            "mcp_type_check", {"name": "test", "count": "not-an-int"})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "invalid type" in parsed["error"]
+        assert "count" in parsed["error"]
+
+    def test_validator_blocks_invalid_enum(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register_schema("mcp_enum_check", "mcp-enum", {
+            "type": "object",
+            "properties": {
+                "priority": {"type": "string", "enum": ["low", "high"]},
+            },
+            "required": ["priority"],
+        })
+        err = validate_deferred_call_args(
+            "mcp_enum_check", {"priority": "urgent"})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "invalid value" in parsed["error"]
+        assert "priority" in parsed["error"]
+
+    def test_validator_blocks_nested_missing_required(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register_schema("mcp_nested_req", "mcp-nested", {
+            "type": "object",
+            "properties": {
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["count"],
+                },
+            },
+            "required": ["options"],
+        })
+        err = validate_deferred_call_args(
+            "mcp_nested_req", {"options": {}})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "missing required field" in parsed["error"]
+        assert "count" in parsed["error"]
+
+    def test_validator_blocks_additional_properties(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register_schema("mcp_addl_props", "mcp-addl", {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        })
+        err = validate_deferred_call_args(
+            "mcp_addl_props", {"name": "test", "extra": "bad"})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "unexpected property" in parsed["error"]
+        assert "extra" in parsed["error"]
+
+    def test_validator_allows_nullable_fields(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register_schema("mcp_nullable", "mcp-nullable", {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "description": {"type": ["string", "null"]},
+            },
+            "required": ["name"],
+        })
+        assert validate_deferred_call_args(
+            "mcp_nullable", {"name": "test", "description": None}) is None
+
+    def test_validator_allows_coerced_values(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register_schema("mcp_coerced", "mcp-coerced", {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["name", "count"],
+        })
+        assert validate_deferred_call_args(
+            "mcp_coerced", {"name": "test", "count": 42}) is None
+
+    def test_validator_blocks_invalid_nested_type(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register_schema("mcp_nested_type", "mcp-ntype", {
+            "type": "object",
+            "properties": {
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["count"],
+                },
+            },
+            "required": ["options"],
+        })
+        err = validate_deferred_call_args(
+            "mcp_nested_type", {"options": {"count": "not-an-int"}})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "invalid type" in parsed["error"]
+
+    def test_validator_blocks_nested_additional_properties(self):
+        from tools.tool_search import validate_deferred_call_args
+
+        self._register_schema("mcp_nested_addl", "mcp-naddl", {
+            "type": "object",
+            "properties": {
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["count"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["options"],
+        })
+        err = validate_deferred_call_args(
+            "mcp_nested_addl", {"options": {"count": 5, "extra": "bad"}})
+        assert err is not None
+        parsed = json.loads(err)
+        assert "unexpected property" in parsed["error"]
+
+    def test_invalid_enum_blocked_before_dispatch(self):
+        import model_tools
+
+        self._register_schema("mcp_enum_integration", "mcp-enum-int", {
+            "type": "object",
+            "properties": {
+                "priority": {"type": "string", "enum": ["low", "high"]},
+                "count": {"type": "integer"},
+            },
+            "required": ["priority", "count"],
+        })
+        result = json.loads(model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": "mcp_enum_integration",
+                           "arguments": {"priority": "urgent", "count": 5}},
+            enabled_toolsets=["mcp-enum-int"],
+        ))
+        assert "error" in result
+        assert "invalid value" in result["error"]
+        assert "NOT invoked" in result["error"]
+
+    def test_valid_call_with_all_constraints_still_dispatches(self):
+        import model_tools
+
+        self._register_schema("mcp_valid_full", "mcp-valid-full", {
+            "type": "object",
+            "properties": {
+                "priority": {"type": "string", "enum": ["low", "high"]},
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["count"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["priority", "options"],
+            "additionalProperties": False,
+        })
+        result = json.loads(model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": "mcp_valid_full",
+                           "arguments": {"priority": "low",
+                                        "options": {"count": 10}}},
+            enabled_toolsets=["mcp-valid-full"],
+        ))
+        assert result.get("ok") is True
+        assert result.get("received", {}).get("priority") == "low"
+        assert result.get("received", {}).get("options", {}).get("count") == 10
