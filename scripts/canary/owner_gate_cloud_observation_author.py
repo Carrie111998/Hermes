@@ -51,6 +51,7 @@ MAX_HTTP_BODY_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024
 MAX_REQUESTS = 160
 MAX_ITEMS = 10_000
+MAX_SNAPSHOT_WORKERS = 4
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -325,6 +326,7 @@ class _FixedCloudFactsReader:
         ancestry_evidence: project_ancestry.ProjectAncestryEvidence,
         phase: str,
         _connection_factories: Mapping[str, Callable[[], Any]] | None = None,
+        _snapshot_workers: int | None = None,
     ) -> None:
         if (
             type(token) is not direct_iam_author._GcloudAccessToken
@@ -351,6 +353,7 @@ class _FixedCloudFactsReader:
             or len(keys) != len(set(keys))
         ):
             _error("owner_gate_cloud_observation_request_inventory_invalid")
+        injected_factories = _connection_factories is not None
         supplied = dict(_connection_factories or {})
         if set(supplied) - _ALLOWED_HOSTS or any(
             not callable(factory) for factory in supplied.values()
@@ -360,6 +363,16 @@ class _FixedCloudFactsReader:
             host: supplied.get(host, lambda host=host: _default_connection(host))
             for host in _ALLOWED_HOSTS
         }
+        workers = (
+            1 if injected_factories else MAX_SNAPSHOT_WORKERS
+        ) if _snapshot_workers is None else _snapshot_workers
+        if (
+            type(workers) is not int
+            or workers < 1
+            or workers > MAX_SNAPSHOT_WORKERS
+        ):
+            _error("owner_gate_cloud_observation_capability_invalid")
+        self._snapshot_workers = workers
 
     def _request_exact(
         self, request: Mapping[str, str]
@@ -427,12 +440,51 @@ class _FixedCloudFactsReader:
     def _collect_once(self) -> Mapping[str, Any]:
         result: dict[str, Any] = {}
         total = 0
-        for request in self._requests:
-            value, size = self._request_exact(request)
-            total += size
-            if total > MAX_SNAPSHOT_BYTES:
-                _error("owner_gate_cloud_observation_http_invalid")
-            result[_request_key(request)] = value
+        if self._snapshot_workers == 1:
+            for request in self._requests:
+                value, size = self._request_exact(request)
+                total += size
+                if total > MAX_SNAPSHOT_BYTES:
+                    _error("owner_gate_cloud_observation_http_invalid")
+                result[_request_key(request)] = value
+            return result
+        batches = tuple(
+            self._requests[index : index + self._snapshot_workers]
+            for index in range(0, len(self._requests), self._snapshot_workers)
+        )
+        with ThreadPoolExecutor(
+            max_workers=self._snapshot_workers,
+            thread_name_prefix="owner-gate-cloud-snapshot",
+        ) as pool:
+            for batch in batches:
+                futures = tuple(
+                    pool.submit(self._request_exact, request)
+                    for request in batch
+                )
+                values: list[
+                    tuple[Mapping[str, Any], int] | None
+                ] = [None] * len(batch)
+                failures: list[BaseException | None] = [None] * len(batch)
+                for index, future in enumerate(futures):
+                    try:
+                        values[index] = future.result()
+                    except BaseException as exc:
+                        failures[index] = exc
+                for request, item, failure in zip(
+                    batch,
+                    values,
+                    failures,
+                    strict=True,
+                ):
+                    if failure is not None:
+                        raise failure
+                    if item is None:
+                        _error("owner_gate_cloud_observation_http_invalid")
+                    value, size = item
+                    total += size
+                    if total > MAX_SNAPSHOT_BYTES:
+                        _error("owner_gate_cloud_observation_http_invalid")
+                    result[_request_key(request)] = value
         return result
 
     @staticmethod
