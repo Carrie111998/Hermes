@@ -31,6 +31,7 @@ import {
 } from 'electron'
 import nodePty from 'node-pty'
 
+import { resolveAppIconPath } from './app-icon'
 import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
@@ -663,11 +664,9 @@ const WINDOW_BUTTON_POSITION = {
 // (pure + unit-testable); computeNativeOverlayWidth() applies it per platform.
 // It's only the pre-layout fallback — the renderer measures the exact overlay
 // width live via the Window Controls Overlay API.
-const APP_ICON_PATHS = [
-  path.join(APP_ROOT, 'public', 'apple-touch-icon.png'),
-  path.join(APP_ROOT, 'dist', 'apple-touch-icon.png'),
-  path.join(unpackedPathFor(APP_ROOT), 'dist', 'apple-touch-icon.png')
-]
+//
+// Native window icon candidates live in app-icon.ts — prefer the same .ico
+// stamped onto Hermes.exe so the taskbar and BrowserWindow stay in lockstep.
 
 let rendererTitleBarTheme = null
 const terminalSessions = new Map()
@@ -5017,7 +5016,15 @@ function registerPowerResumeListeners() {
 }
 
 function getAppIconPath() {
-  return APP_ICON_PATHS.find(fileExists)
+  return resolveAppIconPath(
+    {
+      appRoot: APP_ROOT,
+      resourcesPath: process.resourcesPath || null,
+      unpackedAppRoot: unpackedPathFor(APP_ROOT),
+      platform: process.platform
+    },
+    fileExists
+  )
 }
 
 function sendOpenUpdatesRequested() {
