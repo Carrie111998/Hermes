@@ -2795,6 +2795,21 @@ class AIAgent:
         tags).  The truncation guard ("don't overwrite a larger log with
         fewer messages") is preserved so resume + branch don't clobber a
         fuller existing snapshot.
+
+        Scope: one snapshot per session_id, not one per conversation. Context
+        compression (and /branch) assigns a NEW session_id and therefore
+        writes to a NEW ``session_{new_sid}.json`` -- this snapshot only ever
+        contains the messages since the last split, never the full
+        cross-compression history. A long-running conversation that has
+        compressed several times will show up as multiple separate,
+        comparatively short JSON files, each looking like a truncated
+        transcript in isolation even though nothing was lost: the continuous
+        view (every message across every split) lives in the append-only
+        JSONL transcript (``gateway/mirror.py``) and state.db, which are the
+        source of truth for any tooling doing full-conversation analysis.
+        Don't infer "message loss" or missing tool_calls from a low count in
+        one of these snapshot files alone -- check the JSONL/DB for the same
+        session_id family first (issue #2229).
         """
         if not getattr(self, "_session_json_enabled", False):
             return

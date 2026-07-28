@@ -3383,6 +3383,12 @@ DEFAULT_CONFIG = {
         # no consumer outside their own overwrite guard and accumulated
         # GBs of disk on heavy users.  Opt in only if you have an external
         # tool that consumes the JSON files directly.
+        # Note: one snapshot per session_id, not per conversation — context
+        # compression starts a new session_id, so a long conversation shows
+        # up as several separate (and individually shorter-looking) JSON
+        # files rather than one continuous transcript (issue #2229). The
+        # JSONL/state.db transcript spans every split and is the source of
+        # truth for full-conversation tooling.
         "write_json_snapshots": False,
         # Search-index (FTS) storage optimization — the compact v23 layout
         # that drops duplicate content copies and stops trigram-indexing tool
