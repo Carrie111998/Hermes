@@ -41,6 +41,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from gateway.run import GatewayRunner  # noqa: E402
 
 
 class FakeTree:
@@ -350,6 +351,28 @@ async def test_discord_run_lifecycle_maps_terminal_outcomes(
 
 
 @pytest.mark.asyncio
+async def test_discord_run_lifecycle_success_cannot_downgrade_prior_failure(adapter):
+    event = _make_event(
+        "9b",
+        SimpleNamespace(add_reaction=AsyncMock(), remove_reaction=AsyncMock()),
+    )
+    event.source.chat_type = "thread"
+    event.source.thread_id = "456"
+    session_key = build_session_key(event.source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="status"))
+
+    await adapter.begin_run_lifecycle(event, session_key=session_key, generation=5)
+    adapter.set_run_lifecycle_outcome(event, "failed")
+    adapter.set_run_lifecycle_outcome(event, "success")
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    callback = adapter.pop_post_delivery_callback(session_key, generation=5)
+
+    assert callback is not None
+    await callback()
+    assert adapter.send.await_args_list[-1].args[1].startswith("❌ Run failed · ")
+
+
+@pytest.mark.asyncio
 async def test_discord_run_terminal_precedes_queued_followup_start(adapter):
     raw_message = SimpleNamespace(
         add_reaction=AsyncMock(),
@@ -426,3 +449,53 @@ async def test_discord_run_terminal_precedes_queued_followup_start(adapter):
         "first deferred output",
     ]
     assert first_terminal_indices == [3]
+
+
+@pytest.mark.asyncio
+async def test_recursive_discord_lifecycle_finishes_prior_run_before_next_start(adapter):
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123",
+        thread_id="456",
+        chat_type="thread",
+        user_id="user",
+    )
+    first = MessageEvent(text="first", message_type=MessageType.TEXT, source=source)
+    second = MessageEvent(text="second", message_type=MessageType.TEXT, source=source)
+    session_key = build_session_key(source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="message"))
+
+    await adapter.begin_run_lifecycle(first, session_key=session_key, generation=8)
+
+    async def deferred_delivery():
+        await adapter.send(
+            source.chat_id,
+            "first deferred output",
+            metadata={"thread_id": source.thread_id},
+        )
+
+    adapter.register_post_delivery_callback(
+        session_key,
+        deferred_delivery,
+        generation=8,
+    )
+    await runner._finish_recursive_discord_run_lifecycle(
+        first,
+        session_key=session_key,
+        generation=8,
+        outcome="success",
+        adapter=adapter,
+    )
+    await runner._begin_recursive_discord_run_lifecycle(
+        second,
+        session_key=session_key,
+        generation=8,
+    )
+
+    contents = [call.args[1] for call in adapter.send.await_args_list]
+    assert contents[0] == "⏳ Run started"
+    assert contents[1] == "first deferred output"
+    assert contents[2].startswith("✅ Run complete · ")
+    assert contents[3] == "⏳ Run started"

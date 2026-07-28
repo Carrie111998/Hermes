@@ -2857,8 +2857,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if not isinstance(state, dict):
             return
         normalized = str(outcome or "").strip().lower()
-        if normalized in {"success", "failed", "stopped", "timeout"}:
-            state["outcome"] = normalized
+        if normalized not in {"success", "failed", "stopped", "timeout"}:
+            return
+        current = str(state.get("outcome") or "").strip().lower()
+        # A generic successful return/delivery must not erase a semantic
+        # failure already recorded inside a caught execution path.
+        if normalized == "success" and current in {"failed", "stopped", "timeout"}:
+            return
+        state["outcome"] = normalized
 
     async def begin_run_lifecycle(
         self,
@@ -2920,6 +2926,22 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] Run lifecycle start send failed: %s", self.name, exc)
 
+    def register_run_lifecycle_terminal(self, event: MessageEvent) -> None:
+        """Append this event's terminal marker after existing deferred output."""
+        metadata = getattr(event, "metadata", None)
+        state = metadata.get("_discord_run_lifecycle") if isinstance(metadata, dict) else None
+        if not isinstance(state, dict) or state.get("terminal_registered"):
+            return
+        callback = state.get("terminal_callback")
+        session_key = state.get("session_key")
+        if callable(callback) and session_key:
+            self.register_post_delivery_callback(
+                str(session_key),
+                callback,
+                generation=state.get("generation"),
+            )
+            state["terminal_registered"] = True
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
@@ -2942,16 +2964,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if not isinstance(state, dict) or state.get("outcome") != "timeout":
                 self.set_run_lifecycle_outcome(event, "failed")
 
-        if isinstance(state, dict) and not state.get("terminal_registered"):
-            callback = state.get("terminal_callback")
-            session_key = state.get("session_key")
-            if callable(callback) and session_key:
-                self.register_post_delivery_callback(
-                    str(session_key),
-                    callback,
-                    generation=state.get("generation"),
-                )
-                state["terminal_registered"] = True
+        self.register_run_lifecycle_terminal(event)
 
         await asyncio.to_thread(
             self._record_discord_processing_complete,

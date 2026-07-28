@@ -28,12 +28,15 @@ class _FakeAdapter:
         self.interrupted_sessions = []
         self.lifecycle_starts = []
         self.lifecycle_outcomes = []
+        self.begin_lifecycle_error = None
 
     async def send(self, chat_id, text, **kwargs):
         pass
 
     async def begin_run_lifecycle(self, event, *, session_key, generation=None):
         self.lifecycle_starts.append((event, session_key, generation))
+        if self.begin_lifecycle_error is not None:
+            raise self.begin_lifecycle_error
 
     def set_run_lifecycle_outcome(self, event, outcome):
         self.lifecycle_outcomes.append((event, outcome))
@@ -217,6 +220,20 @@ async def test_discord_agent_run_marks_lifecycle_stopped_when_cancelled():
             await runner._handle_message(event)
 
     assert adapter.lifecycle_outcomes == [(event, "stopped")]
+
+
+@pytest.mark.asyncio
+async def test_discord_start_cancellation_marks_stopped_and_releases_session_slot():
+    runner, adapter, event = _make_discord_runner_and_event()
+    session_key = build_session_key(event.source)
+    adapter.begin_lifecycle_error = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._handle_message(event)
+
+    assert adapter.lifecycle_outcomes == [(event, "stopped")]
+    assert session_key not in runner._running_agents
+    assert session_key not in getattr(runner, "_active_session_leases", {})
 
 
 @pytest.mark.asyncio
