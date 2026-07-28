@@ -1750,10 +1750,14 @@ def test_kanban_guidance_not_injected_without_env_var_even_with_kanban_tools(mon
     Before the fix, the guidance was injected based solely on kanban_show
     presence in valid_tool_names, so orchestrator-mode profiles with kanban
     tools got the worker protocol injected into their system prompt.
+
+    Now the three-way split injects board-routing guidance (KANBAN_ORCHESTRATOR_GUIDANCE)
+    instead of the worker protocol for tool-only profiles.
     """
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
     from pathlib import Path as _P
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
@@ -1771,19 +1775,68 @@ def test_kanban_guidance_not_injected_without_env_var_even_with_kanban_tools(mon
         skip_context_files=True,
         skip_memory=True,
     )
-    # Simulate a profile that has kanban tools enabled (orchestrator mode)
-    # but is NOT a dispatched kanban worker (no HERMES_KANBAN_TASK).
-    a.valid_tool_names = getattr(a, "valid_tool_names", set()) | {"kanban_show"}
-    agent_kanban_guidance = getattr(a, "_kanban_worker_guidance", None)
-    # The gating in init_agent must have left _kanban_worker_guidance empty
-    # because HERMES_KANBAN_TASK is not set, even though kanban_show is present.
-    assert not agent_kanban_guidance, (
-        "KANBAN_GUIDANCE must not be set when HERMES_KANBAN_TASK is absent, "
-        "even if kanban_show is in valid_tool_names"
-    )
     prompt = a._build_system_prompt()
+    # The tool surface IS present for orchestrator profiles...
+    assert "kanban_show" in a.valid_tool_names, (
+        "test setup: kanban toolset should expose kanban tools"
+    )
+    # ...but the worker lifecycle protocol must not be injected.
     assert "Kanban task execution protocol" not in prompt
-    assert "kanban_show()" not in prompt
+    assert "kanban_show()` first" not in prompt
+    # The board-routing guidance IS injected instead — the routing rules
+    # (profile discovery, parents deps, no phantom ids) were folded into
+    # the always-injected guidance when the standalone orchestrator skill
+    # was removed, and must survive the worker/orchestrator split.
+    assert "Kanban board guidance" in prompt
+    assert "unknown assignee" in prompt
+
+
+def test_kanban_guidance_fallback_three_way_split(monkeypatch, tmp_path):
+    """The system_prompt fallback (code paths that bypass agent_init leave
+    ``_kanban_worker_guidance`` unset -> None) mirrors the same three-way
+    split as agent_init: worker protocol iff HERMES_KANBAN_TASK, board
+    guidance for tool-only."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+    from run_agent import AIAgent
+    from agent.system_prompt import invalidate_system_prompt
+    a = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    # Simulate a code path that bypasses agent_init: delete the cached
+    # _kanban_worker_guidance so the fallback in system_prompt runs.
+    if hasattr(a, "_kanban_worker_guidance"):
+        del a._kanban_worker_guidance
+    invalidate_system_prompt()
+    prompt = a._build_system_prompt()
+    # Without HERMES_KANBAN_TASK, the fallback must inject board guidance,
+    # not the worker protocol.
+    assert "Kanban task execution protocol" not in prompt
+    assert "Kanban board guidance" in prompt
+    assert "unknown assignee" in prompt
+
+    # Now set HERMES_KANBAN_TASK and verify the fallback injects the
+    # worker protocol instead.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fallback_test")
+    invalidate_system_prompt()
+    prompt2 = a._build_system_prompt()
+    assert "Kanban task execution protocol" in prompt2
+    assert "kanban_show()` first" in prompt2
 
 
 def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
