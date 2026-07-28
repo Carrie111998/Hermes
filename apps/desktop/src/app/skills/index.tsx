@@ -607,9 +607,11 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                   busy={bulkBusy}
                   enabled={skill.enabled}
                   key={skill.name}
-                  meta={usageOf(skill) > 0 ? `×${compactNumber(usageOf(skill))}` : undefined}
+                  meta={usageOf(skill) > 0 ? `${compactNumber(usageOf(skill))} uses` : undefined}
                   metaTitle={
-                    usageOf(skill) > 0 ? `${compactNumber(usageOf(skill))} uses` : undefined
+                    usageOf(skill) > 0
+                      ? `${compactNumber(usageOf(skill))} uses — Times this skill has been loaded across all sessions`
+                      : undefined
                   }
                   onSelect={() => setSelectedSkill(skill.name)}
                   onToggle={enabled => void handleToggleSkill(skill, enabled)}
