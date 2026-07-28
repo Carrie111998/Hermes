@@ -716,6 +716,47 @@ async def test_background_provider_scans_do_not_block_each_other(
         await coordinator.stop()
 
 
+@pytest.mark.asyncio
+async def test_initial_reconcile_timeout_releases_background_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = BridgeConfig()
+    config = replace(
+        base,
+        service=replace(base.service, catalog_scan_seconds=0.01),
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=config,
+        store=object(),
+        adapters={},
+        refresh_timeout=0.01,
+    )
+    reconcile_started = asyncio.Event()
+    never_reconcile = asyncio.Event()
+    claude_scanned = asyncio.Event()
+
+    async def reconcile_once() -> ReconcileSummary:
+        reconcile_started.set()
+        await never_reconcile.wait()
+        return ReconcileSummary(examined=0, recovered=0, retried=0, failed=0)
+
+    async def scan_once(provider: Provider | None = None):
+        if provider is Provider.CLAUDE:
+            claude_scanned.set()
+        return None
+
+    monkeypatch.setattr(coordinator, "reconcile_once", reconcile_once)
+    monkeypatch.setattr(coordinator, "scan_once", scan_once)
+
+    await coordinator.start()
+    try:
+        await asyncio.wait_for(reconcile_started.wait(), timeout=1.0)
+        await asyncio.wait_for(claude_scanned.wait(), timeout=1.0)
+        assert "mirror_reconcile_failed" in coordinator.health()["recent_error_codes"]
+    finally:
+        await coordinator.stop()
+
+
 def test_sidebar_rename_failure_reconciles_without_duplicate_create(
     tmp_path: Path,
 ) -> None:

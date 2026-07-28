@@ -4308,7 +4308,10 @@ class SessionBridgeCoordinator:
 
     async def _reconcile_loop(self) -> None:
         try:
-            await self.reconcile_once()
+            await asyncio.wait_for(
+                self.reconcile_once(),
+                timeout=self._refresh_timeout,
+            )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception:
