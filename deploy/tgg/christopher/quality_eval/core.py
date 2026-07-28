@@ -756,6 +756,15 @@ class Judge:
                     naive_root = Path(tmp) / "naive-root"
                     naive_root.mkdir(exist_ok=True)
                     argv.extend(["-C", str(naive_root), "--skip-git-repo-check", "--ignore-rules"])
+                else:
+                    # The registry pass keeps repo rules, so it must run inside a
+                    # trusted git directory. Without an explicit -C it inherited the
+                    # caller's cwd: green when a human ran it from a checkout, and
+                    # "Not inside a trusted directory" every time the check runner
+                    # fired from its own cwd. Pin it to the repo root so the pass is
+                    # cwd-independent and keeps the rules that distinguish it from
+                    # the isolated naive pass.
+                    argv.extend(["-C", str(ROOT)])
                 for source_image in source_images:
                     argv.extend(["-i", source_image])
                 argv.append("-")
