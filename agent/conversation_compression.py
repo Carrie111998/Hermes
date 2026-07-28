@@ -2152,6 +2152,8 @@ def compress_context(
                         model=agent.model,
                         model_config=agent._session_init_model_config,
                         system_prompt=new_system_prompt,
+                        delegated_role=getattr(agent, "_delegated_role", None),
+                        delegated_profile=getattr(agent, "_delegated_profile", None),
                         messages=compressed,
                         cwd=getattr(agent, "working_directory", None),
                         profile_name=_profile_for_child,

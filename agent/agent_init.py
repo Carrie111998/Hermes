@@ -518,6 +518,8 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    delegated_role: str = None,
+    delegated_profile: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -1516,6 +1518,8 @@ def init_agent(
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
     agent._parent_session_id = parent_session_id
+    agent._delegated_role = delegated_role
+    agent._delegated_profile = delegated_profile
     # A close flush and the worker's turn-start flush can overlap. The durable
     # marker is attached to each in-memory message dict, so its test-and-append
     # sequence must be serialized per agent rather than relying on SQLite alone.

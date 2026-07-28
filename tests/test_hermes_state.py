@@ -797,6 +797,45 @@ class TestSessionLifecycle:
         child = db.get_session("child")
         assert child["parent_session_id"] == "parent"
 
+    def test_delegated_session_metadata_round_trips(self, db):
+        db.create_session(session_id="parent", source="cli")
+        db.create_session(
+            session_id="child",
+            source="cli",
+            parent_session_id="parent",
+            delegated_role="leaf",
+            delegated_profile="builder",
+        )
+
+        child = db.get_session("child")
+        assert child["parent_session_id"] == "parent"
+        assert child["delegated_role"] == "leaf"
+        assert child["delegated_profile"] == "builder"
+
+    def test_delegated_session_metadata_enriches_without_overwrite(self, db):
+        db.create_session(session_id="child", source="gateway")
+
+        db.create_session(
+            session_id="child",
+            source="subagent",
+            delegated_role="leaf",
+            delegated_profile="builder",
+        )
+        enriched = db.get_session("child")
+        assert enriched["source"] == "gateway"
+        assert enriched["delegated_role"] == "leaf"
+        assert enriched["delegated_profile"] == "builder"
+
+        db.create_session(
+            session_id="child",
+            source="subagent",
+            delegated_role="orchestrator",
+            delegated_profile="reviewer",
+        )
+        preserved = db.get_session("child")
+        assert preserved["delegated_role"] == "leaf"
+        assert preserved["delegated_profile"] == "builder"
+
     def test_db_initializes_without_fts5_module(self, tmp_path, monkeypatch):
         real_connect = sqlite3.connect
 
@@ -3953,6 +3992,12 @@ class TestSchemaInit:
         columns = {row[1] for row in cursor.fetchall()}
         assert "title" in columns
 
+    def test_delegated_session_metadata_columns_exist(self, db):
+        cursor = db._conn.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        assert "delegated_role" in columns
+        assert "delegated_profile" in columns
+
     def test_topic_mode_schema_is_not_auto_migrated_on_open(self, tmp_path):
         """Opening an old DB should not add topic-mode columns until /topic opts in.
 
@@ -4441,6 +4486,13 @@ class TestSchemaInit:
         }
         assert "reasoning_content" in msg_cols
 
+        session_cols = {
+            r[1]
+            for r in migrated_db._conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        assert "delegated_role" in session_cols
+        assert "delegated_profile" in session_cols
+
         # The query that used to crash must now work
         cursor = migrated_db._conn.execute(
             "SELECT role, content, reasoning, reasoning_content, "
@@ -4452,6 +4504,10 @@ class TestSchemaInit:
         assert row is not None
         assert row[0] == "assistant"
         assert row[3] is None  # reasoning_content NULL for old rows
+
+        session = migrated_db.get_session("s1")
+        assert session["delegated_role"] is None
+        assert session["delegated_profile"] is None
 
         migrated_db.close()
 
@@ -7761,4 +7817,3 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
-

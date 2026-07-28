@@ -155,6 +155,31 @@ def test_publish_compression_child_exposes_complete_child(db: SessionDB) -> None
     assert [m["content"] for m in db.get_messages("atomic-child")] == ["summary"]
 
 
+def test_publish_compression_child_inherits_delegated_metadata(db: SessionDB) -> None:
+    db.create_session(
+        "delegated-parent",
+        source="subagent",
+        delegated_role="leaf",
+        delegated_profile="builder",
+    )
+    assert db.try_acquire_compression_lock(
+        "delegated-parent", "winner", ttl_seconds=60
+    )
+
+    db.publish_compression_child(
+        parent_session_id="delegated-parent",
+        child_session_id="delegated-child",
+        source="subagent",
+        messages=[{"role": "user", "content": "summary"}],
+        compression_lock_holder="winner",
+    )
+
+    child = db.get_session("delegated-child")
+    assert child is not None
+    assert child["delegated_role"] == "leaf"
+    assert child["delegated_profile"] == "builder"
+
+
 def test_publish_compression_child_rejects_lost_or_expired_lease(db: SessionDB) -> None:
     db.create_session("lease-parent", source="webui")
     db.append_message("lease-parent", "user", "new durable turn")
