@@ -6653,7 +6653,7 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
-            return requested_resolved, actual_branch
+            return requested_resolved, branch_name
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
         # workspace_path verbatim, so siblings all point here; reusing
