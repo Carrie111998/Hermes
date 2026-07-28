@@ -4688,13 +4688,21 @@ class AIAgent:
             return
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            logger.info(
-                "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) %s",
-                reason,
-                shutdown_count,
-                self._client_log_context(),
-            )
+            if shutdown_count == 0:
+                logger.warning(
+                    "OpenAI client abort found 0 active sockets (%s, shared=False, "
+                    "tcp_force_closed=0, deferred_close=stranger_thread) %s",
+                    reason,
+                    self._client_log_context(),
+                )
+            else:
+                logger.info(
+                    "OpenAI client aborted (%s, shared=False, tcp_force_closed=%d, "
+                    "deferred_close=stranger_thread) %s",
+                    reason,
+                    shutdown_count,
+                    self._client_log_context(),
+                )
         except Exception as exc:
             logger.debug(
                 "OpenAI client abort failed (%s, shared=False) %s error=%s",
@@ -4783,14 +4791,23 @@ class AIAgent:
             return
         try:
             shutdown_count = self._force_close_tcp_sockets(client)
-            logger.info(
-                "Anthropic client aborted (%s, shared=False, tcp_force_closed=%d, "
-                "deferred_close=stranger_thread) provider=%s model=%s",
-                reason,
-                shutdown_count,
-                getattr(self, "provider", None),
-                getattr(self, "model", None),
-            )
+            if shutdown_count == 0:
+                logger.warning(
+                    "Anthropic client abort found 0 active sockets (%s, shared=False, "
+                    "tcp_force_closed=0, deferred_close=stranger_thread) provider=%s model=%s",
+                    reason,
+                    getattr(self, "provider", None),
+                    getattr(self, "model", None),
+                )
+            else:
+                logger.info(
+                    "Anthropic client aborted (%s, shared=False, tcp_force_closed=%d, "
+                    "deferred_close=stranger_thread) provider=%s model=%s",
+                    reason,
+                    shutdown_count,
+                    getattr(self, "provider", None),
+                    getattr(self, "model", None),
+                )
         except Exception as exc:
             logger.debug(
                 "Anthropic client abort failed (%s, shared=False) provider=%s model=%s error=%s",
