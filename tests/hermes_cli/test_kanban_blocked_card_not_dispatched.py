@@ -15,6 +15,7 @@ Acceptance:
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -336,4 +337,150 @@ def test_unblock_task_is_the_only_exit(
         ).fetchone()
         assert rows and rows["cnt"] >= 1, (
             "unblock_task must emit at least one 'unblocked' event"
+        )
+
+
+# ── defense-in-depth: block-gate audit in _dispatch_once_locked ────────
+
+
+def test_block_gate_audit_fires_when_ready_card_has_blocked_event(
+    kanban_home: Path,
+    all_assignees_spawnable: None,
+) -> None:
+    """Defense-in-depth block-gate audit (t_fc1fdf31): a card in ``ready``
+    status that somehow has a ``blocked`` event (bypassing the
+    ``recompute_ready`` blind-spot guard) must be caught by
+    ``_dispatch_once_locked``, which:
+
+    1. Skips the spawn (card is NOT claimed).
+    2. Appends the task id to ``result.skipped_block_gate``.
+    3. Emits a ``block_gate_audit`` event in ``task_events``.
+
+    This tests the third layer of defense — the defense-in-depth audit
+    inside the dispatch tick itself, after both the ``recompute_ready``
+    guard and the blind-spot guard have been bypassed (e.g. via direct
+    DB manipulation that leaves status='ready' + a stale blocked event).
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="block-gate-audit-test",
+            assignee="test-profile",
+        )
+        # Task is ready (no parents, valid assignee).
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Inject a 'blocked' event directly, as if a block happened
+        # before but the card was then put back to 'ready' via direct
+        # DB manipulation — bypassing the first two defense layers.
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'blocked', ?, ?)",
+            (tid, '{"origin":"db-injection","reason":"test"}', now),
+        )
+        conn.commit()
+
+        # _has_sticky_block must now return True
+        assert kb._has_sticky_block(conn, tid), (
+            "_has_sticky_block must detect the injected blocked event"
+        )
+
+        # Run dispatch — the block-gate audit in _dispatch_once_locked
+        # must catch this ready-but-blocked card.
+        spy = _spy_spawn()
+        result = kb.dispatch_once(conn, spawn_fn=spy)
+
+        # (a) Card must NOT be claimed/spawned
+        assert tid not in result.spawned, (
+            f"Block-gate audit failed: blocked+ready card was spawned "
+            f"(spawned={result.spawned!r})"
+        )
+        assert len(spy.calls) == 0, (
+            f"spawn_fn must not be called for a blocked+ready card; "
+            f"got calls={spy.calls!r}"
+        )
+
+        # (b) Card must appear in skipped_block_gate (audit triggered)
+        assert tid in result.skipped_block_gate, (
+            f"Block-gate audit failed: card must be in "
+            f"skipped_block_gate; got {result.skipped_block_gate!r}"
+        )
+
+        # (c) A block_gate_audit event must exist in task_events
+        audit_count = _block_gate_audit_count(conn, tid)
+        assert audit_count >= 1, (
+            f"block_gate_audit event was not created; "
+            f"expected >=1, got {audit_count}"
+        )
+
+        # Card stays 'ready' — the audit is a no-mutate gate, not a
+        # status change.
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_dispatch_once_skips_blocked_card_at_spawn_time(
+    kanban_home: Path,
+    all_assignees_spawnable: None,
+) -> None:
+    """End-to-end regression: ``dispatch_once`` must skip a ready card
+    with a sticky block AND produce a ``block_gate_audit`` event.
+
+    This is the full trace from the task body AC — creates a blocked
+    card, attempts to dispatch it, and verifies:
+    (a) the card is not claimed,
+    (b) an audit log entry is created with the reason 'blocked'.
+    """
+    with kb.connect() as conn:
+        # Create the task so it lands in 'ready' (no parents, assignee).
+        tid = kb.create_task(
+            conn,
+            title="blocked-dispatch-audit-e2e",
+            assignee="test-profile",
+        )
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Inject a 'blocked' event to create a sticky block without
+        # touching the status. This simulates the exact edge case:
+        # a card that is technically 'ready' but has an unresolved
+        # block from a prior manual DB manipulation or missed event.
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'blocked', ?, ?)",
+            (tid, '{"origin":"test-injection","reason":"blocked"}', now),
+        )
+        conn.commit()
+
+        # (a) Card must NOT be claimed — verify before and after dispatch
+        pre_task = kb.get_task(conn, tid)
+        assert pre_task.claim_lock is None, "No claim lock before dispatch"
+
+        spy = _spy_spawn()
+        result = kb.dispatch_once(conn, spawn_fn=spy)
+
+        # Card is still not claimed after dispatch
+        post_task = kb.get_task(conn, tid)
+        assert post_task.claim_lock is None, (
+            f"Card was claimed despite having a sticky block; "
+            f"claim_lock={post_task.claim_lock!r}"
+        )
+        assert tid not in result.spawned, (
+            f"Card was spawned despite sticky block"
+        )
+
+        # (b) Audit event exists with reason 'blocked' in the payload
+        audit_rows = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'block_gate_audit'",
+            (tid,),
+        ).fetchall()
+        assert len(audit_rows) >= 1, (
+            "No block_gate_audit event was created"
+        )
+
+        # Card appears in skipped_block_gate as final evidence
+        assert tid in result.skipped_block_gate, (
+            f"Card must be in skipped_block_gate; "
+            f"got {result.skipped_block_gate!r}"
         )
