@@ -1359,10 +1359,12 @@ class GatewayKanbanWatchersMixin:
                 # Pin this board for the duration of the call — same
                 # pattern as the dashboard specify endpoint. The
                 # decomposer module connects with no board kwarg and
-                # relies on the env var.
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-                try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                # relies on the env var.  Use scoped_current_board()
+                # (ContextVar, highest precedence in get_current_board)
+                # instead of mutating os.environ which is process-global
+                # and causes cross-board races when multiple boards are
+                # ticked concurrently via the thread pool.
+                with _kb.scoped_current_board(slug):
                     try:
                         triage_ids = _decomp.list_triage_ids()
                     except Exception as exc:
@@ -1389,12 +1391,12 @@ class GatewayKanbanWatchersMixin:
                             successes += 1
                             if outcome.fanout and outcome.child_ids:
                                 logger.info(
-                                    "kanban auto-decompose [%s]: %s → %d children",
+                                    "kanban auto-decompose [%s]: %s -> %d children",
                                     slug, tid, len(outcome.child_ids),
                                 )
                             else:
                                 logger.info(
-                                    "kanban auto-decompose [%s]: %s → single task (no fanout)",
+                                    "kanban auto-decompose [%s]: %s -> single task (no fanout)",
                                     slug, tid,
                                 )
                         else:
@@ -1404,11 +1406,6 @@ class GatewayKanbanWatchersMixin:
                                 "kanban auto-decompose [%s]: %s skipped: %s",
                                 slug, tid, outcome.reason,
                             )
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
             return successes
 
         logger.info(
