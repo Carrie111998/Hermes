@@ -106,8 +106,12 @@ async def test_connect_registers_my_chat_member_handler(monkeypatch):
             captured["chat_member_types"] = chat_member_types
             return registered_handler
 
+    async def fake_start_polling(**_kwargs):
+        # Cold connects now wait for the first successful getUpdates response.
+        adapter._record_polling_progress(adapter._polling_generation)
+
     updater = SimpleNamespace(
-        start_polling=AsyncMock(),
+        start_polling=AsyncMock(side_effect=fake_start_polling),
         stop=AsyncMock(),
         running=True,
     )
