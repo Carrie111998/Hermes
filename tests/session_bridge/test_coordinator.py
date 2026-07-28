@@ -2083,6 +2083,50 @@ async def test_codex_bounded_scan_stages_changed_inventory_before_seen_cache_los
 
 
 @pytest.mark.asyncio
+async def test_codex_continuous_scan_uses_recent_bounded_inventory() -> None:
+    summary = _codex_summary("codex-recent", 300.0)
+    operations: list[tuple[object, ...]] = []
+
+    class RecentCodexAdapter(_BacklogCodexAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                inventory_batches=[],
+                summaries_by_native_id={summary.native_id: summary},
+                operations=operations,
+            )
+            self.recent_calls: list[tuple[bool, float]] = []
+
+        def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
+            del archived
+            raise AssertionError("continuous scan must not page through full inventory")
+
+        def list_recent_inventory(
+            self,
+            *,
+            archived: bool,
+            after: float,
+        ) -> list[CodexThreadSummary]:
+            self.recent_calls.append((archived, after))
+            return [] if archived else [summary]
+
+    adapter = RecentCodexAdapter()
+    store = _StateStore(operations)
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CODEX: adapter},
+    )
+    coordinator._continuous_watermark = 250.0
+
+    result = await coordinator.scan_once(Provider.CODEX)
+
+    assert result.failed == 0
+    assert result.indexed == 1
+    assert adapter.recent_calls == [(False, 250.0), (True, 250.0)]
+    assert adapter.projected_native_ids == ["codex-recent"]
+
+
+@pytest.mark.asyncio
 async def test_codex_scan_revisits_cataloged_native_when_trusted_origin_appears() -> (
     None
 ):

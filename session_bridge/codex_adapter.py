@@ -805,6 +805,34 @@ class CodexSourceAdapter:
         self._inventory_cache = next_cache
         return changed
 
+    def list_recent_inventory(
+        self,
+        *,
+        archived: bool,
+        after: float,
+    ) -> list[CodexThreadSummary]:
+        """Return recent state-DB summaries without paging full task payloads."""
+
+        cutoff = float(after)
+        if not math.isfinite(cutoff):
+            raise ValueError("Codex inventory cutoff must be finite")
+        self._ensure_initialized()
+        summaries = self._fetch_inventory_pages(
+            archived=archived,
+            source_kinds=None,
+            state_db_only=True,
+            stop_after=cutoff,
+        )
+        summaries = [
+            summary for summary in summaries if summary.last_active >= cutoff
+        ]
+        summaries = self._refresh_trusted_origins(summaries)
+        next_cache = dict(self._inventory_cache)
+        for summary in summaries:
+            next_cache[summary.native_id] = summary
+        self._inventory_cache = next_cache
+        return summaries
+
     def list_full_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
         """Return every inventory row without applying the changed-thread cache."""
 

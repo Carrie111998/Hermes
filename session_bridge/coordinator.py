@@ -4074,11 +4074,24 @@ class SessionBridgeCoordinator:
         adapter = self._adapter(provider)
         pending_ids = await self._load_pending(provider)
         progress = await self._load_progress(provider)
-        discovered_summaries = await self._provider_call(
-            _codex_inventory,
-            adapter,
-            include_archived=self._config.catalog.include_archived_codex,
-        )
+        recent_inventory = getattr(adapter, "list_recent_inventory", None)
+        if (
+            discovery_mode is DiscoveryMode.CONTINUOUS
+            and self._continuous_watermark is not None
+            and callable(recent_inventory)
+        ):
+            discovered_summaries = await self._provider_call(
+                _codex_recent_inventory,
+                adapter,
+                include_archived=self._config.catalog.include_archived_codex,
+                after=self._continuous_watermark,
+            )
+        else:
+            discovered_summaries = await self._provider_call(
+                _codex_inventory,
+                adapter,
+                include_archived=self._config.catalog.include_archived_codex,
+            )
         ordered_summaries = _sort_codex_summaries(discovered_summaries)
         summaries_by_native_id: dict[str, object] = {}
         inventory_ids: list[str] = []
@@ -4685,6 +4698,33 @@ def _codex_inventory(
             batch = list(summaries)
         except TypeError as exc:
             raise RuntimeError("Codex inventory returned no summary list") from exc
+        for summary in batch:
+            native_id = _codex_native_id(summary)
+            merged.setdefault(native_id, summary)
+    return list(merged.values())
+
+
+def _codex_recent_inventory(
+    adapter: object,
+    *,
+    include_archived: bool,
+    after: float,
+) -> list[object]:
+    passes = [False, True] if include_archived else [False]
+    merged: dict[str, object] = {}
+    for archived in passes:
+        summaries = _call(
+            adapter,
+            "list_recent_inventory",
+            archived=archived,
+            after=after,
+        )
+        try:
+            batch = list(summaries)
+        except TypeError as exc:
+            raise RuntimeError(
+                "Codex recent inventory returned no summary list"
+            ) from exc
         for summary in batch:
             native_id = _codex_native_id(summary)
             merged.setdefault(native_id, summary)

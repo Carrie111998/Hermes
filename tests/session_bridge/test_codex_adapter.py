@@ -101,6 +101,47 @@ def _read_with_items(*items: dict[str, Any]) -> dict[str, Any]:
 
 
 class TestInventory:
+    def test_recent_inventory_uses_state_db_and_stops_at_watermark(self) -> None:
+        client = FakeInitializingClient({
+            "thread/list": [
+                {
+                    "data": [
+                        {
+                            "id": "recent",
+                            "createdAt": 290,
+                            "updatedAt": 300,
+                        }
+                    ],
+                    "nextCursor": "page-2",
+                },
+                {
+                    "data": [
+                        {
+                            "id": "older",
+                            "createdAt": 190,
+                            "updatedAt": 200,
+                        }
+                    ],
+                    "nextCursor": "page-3",
+                },
+            ]
+        })
+
+        summaries = CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+        ).list_recent_inventory(archived=False, after=250)
+
+        assert [summary.native_id for summary in summaries] == ["recent"]
+        assert len(client.calls) == 2
+        for method, params, timeout in client.calls:
+            assert method == "thread/list"
+            assert params["useStateDbOnly"] is True
+            assert params["limit"] == 100
+            assert params["sortKey"] == "updated_at"
+            assert params["sortDirection"] == "desc"
+            assert timeout == 30.0
+
     def test_projection_reuses_trusted_origin_snapshot_from_inventory(self) -> None:
         native_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         calls = 0
