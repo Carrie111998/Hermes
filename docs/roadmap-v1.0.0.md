@@ -14,7 +14,7 @@
 | **0.21.0** | Payment Rails | ≥3 payment rail plugins working | ✅ Released |
 | **0.22.0** | Postgres Authority Store | HA-capable authority database | ✅ Released |
 | **0.23.0** | Multi-Tenant Isolation | Organization/workspace boundaries | ✅ Released |
-| **0.24.0** | Billing Engine | Usage metering + invoicing | 🟡 Next |
+| **0.24.0** | Billing Engine | Usage metering + invoicing | ✅ Complete |
 | **0.25.0** | Agent Marketplace | Tool/skill discovery + installation | 🔲 |
 | **0.26.0** | External Integrations | Email, calendar, CRM, project tools | 🔲 |
 | **0.27.0** | Monitoring & Observability | Metrics, traces, health dashboards | 🔲 |
@@ -68,7 +68,7 @@
 
 **Goal:** Usage metering, invoicing, and payment collection for multi-tenant SaaS.
 
-**Status:** 🔲 Not started
+**Status:** ✅ Complete — all scope items delivered and tested.
 
 ### Scope
 
@@ -80,6 +80,23 @@
 - Quota enforcement: hard/soft limits on task claims per billing period
 - Tenant billing dashboard: current usage, invoices, payment methods
 - Webhook handlers: Stripe payment events → authority store state
+
+### Completed
+
+- [x] RFC accepted (docs/rfc-0.24.0-billing-engine.md)
+- [x] v6→v7 migration with billing tables (plans, subscriptions, meters, invoices)
+- [x] Plan CRUD operations (create, get, list)
+- [x] Subscription management (subscribe, cancel, status updates)
+- [x] Usage metering with idempotent recording (UNIQUE meter_type, reference_id)
+- [x] Quota enforcement: free=hard limit, paid=soft limit, enterprise=unlimited
+- [x] Quota enforcement wired into claim_task (blocks at authority layer)
+- [x] Usage metering wired into claim_task, consume_permit, record_effect
+- [x] Invoice generation from usage meters (base fee + overage line items)
+- [x] Stripe integration (customer, subscription, usage reporting, webhook verify)
+- [x] Webhook handlers: invoice.paid, payment_failed, subscription.updated/deleted
+- [x] Billing API endpoints (REST: plans, subscription, usage, invoices, stripe webhook)
+- [x] Tests: 23 billing + 4 quota enforcement + 5 Stripe webhook = 32 tests
+- [x] Full billing cycle acceptance test (subscribe → use → invoice → pay)
 
 ### Prerequisites (from v0.23.0)
 
