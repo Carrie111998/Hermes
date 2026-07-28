@@ -733,7 +733,9 @@ _REPLAY_BUDGET_KEYS = (
 )
 
 
-def _estimate_msg_budget_tokens(msg: dict) -> int:
+def _estimate_msg_budget_tokens(
+    msg: dict, *, include_replay: bool = True,
+) -> int:
     """Token estimate for one message in the tail-protection budget walks.
 
     Counts the message content plus the **full** ``tool_call`` envelope —
@@ -745,13 +747,21 @@ def _estimate_msg_budget_tokens(msg: dict) -> int:
     See issue #28053.
 
     Also counts provider replay fields (``codex_reasoning_items`` etc. —
-    see ``_REPLAY_BUDGET_KEYS``).  The preflight "should I compress?"
-    estimator sees the full message shape, so the tail walk must use the
-    same size class; otherwise an assistant message with tiny visible
-    content but large hidden replay blobs is protected as if it were small,
-    the post-compression session stays near the context limit, and
-    compaction re-fires continuously (#55572).  Accounting-only: replay
+    see ``_REPLAY_BUDGET_KEYS``) when *include_replay* is True.  The preflight
+    "should I compress?" estimator sees the full message shape, so the tail
+    walk must use the same size class; otherwise an assistant message with
+    tiny visible content but large hidden replay blobs is protected as if it
+    were small, the post-compression session stays near the context limit,
+    and compaction re-fires continuously (#55572).  Accounting-only: replay
     fields are never mutated or pruned here.
+
+    Adapters on ``upstream/main`` only replay thinking for the **newest
+    assistant turn** (e.g. ``anthropic_adapter.convert_messages_to_anthropic``
+    strips reasoning from all earlier assistant messages via the
+    ``idx != last_assistant_idx`` gate).  Passing ``include_replay=False``
+    for stale assistant turns avoids inflating the tail budget with 19-24%
+    of tokens that are provably stripped before the request is sent
+    (issue #73624).
     """
     content = msg.get("content") or ""
     if isinstance(content, str):
@@ -762,8 +772,9 @@ def _estimate_msg_budget_tokens(msg: dict) -> int:
     for tc in msg.get("tool_calls") or []:
         if isinstance(tc, dict):
             tokens += estimate_tokens_rough(str(tc))
-    for key in _REPLAY_BUDGET_KEYS:
-        tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
+    if include_replay:
+        for key in _REPLAY_BUDGET_KEYS:
+            tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
     return tokens
 
 
@@ -2488,9 +2499,18 @@ class ContextCompressor(ContextEngine):
                 len(result),
                 _MAX_TAIL_MESSAGE_FLOOR,
             )
+            # Pre-compute the last assistant index — only charge replay
+            # budget for the newest assistant turn (issue #73624).
+            last_asst_idx = -1
+            for i in range(len(result) - 1, -1, -1):
+                if result[i].get("role") == "assistant":
+                    last_asst_idx = i
+                    break
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
-                msg_tokens = _estimate_msg_budget_tokens(msg)
+                msg_tokens = _estimate_msg_budget_tokens(
+                    msg, include_replay=(i == last_asst_idx),
+                )
                 if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
                     boundary = i
                     break
@@ -2645,10 +2665,19 @@ class ContextCompressor(ContextEngine):
             keep_recent = min(_PRESSURE_KEEP_RECENT_MESSAGES, len(result))
             demote_end = len(result) - keep_recent
 
+            # Pre-compute the last assistant index for the pressure-pass
+            # budget sum — only charge replay budget for the newest
+            # assistant turn (issue #73624).
+            _prune_last_asst_idx = -1
+            for i in range(len(result) - 1, -1, -1):
+                if result[i].get("role") == "assistant":
+                    _prune_last_asst_idx = i
+                    break
+
             def _protected_region_tokens() -> int:
                 start = max(0, prune_boundary)
                 return sum(
-                    _estimate_msg_budget_tokens(result[i])
+                    _estimate_msg_budget_tokens(result[i], include_replay=(i == _prune_last_asst_idx))
                     for i in range(start, len(result))
                 )
 
@@ -4751,9 +4780,23 @@ This compaction should PRIORITISE preserving all information related to the focu
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
+        # Pre-compute the index of the last assistant message so the budget
+        # walk only charges replay fields (_REPLAY_BUDGET_KEYS) for that one
+        # turn — adapters on upstream/main strip reasoning from all earlier
+        # assistant messages (anthropic_adapter: idx != last_assistant_idx),
+        # so counting them inflates the tail budget by 19-24% with tokens
+        # that are provably never sent on the wire (issue #73624).
+        last_asst_idx = -1
+        for i in range(n - 1, head_end - 1, -1):
+            if messages[i].get("role") == "assistant":
+                last_asst_idx = i
+                break
+
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
-            msg_tokens = _estimate_msg_budget_tokens(msg)
+            msg_tokens = _estimate_msg_budget_tokens(
+                msg, include_replay=(i == last_asst_idx),
+            )
             # Stop once we exceed the soft ceiling (unless we haven't hit min_tail yet)
             if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
                 break
@@ -4779,7 +4822,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             raw_accumulated = 0
             for j in range(n - 1, head_end - 1, -1):
                 raw_msg = messages[j]
-                raw_tok = _estimate_msg_budget_tokens(raw_msg)
+                raw_tok = _estimate_msg_budget_tokens(
+                    raw_msg, include_replay=(j == last_asst_idx),
+                )
                 if raw_accumulated + raw_tok > raw_budget and (n - j) >= min_tail:
                     cut_idx = j
                     break
