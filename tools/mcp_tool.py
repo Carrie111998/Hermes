@@ -5658,6 +5658,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             k: v
             for k, v in servers.items()
             if k not in _servers
+            and k not in _server_connecting
             and _parse_boolish(v.get("enabled", True), default=True)
             # Skip a server still serving its post-failure backoff. Without
             # this, a server that fails to connect (and is therefore never
@@ -5789,7 +5790,9 @@ def discover_mcp_tools() -> List[str]:
         new_server_names = [
             name
             for name, cfg in servers.items()
-            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
+            if name not in _servers
+            and name not in _server_connecting
+            and _parse_boolish(cfg.get("enabled", True), default=True)
         ]
 
     tool_names = register_mcp_servers(servers)
