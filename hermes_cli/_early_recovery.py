@@ -41,7 +41,7 @@ LAZY_REFRESH_IMPORT_PROBES: tuple[tuple[str, str], ...] = (
     ("click", "Command"),
     ("certifi", "contents"),
     ("rich", "print"),
-    ("cryptography", "__version__"),
+    ("cryptography", "__name__"),
     ("jwt", "encode"),
 )
 
