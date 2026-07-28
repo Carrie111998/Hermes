@@ -3510,13 +3510,12 @@ DEFAULT_CONFIG = {
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
 
-        # Optional bounded lifecycle for long-running local gateways that touch
-        # many workspaces. Disabled by default to preserve process-lifetime
-        # server retention and warm indexes. When enabled, idle servers are
-        # retired after the configured timeout and client capacity is enforced
-        # per Hermes process. A cap of 0 means unlimited.
+        # Bounded lifecycle for long-running local gateways that touch many
+        # workspaces. Enabled by default with a conservative two-hour idle
+        # timeout; set enabled=false to preserve process-lifetime retention and
+        # warm indexes. Client capacity is per Hermes process; 0 is unlimited.
         "lifecycle": {
-            "enabled": False,
+            "enabled": True,
             "idle_timeout_seconds": 7200,
             "sweep_interval_seconds": 60,
             "max_clients_per_process": 0,

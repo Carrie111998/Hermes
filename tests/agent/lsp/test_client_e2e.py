@@ -159,6 +159,57 @@ async def test_concurrent_shutdown_callers_wait_for_same_cleanup(tmp_path: Path,
 
 
 @pytest.mark.asyncio
+async def test_failed_shared_shutdown_can_be_retried(tmp_path: Path, monkeypatch):
+    client = _client(tmp_path, "clean")
+    await client.start()
+    original_cleanup = client._cleanup_process
+    attempts = 0
+
+    async def fail_once(descendants=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("synthetic cleanup failure")
+        await original_cleanup(descendants)
+
+    monkeypatch.setattr(client, "_cleanup_process", fail_once)
+    with pytest.raises(RuntimeError, match="synthetic cleanup failure"):
+        await client.shutdown()
+
+    await client.shutdown()
+    assert attempts == 2
+    assert client.process_alive is False
+
+
+@pytest.mark.asyncio
+async def test_successful_incomplete_shared_shutdown_is_retried(
+    tmp_path: Path, monkeypatch
+):
+    client = _client(tmp_path, "clean")
+    await client.start()
+    original_shutdown = client._shutdown_impl
+    attempts = 0
+
+    async def leave_tree_once():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return
+        await original_shutdown()
+
+    monkeypatch.setattr(client, "_shutdown_impl", leave_tree_once)
+    try:
+        await client.shutdown()
+        assert client.process_tree_alive is True
+
+        await client.shutdown()
+        assert attempts == 2
+        assert client.process_tree_alive is False
+    finally:
+        await asyncio.shield(client.shutdown())
+
+
+@pytest.mark.asyncio
 @pytest.mark.live_system_guard_bypass
 async def test_cancelling_shutdown_caller_does_not_cancel_shared_cleanup(
     tmp_path: Path, monkeypatch
@@ -282,6 +333,125 @@ async def test_shutdown_removes_wrapper_descendant_tree(tmp_path: Path):
         if child_pid is not None and psutil.pid_exists(child_pid):
             try:
                 child = psutil.Process(child_pid)
+                child.kill()
+                child.wait(timeout=2.0)
+            except psutil.Error:
+                pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_system_guard_bypass
+async def test_shutdown_finds_owned_descendant_after_wrapper_exit(tmp_path: Path):
+    import psutil
+
+    pid_file = tmp_path / "orphan-child.pid"
+    client = LSPClient(
+        server_id="mock-orphan-child",
+        workspace_root=str(tmp_path),
+        command=[sys.executable, MOCK_SERVER],
+        env={
+            "MOCK_LSP_SCRIPT": "child",
+            "MOCK_LSP_CHILD_PID_FILE": str(pid_file),
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        },
+        cwd=str(tmp_path),
+    )
+    child_pid = None
+    try:
+        await client.start()
+        for _ in range(100):
+            if pid_file.exists():
+                break
+            await asyncio.sleep(0.01)
+        child_pid = int(pid_file.read_text())
+        assert psutil.pid_exists(child_pid)
+
+        assert client._proc is not None
+        client._proc.kill()
+        # The helper inherited the wrapper's pipe descriptors, so awaiting
+        # Process.wait() here can block until that helper is cleaned up. Poll
+        # only for the wrapper exit notification, then let shutdown recover
+        # the token-owned orphan and close the pipes.
+        for _ in range(100):
+            if client._proc.returncode is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert client._proc.returncode is not None
+        assert client.process_alive is False
+        assert client.process_tree_alive is True
+        await client.shutdown()
+        assert client.process_tree_alive is False
+
+        for _ in range(100):
+            if not psutil.pid_exists(child_pid):
+                break
+            try:
+                if psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break
+            await asyncio.sleep(0.01)
+        assert (
+            not psutil.pid_exists(child_pid)
+            or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+        )
+    finally:
+        await asyncio.shield(client.shutdown())
+        if child_pid is not None and psutil.pid_exists(child_pid):
+            try:
+                child = psutil.Process(child_pid)
+                child.kill()
+                child.wait(timeout=2.0)
+            except psutil.Error:
+                pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_system_guard_bypass
+async def test_shutdown_sweeps_children_spawned_until_wrapper_kill(tmp_path: Path):
+    import psutil
+
+    pid_file = tmp_path / "spawn-loop-children.pid"
+    client = LSPClient(
+        server_id="mock-spawn-loop",
+        workspace_root=str(tmp_path),
+        command=[sys.executable, MOCK_SERVER],
+        env={
+            "MOCK_LSP_SCRIPT": "spawn_loop",
+            "MOCK_LSP_CHILD_PID_FILE": str(pid_file),
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        },
+        cwd=str(tmp_path),
+    )
+    pids = set()
+    try:
+        await client.start()
+        for _ in range(100):
+            if pid_file.exists():
+                pids = {int(pid) for pid in pid_file.read_text().splitlines()}
+                if len(pids) >= 3:
+                    break
+            await asyncio.sleep(0.02)
+        assert len(pids) >= 3
+
+        await client.shutdown()
+        if pid_file.exists():
+            pids.update(int(pid) for pid in pid_file.read_text().splitlines())
+        assert client.process_tree_alive is False
+        assert all(
+            not psutil.pid_exists(pid)
+            or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+            for pid in pids
+        )
+    finally:
+        await asyncio.shield(client.shutdown())
+        if pid_file.exists():
+            pids.update(int(pid) for pid in pid_file.read_text().splitlines())
+        for pid in pids:
+            if not psutil.pid_exists(pid):
+                continue
+            try:
+                child = psutil.Process(pid)
                 child.kill()
                 child.wait(timeout=2.0)
             except psutil.Error:

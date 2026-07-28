@@ -1,4 +1,4 @@
-"""Race-focused tests for the opt-in bounded LSP client lifecycle."""
+"""Race-focused tests for the bounded LSP client lifecycle."""
 from __future__ import annotations
 
 import asyncio
@@ -77,8 +77,8 @@ def install_entry(
     return entry, client
 
 
-def test_lifecycle_config_is_opt_in_and_strict(caplog):
-    assert _lifecycle_config({}) == (False, 7200.0, 60.0, 0, None)
+def test_lifecycle_config_is_default_on_and_strict(caplog):
+    assert _lifecycle_config({}) == (True, 7200.0, 60.0, 0, None)
     assert _lifecycle_config(
         {
             "lifecycle": {
@@ -89,15 +89,24 @@ def test_lifecycle_config_is_opt_in_and_strict(caplog):
             }
         }
     ) == (True, 120.0, 5.0, 3, None)
+    assert _lifecycle_config({"lifecycle": {"enabled": False}}) == (
+        False,
+        7200.0,
+        60.0,
+        0,
+        None,
+    )
 
     invalid_enabled = _lifecycle_config({"lifecycle": {"enabled": "false"}})
-    assert invalid_enabled[:4] == (False, 7200.0, 60.0, 0)
+    assert invalid_enabled[:4] == (True, 7200.0, 60.0, 0)
     assert invalid_enabled[4]
 
     invalid_enabled_policies = [
         {"enabled": True, "idle_timeout_seconds": True},
         {"enabled": True, "idle_timeout_seconds": float("nan")},
         {"enabled": True, "sweep_interval_seconds": 0},
+        {"enabled": True, "idle_timeout_seconds": 10**400},
+        {"enabled": True, "sweep_interval_seconds": 10**400},
         {"enabled": True, "max_clients_per_process": 1.5},
         {"enabled": True, "max_clients_per_process": 65},
         {"enabled": True, "max_client_per_process": 3},
@@ -109,18 +118,18 @@ def test_lifecycle_config_is_opt_in_and_strict(caplog):
     assert "invalid lsp.lifecycle configuration" in caplog.text
 
 
-def test_default_config_declares_default_off_lifecycle_policy():
+def test_default_config_declares_default_on_lifecycle_policy():
     from hermes_cli.config import DEFAULT_CONFIG
 
     assert DEFAULT_CONFIG["lsp"]["lifecycle"] == {
-        "enabled": False,
+        "enabled": True,
         "idle_timeout_seconds": 7200,
         "sweep_interval_seconds": 60,
         "max_clients_per_process": 0,
     }
 
 
-def test_create_from_default_config_wires_process_lifetime_policy(monkeypatch):
+def test_create_from_default_config_wires_bounded_policy(monkeypatch):
     from hermes_cli import config as config_module
 
     monkeypatch.setattr(config_module, "load_config", lambda: config_module.DEFAULT_CONFIG)
@@ -128,12 +137,12 @@ def test_create_from_default_config_wires_process_lifetime_policy(monkeypatch):
     assert service is not None
     try:
         lifecycle = service.get_status()["lifecycle"]
-        assert lifecycle["enabled"] is False
+        assert lifecycle["enabled"] is True
         assert lifecycle["idle_timeout_seconds"] == 7200.0
         assert lifecycle["sweep_interval_seconds"] == 60.0
         assert lifecycle["max_clients_per_process"] == 0
         assert lifecycle["config_error"] is None
-        assert lifecycle["reaper_running"] is False
+        assert lifecycle["reaper_running"] is True
     finally:
         service.shutdown()
 
@@ -362,6 +371,107 @@ def test_failed_retirement_tombstone_blocks_overlapping_replacement(monkeypatch)
         client.running = False
         client.state = "stopped"
         service.shutdown()
+
+
+def test_service_shutdown_stays_closing_while_tombstone_is_live():
+    service = make_service(clock=lambda: 0.0)
+    key = ("fake", "/repo")
+    entry, _ = install_entry(service, key, last_used=0.0)
+
+    class FailingClient(FakeClient):
+        @property
+        def process_alive(self) -> bool:
+            return False
+
+        @property
+        def process_tree_alive(self) -> bool:
+            return self.running
+
+        async def shutdown(self) -> None:
+            self.shutdown_calls += 1
+            if self.shutdown_calls >= 2:
+                self.running = False
+                self.state = "stopped"
+
+    client = FailingClient()
+    with service._state_lock:
+        entry.client = cast(LSPClient, client)
+
+    service.begin_shutdown()
+    with pytest.raises(RuntimeError, match="non-terminated generations"):
+        service._loop.run(service._shutdown_async(), timeout=2.0)
+
+    assert service.is_closed() is False
+    status = service.get_status()
+    assert status["lifecycle"]["service_state"] == "closing"
+    assert status["lifecycle"]["counts"]["retiring"] == 1
+    assert status["clients"][0]["running"] is True
+    assert client.shutdown_calls == 1
+
+    service.shutdown()
+    assert client.shutdown_calls == 2
+    assert service.is_closed() is True
+
+
+def test_cancelled_spawn_cleanup_failure_is_retained_and_retried(monkeypatch):
+    service = make_service(clock=lambda: 0.0)
+    started = asyncio.Event()
+    release_start = asyncio.Event()
+    created = []
+
+    class SpawnClient(FakeClient):
+        async def start(self) -> None:
+            started.set()
+            await release_start.wait()
+
+        @property
+        def process_alive(self) -> bool:
+            return self.running
+
+        async def shutdown(self) -> None:
+            self.shutdown_calls += 1
+            if self.shutdown_calls == 1:
+                raise RuntimeError("synthetic first cleanup failure")
+            self.running = False
+            self.state = "stopped"
+
+    def make_client(**_kwargs):
+        client = SpawnClient()
+        created.append(client)
+        return client
+
+    srv = SimpleNamespace(
+        server_id="fake",
+        seed_first_push=False,
+        build_spawn=lambda root, _ctx: SimpleNamespace(
+            workspace_root=root,
+            command=["fake"],
+            env=None,
+            cwd=root,
+            initialization_options=None,
+            seed_diagnostics_on_first_push=False,
+        ),
+    )
+    monkeypatch.setattr(manager_module, "LSPClient", make_client)
+
+    async def scenario():
+        reservation = asyncio.create_task(
+            service._reserve_spawn(srv, ("fake", "/repo"), "/repo")
+        )
+        await started.wait()
+        service.begin_shutdown()
+        await service._shutdown_async()
+        assert await reservation is None
+
+    try:
+        service._loop.run(scenario(), timeout=2.0)
+        assert created[0].shutdown_calls == 2
+        assert created[0].process_alive is False
+        assert service.is_closed() is True
+        assert service.get_status()["clients"] == []
+    finally:
+        release_start.set()
+        assert service._loop.stop() is True
 
 
 def test_generation_bound_release_is_idempotent_and_cannot_touch_replacement():

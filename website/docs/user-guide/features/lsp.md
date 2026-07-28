@@ -164,10 +164,10 @@ lsp:
   #   manual  — only use binaries already on PATH
   install_strategy: auto
 
-  # Optional bounded lifecycle for long-running, multi-workspace processes.
-  # Disabled by default: absent/false preserves process-lifetime retention.
+  # Bounded lifecycle for long-running, multi-workspace processes.
+  # Enabled by default; set false to preserve process-lifetime retention.
   lifecycle:
-    enabled: false
+    enabled: true
     idle_timeout_seconds: 7200
     sweep_interval_seconds: 60
     max_clients_per_process: 0  # 0 = unlimited
@@ -189,10 +189,10 @@ lsp:
 Lifecycle validation is strict: `idle_timeout_seconds` must be between `0`
 and `31536000`, `sweep_interval_seconds` must be greater than `0` and at most
 `86400`, and `max_clients_per_process` must be an integer from `0` through
-`64`. Unknown keys and invalid values are reported by `hermes lsp status`. If
-an explicitly enabled policy is malformed, Hermes keeps lifecycle management
-enabled with the safe `7200s / 60s / unlimited-count` defaults rather than
-silently falling back to unbounded process-lifetime retention.
+`64`. Unknown keys and invalid values are reported by `hermes lsp status`.
+If an enabled policy is malformed, Hermes keeps lifecycle management enabled
+with the safe `7200s / 60s / unlimited-count` defaults rather than silently
+falling back to unbounded process-lifetime retention.
 
 ### Per-server keys
 
@@ -238,9 +238,10 @@ answered after it). Slow servers that haven't re-checked yet result
 in "no data" for that edit — never in yesterday's errors being
 re-reported as current.
 
-By default, servers are kept alive for the life of the Hermes process,
-preserving warm indexes and existing behavior. Long-running gateways that
-touch many workspaces can opt into `lsp.lifecycle`. The bounded lifecycle:
+By default, servers idle for two hours are retired. Set
+`lsp.lifecycle.enabled: false` to keep servers alive for the life of the Hermes
+process when preserving warm indexes matters more than bounding resources. The
+bounded lifecycle:
 
 - retires only clients that have no active diagnostics operation;
 - waits for a retired process tree to exit before replacing that slot;

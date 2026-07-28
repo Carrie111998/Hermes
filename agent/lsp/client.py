@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,6 +74,8 @@ from agent.lsp.protocol import (
 )
 
 logger = logging.getLogger("agent.lsp.client")
+
+_OWNER_TOKEN_ENV = "HERMES_LSP_OWNER_TOKEN"
 
 # Timeouts (seconds) — mirror OpenCode's constants, scaled to seconds.
 INITIALIZE_TIMEOUT = 45.0
@@ -202,6 +205,10 @@ class LSPClient:
         self._cwd = cwd or workspace_root
         self._init_options = initialization_options or {}
         self._seed_first_push = seed_diagnostics_on_first_push
+        # A random marker inherited by the wrapper's entire process tree.
+        # Unlike parent-PID traversal, this still identifies helpers after a
+        # crashed wrapper has exited and the OS has reparented them.
+        self._owner_token = secrets.token_hex(16)
 
         # Process + streams
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -263,6 +270,24 @@ class LSPClient:
         return self._proc is not None and self._proc.returncode is None
 
     @property
+    def process_tree_alive(self) -> bool:
+        """Whether the wrapper or any token-owned descendant still exists."""
+        if self.process_alive:
+            return True
+        try:
+            import psutil
+
+            for proc in self._capture_owned_processes():
+                try:
+                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                        return True
+                except (psutil.Error, OSError):
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    @property
     def state(self) -> str:
         return self._state
 
@@ -301,6 +326,10 @@ class LSPClient:
         env = dict(os.environ)
         if self._env:
             env.update(self._env)
+        # Set this after user overrides so ownership cannot be spoofed by a
+        # stale inherited value. The token is not a credential; it is a
+        # process-tree identity used only during cleanup.
+        env[_OWNER_TOKEN_ENV] = self._owner_token
 
         cmd = self._command
         if sys.platform == "win32":
@@ -462,14 +491,28 @@ class LSPClient:
     async def shutdown(self) -> None:
         """Best-effort graceful, cancellation-safe idempotent shutdown.
 
-        Cleanup lives in one retained task. Cancelling any caller does not
-        cancel or falsely complete process-tree teardown; later callers await
-        the same result.
+        Cleanup lives in one shared task. Cancelling any caller does not cancel
+        process-tree teardown; successful complete cleanup remains idempotent.
+        A failed task or a cleanup that leaves an owned process alive is
+        replaced on the next call so tombstones can make progress.
         """
         task = self._shutdown_task
-        if task is None:
+        retry_failed = bool(
+            task is not None
+            and task.done()
+            and (task.cancelled() or task.exception() is not None)
+        )
+        retry_incomplete = bool(
+            task is not None
+            and task.done()
+            and not task.cancelled()
+            and task.exception() is None
+            and self.process_tree_alive
+        )
+        if task is None or retry_failed or retry_incomplete:
             task = asyncio.create_task(
-                self._shutdown_impl(), name=f"hermes-lsp-client-shutdown-{self.server_id}"
+                self._shutdown_impl(),
+                name=f"hermes-lsp-client-shutdown-{self.server_id}",
             )
             self._shutdown_task = task
         await asyncio.shield(task)
@@ -502,14 +545,31 @@ class LSPClient:
 
     def _capture_descendants(self):
         proc = self._proc
-        if proc is None:
-            return []
+        captured = []
+        if proc is not None and proc.returncode is None:
+            captured.extend(self._capture_descendants_for_pid(proc.pid))
+        captured.extend(self._capture_owned_processes())
+        return captured
+
+    def _capture_owned_processes(self):
+        """Find processes carrying this client's inherited ownership token."""
+        proc = self._proc
+        captured = []
         try:
             import psutil
 
-            return psutil.Process(proc.pid).children(recursive=True)
+            wrapper_pid = proc.pid if proc is not None else None
+            for candidate in psutil.process_iter(["pid"]):
+                if candidate.pid in {os.getpid(), wrapper_pid}:
+                    continue
+                try:
+                    if candidate.environ().get(_OWNER_TOKEN_ENV) == self._owner_token:
+                        captured.append(candidate)
+                except (psutil.Error, OSError):
+                    continue
         except Exception:  # noqa: BLE001
-            return []
+            pass
+        return captured
 
     async def _cleanup_process(self, descendants=None) -> None:
         if self._reader_task is not None and not self._reader_task.done():
@@ -526,30 +586,44 @@ class LSPClient:
                 pass
         proc = self._proc
         captured = list(descendants or [])
-        if proc is not None:
-            captured.extend(self._capture_descendants_for_pid(proc.pid))
-            if captured:
-                # Terminate descendants leaf-first while the wrapper still
-                # exists, then refresh once to catch helpers created during
-                # the graceful protocol shutdown.
-                await asyncio.to_thread(self._terminate_descendants, captured)
-            refreshed = self._capture_descendants_for_pid(proc.pid)
-            if refreshed:
-                await asyncio.to_thread(self._terminate_descendants, refreshed)
+        captured.extend(self._capture_descendants())
+
+        # Stop the wrapper before sweeping descendants so it cannot create a
+        # fresh helper between the last scan and its own termination. Poll
+        # returncode instead of awaiting Process.wait(): descendants may hold
+        # inherited stdout/stderr descriptors and keep that await blocked.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + SHUTDOWN_GRACE
+            while proc.returncode is None and loop.time() < deadline:
+                await asyncio.sleep(0.05)
             if proc.returncode is None:
                 try:
-                    proc.terminate()
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                    except asyncio.TimeoutError:
-                        try:
-                            proc.kill()
-                            await proc.wait()
-                        except ProcessLookupError:
-                            pass
+                    proc.kill()
                 except ProcessLookupError:
                     pass
-        self._proc = None
+                deadline = loop.time() + SHUTDOWN_GRACE
+                while proc.returncode is None and loop.time() < deadline:
+                    await asyncio.sleep(0.05)
+
+        # The wrapper can no longer spawn helpers. Token discovery still finds
+        # processes reparented after its exit; the second sweep catches helpers
+        # that were created while the first captured set was being terminated.
+        captured.extend(self._capture_descendants())
+        if captured:
+            await asyncio.to_thread(self._terminate_descendants, captured)
+        refreshed = self._capture_descendants()
+        if refreshed:
+            await asyncio.to_thread(self._terminate_descendants, refreshed)
+
+        # Preserve a stubborn live wrapper for a later tombstone retry.
+        if proc is None or proc.returncode is not None:
+            self._proc = None
 
     @staticmethod
     def _capture_descendants_for_pid(pid: int):

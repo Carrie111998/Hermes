@@ -15,7 +15,7 @@ Design choices:
   re-use it.
 
 - A **broken-set** records deterministic ``(server_id, workspace_root)``
-  failures such as an unavailable spawn command. In opt-in lifecycle mode,
+  failures such as an unavailable spawn command. In bounded lifecycle mode,
   transient startup/request failures use a short monotonic cooldown so the
   service can recover; process-lifetime mode preserves permanent marking.
 
@@ -110,21 +110,22 @@ def _lifecycle_config(
 ) -> Tuple[bool, float, float, int, Optional[str]]:
     """Parse bounded-lifecycle settings and surface invalid policy explicitly.
 
-    If an explicitly enabled policy is malformed, safe bounded defaults remain
-    enabled rather than silently reverting to unbounded process-lifetime
-    retention. The validation error is exposed through status.
+    Bounded lifecycle is the default. An explicit ``enabled: false`` preserves
+    process-lifetime retention. Malformed enabled policies remain bounded
+    rather than silently reverting to unbounded retention, and expose the
+    validation error through status.
     """
 
     raw = lsp_cfg.get("lifecycle")
-    defaults = (False, DEFAULT_IDLE_TIMEOUT, DEFAULT_SWEEP_INTERVAL, 0, None)
+    defaults = (True, DEFAULT_IDLE_TIMEOUT, DEFAULT_SWEEP_INTERVAL, 0, None)
     if raw is None:
         return defaults
     if not isinstance(raw, dict):
         error = "lsp.lifecycle must be a mapping"
         logger.warning(error)
-        return False, DEFAULT_IDLE_TIMEOUT, DEFAULT_SWEEP_INTERVAL, 0, error
+        return True, DEFAULT_IDLE_TIMEOUT, DEFAULT_SWEEP_INTERVAL, 0, error
 
-    enabled = raw.get("enabled", False)
+    enabled = raw.get("enabled", True)
     enabled_valid = isinstance(enabled, bool)
     try:
         if not enabled_valid:
@@ -180,11 +181,11 @@ def _lifecycle_config(
                 "max_clients_per_process must be an integer between "
                 f"0 and {MAX_CLIENTS_PER_PROCESS}"
             )
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         error = str(exc)
         logger.warning("invalid lsp.lifecycle configuration: %s", error)
         return (
-            bool(enabled) if enabled_valid else False,
+            bool(enabled) if enabled_valid else True,
             DEFAULT_IDLE_TIMEOUT,
             DEFAULT_SWEEP_INTERVAL,
             0,
@@ -499,12 +500,20 @@ class LSPService:
             if client is not None:
                 await client.shutdown()
                 terminated = not bool(
-                    getattr(client, "process_alive", client.is_running)
+                    getattr(
+                        client,
+                        "process_tree_alive",
+                        getattr(client, "process_alive", client.is_running),
+                    )
                 )
         except BaseException as exc:  # noqa: BLE001
             error = exc
             terminated = client is None or not bool(
-                getattr(client, "process_alive", client.is_running)
+                getattr(
+                    client,
+                    "process_tree_alive",
+                    getattr(client, "process_alive", client.is_running),
+                )
             )
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -819,7 +828,7 @@ class LSPService:
         """Retire a failed generation and preserve the configured retry policy.
 
         Legacy process-lifetime mode keeps the historical permanent broken
-        mark. Opt-in lifecycle mode uses a short retry cooldown so an
+        mark. Bounded lifecycle mode uses a short retry cooldown so an
         intentionally bounded gateway can recover from transient cold starts.
         """
         target = self._resolve_target(file_path)
@@ -1156,7 +1165,23 @@ class LSPService:
             return client
         except asyncio.CancelledError:
             if client is not None:
-                await asyncio.shield(client.shutdown())
+                try:
+                    await asyncio.shield(client.shutdown())
+                except (
+                    asyncio.CancelledError,
+                    Exception,
+                ) as cleanup_exc:  # includes cancellation
+                    with self._state_lock:
+                        current = self._entries.get(entry.key)
+                        if current is entry:
+                            entry.client = client
+                            entry.state = "retiring"
+                            entry.pending_eviction = "spawn-cleanup-failed"
+                    logger.warning(
+                        "LSP cancelled spawn cleanup failed for %s: %s",
+                        entry.key,
+                        cleanup_exc,
+                    )
             raise
         except Exception as exc:  # noqa: BLE001
             eventlog.log_spawn_failed(srv.server_id, entry.workspace_root, exc)
@@ -1166,7 +1191,20 @@ class LSPService:
                 else:
                     self._broken.add(entry.key)
             if client is not None:
-                await client.shutdown()
+                try:
+                    await client.shutdown()
+                except (asyncio.CancelledError, Exception) as cleanup_exc:
+                    with self._state_lock:
+                        current = self._entries.get(entry.key)
+                        if current is entry:
+                            entry.client = client
+                            entry.state = "retiring"
+                            entry.pending_eviction = "spawn-cleanup-failed"
+                    logger.warning(
+                        "LSP failed-spawn cleanup failed for %s: %s",
+                        entry.key,
+                        cleanup_exc,
+                    )
             return None
         finally:
             with self._state_lock:

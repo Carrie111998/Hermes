@@ -34,8 +34,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -65,6 +67,7 @@ def write_message(obj):
 
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
+    spawn_forever = False
     if script == "child":
         child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(300)"],
@@ -73,6 +76,28 @@ def main():
         if pid_file:
             with open(pid_file, "w", encoding="utf-8") as handle:
                 handle.write(str(child.pid))
+        script = "clean"
+    elif script == "spawn_loop":
+        spawn_forever = True
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        pid_file = os.environ["MOCK_LSP_CHILD_PID_FILE"]
+
+        def spawn_children():
+            while True:
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import signal,time; "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "time.sleep(300)",
+                    ],
+                )
+                with open(pid_file, "a", encoding="utf-8") as handle:
+                    handle.write(f"{child.pid}\n")
+                time.sleep(0.05)
+
+        threading.Thread(target=spawn_children, daemon=True).start()
         script = "clean"
 
     while True:
@@ -198,6 +223,8 @@ def main():
             continue
 
         if msg.get("method") == "exit":
+            if spawn_forever:
+                continue
             return 0
 
         # Unknown request: respond with method-not-found.
