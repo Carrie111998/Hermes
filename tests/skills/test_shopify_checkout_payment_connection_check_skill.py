@@ -12,7 +12,7 @@ class CheckoutSkillContractTest(unittest.TestCase):
         text = SKILL.read_text(encoding="utf-8")
         for heading in ("## When to Use", "## Prerequisites", "## Procedure", "## Verification"):
             self.assertIn(heading, text)
-        self.assertIn("explicit approval", text.lower())
+        self.assertIn("Do not submit the checkout", text)
         self.assertNotIn("shpat_", text)
 
     def test_helper_remains_read_only_by_design(self):
