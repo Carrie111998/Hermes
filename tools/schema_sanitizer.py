@@ -587,3 +587,95 @@ def strip_slash_enum(tools: list[dict]) -> tuple[list[dict], int]:
             stripped,
         )
     return tools, stripped
+
+
+def _is_degenerate_object_branch(branch: Any) -> bool:
+    """True when an anyOf/oneOf branch carries no constraints at all.
+
+    Matches ``{}``, ``{"type": "object"}``, and the MCP-generated
+    ``{"type": "object", "properties": {}, "required": []}`` shape — an
+    empty object schema that accepts everything and constrains nothing.
+    """
+    if not isinstance(branch, dict):
+        return False
+    for key, value in branch.items():
+        if key == "type" and value == "object":
+            continue
+        if key == "properties" and value == {}:
+            continue
+        if key == "required" and value == []:
+            continue
+        return False
+    return True
+
+
+def strip_degenerate_anyof(tools: list[dict]) -> tuple[list[dict], int]:
+    """Strip ``anyOf``/``oneOf`` keywords whose branches are ALL empty
+    object schemas.
+
+    Moonshot AI's chat-completions endpoint (Kimi K2.x/K3, reached directly
+    or via routers like Nous/OpenRouter) rejects tool schemas containing an
+    ``anyOf`` made up of empty object branches — e.g. the Apollo MCP
+    ``tasks_bulk_create`` tool ships
+    ``anyOf: [{"type":"object","properties":{},"required":[]}, ...]`` inside
+    its array ``items`` — failing the whole request with an opaque HTTP 400
+    ("Check the model name and other parameters"). Every other provider
+    tolerates the construct.
+
+    An empty object branch accepts everything, so an ``anyOf`` composed
+    solely of such branches is a no-op — dropping the keyword preserves
+    semantics exactly. Mixed ``anyOf`` lists (any branch with real
+    constraints) are left untouched.
+
+    Args:
+        tools: OpenAI-format or Responses-format tool list, mutated in
+            place. Callers that need to preserve the original should
+            deep-copy first.
+
+    Returns:
+        ``(tools, stripped_count)`` — same list reference plus a count of
+        how many ``anyOf``/``oneOf`` keywords were removed.
+    """
+    if not tools:
+        return tools, 0
+
+    stripped = 0
+
+    def _walk(node: Any) -> None:
+        nonlocal stripped
+        if isinstance(node, dict):
+            for combinator in ("anyOf", "oneOf"):
+                branches = node.get(combinator)
+                if (
+                    isinstance(branches, list)
+                    and branches
+                    and all(_is_degenerate_object_branch(b) for b in branches)
+                ):
+                    node.pop(combinator, None)
+                    stripped += 1
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            params = fn.get("parameters")
+            if isinstance(params, dict):
+                _walk(params)
+                continue
+        params = tool.get("parameters")
+        if isinstance(params, dict):
+            _walk(params)
+
+    if stripped:
+        logger.info(
+            "schema_sanitizer: stripped %d degenerate anyOf/oneOf keyword(s) "
+            "from tool schemas (Moonshot/Kimi strict-validation recovery)",
+            stripped,
+        )
+    return tools, stripped
