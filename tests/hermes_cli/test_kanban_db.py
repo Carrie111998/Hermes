@@ -1989,6 +1989,46 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_dispatch_respawn_guard_blocker_auth_counts_toward_failure_limit(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once counts each blocker_auth deferral as a failure toward
+    failure_limit, so a persistently blocker_auth task gets auto-blocked
+    instead of looping in ready forever (#73369)."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stuck-auth", assignee="alice",
+                            max_retries=2)
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("403 Forbidden: unauthorized", t),
+        )
+        # Tick 1: defer + record failure (consecutive_failures 0 -> 1)
+        r1 = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert t not in r1.auto_blocked
+        assert (t, "blocker_auth") in r1.respawn_guarded
+        assert t not in spawned_ids
+        task1 = kb.get_task(conn, t)
+        assert task1.status == "ready"
+        assert task1.consecutive_failures == 1
+
+        # Tick 2: defer + fail again (consecutive_failures 1 -> 2 >=
+        # max_retries=2) → auto-blocked
+        r2 = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert t in r2.auto_blocked, (
+            f"second blocker_auth tick should auto-block; "
+            f"got auto_blocked={r2.auto_blocked!r}"
+        )
+        assert t not in spawned_ids
+        task2 = kb.get_task(conn, t)
+        assert task2.status == "blocked"
+        assert task2.consecutive_failures == 2
+
+
 def test_dispatch_respawn_guard_skips_recent_success(
     kanban_home, all_assignees_spawnable
 ):
