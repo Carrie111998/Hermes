@@ -430,14 +430,28 @@ class TestHermesHomeLeakGuard:
         would forever name the wrong session — the same burn-in failure the
         HERMES_HOME guards above exist to prevent. The one legitimate delivery
         under codex is the entry's ``env_vars`` name-passthrough (a spawn-time
-        snapshot of the codex process env — a NAME, never a value); this entry
-        does not wire it, so the shim's own-lineage exclusion stays INACTIVE
-        (fail-open) under codex rather than wrong. What this test pins is the
-        burn-in rule: no literal session id, under any key, may land in the
-        entry's ``env`` map."""
+        snapshot of the codex process env — a NAME, never a value); the test
+        below pins that the entry wires exactly that. What this test pins is
+        the burn-in rule: no literal session id, under any key, may land in
+        the entry's ``env`` map."""
         monkeypatch.setenv("HERMES_SESSION_ID", "sess-must-not-persist")
         entry = _build_hermes_tools_mcp_entry()
         env = entry.get("env", {})
         assert not any("SESSION_ID" in key for key in env), (
             f"no session id may be serialized into config.toml, got: {env!r}"
         )
+
+    def test_session_id_delivered_by_name_passthrough(self, monkeypatch):
+        """#26604 keep_open resolution, option (a): the entry names
+        HERMES_SESSION_ID in ``env_vars`` — codex's spawn-time NAME
+        passthrough — so the shim's own-lineage exclusion follows the
+        ACTIVE session, while the burn-in rule above still holds: never
+        a VALUE in the env map."""
+        monkeypatch.setenv("HERMES_SESSION_ID", "sess-live-1")
+        entry = _build_hermes_tools_mcp_entry()
+        assert "HERMES_SESSION_ID" in entry.get("env_vars", []), (
+            f"entry must NAME the session var for codex to deliver it, got: "
+            f"{entry.get('env_vars')!r}"
+        )
+        env = entry.get("env", {})
+        assert not any("SESSION_ID" in key for key in env)

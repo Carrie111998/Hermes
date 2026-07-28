@@ -343,3 +343,62 @@ class TestShimRegistration:
 
         out = handle_function_call("memory", {"action": "add", "content": "x"})
         assert "must be handled by the agent loop" in out
+
+
+class TestCodexLifecycleDelivery:
+    def test_codex_entry_delivers_session_id_end_to_end(
+        self, tmp_hermes_home, monkeypatch
+    ):
+        """#26604 keep_open resolution, option (a) — the leg the production-
+        producer test above deliberately scopes OUT: delivery across the codex
+        MCP lifecycle. Codex builds an MCP child's env from the entry's ``env``
+        map (literal values) plus a spawn-time snapshot of the NAMES listed in
+        the entry's ``env_vars``. Simulate exactly that contract from the REAL
+        migration entry: the real producer writes the id → codex-style spawn
+        snapshots only the names the entry declares → the shim, reading only
+        what was delivered, excludes the calling lineage."""
+        import os
+
+        from gateway.session_context import set_current_session_id
+        from hermes_cli.codex_runtime_plugin_migration import (
+            _build_hermes_tools_mcp_entry,
+        )
+        from hermes_state import SessionDB
+
+        db_path = tmp_hermes_home / "state.db"
+        db = SessionDB(db_path=db_path)
+        db.create_session("sess-other-1", source="telegram")
+        db.append_message(
+            "sess-other-1", "assistant", "the auth refactor merged on Thursday"
+        )
+        db.create_session("sess-mine-2", source="telegram")
+        db.append_message(
+            "sess-mine-2", "assistant", "the auth refactor notes are mine"
+        )
+        db.close()
+
+        # setenv first so monkeypatch restores env at teardown; the value under
+        # test is written by the real producer on the next line.
+        monkeypatch.setenv("HERMES_SESSION_ID", "")
+        set_current_session_id("sess-mine-2")
+
+        entry = _build_hermes_tools_mcp_entry()
+        delivered = dict(entry.get("env", {}))
+        for name in entry.get("env_vars", []) or []:
+            if name in os.environ:
+                delivered[name] = os.environ[name]
+
+        # The shim may see ONLY what the codex contract delivered: drop the
+        # producer's process-global write, then install the delivered set.
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        for key, value in delivered.items():
+            monkeypatch.setenv(key, value)
+        # Internal mechanism bridge, not part of the delivery under test.
+        monkeypatch.setenv("HERMES_MCP_STATE_DB", str(db_path))
+
+        out = dispatch_session_search({"query": "auth refactor", "limit": 10})
+        assert "sess-other-1" in out
+        assert "sess-mine-2" not in out, (
+            "own-lineage exclusion inactive: the entry did not deliver "
+            "HERMES_SESSION_ID through the codex env contract"
+        )

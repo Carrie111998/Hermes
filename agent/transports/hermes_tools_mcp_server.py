@@ -204,10 +204,12 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 # it, and `_inject_session_context_env()` inside `hermes_subprocess_env()` bridges it
 # into the HOST process's spawn env. That is hop 1 only: codex builds an MCP child's
 # env from a fixed whitelist plus the names listed in the entry's `env_vars` (a
-# spawn-time snapshot of the codex process env), and the migration entry names none —
-# so under codex today the shim does not receive this var and own-lineage exclusion is
-# INACTIVE (fail-open, documented above). A host delivers it by naming it in the
-# entry's `env_vars` or by setting it in the server's spawn env directly. Reading a
+# spawn-time snapshot of the codex process env). The migration entry names
+# HERMES_SESSION_ID there (`_build_hermes_tools_mcp_entry`), so under codex the shim
+# receives the ACTIVE session's id and own-lineage exclusion is ACTIVE; a host that
+# delivers nothing leaves it INACTIVE (fail-open, documented above). Any other host
+# delivers it the same two ways: name it in the entry's `env_vars` or set it in the
+# server's spawn env directly. Reading a
 # bespoke name instead would be strictly worse: it has no producer in any launch path,
 # and the cross-session leak guard in `_inject_session_context_env` covers only
 # `_VAR_MAP` keys, so a bespoke var could carry a SIBLING session's id under a
