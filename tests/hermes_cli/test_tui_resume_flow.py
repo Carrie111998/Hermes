@@ -928,6 +928,90 @@ def test_oneshot_waits_for_mcp_discovery_before_agent_snapshot(monkeypatch):
     assert events == ["start", "wait", "agent"]
 
 
+def test_oneshot_pairs_environment_model_with_environment_provider(monkeypatch):
+    """A routed HERMES model/provider pair must not be auto-detected elsewhere."""
+    from hermes_cli.oneshot import _run_agent
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["agent"] = kwargs
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+
+        def chat(self, _prompt):
+            return "ok"
+
+    def mod(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    def resolve_runtime_provider(**kwargs):
+        captured["runtime"] = kwargs
+        return {
+            "api_key": "k",
+            "base_url": "u",
+            "provider": kwargs["requested"],
+            "api_mode": "responses",
+            "credential_pool": None,
+        }
+
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "gpt-5.6-sol")
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openai-codex")
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=FakeAgent))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        mod("hermes_cli.config", load_config=lambda: {"model": {}}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.models",
+        mod(
+            "hermes_cli.models",
+            detect_provider_for_model=lambda *_args, **_kwargs: pytest.fail(
+                "environment provider/model pairs must not be auto-detected"
+            ),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        mod(
+            "hermes_cli.runtime_provider",
+            resolve_runtime_provider=resolve_runtime_provider,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: set()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.mcp_startup",
+        mod(
+            "hermes_cli.mcp_startup",
+            start_background_mcp_discovery=lambda **_kwargs: None,
+            wait_for_mcp_discovery=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.oneshot._create_session_db_for_oneshot",
+        lambda: None,
+    )
+
+    assert _run_agent("use the routed provider") == "ok"
+    assert captured["runtime"]["requested"] == "openai-codex"
+    assert captured["runtime"]["target_model"] == "gpt-5.6-sol"
+    assert captured["agent"]["provider"] == "openai-codex"
+    assert captured["agent"]["model"] == "gpt-5.6-sol"
+
+
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     captured = {}
     active_path_during_call = None

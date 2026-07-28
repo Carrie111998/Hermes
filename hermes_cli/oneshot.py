@@ -289,6 +289,13 @@ def _run_agent(
     # the user's configured default provider, which may not host the model
     # the caller just asked for.
     effective_provider = (provider or "").strip() or None
+    env_provider = os.getenv("HERMES_INFERENCE_PROVIDER", "").strip() or None
+    if effective_provider is None and not (model or "").strip() and env_model:
+        # Nomad/profile routers set model and provider as an environment pair.
+        # Keep that pair intact instead of auto-detecting the routed model on
+        # a different provider. An explicit --model still retains the CLI's
+        # documented auto-detection behavior when --provider is omitted.
+        effective_provider = env_provider
     explicit_base_url_from_alias: Optional[str] = None
     if effective_provider is None and (model or env_model):
         # Only auto-detect when the model was explicitly requested via arg or
