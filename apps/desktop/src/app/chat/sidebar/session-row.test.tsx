@@ -47,7 +47,10 @@ vi.mock('@/lib/session-source', () => ({
   handoffOriginSource: (state?: string, platform?: string) => (state && platform ? platform : null),
   sessionSourceLabel: (source: string) => source
 }))
-vi.mock('@/lib/time', () => ({ coarseElapsed: () => ({ unit: 'minute' as const, value: 5 }) }))
+vi.mock('@/lib/time', () => ({
+  coarseElapsed: () => ({ unit: 'minute' as const, value: 5 }),
+  normalizeTimestampMs: (value: number) => value * 1000
+}))
 
 // These mocks use importOriginal rather than replacing the module wholesale:
 // session-row.tsx (and its transitive imports, e.g. session-color.ts) reads

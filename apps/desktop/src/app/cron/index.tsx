@@ -47,6 +47,7 @@ import { type Translations, useI18n } from '@/i18n'
 import { AlertTriangle } from '@/lib/icons'
 import { requestModelOptions } from '@/lib/model-options'
 import { asText } from '@/lib/text'
+import { normalizeTimestampMs } from '@/lib/time'
 import { $cronFocusJobId, $cronJobs, setCronFocusJobId, setCronJobs, updateCronJobs } from '@/store/cron'
 import { notify, notifyError } from '@/store/notifications'
 import { $profileScope, ALL_PROFILES } from '@/store/profile'
@@ -663,11 +664,13 @@ function CronJobDetail({
 }
 
 function formatRunTime(seconds?: null | number): string {
-  if (!seconds) {
+  const ms = normalizeTimestampMs(seconds)
+
+  if (!ms) {
     return '—'
   }
 
-  const date = new Date(seconds * 1000)
+  const date = new Date(ms)
 
   return Number.isNaN(date.valueOf()) ? '—' : date.toLocaleString()
 }

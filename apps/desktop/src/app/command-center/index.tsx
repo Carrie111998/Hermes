@@ -25,7 +25,7 @@ import {
   Wrench
 } from '@/lib/icons'
 import { exportSession } from '@/lib/session-export'
-import { fmtDateTime } from '@/lib/time'
+import { fmtDateTime, normalizeTimestampMs } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
@@ -58,11 +58,13 @@ interface CommandCenterViewProps {
 }
 
 function formatTimestamp(value?: number | null): string {
-  if (!value) {
+  const ms = normalizeTimestampMs(value)
+
+  if (!ms) {
     return ''
   }
 
-  const date = new Date(value * 1000)
+  const date = new Date(ms)
 
   if (Number.isNaN(date.getTime())) {
     return ''

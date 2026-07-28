@@ -12,7 +12,7 @@ import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
-import { coarseElapsed } from '@/lib/time'
+import { coarseElapsed, normalizeTimestampMs } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { $attentionSessionIds, openSessionTile } from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
@@ -48,7 +48,13 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
 const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
 
 function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
-  const { unit, value } = coarseElapsed(Date.now() - seconds * 1000)
+  const ms = normalizeTimestampMs(seconds)
+
+  if (!ms) {
+    return r.ageNow
+  }
+
+  const { unit, value } = coarseElapsed(Date.now() - ms)
 
   // Under a minute reads as "now" — the sidebar never shows a seconds tick.
   return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`

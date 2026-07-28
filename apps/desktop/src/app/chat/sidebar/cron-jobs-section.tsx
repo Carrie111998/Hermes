@@ -8,7 +8,7 @@ import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import { Tip } from '@/components/ui/tooltip'
 import { getCronJobRuns, type SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { fmtDayTime, relativeTime } from '@/lib/time'
+import { fmtDayTime, normalizeTimestampMs, relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { $selectedStoredSessionId } from '@/store/session'
 import type { CronJob } from '@/types/hermes'
@@ -47,11 +47,13 @@ function nextRunMs(job: CronJob): null | number {
 // the timestamp is what tells them apart. Compact (no year, no seconds) for the
 // narrow sidebar.
 function formatRunTime(seconds?: null | number): string {
-  if (!seconds) {
+  const ms = normalizeTimestampMs(seconds)
+
+  if (!ms) {
     return '—'
   }
 
-  const date = new Date(seconds * 1000)
+  const date = new Date(ms)
 
   return Number.isNaN(date.valueOf()) ? '—' : fmtDayTime.format(date)
 }

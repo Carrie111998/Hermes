@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,20 @@ def _trim_text(text: str, limit: int = _MAX_BODY_CHARS) -> str:
     return cleaned[: limit - 20] + "\n…[truncated]"
 
 
+def _normalize_result_url(raw: str) -> str:
+    """Unwrap DuckDuckGo redirect links before returning search results."""
+    value = (raw or "").strip()
+    if value.startswith("//"):
+        value = "https:" + value
+    try:
+        target = parse_qs(urlparse(value).query).get("uddg", [""])[0]
+        if target:
+            return target
+    except Exception:
+        pass
+    return value
+
+
 def _parse_ddg_html_results(page: Any, limit: int) -> list[dict[str, Any]]:
     """Parse DuckDuckGo HTML search results from an open Playwright page."""
     web: list[dict[str, Any]] = []
@@ -80,7 +94,7 @@ def _parse_ddg_html_results(page: Any, limit: int) -> list[dict[str, Any]]:
         link = row.locator("a.result__a").first
         if link.count() == 0:
             continue
-        href = (link.get_attribute("href") or "").strip()
+        href = _normalize_result_url(link.get_attribute("href") or "")
         title = (link.inner_text() or "").strip()
         snippet_loc = row.locator(".result__snippet").first
         description = (

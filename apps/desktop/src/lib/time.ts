@@ -7,6 +7,30 @@ export const MINUTE = 60_000
 export const HOUR = 3_600_000
 export const DAY = 86_400_000
 
+const EPOCH_MS_THRESHOLD = 100_000_000_000
+
+/**
+ * Normalize mixed Unix timestamps to epoch milliseconds.
+ *
+ * - `null` / `undefined` / `NaN` / non-finite => `null`
+ * - `<= 0` => `null` (preserves existing "no timestamp" semantics)
+ * - `< EPOCH_MS_THRESHOLD` => treated as Unix seconds
+ * - otherwise => treated as epoch milliseconds
+ */
+export function normalizeTimestampMs(value: null | number | undefined): null | number {
+  if (!Number.isFinite(value)) {
+    return null
+  }
+
+  const numeric = Number(value)
+
+  if (numeric <= 0) {
+    return null
+  }
+
+  return numeric < EPOCH_MS_THRESHOLD ? numeric * SECOND : numeric
+}
+
 // ── Absolute date/time formatters ──────────────────────────────────────────
 // `hh:mm` clock (thread today/yesterday lines).
 export const fmtClock = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' })

@@ -151,7 +151,6 @@ import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
-import { resolveWatchdogPrewarmedBackend } from './watchdog-backend'
 import {
   RemoteLivenessTracker,
   RemoteRevalidationCoordinator,
@@ -194,6 +193,7 @@ import {
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
+import { resolveWatchdogPrewarmedBackend } from './watchdog-backend'
 import {
   computeWindowOptions,
   debounce,

@@ -867,6 +867,25 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             )
             response_data = provider.search(query, limit)
 
+            # Keep the configured provider as the primary path. Only a
+            # genuine provider failure/empty result enters the local
+            # CloakBrowser fallback; this avoids changing normal routing.
+            if not response_data.get("success") or not response_data.get("data", {}).get("web"):
+                from plugins.web.cloakbrowser.fallback import (
+                    manual_browser_hint,
+                    search_after_failure,
+                )
+
+                primary_error = response_data.get("error", "empty search result")
+                fallback_data = search_after_failure(query, limit)
+                if fallback_data.get("success"):
+                    response_data = fallback_data
+                else:
+                    response_data["error"] = (
+                        f"{primary_error}; {fallback_data.get('error', 'CloakBrowser failed')}. "
+                        + manual_browser_hint(query)
+                    )
+
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         debug_call_data["final_response_size"] = len(result_json)

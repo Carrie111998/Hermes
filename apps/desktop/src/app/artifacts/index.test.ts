@@ -67,6 +67,33 @@ describe('collectArtifactsForSession', () => {
     })
   })
 
+  it('normalizes session-level unix-second timestamps to epoch milliseconds', () => {
+    const session = makeSession({ last_active: 1_700_000_000, started_at: 1_699_000_000 })
+
+    const artifacts = collectArtifactsForSession(session, [
+      {
+        content: 'Reference: https://example.com/status',
+        role: 'assistant'
+      }
+    ])
+
+    expect(artifacts).toHaveLength(1)
+    expect(artifacts[0]?.timestamp).toBe(1_700_000_000_000)
+  })
+
+  it('keeps message timestamps that are already in milliseconds', () => {
+    const artifacts = collectArtifactsForSession(makeSession({ last_active: 1_700_000_000 }), [
+      {
+        content: 'Reference: https://example.com/docs',
+        role: 'assistant',
+        timestamp: 1_700_000_123_456
+      }
+    ])
+
+    expect(artifacts).toHaveLength(1)
+    expect(artifacts[0]?.timestamp).toBe(1_700_000_123_456)
+  })
+
   it('resolves remote image artifact thumbnails through the desktop fs bridge', async () => {
     const api = vi.fn(async ({ path }: { path: string }) => {
       if (path.startsWith('/api/fs/read-data-url?')) {
