@@ -615,6 +615,7 @@ def _build_apikey_providers_list() -> list:
         "Arcee AI": "arcee", "GMI Cloud": "gmi", "DeepSeek": "deepseek",
         "Hugging Face": "huggingface", "NVIDIA NIM": "nvidia",
         "Alibaba/DashScope": "alibaba", "MiniMax": "minimax",
+        "Alibaba Cloud (Coding Plan)": "alibaba-coding-plan", "Alibaba Cloud (Coding Plan CN)": "alibaba-coding-plan-cn",
         "MiniMax (China)": "minimax-cn",
         "Kilo Code": "kilocode", "OpenCode Zen": "opencode-zen",
         "OpenCode Go": "opencode-go",
