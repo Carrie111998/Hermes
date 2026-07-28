@@ -1879,6 +1879,75 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
+def _is_strictly_newer(candidate: str, existing: str) -> bool:
+    """True if ``candidate`` is a later instant than ``existing``.
+
+    Compared as instants, not strings: these timestamps carry a local UTC
+    offset that shifts across a DST boundary (-04:00 → -05:00), so a lexical
+    compare can rank a genuinely later run as older. Unparseable input falls
+    back to the lexical order rather than blocking the stamp outright.
+    """
+    try:
+        return (_ensure_aware(datetime.fromisoformat(candidate))
+                > _ensure_aware(datetime.fromisoformat(existing)))
+    except (TypeError, ValueError):
+        return candidate > existing
+
+
+def mark_job_interrupted(job_id: str, *, ran_at: str,
+                         error: Optional[str] = None) -> bool:
+    """Record that a job fired but its outcome was never durably written.
+
+    ``mark_job_run()`` is the only writer of ``last_run_at``, and it runs at the
+    END of a run inside the owning process, while ``advance_next_run()`` moves
+    ``next_run_at`` BEFORE it. Kill the owner in between and the schedule has
+    advanced but the job record still reports its previous clean completion —
+    a daily job then reads as days-idle while its side effects demonstrably
+    ran. The execution ledger already proves the attempt happened; this carries
+    that verdict back so jobs.json under-reports nothing.
+
+    Deliberately narrower than ``mark_job_run()``: ``next_run_at`` is left
+    alone (already advanced pre-run — recomputing here would skip a fire),
+    ``repeat.completed`` is not incremented (an unknown outcome is not a known
+    completion, and bumping it can trip the one-shot repeat-limit deletion),
+    and ``consecutive_errors`` is untouched (unknown is not a known failure, so
+    it must not drive error alerting).
+
+    Returns True if the record was stamped.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            # Never regress a newer outcome. A recovery pass can run after the
+            # job has already completed cleanly again (long-lived ledger row,
+            # delayed restart); the fresher truth wins.
+            previous = job.get("last_run_at")
+            if previous and not _is_strictly_newer(ran_at, previous):
+                logger.info(
+                    "mark_job_interrupted: job '%s' already reports a newer run "
+                    "(%s >= %s) — leaving it alone",
+                    job.get("name", job_id), previous, ran_at,
+                )
+                return False
+            job["last_run_at"] = ran_at
+            job["last_status"] = "unknown"
+            job["last_error"] = error
+            save_jobs(jobs)
+            logger.warning(
+                "Job '%s' fired at %s but its owner exited before recording an "
+                "outcome — marked last_status=unknown",
+                job.get("name", job_id), ran_at,
+            )
+            return True
+
+    logger.info(
+        "mark_job_interrupted: job_id %s not found (deleted since it ran)", job_id
+    )
+    return False
+
+
 def claim_dispatch(job_id: str) -> bool:
     """Atomically claim a finite one-shot job dispatch BEFORE execution.
 

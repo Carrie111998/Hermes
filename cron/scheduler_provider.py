@@ -83,10 +83,39 @@ class CronScheduler(ABC):
         return None
 
     def recover_interrupted(self) -> int:
-        """Run profile-local attempt recovery for every provider lifecycle."""
-        from cron.executions import recover_interrupted_executions
+        """Run profile-local attempt recovery for every provider lifecycle.
 
-        return recover_interrupted_executions()
+        Also carries each recovered verdict onto the job record. jobs.json's
+        ``last_run_at`` is written only by ``mark_job_run()`` at the end of a
+        run, so an owner that dies mid-run leaves the job reporting its
+        previous clean completion — with ``next_run_at`` already advanced, that
+        reads as "never ran" indefinitely for anything less frequent than the
+        restart cadence. The ledger knows better; propagate it.
+        """
+        import logging
+
+        from cron.executions import recover_interrupted_execution_records
+        from cron.jobs import mark_job_interrupted
+
+        logger = logging.getLogger("cron.scheduler_provider")
+        records = recover_interrupted_execution_records()
+        for record in records:
+            try:
+                mark_job_interrupted(
+                    record["job_id"],
+                    # started_at is when the side effects began; a claimed-but-
+                    # never-started attempt only has claimed_at.
+                    ran_at=record.get("started_at") or record["claimed_at"],
+                    error=record.get("error"),
+                )
+            except Exception as e:
+                # One unwritable job record must not abandon the rest of the
+                # pass — the ledger is already correct either way.
+                logger.warning(
+                    "Could not stamp interrupted run onto job %s: %s",
+                    record.get("job_id"), e,
+                )
+        return len(records)
 
     def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the

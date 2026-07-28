@@ -283,8 +283,8 @@ def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
     stop = __import__("threading").Event()
     stop.set()
     monkeypatch.setattr(
-        "cron.executions.recover_interrupted_executions",
-        lambda: events.append("recover") or 0,
+        "cron.executions.recover_interrupted_execution_records",
+        lambda: events.append("recover") or [],
         raising=False,
     )
     monkeypatch.setattr("cron.jobs.record_ticker_heartbeat", lambda **_kwargs: events.append("heartbeat"))
@@ -301,8 +301,8 @@ def test_external_provider_start_recovers_interrupted_records(monkeypatch):
     provider._client = type("Client", (), {"arm": lambda self, **kwargs: None})()
     events = []
     monkeypatch.setattr(
-        "cron.executions.recover_interrupted_executions",
-        lambda: events.append("recover") or 0,
+        "cron.executions.recover_interrupted_execution_records",
+        lambda: events.append("recover") or [],
     )
     monkeypatch.setattr(provider, "reconcile", lambda: events.append("reconcile"))
 
@@ -326,3 +326,142 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+# =========================================================================
+# Orphaned write-back backfill
+# =========================================================================
+# jobs.json's ``last_run_at`` is written ONLY by mark_job_run() at the end of a
+# run, in the owning process, while advance_next_run() moves ``next_run_at``
+# BEFORE the run. When the owner dies in between, next_run_at advanced but
+# last_run_at did not, so the job silently reports its previous clean
+# completion forever. Observed 2026-07-27: financier-snapshot-pm produced its
+# snapshot artifact at 16:12 but jobs.json still claimed a 2026-07-24 run
+# because gateway pid 6668 died before mark_job_run(). The ledger knew
+# (status='unknown') but nothing carried that back to jobs.json.
+
+
+def _point_jobs(monkeypatch, tmp_path):
+    import cron.jobs as jobs
+
+    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    return jobs
+
+
+def _orphan(executions, job_id):
+    """Create an attempt whose owner process is provably gone."""
+    record = executions.create_execution(job_id, source="builtin")
+    executions.mark_execution_running(record["id"])
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
+            ("dead-owner", -1, record["id"]),
+        )
+    # Re-read: the create_execution() row predates the running transition, so
+    # its started_at is still None.
+    return executions.latest_execution(job_id)
+
+
+def test_recovery_returns_records_and_count_stays_int(monkeypatch, tmp_path):
+    """The records variant exposes the rows; the legacy name still returns a count."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = _orphan(executions, "records-api")
+
+    recovered = executions.recover_interrupted_execution_records()
+
+    assert [row["id"] for row in recovered] == [record["id"]]
+    assert recovered[0]["status"] == "unknown"
+    assert recovered[0]["job_id"] == "records-api"
+    # Idempotent: the row is terminal now, so a second pass recovers nothing.
+    assert executions.recover_interrupted_executions() == 0
+
+
+def test_mark_job_interrupted_stamps_unknown_without_advancing_schedule(
+    monkeypatch, tmp_path
+):
+    """An orphaned run lands last_run_at/last_status but must not move the schedule."""
+    jobs = _point_jobs(monkeypatch, tmp_path)
+    job = jobs.create_job(prompt="snapshot", schedule="every 1h", name="snap")
+    jobs.advance_next_run(job["id"])  # pre-run advance, as the scheduler does
+    armed_next = jobs.get_job(job["id"])["next_run_at"]
+
+    assert jobs.mark_job_interrupted(
+        job["id"], ran_at="2026-07-27T16:10:45.551353-04:00", error="owner exited"
+    ) is True
+
+    stamped = jobs.get_job(job["id"])
+    assert stamped["last_run_at"] == "2026-07-27T16:10:45.551353-04:00"
+    assert stamped["last_status"] == "unknown"
+    assert stamped["last_error"] == "owner exited"
+    # next_run_at was already advanced pre-run — re-advancing would skip a fire.
+    assert stamped["next_run_at"] == armed_next
+    # An unknown outcome is not a known completion and not a known error.
+    assert stamped["repeat"]["completed"] == 0
+    assert stamped.get("consecutive_errors", 0) == 0
+
+
+def test_mark_job_interrupted_never_regresses_a_newer_run(monkeypatch, tmp_path):
+    """A late recovery pass must not overwrite a newer clean completion."""
+    jobs = _point_jobs(monkeypatch, tmp_path)
+    job = jobs.create_job(prompt="snapshot", schedule="every 1h", name="snap")
+    jobs.mark_job_run(job["id"], success=True)
+    fresh = jobs.get_job(job["id"])["last_run_at"]
+
+    assert jobs.mark_job_interrupted(
+        job["id"], ran_at="2026-07-24T16:14:54.214437-04:00", error="stale orphan"
+    ) is False
+
+    unchanged = jobs.get_job(job["id"])
+    assert unchanged["last_run_at"] == fresh
+    assert unchanged["last_status"] == "ok"
+
+
+def test_mark_job_interrupted_ignores_unknown_job(monkeypatch, tmp_path):
+    jobs = _point_jobs(monkeypatch, tmp_path)
+    jobs.save_jobs([])
+
+    assert jobs.mark_job_interrupted("ghost", ran_at="2026-07-27T16:10:45-04:00") is False
+
+
+def test_restart_backfills_jobs_json_for_orphaned_run(monkeypatch, tmp_path):
+    """The reported bug: a dead owner must not leave jobs.json reporting a stale run.
+
+    financier-snapshot-pm ran and produced its artifact, but its gateway died
+    before mark_job_run(). jobs.json kept reporting the previous clean run days
+    later. Recovery must carry the ledger's verdict back onto the job record.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    jobs = _point_jobs(monkeypatch, tmp_path)
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    job = jobs.create_job(prompt="", schedule="every 1d", name="financier-snapshot-pm")
+    jobs.mark_job_run(job["id"], success=True)
+    stale_run = jobs.get_job(job["id"])["last_run_at"]
+
+    record = _orphan(executions, job["id"])
+
+    assert InProcessCronScheduler().recover_interrupted() == 1
+
+    backfilled = jobs.get_job(job["id"])
+    assert backfilled["last_run_at"] != stale_run
+    assert backfilled["last_run_at"] == record["started_at"]
+    assert backfilled["last_status"] == "unknown"
+    assert "owner exited" in backfilled["last_error"]
+
+
+def test_recovery_backfill_survives_a_missing_job_record(monkeypatch, tmp_path):
+    """A ledger row for a since-deleted job must not abort the recovery pass."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    jobs = _point_jobs(monkeypatch, tmp_path)
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    job = jobs.create_job(prompt="", schedule="every 1d", name="survivor")
+    _orphan(executions, "deleted-job")
+    _orphan(executions, job["id"])
+
+    assert InProcessCronScheduler().recover_interrupted() == 2
+    assert jobs.get_job(job["id"])["last_status"] == "unknown"
