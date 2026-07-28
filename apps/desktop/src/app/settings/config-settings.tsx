@@ -29,6 +29,7 @@ import { PanelEmpty } from '../overlays/panel'
 
 import { ConfigField } from './config-field'
 import { enumOptionsFor, getNested, isExternalMemoryProvider, sectionFieldEntries, setNested } from './helpers'
+import { FIELD_DESCRIPTIONS, FIELD_LABELS } from './constants'
 import { MemoryConnect } from './memory/connect'
 import { ProviderConfigPanel } from './memory/provider-config-panel'
 import { ModelSettings, ModelSettingsSkeleton } from './model-settings'
@@ -316,11 +317,14 @@ export function ConfigSettings({
           <QuickEntrySettings />
         </>
       )}
+      {activeSectionId === 'performance' && config && (
+        <PerformanceSettings config={config} updateConfig={updateConfig} />
+      )}
       {/* Device-local attach/preview byte cap (main-process IPC guard). Chat is
           where image-attachment behavior already lives, so this sits above the
           schema fields for that section. */}
       {activeSectionId === 'chat' ? <AttachmentSizeSetting /> : null}
-      {visibleFields.length === 0 && activeSectionId !== 'chat' ? (
+      {visibleFields.length === 0 && activeSectionId !== 'chat' && activeSectionId !== 'performance' ? (
         <EmptyState description={c.emptyDesc} title={c.emptyTitle} />
       ) : visibleFields.length === 0 ? null : (
         <div className="grid gap-1">
@@ -428,5 +432,57 @@ function AttachmentSizeSetting() {
       description={c.attachmentSizeDesc}
       title={c.attachmentSizeTitle}
     />
+  )
+}
+
+// Performance panel: two bespoke toggles that don't map to a single schema
+// field each. Max Speed writes delegation.max_concurrent_children (12 on /
+// 3 off) so the orchestrator fans out up to 12 parallel subagents. GPU
+// Acceleration writes desktop.disable_gpu (false = GPU on, true = software);
+// the CLI bridges that to HERMES_DESKTOP_DISABLE_GPU before the Electron app
+// launches, so the change takes effect on the next app start.
+const MAX_SPEED_ON = 12
+const MAX_SPEED_OFF = 3
+
+function PerformanceSettings({
+  config,
+  updateConfig
+}: {
+  config: HermesConfigRecord
+  updateConfig: (next: HermesConfigRecord) => void
+}) {
+  const { t } = useI18n()
+
+  const maxConcurrent = Number(getNested(config, 'delegation.max_concurrent_children') ?? MAX_SPEED_OFF)
+  const maxSpeedOn = maxConcurrent >= MAX_SPEED_ON
+
+  const disableGpuRaw = getNested(config, 'desktop.disable_gpu')
+  // `auto` / false / "0" → GPU enabled (toggle on). true / "1" → disabled.
+  const gpuOn = !(disableGpuRaw === true || disableGpuRaw === 'true' || disableGpuRaw === '1')
+
+  const setMaxSpeed = (on: boolean) => {
+    updateConfig(setNested(config, 'delegation.max_concurrent_children', on ? MAX_SPEED_ON : MAX_SPEED_OFF))
+  }
+
+  const setGpu = (on: boolean) => {
+    // Persist as a boolean so the CLI normalizes it to "0"/"1" for the env bridge.
+    updateConfig(setNested(config, 'desktop.disable_gpu', on ? false : true))
+  }
+
+  return (
+    <div className="grid gap-1">
+      <ToggleRow
+        checked={maxSpeedOn}
+        description={FIELD_DESCRIPTIONS['maxSpeed'] ?? 'Run up to 12 parallel subagents (vs the default 3).'}
+        label={FIELD_LABELS['maxSpeed'] ?? 'Max Speed'}
+        onChange={setMaxSpeed}
+      />
+      <ToggleRow
+        checked={gpuOn}
+        description={FIELD_DESCRIPTIONS['desktop.disableGpu'] ?? 'Use the GPU for rendering. Off forces software rendering.'}
+        label={FIELD_LABELS['desktop.disableGpu'] ?? 'GPU Acceleration'}
+        onChange={setGpu}
+      />
+    </div>
   )
 }

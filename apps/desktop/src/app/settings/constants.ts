@@ -9,7 +9,8 @@ import {
   Moon,
   Palette,
   Sun,
-  Wrench
+  Wrench,
+  Zap
 } from '@/lib/icons'
 import { REASONING_EFFORTS } from '@/lib/reasoning-effort'
 import type { ThemeMode } from '@/themes/context'
@@ -396,8 +397,13 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
   desktop: {
     repoScanEnabled: 'Automatic Repository Discovery',
     repoScanRoots: 'Repository Discovery Roots',
-    repoScanExcludePaths: 'Excluded Repository Paths'
+    repoScanExcludePaths: 'Excluded Repository Paths',
+    disableGpu: 'GPU Acceleration',
+    gpuAcceleration: 'GPU Acceleration'
   },
+  // Synthetic (non-config) label for the Max Speed toggle: it writes
+  // delegation.max_concurrent_children (12 on / 3 off) rather than its own key.
+  maxSpeed: 'Max Speed',
   agent: {
     maxTurns: 'Max Agent Steps',
     imageInputMode: 'Image Attachments',
@@ -562,8 +568,11 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   desktop: {
     repoScanEnabled: 'Scan local folders for Git repositories to show in Projects.',
     repoScanRoots: 'Folders to scan. Leave empty to scan your home directory.',
-    repoScanExcludePaths: 'Folders and their descendants to skip during repository discovery.'
+    repoScanExcludePaths: 'Folders and their descendants to skip during repository discovery.',
+    disableGpu: 'Use the GPU for rendering. Off forces software rendering (helps on GPU-less VMs / remote displays).',
+    gpuAcceleration: 'Use the GPU for rendering. Off forces software rendering (helps on GPU-less VMs / remote displays).'
   },
+  maxSpeed: 'Run up to 12 parallel subagents (vs the default 3) for max-throughput fan-out.',
   timezone: 'Used when Hermes needs local time context. Blank uses the system timezone.',
   agent: {
     imageInputMode: 'Controls how image attachments are sent to the model.',
@@ -776,6 +785,16 @@ export const SECTIONS: DesktopConfigSection[] = [
       'delegation.reasoning_effort',
       'updates.non_interactive_local_changes'
     ]
+  },
+  {
+    id: 'performance',
+    label: 'Performance',
+    icon: Zap,
+    // Custom-rendered toggles (see ConfigSettings `performance` branch):
+    // Max Speed writes delegation.max_concurrent_children (12/3), and GPU
+    // Acceleration writes desktop.disable_gpu. Empty keys keeps the generic
+    // field loop from double-rendering them as raw schema fields.
+    keys: []
   }
 ]
 

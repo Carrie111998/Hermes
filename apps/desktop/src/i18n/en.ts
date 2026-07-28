@@ -409,7 +409,8 @@ export const en: Translations = {
       safety: 'Safety',
       memory: 'Memory & Context',
       voice: 'Voice',
-      advanced: 'Advanced'
+      advanced: 'Advanced',
+      performance: 'Performance'
     },
     searchPlaceholder: {
       about: 'About Hermes Desktop',
