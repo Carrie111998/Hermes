@@ -512,7 +512,7 @@ class WorkflowEngine:
             if context:
                 task_with_context += f"\n\nContext: {json.dumps(context)}"
 
-        title = f"[{node.id}] {node.agent}: {node.task[:60]}"
+        title = f"[{node.id}] {node.agent}: {task_with_context[:60]}"
         # Resolve {context_var} placeholders in the agent field.
         # This lets workflows accept agent profile names at runtime
         # via context (e.g., agent: "{target_agent}").
