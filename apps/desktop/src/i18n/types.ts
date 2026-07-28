@@ -479,6 +479,7 @@ export interface Translations {
       autosaveFailed: string
       imported: string
       invalidJson: string
+      toolsetsWipeConfirm: string
       keepAwakeTitle: string
       keepAwakeDesc: string
       attachmentSizeTitle: string
