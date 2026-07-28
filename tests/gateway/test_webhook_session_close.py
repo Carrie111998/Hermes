@@ -51,9 +51,13 @@ class _FakeRunner:
     def __init__(self, store: SessionStore):
         self.session_store = store
         self._session_db = store._db
+        self.evicted_session_keys = []
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         return self.session_store._generate_session_key(source)
+
+    def _evict_cached_agent(self, session_key: str) -> None:
+        self.evicted_session_keys.append(session_key)
 
 
 def _make_store(tmp_path) -> SessionStore:
@@ -144,6 +148,9 @@ async def test_completed_webhook_delivery_closes_its_session(tmp_path):
         "prune_sessions can never reap it (the ghost-session leak)"
     )
     assert row["end_reason"] == "webhook_complete"
+    assert runner.evicted_session_keys == [
+        runner._session_key_for_source(event.source)
+    ]
 
     # And the closed row is actually prunable, unlike the pre-fix leak.
     pruned = store._db.prune_sessions(older_than_days=0, source="webhook")
@@ -184,6 +191,9 @@ async def test_webhook_session_closed_even_when_agent_run_raises(tmp_path):
         "on the error path"
     )
     assert row["end_reason"] == "webhook_complete"
+    assert runner.evicted_session_keys == [
+        runner._session_key_for_source(event.source)
+    ]
     store._db.close()
 
 
@@ -209,4 +219,7 @@ async def test_end_webhook_session_awaits_async_session_db(tmp_path):
     row = store._db.get_session(entry.session_id)
     assert row["ended_at"] is not None
     assert row["end_reason"] == "webhook_complete"
+    assert runner.evicted_session_keys == [
+        runner._session_key_for_source(event.source)
+    ]
     store._db.close()
