@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import enum
 import faulthandler
 import inspect
 import json
@@ -9923,9 +9924,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _agent, context="shutdown idle-cache"
                     )
 
-            # Drain completion-batch flush tasks before adapter teardown
-            # so they get a last chance to deliver (or be cancelled cleanly
-            # with all waiters resolved as retryable).
+            # Drain completion-batch flush tasks before adapter teardown.
+            # Cancel each pending flush so its CancelledError handler
+            # resolves every waiter as retryable (False).  Awaited with
+            # shield + deadline so the cancellation + waiter resolution
+            # completes before adapters disappear.
             _flush_tasks = [
                 _t for _t in list(self._background_tasks)
                 if _t is not self._stop_task
@@ -18485,16 +18488,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # Process completion batching (#70300 / PR #71900)
     # ------------------------------------------------------------------
 
+    class CompletionDisposition(enum.Enum):
+        """Explicit resolution for every completion notification waiter.
+
+        Replaces the ``Optional[bool]`` tri-state returned by
+        ``_deliver_completion_notification()`` (still used for backward
+        compatibility) with explicit variants that prevent silent
+        consumption of completions.
+        """
+        DELIVERED = "delivered"            # adapter accepted; do not retry
+        RETRY = "retry"                    # transient failure; watcher should retry
+        DROP_DUPLICATE = "drop_duplicate"  # already delivered by another path
+        DROP_UNROUTABLE = "drop_unroutable"  # permanently unroutable; do not retry
+        SHUTTING_DOWN = "shutting_down"    # gateway shutting down; retry next cycle
+
+    @staticmethod
+    def _bool_to_disposition(result: Optional[bool]) -> "CompletionDisposition":
+        """Map legacy ``Optional[bool]`` to ``CompletionDisposition``."""
+        if result is True:
+            return GatewayRunner.CompletionDisposition.DELIVERED
+        if result is False:
+            return GatewayRunner.CompletionDisposition.RETRY
+        return GatewayRunner.CompletionDisposition.DROP_UNROUTABLE
+
     @staticmethod
     def _completion_notification_batch_key(evt: dict) -> tuple:
-        """Return a routing-complete key for short-window process fan-in."""
+        """Return a routing-complete key for short-window process fan-in.
+
+        Uses a sentinel for ``None`` so that ``None`` and ``""`` produce
+        distinct keys — preventing session-boundary crossing.
+        """
+        _NONE = "\x00<none>"
         return (
-            str(evt.get("session_key") or ""),
-            str(evt.get("platform") or ""),
-            str(evt.get("chat_type") or ""),
-            str(evt.get("chat_id") or ""),
-            str(evt.get("thread_id") or ""),
-            str(evt.get("user_id") or ""),
+            _NONE if evt.get("session_key") is None else str(evt.get("session_key") or ""),
+            _NONE if evt.get("platform") is None else str(evt.get("platform") or ""),
+            _NONE if evt.get("chat_type") is None else str(evt.get("chat_type") or ""),
+            _NONE if evt.get("chat_id") is None else str(evt.get("chat_id") or ""),
+            _NONE if evt.get("thread_id") is None else str(evt.get("thread_id") or ""),
+            _NONE if evt.get("user_id") is None else str(evt.get("user_id") or ""),
         )
 
     @staticmethod
@@ -18634,19 +18665,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 delivered = False
             finally:
+                disposition = self._bool_to_disposition(delivered)
                 for _text, _evt, future in entries:
                     if not future.done():
-                        future.set_result(delivered)
+                        future.set_result(disposition)
         except asyncio.CancelledError:
             # Shutdown or lifecycle cancellation — detach the batch,
-            # resolve every waiter as retryable (False) so callers retry
-            # or surface correctly, then re-raise.
+            # resolve every waiter as RETRY so callers retry or surface
+            # correctly, then re-raise.
             stale = self._completion_notification_batches.pop(key, [])
             if self._completion_notification_batch_tasks.get(key) is current_task:
                 self._completion_notification_batch_tasks.pop(key, None)
             for _text, _evt, future in stale:
                 if not future.done():
-                    future.set_result(False)
+                    future.set_result(self.CompletionDisposition.RETRY)
             raise
         finally:
             if self._completion_notification_batch_tasks.get(key) is current_task:
@@ -18654,7 +18686,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _enqueue_process_completion_notification(
         self, synth_text: str, evt: dict,
-    ) -> Optional[bool]:
+    ) -> "CompletionDisposition":
         """Fan in concurrent process completions that share one conversation.
 
         Completions are grouped by route for up to
@@ -18663,18 +18695,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Single completions pay the full batching window — there is no
         zero-latency shortcut because true zero-latency requires limiting
         coalescing to work already available in the same loop tick.
+
+        Returns a ``CompletionDisposition`` so callers can decide whether
+        to retry or drop without relying on overloaded ``Optional[bool]``.
         """
         if not hasattr(self, "_completion_notification_batches"):
             self._completion_notification_batches = {}
             self._completion_notification_batch_tasks = {}
             self._completion_notification_batch_lock = __import__("threading").Lock()
             self._completion_notification_batch_window = 0.1
+            self._completion_notification_batch_max = 50
 
         key = self._completion_notification_batch_key(evt)
         future = asyncio.get_running_loop().create_future()
 
         with self._completion_notification_batch_lock:
             batch = self._completion_notification_batches.setdefault(key, [])
+            if len(batch) >= self._completion_notification_batch_max:
+                # Cap reached — resolve immediately as dropped so the
+                # watcher doesn't wait for a flush that will never include
+                # this entry.
+                future.set_result(self.CompletionDisposition.DROP_UNROUTABLE)
+                return await future
             batch.append((synth_text, evt, future))
 
             # P1: schedule flush as a lifecycle-owned background task
@@ -18762,8 +18804,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         snippet_lines = []
                         for e in group[:5]:
                             sid = str(e.get("session_id", "?"))
-                            cmd = str(e.get("command", ""))[:100]
-                            out = str(e.get("output", ""))[:120]
+                            cmd = _redact_gateway_user_facing_secrets(
+                                str(e.get("command", ""))[:100]
+                            )
+                            out = _redact_gateway_user_facing_secrets(
+                                str(e.get("output", ""))[:120]
+                            )
                             sup = e.get("suppressed", 0)
                             line = f"  {sid}: {cmd}"
                             if out:
@@ -18982,7 +19028,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     delivered = await self._enqueue_process_completion_notification(
                         synth_text, completion_evt,
                     )
-                    if delivered is False:
+                    if delivered is self.CompletionDisposition.RETRY:
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.
                         continue
