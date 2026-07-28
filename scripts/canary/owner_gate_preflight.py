@@ -912,6 +912,7 @@ def _validate_host(
         "project_ancestry_evidence_sha256", "project_ancestry_chain_sha256",
         "resource_ancestor_chain",
         "install_receipt_sha256", "install_receipt_file_sha256",
+        "terminal_receipt_sha256",
         "cloud_signer_provisioning_receipt_sha256",
         "cloud_signer_readiness_sha256",
         "host_signer_provisioning_receipt_sha256",
@@ -943,6 +944,7 @@ def _validate_host(
                 "project_ancestry_chain_sha256",
                 "install_receipt_sha256",
                 "install_receipt_file_sha256",
+                "terminal_receipt_sha256",
                 "cloud_signer_provisioning_receipt_sha256",
                 "cloud_signer_readiness_sha256",
                 "host_signer_provisioning_receipt_sha256",
@@ -1173,6 +1175,7 @@ def _validate_cross_observation_binding(
             "project_ancestry_chain_sha256",
         ),
         ("resource_ancestor_chain", "resource_ancestor_chain"),
+        ("terminal_receipt_sha256", "terminal_receipt_sha256"),
         (
             "attached_sa_permission_probe_report_sha256",
             "attached_sa_permission_probe_report_sha256",

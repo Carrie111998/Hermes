@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -373,6 +374,7 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
         preflight_runner: Any = subprocess.run,
         preflight_timeout_seconds: float = 30.0,
     ) -> None:
+        process_isolated_preflight_runner = preflight_runner is subprocess.run
         super().__init__(
             owner_identity,
             gcloud_executable=gcloud_executable,
@@ -385,6 +387,9 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
             popen_factory=popen_factory,
             preflight_runner=preflight_runner,
             preflight_timeout_seconds=preflight_timeout_seconds,
+        )
+        self._process_isolated_preflight_runner = (
+            process_isolated_preflight_runner
         )
 
     def _remote_argv(
@@ -448,17 +453,77 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
         )
 
     def _authorization_snapshot(self, account: str) -> tuple[str, str, str]:
-        instance = self._run_read_only_gcloud_json((
-            "compute",
-            "instances",
-            "describe",
-            PRODUCTION_VM_NAME,
-            f"--project={PRODUCTION_PROJECT}",
-            f"--zone={PRODUCTION_ZONE}",
-            f"--account={account}",
-            "--format=json(id,name,zone,metadata.items)",
-            "--quiet",
-        ))
+        commands = {
+            "instance": (
+                "compute",
+                "instances",
+                "describe",
+                PRODUCTION_VM_NAME,
+                f"--project={PRODUCTION_PROJECT}",
+                f"--zone={PRODUCTION_ZONE}",
+                f"--account={account}",
+                "--format=json(id,name,zone,metadata.items)",
+                "--quiet",
+            ),
+            "project": (
+                "compute",
+                "project-info",
+                "describe",
+                f"--project={PRODUCTION_PROJECT}",
+                f"--account={account}",
+                "--format=json(name,commonInstanceMetadata.items)",
+                "--quiet",
+            ),
+            "profile": (
+                "compute",
+                "os-login",
+                "describe-profile",
+                f"--project={PRODUCTION_PROJECT}",
+                f"--account={account}",
+                "--format=json",
+                "--quiet",
+            ),
+        }
+        values: dict[str, Any] = {}
+        failures: dict[str, BaseException] = {}
+        ordered = ("instance", "project", "profile")
+        if self._process_isolated_preflight_runner:
+            # Each future invokes the exact process runner independently. No
+            # mutable SDK client/session is shared across worker threads.
+            with ThreadPoolExecutor(
+                max_workers=3,
+                thread_name_prefix="production-iap-authorization",
+            ) as pool:
+                futures = {
+                    name: pool.submit(
+                        self._run_read_only_gcloud_json,
+                        commands[name],
+                    )
+                    for name in ordered
+                }
+                for name in ordered:
+                    try:
+                        values[name] = futures[name].result()
+                    except BaseException as exc:
+                        failures[name] = exc
+        else:
+            # The injected test seam may close over mutable state, so preserve
+            # the original deterministic single-threaded contract.
+            for name in ordered:
+                try:
+                    values[name] = self._run_read_only_gcloud_json(
+                        commands[name]
+                    )
+                except BaseException as exc:
+                    failures[name] = exc
+                    break
+        if failures:
+            raise failures[
+                next(name for name in ordered if name in failures)
+            ]
+        instance = values["instance"]
+        project = values["project"]
+        profile = values["profile"]
         instance_metadata = self._metadata_items(instance, "metadata")
         if (
             set(instance) != {"id", "name", "zone", "metadata"}
@@ -476,15 +541,6 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 "iap_ssh_authorization_invalid"
             )
 
-        project = self._run_read_only_gcloud_json((
-            "compute",
-            "project-info",
-            "describe",
-            f"--project={PRODUCTION_PROJECT}",
-            f"--account={account}",
-            "--format=json(name,commonInstanceMetadata.items)",
-            "--quiet",
-        ))
         self._metadata_items(project, "commonInstanceMetadata")
         if (
             set(project) != {"name", "commonInstanceMetadata"}
@@ -494,15 +550,6 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 "iap_ssh_authorization_invalid"
             )
 
-        profile = self._run_read_only_gcloud_json((
-            "compute",
-            "os-login",
-            "describe-profile",
-            f"--project={PRODUCTION_PROJECT}",
-            f"--account={account}",
-            "--format=json",
-            "--quiet",
-        ))
         posix_accounts = profile.get("posixAccounts")
         ssh_keys = profile.get("sshPublicKeys")
         public_key = self._known_hosts.public_key_line()

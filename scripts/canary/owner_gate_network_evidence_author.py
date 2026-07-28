@@ -17,6 +17,7 @@ import math
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -490,6 +491,58 @@ def _collect_raw(run_json: RunJson) -> Mapping[str, Any]:
     raw["serverless_connectors"] = {
         region: run_json(connector_command(region)) for region in names
     }
+    return raw
+
+
+def _collect_raw_parallel(run_json: RunJson) -> Mapping[str, Any]:
+    """Parallel read seam for the exact stateless subprocess runtime only."""
+
+    if not callable(run_json):
+        raise OwnerGateNetworkEvidenceAuthorError(
+            "owner_gate_network_runner_invalid"
+        )
+
+    def collect_many(
+        commands: Mapping[str, tuple[str, ...]],
+    ) -> dict[str, Any]:
+        if not commands:
+            return {}
+        ordered = tuple(commands)
+        values: dict[str, Any] = {}
+        failures: dict[str, BaseException] = {}
+        with ThreadPoolExecutor(
+            max_workers=min(16, len(ordered)),
+            thread_name_prefix="owner-gate-network-read",
+        ) as pool:
+            futures = {
+                name: pool.submit(run_json, commands[name])
+                for name in ordered
+            }
+            for name in ordered:
+                try:
+                    values[name] = futures[name].result()
+                except BaseException as exc:
+                    failures[name] = exc
+        if failures:
+            raise failures[next(name for name in ordered if name in failures)]
+        return values
+
+    raw = collect_many(inventory_commands())
+    regions = _items(raw["regions"], label="regions")
+    names = sorted({
+        str(item.get("name"))
+        for item in regions
+        if item.get("status") in {"UP", None}
+        and isinstance(item.get("name"), str)
+        and _REGION.fullmatch(str(item["name"])) is not None
+    })
+    if not names or len(names) > _MAX_REGIONS:
+        raise OwnerGateNetworkEvidenceAuthorError(
+            "owner_gate_network_regions_invalid"
+        )
+    raw["serverless_connectors"] = collect_many({
+        region: connector_command(region) for region in names
+    })
     return raw
 
 
@@ -1027,9 +1080,14 @@ def _collect_and_author_with_runtime(
             )
         )
 
-    result = _collect_and_author_with_runner(
+    collector = (
+        _collect_raw_parallel
+        if type(runner) is _SubprocessNetworkEvidenceRunner
+        else _collect_raw
+    )
+    result = _normalize_and_author(
+        collector(run_json),
         release_revision=release_revision,
-        run_json=run_json,
         collected_at_unix=collected_at_unix,
     )
     try:

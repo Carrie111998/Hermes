@@ -23,6 +23,7 @@ import socket
 import ssl
 import stat
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, NoReturn, Sequence
 from urllib.parse import urlsplit
@@ -2496,7 +2497,45 @@ def consume_bound_observation_pair(
     return cloud_observation, host_observation
 
 
-def _collect_and_author_components(
+def _sign_with_stable_terminal(
+    *,
+    signer_method: Any,
+    stage0_transport: Any,
+    phase: str,
+    unsigned_observation: Mapping[str, Any],
+    preparation: Any,
+    handoff: Any,
+    handoff_snapshot: bytes,
+) -> Mapping[str, Any]:
+    """Recheck the exact prepared terminal at the signer call boundary."""
+
+    prepared_terminal = getattr(preparation, "_terminal", None)
+    current_terminal = getattr(handoff, "terminal_receipt", None)
+    host_observation = getattr(handoff, "host_observation", None)
+    if (
+        not callable(signer_method)
+        or not isinstance(prepared_terminal, Mapping)
+        or not isinstance(current_terminal, Mapping)
+        or not isinstance(host_observation, Mapping)
+        or current_terminal.get("terminal_receipt_sha256")
+        != prepared_terminal.get("terminal_receipt_sha256")
+        or _canonical(current_terminal) != _canonical(prepared_terminal)
+        or handoff_snapshot
+        != _canonical({
+            "terminal_receipt": current_terminal,
+            "host_observation": host_observation,
+        })
+    ):
+        _error("owner_gate_cloud_observation_terminal_changed")
+    return signer_method(
+        stage0_transport,
+        phase=phase,
+        unsigned_observation=unsigned_observation,
+        terminal_binding=handoff,
+    )
+
+
+def _collect_and_author_components_with_preparation(
     *,
     plan: foundation.OwnerGateFoundationPlan,
     foundation_apply_chain: Any,
@@ -2511,6 +2550,7 @@ def _collect_and_author_components(
     stage0_transport: Any,
     kit_stream: Any,
     bundle_stream: Any,
+    host_preparation: Any | None,
 ) -> tuple[Mapping[str, Any], Any]:
     """Collect and remotely sign one inert or post-IAM observation."""
 
@@ -2594,13 +2634,20 @@ def _collect_and_author_components(
         != plan.spec.interpreter_sha256
     ):
         _error("owner_gate_cloud_observation_capability_invalid")
-    composite_method = stage0_iap.OwnerGateStage0IapTransport.__dict__.get(
-        "collect_owner_gate_host_observation"
+    prepare_method = stage0_iap.OwnerGateStage0IapTransport.__dict__.get(
+        "prepare_owner_gate_host_observation"
+    )
+    fresh_tail_method = stage0_iap.OwnerGateStage0IapTransport.__dict__.get(
+        "collect_owner_gate_host_observation_fresh_tail"
     )
     signer_method = stage0_iap.OwnerGateStage0IapTransport.__dict__.get(
         "_sign_owner_gate_cloud_observation_on_target"
     )
-    if not callable(composite_method) or not callable(signer_method):
+    if (
+        not callable(prepare_method)
+        or not callable(fresh_tail_method)
+        or not callable(signer_method)
+    ):
         _error("owner_gate_cloud_observation_host_composite_unavailable")
     cloud_public_before = _public_signer_snapshot(
         plan.spec.release_revision,
@@ -2630,23 +2677,112 @@ def _collect_and_author_components(
     handoff_snapshot: bytes | None = None
     try:
         _reject_ambient_network_environment()
+        preparation = host_preparation
+        if preparation is None:
+            try:
+                preparation = prepare_method(
+                    stage0_transport,
+                    phase=phase,
+                    kit_stream=kit_stream,
+                    bundle_stream=bundle_stream,
+                )
+            except launcher.OwnerLauncherError as exc:
+                _error(
+                    "owner_gate_cloud_observation_host_composite_failed",
+                    exc,
+                )
         try:
-            handoff = composite_method(
-                stage0_transport,
-                phase=phase,
-                plan=plan,
-                final_network_evidence=final_network_evidence,
-                final_network_collector_public_key=(
-                    final_network_collector_public_key
-                ),
-                production_ingress_observation_sha256=(
-                    production_ingress_observation_sha256
-                ),
-                kit_stream=kit_stream,
-                bundle_stream=bundle_stream,
+            token = direct_iam_author.acquire_access_token(
+                token_provider=owner_identity
             )
-        except launcher.OwnerLauncherError as exc:
-            _error("owner_gate_cloud_observation_host_composite_failed", exc)
+        except direct_iam_author.DirectIamIdentityAuthorError as exc:
+            _error("owner_gate_cloud_observation_token_unavailable", exc)
+
+        def collect_cloud_facts() -> tuple[int, Mapping[str, Any]]:
+            observed_at = (
+                int(time.time())
+                if collected_at_unix is None
+                else collected_at_unix
+            )
+            if type(observed_at) is not int or observed_at <= 0:
+                _error("owner_gate_cloud_observation_time_invalid")
+            raw = _FixedCloudFactsReader(
+                token=token,
+                plan=plan,
+                ancestry_evidence=identities.ancestry_evidence,
+                phase=phase,
+            ).collect()
+            return observed_at, raw
+
+        cloud_value: tuple[int, Mapping[str, Any]] | None = None
+        cloud_failure: BaseException | None = None
+        host_failure: BaseException | None = None
+        pool_failure: BaseException | None = None
+        wipe_failure: BaseException | None = None
+        try:
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="owner-gate-observation",
+                ) as pool:
+                    cloud_future = pool.submit(collect_cloud_facts)
+                    host_future = pool.submit(
+                        fresh_tail_method,
+                        stage0_transport,
+                        preparation=preparation,
+                        plan=plan,
+                        final_network_evidence=final_network_evidence,
+                        final_network_collector_public_key=(
+                            final_network_collector_public_key
+                        ),
+                        production_ingress_observation_sha256=(
+                            production_ingress_observation_sha256
+                        ),
+                    )
+                    try:
+                        cloud_value = cloud_future.result()
+                    except BaseException as exc:
+                        cloud_failure = exc
+                    try:
+                        handoff = host_future.result()
+                    except BaseException as exc:
+                        host_failure = exc
+            except BaseException as exc:
+                pool_failure = exc
+        finally:
+            try:
+                direct_iam_author.wipe_access_token(token)
+            except BaseException as exc:
+                wipe_failure = exc
+        if wipe_failure is not None or any(token._raw):
+            _error("owner_gate_cloud_observation_token_wipe_failed")
+        try:
+            gcloud_configuration.assert_stable()
+            owner_identity.require_stable()
+        except BaseException as exc:
+            _error("owner_gate_cloud_observation_capability_changed", exc)
+        if pool_failure is not None or (
+            cloud_failure is not None and host_failure is not None
+        ):
+            _error("owner_gate_cloud_observation_concurrent_collection_failed")
+        if host_failure is not None:
+            _error(
+                "owner_gate_cloud_observation_host_composite_failed",
+                host_failure,
+            )
+        if cloud_failure is not None:
+            if isinstance(
+                cloud_failure,
+                OwnerGateCloudObservationAuthorError,
+            ):
+                raise cloud_failure
+            _error(
+                "owner_gate_cloud_observation_cloud_collection_failed",
+                cloud_failure,
+            )
+        if cloud_value is None or handoff is None:
+            _error("owner_gate_cloud_observation_concurrent_collection_failed")
+        observed_at, raw = cloud_value
         verified_probe = _verified_probe_from_host_handoff(
             handoff,
             plan=plan,
@@ -2664,26 +2800,6 @@ def _collect_and_author_components(
             "terminal_receipt": handoff.terminal_receipt,
             "host_observation": handoff.host_observation,
         })
-        observed_at = (
-            int(time.time()) if collected_at_unix is None else collected_at_unix
-        )
-        if type(observed_at) is not int or observed_at <= 0:
-            _error("owner_gate_cloud_observation_time_invalid")
-        try:
-            token = direct_iam_author.acquire_access_token(
-                token_provider=owner_identity
-            )
-        except direct_iam_author.DirectIamIdentityAuthorError as exc:
-            _error("owner_gate_cloud_observation_token_unavailable", exc)
-        raw = _FixedCloudFactsReader(
-            token=token,
-            plan=plan,
-            ancestry_evidence=identities.ancestry_evidence,
-            phase=phase,
-        ).collect()
-        direct_iam_author.wipe_access_token(token)
-        if any(token._raw):
-            _error("owner_gate_cloud_observation_token_wipe_failed")
         unsigned = _unsigned_from_raw(
             plan=plan,
             ancestry_evidence=identities.ancestry_evidence,
@@ -2695,11 +2811,14 @@ def _collect_and_author_components(
             verified_probe=verified_probe,
         )
         try:
-            result = signer_method(
-                stage0_transport,
+            result = _sign_with_stable_terminal(
+                signer_method=signer_method,
+                stage0_transport=stage0_transport,
                 phase=phase,
                 unsigned_observation=unsigned,
-                terminal_binding=handoff,
+                preparation=preparation,
+                handoff=handoff,
+                handoff_snapshot=handoff_snapshot,
             )
         except launcher.OwnerLauncherError as exc:
             _error("owner_gate_cloud_observation_remote_signer_failed", exc)
@@ -2805,6 +2924,44 @@ def _collect_and_author_components(
     return result, handoff
 
 
+def _collect_and_author_components(
+    *,
+    plan: foundation.OwnerGateFoundationPlan,
+    foundation_apply_chain: Any,
+    final_network_evidence: foundation.ProductionNetworkEvidence,
+    final_network_collector_public_key: Ed25519PublicKey,
+    production_ingress_observation: Mapping[str, Any],
+    phase: str,
+    collected_at_unix: int | None,
+    gcloud_executable: launcher.TrustedGcloudExecutable,
+    gcloud_configuration: launcher.PinnedGcloudConfiguration,
+    owner_identity: launcher.GcloudOwnerAccessToken,
+    stage0_transport: Any,
+    kit_stream: Any,
+    bundle_stream: Any,
+) -> tuple[Mapping[str, Any], Any]:
+    """Preserve the established internal composite entry shape."""
+
+    return _collect_and_author_components_with_preparation(
+        plan=plan,
+        foundation_apply_chain=foundation_apply_chain,
+        final_network_evidence=final_network_evidence,
+        final_network_collector_public_key=(
+            final_network_collector_public_key
+        ),
+        production_ingress_observation=production_ingress_observation,
+        phase=phase,
+        collected_at_unix=collected_at_unix,
+        gcloud_executable=gcloud_executable,
+        gcloud_configuration=gcloud_configuration,
+        owner_identity=owner_identity,
+        stage0_transport=stage0_transport,
+        kit_stream=kit_stream,
+        bundle_stream=bundle_stream,
+        host_preparation=None,
+    )
+
+
 def collect_and_author(
     *,
     plan: foundation.OwnerGateFoundationPlan,
@@ -2886,6 +3043,82 @@ def collect_and_author_bound_pair(
         host_observation=host_observation,
         plan_sha256=plan.sha256,
         phase=phase,
+    )
+
+
+def _collect_and_author_bound_pair_from_preparation(
+    *,
+    plan: foundation.OwnerGateFoundationPlan,
+    foundation_apply_chain: Any,
+    final_network_evidence: foundation.ProductionNetworkEvidence,
+    final_network_collector_public_key: Ed25519PublicKey,
+    production_ingress_observation: Mapping[str, Any],
+    phase: str,
+    collected_at_unix: int | None,
+    gcloud_executable: launcher.TrustedGcloudExecutable,
+    gcloud_configuration: launcher.PinnedGcloudConfiguration,
+    owner_identity: launcher.GcloudOwnerAccessToken,
+    stage0_transport: Any,
+    kit_stream: Any,
+    bundle_stream: Any,
+    host_preparation: Any,
+) -> tuple[BoundObservationPair, Mapping[str, Any]]:
+    """Internal release flow with all long work before fresh evidence."""
+
+    cloud_observation, handoff = (
+        _collect_and_author_components_with_preparation(
+            plan=plan,
+            foundation_apply_chain=foundation_apply_chain,
+            final_network_evidence=final_network_evidence,
+            final_network_collector_public_key=(
+                final_network_collector_public_key
+            ),
+            production_ingress_observation=production_ingress_observation,
+            phase=phase,
+            collected_at_unix=collected_at_unix,
+            gcloud_executable=gcloud_executable,
+            gcloud_configuration=gcloud_configuration,
+            owner_identity=owner_identity,
+            stage0_transport=stage0_transport,
+            kit_stream=kit_stream,
+            bundle_stream=bundle_stream,
+            host_preparation=host_preparation,
+        )
+    )
+    host_observation = getattr(handoff, "host_observation", None)
+    terminal_receipt = getattr(handoff, "terminal_receipt", None)
+    release_binding = cloud_observation.get("release_binding")
+    host_release = (
+        host_observation.get("release")
+        if isinstance(host_observation, Mapping)
+        else None
+    )
+    terminal_sha256 = (
+        terminal_receipt.get("terminal_receipt_sha256")
+        if isinstance(terminal_receipt, Mapping)
+        else None
+    )
+    if (
+        not isinstance(host_observation, Mapping)
+        or not isinstance(terminal_receipt, Mapping)
+        or not isinstance(release_binding, Mapping)
+        or not isinstance(host_release, Mapping)
+        or _SHA256.fullmatch(str(terminal_sha256 or "")) is None
+        or release_binding.get("terminal_receipt_sha256")
+        != terminal_sha256
+        or host_release.get("terminal_receipt_sha256")
+        != terminal_sha256
+    ):
+        _error("owner_gate_bound_observation_pair_invalid")
+    terminal_copy = _decode_json(_canonical(terminal_receipt))
+    return (
+        BoundObservationPair._create(
+            cloud_observation=cloud_observation,
+            host_observation=host_observation,
+            plan_sha256=plan.sha256,
+            phase=phase,
+        ),
+        terminal_copy,
     )
 
 

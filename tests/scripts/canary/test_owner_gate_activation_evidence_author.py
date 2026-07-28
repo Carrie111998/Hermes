@@ -82,9 +82,15 @@ def _frozen(
     release_revision: str,
     evidence: Mapping[str, Mapping[str, Any]],
     assert_stable: Any | None = None,
+    assert_collection_stable: Any | None = None,
+    assert_staging_stable: Any | None = None,
 ) -> SimpleNamespace:
     inert_evidence = {
         name: evidence[name] for name in inert._EVIDENCE_NAMES
+    }
+    inert_evidence[inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME] = {
+        "schema": stage0_iap.INERT_CLOUD_BUNDLE_TERMINAL_SCHEMA,
+        "terminal_receipt_sha256": "c" * 64,
     }
     return SimpleNamespace(
         evidence=inert_evidence,
@@ -103,7 +109,16 @@ def _frozen(
         network_key=object(),
         cloud_key=object(),
         host_key=object(),
-        assert_stable=assert_stable or (lambda **_kwargs: None),
+        assert_activation_collection_window_stable=(
+            assert_collection_stable
+            or assert_stable
+            or (lambda **_kwargs: None)
+        ),
+        assert_activation_staging_window_stable=(
+            assert_staging_stable
+            or assert_stable
+            or (lambda **_kwargs: None)
+        ),
     )
 
 
@@ -117,12 +132,110 @@ def _install_snapshot(
         assert now_unix > 0
         yield frozen
 
-    monkeypatch.setattr(inert, "_fresh_inert_evidence_snapshot", snapshot)
+    monkeypatch.setattr(author, "_iam_bound_inert_evidence_snapshot", snapshot)
     monkeypatch.setattr(
         stage0_iap,
         "OwnerGateStage0IapTransport",
-        lambda **_kwargs: SimpleNamespace(),
+        lambda **_kwargs: SimpleNamespace(
+            resume_owner_gate_host_observation_preparation=(
+                lambda **_resume_kwargs: SimpleNamespace(
+                    _terminal=frozen.evidence[
+                        inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
+                    ]
+                )
+            ),
+        ),
     )
+
+
+def _owner_capabilities(
+    events: list[str] | None = None,
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    def record(name: str) -> None:
+        if events is not None:
+            events.append(name)
+
+    configuration = SimpleNamespace(
+        account=author.cloud_author.OWNER_ACCOUNT,
+        assert_stable=lambda: record("config-stable"),
+    )
+    identity = SimpleNamespace(
+        bind_approved_subject=lambda _digest: record("owner-bind"),
+        require_stable=lambda: record("owner-stable"),
+    )
+    return configuration, identity
+
+
+def test_iam_authority_wraps_activation_evidence_journal_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    evidence = _evidence()
+    frame = stager.build_staging_frame(release_revision=R1, evidence=evidence)
+    intent = author._intent(release_revision=R1, frame=frame)
+    transaction_id = str(intent["transaction_id"])
+    journal = _journal(tmp_path)
+    with journal.release_lease(R1):
+        journal.publish(R1, transaction_id, "intent", intent)
+    frozen = _frozen(release_revision=R1, evidence=evidence)
+    events: list[str] = []
+    iam_active = False
+
+    @contextmanager
+    def snapshot(*, release_revision: str, now_unix: int):
+        nonlocal iam_active
+        assert release_revision == R1
+        assert now_unix == 1000
+        events.append("iam-enter")
+        iam_active = True
+        try:
+            yield frozen
+        finally:
+            iam_active = False
+            events.append("iam-exit")
+
+    real_release_lease = journal.release_lease
+
+    @contextmanager
+    def activation_lease(release_revision: str):
+        assert iam_active
+        events.append("activation-enter")
+        with real_release_lease(release_revision):
+            yield
+        events.append("activation-exit")
+
+    journal.release_lease = activation_lease  # type: ignore[method-assign]
+    monkeypatch.setattr(author, "_iam_bound_inert_evidence_snapshot", snapshot)
+    monkeypatch.setattr(
+        stage0_iap,
+        "OwnerGateStage0IapTransport",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        author,
+        "_dispatch_exact_frame",
+        lambda **_kwargs: {"replayed": True},
+    )
+
+    result = author._stage_post_iam_activation_evidence(
+        release_revision=R1,
+        gcloud_executable=cast(launcher.TrustedGcloudExecutable, object()),
+        gcloud_configuration=cast(
+            launcher.PinnedGcloudConfiguration, object()
+        ),
+        owner_identity=cast(launcher.GcloudOwnerAccessToken, object()),
+        reauth_runner=cast(author.owner_reauth.OwnerReauthRunner, object()),
+        now_unix=lambda: 1000,
+        journal=journal,
+    )
+
+    assert result == {"replayed": True}
+    assert events == [
+        "iam-enter",
+        "activation-enter",
+        "activation-exit",
+        "iam-exit",
+    ]
 
 
 def test_new_authoring_persists_exact_intent_before_iap_and_reauths_after_post(
@@ -130,7 +243,17 @@ def test_new_authoring_persists_exact_intent_before_iap_and_reauths_after_post(
     tmp_path: Path,
 ) -> None:
     evidence = _evidence()
-    frozen = _frozen(release_revision=R1, evidence=evidence)
+    guard_events: list[str] = []
+    frozen = _frozen(
+        release_revision=R1,
+        evidence=evidence,
+        assert_collection_stable=(
+            lambda **_kwargs: guard_events.append("collection")
+        ),
+        assert_staging_stable=(
+            lambda **_kwargs: guard_events.append("staging")
+        ),
+    )
     _install_snapshot(monkeypatch, frozen)
     journal = _journal(tmp_path)
     events: list[tuple[str, int]] = []
@@ -139,6 +262,28 @@ def test_new_authoring_persists_exact_intent_before_iap_and_reauths_after_post(
     post_ingress = {"kind": "post-ingress"}
     post_cloud = {"kind": "post-cloud"}
     post_host = {"kind": "post-host"}
+    ordering: list[str] = []
+    terminal = frozen.evidence[
+        inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
+    ]
+    host_preparation = object()
+
+    def resume(**_kwargs: Any) -> object:
+        assert ordering[:3] == [
+            "config-stable",
+            "owner-bind",
+            "owner-stable",
+        ]
+        ordering.extend(("resume-start", "resume-complete"))
+        return host_preparation
+
+    monkeypatch.setattr(
+        stage0_iap,
+        "OwnerGateStage0IapTransport",
+        lambda **_kwargs: SimpleNamespace(
+            resume_owner_gate_host_observation_preparation=resume
+        ),
+    )
 
     monkeypatch.setattr(inert, "_release_private_key", lambda _binding: object())
     monkeypatch.setattr(
@@ -151,20 +296,34 @@ def test_new_authoring_persists_exact_intent_before_iap_and_reauths_after_post(
         "OwnerGateProductionIngressTransport",
         lambda _transport: object(),
     )
+    def collect_ingress(*_args: Any, **_kwargs: Any) -> Mapping[str, Any]:
+        assert ordering[-1] == "owner-stable"
+        assert "resume-complete" in ordering
+        ordering.append("fresh-ingress")
+        return post_ingress
+
     monkeypatch.setattr(
         author.ingress,
         "collect_and_sign_production_ingress_observation",
-        lambda *_args, **_kwargs: post_ingress,
+        collect_ingress,
     )
     monkeypatch.setattr(
         author.ingress,
         "validate_signed_production_ingress_observation",
         lambda *_args, **_kwargs: post_ingress,
     )
+    pair = object()
+
+    def collect_pair(**kwargs: Any) -> tuple[object, Mapping[str, Any]]:
+        assert ordering[-1] == "owner-stable"
+        assert kwargs["host_preparation"] is host_preparation
+        ordering.append("post-pair")
+        return pair, terminal
+
     monkeypatch.setattr(
         author.cloud_author,
-        "collect_and_author_bound_pair",
-        lambda **_kwargs: object(),
+        "_collect_and_author_bound_pair_from_preparation",
+        collect_pair,
     )
     monkeypatch.setattr(
         author.cloud_author,
@@ -222,11 +381,14 @@ def test_new_authoring_persists_exact_intent_before_iap_and_reauths_after_post(
         return {"journaled": True}
 
     monkeypatch.setattr(author, "_dispatch_exact_frame", dispatch)
+    configuration, identity = _owner_capabilities(ordering)
     result = author._stage_post_iam_activation_evidence(
         release_revision=R1,
         gcloud_executable=cast(launcher.TrustedGcloudExecutable, object()),
-        gcloud_configuration=cast(launcher.PinnedGcloudConfiguration, object()),
-        owner_identity=cast(launcher.GcloudOwnerAccessToken, object()),
+        gcloud_configuration=cast(
+            launcher.PinnedGcloudConfiguration, configuration
+        ),
+        owner_identity=cast(launcher.GcloudOwnerAccessToken, identity),
         reauth_runner=cast(author.owner_reauth.OwnerReauthRunner, object()),
         now_unix=clock,
         journal=journal,
@@ -236,6 +398,11 @@ def test_new_authoring_persists_exact_intent_before_iap_and_reauths_after_post(
     assert events[0][0] == "post"
     assert events[1][0] == "reauth"
     assert events[1][1] > events[0][1]
+    assert ordering.index("resume-complete") < ordering.index(
+        "fresh-ingress"
+    )
+    assert ordering.index("fresh-ingress") < ordering.index("post-pair")
+    assert guard_events == ["collection", "collection", "staging"]
     frame = stager._decode_canonical(dispatched[0])
     assert set(frame["evidence"]) == set(activation.EVIDENCE_NAMES)
     assert frame["evidence"][activation.NETWORK_EVIDENCE_NAME] == evidence[
@@ -274,8 +441,13 @@ def test_reauth_receipt_not_strictly_after_post_report_is_refused(
     )
     monkeypatch.setattr(
         author.cloud_author,
-        "collect_and_author_bound_pair",
-        lambda **_kwargs: object(),
+        "_collect_and_author_bound_pair_from_preparation",
+        lambda **_kwargs: (
+            object(),
+            frozen.evidence[
+                inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
+            ],
+        ),
     )
     monkeypatch.setattr(
         author.cloud_author,
@@ -316,7 +488,8 @@ def test_reauth_receipt_not_strictly_after_post_report_is_refused(
         "_dispatch_exact_frame",
         lambda **_kwargs: pytest.fail("IAP must not be reached"),
     )
-    current = iter((1000, 1001, 1002))
+    current = iter((1000, 1001, 1002, 1003, 1004, 1005))
+    configuration, identity = _owner_capabilities()
     with pytest.raises(
         launcher.OwnerLauncherError,
         match="owner_gate_activation_evidence_author_reauth_invalid",
@@ -325,11 +498,86 @@ def test_reauth_receipt_not_strictly_after_post_report_is_refused(
             release_revision=R1,
             gcloud_executable=cast(launcher.TrustedGcloudExecutable, object()),
             gcloud_configuration=cast(
-                launcher.PinnedGcloudConfiguration, object()
+                launcher.PinnedGcloudConfiguration, configuration
             ),
-            owner_identity=cast(launcher.GcloudOwnerAccessToken, object()),
+            owner_identity=cast(launcher.GcloudOwnerAccessToken, identity),
             reauth_runner=cast(author.owner_reauth.OwnerReauthRunner, object()),
             now_unix=lambda: next(current),
+            journal=journal,
+        )
+
+
+def test_resume_failure_stops_before_first_fresh_observation_or_iap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    evidence = _evidence()
+    frozen = _frozen(release_revision=R1, evidence=evidence)
+    _install_snapshot(monkeypatch, frozen)
+    journal = _journal(tmp_path)
+    monkeypatch.setattr(
+        inert,
+        "_release_private_key",
+        lambda _binding: object(),
+    )
+    monkeypatch.setattr(
+        author.production_cutover,
+        "ProductionCutoverTransport",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    def fail_resume(**_kwargs: Any) -> None:
+        raise launcher.OwnerLauncherError("fixture-resume-failed")
+
+    monkeypatch.setattr(
+        stage0_iap,
+        "OwnerGateStage0IapTransport",
+        lambda **_kwargs: SimpleNamespace(
+            resume_owner_gate_host_observation_preparation=fail_resume,
+        ),
+    )
+    monkeypatch.setattr(
+        author.ingress,
+        "collect_and_sign_production_ingress_observation",
+        lambda *_args, **_kwargs: pytest.fail(
+            "fresh ingress must not start after resume failure"
+        ),
+    )
+    monkeypatch.setattr(
+        author.cloud_author,
+        "_collect_and_author_bound_pair_from_preparation",
+        lambda **_kwargs: pytest.fail(
+            "fresh cloud/host tail must not start after resume failure"
+        ),
+    )
+    monkeypatch.setattr(
+        author,
+        "_dispatch_exact_frame",
+        lambda **_kwargs: pytest.fail(
+            "IAP staging must not start after resume failure"
+        ),
+    )
+    configuration, identity = _owner_capabilities()
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="owner_gate_activation_evidence_author_resume_failed",
+    ):
+        author._stage_post_iam_activation_evidence(
+            release_revision=R1,
+            gcloud_executable=cast(
+                launcher.TrustedGcloudExecutable, object()
+            ),
+            gcloud_configuration=cast(
+                launcher.PinnedGcloudConfiguration, configuration
+            ),
+            owner_identity=cast(
+                launcher.GcloudOwnerAccessToken, identity
+            ),
+            reauth_runner=cast(
+                author.owner_reauth.OwnerReauthRunner, object()
+            ),
+            now_unix=lambda: 1000,
             journal=journal,
         )
 
@@ -357,6 +605,16 @@ def test_incomplete_intent_retries_byte_identical_even_after_failure_artifact(
         )
     frozen = _frozen(release_revision=R1, evidence=evidence)
     _install_snapshot(monkeypatch, frozen)
+    resume_attempts: list[bool] = []
+    monkeypatch.setattr(
+        stage0_iap,
+        "OwnerGateStage0IapTransport",
+        lambda **_kwargs: SimpleNamespace(
+            resume_owner_gate_host_observation_preparation=(
+                lambda **_resume_kwargs: resume_attempts.append(True)
+            )
+        ),
+    )
     monkeypatch.setattr(
         author.ingress,
         "collect_and_sign_production_ingress_observation",
@@ -382,6 +640,7 @@ def test_incomplete_intent_retries_byte_identical_even_after_failure_artifact(
             journal=journal,
         )
     assert attempts == [author._canonical(frame), author._canonical(frame)]
+    assert resume_attempts == []
 
 
 @pytest.mark.parametrize("mode", ["stale", "mutated"])

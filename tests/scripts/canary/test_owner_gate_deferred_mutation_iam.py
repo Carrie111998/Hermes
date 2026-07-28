@@ -443,6 +443,192 @@ def _frozen_stub(label: str) -> SimpleNamespace:
     )
 
 
+def _install_successful_historical_context(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    authority: deferred._DeferredMutationIamAuthority,
+    journal: deferred.DeferredMutationIamJournal,
+    frozen: SimpleNamespace,
+    descriptor_transform=lambda value: value,
+) -> None:
+    monkeypatch.setattr(
+        deferred,
+        "_release_transaction_id",
+        lambda release_revision: (
+            authority.transaction_id
+            if release_revision == authority.plan.spec.release_revision
+            else pytest.fail("wrong release")
+        ),
+    )
+
+    @contextmanager
+    def historical_context(**kwargs: Any):
+        assert kwargs == {
+            "release_revision": authority.plan.spec.release_revision,
+            "journal": journal,
+            "now_unix": pre_fixture.NOW,
+        }
+        journal.require_contract_lease()
+        descriptor = deferred._basic_activation_attempt_descriptor(
+            artifacts=journal.list(authority.transaction_id),
+            transaction_id=authority.transaction_id,
+            release_revision=authority.plan.spec.release_revision,
+        )
+        assert descriptor is not None
+        yield frozen, authority, descriptor_transform(descriptor)
+
+    monkeypatch.setattr(
+        deferred,
+        "_historical_remove_authority",
+        historical_context,
+    )
+
+
+def test_successful_activation_evidence_context_holds_contract_and_exact_set(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    authority = _authority()
+    provider = _FakeProvider(authority)
+    journal = _journal(tmp_path / "journal")
+    _execute(authority, provider, journal)
+    frozen = SimpleNamespace(
+        receipt={
+            "evidence_set_sha256": authority.lineage[
+                "inert_evidence_set_sha256"
+            ]
+        }
+    )
+    _install_successful_historical_context(
+        monkeypatch,
+        authority=authority,
+        journal=journal,
+        frozen=frozen,
+    )
+
+    with deferred._successful_activation_evidence_context(
+        release_revision=authority.plan.spec.release_revision,
+        now_unix=pre_fixture.NOW,
+        journal=journal,
+    ) as observed:
+        assert observed is frozen
+        journal.require_contract_lease()
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    ("wrong_evidence_set", "missing_success", "failure", "removed"),
+)
+def test_successful_activation_evidence_context_rejects_non_authority(
+    invalid_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    authority = _authority()
+    provider = _FakeProvider(authority)
+    journal = _journal(tmp_path / "journal")
+    if invalid_state == "missing_success":
+        observation = provider.observe_policy(authority)
+        intent = deferred._build_intent(
+            authority=authority,
+            action=deferred.ACTION_ACTIVATE,
+            observation=observation,
+            activation_authorization=_activation_authorization(authority),
+            activation_success=None,
+            activation_attempt_index=0,
+        )
+        with journal.transaction_lease(authority.transaction_id):
+            journal.publish(
+                authority.transaction_id,
+                "activate-intent",
+                intent,
+            )
+    elif invalid_state == "failure":
+        provider.operation_state = "failed"
+        with pytest.raises(deferred.OwnerGateDeferredMutationIamFailed):
+            _execute(authority, provider, journal)
+    else:
+        _execute(authority, provider, journal)
+    if invalid_state == "removed":
+        _execute(
+            authority,
+            provider,
+            journal,
+            action=deferred.ACTION_REMOVE,
+        )
+    frozen = SimpleNamespace(
+        receipt={
+            "evidence_set_sha256": (
+                "6" * 64
+                if invalid_state == "wrong_evidence_set"
+                else authority.lineage["inert_evidence_set_sha256"]
+            )
+        }
+    )
+    _install_successful_historical_context(
+        monkeypatch,
+        authority=authority,
+        journal=journal,
+        frozen=frozen,
+    )
+
+    with pytest.raises(
+        deferred.OwnerGateDeferredMutationIamError,
+        match="activation_not_authoritative",
+    ):
+        with deferred._successful_activation_evidence_context(
+            release_revision=authority.plan.spec.release_revision,
+            now_unix=pre_fixture.NOW,
+            journal=journal,
+        ):
+            pytest.fail("invalid IAM lifecycle became staging authority")
+
+
+def test_successful_activation_evidence_context_rechecks_journal_on_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    authority = _authority()
+    provider = _FakeProvider(authority)
+    journal = _journal(tmp_path / "journal")
+    _execute(authority, provider, journal)
+    frozen = SimpleNamespace(
+        receipt={
+            "evidence_set_sha256": authority.lineage[
+                "inert_evidence_set_sha256"
+            ]
+        }
+    )
+    _install_successful_historical_context(
+        monkeypatch,
+        authority=authority,
+        journal=journal,
+        frozen=frozen,
+    )
+    real_list = journal.list
+    calls = 0
+
+    def changed_on_exit(transaction_id: str):
+        nonlocal calls
+        calls += 1
+        artifacts = real_list(transaction_id)
+        if calls >= 3:
+            return {**artifacts, "remove-intent": {"changed": True}}
+        return artifacts
+
+    journal.list = changed_on_exit  # type: ignore[method-assign]
+    with pytest.raises(
+        deferred.OwnerGateDeferredMutationIamError,
+        match="journal_invalid",
+    ):
+        with deferred._successful_activation_evidence_context(
+            release_revision=authority.plan.spec.release_revision,
+            now_unix=pre_fixture.NOW,
+            journal=journal,
+        ):
+            journal.require_contract_lease()
+
+
 def _pathless_capabilities(
     monkeypatch: pytest.MonkeyPatch,
     *,

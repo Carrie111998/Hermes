@@ -2,11 +2,12 @@
 """Owner-side authoring and inert staging of post-IAM activation evidence.
 
 The public boundary accepts only the sealed owner capabilities and one release
-revision.  It consumes an already-published fresh inert transaction, authors a
-fresh post-IAM observation and owner reauthentication receipt, journals the
-exact canonical staging frame durably, and invokes only the fixed Stage0
-activation-evidence stager.  It never publishes an activation seal and never
-mutates IAM, runtime, Caddy, Cloud resources, or storage.
+revision.  It consumes the exact inert transaction bound by the successful
+deferred-IAM journal, authors a fresh post-IAM observation and owner
+reauthentication receipt, journals the exact canonical staging frame durably,
+and invokes only the fixed Stage0 activation-evidence stager.  It never
+publishes an activation seal and never mutates IAM, runtime, Caddy, Cloud
+resources, or storage.
 """
 
 from __future__ import annotations
@@ -14,14 +15,16 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Mapping, Never
+from typing import Any, Callable, Iterator, Mapping, Never
 
 from scripts.canary import full_canary_owner_launcher as launcher
 from scripts.canary import owner_gate_activation_evidence_stager as stager
 from scripts.canary import owner_gate_activation_seal as activation
 from scripts.canary import owner_gate_author_journal as author_journal
 from scripts.canary import owner_gate_cloud_observation_author as cloud_author
+from scripts.canary import owner_gate_deferred_mutation_iam as deferred_iam
 from scripts.canary import owner_gate_foundation as foundation
 from scripts.canary import owner_gate_inert_observation as inert
 from scripts.canary import owner_gate_owner_reauth as owner_reauth
@@ -84,6 +87,27 @@ def _clock(now_unix: Callable[[], int]) -> int:
     if type(value) is not int or value <= 0:
         _error("owner_gate_activation_evidence_author_time_invalid")
     return value
+
+
+@contextmanager
+def _iam_bound_inert_evidence_snapshot(
+    *,
+    release_revision: str,
+    now_unix: int,
+) -> Iterator[inert._FrozenInertEvidence]:
+    """Map the successful deferred-IAM authority into this owner boundary."""
+
+    try:
+        with deferred_iam._successful_activation_evidence_context(
+            release_revision=release_revision,
+            now_unix=now_unix,
+        ) as frozen:
+            yield frozen
+    except deferred_iam.OwnerGateDeferredMutationIamError as exc:
+        _error(
+            "owner_gate_activation_evidence_author_iam_binding_invalid",
+            exc,
+        )
 
 
 class ActivationEvidenceJournal(author_journal.OwnerGateAuthorJournal):
@@ -439,7 +463,7 @@ def _dispatch_exact_frame(
     post_cloud = evidence[activation.POST_IAM_CLOUD_OBSERVATION_NAME]
     post_host = evidence[activation.POST_IAM_HOST_OBSERVATION_NAME]
     current = _clock(now_unix)
-    frozen.assert_stable(now_unix=current)
+    frozen.assert_activation_staging_window_stable(now_unix=current)
     _assert_post_iam_ready(
         report=post_report,
         production_ingress_observation=post_ingress,
@@ -460,7 +484,7 @@ def _dispatch_exact_frame(
             checked_response,
             now_unix=final_now,
         )
-        frozen.assert_stable(now_unix=final_now)
+        frozen.assert_activation_staging_window_stable(now_unix=final_now)
         _assert_post_iam_ready(
             report=post_report,
             production_ingress_observation=post_ingress,
@@ -506,7 +530,7 @@ def _stage_post_iam_activation_evidence(
     journal: ActivationEvidenceJournal | None = None,
 ) -> Mapping[str, Any]:
     journal = journal or ActivationEvidenceJournal()
-    with inert._fresh_inert_evidence_snapshot(
+    with _iam_bound_inert_evidence_snapshot(
         release_revision=release_revision,
         now_unix=_clock(now_unix),
     ) as frozen:
@@ -556,7 +580,9 @@ def _stage_post_iam_activation_evidence(
                         frame=frame,
                     )
                     current = _clock(now_unix)
-                    frozen.assert_stable(now_unix=current)
+                    frozen.assert_activation_staging_window_stable(
+                        now_unix=current
+                    )
                     _assert_post_iam_ready(
                         report=frame["evidence"][
                             activation.POST_IAM_PREFLIGHT_NAME
@@ -590,37 +616,130 @@ def _stage_post_iam_activation_evidence(
                 )
 
             release_private_key = inert._release_private_key(frozen.binding)
+            try:
+                gcloud_configuration.assert_stable()
+                if (
+                    gcloud_configuration.account
+                    != cloud_author.OWNER_ACCOUNT
+                ):
+                    _error(
+                        "owner_gate_activation_evidence_author_owner_invalid"
+                    )
+                owner_identity.bind_approved_subject(
+                    hashlib.sha256(
+                        cloud_author.OWNER_ACCOUNT.encode("ascii")
+                    ).hexdigest()
+                )
+                owner_identity.require_stable()
+            except launcher.OwnerLauncherError as exc:
+                _error(
+                    "owner_gate_activation_evidence_author_owner_invalid",
+                    exc,
+                )
             production_transport = production_cutover.ProductionCutoverTransport(
                 owner_identity,
                 gcloud_executable=gcloud_executable,
                 gcloud_configuration=gcloud_configuration,
             )
-            post_ingress = ingress.collect_and_sign_production_ingress_observation(
-                ingress.OwnerGateProductionIngressTransport(production_transport),
-                phase=POST_IAM_PHASE,
-                release_revision=release_revision,
-                plan_sha256=frozen.plan.sha256,
-                release_private_key=release_private_key,
+            terminal_receipt = frozen.evidence.get(
+                inert.INERT_CLOUD_BUNDLE_TERMINAL_RECEIPT_NAME
             )
-            pair = cloud_author.collect_and_author_bound_pair(
-                plan=frozen.plan,
-                foundation_apply_chain=frozen.loaded.chain,
-                final_network_evidence=frozen.network_evidence,
-                final_network_collector_public_key=frozen.network_key,
-                production_ingress_observation=post_ingress,
-                phase=POST_IAM_PHASE,
-                collected_at_unix=None,
-                gcloud_executable=gcloud_executable,
-                gcloud_configuration=gcloud_configuration,
-                owner_identity=owner_identity,
-                stage0_transport=transport,
-                kit_stream=frozen.inputs.kit_stream,
-                bundle_stream=frozen.inputs.bundle_stream,
+            if not isinstance(terminal_receipt, Mapping):
+                _error(
+                    "owner_gate_activation_evidence_author_terminal_invalid"
+                )
+
+            try:
+                host_preparation = (
+                    transport.resume_owner_gate_host_observation_preparation(
+                        phase=POST_IAM_PHASE,
+                        terminal_receipt=terminal_receipt,
+                        kit_stream=frozen.inputs.kit_stream,
+                        bundle_stream=frozen.inputs.bundle_stream,
+                    )
+                )
+            except BaseException as exc:
+                _error(
+                    "owner_gate_activation_evidence_author_resume_failed",
+                    exc,
+                )
+            frozen.assert_activation_collection_window_stable(
+                now_unix=_clock(now_unix)
             )
+            try:
+                gcloud_configuration.assert_stable()
+                owner_identity.require_stable()
+            except BaseException as exc:
+                _error(
+                    "owner_gate_activation_evidence_author_capability_changed",
+                    exc,
+                )
+            try:
+                post_ingress = (
+                    ingress.collect_and_sign_production_ingress_observation(
+                        ingress.OwnerGateProductionIngressTransport(
+                            production_transport
+                        ),
+                        phase=POST_IAM_PHASE,
+                        release_revision=release_revision,
+                        plan_sha256=frozen.plan.sha256,
+                        release_private_key=release_private_key,
+                    )
+                )
+            except BaseException as exc:
+                _error(
+                    "owner_gate_activation_evidence_author_post_iam_stale",
+                    exc,
+                )
+            frozen.assert_activation_collection_window_stable(
+                now_unix=_clock(now_unix)
+            )
+            try:
+                gcloud_configuration.assert_stable()
+                owner_identity.require_stable()
+            except BaseException as exc:
+                _error(
+                    "owner_gate_activation_evidence_author_capability_changed",
+                    exc,
+                )
+            pair, post_terminal = (
+                cloud_author._collect_and_author_bound_pair_from_preparation(
+                    plan=frozen.plan,
+                    foundation_apply_chain=frozen.loaded.chain,
+                    final_network_evidence=frozen.network_evidence,
+                    final_network_collector_public_key=frozen.network_key,
+                    production_ingress_observation=post_ingress,
+                    phase=POST_IAM_PHASE,
+                    collected_at_unix=None,
+                    gcloud_executable=gcloud_executable,
+                    gcloud_configuration=gcloud_configuration,
+                    owner_identity=owner_identity,
+                    stage0_transport=transport,
+                    kit_stream=frozen.inputs.kit_stream,
+                    bundle_stream=frozen.inputs.bundle_stream,
+                    host_preparation=host_preparation,
+                )
+            )
+            if (
+                not isinstance(post_terminal, Mapping)
+                or post_terminal.get("terminal_receipt_sha256")
+                != terminal_receipt.get("terminal_receipt_sha256")
+                or _canonical(post_terminal) != _canonical(terminal_receipt)
+            ):
+                _error(
+                    "owner_gate_activation_evidence_author_terminal_changed"
+                )
             post_cloud, post_host = cloud_author.consume_bound_observation_pair(
                 pair,
                 plan=frozen.plan,
                 phase=POST_IAM_PHASE,
+            )
+            # The fresh-tail pair has now accepted the current network proof.
+            # From here onward the activation seal's inert preflight/ingress
+            # clocks and the separately checked post-IAM clocks are operative;
+            # reauth, journaling, and staging do not re-age the network proof.
+            frozen.assert_activation_staging_window_stable(
+                now_unix=_clock(now_unix)
             )
             post_time = _clock(now_unix)
             try:

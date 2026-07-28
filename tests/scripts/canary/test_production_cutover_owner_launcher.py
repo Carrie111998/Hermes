@@ -3731,6 +3731,111 @@ def test_production_identity_preflight_binds_instance_os_login_and_profile() -> 
     assert "muncho-canary-v2-01" not in joined
 
 
+def test_production_identity_parallelism_is_exact_process_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = _identity_responses()
+    barrier = threading.Barrier(3)
+    lock = threading.Lock()
+    calls: list[tuple[str, ...]] = []
+    worker_ids: set[int] = set()
+
+    def exact_process_run(argv, **_kwargs):
+        exact = tuple(argv)
+        with lock:
+            calls.append(exact)
+            worker_ids.add(threading.get_ident())
+        barrier.wait(timeout=2.0)
+        if "instances" in exact:
+            value = responses[0]
+        elif "project-info" in exact:
+            value = responses[1]
+        else:
+            value = responses[2]
+        return subprocess.CompletedProcess(
+            exact,
+            0,
+            stdout=_canonical(value),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(owner.subprocess, "run", exact_process_run)
+    transport = _production_transport(runner=owner.subprocess.run)
+
+    snapshot = transport._authorization_snapshot("owner@example.com")
+
+    assert len(snapshot) == 3
+    assert len(calls) == 3
+    assert len(worker_ids) == 3
+    assert transport._process_isolated_preflight_runner is True
+
+    injected_calls: list[tuple[str, ...]] = []
+    injected_threads: list[int] = []
+
+    def injected_runner(argv, **kwargs):
+        injected_threads.append(threading.get_ident())
+        return _identity_runner(
+            responses,
+            injected_calls,
+        )(argv, **kwargs)
+
+    injected = _production_transport(runner=injected_runner)
+    injected._authorization_snapshot("owner@example.com")
+    assert injected._process_isolated_preflight_runner is False
+    assert injected_threads == [threading.get_ident()] * 3
+    assert [
+        "instance"
+        if "instances" in call
+        else "project"
+        if "project-info" in call
+        else "profile"
+        for call in injected_calls
+    ] == ["instance", "project", "profile"]
+
+
+def test_production_identity_parallel_failure_joins_every_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = _identity_responses()
+    barrier = threading.Barrier(3)
+    lock = threading.Lock()
+    active = 0
+    calls = 0
+
+    def exact_process_run(argv, **_kwargs):
+        nonlocal active, calls
+        exact = tuple(argv)
+        with lock:
+            active += 1
+            calls += 1
+        try:
+            barrier.wait(timeout=2.0)
+            if "project-info" in exact:
+                raise OSError("bounded fixture failure")
+            value = responses[0] if "instances" in exact else responses[2]
+            return subprocess.CompletedProcess(
+                exact,
+                0,
+                stdout=_canonical(value),
+                stderr=b"",
+            )
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(owner.subprocess, "run", exact_process_run)
+    transport = _production_transport(runner=owner.subprocess.run)
+
+    with pytest.raises(
+        canary_transport.OwnerLauncherError,
+        match="iap_ssh_preflight_unavailable",
+    ):
+        transport._authorization_snapshot("owner@example.com")
+
+    assert calls == 3
+    assert active == 0
+
+
 @pytest.mark.parametrize(
     "responses",
     (

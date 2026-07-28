@@ -521,6 +521,7 @@ def _host(plan, key, *, iam: bool) -> dict:
             "resource_ancestor_chain": [plan.spec.organization_resource],
             "install_receipt_sha256": "c" * 64,
             "install_receipt_file_sha256": "d" * 64,
+            "terminal_receipt_sha256": "e" * 64,
             "cloud_signer_provisioning_receipt_sha256": "f" * 64,
             "cloud_signer_readiness_sha256": "0" * 64,
             "host_signer_provisioning_receipt_sha256": "1" * 64,

@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -299,6 +300,11 @@ def test_collect_and_author_uses_complete_read_only_inventory_and_signs() -> Non
         author.connector_command("europe-west3"),
         author.connector_command("us-central1"),
     }
+    assert calls == [
+        *author.inventory_commands().values(),
+        author.connector_command("europe-west3"),
+        author.connector_command("us-central1"),
+    ]
     assert len(calls) == len(set(calls))
 
 
@@ -840,6 +846,113 @@ def test_runtime_collection_uses_only_fixed_prefix_and_closed_environment(
             "SSL_CERT_FILE",
         } & set(environment)
         assert timeout == author._CAPTURE_TIMEOUT_SECONDS
+
+
+def test_exact_subprocess_runtime_parallelizes_independent_inventory_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, configuration = _runtime(tmp_path)
+    values = _raw()
+    inventory = frozenset(author.inventory_commands().values())
+    initial_barrier = threading.Barrier(len(inventory))
+    connector_barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    initial_worker_ids: set[int] = set()
+    connector_worker_ids: set[int] = set()
+
+    def run_capture(_self, argv, *, env, timeout_seconds):
+        del env, timeout_seconds
+        command = tuple(argv)
+        logical = ("gcloud", *command[len(executable.prefix) : -3])
+        if logical in inventory:
+            with lock:
+                initial_worker_ids.add(threading.get_ident())
+            initial_barrier.wait(timeout=2.0)
+        else:
+            with lock:
+                connector_worker_ids.add(threading.get_ident())
+            connector_barrier.wait(timeout=2.0)
+        return author._CapturedJson(
+            0,
+            json.dumps(values[logical]).encode("ascii"),
+            b"",
+        )
+
+    monkeypatch.setattr(
+        author._SubprocessNetworkEvidenceRunner,
+        "run_capture",
+        run_capture,
+    )
+    runner = author._SubprocessNetworkEvidenceRunner()
+
+    author._collect_and_author_with_runtime(
+        release_revision=RELEASE,
+        collected_at_unix=NOW,
+        gcloud_executable=executable,
+        gcloud_configuration=configuration,
+        sealed_runtime_snapshot=lambda: _sealed_identity(executable.prefix),
+        runner=runner,
+    )
+
+    assert len(initial_worker_ids) == len(inventory)
+    assert len(connector_worker_ids) == 2
+
+
+def test_exact_subprocess_parallel_failure_joins_every_inventory_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable, configuration = _runtime(tmp_path)
+    values = _raw()
+    inventory = frozenset(author.inventory_commands().values())
+    barrier = threading.Barrier(len(inventory))
+    lock = threading.Lock()
+    active = 0
+    calls = 0
+
+    def run_capture(_self, argv, *, env, timeout_seconds):
+        nonlocal active, calls
+        del env, timeout_seconds
+        command = tuple(argv)
+        logical = ("gcloud", *command[len(executable.prefix) : -3])
+        with lock:
+            active += 1
+            calls += 1
+        try:
+            barrier.wait(timeout=2.0)
+            return author._CapturedJson(
+                1 if logical == author.inventory_commands()["routes"] else 0,
+                json.dumps(values[logical]).encode("ascii"),
+                b"",
+            )
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(
+        author._SubprocessNetworkEvidenceRunner,
+        "run_capture",
+        run_capture,
+    )
+
+    with pytest.raises(
+        author.OwnerGateNetworkEvidenceAuthorError,
+        match="owner_gate_network_collection_failed",
+    ):
+        author._collect_and_author_with_runtime(
+            release_revision=RELEASE,
+            collected_at_unix=NOW,
+            gcloud_executable=executable,
+            gcloud_configuration=configuration,
+            sealed_runtime_snapshot=lambda: _sealed_identity(
+                executable.prefix
+            ),
+            runner=author._SubprocessNetworkEvidenceRunner(),
+        )
+
+    assert calls == len(inventory)
+    assert active == 0
 
 
 def test_public_collection_rejects_structural_runtime_fakes(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import inspect
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -542,17 +543,54 @@ def test_valid_ingress_envelope_digest_is_forwarded_to_host_stage0(
         "_reject_ambient_network_environment",
         lambda: None,
     )
+    token = SimpleNamespace(_raw=bytearray(b"token"))
+    monkeypatch.setattr(
+        author.direct_iam_author,
+        "acquire_access_token",
+        lambda **_kwargs: token,
+    )
+    monkeypatch.setattr(
+        author.direct_iam_author,
+        "wipe_access_token",
+        lambda value: value._raw.__setitem__(
+            slice(None), b"\0" * len(value._raw)
+        ),
+    )
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    worker_ids: set[int] = set()
+
+    def rendezvous() -> None:
+        with lock:
+            worker_ids.add(threading.get_ident())
+        barrier.wait(timeout=2.0)
+
+    monkeypatch.setattr(
+        author,
+        "_FixedCloudFactsReader",
+        lambda **_kwargs: SimpleNamespace(
+            collect=lambda: (rendezvous() or {})
+        ),
+    )
     final_network_evidence = cast(foundation.ProductionNetworkEvidence, object())
     final_network_collector_public_key = cast(Ed25519PublicKey, object())
     forwarded: list[dict[str, object]] = []
 
+    preparation = object()
+    monkeypatch.setattr(
+        stage0_iap.OwnerGateStage0IapTransport,
+        "prepare_owner_gate_host_observation",
+        lambda _self, **_kwargs: preparation,
+    )
+
     def stop_after_capture(_self: object, **kwargs: object) -> None:
+        rendezvous()
         forwarded.append(kwargs)
         raise author.launcher.OwnerLauncherError("captured")
 
     monkeypatch.setattr(
         stage0_iap.OwnerGateStage0IapTransport,
-        "collect_owner_gate_host_observation",
+        "collect_owner_gate_host_observation_fresh_tail",
         stop_after_capture,
     )
     chain = SimpleNamespace(
@@ -582,6 +620,9 @@ def test_valid_ingress_envelope_digest_is_forwarded_to_host_stage0(
             bundle_stream=stable_stream,
         )
     assert len(forwarded) == 1
+    assert len(worker_ids) == 2
+    assert not any(token._raw)
+    assert forwarded[0]["preparation"] is preparation
     assert forwarded[0]["final_network_evidence"] is final_network_evidence
     assert (
         forwarded[0]["final_network_collector_public_key"]
@@ -591,6 +632,51 @@ def test_valid_ingress_envelope_digest_is_forwarded_to_host_stage0(
         forwarded[0]["production_ingress_observation_sha256"]
         == envelope["envelope_sha256"]
     )
+
+
+def test_terminal_is_rechecked_at_exact_signer_boundary() -> None:
+    terminal = {"terminal_receipt_sha256": "a" * 64, "value": "exact"}
+    preparation = SimpleNamespace(_terminal=copy.deepcopy(terminal))
+    handoff = SimpleNamespace(
+        terminal_receipt=copy.deepcopy(terminal),
+        host_observation={"report_sha256": "b" * 64},
+    )
+    snapshot = foundation.canonical_json_bytes({
+        "terminal_receipt": handoff.terminal_receipt,
+        "host_observation": handoff.host_observation,
+    })
+    calls: list[dict[str, Any]] = []
+
+    def signer(_transport: object, **kwargs: Any) -> Mapping[str, Any]:
+        calls.append(kwargs)
+        return {"signed": True}
+
+    assert author._sign_with_stable_terminal(
+        signer_method=signer,
+        stage0_transport=object(),
+        phase="inert",
+        unsigned_observation={"plan_sha256": "c" * 64},
+        preparation=preparation,
+        handoff=handoff,
+        handoff_snapshot=snapshot,
+    ) == {"signed": True}
+    assert len(calls) == 1
+
+    preparation._terminal["value"] = "changed"
+    with pytest.raises(
+        author.OwnerGateCloudObservationAuthorError,
+        match="owner_gate_cloud_observation_terminal_changed",
+    ):
+        author._sign_with_stable_terminal(
+            signer_method=signer,
+            stage0_transport=object(),
+            phase="inert",
+            unsigned_observation={"plan_sha256": "c" * 64},
+            preparation=preparation,
+            handoff=handoff,
+            handoff_snapshot=snapshot,
+        )
+    assert len(calls) == 1
 
 
 def _final_release_transition(
