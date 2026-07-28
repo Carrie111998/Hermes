@@ -108,7 +108,9 @@ Desktop: [`apps/desktop/AGENTS.md`](apps/desktop/AGENTS.md). Tools: register in
 - Upstream security/fix/Dependabot PRs: branch from latest `upstream/main`,
   exclude `_docs`/fork noise, King's English, check for duplicate Issue/PR;
   salvage incomplete prior fixes; harden env-leak / path-traversal /
-  agent-runaway without gutting capability.
+  agent-runaway without gutting capability. Large framework migrations
+  (e.g. react-router v8 / `web/`) stay on dedicated branches — do not fold
+  into Dependabot batch or upstream-sync merges.
 - New agent-facing folders (esp. harness docs): add `AGENTS.md` + README.
 
 ## Learned Workspace Facts
@@ -125,9 +127,11 @@ Desktop: [`apps/desktop/AGENTS.md`](apps/desktop/AGENTS.md). Tools: register in
   separate argv for `-hermes-root` (never PowerShell `$args`); `detectRepoRoot`
   needs `pyproject.toml`, must not stop at `\scripts`. Mutual monitoring:
   `%LOCALAPPDATA%\HermesWatchdog\desktop-backend.json` + `HERMES_DESKTOP_REMOTE_*`.
-  Mirror: https://github.com/zapabob/HermesDesktopwatchdog. After Go watchdog
-  source changes: rebuild with `Build-HermesGoWatchdog.ps1` (e.g. `-SkipTest`)
-  before `-StartGoWatchdog`.
+  Mirror / local hot-swap checkout:
+  `C:\Users\downl\Documents\New project\HermesDesktopwatchdog` (GitHub:
+  zapabob/HermesDesktopwatchdog). After Go watchdog or post-merge Desktop
+  announce/auth changes: rebuild from that checkout or
+  `Build-HermesGoWatchdog.ps1` (e.g. `-SkipTest`) before `-StartGoWatchdog`.
 - Prewarm/managed ports: `/api/status` or LISTEN alone is insufficient (wedged
   serve can hang HTTP at 0 bytes). Manifest token drift → `/api/sessions` 401 /
   “Could not connect”; Go watchdog `testBackendAuth` before publishing and
@@ -152,7 +156,9 @@ Desktop: [`apps/desktop/AGENTS.md`](apps/desktop/AGENTS.md). Tools: register in
   provider keys in `~/.hermes/.env` only; dashboard
   `.venv\Scripts\intel-dashboard.exe` → `http://localhost:8501` (Tailscale for
   remote).
-- Missing Desktop session history: treat as Desktop↔`hermes serve`
-  connectivity/auth first (`:9119`, stale `HERMES_DESKTOP_REMOTE_*`, manifest
-  drift / 401). `~/.hermes/state.db` is often intact — do not VACUUM/rewrite the
-  live DB while other agents may use it.
+- Missing Desktop session history / post-merge boot failure: treat as
+  Desktop↔`hermes serve` connectivity/auth first (`:9119` LISTEN-but-HTTP-000
+  zombie, stale `HERMES_DESKTOP_REMOTE_*`). URL set without TOKEN is a hard fail —
+  clear both and use local `:9119`; also check manifest drift / 401.
+  `~/.hermes/state.db` is often intact — do not VACUUM/rewrite the live DB
+  while other agents may use it.
