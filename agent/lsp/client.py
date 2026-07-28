@@ -45,6 +45,7 @@ Implementation notes:
   backoff up to 3 times.  This matches Claude Code's
   ``LSPServerInstance.sendRequest``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -110,7 +111,7 @@ def uri_to_path(uri: str) -> str:
     """Inverse of :func:`file_uri`."""
     if not uri.startswith("file://"):
         return uri
-    raw = uri[len("file://"):]
+    raw = uri[len("file://") :]
     if os.name == "nt" and raw.startswith("/") and len(raw) > 2 and raw[2] == ":":
         raw = raw[1:]  # strip leading slash before drive letter
     return os.path.normpath(unquote(raw))
@@ -209,6 +210,10 @@ class LSPClient:
         # Unlike parent-PID traversal, this still identifies helpers after a
         # crashed wrapper has exited and the OS has reparented them.
         self._owner_token = secrets.token_hex(16)
+        # POSIX wrappers already run in a dedicated session/process group.
+        # Retaining the pgid lets cleanup recover descendants that deliberately
+        # or incidentally sanitize their inherited environment.
+        self._process_group_id: Optional[int] = None
 
         # Process + streams
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -360,6 +365,8 @@ class LSPClient:
                 start_new_session=True,
                 creationflags=creationflags,
             )
+            if os.name != "nt":
+                self._process_group_id = self._proc.pid
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
@@ -402,7 +409,9 @@ class LSPClient:
                 elif kind == "notification":
                     self._dispatch_notification(key, msg)
                 else:
-                    logger.warning("[%s] dropping invalid message: %r", self.server_id, msg)
+                    logger.warning(
+                        "[%s] dropping invalid message: %r", self.server_id, msg
+                    )
         except LSPProtocolError as e:
             logger.warning("[%s] protocol error in reader loop: %s", self.server_id, e)
         except (asyncio.CancelledError, OSError):
@@ -519,10 +528,12 @@ class LSPClient:
 
     async def _shutdown_impl(self) -> None:
         """Own the complete protocol and process-tree shutdown sequence."""
+        was_running = self.is_running
         self._stopping = True
+        self._state = "stopping"
         descendants = self._capture_descendants()
         try:
-            if self.is_running:
+            if was_running:
                 try:
                     await asyncio.wait_for(
                         self._send_request("shutdown", None), timeout=2.0
@@ -540,8 +551,10 @@ class LSPClient:
                     except asyncio.TimeoutError:
                         pass
         finally:
-            self._state = "stopped"
-            await self._cleanup_process(descendants)
+            try:
+                await self._cleanup_process(descendants)
+            finally:
+                self._state = "error" if self.process_tree_alive else "stopped"
 
     def _capture_descendants(self):
         proc = self._proc
@@ -552,7 +565,7 @@ class LSPClient:
         return captured
 
     def _capture_owned_processes(self):
-        """Find processes carrying this client's inherited ownership token."""
+        """Find token- or POSIX-process-group-owned descendants."""
         proc = self._proc
         captured = []
         try:
@@ -563,7 +576,18 @@ class LSPClient:
                 if candidate.pid in {os.getpid(), wrapper_pid}:
                     continue
                 try:
-                    if candidate.environ().get(_OWNER_TOKEN_ENV) == self._owner_token:
+                    group_owned = bool(
+                        self._process_group_id is not None
+                        and os.name != "nt"
+                        and os.getpgid(candidate.pid) == self._process_group_id
+                    )
+                    token_owned = False
+                    if not group_owned:
+                        token_owned = (
+                            candidate.environ().get(_OWNER_TOKEN_ENV)
+                            == self._owner_token
+                        )
+                    if group_owned or token_owned:
                         captured.append(candidate)
                 except (psutil.Error, OSError):
                     continue
@@ -624,6 +648,8 @@ class LSPClient:
         # Preserve a stubborn live wrapper for a later tombstone retry.
         if proc is None or proc.returncode is not None:
             self._proc = None
+            if not self._capture_owned_processes():
+                self._process_group_id = None
 
     @staticmethod
     def _capture_descendants_for_pid(pid: int):
@@ -674,7 +700,11 @@ class LSPClient:
     # ------------------------------------------------------------------
 
     async def _send_request(self, method: str, params: Any) -> Any:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
+        if (
+            self._proc is None
+            or self._proc.stdin is None
+            or self._proc.stdin.is_closing()
+        ):
             raise LSPProtocolError(f"cannot send {method!r}: stdin closed")
         loop = asyncio.get_running_loop()
         req_id = self._next_id
@@ -692,7 +722,9 @@ class LSPClient:
         finally:
             self._pending.pop(req_id, None)
 
-    async def _send_request_with_retry(self, method: str, params: Any, *, timeout: float) -> Any:
+    async def _send_request_with_retry(
+        self, method: str, params: Any, *, timeout: float
+    ) -> Any:
         """Send a request, retrying on ``ContentModified`` (-32801).
 
         Other errors propagate.  The retry policy matches Claude Code's
@@ -701,15 +733,24 @@ class LSPClient:
         """
         for attempt in range(MAX_CONTENT_MODIFIED_RETRIES + 1):
             try:
-                return await asyncio.wait_for(self._send_request(method, params), timeout=timeout)
+                return await asyncio.wait_for(
+                    self._send_request(method, params), timeout=timeout
+                )
             except LSPRequestError as e:
-                if e.code == ERROR_CONTENT_MODIFIED and attempt < MAX_CONTENT_MODIFIED_RETRIES:
-                    await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                if (
+                    e.code == ERROR_CONTENT_MODIFIED
+                    and attempt < MAX_CONTENT_MODIFIED_RETRIES
+                ):
+                    await asyncio.sleep(RETRY_BASE_DELAY * (2**attempt))
                     continue
                 raise
 
     async def _send_notification(self, method: str, params: Any) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
+        if (
+            self._proc is None
+            or self._proc.stdin is None
+            or self._proc.stdin.is_closing()
+        ):
             return
         try:
             self._proc.stdin.write(encode_message(make_notification(method, params)))
@@ -718,7 +759,11 @@ class LSPClient:
             logger.debug("[%s] notify %s failed: %s", self.server_id, method, e)
 
     async def _send_response(self, req_id: Any, result: Any) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
+        if (
+            self._proc is None
+            or self._proc.stdin is None
+            or self._proc.stdin.is_closing()
+        ):
             return
         try:
             self._proc.stdin.write(encode_message(make_response(req_id, result)))
@@ -727,10 +772,16 @@ class LSPClient:
             pass
 
     async def _send_error_response(self, req_id: Any, code: int, message: str) -> None:
-        if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
+        if (
+            self._proc is None
+            or self._proc.stdin is None
+            or self._proc.stdin.is_closing()
+        ):
             return
         try:
-            self._proc.stdin.write(encode_message(make_error_response(req_id, code, message)))
+            self._proc.stdin.write(
+                encode_message(make_error_response(req_id, code, message))
+            )
             await self._proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
@@ -756,12 +807,16 @@ class LSPClient:
         params = msg.get("params")
         handler = self._request_handlers.get(method)
         if handler is None:
-            await self._send_error_response(req_id, ERROR_METHOD_NOT_FOUND, f"method not found: {method}")
+            await self._send_error_response(
+                req_id, ERROR_METHOD_NOT_FOUND, f"method not found: {method}"
+            )
             return
         try:
             result = await handler(params)
         except Exception as e:  # noqa: BLE001 — protocol must not blow up
-            logger.warning("[%s] request handler %s failed: %s", self.server_id, method, e)
+            logger.warning(
+                "[%s] request handler %s failed: %s", self.server_id, method, e
+            )
             await self._send_error_response(req_id, -32000, f"handler failed: {e}")
             return
         await self._send_response(req_id, result)
@@ -773,7 +828,9 @@ class LSPClient:
         try:
             handler(msg.get("params"))
         except Exception as e:  # noqa: BLE001
-            logger.debug("[%s] notification handler %s failed: %s", self.server_id, method, e)
+            logger.debug(
+                "[%s] notification handler %s failed: %s", self.server_id, method, e
+            )
 
     # ------------------------------------------------------------------
     # built-in server-→-client request handlers
@@ -987,9 +1044,7 @@ class LSPClient:
         doc = self._docs.get(abs_path)
         sent_version = doc.version if doc else -1
         try:
-            params: Dict[str, Any] = {
-                "textDocument": {"uri": file_uri(abs_path)}
-            }
+            params: Dict[str, Any] = {"textDocument": {"uri": file_uri(abs_path)}}
             result = await self._send_request_with_retry(
                 "textDocument/diagnostic",
                 params,
@@ -1046,7 +1101,9 @@ class LSPClient:
         if timeout is not None and timeout > 0:
             budget = timeout
         else:
-            budget = DIAGNOSTICS_FULL_WAIT if mode == "full" else DIAGNOSTICS_DOCUMENT_WAIT
+            budget = (
+                DIAGNOSTICS_FULL_WAIT if mode == "full" else DIAGNOSTICS_DOCUMENT_WAIT
+            )
         deadline = asyncio.get_event_loop().time() + budget
         abs_path = os.path.abspath(path)
 
@@ -1057,7 +1114,9 @@ class LSPClient:
 
             # Concurrent: document pull + push wait.
             pull_task = asyncio.create_task(self._pull_document_diagnostics(abs_path))
-            push_task = asyncio.create_task(self._wait_for_fresh_push(abs_path, version, remaining))
+            push_task = asyncio.create_task(
+                self._wait_for_fresh_push(abs_path, version, remaining)
+            )
             done, pending = await asyncio.wait(
                 {pull_task, push_task},
                 timeout=remaining,
@@ -1083,7 +1142,9 @@ class LSPClient:
 
             # Loop until budget runs out.
 
-    async def _wait_for_fresh_push(self, path: str, version: int, timeout: float) -> None:
+    async def _wait_for_fresh_push(
+        self, path: str, version: int, timeout: float
+    ) -> None:
         """Wait until a fresh publishDiagnostics arrives for ``path`` at ``version``+."""
         deadline = asyncio.get_event_loop().time() + timeout
         baseline = self._push_counter
@@ -1102,7 +1163,9 @@ class LSPClient:
                         break
                     self._push_event.clear()
                     try:
-                        await asyncio.wait_for(self._push_event.wait(), timeout=remaining)
+                        await asyncio.wait_for(
+                            self._push_event.wait(), timeout=remaining
+                        )
                     except asyncio.TimeoutError:
                         break
                 return
@@ -1116,11 +1179,15 @@ class LSPClient:
                 continue
             self._push_event.clear()
             try:
-                await asyncio.wait_for(self._push_event.wait(), timeout=min(remaining, 0.5))
+                await asyncio.wait_for(
+                    self._push_event.wait(), timeout=min(remaining, 0.5)
+                )
             except asyncio.TimeoutError:
                 continue
 
-    def diagnostics_for(self, path: str, *, fresh_only: bool = False) -> List[Dict[str, Any]]:
+    def diagnostics_for(
+        self, path: str, *, fresh_only: bool = False
+    ) -> List[Dict[str, Any]]:
         """Return current merged + deduped diagnostics for one file.
 
         Diagnostics from push and pull stores are concatenated and
@@ -1173,15 +1240,13 @@ def _diagnostic_key(d: Dict[str, Any]) -> str:
     code = d.get("code")
     if code is not None and not isinstance(code, str):
         code = str(code)
-    return "\x00".join(
-        [
-            str(d.get("severity") or 1),
-            str(code or ""),
-            str(d.get("source") or ""),
-            str(d.get("message") or "").strip(),
-            f"{start.get('line', 0)}:{start.get('character', 0)}-{end.get('line', 0)}:{end.get('character', 0)}",
-        ]
-    )
+    return "\x00".join([
+        str(d.get("severity") or 1),
+        str(code or ""),
+        str(d.get("source") or ""),
+        str(d.get("message") or "").strip(),
+        f"{start.get('line', 0)}:{start.get('character', 0)}-{end.get('line', 0)}:{end.get('character', 0)}",
+    ])
 
 
 __all__ = [

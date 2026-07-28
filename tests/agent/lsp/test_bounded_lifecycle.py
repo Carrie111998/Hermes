@@ -1,4 +1,5 @@
 """Race-focused tests for the bounded LSP client lifecycle."""
+
 from __future__ import annotations
 
 import asyncio
@@ -40,7 +41,9 @@ class FakeClient:
         return []
 
 
-def make_service(*, clock, lifecycle_enabled=True, idle_timeout=100.0, max_clients=0, sweep=3600.0):
+def make_service(
+    *, clock, lifecycle_enabled=True, idle_timeout=100.0, max_clients=0, sweep=3600.0
+):
     return LSPService(
         enabled=True,
         wait_mode="document",
@@ -79,16 +82,14 @@ def install_entry(
 
 def test_lifecycle_config_is_default_on_and_strict(caplog):
     assert _lifecycle_config({}) == (True, 7200.0, 60.0, 0, None)
-    assert _lifecycle_config(
-        {
-            "lifecycle": {
-                "enabled": True,
-                "idle_timeout_seconds": 120,
-                "sweep_interval_seconds": 5,
-                "max_clients_per_process": 3,
-            }
+    assert _lifecycle_config({
+        "lifecycle": {
+            "enabled": True,
+            "idle_timeout_seconds": 120,
+            "sweep_interval_seconds": 5,
+            "max_clients_per_process": 3,
         }
-    ) == (True, 120.0, 5.0, 3, None)
+    }) == (True, 120.0, 5.0, 3, None)
     assert _lifecycle_config({"lifecycle": {"enabled": False}}) == (
         False,
         7200.0,
@@ -132,7 +133,9 @@ def test_default_config_declares_default_on_lifecycle_policy():
 def test_create_from_default_config_wires_bounded_policy(monkeypatch):
     from hermes_cli import config as config_module
 
-    monkeypatch.setattr(config_module, "load_config", lambda: config_module.DEFAULT_CONFIG)
+    monkeypatch.setattr(
+        config_module, "load_config", lambda: config_module.DEFAULT_CONFIG
+    )
     service = LSPService.create_from_config()
     assert service is not None
     try:
@@ -143,6 +146,30 @@ def test_create_from_default_config_wires_bounded_policy(monkeypatch):
         assert lifecycle["max_clients_per_process"] == 0
         assert lifecycle["config_error"] is None
         assert lifecycle["reaper_running"] is True
+    finally:
+        service.shutdown()
+
+
+def test_create_from_config_wires_explicit_lifecycle_opt_out(monkeypatch):
+    from hermes_cli import config as config_module
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {
+            "lsp": {
+                "enabled": True,
+                "lifecycle": {"enabled": False},
+            }
+        },
+    )
+    service = LSPService.create_from_config()
+    assert service is not None
+    try:
+        lifecycle = service.get_status()["lifecycle"]
+        assert lifecycle["enabled"] is False
+        assert lifecycle["config_error"] is None
+        assert lifecycle["reaper_running"] is False
     finally:
         service.shutdown()
 
@@ -232,6 +259,61 @@ def test_service_shutdown_is_idempotent_and_stops_owner_thread():
     service.shutdown()
     assert service.is_closed() is True
     assert service._loop._thread is None
+
+
+def test_service_shutdown_waits_for_inflight_build_spawn():
+    service = make_service(clock=lambda: 0.0)
+    build_started = threading.Event()
+    release_build = threading.Event()
+    build_completed = threading.Event()
+    shutdown_completed = threading.Event()
+    shutdown_errors = []
+
+    def blocking_build(_root, _ctx):
+        build_started.set()
+        if not release_build.wait(timeout=2.0):
+            raise RuntimeError("test did not release build_spawn")
+        build_completed.set()
+        return None
+
+    srv = SimpleNamespace(
+        server_id="fake",
+        seed_first_push=False,
+        build_spawn=blocking_build,
+    )
+    loop = service._loop._loop
+    assert loop is not None
+    reservation = asyncio.run_coroutine_threadsafe(
+        service._reserve_spawn(srv, ("fake", "/repo"), "/repo"), loop
+    )
+    assert build_started.wait(timeout=1.0)
+
+    def shutdown_service():
+        try:
+            service.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            shutdown_errors.append(exc)
+        finally:
+            shutdown_completed.set()
+
+    shutdown_thread = threading.Thread(target=shutdown_service)
+    shutdown_thread.start()
+    try:
+        assert not shutdown_completed.wait(timeout=0.1)
+        assert service.is_accepting_requests() is False
+        assert service.is_closed() is False
+        release_build.set()
+        shutdown_thread.join(timeout=2.0)
+        assert shutdown_completed.is_set()
+        assert shutdown_errors == []
+        assert build_completed.is_set()
+        assert reservation.result(timeout=1.0) is None
+        assert service.is_closed() is True
+    finally:
+        release_build.set()
+        shutdown_thread.join(timeout=2.0)
+        if not service.is_closed():
+            service.shutdown()
 
 
 def test_synchronous_shutdown_is_rejected_on_owner_loop():

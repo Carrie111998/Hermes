@@ -33,6 +33,7 @@ servers are missing binaries and auto-install is off, ``is_active``
 returns False and the file_operations layer falls through to the
 in-process syntax check.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -83,6 +84,7 @@ class _ClientEntry:
     leases: int = 0
     lease_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     spawn_task: Optional[asyncio.Task] = None
+    build_task: Optional[asyncio.Task[Any]] = None
     retire_task: Optional[asyncio.Task] = None
     pending_eviction: Optional[str] = None
 
@@ -154,9 +156,7 @@ def _lifecycle_config(
                 or result > maximum
             ):
                 comparator = "greater than zero" if positive else "non-negative"
-                raise ValueError(
-                    f"{name} must be {comparator} and at most {maximum:g}"
-                )
+                raise ValueError(f"{name} must be {comparator} and at most {maximum:g}")
             return result
 
         idle_timeout = finite_number(
@@ -231,9 +231,18 @@ class _BackgroundLoop:
             for task in pending:
                 task.cancel()
             if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
             try:
                 loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                # Cancelling an ``asyncio.to_thread`` awaiter does not stop its
+                # worker. Do not declare the owner loop dead while binary
+                # discovery/install work is still running in its executor.
+                loop.run_until_complete(loop.shutdown_default_executor())
             except Exception:  # noqa: BLE001
                 pass
             self._thread_id = None
@@ -248,6 +257,7 @@ class _BackgroundLoop:
         Returns the coroutine's result, or raises its exception.
         """
         from agent.async_utils import safe_schedule_threadsafe
+
         if self.is_owner_thread():
             if asyncio.iscoroutine(coro):
                 coro.close()
@@ -366,6 +376,7 @@ class LSPService:
         """
         try:
             from hermes_cli.config import load_config
+
             cfg = load_config()
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP config load failed: %s", e)
@@ -430,7 +441,9 @@ class LSPService:
 
     async def _initialize_async_state(self) -> None:
         self._admission_lock = asyncio.Lock()
-        if self._lifecycle_enabled and (self._idle_timeout > 0 or self._max_clients > 0):
+        if self._lifecycle_enabled and (
+            self._idle_timeout > 0 or self._max_clients > 0
+        ):
             self._reaper_task = asyncio.create_task(
                 self._reaper_loop(), name="hermes-lsp-reaper"
             )
@@ -532,7 +545,9 @@ class LSPService:
                     self._reap_count += 1
                 elif terminated and reason == "capacity":
                     self._capacity_eviction_count += 1
-            level = logging.WARNING if error is not None or not terminated else logging.INFO
+            level = (
+                logging.WARNING if error is not None or not terminated else logging.INFO
+            )
             logger.log(
                 level,
                 "LSP lifecycle retired server=%s root=%s generation=%s "
@@ -805,6 +820,7 @@ class LSPService:
                     # that mapped into a deleted region drop out
                     # silently — they no longer apply.
                     from agent.lsp.range_shift import shift_baseline
+
                     baseline = shift_baseline(baseline, line_shift)
                 seen = {_diag_key(d) for d in baseline}
                 diags = [d for d in diags if _diag_key(d) not in seen]
@@ -812,7 +828,10 @@ class LSPService:
             # to the just-emitted state, mirroring claude-code's
             # diagnosticTracking.
             try:
-                fresh = self._loop.run(self._current_diags_async(file_path), timeout=2.0) or []
+                fresh = (
+                    self._loop.run(self._current_diags_async(file_path), timeout=2.0)
+                    or []
+                )
             except Exception:  # noqa: BLE001
                 fresh = []
             if fresh:
@@ -843,9 +862,7 @@ class LSPService:
                 first_failure = key not in self._broken
                 self._broken.add(key)
         try:
-            self._loop.run(
-                self._retire_key_async(key, "request-failure"), timeout=3.0
-            )
+            self._loop.run(self._retire_key_async(key, "request-failure"), timeout=3.0)
         except Exception as cleanup_exc:  # noqa: BLE001
             logger.debug("LSP failed-generation cleanup for %s: %s", key, cleanup_exc)
         if first_failure:
@@ -994,9 +1011,7 @@ class LSPService:
                         return None
 
             if wait_task is not None:
-                await asyncio.gather(
-                    asyncio.shield(wait_task), return_exceptions=True
-                )
+                await asyncio.gather(asyncio.shield(wait_task), return_exceptions=True)
                 continue
             if not spawn:
                 return None
@@ -1045,9 +1060,7 @@ class LSPService:
                                 existing.client,
                                 owner,
                             )
-                        wait_task = self._begin_retirement_locked(
-                            existing, "crashed"
-                        )
+                        wait_task = self._begin_retirement_locked(existing, "crashed")
                         if wait_task is None:
                             return None
                     elif existing is not None and existing.state == "spawning":
@@ -1131,9 +1144,7 @@ class LSPService:
                     entry.client = target
                     entry.state = "retiring"
                     entry.pending_eviction = "spawn-cleanup-failed"
-            logger.warning(
-                "LSP spawn cleanup incomplete for %s: %s", entry.key, detail
-            )
+            logger.warning("LSP spawn cleanup incomplete for %s: %s", entry.key, detail)
 
         try:
             ctx = ServerContext(
@@ -1143,7 +1154,19 @@ class LSPService:
                 env_overrides=self._env_overrides,
                 init_overrides=self._init_overrides,
             )
-            spec = await asyncio.to_thread(srv.build_spawn, entry.workspace_root, ctx)
+            build_task = asyncio.create_task(
+                asyncio.to_thread(srv.build_spawn, entry.workspace_root, ctx),
+                name=f"hermes-lsp-build-{entry.generation}",
+            )
+            with self._state_lock:
+                current = self._entries.get(entry.key)
+                if current is entry:
+                    entry.build_task = build_task
+            spec = await asyncio.shield(build_task)
+            with self._state_lock:
+                current = self._entries.get(entry.key)
+                if current is entry:
+                    entry.build_task = None
             if spec is None:
                 eventlog.log_server_unavailable(srv.server_id, srv.server_id)
                 with self._state_lock:
@@ -1239,6 +1262,11 @@ class LSPService:
                 for entry in self._entries.values()
                 if entry.spawn_task is not None and not entry.spawn_task.done()
             ]
+            build_tasks = [
+                entry.build_task
+                for entry in self._entries.values()
+                if entry.build_task is not None and not entry.build_task.done()
+            ]
             maintenance = [
                 task
                 for task in self._maintenance_tasks
@@ -1247,13 +1275,18 @@ class LSPService:
         for task in spawn_tasks + maintenance:
             task.cancel()
         if spawn_tasks or maintenance:
+            await asyncio.gather(*(spawn_tasks + maintenance), return_exceptions=True)
+        if build_tasks:
+            # ``build_spawn`` runs in the default executor. Cancelling its
+            # spawn awaiter cannot stop discovery or an auto-install already
+            # running in the worker thread. Await that separately tracked work
+            # before closing so a replacement singleton cannot overlap it.
             await asyncio.gather(
-                *(spawn_tasks + maintenance), return_exceptions=True
+                *(asyncio.shield(task) for task in build_tasks),
+                return_exceptions=True,
             )
 
-        deadline = (
-            asyncio.get_running_loop().time() + SHUTDOWN_LEASE_DRAIN_TIMEOUT
-        )
+        deadline = asyncio.get_running_loop().time() + SHUTDOWN_LEASE_DRAIN_TIMEOUT
         while True:
             with self._state_lock:
                 leased = sum(entry.leases for entry in self._entries.values())
@@ -1399,15 +1432,13 @@ def _diag_key(d: Dict[str, Any]) -> str:
     code = d.get("code")
     if code is not None and not isinstance(code, str):
         code = str(code)
-    return "\x00".join(
-        [
-            str(d.get("severity") or 1),
-            str(code or ""),
-            str(d.get("source") or ""),
-            str(d.get("message") or "").strip(),
-            f"{start.get('line', 0)}:{start.get('character', 0)}-{end.get('line', 0)}:{end.get('character', 0)}",
-        ]
-    )
+    return "\x00".join([
+        str(d.get("severity") or 1),
+        str(code or ""),
+        str(d.get("source") or ""),
+        str(d.get("message") or "").strip(),
+        f"{start.get('line', 0)}:{start.get('character', 0)}-{end.get('line', 0)}:{end.get('character', 0)}",
+    ])
 
 
 __all__ = ["LSPService"]

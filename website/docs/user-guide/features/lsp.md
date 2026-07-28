@@ -244,7 +244,11 @@ process when preserving warm indexes matters more than bounding resources. The
 bounded lifecycle:
 
 - retires only clients that have no active diagnostics operation;
-- waits for a retired process tree to exit before replacing that slot;
+- waits for a retired process tree to exit before replacing that slot, using an
+  inherited ownership token and POSIX process-group identity to recover helpers
+  after their direct wrapper exits;
+- waits for in-flight binary discovery or installation before allowing a
+  replacement service;
 - can enforce a process-local least-recently-used client cap;
 - temporarily exceeds the cap rather than interrupting active work; and
 - respawns an intentionally retired server on the next edit.

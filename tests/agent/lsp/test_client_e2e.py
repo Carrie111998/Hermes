@@ -5,6 +5,7 @@ it through real LSP traffic, and asserts diagnostic flow.  This is
 the closest thing we have to integration coverage without requiring
 pyright/gopls/etc. to be installed in CI.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -83,7 +84,9 @@ async def test_client_didchange_bumps_version(tmp_path: Path):
     try:
         v0 = await client.open_file(str(f), language_id="python")
         f.write_text("print('hi 2')\n")
-        v1 = await client.open_file(str(f), language_id="python")  # re-open path = didChange
+        v1 = await client.open_file(
+            str(f), language_id="python"
+        )  # re-open path = didChange
         assert v1 == v0 + 1
         await client.wait_for_diagnostics(str(f), v1, mode="document")
         # Mock pushed a diagnostic for both events; merged view has one
@@ -127,7 +130,9 @@ async def test_client_shutdown_idempotent(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_shutdown_callers_wait_for_same_cleanup(tmp_path: Path, monkeypatch):
+async def test_concurrent_shutdown_callers_wait_for_same_cleanup(
+    tmp_path: Path, monkeypatch
+):
     client = _client(tmp_path, "clean")
     await client.start()
     cleanup_entered = asyncio.Event()
@@ -144,11 +149,13 @@ async def test_concurrent_shutdown_callers_wait_for_same_cleanup(tmp_path: Path,
     second = None
     try:
         await cleanup_entered.wait()
+        assert client.state == "stopping"
         second = asyncio.create_task(client.shutdown())
         await asyncio.sleep(0)
         assert not second.done()
         allow_cleanup.set()
         await asyncio.gather(first, second)
+        assert client.state == "stopped"
     finally:
         allow_cleanup.set()
         pending = [first]
@@ -408,16 +415,31 @@ async def test_shutdown_finds_owned_descendant_after_wrapper_exit(tmp_path: Path
 
 @pytest.mark.asyncio
 @pytest.mark.live_system_guard_bypass
-async def test_shutdown_sweeps_children_spawned_until_wrapper_kill(tmp_path: Path):
+@pytest.mark.parametrize(
+    "script",
+    [
+        "spawn_loop",
+        pytest.param(
+            "spawn_loop_sanitized",
+            marks=pytest.mark.skipif(
+                os.name == "nt",
+                reason="sanitized fallback uses the POSIX process group",
+            ),
+        ),
+    ],
+)
+async def test_shutdown_sweeps_children_spawned_until_wrapper_kill(
+    tmp_path: Path, script: str
+):
     import psutil
 
     pid_file = tmp_path / "spawn-loop-children.pid"
     client = LSPClient(
-        server_id="mock-spawn-loop",
+        server_id=f"mock-{script}",
         workspace_root=str(tmp_path),
         command=[sys.executable, MOCK_SERVER],
         env={
-            "MOCK_LSP_SCRIPT": "spawn_loop",
+            "MOCK_LSP_SCRIPT": script,
             "MOCK_LSP_CHILD_PID_FILE": str(pid_file),
             "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
         },

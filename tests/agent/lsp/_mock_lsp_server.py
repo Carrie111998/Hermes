@@ -30,6 +30,7 @@ The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
 under whatever Python the test process picks up.
 """
+
 from __future__ import annotations
 
 import json
@@ -77,13 +78,18 @@ def main():
             with open(pid_file, "w", encoding="utf-8") as handle:
                 handle.write(str(child.pid))
         script = "clean"
-    elif script == "spawn_loop":
+    elif script in {"spawn_loop", "spawn_loop_sanitized"}:
         spawn_forever = True
+        sanitize_children = script == "spawn_loop_sanitized"
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         pid_file = os.environ["MOCK_LSP_CHILD_PID_FILE"]
 
         def spawn_children():
             while True:
+                child_env = None
+                if sanitize_children:
+                    child_env = dict(os.environ)
+                    child_env.pop("HERMES_LSP_OWNER_TOKEN", None)
                 child = subprocess.Popen(
                     [
                         sys.executable,
@@ -92,6 +98,7 @@ def main():
                         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                         "time.sleep(300)",
                     ],
+                    env=child_env,
                 )
                 with open(pid_file, "a", encoding="utf-8") as handle:
                     handle.write(f"{child.pid}\n")
@@ -108,19 +115,20 @@ def main():
         if "id" in msg and msg.get("method") == "initialize":
             if script == "slow":
                 time.sleep(1.0)
-            write_message(
-                {
-                    "jsonrpc": "2.0",
-                    "id": msg["id"],
-                    "result": {
-                        "capabilities": {
-                            "textDocumentSync": 1,  # Full
-                            "diagnosticProvider": {"interFileDependencies": False, "workspaceDiagnostics": False},
+            write_message({
+                "jsonrpc": "2.0",
+                "id": msg["id"],
+                "result": {
+                    "capabilities": {
+                        "textDocumentSync": 1,  # Full
+                        "diagnosticProvider": {
+                            "interFileDependencies": False,
+                            "workspaceDiagnostics": False,
                         },
-                        "serverInfo": {"name": "mock-lsp", "version": "0.1"},
                     },
-                }
-            )
+                    "serverInfo": {"name": "mock-lsp", "version": "0.1"},
+                },
+            })
             if script == "crash":
                 return 0
             continue
@@ -156,32 +164,22 @@ def main():
                 # Ghost scenario: publish an error for the ORIGINAL
                 # content, then never publish again after edits.
                 if not is_change:
-                    write_message(
-                        {
-                            "jsonrpc": "2.0",
-                            "method": "textDocument/publishDiagnostics",
-                            "params": {"uri": uri, "version": version, "diagnostics": error_diag},
-                        }
-                    )
+                    write_message({
+                        "jsonrpc": "2.0",
+                        "method": "textDocument/publishDiagnostics",
+                        "params": {
+                            "uri": uri,
+                            "version": version,
+                            "diagnostics": error_diag,
+                        },
+                    })
                 continue
             if script == "slow_push":
                 diagnostics = error_diag
                 if is_change:
                     time.sleep(float(os.environ.get("MOCK_LSP_PUSH_DELAY", "1.0")))
                     diagnostics = []
-                write_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "method": "textDocument/publishDiagnostics",
-                        "params": {"uri": uri, "version": version, "diagnostics": diagnostics},
-                    }
-                )
-                continue
-            diagnostics = []
-            if script == "errors":
-                diagnostics = error_diag
-            write_message(
-                {
+                write_message({
                     "jsonrpc": "2.0",
                     "method": "textDocument/publishDiagnostics",
                     "params": {
@@ -189,30 +187,38 @@ def main():
                         "version": version,
                         "diagnostics": diagnostics,
                     },
-                }
-            )
+                })
+                continue
+            diagnostics = []
+            if script == "errors":
+                diagnostics = error_diag
+            write_message({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": uri,
+                    "version": version,
+                    "diagnostics": diagnostics,
+                },
+            })
             continue
 
         if msg.get("method") == "textDocument/diagnostic":
             if script in {"stale", "slow_push"}:
                 # These scripts model push-only servers so the ghost
                 # can't be papered over by the pull channel.
-                write_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": msg["id"],
-                        "error": {"code": -32601, "message": "method not found"},
-                    }
-                )
-                continue
-            # Pull endpoint — return empty.
-            write_message(
-                {
+                write_message({
                     "jsonrpc": "2.0",
                     "id": msg["id"],
-                    "result": {"kind": "full", "items": []},
-                }
-            )
+                    "error": {"code": -32601, "message": "method not found"},
+                })
+                continue
+            # Pull endpoint — return empty.
+            write_message({
+                "jsonrpc": "2.0",
+                "id": msg["id"],
+                "result": {"kind": "full", "items": []},
+            })
             continue
 
         if msg.get("method") == "textDocument/didSave":
@@ -229,13 +235,14 @@ def main():
 
         # Unknown request: respond with method-not-found.
         if "id" in msg:
-            write_message(
-                {
-                    "jsonrpc": "2.0",
-                    "id": msg["id"],
-                    "error": {"code": -32601, "message": f"method not found: {msg.get('method')}"},
-                }
-            )
+            write_message({
+                "jsonrpc": "2.0",
+                "id": msg["id"],
+                "error": {
+                    "code": -32601,
+                    "message": f"method not found: {msg.get('method')}",
+                },
+            })
 
 
 if __name__ == "__main__":
