@@ -4169,6 +4169,12 @@ class _PinnedExecutablePath:
                         stat.S_IWGRP | stat.S_IWOTH
                     ):
                         raise OwnerLauncherError(self._invalid_code)
+                    # Directory mtime/ctime changes when an unrelated sibling is
+                    # created or when an idempotent chmod reapplies the existing
+                    # mode.  Neither changes resolution of this exact component.
+                    # Pin its identity and security-relevant metadata instead;
+                    # replacement is still detected by (st_dev, st_ino), while
+                    # mode/owner drift remains fail-closed.
                     chain.append((
                         "directory",
                         prefix,
@@ -4177,8 +4183,6 @@ class _PinnedExecutablePath:
                         metadata.st_gid,
                         metadata.st_dev,
                         metadata.st_ino,
-                        metadata.st_mtime_ns,
-                        metadata.st_ctime_ns,
                     ))
                     continue
                 if (
