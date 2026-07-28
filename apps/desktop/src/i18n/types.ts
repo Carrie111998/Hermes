@@ -344,6 +344,8 @@ export interface Translations {
       colorModeDesc: string
       toolViewTitle: string
       toolViewDesc: string
+      keepReasoningExpandedTitle: string
+      keepReasoningExpandedDesc: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
       translucencyTitle: string
