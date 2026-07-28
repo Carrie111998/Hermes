@@ -71,6 +71,14 @@ _CLAUDE_2110_RESUME_SCAFFOLD = "No response requested."
 _MAX_AUTH_RECOVERY_ATTEMPTS = 24
 
 
+class _PtyReadinessTimeout(TimeoutError):
+    """Bounded, non-transcript diagnostic for a Claude readiness timeout."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Claude PTY readiness timed out: {reason}")
+        self.reason = reason
+
+
 def _canonical_claude_startup_settings(theme: object) -> str:
     """Return the sole isolated startup setting accepted by the registrar."""
 
@@ -596,7 +604,14 @@ class _WinPtyProcess:
                     and _claude_launch_input_ready(readiness_output)
                 ):
                     return "".join(chunks)
-                raise TimeoutError
+                raise _PtyReadinessTimeout(
+                    _readiness_timeout_reason(
+                        "".join(chunks),
+                        readiness_output=readiness_output,
+                        trust_redraw_pending=trust_redraw_pending,
+                        post_trust_modal_seen=post_trust_modal_seen,
+                    )
+                )
             try:
                 value = timed_read(4096, remaining)
             except (EOFError, StopIteration) as exc:
@@ -1283,6 +1298,12 @@ class ClaudeNativeRegistrar:
                 "claude_executable_unavailable",
                 "Claude executable unavailable",
             )
+        except _PtyReadinessTimeout as exc:
+            pending = (
+                "retry",
+                "creation_ambiguous",
+                f"Claude TUI readiness blocked: {exc.reason}",
+            )
         except TimeoutError:
             pending = ("retry", "creation_ambiguous", "registration result ambiguous")
         except RuntimeError:
@@ -1300,10 +1321,15 @@ class ClaudeNativeRegistrar:
                         terminated = False
                     if not terminated:
                         provider_limit_observed = False
+                        detail = (
+                            pending[2]
+                            if pending is not None
+                            else "PTY termination was not confirmed"
+                        )
                         pending = (
                             "retry",
                             "creation_ambiguous",
-                            "PTY termination was not confirmed",
+                            detail,
                         )
                 try:
                     cleanup = process.close(self._exit_timeout)
@@ -1311,10 +1337,15 @@ class ClaudeNativeRegistrar:
                     cleanup = PtyCleanupResult(False, False, False, None)
                 if not cleanup.succeeded:
                     provider_limit_observed = False
+                    detail = (
+                        pending[2]
+                        if pending is not None
+                        else "PTY cleanup postconditions failed"
+                    )
                     pending = (
                         "retry",
                         "creation_ambiguous",
-                        "PTY cleanup postconditions failed",
+                        detail,
                     )
 
         if pending is not None and not provider_limit_observed:
@@ -1641,6 +1672,28 @@ def _workspace_trust_prompt_visible(output: str) -> bool:
     """Recognize only Claude's native two-choice trust gate before submitting."""
 
     return _workspace_trust_prompt_end(output) is not None
+
+
+def _readiness_timeout_reason(
+    output: str,
+    *,
+    readiness_output: str,
+    trust_redraw_pending: bool,
+    post_trust_modal_seen: bool,
+) -> str:
+    """Classify readiness without retaining or exposing terminal transcript text."""
+
+    if post_trust_modal_seen or _known_claude_input_modal_visible(readiness_output):
+        return "known_input_modal"
+    if trust_redraw_pending:
+        return "workspace_trust_redraw_incomplete"
+    if _workspace_trust_prompt_prefix_start(output) is not None:
+        return "workspace_trust_pending"
+    if not _bracketed_paste_enabled(readiness_output):
+        return "terminal_input_not_enabled"
+    if not _claude_main_repl_ready(readiness_output):
+        return "main_repl_footer_missing"
+    return "main_repl_unsettled"
 
 
 def _workspace_trust_prompt_end(output: str) -> int | None:

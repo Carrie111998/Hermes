@@ -25,6 +25,7 @@ from session_bridge.claude_registrar import (
     ClaudeNativeRegistrar,
     PtyCleanupResult,
     WindowsConPtyFactory,
+    _PtyReadinessTimeout,
     _WinPtyProcess,
     _claude_main_repl_ready,
     _registrar_pywinpty_process_type,
@@ -433,6 +434,20 @@ def test_tui_readiness_timeout_never_writes_registration_prompt() -> None:
 
     assert result.status == "retry"
     assert result.error_code == "creation_ambiguous"
+    assert process.writes == []
+    assert process.terminated and process.closed
+
+
+def test_tui_readiness_timeout_preserves_bounded_phase_diagnostic() -> None:
+    process = FakePty(
+        ready_error=_PtyReadinessTimeout("known_input_modal"),
+    )
+
+    result = registrar(FakeSource(), FakeFactory(process)).process(claim())
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert result.detail == "Claude TUI readiness blocked: known_input_modal"
     assert process.writes == []
     assert process.terminated and process.closed
 
@@ -1654,11 +1669,12 @@ def test_winpty_readiness_keeps_post_trust_product_modal_sticky_across_redraw() 
             self.writes.append(data)
 
     process = Process()
-    with pytest.raises(TimeoutError):
+    with pytest.raises(_PtyReadinessTimeout) as failure:
         _WinPtyProcess(process).read_until_ready(
             1.0, accept_workspace_trust=True
         )
 
+    assert failure.value.reason == "known_input_modal"
     assert process.writes == ["\r"]
 
 
