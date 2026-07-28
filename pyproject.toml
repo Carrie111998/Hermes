@@ -2,7 +2,7 @@
 
 [project]
 name = "charterforge"
-version = "0.20.0"
+version = "0.22.0"
 description = "Governed autonomous-company runtime led by an agentic Founder and CEO"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
@@ -137,6 +137,7 @@ dependencies = [
   # Hence the ``sys_platform == 'win32'`` marker: the dep (and its portalocker
   # / pywin32 tree) ships only where it's actually used.
   "concurrent-log-handler==0.9.29; sys_platform == 'win32'",
+  "psycopg>=3.2.9",
 ]
 
 [project.optional-dependencies]

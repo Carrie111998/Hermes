@@ -304,6 +304,7 @@ hermes_cli/active_sessions.py
 hermes_cli/agent_identity.py
 hermes_cli/agentmail_events.py
 hermes_cli/approval_artifacts.py
+hermes_cli/audit_redaction.py
 hermes_cli/auth.py
 hermes_cli/auth_commands.py
 hermes_cli/authority_integrity.py
@@ -320,6 +321,7 @@ hermes_cli/business.py
 hermes_cli/business_audit.py
 hermes_cli/business_commitments.py
 hermes_cli/business_metrics.py
+hermes_cli/business_readiness.py
 hermes_cli/business_security.py
 hermes_cli/callbacks.py
 hermes_cli/checkpoints.py
@@ -349,6 +351,7 @@ hermes_cli/cron.py
 hermes_cli/curator.py
 hermes_cli/curses_ui.py
 hermes_cli/dashboard_register.py
+hermes_cli/db_commands.py
 hermes_cli/debug.py
 hermes_cli/default_soul.py
 hermes_cli/dep_ensure.py
@@ -434,6 +437,7 @@ hermes_cli/platforms.py
 hermes_cli/plugins.py
 hermes_cli/plugins_cmd.py
 hermes_cli/portal_cli.py
+hermes_cli/postgres_authority.py
 hermes_cli/procurement_policy.py
 hermes_cli/profile_describer.py
 hermes_cli/profile_distribution.py
@@ -453,6 +457,7 @@ hermes_cli/relaunch.py
 hermes_cli/resource_budget.py
 hermes_cli/route_identity.py
 hermes_cli/runtime_deployment.py
+hermes_cli/runtime_drift.py
 hermes_cli/runtime_provider.py
 hermes_cli/secret_prompt.py
 hermes_cli/secrets_cli.py
@@ -488,6 +493,7 @@ hermes_cli/tools_config.py
 hermes_cli/toolset_validation.py
 hermes_cli/uninstall.py
 hermes_cli/urllib_security.py
+hermes_cli/usage_billing.py
 hermes_cli/verification_evidence.py
 hermes_cli/voice.py
 hermes_cli/web_git.py
@@ -755,6 +761,8 @@ tests/test_background_review_session_isolation.py
 tests/test_base_url_hostname.py
 tests/test_batch_runner_checkpoint.py
 tests/test_bitwarden_secrets.py
+tests/test_charterforge_install_script.py
+tests/test_charterforge_namespace.py
 tests/test_cli_file_drop.py
 tests/test_cli_manual_compress.py
 tests/test_cli_skin_integration.py
@@ -764,6 +772,7 @@ tests/test_conftest_wal_gate.py
 tests/test_copilot_initiator.py
 tests/test_credential_file_permissions.py
 tests/test_ctx_halving_fix.py
+tests/test_db_commands.py
 tests/test_delegate_cascade_49148.py
 tests/test_dispatch_session_id.py
 tests/test_empty_model_fallback.py
@@ -829,6 +838,7 @@ tests/test_packaging_build_guard.py
 tests/test_packaging_metadata.py
 tests/test_plugin_skills.py
 tests/test_plugin_utils.py
+tests/test_postgres_authority.py
 tests/test_process_loop_event_loop_warning.py
 tests/test_profile_isolation_runtime.py
 tests/test_project_metadata.py

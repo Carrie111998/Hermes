@@ -1,5 +1,136 @@
 # Changelog
 
+## 0.22.0 — 2026-07-28
+
+**Production HA-capable authority database with adversarial Postgres testing.**
+
+This release delivers a fully-fenced Postgres authority store with schema
+versioning, downgrade support, and built-in health checks. All 33 adversarial
+tests against a live PostgreSQL database pass deterministically.
+
+### Postgres Authority Store ⛓️
+
+- **Claim exclusivity**: `UNIQUE (task_id, organization_id)` at DB level
+  enforces exactly one active claim per (task, org) — two connections with
+  different tokens cannot claim the same task.
+- **Lease-generation fencing**: `reclaim_task()` atomically increments
+  `lease_generation`; all subsequent writes (release, complete, permit
+  consume, effect insert) require the correct_generation — stale workers
+  cannot act after being superseded.
+- **Full permit model**: `task_permits` now matches the SQLite authority
+  model with `actor`, `executor`, `capability`, `action_type`,
+  `target_resource`, `payload_hash`, `policy_version`, `revoked_at`,
+  `revocation_reason` — full revocation, policy versioning, and payload
+  integrity verification.
+- **Idempotent effects**: `execution_effects.effect_key UNIQUE` with
+  `INSERT ... ON CONFLICT DO NOTHING` ensures duplicate effect recording
+  during replay or recovery is a safe no-op.
+- **Bound timestamp parameters**: All datetime values passed as
+  timezone-aware Python `datetime` objects via bound parameters — no
+  string interpolation, no SQL injection surface.
+- **Versioned migrations**: `_MIGRATIONS` ordered list with fail-closed
+  startup (`RuntimeError` if DB version > current). Migrations available
+  for v0→v1 (tables), v1→v2 (schema_version table).
+- **Downgrade support**: `charterforge db downgrade` — walk backwards
+  through migrations, dropping tables where reverse DDL is defined.
+  Currently supports v2→v1 (drop schema_version) and v1→v0 (drop tables).
+
+### CLI Enhancements 📜
+
+- `charterforge db init --postgres-url <url>` — initialize Postgres authority
+- `charterforge db upgrade` — apply migrations to latest schema
+- `charterforge db downgrade [--to-version V]` — rollback schema
+- `charterforge db status` — show version, connections, table counts
+
+### Health Checks 🩺
+
+- `charterforge business readiness --check` now includes authority store
+  health in its projection:
+  - `authority_store_unreachable` when Postgres is unreachable
+  - `authority_store_schema_outdated` when current < required
+  - `authority_store_schema_too_new` when current > supported
+  - `authority_store_driver_missing` when psycopg is not installed
+  - SQLite backend always returns healthy (no connectivity to probe)
+- `/api/health` returns `database` object:
+  - `backend`, `reachable`, `schema_version`, `schema_current`,
+    `required_version` when Postgres is configured
+
+### Tests & CI 🧪
+
+- **33 adversarial Postgres integration tests** prove:
+  - Two-connection claim exclusivity (exactly one succeeds)
+  - Expired claim replacement by a third connection
+  - Stale fencing — generation mismatch rejects all writes
+  - Duplicate effect recording idempotency
+  - Organization/task scoping
+  - Cleanup semantics
+  - Generation violations
+  - Migrations fail-closed
+- **9 authority store unit tests** cover SQLite contract, Postgres contract,
+  unknown backend rejection, and readiness findings without a live DB.
+- **8 db command tests** validate init/upgrade/status/error handling.
+- Full suite passes in ~45 seconds against a live PostgreSQL 16 instance.
+- CI job runs with PostgreSQL 16 container, explicit port, and schema URL.
+
+### Breaking Changes ⚠️
+
+- **`claim_lock` column removed** — use `UNIQUE (task_id, organization_id)`
+  instead. Existing SQLite databases remain unchanged; Postgres migrations
+  create the correct constraint on init.
+
+### Dependencies 📦
+
+- Added optional `psycopg_pool` to support connection pooling in v0.23+
+
+### Validation
+
+```bash
+# Initialize Postgres authority store
+charterforge db init --postgres-url "postgresql://user:pass@host:5432/db"
+
+# Run adversarial test suite against live DB
+AUTHORITY_POSTGRES_TEST_URL="postgresql://test:test@localhost/charterforge_test" \
+  pytest tests/test_postgres_authority.py -v
+
+# Health check includes DB status
+charterforge business readiness --check
+
+# Downgrade one version
+charterforge db downgrade
+```
+
+### Roadmap Milestone
+
+| Milestone | Status |
+|-----------|--------|
+| v0.20.0 — Crash Recovery | ✅ |
+| v0.21.0 — Payment Rails | 🔲 Next |
+| v0.22.0 — Postgres Authority Store | ✅ Released |
+| v0.23.0 — Multi-Tenant Isolation | 🔲 Planning |
+| v0.24.0 — Billing Engine | 🔲 |
+
+### Changes by Commit
+
+- `e0a646b33` fix(postgres): exclusive claim per (task_id, org) with lease_generation fencing token
+- `db5acd40a` test(postgres): adversarial fencing + exclusivity + idempotency test suite
+- `5d22bea7b` feat(readiness): Postgres health check in readiness projection and /api/health
+
+## 0.21.0 — 2026-07-27
+
+**Payment rail plugins — ≥3 rails working.**
+
+This release establishes the payment rail plugin contract with three
+production-ready implementations.
+
+### Payment Rails
+
+- Added `charterforge-stripe-rail` — webhook authentication, signature
+  verification, event routing.
+- Added `charterforge-circle-rail` — USDC payments, on-chain receipts.
+- Added `charterforge-crossmint-rail` — card issuance, custodial accounts.
+- Documented geo flexibility: Stripe, Nevermined, Circle, Crossmint,
+  Wise, Payoneer, PayPal.
+
 ## 0.20.0 — 2026-07-27
 
 **Governed autonomous company runtime with proven crash recovery.**

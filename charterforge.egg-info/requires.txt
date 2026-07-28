@@ -24,6 +24,7 @@ fastapi<1,>=0.104.0
 uvicorn[standard]<1,>=0.24.0
 python-multipart<1,>=0.0.9
 Pillow==12.2.0
+psycopg>=3.2.9
 
 [:sys_platform != "win32"]
 ptyprocess<1,>=0.7.0
@@ -149,6 +150,9 @@ nemo-relay<1.0,>=0.5
 
 [parallel-web]
 parallel-web==0.4.2
+
+[postgres]
+psycopg[binary]==3.2.9
 
 [pty]
 
