@@ -31,6 +31,15 @@ class TestGetToolset:
         assert ts is not None
         assert "web_search" in ts["tools"]
 
+    def test_x_search_toolset_marks_read_only_and_points_to_xurl(self):
+        ts = get_toolset("x_search")
+        assert ts is not None
+        assert ts["tools"] == ["x_search"]
+        description = ts["description"].lower()
+        assert "read-only" in description
+        assert "xurl" in description
+        assert "authenticated" in description
+
     def test_merges_registry_tools_into_builtin_toolset(self, monkeypatch):
         reg = ToolRegistry()
         reg.register(
@@ -133,9 +142,9 @@ class TestValidateToolset:
     def test_mcp_alias_uses_live_registry(self, monkeypatch):
         reg = ToolRegistry()
         reg.register(
-            name="mcp_dynserver_ping",
+            name="mcp__dynserver__ping",
             toolset="mcp-dynserver",
-            schema=_make_schema("mcp_dynserver_ping", "Ping"),
+            schema=_make_schema("mcp__dynserver__ping", "Ping"),
             handler=_dummy_handler,
         )
         reg.register_toolset_alias("dynserver", "mcp-dynserver")
@@ -144,7 +153,7 @@ class TestValidateToolset:
 
         assert validate_toolset("dynserver") is True
         assert validate_toolset("mcp-dynserver") is True
-        assert "mcp_dynserver_ping" in resolve_toolset("dynserver")
+        assert "mcp__dynserver__ping" in resolve_toolset("dynserver")
 
 
 class TestGetToolsetInfo:

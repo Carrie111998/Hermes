@@ -621,3 +621,282 @@ def test_repair_does_NOT_merge_codex_interim_assistants():
     assert len(interim) == 2
     encs = [m["codex_reasoning_items"][0]["encrypted_content"] for m in interim]
     assert "enc_first" in encs and "enc_second" in encs
+
+
+# ── tool_call_id de-duplication (#58327) ────────────────────────────────────
+# Strict providers (DeepSeek) reject a payload where the same tool_call_id
+# appears more than once with HTTP 400 "Duplicate value for 'tool_call_id'".
+
+
+def test_repair_deduplicates_duplicate_tool_results():
+    """A second tool result reusing an already-matched tool_call_id is dropped.
+
+    repair_message_sequence consumes the id from known_tool_ids on first match
+    so the duplicate falls into the repair/drop branch (#58327, kernel #55436).
+    """
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    agent = _bare_agent()
+    messages = [
+        {"role": "user", "content": "run the tool"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "call_1", "type": "function",
+                         "function": {"name": "test", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "res1"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "res1 duplicate"},
+    ]
+    repairs = repair_message_sequence(agent, messages)
+    assert repairs == 1
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["content"] == "res1"
+
+
+def test_sanitize_deduplicates_duplicate_tool_results():
+    """sanitize_api_messages (final pre-API chokepoint) drops duplicate tool
+    results sharing a tool_call_id."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "call_X", "type": "function",
+                         "function": {"name": "foo", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_X", "content": "A"},
+        {"role": "tool", "tool_call_id": "call_X", "content": "B (duplicate)"},
+        {"role": "assistant", "content": "done"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    tool_ids = [m["tool_call_id"] for m in out if m.get("role") == "tool"]
+    assert tool_ids == ["call_X"]  # exactly one survives
+
+
+def test_sanitize_deduplicates_duplicate_assistant_tool_call_ids():
+    """sanitize_api_messages collapses duplicate tool_calls sharing an id
+    WITHIN a single assistant message (the message[6] shape from #58327)."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_Y", "type": "function",
+             "function": {"name": "foo", "arguments": "{}"}},
+            {"id": "call_Y", "type": "function",
+             "function": {"name": "bar", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_Y", "content": "r"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assistant = [m for m in out if m.get("role") == "assistant"][0]
+    ids = [tc["id"] for tc in assistant["tool_calls"]]
+    assert ids == ["call_Y"]  # duplicate collapsed
+
+
+def test_sanitize_preserves_distinct_tool_call_ids():
+    """Negative control: legitimate DISTINCT tool_call_ids must NOT be dropped
+    (guards against over-dedup)."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_A", "type": "function",
+             "function": {"name": "a", "arguments": "{}"}},
+            {"id": "call_B", "type": "function",
+             "function": {"name": "b", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_A", "content": "ra"},
+        {"role": "tool", "tool_call_id": "call_B", "content": "rb"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assistant = [m for m in out if m.get("role") == "assistant"][0]
+    assert [tc["id"] for tc in assistant["tool_calls"]] == ["call_A", "call_B"]
+    assert sorted(m["tool_call_id"] for m in out if m.get("role") == "tool") == ["call_A", "call_B"]
+
+
+def test_sanitize_drops_empty_tool_calls_array():
+    """sanitize_api_messages strips ``tool_calls: []`` from assistant messages.
+
+    DeepSeek v4 rejects an empty tool_calls array with HTTP 400 "Invalid
+    'messages[N].tool_calls': empty array" (#58755). The empty array is
+    semantically "no tool calls", so the key is dropped while content is
+    preserved.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "answer", "tool_calls": []},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assistant = [m for m in out if m.get("role") == "assistant"][0]
+    assert "tool_calls" not in assistant
+    assert assistant["content"] == "answer"
+
+
+def test_sanitize_drops_non_list_tool_calls():
+    """A malformed non-list ``tool_calls`` (e.g. None under the key) is also
+    dropped so it can't reach a strict provider."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "assistant", "content": "text", "tool_calls": None},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assert "tool_calls" not in out[0]
+
+
+def test_sanitize_does_not_mutate_original_on_empty_tool_calls():
+    """Stripping must be non-destructive: the caller's message dicts (the
+    persisted trajectory) keep their original ``tool_calls`` key."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    original_assistant = {"role": "assistant", "content": "answer", "tool_calls": []}
+    messages = [{"role": "user", "content": "hi"}, original_assistant]
+    sanitize_api_messages(list(messages))
+    assert original_assistant["tool_calls"] == []  # untouched in-place
+
+
+def test_sanitize_preserves_populated_tool_calls():
+    """Negative control: a non-empty tool_calls array (with its matching tool
+    result) must survive untouched."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_Z", "type": "function",
+             "function": {"name": "foo", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_Z", "content": "r"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assistant = [m for m in out if m.get("role") == "assistant"][0]
+    assert [tc["id"] for tc in assistant["tool_calls"]] == ["call_Z"]
+
+
+# ── Self-recovery: heal empty-content non-final messages ──────────────────
+# Repro of the production incident: a dead stream persisted an empty-content
+# assistant stub mid-transcript, and every later request 400'd with
+# "all messages must have non-empty content except for the optional final
+# assistant message" (INVALID_REQUEST_BODY). sanitize_api_messages now heals
+# such turns on the per-call copy so the session recovers itself in memory.
+
+def test_sanitize_heals_empty_assistant_stub_between_tool_and_user():
+    """The exact production shape: tool -> EMPTY assistant (finish=length) ->
+    user recovery. The empty assistant would 400 the whole request; it must be
+    substituted with non-empty placeholder content, not left empty."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "do a thing"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_A", "type": "function",
+             "function": {"name": "foo", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_A", "content": "result"},
+        {"role": "assistant", "content": None},  # <-- poison stub (non-final)
+        {"role": "user", "content": "[System: previous response was cut off]"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    # Every non-final message now has non-empty content.
+    for m in out[:-1]:
+        c = m.get("content")
+        assert m.get("tool_calls") or (isinstance(c, str) and c.strip()) or (
+            isinstance(c, list) and c), f"empty non-final survived: {m}"
+    # The stub specifically became the placeholder.
+    stub = out[3]
+    assert stub["role"] == "assistant"
+    assert stub["content"] == "[response interrupted]"
+
+
+def test_sanitize_heals_empty_user_message():
+    """An empty user turn mid-transcript is equally invalid and is healed."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": ""},          # <-- empty user (non-final)
+        {"role": "assistant", "content": "still here"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assert out[1]["content"] == "[response interrupted]"
+
+
+def test_sanitize_allows_empty_final_assistant():
+    """Negative control: an empty FINAL assistant message is legal per the API
+    ('except for the optional final assistant message') and must NOT be
+    touched."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": ""},  # final — allowed empty
+    ]
+    out = sanitize_api_messages(list(messages))
+    assert out[-1]["content"] == ""  # untouched
+
+
+def test_sanitize_empty_heal_is_non_destructive():
+    """Healing must not mutate the caller's persisted dicts — only the per-call
+    copy is repaired, so the stored trajectory keeps the true empty turn."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    original_stub = {"role": "assistant", "content": None}
+    messages = [
+        {"role": "user", "content": "q"},
+        original_stub,
+        {"role": "user", "content": "recovery"},
+    ]
+    sanitize_api_messages(list(messages))
+    assert original_stub["content"] is None  # untouched in-place
+
+
+def test_sanitize_preserves_reasoning_only_and_toolcall_turns():
+    """Negative control: a non-final assistant turn that is 'empty content' but
+    carries reasoning OR tool_calls is valid payload and must NOT be rewritten
+    to the placeholder (that would clobber real model output)."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_R", "type": "function",
+             "function": {"name": "foo", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_R", "content": "r"},
+        {"role": "user", "content": "next"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    # tool_call assistant keeps its tool_calls, content not clobbered to text
+    tc_asst = out[1]
+    assert tc_asst.get("tool_calls") and tc_asst["tool_calls"][0]["id"] == "call_R"
+    assert tc_asst["content"] != "[response interrupted]"
+
+
+
+def test_sanitize_preserves_codex_item_carrier_turns():
+    """Negative control: a codex commentary-phase assistant turn persists with
+    content:'' by DESIGN — its text lives in codex_message_items (delivered
+    via the interim callback, replayed as structured items for prefix-cache
+    hits).  The empty-content repair must treat the item carriers as payload
+    and never rewrite these turns (July 2026: a write-time pad that ignored
+    this broke codex commentary replay in CI)."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "analyze repo"},
+        {"role": "assistant", "content": "", "codex_message_items": [
+            {"id": "msg_1", "phase": "commentary",
+             "content": [{"type": "output_text", "text": "I'll inspect first."}]},
+        ]},
+        {"role": "user", "content": "go on"},
+        {"role": "assistant", "content": "", "codex_reasoning_items": [
+            {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"},
+        ]},
+        {"role": "user", "content": "final"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    commentary = out[1]
+    reasoning_carrier = out[3]
+    assert commentary["content"] == "", (
+        "codex_message_items carrier must keep its designed-empty content"
+    )
+    assert reasoning_carrier["content"] == "", (
+        "codex_reasoning_items carrier must keep its designed-empty content"
+    )

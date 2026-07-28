@@ -326,6 +326,40 @@ class TestPreToolCallBlocking:
         assert "post_tool_call" in hook_calls
         assert "transform_tool_result" in hook_calls
 
+    def test_relay_rewrite_is_visible_to_pre_tool_authorization(self, monkeypatch):
+        observed = {}
+
+        def rewrite(**kwargs):
+            assert kwargs["tool_name"] == "read_file"
+            return {**kwargs["args"], "path": "approved.txt"}
+
+        def fake_invoke_hook(hook_name, **kwargs):
+            if hook_name == "pre_tool_call":
+                observed["pre_tool_args"] = kwargs["args"]
+            return []
+
+        def dispatch(_name, args, **_kwargs):
+            observed["dispatch_args"] = args
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr(
+            "hermes_cli.observability.relay_runtime.apply_tool_request_intercepts",
+            rewrite,
+        )
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        handle_function_call(
+            "read_file",
+            {"path": "original.txt"},
+            task_id="t1",
+            session_id="s1",
+        )
+
+        assert observed["pre_tool_args"]["path"] == "approved.txt"
+        assert observed["dispatch_args"]["path"] == "approved.txt"
+
     def test_run_agent_pattern_fires_pre_tool_call_exactly_once(self, monkeypatch):
         """End-to-end regression for the double-fire bug.
 
@@ -536,3 +570,54 @@ class TestDisabledToolsetsPlatformBundle:
         from toolsets import bundle_non_core_tools
         # A non-existent bundle resolves to an empty set (no tools), not a crash.
         assert bundle_non_core_tools("hermes-does-not-exist") == set()
+
+
+class TestDisabledToolsetsPostureToolset:
+    """Regression test for #57315: disabling a posture toolset (`coding`,
+    posture: True) must preserve the shared core tools it re-lists but does
+    not own -- same non-core-delta subtraction as hermes-* bundles (#33924) --
+    while atomic toolsets stay fully removable."""
+
+    def test_disabling_coding_preserves_core_but_atomic_disables_still_remove(self):
+        from model_tools import get_tool_definitions
+
+        # web_search is check_fn-gated (needs an API key); probe only the core
+        # tools actually present in baseline so gating cannot mask the fix.
+        core_probe = {"terminal", "read_file", "write_file", "web_search", "execute_code"}
+
+        baseline = {
+            t["function"]["name"]
+            for t in get_tool_definitions(quiet_mode=True)
+        }
+        present_core = core_probe & baseline
+        # Sanity: at least some probed core tools are available in this env.
+        assert present_core, "no probed core tools present in baseline"
+
+        no_coding = {
+            t["function"]["name"]
+            for t in get_tool_definitions(
+                disabled_toolsets=["coding"], quiet_mode=True
+            )
+        }
+        # Previously the full resolve_toolset("coding") subtraction stripped
+        # these shared core tools, collapsing the schema to a handful (#57315).
+        assert present_core <= no_coding, (
+            f"Core tools stripped by disabling 'coding': {present_core - no_coding}"
+        )
+
+        # Atomic (non-posture) toolsets must still be fully removable.
+        no_terminal = {
+            t["function"]["name"]
+            for t in get_tool_definitions(
+                disabled_toolsets=["terminal"], quiet_mode=True
+            )
+        }
+        assert "terminal" not in no_terminal
+
+        no_file = {
+            t["function"]["name"]
+            for t in get_tool_definitions(
+                disabled_toolsets=["file"], quiet_mode=True
+            )
+        }
+        assert "write_file" not in no_file

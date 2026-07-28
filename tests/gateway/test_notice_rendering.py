@@ -84,7 +84,7 @@ def test_real_policy_notices_render_without_doubling():
     notices = (
         _emitted(uf=0.9)                          # band 90 (warn)
         + _emitted(uf=0.5)                        # band 50 (info)
-        + _emitted(uf=1.0, purchased=5_000_000)   # band 90 + grant_spent
+        + _emitted(uf=1.0, purchased=5_000_000)   # top-up at cap → no notices (empty)
         + _emitted(uf=None, paid=False)           # depleted
     )
     assert notices, "policy produced no notices to check"
@@ -107,6 +107,10 @@ def _make_source(platform_value="telegram", chat_id="555", user_id="u1"):
     src.platform = plat
     src.chat_id = chat_id
     src.user_id = user_id
+    # Real SessionSource.profile is None (single-profile) or a str; a MagicMock
+    # auto-attribute would read as a truthy "stamped profile" and trip the
+    # fail-closed path in _adapter_for_source (see AGENTS.md pitfall #17).
+    src.profile = None
     return src
 
 
