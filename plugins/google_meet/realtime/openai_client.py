@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from plugins.google_meet.queue_io import read_jsonl, remove_jsonl_entry, write_jsonl
+from plugins.google_meet.queue_io import read_jsonl, remove_jsonl_entry
 
 
 REALTIME_URL = "wss://api.openai.com/v1/realtime"
@@ -261,9 +261,6 @@ class RealtimeSpeaker:
 
     def _read_queue(self) -> list[dict]:
         return read_jsonl(self.queue_path)
-
-    def _rewrite_queue(self, remaining: list[dict]) -> None:
-        write_jsonl(self.queue_path, remaining)
 
     def _remove_processed(self, entry: dict) -> None:
         remove_jsonl_entry(self.queue_path, str(entry.get("id") or ""))

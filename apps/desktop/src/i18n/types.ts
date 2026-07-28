@@ -5,7 +5,7 @@
 // partial locales should use `defineLocale()` so missing desktop-only strings
 // fall back to English while new keys remain type-checked.
 
-export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja'
+export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar'
 
 export type ToolTitleKey =
   | 'browser_click'
@@ -20,6 +20,7 @@ export type ToolTitleKey =
   | 'execute_code'
   | 'image_generate'
   | 'list_files'
+  | 'memory'
   | 'patch'
   | 'read_file'
   | 'search_files'
@@ -235,7 +236,6 @@ export interface Translations {
     search: string
     searchTitle: string
     swapSidebarSides: string
-    swapSidebarSidesTitle: string
     hideRightSidebar: string
     showRightSidebar: string
     muteHaptics: string
@@ -259,6 +259,12 @@ export interface Translations {
     conflictWith: (label: string) => string
     categories: Record<string, string>
     actions: Record<string, string>
+  }
+
+  // Find-in-page bar (⌘F). `close` reuses common.close.
+  findInPage: {
+    next: string
+    previous: string
   }
 
   language: {
@@ -449,6 +455,15 @@ export interface Translations {
       keepAwakeTitle: string
       keepAwakeDesc: string
     }
+    quickEntry: {
+      enabledTitle: string
+      enabledDesc: string
+      shortcutTitle: string
+      shortcutDesc: string
+      active: string
+      takenBy: string
+      invalidShortcut: string
+    }
     credentials: {
       pasteKey: string
       pasteLabelKey: (label: string) => string
@@ -460,8 +475,7 @@ export interface Translations {
       saving: string
     }
     envActions: {
-      actionsFor: (label: string) => string
-      credentialActions: string
+      actions: string
       manageInKeys: string
       docs: string
       hideValue: string
@@ -486,6 +500,8 @@ export interface Translations {
       modeTitle: string
       localTitle: string
       localDesc: string
+      inheritTitle: string
+      inheritDesc: string
       remoteTitle: string
       remoteDesc: string
       remoteAuthHint: string
@@ -723,6 +739,11 @@ export interface Translations {
       messages: (count: number) => string
       restored: string
       deleteConfirm: (title: string) => string
+      autoArchiveTitle: string
+      autoArchiveDesc: string
+      autoArchiveDaysLabel: string
+      autoArchiveDaysUnit: string
+      autoArchiveFailed: string
       defaultDirTitle: string
       defaultDirDesc: string
       defaultDirUpdated: string
@@ -1176,6 +1197,64 @@ export interface Translations {
     platformIntro: Record<string, string>
   }
 
+  webhooks: {
+    search: string
+    loading: string
+    loadFailed: string
+    subscriptions: (count: number) => string
+    hint: string
+    empty: string
+    disabledTitle: string
+    disabledBody: string
+    enable: string
+    enabling: string
+    enabled: (name: string) => string
+    disabled: (name: string) => string
+    enableRow: string
+    disableRow: string
+    delete: string
+    deleting: string
+    deleted: string
+    deleteTitle: string
+    deleteDescPrefix: string
+    deleteDescSuffix: string
+    deleteFailed: (name: string) => string
+    toggleFailed: (name: string) => string
+    newSubscription: string
+    restarting: string
+    restartNeeded: string
+    restartGateway: string
+    restartingGateway: string
+    restartFailed: (detail: string) => string
+    enabledRestarting: string
+    all: string
+    deliverOnly: string
+    createdTitle: string
+    createdSecretHint: string
+    webhookUrl: string
+    secretOnce: string
+    done: string
+    fieldName: string
+    fieldNamePlaceholder: string
+    fieldDescription: string
+    fieldDescriptionPlaceholder: string
+    fieldEvents: string
+    fieldEventsPlaceholder: string
+    fieldSkills: string
+    fieldSkillsPlaceholder: string
+    fieldDeliver: string
+    fieldDeliverOnly: string
+    fieldPrompt: string
+    fieldPromptPlaceholder: string
+    nameRequired: string
+    create: string
+    creating: string
+    created: string
+    createFailed: (detail: string) => string
+    copy: string
+    deliverOptions: Record<string, string>
+  }
+
   profiles: {
     close: string
     nameHint: string
@@ -1188,9 +1267,9 @@ export interface Translations {
     showAllProfiles: string
     switchToProfile: (name: string) => string
     manageProfiles: string
-    actionsFor: (name: string) => string
+    actions: string
     color: string
-    colorFor: (name: string) => string
+    colorFor: string
     setColor: (color: string) => string
     autoColor: string
     noProfiles: string
@@ -1284,7 +1363,6 @@ export interface Translations {
     showRuns: string
     hideRuns: string
     runHistory: string
-    actionsFor: (title: string) => string
     actionsTitle: string
     resume: string
     pause: string
@@ -1317,6 +1395,7 @@ export interface Translations {
     promptPlaceholder: string
     frequencyLabel: string
     deliverLabel: string
+    deliverNeedsHomeChannel: string
     modelLabel: string
     modelDefault: string
     customScheduleLabel: string
@@ -1329,6 +1408,24 @@ export interface Translations {
     scriptOnlyEditHint: string
     saveChanges: string
     createAction: string
+    tabs: {
+      jobs: string
+      blueprints: string
+    }
+    blueprints: {
+      tab: string
+      startFrom: string
+      custom: string
+      subtitle: string
+      dialogDesc: string
+      scheduleIt: string
+      scheduling: string
+      scheduled: string
+      loading: string
+      failedLoad: string
+      emptyTitle: string
+      emptyDesc: string
+    }
   }
 
   artifacts: {
@@ -1366,6 +1463,26 @@ export interface Translations {
     copyPath: string
   }
 
+  artifactCard: {
+    kind: Record<'code' | 'html' | 'svg', string>
+    generating: (lines: number) => string
+    versionBadge: (count: number) => string
+    open: string
+  }
+
+  artifactPreview: {
+    versionOf: (current: number, total: number) => string
+    olderVersion: string
+    newerVersion: string
+    latest: string
+    copyContent: string
+    download: string
+    openInBrowser: string
+    openInBrowserFailed: string
+    missingTitle: string
+    missingBody: string
+  }
+
   sidebar: {
     nav: Record<string, string>
     searchAria: string
@@ -1385,11 +1502,11 @@ export interface Translations {
     allPinned: string
     shiftClickHint: string
     noWorkspace: string
-    noProject: string
     projectEmpty: string
     noSessions: string
     projects: {
       sectionLabel: string
+      home: string
       newButton: string
       createTitle: string
       createDesc: string
@@ -1466,7 +1583,6 @@ export interface Translations {
       openInNewTab: string
       openInSplit: string
       copyIdFailed: string
-      actionsFor: (title: string) => string
       sessionActions: string
       sessionRunning: string
       needsInput: string
@@ -1485,6 +1601,13 @@ export interface Translations {
       ageDay: string
       ageHour: string
       ageMin: string
+    }
+    dateDivider: {
+      today: string
+      yesterday: string
+      thisWeek: string
+      lastWeek: string
+      thisMonth: string
     }
   }
 
@@ -1577,6 +1700,10 @@ export interface Translations {
   statusStack: {
     agents: string
     background: (count: number) => string
+    goalActive: string
+    goalDone: string
+    goalPaused: string
+    goalWaiting: string
     subagents: (count: number) => string
     todos: (done: number, total: number) => string
     running: string
@@ -1683,6 +1810,39 @@ export interface Translations {
     viewDocs: string
     installTo: string
     retryAfterRun: string
+    setupChoiceTitle: string
+    setupChoiceDesc: string
+    connectExistingTitle: string
+    connectExistingShort: string
+    connectExistingDesc: string
+    installLocalTitle: string
+    installLocalDesc: string
+    localStartUnavailable: string
+    remoteSetupTitle: string
+    remoteSetupDesc: string
+    remoteUrlTitle: string
+    remoteUrlDesc: string
+    remoteUrlPlaceholder: string
+    probing: string
+    probeError: string
+    identityProvider: string
+    authTitle: string
+    authNeedsOauth: (provider: string) => string
+    authSignedIn: string
+    connected: string
+    signIn: string
+    signInWith: (provider: string) => string
+    enterUrlFirst: string
+    signInIncomplete: string
+    tokenTitle: string
+    tokenDesc: string
+    pasteSessionToken: string
+    incompleteSignInTest: string
+    incompleteTokenTest: string
+    testConnection: string
+    testSucceeded: (baseUrl: string, version?: string) => string
+    applyRemote: string
+    backToSetup: string
     failedTitle: string
     settingUpTitle: string
     finishingTitle: string
@@ -1793,7 +1953,6 @@ export interface Translations {
       editModels: string
       refreshModels: string
       fast: string
-      medium: string
     }
     modelOptions: {
       noOptions: string
@@ -1866,6 +2025,17 @@ export interface Translations {
       gatewayOffline: string
       gatewayRestarting: string
       gatewayTitle: string
+      customizeTitle: string
+      hideStatusbar: string
+      toggleApprovalMode: string
+      toggleBackendVersion: string
+      toggleCommandCenter: string
+      toggleContextUsage: string
+      toggleRunningTimer: string
+      toggleSessionTimer: string
+      toggleTerminal: string
+      toggleVersion: string
+      toggleWorkspace: string
       agents: string
       closeAgents: string
       openAgents: string
@@ -1874,10 +2044,11 @@ export interface Translations {
       running: (count: number) => string
       cron: string
       openCron: string
+      webhooks: string
+      openWebhooks: string
       starmap: string
       openStarmap: string
       turnRunning: string
-      currentTurnElapsed: string
       contextUsage: string
       contextUsagePanel: {
         categories: {
@@ -1896,9 +2067,7 @@ export interface Translations {
         title: string
         tokenSummary: (used: string, max: string) => string
       }
-      openContextUsage: string
       session: string
-      runtimeSessionElapsed: string
       yoloOn: string
       yoloOff: string
       modelNone: string
@@ -2092,6 +2261,9 @@ export interface Translations {
       loadingResponse: string
       resumeWhenBackgroundDone: (count: number) => string
       thinking: string
+      thought: string
+      thoughtBriefly: string
+      thoughtFor: (duration: string) => string
       today: (time: string) => string
       yesterday: (time: string) => string
       copy: string
@@ -2147,7 +2319,6 @@ export interface Translations {
       lateAnswerHint: string
     }
     tool: {
-      code: string
       copyCode: string
       renderingImage: string
       copyOutput: string
