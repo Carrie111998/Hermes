@@ -43,7 +43,8 @@
     "dompurify": "^3.4.11",
     "http-proxy-middleware": "3.0.7",
     "js-yaml": "^4.2.0",
-    "undici": "^7.28.0"
+    "undici": "^7.28.0",
+    "brace-expansion": "5.0.8"
   },
   "browserslist": {
     "production": [
