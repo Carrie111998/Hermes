@@ -992,18 +992,19 @@ class WorkflowEngine:
             lookup["context"]["run_id"] = workflow.run_id
             # date = YYYY-MM-DD derived from the run_id timestamp
             if "-" in workflow.run_id:
-                ts_part = workflow.run_id.split("-", 1)[1]  # "20260610-214500"
-                date_part = ts_part.split("-")[0]            # "20260610"
+                ts_part = workflow.run_id.split("-", 1)[1]  # "20260728-185117-123456"
+                date_part = ts_part.split("-")[0]            # "20260728"
                 lookup["date"] = date_part
                 lookup["context"]["date"] = date_part
-                # Short run ID: just the time portion (HHMMSS) for
+                # Short run ID: time portion past the date for
                 # disambiguation in card names and task prompts.
-                # e.g. run_id = "implementation-20260728-123456"
-                #      run_short_id = "123456"
-                time_part = ts_part.split("-")[1] if "-" in ts_part else ""
-                if time_part:
-                    lookup["run_short_id"] = time_part
-                    lookup["context"]["run_short_id"] = time_part
+                # e.g. run_id = "implementation-20260728-185117-123456"
+                #      run_short_id = "185117-123456"
+                time_parts = ts_part.split("-")[1:]
+                if time_parts:
+                    join = "-".join(time_parts)
+                    lookup["run_short_id"] = join
+                    lookup["context"]["run_short_id"] = join
 
         # Pre-compute the phase label for each node. Authors can set
         # `phase:` explicitly in YAML; otherwise we default to the
@@ -2513,8 +2514,9 @@ class WorkflowEngine:
 
         # Generate a run ID for this invocation. Available as {run_id}
         # in template substitution so YAML authors can create unique
-        # artifact filenames per run.
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        # artifact filenames per run. Microsecond precision ensures
+        # concurrent dispatches get unique IDs.
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")[:21]  # YYYYMMDD-HHMMSS-ffffff → 21 chars
         workflow.run_id = f"{workflow_name}-{ts}"
 
         layers = self.topological_sort(workflow)
