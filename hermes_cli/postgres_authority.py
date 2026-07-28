@@ -46,7 +46,7 @@ except ImportError:
 # Current schema version.  Startup fails closed if the DB is on an
 # unsupported version (higher than this) or a lower version that cannot
 # be migrated automatically.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Each entry describes one migration step: (from_version, sql).
 # Migrations are applied in order when current_version < SCHEMA_VERSION.
@@ -546,6 +546,59 @@ _MIGRATIONS: list[tuple[int, str]] = [
 
         CREATE INDEX IF NOT EXISTS idx_alert_rules_tenant
             ON alert_rules(tenant_id);
+        """,
+    ),
+    # v10 → v11: disaster recovery (RFC-0.28.0).
+    (
+        10,
+        """
+        CREATE TABLE IF NOT EXISTS backup_records (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            backup_type     TEXT        NOT NULL
+                CHECK (backup_type IN ('full', 'incremental', 'snapshot')),
+            status          TEXT        NOT NULL
+                CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+            storage_path    TEXT        NOT NULL DEFAULT '',
+            size_bytes      BIGINT      NOT NULL DEFAULT 0,
+            schema_version  INTEGER     NOT NULL,
+            started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            completed_at    TIMESTAMPTZ,
+            expires_at      TIMESTAMPTZ,
+            metadata        JSONB       NOT NULL DEFAULT '{}'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_backups_tenant
+            ON backup_records(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS restore_points (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            name            TEXT        NOT NULL,
+            backup_id       BIGINT      REFERENCES backup_records(id),
+            schema_version  INTEGER     NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+            CONSTRAINT uq_restore_point_name UNIQUE (tenant_id, name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_restore_points_tenant
+            ON restore_points(tenant_id);
+
+        CREATE TABLE IF NOT EXISTS failover_drills (
+            id              BIGSERIAL   PRIMARY KEY,
+            tenant_id       UUID        NOT NULL,
+            drill_type      TEXT        NOT NULL,
+            status          TEXT        NOT NULL
+                CHECK (status IN ('scheduled', 'running', 'passed', 'failed')),
+            started_at      TIMESTAMPTZ,
+            completed_at    TIMESTAMPTZ,
+            results         JSONB       NOT NULL DEFAULT '{}',
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_drills_tenant
+            ON failover_drills(tenant_id);
         """,
     ),
 ]
@@ -3002,6 +3055,187 @@ def disable_alert_rule(
 
 
 # ---------------------------------------------------------------------------
+# Disaster Recovery: Backups
+# ---------------------------------------------------------------------------
+
+
+def create_backup(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    backup_type: str,
+    storage_path: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> dict:
+    """Create a backup record."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO backup_records
+                (tenant_id, backup_type, status, storage_path,
+                 schema_version, metadata)
+            VALUES (%s, %s, 'pending', %s, %s, %s)
+            RETURNING *
+            """,
+            (str(tenant_id), backup_type, storage_path,
+             SCHEMA_VERSION, json.dumps(metadata or {})),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def complete_backup(
+    conn: "psycopg.Connection",
+    *,
+    backup_id: int,
+    size_bytes: int = 0,
+    storage_path: str = "",
+) -> bool:
+    """Mark a backup as completed."""
+    with conn.cursor() as cur:
+        params = [backup_id]
+        set_parts = ["status = 'completed'", "completed_at = NOW()"]
+        if size_bytes:
+            set_parts.append("size_bytes = %s")
+            params.insert(-1, size_bytes)
+            params = [size_bytes, backup_id]
+        if storage_path:
+            set_parts.append("storage_path = %s")
+            params = [size_bytes, storage_path, backup_id] if size_bytes else [storage_path, backup_id]
+        cur.execute(
+            f"UPDATE backup_records SET {', '.join(set_parts)} WHERE id = %s",
+            params,
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def list_backups(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    limit: int = 20,
+) -> list[dict]:
+    """List backups for a tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM backup_records WHERE tenant_id = %s "
+            "ORDER BY started_at DESC LIMIT %s",
+            (str(tenant_id), limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Disaster Recovery: Restore Points
+# ---------------------------------------------------------------------------
+
+
+def create_restore_point(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    name: str,
+    backup_id: int | None = None,
+) -> dict:
+    """Create a named restore point (upserts on name)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO restore_points (tenant_id, name, backup_id, schema_version)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (tenant_id, name) DO UPDATE SET
+                backup_id = EXCLUDED.backup_id,
+                schema_version = EXCLUDED.schema_version,
+                created_at = NOW()
+            RETURNING *
+            """,
+            (str(tenant_id), name, backup_id, SCHEMA_VERSION),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def list_restore_points(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+) -> list[dict]:
+    """List restore points for a tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM restore_points WHERE tenant_id = %s "
+            "ORDER BY created_at DESC",
+            (str(tenant_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Disaster Recovery: Failover Drills
+# ---------------------------------------------------------------------------
+
+
+def schedule_drill(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    drill_type: str,
+) -> dict:
+    """Schedule a failover drill."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO failover_drills (tenant_id, drill_type, status)
+            VALUES (%s, %s, 'scheduled')
+            RETURNING *
+            """,
+            (str(tenant_id), drill_type),
+        )
+        row = cur.fetchone()
+    conn.commit()
+    return dict(row) if row else {}
+
+
+def complete_drill(
+    conn: "psycopg.Connection",
+    *,
+    drill_id: int,
+    status: str,
+    results: dict[str, Any] | None = None,
+) -> bool:
+    """Complete a failover drill with results."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE failover_drills SET status = %s, completed_at = NOW(), "
+            "results = %s WHERE id = %s",
+            (status, json.dumps(results or {}), drill_id),
+        )
+        affected = cur.rowcount
+    conn.commit()
+    return affected > 0
+
+
+def list_drills(
+    conn: "psycopg.Connection",
+    *,
+    tenant_id: UUID | str,
+    limit: int = 20,
+) -> list[dict]:
+    """List failover drills for a tenant."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM failover_drills WHERE tenant_id = %s "
+            "ORDER BY created_at DESC LIMIT %s",
+            (str(tenant_id), limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
 # Backend detection
 # ---------------------------------------------------------------------------
 
@@ -3077,6 +3311,14 @@ __all__ = [
     "mark_invoice_paid",
     "get_invoice",
     "list_invoices",
+    "create_backup",
+    "complete_backup",
+    "list_backups",
+    "create_restore_point",
+    "list_restore_points",
+    "schedule_drill",
+    "complete_drill",
+    "list_drills",
     "record_metric",
     "query_metrics",
     "record_health_check",
