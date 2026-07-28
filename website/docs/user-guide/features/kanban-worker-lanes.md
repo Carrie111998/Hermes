@@ -50,7 +50,7 @@ For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spa
 
 Every claim must end in exactly one of:
 
-- `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done`.
+- `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done` — unless the card carries a verified-completion gate (`--verify-cmd` / `--verify auto`), in which case the verify must pass first; a red result rejects the call and the worker keeps its claim to fix and retry.
 - `kanban_block(reason=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs.
 - The worker process exits without a tool call. The kernel reaps it and emits `crashed` (PID died) or `gave_up` (consecutive-failure breaker tripped) or `timed_out` (max_runtime exceeded). This is the failure path; healthy workers don't end here.
 
@@ -65,6 +65,8 @@ For most code-changing tasks, the work isn't truly *done* the moment the worker 
 - **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
 
 The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
+
+Verified completion (`--verify-cmd` / `--verify auto` on `kanban create`) is the mechanized, opt-in sibling of this convention: instead of trusting the worker to block for review, the board itself refuses the `done` transition until a deterministic check passes. Use the voluntary convention when "done" needs human judgment; use the gate when "done" is machine-checkable.
 
 ## Logs and audit trail
 
@@ -104,6 +106,7 @@ So lane authors don't have to reimplement these:
 - **Crashed worker** — a worker whose host-local PID has vanished is detected by `detect_crashed_workers` and reaped; the task increments `consecutive_failures` and may auto-block when the breaker trips.
 - **Run-level retry** — when a task is retried (post-block, post-crash, post-reclaim), the worker can use the `expected_run_id` parameter on terminating tools to fail fast if its own run was already superseded.
 - **Per-task max runtime** — `task.max_runtime_seconds` hard-caps wall-clock time per run, regardless of PID liveness. Catches genuinely-deadlocked workers that the live-PID extension would otherwise keep running.
+- **Verified-completion exhaustion** — on cards with a verify gate, each rejected `kanban_complete` charges the same consecutive-failure budget as crashes/timeouts; when it runs out the card auto-blocks (`gave_up`) with the failure evidence attached as a comment, and `kanban_unblock` grants a fresh budget.
 - **Stranded-task detection** — a ready task whose assignee never produces a claim within `kanban.stranded_threshold_seconds` (default 30 min) shows up in `hermes kanban diagnostics` as a `stranded_in_ready` warning. Severity escalates to error at 2x the threshold and critical at 6x. Catches typo'd assignees, deleted profiles, and down external worker pools in one signal — identity-agnostic, no per-board allowlist to curate.
 
 ## Related

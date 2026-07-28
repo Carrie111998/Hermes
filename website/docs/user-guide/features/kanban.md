@@ -418,6 +418,14 @@ streak — and a per-task `max_retries` overrides the bound. This usually means
 the model wrote a plain-text answer and exited without using the Kanban tool
 surface.
 
+Verified-completion rejections (see "Verified completion" below) are the
+third bounded retry in this family: they charge the same
+`consecutive_failures` counter as crashes and timeouts, while clean-exit
+protocol violations tick their own independent streak. A worker alternating
+verify-reds and clean exits can therefore consume up to roughly the *sum* of
+the two budgets before its card blocks — still bounded, and every rejection
+is loud in the event log.
+
 The lifecycle plus the load-bearing reference details (workspace kinds, deliverable `artifacts`, claiming created cards) ship in that system-prompt block, so every worker has them regardless of which profile it runs under — no per-profile skill setup required.
 
 ### Pinning extra skills to a specific task
@@ -497,6 +505,32 @@ hermes kanban create "Translate the docs site to French" \
 ```
 
 Use it for open-ended, multi-step, or "keep going until X is true" cards. Skip it for cheap one-shot work — the per-turn judge overhead isn't worth it, and the dispatcher's existing retry/circuit-breaker already handles transient worker failures. The judge is only as good as your goal text, so write the body as **explicit acceptance criteria**.
+
+### Verified completion (`--verify-cmd` / `--verify auto`)
+
+By default a worker's word is final: `kanban_complete` flips the card `done` on the model's say-so. For work with a deterministic, checkable definition of done — a test suite, a build, a lint pass — you can make the board check instead of trust. A card created with `--verify-cmd` (or `--verify auto`) carries a **verified-completion gate**: when the dispatched worker calls `kanban_complete`, the gate runs first, and only a green result lets the completion through. A red result rejects the completion, counts one failure toward the retry budget, and feeds the failure output straight back to the worker, which keeps its claim and fixes the problem **in the same session** before retrying. When the budget is exhausted the card lands in `blocked` for human review with the failure evidence attached as a comment — never silently `done`.
+
+```bash
+hermes kanban create "Fix the flaky websocket reconnect test" \
+    --assignee backend \
+    --workspace worktree \
+    --verify-cmd "pytest tests/ws -q" \    # must exit 0 before kanban_complete succeeds
+    --max-retries 4                        # verify reds share the crash/timeout budget
+```
+
+The two modes:
+
+- **`--verify-cmd CMD`** runs `CMD` via `/bin/sh -c` in the task's workspace at completion time (10-minute timeout, process-group-killed on expiry, output redacted and capped to 2000 chars). Exit 0 = pass. Anything else — including a timeout, a missing workspace, or a spawn error — is a counted red: for a correctness gate, failing open would contradict the whole point.
+- **`--verify auto`** executes nothing. It consults the verification evidence ledger (the passive record of what the agent actually proved in its workspace): the completion is accepted only when the worker has run the project's verify command **to completion, in its own session, with no file edits after it, at full scope**. Targeted runs (`pytest tests/test_one.py`) never count — targeted checks are never upgraded into a repo-green claim. Tests run via a delegated subagent do not count either (they record under the subagent's session), and after a context-compression event pre-compression evidence may not be found — in both cases the fix is the one the rejection message states: re-run the verify command.
+
+Mechanics worth knowing:
+
+- The gate lives at the worker tool surface (`kanban_complete`) and is enforced **only for the dispatched worker** completing its own card. Orchestrator profiles that try to tool-close a verify-gated child get a deterministic, uncounted rejection naming the two legitimate paths: let the worker finish, or override as a human. Human surfaces — `hermes kanban complete` from the CLI (which prints a bypass notice to stderr) and the dashboard — bypass the gate: the invariant is "never `done` on an LLM's say-so", not "never `done` by a human".
+- Every rejected attempt is recorded as a `completion_blocked_evidence` event (gate, command, exit code, redacted output excerpt), so `hermes kanban show` and the dashboard carry the full audit trail. On exhaustion the card auto-blocks exactly like the crash breaker (`gave_up`), and `hermes kanban unblock` is the retry verb — it resets the failure counter, granting a fresh budget.
+- A re-dispatched worker (after a crash or requeue) sees the gate contract and the latest red evidence in its worker context, so it starts from the failure rather than from scratch.
+- Cmd-mode traps: the command runs on the **worker's host** in the task's `workspace_path`, so remote terminal backends (where the real work happens off-host) and scratch-workspace cards whose command expects a repo will red-verify every attempt and end blocked — use worktree workspaces and host-local workers. Keep verify commands side-effect-light: a timed-out verify is process-group-killed, but a worker killed mid-verify can leave the command running in the worktree until it exits on its own.
+
+Use it when "done" is machine-checkable and the cost of a false `done` is high. Skip it for open-ended or judgment-shaped cards — that's what `--goal`'s LLM judge is for. The two compose: on a card with both, the deterministic verify gate runs first (a red suite makes the judge call moot).
 
 ### How the orchestrator behaves
 
@@ -693,6 +727,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
                                 [--max-runtime 30m|2h|1d|<seconds>]
                                 [--max-retries N]
+                                [--verify-cmd CMD | --verify auto]
                                 [--goal] [--goal-max-turns N]
                                 [--skill <name>]...
                                 [--json]
@@ -746,6 +781,8 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+
+`--verify-cmd` / `--verify auto` opt a task into verified completion (see the "Verified completion" section above): the worker's `kanban_complete` only succeeds after the verification passes. Verification failures count toward the **same** consecutive-failure breaker as crashes and timeouts — the default limit is 2, so an untuned verify task gets a single retry. Pair the verify flags with `--max-retries` (3–5 is a sensible starting range), and note that a task whose earlier dispatches crashed arrives at its first verify attempt with part of the budget already spent; rejection messages therefore say "failure N of limit M", not "attempt N of M".
 
 ### Concurrency, scheduling, and child promotion config
 
@@ -999,6 +1036,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
 | `protocol_violation` | `{pid, claimer, exit_code, protocol_violation}` | Worker exited successfully while the task was still `running`, usually because it answered without calling `kanban_complete` or `kanban_block`. Emitted on every violation (the payload's `protocol_violation: true` marker is copied into the run metadata and feeds the violation-only retry budget). Below the budget — up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` (default 3) *consecutive* violations, per-task `max_retries` overriding — the task simply returns to `ready` for another attempt; when the streak reaches the bound the dispatcher also emits `gave_up` and auto-blocks. |
 | `gave_up` | `{failures, effective_limit, limit_source, error}` | Circuit breaker fired after N consecutive non-successful attempts. Task auto-blocks with the last error. The effective limit resolves as task `max_retries`, then dispatcher `failure_limit` / `kanban.failure_limit`, then the built-in default. |
+| `completion_blocked_evidence` | `{gate, command, exit_code, output_excerpt, failures, effective_limit, limit_source, exhausted, counted, stale_run?, summary_preview}` | A verified-completion attempt was rejected (`--verify-cmd` / `--verify auto` cards only). Emitted on **every** rejection so the audit trail is complete; `exhausted: true` marks the attempt that tripped the breaker (the card auto-blocks via `gave_up` in the same stroke); `counted: false` + `stale_run: true` marks an uncounted audit entry from a superseded run (a mid-verify reclaim/requeue) that touched neither the budget nor the board state. |
 
 `hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 
