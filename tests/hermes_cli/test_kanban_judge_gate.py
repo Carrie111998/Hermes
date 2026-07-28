@@ -397,3 +397,17 @@ def test_event_recording_failure_does_not_block_completion(monkeypatch):
 
     d = gate.evaluate(_BrokenKb(), _FakeConn(), _task(), "x", task_id="t1")
     assert d.allow is True and d.transport is True
+
+
+@pytest.mark.parametrize("variant", ["done.", "done!", "  DONE  ", "Done,,,"])
+def test_trivial_edits_do_not_buy_a_ceiling_slot(monkeypatch, variant):
+    """Regression: sha256(strip()) let "done" -> "done." -> "done!" close any
+    goal card in three junk summaries. The guarding test passed IDENTICAL
+    evidence, so it stayed green while the hole was wide open."""
+    assert gate._evidence_digest(variant) == gate._evidence_digest("done")
+
+
+def test_substantively_different_evidence_still_counts():
+    """Normalisation must not collapse genuinely different attempts."""
+    assert gate._evidence_digest("opened PR #12, tests green") != \
+        gate._evidence_digest("rebased onto main")

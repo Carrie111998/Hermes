@@ -41,6 +41,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from typing import Any, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
@@ -146,9 +147,20 @@ def judge_available() -> bool:
         return False
 
 
+_EVIDENCE_NOISE = re.compile(r"[^a-z0-9]+")
+
+
 def _evidence_digest(response: str) -> str:
-    """Stable short digest of the evidence a completion attempt offered."""
-    return hashlib.sha256(response.strip().encode("utf-8", "replace")).hexdigest()[:16]
+    """Stable digest of the SUBSTANCE of a completion attempt.
+
+    Normalised hard on purpose. Hashing the raw string meant "done", "done."
+    and "done!" were three distinct pieces of evidence, so a worker could
+    reach the rejection ceiling — and close any goal card — by appending one
+    character three times. Case, punctuation and whitespace carry no
+    acceptance-criteria meaning, so they must not buy a ceiling slot.
+    """
+    flat = _EVIDENCE_NOISE.sub(" ", response.casefold()).strip()
+    return hashlib.sha256(flat.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _count_rejections(conn: Any, task_id: str, run_id: Optional[int] = None) -> int:

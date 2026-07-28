@@ -853,9 +853,16 @@ def _dashboard_completion_gate(conn, task, task_id: str, payload):
     """
     from hermes_cli import kanban_judge_gate as judge_gate
 
+    # run_id matters: without it _count_rejections drops its run filter and
+    # counts the card's LIFETIME rejections, so a respawned card arrives
+    # already at its ceiling and the very first dashboard attempt self-opens.
+    try:
+        current_run = getattr(task, "current_run_id", None)
+    except Exception:
+        current_run = None
     gate = judge_gate.evaluate(
         kanban_db, conn, task, payload.summary or payload.result or "",
-        task_id=task_id,
+        task_id=task_id, run_id=current_run,
     )
     metadata = payload.metadata
     if not gate.allow:
