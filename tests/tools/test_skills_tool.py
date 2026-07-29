@@ -2,6 +2,7 @@
 
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +20,15 @@ from tools.skills_tool import (
     skill_view,
     MAX_DESCRIPTION_LENGTH,
 )
+
+
+@contextmanager
+def _secret_capture(callback):
+    token = skills_tool_module.bind_secret_capture_callback(callback)
+    try:
+        yield
+    finally:
+        skills_tool_module.reset_secret_capture_callback(token)
 
 
 def _make_skill(
@@ -604,14 +614,9 @@ class TestSkillViewSecureSetupOnLoad:
                 "skipped": False,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
-
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        with _secret_capture(fake_secret_callback), patch(
+            "tools.skills_tool.SKILLS_DIR", tmp_path
+        ):
             _make_skill(
                 tmp_path,
                 "gif-search",
@@ -653,14 +658,9 @@ class TestSkillViewSecureSetupOnLoad:
                 "skipped": True,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
-
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        with _secret_capture(fake_secret_callback), patch(
+            "tools.skills_tool.SKILLS_DIR", tmp_path
+        ):
             _make_skill(
                 tmp_path,
                 "gif-search",
@@ -1008,14 +1008,9 @@ class TestSkillViewPrerequisites:
                 "skipped": False,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
-
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        with _secret_capture(fake_secret_callback), patch(
+            "tools.skills_tool.SKILLS_DIR", tmp_path
+        ):
             _make_skill(
                 tmp_path,
                 "gif-search",
@@ -1106,14 +1101,9 @@ Do the legacy thing.
                 "skipped": False,
             }
 
-        monkeypatch.setattr(
-            skills_tool_module,
-            "_secret_capture_callback",
-            fake_secret_callback,
-            raising=False,
-        )
-
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        with _secret_capture(fake_secret_callback), patch(
+            "tools.skills_tool.SKILLS_DIR", tmp_path
+        ):
             _make_skill(
                 tmp_path,
                 "gif-search",

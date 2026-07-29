@@ -1897,6 +1897,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         secret_token = None
+        secret_capture_token = None
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -1987,7 +1988,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             except Exception:
                 pass
 
-            _wire_callbacks(sid)
+            secret_capture_token = _wire_callbacks(sid)
             # Surface the self-improvement review's "💾 …" summary as an event
             # the TUI/desktop render in-transcript, honoring
             # display.memory_notifications. _init_session wires this for the
@@ -2030,6 +2031,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
+            _reset_secret_capture_token(secret_capture_token)
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
@@ -5317,7 +5319,7 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
 
 def _wire_callbacks(sid: str):
     from tools.terminal_tool import set_sudo_password_callback
-    from tools.skills_tool import set_secret_capture_callback
+    from tools.skills_tool import bind_secret_capture_callback
     from tools.project_tools import set_project_workspace_callback
 
     set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
@@ -5344,7 +5346,15 @@ def _wire_callbacks(sid: str):
             "message": "ok",
         }
 
-    set_secret_capture_callback(secret_cb)
+    return bind_secret_capture_callback(secret_cb)
+
+
+def _reset_secret_capture_token(token) -> None:
+    if token is None:
+        return
+    from tools.skills_tool import reset_secret_capture_callback
+
+    reset_secret_capture_callback(token)
 
 
 def _render_personality_prompt(value) -> str:
@@ -6135,7 +6145,8 @@ def _init_session(
         # Bare AIAgents that don't expose the attribute (unlikely, but keep
         # session startup resilient).
         pass
-    _wire_callbacks(sid)
+    secret_capture_token = _wire_callbacks(sid)
+    _reset_secret_capture_token(secret_capture_token)
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
@@ -11992,6 +12003,7 @@ def _run_prompt_submit(
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
+        secret_capture_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
@@ -12030,9 +12042,9 @@ def _run_prompt_submit(
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
             # and hang the headless gateway. Re-wire here so the prompt routes to
-            # the sudo.request overlay. (secret capture is a module global, so
-            # re-running is a harmless no-op.)
-            _wire_callbacks(sid)
+            # the sudo.request overlay. Secret capture is context-local, so
+            # re-running binds this turn to the correct session.
+            secret_capture_token = _wire_callbacks(sid)
             # Skip the config-model sync while a /model --once override is
             # active: the once-model is intentionally not pinned as a session
             # model_override (it must not persist), so without this guard the
@@ -12566,6 +12578,7 @@ def _run_prompt_submit(
                     reset_current_session_key(approval_token)
             except Exception:
                 pass
+            _reset_secret_capture_token(secret_capture_token)
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
@@ -13313,8 +13326,10 @@ def _(rid, params: dict) -> dict:
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
 
     def run():
+        secret_capture_token = None
         session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
         try:
+            secret_capture_token = _wire_callbacks(parent)
             from run_agent import AIAgent
 
             result = AIAgent(
@@ -13342,6 +13357,7 @@ def _(rid, params: dict) -> dict:
                 {"task_id": task_id, "text": f"error: {e}"},
             )
         finally:
+            _reset_secret_capture_token(secret_capture_token)
             _clear_session_context(session_tokens)
 
     threading.Thread(target=run, daemon=True).start()
@@ -13410,8 +13426,10 @@ def _(rid, params: dict) -> dict:
     def run():
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
+        secret_capture_token = None
         session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
         try:
+            secret_capture_token = _wire_callbacks(parent)
             from run_agent import AIAgent
             from tools.terminal_tool import register_task_env_overrides
 
@@ -13455,6 +13473,7 @@ def _(rid, params: dict) -> dict:
                 clear_task_env_overrides(task_id)
             except Exception:
                 pass
+            _reset_secret_capture_token(secret_capture_token)
             _clear_session_context(session_tokens)
 
     threading.Thread(target=run, daemon=True).start()
