@@ -207,7 +207,7 @@ coder config set terminal.cwd /absolute/path/to/project
 
 ### Nous Portal OAuth across profiles
 
-Nous Portal OAuth has one profile-local record in each profile's `auth.json`, but it also uses a shared token store so multiple Hermes processes can import the same rotated Nous credentials safely. By default that shared store lives under your base Hermes root (`~/.hermes/shared/nous_auth.json`), outside any named profile.
+Nous Portal OAuth has one profile-local record in each profile's `auth.json`, but it also uses a shared token store so multiple Hermes processes can import the same rotated Nous credentials safely. By default that shared store lives under your base Hermes root as `<hermes-root>/shared/nous_auth.json` — for example, `~/.hermes/shared/nous_auth.json` on Linux/macOS — outside any named profile. Native Windows and custom/Docker roots use their own resolved Hermes root instead of the literal `~/.hermes` path.
 
 If you run multiple gateways, workers, cron jobs, or watchdog scripts from different `HERMES_HOME` roots, point every process at the same shared Nous auth directory:
 
