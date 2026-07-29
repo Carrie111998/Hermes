@@ -224,6 +224,78 @@ def test_exhausted_entry_resets_after_ttl(tmp_path, monkeypatch):
     assert entry.last_status == "ok"
 
 
+@pytest.mark.parametrize(
+    ("failures", "expected_ttl"),
+    [(0, 3600), (1, 3600), (2, 7200), (3, 14400), (4, 28800), (9, 28800)],
+)
+def test_exhausted_ttl_uses_capped_exponential_backoff(failures, expected_ttl):
+    from agent.credential_pool import _exhausted_ttl
+
+    assert _exhausted_ttl(429, failures) == expected_ttl
+
+
+@pytest.mark.parametrize(
+    ("persisted_failures", "expected_failures"),
+    [("3", 3), (None, 0), ("not-a-number", 0), (-1, 0)],
+)
+def test_pooled_credential_coerces_persisted_failure_streak(
+    persisted_failures, expected_failures
+):
+    from agent.credential_pool import PooledCredential
+
+    credential = PooledCredential.from_dict(
+        "openrouter", {"consecutive_failures": persisted_failures}
+    )
+
+    assert credential.consecutive_failures == expected_failures
+
+
+def test_expired_cooldown_preserves_streak_until_recovery_or_reset(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-primary",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 7201,
+                        "last_error_code": 429,
+                        "consecutive_failures": 2,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import _exhausted_until, load_pool
+
+    pool = load_pool("openrouter")
+    entry = pool.select()
+
+    assert entry is not None
+    assert entry.last_status == "ok"
+    assert entry.consecutive_failures == 2
+
+    pool.mark_exhausted_and_rotate(status_code=429)
+    exhausted = pool.entries()[0]
+
+    assert exhausted.consecutive_failures == 3
+    assert exhausted.last_status == "exhausted"
+    assert _exhausted_until(exhausted) - exhausted.last_status_at == 4 * 3600
+
+    assert pool.reset_statuses() == 1
+    reset = pool.entries()[0]
+    assert reset.consecutive_failures == 0
+
+
 def test_exhausted_402_entry_resets_after_one_hour(tmp_path, monkeypatch):
     """402-exhausted credentials recover after 1 hour, not 24."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -3537,6 +3609,7 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
         last_error_reason="token_expired",
         last_error_message="Access token has expired",
         last_error_reset_at=now + 300,
+        consecutive_failures=4,
     )
     pool._replace_entry(entry, exhausted)
 
@@ -3555,6 +3628,7 @@ def test_sync_anthropic_entry_clears_all_error_fields(tmp_path, monkeypatch):
     assert synced.last_error_reason is None
     assert synced.last_error_message is None
     assert synced.last_error_reset_at is None
+    assert synced.consecutive_failures == 0
 
 
 def _load_two_ok_pool(tmp_path, monkeypatch):

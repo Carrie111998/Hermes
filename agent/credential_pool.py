@@ -117,10 +117,12 @@ SUPPORTED_POOL_STRATEGIES = {
 # Cooldown before retrying an exhausted credential.
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
 # 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
+# Repeated exhaustion backs off up to eight times the relevant base TTL.
 # Provider-supplied reset_at timestamps override these defaults.
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+MAX_EXHAUSTED_TTL_MULTIPLIER = 8
 
 # Throttle window for the "no available entries" INFO line. Credential
 # selection runs on a hot path (every model call, plus auxiliary tasks like
@@ -150,6 +152,14 @@ _EXTRA_KEYS = frozenset({
 })
 
 
+def _coerce_consecutive_failures(value: Any) -> int:
+    """Return a non-negative persisted failure count, defaulting malformed data."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
     """Infer pool auth metadata for token formats with one unambiguous meaning."""
     if (
@@ -177,6 +187,7 @@ class PooledCredential:
     last_error_reason: Optional[str] = None
     last_error_message: Optional[str] = None
     last_error_reset_at: Optional[float] = None
+    consecutive_failures: int = 0
     base_url: Optional[str] = None
     expires_at: Optional[str] = None
     expires_at_ms: Optional[int] = None
@@ -194,6 +205,9 @@ class PooledCredential:
             self.provider,
             self.access_token,
             self.auth_type,
+        )
+        self.consecutive_failures = _coerce_consecutive_failures(
+            self.consecutive_failures
         )
 
     def __getattr__(self, name: str):
@@ -286,13 +300,21 @@ def _is_manual_source(source: str) -> bool:
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
 
 
-def _exhausted_ttl(error_code: Optional[int]) -> int:
-    """Return cooldown seconds based on the HTTP status that caused exhaustion."""
+def _exhausted_ttl(
+    error_code: Optional[int], consecutive_failures: int = 0
+) -> int:
+    """Return an exponentially backed-off cooldown for repeated exhaustion."""
     if error_code == 401:
-        return EXHAUSTED_TTL_401_SECONDS
-    if error_code == 429:
-        return EXHAUSTED_TTL_429_SECONDS
-    return EXHAUSTED_TTL_DEFAULT_SECONDS
+        base_ttl = EXHAUSTED_TTL_401_SECONDS
+    elif error_code == 429:
+        base_ttl = EXHAUSTED_TTL_429_SECONDS
+    else:
+        base_ttl = EXHAUSTED_TTL_DEFAULT_SECONDS
+
+    failures = _coerce_consecutive_failures(consecutive_failures)
+    max_exponent = MAX_EXHAUSTED_TTL_MULTIPLIER.bit_length() - 1
+    exponent = min(max(failures - 1, 0), max_exponent)
+    return base_ttl * (2 ** exponent)
 
 
 def _parse_absolute_timestamp(value: Any) -> Optional[float]:
@@ -380,7 +402,9 @@ def _exhausted_until(entry: PooledCredential) -> Optional[float]:
     if reset_at is not None:
         return reset_at
     if entry.last_status_at:
-        return entry.last_status_at + _exhausted_ttl(entry.last_error_code)
+        return entry.last_status_at + _exhausted_ttl(
+            entry.last_error_code, entry.consecutive_failures
+        )
     return None
 
 
@@ -717,6 +741,11 @@ class CredentialPool:
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
             last_error_reset_at=normalized_error.get("reset_at"),
+            consecutive_failures=(
+                entry.consecutive_failures + 1
+                if terminal_status == STATUS_EXHAUSTED
+                else 0
+            ),
         )
         self._replace_entry(entry, updated)
         if persist:
@@ -767,6 +796,7 @@ class CredentialPool:
                     last_error_reason=None,
                     last_error_message=None,
                     last_error_reset_at=None,
+                    consecutive_failures=0,
                 )
                 self._replace_entry(entry, updated)
                 self._persist()
@@ -828,6 +858,7 @@ class CredentialPool:
                     "last_error_reason": None,
                     "last_error_message": None,
                     "last_error_reset_at": None,
+                    "consecutive_failures": 0,
                 }
                 if state.get("last_refresh"):
                     field_updates["last_refresh"] = state["last_refresh"]
@@ -886,6 +917,7 @@ class CredentialPool:
                     "last_error_reason": None,
                     "last_error_message": None,
                     "last_error_reset_at": None,
+                    "consecutive_failures": 0,
                 }
                 if state.get("last_refresh"):
                     field_updates["last_refresh"] = state["last_refresh"]
@@ -980,6 +1012,7 @@ class CredentialPool:
                     "last_error_reason": None,
                     "last_error_message": None,
                     "last_error_reset_at": None,
+                    "consecutive_failures": 0,
                 }
                 if store_access:
                     field_updates["access_token"] = store_access
@@ -1281,6 +1314,7 @@ class CredentialPool:
                             last_status=STATUS_OK,
                             last_status_at=None,
                             last_error_code=None,
+                            consecutive_failures=0,
                         )
                         self._replace_entry(synced, updated)
                         self._persist()
@@ -1320,6 +1354,7 @@ class CredentialPool:
                         last_error_reason=None,
                         last_error_message=None,
                         last_error_reset_at=None,
+                        consecutive_failures=0,
                     )
                     self._replace_entry(synced, updated)
                     self._persist()
@@ -1390,6 +1425,7 @@ class CredentialPool:
                         last_error_reason=None,
                         last_error_message=None,
                         last_error_reset_at=None,
+                        consecutive_failures=0,
                     )
                     self._replace_entry(synced, updated)
                     self._persist()
@@ -1457,6 +1493,7 @@ class CredentialPool:
                         last_error_reason=None,
                         last_error_message=None,
                         last_error_reset_at=None,
+                        consecutive_failures=0,
                     )
                     self._replace_entry(synced, updated)
                     self._persist()
@@ -1520,6 +1557,7 @@ class CredentialPool:
             last_error_reason=None,
             last_error_message=None,
             last_error_reset_at=None,
+            consecutive_failures=0,
         )
         self._replace_entry(entry, updated)
         self._persist()
@@ -1706,6 +1744,9 @@ class CredentialPool:
                     ):
                         continue
                 if clear_expired:
+                    # Cooldown expiry only makes this entry eligible for a new
+                    # request. It does not prove the provider recovered, so
+                    # retain the streak for the next exhaustion cooldown.
                     cleared = replace(
                         entry,
                         last_status=STATUS_OK,
@@ -2024,7 +2065,12 @@ class CredentialPool:
             count = 0
             new_entries = []
             for entry in self._entries:
-                if entry.last_status or entry.last_status_at or entry.last_error_code:
+                if (
+                    entry.last_status
+                    or entry.last_status_at
+                    or entry.last_error_code
+                    or entry.consecutive_failures
+                ):
                     new_entries.append(
                         replace(
                             entry,
@@ -2034,6 +2080,7 @@ class CredentialPool:
                             last_error_reason=None,
                             last_error_message=None,
                             last_error_reset_at=None,
+                            consecutive_failures=0,
                         )
                     )
                     count += 1
