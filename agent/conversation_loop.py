@@ -4295,6 +4295,14 @@ def run_conversation(
                 # + provider-specific troubleshooting guidance unchanged.
                 if (
                     classified.is_auth
+                    # Defensive: every auth-classified reason currently sets
+                    # ``should_fallback=True`` in ``error_classifier.py``, so
+                    # this guard is a no-op today. It codifies the principle
+                    # that any future auth reason the classifier marks as
+                    # non-recoverable-by-fallback must not burn a fallback
+                    # slot — see #16022 for the matching guard inside
+                    # ``is_client_error``.
+                    and classified.should_fallback
                     and not _retry.auth_failover_attempted
                     and agent._fallback_index < len(agent._fallback_chain)
                 ):
@@ -5065,7 +5073,16 @@ def run_conversation(
                         agent._fallback_index = 0
                         agent._fallback_activated = False
                         continue
-                    # Try fallback before giving up entirely
+                    # Try fallback before giving up entirely. NOTE: this path
+                    # is reached only by retryable errors whose retry budget
+                    # is spent (malformed-args and other non-retryable
+                    # client errors abort earlier via the `is_client_error`
+                    # branch above, which carries the `should_fallback`
+                    # guard). For overloaded / timeout / rate_limit at
+                    # retries-exhausted, switching providers is a legitimate
+                    # recovery so the call stays unconditional — see #16022
+                    # for the semantic analysis of why `should_fallback` is
+                    # not a uniform signal here.
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                     if agent._try_activate_fallback():
