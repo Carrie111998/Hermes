@@ -3947,7 +3947,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents
             )
-        except BaseException:
+        except BaseException as exc:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
             # (#10200), then re-raise into the outer handler. BaseException
@@ -3955,6 +3955,31 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # still triggers teardown before propagating.
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
+            # `except BaseException` also matches plain Exception subclasses —
+            # those must fall straight through to the `except Exception` below
+            # (which marks the run) so it isn't marked TWICE. Only a exception
+            # that is NOT an Exception (KeyboardInterrupt/SystemExit/
+            # GeneratorExit) skips that handler entirely, so without this it
+            # propagates out of run_one_job with mark_job_run/finish_execution
+            # never called — a finite one-shot's claim_dispatch() commit
+            # (issue #38758) is then left with no recorded outcome (#73973).
+            # Persist the same failure record the Exception path below would,
+            # then re-raise unchanged. This only helps the recoverable
+            # subclass of the crash-loss issue (an interpreter-level
+            # interrupt/exit); it cannot help a true process kill (SIGKILL/
+            # OOM), which never reaches this handler.
+            if not isinstance(exc, Exception):
+                try:
+                    if not _consume_interrupted_flag(job["id"]):
+                        mark_job_run(
+                            job["id"], False,
+                            f"Interrupted by {type(exc).__name__} during execution.",
+                        )
+                    finish_execution(execution_id, success=False, error=str(exc))
+                except Exception:
+                    logger.exception(
+                        "Failed to persist interrupted-job outcome for %s", job["id"]
+                    )
             raise
         finally:
             reset_secret_scope(_scope_token)

@@ -119,6 +119,41 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
     assert marks == [("j6", False)]
 
 
+def test_run_one_job_base_exception_marks_failure_and_reraises(monkeypatch):
+    """Regression for #73973: KeyboardInterrupt/SystemExit escape the
+    `except Exception` handler by design, but must still persist an outcome
+    before propagating — otherwise a one-shot's pre-run claim_dispatch()
+    commit (#38758) is left with no recorded result once the process dies.
+    """
+    def interrupted(job, *, defer_agent_teardown=None):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(s, "run_job", interrupted)
+    marks = []
+    finishes = []
+    monkeypatch.setattr(
+        s, "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok, err)),
+    )
+    monkeypatch.setattr(
+        s, "finish_execution",
+        lambda exec_id, *, success, error=None: finishes.append((success, error)),
+    )
+
+    raised = False
+    try:
+        s.run_one_job({"id": "j11", "name": "t"})
+    except KeyboardInterrupt:
+        raised = True
+
+    assert raised, "KeyboardInterrupt must still propagate, not be swallowed"
+    assert len(marks) == 1
+    jid, ok, err = marks[0]
+    assert (jid, ok) == ("j11", False)
+    assert "KeyboardInterrupt" in err
+    assert finishes and finishes[0][0] is False
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads

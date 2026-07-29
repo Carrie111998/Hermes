@@ -1140,12 +1140,17 @@ class TestGetDueJobs:
         assert get_due_jobs() == []
         assert get_job("inflight") is not None  # still visible to list/run
 
-        # The claiming tick really died (running set empty) → recovered as before.
+        # The claiming tick really died (running set empty) → recovered as before,
+        # but retired as an auditable error rather than deleted (#73973).
         monkeypatch.setattr(
             scheduler_mod, "get_running_job_ids", lambda: frozenset()
         )
         assert get_due_jobs() == []
-        assert get_job("inflight") is None  # stale entry cleaned up
+        retired = get_job("inflight")
+        assert retired is not None  # kept, not deleted
+        assert retired["enabled"] is False
+        assert retired["state"] == "error"
+        assert retired["last_status"] == "error"
 
     def test_stale_maxed_oneshot_kept_when_running_check_errors(
         self, tmp_cron_dir, monkeypatch
@@ -1835,12 +1840,18 @@ class TestClaimDispatch:
         # Persisted BEFORE any side effect — survives a crash.
         assert load_jobs()[0]["repeat"]["completed"] == 1
 
-    def test_already_dispatched_oneshot_is_removed(self, tmp_cron_dir):
+    def test_already_dispatched_oneshot_is_retired_not_removed(self, tmp_cron_dir):
         # A prior tick claimed (completed==times) then died before mark_job_run
-        # could remove the job.  The next claim must refuse AND clean up.
+        # could record an outcome. The next claim must refuse AND retire the
+        # job as an auditable error instead of silently deleting it (#73973).
         save_jobs([self._oneshot(times=1, completed=1)])
         assert claim_dispatch("os1") is False
-        assert load_jobs() == []  # removed, will not re-fire
+        jobs = load_jobs()
+        assert len(jobs) == 1  # kept, not deleted — will not re-fire
+        assert jobs[0]["enabled"] is False
+        assert jobs[0]["state"] == "error"
+        assert jobs[0]["last_status"] == "error"
+        assert jobs[0]["last_error"]
 
     def test_recurring_job_is_not_claimed(self, tmp_cron_dir):
         job = {
@@ -1892,10 +1903,11 @@ class TestClaimDispatch:
         mark_job_run("rec", success=True)
         assert load_jobs()[0]["repeat"]["completed"] == 2
 
-    def test_get_due_jobs_removes_stale_maxed_oneshot(self, tmp_cron_dir):
+    def test_get_due_jobs_retires_stale_maxed_oneshot(self, tmp_cron_dir):
         # A claimed one-shot whose tick died leaves completed>=times with
         # last_run_at still unset, so the recovery helper re-arms it as due.
-        # get_due_jobs must drop it instead of returning it for another fire.
+        # get_due_jobs must not return it for another fire, and must retire it
+        # as an auditable error instead of silently deleting it (#73973).
         past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
         save_jobs([{
             "id": "os1",
@@ -1907,7 +1919,12 @@ class TestClaimDispatch:
         }])
         due = get_due_jobs()
         assert due == []
-        assert load_jobs() == []  # cleaned up
+        jobs = load_jobs()
+        assert len(jobs) == 1  # kept, not deleted
+        assert jobs[0]["enabled"] is False
+        assert jobs[0]["state"] == "error"
+        assert jobs[0]["last_status"] == "error"
+        assert jobs[0]["last_error"]
 
     def test_bad_schedule_does_not_crash_or_block_sibling_jobs(self, tmp_cron_dir):
         """Regression for a job with non-dict 'schedule' (null / string / etc.
