@@ -869,16 +869,63 @@ class BuzzAdapter(BasePlatformAdapter):
             subscriptions[_WS_MEMBERSHIP_SUB_ID] = None
         return subscriptions
 
+    async def _refresh_joined_group_channels(self) -> List[str]:
+        """Seed any joined group channels we are not yet watching.
+
+        When ``self.channels`` is empty (all-joined mode), every non-archived
+        channel from ``channels list`` is eligible. When a fixed allowlist is
+        set, only listed UUIDs are eligible — so membership alone cannot
+        expand past the pin.
+
+        Returns newly seeded channel ids (caller may WS-subscribe them).
+        """
+        code, out, err = await self._run_cli(["channels", "list"])
+        if code != 0:
+            logger.debug(
+                "Buzz: channels list failed during join refresh — %s",
+                _cli_error_message(err, code),
+            )
+            return []
+        listed = _parse_json_list(out)
+        added: List[str] = []
+        for ch in listed:
+            channel_id = str(ch.get("channel_id") or "").strip()
+            if not channel_id:
+                continue
+            # Fixed allowlist mode: never hot-add outside the pin.
+            if self.channels and channel_id not in self.channels:
+                continue
+            name = str(ch.get("name") or channel_id)
+            # Skip archived rooms if the relay marks them.
+            status = str(ch.get("status") or ch.get("state") or "").lower()
+            if status == "archived" or ch.get("archived") is True:
+                continue
+            self._channel_names[channel_id] = name
+            self._channel_meta[channel_id] = ch
+            if channel_id in self._channel_state:
+                continue
+            # DM-shaped list entries still go through group seed; p-tag latch
+            # reclassifies them the same way connect() does.
+            await self._seed_channel(channel_id, chat_type="group")
+            if channel_id in self._channel_state:
+                added.append(channel_id)
+                logger.info("Buzz: watching newly joined channel %s (%s)", channel_id, name)
+        return added
+
     async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
-        """A membership event p-tagged to us: rediscover conversations and
-        subscribe to any new ones (fresh DMs dispatch from their beginning)."""
+        """Membership event p-tagged to us: hot-add DMs *and* group channels.
+
+        Previously this only ran DM discovery, so new epic/group rooms stayed
+        silent until a gateway restart rebuilt the watch set.
+        """
         self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
         before = set(self._channel_state)
         await self._discover_dms(seed=False)
-        for channel_id in self._channel_state:
+        await self._refresh_joined_group_channels()
+        for channel_id in list(self._channel_state):
             if channel_id in before:
                 continue
-            subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
+            subscription_id = f"hermes-buzz-join-{len(subscriptions)}"
             subscriptions[subscription_id] = channel_id
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
             logger.info("Buzz: subscribed to new conversation %s", channel_id)
@@ -956,6 +1003,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 try:
                     if self._poll_count % _DM_DISCOVERY_EVERY == 0:
                         await self._discover_dms(seed=False)
+                        await self._refresh_joined_group_channels()
                     for channel_id in list(self._channel_state):
                         await self._poll_channel(channel_id)
                 except asyncio.CancelledError:

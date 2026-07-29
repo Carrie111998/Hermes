@@ -738,6 +738,47 @@ class TestDmClassification:
 # ── Sending ───────────────────────────────────────────────────────────────
 
 
+
+class TestJoinedChannelHotAdd:
+    """New group rooms must become watchable without a gateway restart."""
+
+    @pytest.mark.asyncio
+    async def test_refresh_joined_group_channels_all_joined_mode(self):
+        adapter = _make_adapter(extra={"channels": []})  # all-joined
+        adapter.channels = []
+        cli = _ScriptedCli()
+        new_ch = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        cli.script("channels", "list", [
+            {"channel_id": CHANNEL, "name": "general", "description": "hub"},
+            {"channel_id": new_ch, "name": "🐔⚡-new-epic", "description": "epic room"},
+        ])
+        # seed calls messages get for each new channel
+        cli.script("messages", "get", [])
+        cli.script("messages", "get", [])
+        adapter._run_cli = cli
+        # pre-seed one channel so only the new one is "added"
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 1, "seen": {}}
+        added = await adapter._refresh_joined_group_channels()
+        assert new_ch in added
+        assert new_ch in adapter._channel_state
+        assert CHANNEL not in added
+
+    @pytest.mark.asyncio
+    async def test_refresh_respects_fixed_allowlist(self):
+        adapter = _make_adapter(extra={"channels": [CHANNEL]})
+        adapter.channels = [CHANNEL]
+        cli = _ScriptedCli()
+        outsider = "ffffffff-0000-0000-0000-ffffffffffff"
+        cli.script("channels", "list", [
+            {"channel_id": CHANNEL, "name": "general"},
+            {"channel_id": outsider, "name": "not-allowed"},
+        ])
+        adapter._run_cli = cli
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 1, "seen": {}}
+        added = await adapter._refresh_joined_group_channels()
+        assert added == []
+        assert outsider not in adapter._channel_state
+
 class TestBuzzAdapterSend:
 
     @pytest.mark.asyncio
