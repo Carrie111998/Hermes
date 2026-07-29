@@ -1106,7 +1106,12 @@ def recover_with_credential_pool(
                 or "usage limit reached" in context_message
                 or "usage limit has been reached" in context_message
             )
-        if not has_retried_429 and not usage_limit_reached:
+        provider_name = str(getattr(agent, "provider", "") or "").strip().lower()
+        if (
+            not has_retried_429
+            and not usage_limit_reached
+            and provider_name != "gemini"
+        ):
             return False, True
         rotate_status = status_code if status_code is not None else 429
         next_entry = _rotate_failed_credential(rotate_status)
