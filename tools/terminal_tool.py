@@ -2131,6 +2131,58 @@ def _resolve_command_cwd(
 # notice or recover.
 _WATCHDOG_MARGIN_SECONDS = 45
 
+# Hard ceiling for _create_environment() (sandbox/shell setup, run once per
+# task_id) and, separately, for how long a caller will wait to acquire the
+# per-task creation lock before giving up (see the call site in terminal_tool
+# for why the lock itself also needs a bound, not just the call it guards).
+# 90s is generous for the "local" backend (should be sub-second) while still
+# leaving room for container/cloud backends to pull images or cold-start.
+# Root-caused from a live incident: a session hung for 40+ minutes with zero
+# log output between the model's tool-call request and any tool_executor
+# completion/error -- past the point either the terminal-execute watchdog or
+# the smart-approval watchdog would have already resolved it, meaning the
+# stall was upstream of both, in environment setup itself.
+_ENV_CREATION_WATCHDOG_SECONDS = 90
+
+
+def _create_environment_with_watchdog(**kwargs):
+    """Run _create_environment() on a daemon thread with a hard ceiling.
+
+    See _ENV_CREATION_WATCHDOG_SECONDS for rationale. Same daemon-thread
+    (not concurrent.futures.ThreadPoolExecutor) reasoning as
+    _execute_foreground_with_watchdog: an abandoned worker must not block a
+    later, unrelated clean shutdown of the agent process.
+    """
+    result_queue = queue.Queue(maxsize=1)
+
+    def _run():
+        try:
+            result_queue.put(("ok", _create_environment(**kwargs)))
+        except BaseException as e:  # noqa: BLE001 - must forward any failure to the waiter
+            result_queue.put(("error", e))
+
+    worker = threading.Thread(
+        target=_run, name=f"env-creation-watchdog-{kwargs.get('task_id')}", daemon=True,
+    )
+    worker.start()
+    try:
+        kind, payload = result_queue.get(timeout=_ENV_CREATION_WATCHDOG_SECONDS)
+    except queue.Empty:
+        logger.error(
+            "_create_environment() watchdog fired after %ds for env_type=%s "
+            "task=%s. The call never returned -- abandoning the worker "
+            "thread so the agent turn can continue.",
+            _ENV_CREATION_WATCHDOG_SECONDS, kwargs.get("env_type"), kwargs.get("task_id"),
+        )
+        raise TimeoutError(
+            f"Environment creation did not complete within "
+            f"{_ENV_CREATION_WATCHDOG_SECONDS}s -- watchdog aborted the wait"
+        ) from None
+
+    if kind == "error":
+        raise payload
+    return payload
+
 
 def _execute_foreground_with_watchdog(env, command, execute_kwargs, *, task_id, env_type):
     """Run env.execute() with a hard wall-clock ceiling.
@@ -2355,7 +2407,33 @@ def terminal_tool(
                     _creation_locks[effective_task_id] = threading.Lock()
                 task_lock = _creation_locks[effective_task_id]
 
-            with task_lock:
+            # Bounded acquire, not `with task_lock:` -- a plain blocking acquire
+            # here means that if the thread creating the sandbox ever wedges
+            # (see _create_environment_with_watchdog below), EVERY subsequent
+            # call for this task_id piles up waiting on the same lock forever,
+            # turning one stuck call into a permanently dead task_id. A
+            # threading.Lock can be released by any thread, not just the one
+            # that acquired it, so releasing it here after giving up is safe
+            # even if the abandoned creation call is technically still running
+            # in the background -- its eventual result is simply discarded.
+            if not task_lock.acquire(timeout=_ENV_CREATION_WATCHDOG_SECONDS):
+                logger.error(
+                    "Timed out after %ds waiting for the %s environment "
+                    "creation lock for task %s -- a previous creation call "
+                    "for this task appears to be wedged.",
+                    _ENV_CREATION_WATCHDOG_SECONDS, env_type, effective_task_id,
+                )
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        f"Timed out after {_ENV_CREATION_WATCHDOG_SECONDS}s waiting to "
+                        "create the terminal environment (a previous creation attempt "
+                        "for this task appears stuck). Try again."
+                    ),
+                }, ensure_ascii=False)
+
+            try:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
                     _existing_key = (
@@ -2407,7 +2485,7 @@ def terminal_tool(
                                 "persistent": config.get("local_persistent", False),
                             }
 
-                        new_env = _create_environment(
+                        new_env = _create_environment_with_watchdog(
                             env_type=env_type,
                             image=image,
                             cwd=cwd,
@@ -2425,12 +2503,20 @@ def terminal_tool(
                             "error": f"Terminal tool disabled: environment creation failed ({e})",
                             "status": "disabled"
                         }, ensure_ascii=False)
+                    except TimeoutError as e:
+                        return json.dumps({
+                            "output": "",
+                            "exit_code": -1,
+                            "error": str(e),
+                        }, ensure_ascii=False)
 
                     with _env_lock:
                         _active_environments[effective_task_id] = new_env
                         _last_activity[effective_task_id] = time.time()
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+            finally:
+                task_lock.release()
 
         if env is None:
             # Unreachable in practice (either the cached branch or the creation
