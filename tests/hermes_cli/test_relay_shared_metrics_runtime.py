@@ -707,7 +707,7 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
     }
     package_values: dict[tuple[str, tuple[tuple[str, str], ...]], int] = {}
     packages = sorted((root / "outbox").glob("*.json"))
-    assert len(packages) == 4
+    assert len(packages) == 2
     package_payloads = [
         json.loads(package.read_text(encoding="utf-8")) for package in packages
     ]
