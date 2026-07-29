@@ -166,6 +166,38 @@ def test_normalize_usage_openai_prefers_prompt_tokens_details_over_top_level():
     assert normalized.cache_write_tokens == 150
 
 
+def test_normalize_usage_codex_responses_dict_and_object_shapes_match():
+    """The Codex Responses terminal-event handler stores ``usage`` as a plain
+    dict when the SDK response object is itself a dict (see
+    agent/codex_runtime.py's dict fallback for resp_obj). normalize_usage()
+    must read dict-shaped usage the same way it reads attribute-style SDK
+    objects — getattr() alone silently returns 0 for every field on a dict,
+    including nested cache/reasoning detail counts."""
+    payload = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "input_tokens_details": {"cached_tokens": 60},
+        "output_tokens_details": {"reasoning_tokens": 7},
+    }
+    object_usage = SimpleNamespace(
+        input_tokens=100,
+        output_tokens=20,
+        input_tokens_details=SimpleNamespace(cached_tokens=60),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=7),
+    )
+
+    dict_normalized = normalize_usage(payload, provider="openai", api_mode="codex_responses")
+    object_normalized = normalize_usage(
+        object_usage, provider="openai", api_mode="codex_responses"
+    )
+
+    assert dict_normalized == object_normalized
+    assert dict_normalized.input_tokens == 40
+    assert dict_normalized.output_tokens == 20
+    assert dict_normalized.cache_read_tokens == 60
+    assert dict_normalized.reasoning_tokens == 7
+
+
 def test_openrouter_models_api_pricing_is_converted_from_per_token_to_per_million(monkeypatch):
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata",
