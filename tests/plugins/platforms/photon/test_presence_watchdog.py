@@ -104,6 +104,29 @@ async def test_probe_once_inconclusive_on_error_status(
 
 
 @pytest.mark.asyncio
+async def test_probe_once_hung_on_explicit_sidecar_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sidecar applies its own upstream timeout before replying. Preserve
+    that specific verdict so recovery does not depend on a race between two
+    equal HTTP timeout clocks."""
+    a = _make_adapter(monkeypatch)
+
+    class _Resp:
+        status_code = 503
+
+        def json(self) -> Any:
+            return {"ok": False, "alive": False, "outcome": "hung"}
+
+    class _Client:
+        async def post(self, *args: Any, **kwargs: Any) -> Any:
+            return _Resp()
+
+    a._http_client = _Client()  # type: ignore[assignment]
+    assert await a._probe_once() == "hung"
+
+
+@pytest.mark.asyncio
 async def test_probe_once_hung_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     a = _make_adapter(monkeypatch)
 

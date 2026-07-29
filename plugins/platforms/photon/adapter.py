@@ -679,13 +679,12 @@ class PhotonAdapter(BasePlatformAdapter):
         # Presence watchdog. spectrum-ts only reconnects when its inbound
         # iterator throws or ends; a half-open ("zombie") gRPC socket makes the
         # iterator hang forever (no error, no end), so inbound silently dies
-        # until the sidecar is restarted. The sidecar owns primary zombie
-        # detection (stream-staleness + upstream probe -> degraded -> exit 75;
-        # surfaced here via /healthz in _monitor_sidecar_health). This adapter-
-        # side watchdog is a conservative second layer that only respawns the
-        # sidecar when the sidecar's own HTTP loop stops responding (probe
-        # HTTP call hangs) — an "inconclusive" probe (sidecar answered but
-        # could not prove upstream liveness) NEVER counts toward a respawn:
+        # until the sidecar is restarted. This watchdog periodically asks the
+        # sidecar to drive a unary call over the same gRPC channel. A successful
+        # call is a keepalive, but never evidence that a quiet event stream is
+        # dead: healthy shared lines can be silent for hours. Only repeated
+        # probe hangs respawn the sidecar. An "inconclusive" probe (the sidecar
+        # answered but could not prove upstream liveness) NEVER counts:
         # the network may simply be down, and restarting cannot fix that.
         # Thresholds are deliberately conservative (10 min interval) — shared
         # lines can be legitimately quiet for hours, so we never restart on
@@ -1048,22 +1047,6 @@ class PhotonAdapter(BasePlatformAdapter):
             stream = data.get("stream") if isinstance(data, dict) else None
             if not isinstance(stream, dict):
                 continue
-
-            # Surface the sidecar's zombie-stream staleness state early: a
-            # suspected half-open stream (silence past threshold + probe-proven
-            # connectivity) is worth a loud log line even before the sidecar's
-            # degraded->exit-75 path fires.
-            staleness = stream.get("staleness")
-            if (
-                isinstance(staleness, dict)
-                and staleness.get("zombieSuspected") is True
-            ):
-                logger.warning(
-                    "[photon] sidecar reports suspected zombie stream"
-                    " (silentForMs=%s, lastProbeOutcome=%s)",
-                    staleness.get("silentForMs"),
-                    staleness.get("lastProbeOutcome"),
-                )
 
             if stream.get("ok") is not False:
                 continue
@@ -1755,13 +1738,13 @@ class PhotonAdapter(BasePlatformAdapter):
 
         - ``"alive"``        — the sidecar completed a real upstream gRPC
           round-trip (HTTP 200). Only this counts as proof of liveness.
-        - ``"hung"``         — the probe HTTP call itself timed out: the
-          sidecar's event loop is unresponsive. Counts toward respawn.
-        - ``"inconclusive"`` — anything else (503 from the sidecar's strict
-          probe, connection refused, transport error). NEVER counts as alive
-          and NEVER counts toward a respawn: a rejected upstream probe may
-          just mean the network is down, and a dead sidecar process is the
-          supervisor's job, not ours.
+        - ``"hung"``         — the adapter HTTP call timed out, or the sidecar
+          reported that its upstream unary call timed out. Counts toward
+          respawn.
+        - ``"inconclusive"`` — anything else (non-hung 503, connection refused,
+          transport error). NEVER counts as alive and NEVER counts toward a
+          respawn: a rejected upstream probe may just mean the network is down,
+          and a dead sidecar process is the supervisor's job, not ours.
         """
         client = self._http_client
         if client is None:
@@ -1781,7 +1764,15 @@ class PhotonAdapter(BasePlatformAdapter):
                 return "hung"
             logger.debug("[photon] probe transport error (inconclusive): %s", e)
             return "inconclusive"
-        return "alive" if resp.status_code == 200 else "inconclusive"
+        if resp.status_code == 200:
+            return "alive"
+        try:
+            payload = resp.json()
+        except (AttributeError, TypeError, ValueError):
+            return "inconclusive"
+        if isinstance(payload, dict) and payload.get("outcome") == "hung":
+            return "hung"
+        return "inconclusive"
 
     async def _respawn_sidecar(self, reason: str) -> None:
         """Tear down and restart the sidecar to recover a dead gRPC stream.
@@ -1821,13 +1812,12 @@ class PhotonAdapter(BasePlatformAdapter):
     async def _presence_watchdog(self) -> None:
         """Periodically confirm the sidecar (and its stream) is responsive.
 
-        The sidecar owns primary zombie-stream detection (silence tracking +
-        upstream probe -> degraded /healthz -> exit 75). This loop is the
-        adapter's conservative second layer: it probes on a long interval,
-        skips the probe when natural inbound traffic already proved liveness,
-        and only counts a *hung* probe (the sidecar HTTP call itself timing
-        out) toward a respawn. Inconclusive probes — the sidecar answered but
-        couldn't prove upstream liveness — reset nothing and trigger nothing:
+        The loop probes on a long interval, skips the probe when natural
+        inbound traffic already proved liveness, and only counts a *hung*
+        upstream probe toward a respawn. The hang can surface either as an
+        adapter HTTP timeout or as the sidecar's explicit ``outcome=hung``
+        response. Inconclusive probes — the sidecar answered but couldn't
+        prove upstream liveness — reset nothing and trigger nothing:
         the network may just be down, and restarting can't fix that. After
         ``_probe_max_failures`` consecutive hung probes we respawn the sidecar
         to force a fresh stream.
