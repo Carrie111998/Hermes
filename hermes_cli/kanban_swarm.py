@@ -88,6 +88,8 @@ def create_swarm(
     created_by: str = "swarm-orchestrator",
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
+    project_id: Optional[str] = None,
+    branch_name: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
@@ -96,6 +98,18 @@ def create_swarm(
     The returned graph is immediately dispatchable: the planning root is marked
     ``done`` with topology metadata, parallel workers are ``ready``, the verifier
     waits for every worker, and the synthesizer waits for the verifier.
+
+    For ``workspace_kind="worktree"`` swarms (code pipelines, e.g. a single
+    ``programmer`` worker handing off to a code-review ``verifier``), every
+    downstream card must land in the *same* git worktree the worker committed
+    to, or the verifier opens an empty checkout and reviews nothing.
+    ``kb.create_task`` normally hands each project-linked task its own fresh
+    ``<repo>/.worktrees/<task-id>`` dir, so left alone every card in the swarm
+    would get a different worktree. To avoid that, the first worker's
+    resolved ``workspace_path``/``branch_name`` (whether pinned explicitly via
+    ``workspace_path`` or auto-derived from ``project_id``) is captured after
+    it's created and reused verbatim for every remaining worker, the verifier,
+    and the synthesizer.
     """
 
     goal = _require_text(goal, "goal")
@@ -107,6 +121,14 @@ def create_swarm(
     for i, spec in enumerate(worker_specs, start=1):
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
+    if workspace_kind == "worktree" and len(worker_specs) > 1:
+        raise ValueError(
+            "swarm with workspace_kind='worktree' supports exactly one "
+            "--worker: multiple parallel workers writing to the same git "
+            "worktree/branch will clobber each other's changes. Use a "
+            "single worker for code pipelines, or drop --workspace/--project "
+            "to keep parallel workers on independent scratch dirs."
+        )
 
     root = kb.create_task(
         conn,
@@ -154,8 +176,16 @@ def create_swarm(
     )
 
     context_suffix = _swarm_context(root, goal)
+    # These start as the caller's request and get pinned to the first
+    # worker's *resolved* worktree right after it's created, so every later
+    # card (siblings, verifier, synthesizer) lands in that same checkout
+    # instead of each getting its own fresh `.worktrees/<task-id>` dir.
+    shared_ws_kind = workspace_kind
+    shared_ws_path = workspace_path
+    shared_branch = branch_name
+
     worker_ids: list[str] = []
-    for spec in worker_specs:
+    for i, spec in enumerate(worker_specs):
         worker_id = kb.create_task(
             conn,
             title=spec.title,
@@ -165,12 +195,22 @@ def create_swarm(
             parents=[root],
             tenant=tenant,
             priority=spec.priority or priority,
-            workspace_kind=workspace_kind,
-            workspace_path=workspace_path,
+            workspace_kind=shared_ws_kind,
+            workspace_path=shared_ws_path,
+            branch_name=shared_branch,
+            project_id=project_id if shared_ws_path is None else None,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
         )
         worker_ids.append(worker_id)
+        if i == 0 and shared_ws_kind == "worktree" and shared_ws_path is None:
+            # project_id-only worktree: kb.create_task just auto-derived a
+            # fresh <repo>/.worktrees/<worker_id> dir + deterministic branch.
+            # Lock that exact path/branch in for the verifier + synthesizer.
+            created_worker = kb.get_task(conn, worker_id)
+            shared_ws_kind = created_worker.workspace_kind or shared_ws_kind
+            shared_ws_path = created_worker.workspace_path
+            shared_branch = created_worker.branch_name
 
     verifier_body = (
         "Review every worker handoff and blackboard update. Gate the swarm: "
@@ -187,8 +227,10 @@ def create_swarm(
         parents=worker_ids,
         tenant=tenant,
         priority=priority,
-        workspace_kind=workspace_kind,
-        workspace_path=workspace_path,
+        workspace_kind=shared_ws_kind,
+        workspace_path=shared_ws_path,
+        branch_name=shared_branch,
+        project_id=project_id if shared_ws_path is None else None,
         skills=["requesting-code-review"],
     )
 
@@ -206,8 +248,10 @@ def create_swarm(
         parents=[verifier],
         tenant=tenant,
         priority=priority,
-        workspace_kind=workspace_kind,
-        workspace_path=workspace_path,
+        workspace_kind=shared_ws_kind,
+        workspace_path=shared_ws_path,
+        branch_name=shared_branch,
+        project_id=project_id if shared_ws_path is None else None,
         skills=["humanizer"],
     )
 
