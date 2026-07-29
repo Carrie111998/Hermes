@@ -25,6 +25,7 @@ from cron.jobs import (
     get_due_jobs,
     save_job_output,
 )
+from cron.model_policy import detect_privileged_workload_tags
 
 
 # =========================================================================
@@ -253,6 +254,51 @@ class TestJobCRUD:
     def test_default_delivery_local_no_origin(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
+
+
+class TestPrivilegedModelPolicy:
+    def test_detects_legal_and_finance_tags_from_job_metadata(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Prepare Zheng settlement finance reconciliation summary from QBO workpapers",
+            schedule="30m",
+        )
+        assert detect_privileged_workload_tags(job) == ("finance", "legal")
+
+    def test_privileged_job_rejects_owl_model_override(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="denied model route"):
+            create_job(
+                prompt="Review Zheng settlement posture",
+                schedule="30m",
+                provider="openrouter",
+                model="openrouter/owl-alpha",
+            )
+        assert list_jobs() == []
+
+    def test_privileged_job_accepts_allowlisted_nemotron_route(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Run accounting-department daily USTC QBO check",
+            schedule="30m",
+            skills=["accounting-department"],
+            provider="openrouter",
+            model="nvidia/nemotron-3-ultra-550b-a55b:free",
+        )
+        assert job["provider"] == "openrouter"
+        assert job["model"] == "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+    def test_privileged_update_rejects_disallowed_route(self, tmp_cron_dir):
+        job = create_job(prompt="HHS settlement monitor", schedule="every 1h")
+        with pytest.raises(ValueError, match="not allowlisted"):
+            update_job(job["id"], {"provider": "custom:logger", "model": "great-model"})
+        assert get_job(job["id"])["provider"] is None
+
+    def test_non_privileged_job_can_use_owl(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Summarize public TypeScript changelog",
+            schedule="30m",
+            provider="openrouter",
+            model="openrouter/owl-alpha",
+        )
+        assert job["model"] == "openrouter/owl-alpha"
 
 
 class TestUpdateJob:

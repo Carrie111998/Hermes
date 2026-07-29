@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
 from utils import atomic_replace
+from cron.model_policy import enforce_privileged_model_route
 
 try:
     from croniter import croniter
@@ -664,6 +665,8 @@ def create_job(
         "profile": normalized_profile,
     }
 
+    enforce_privileged_model_route(job)
+
     jobs = load_jobs()
     jobs.append(job)
     save_jobs(jobs)
@@ -776,6 +779,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
+
+        enforce_privileged_model_route(updated)
 
         jobs[i] = updated
         save_jobs(jobs)

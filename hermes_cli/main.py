@@ -1353,7 +1353,8 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         if not os.environ.get("HERMES_QUIET"):
             print("Installing TUI dependencies…")
         result = subprocess.run(
-            [npm, "install", "--silent", "--no-fund", "--no-audit", "--progress=false"],
+            [npm, "install", "--silent", "--no-fund", "--no-audit", "--progress=false",
+             "--legacy-peer-deps"],
             cwd=str(tui_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
