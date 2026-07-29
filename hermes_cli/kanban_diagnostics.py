@@ -698,14 +698,16 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
-            # A success (or manual reclaim) breaks the streak.
-            break
-        else:
-            # Other outcomes (timed_out, blocked, spawn_failed, gave_up)
-            # aren't crash signals — don't count them, but they also
-            # don't break the crash streak.
+        elif outcome is None:
+            # An in-flight row is not an outcome. ``running`` cards are
+            # already exempt above, but tolerate incomplete historical rows.
             continue
+        else:
+            # Any resolved non-crash attempt breaks a *consecutive* crash
+            # streak. Other failure classes have their own unified diagnostic;
+            # skipping them here made old crashes look current after a later
+            # governed capability/dependency handoff.
+            break
     if consecutive < threshold:
         return []
     task_id = _task_field(task, "id")
