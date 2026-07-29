@@ -61,6 +61,8 @@ Every turn (in `hybrid` or `context` mode), Honcho assembles two layers of conte
 
 Both layers are concatenated and truncated to the `contextTokens` budget (if set).
 
+When `curatedContextPath` is configured, its Markdown content replaces the raw Honcho base layer. The file must resolve inside `HERMES_HOME/memory`, is capped by `curatedContextTokens`, and passes Hermes' strict prompt-injection scan before use. This explicit curated source may also be injected in `tools` mode; raw Honcho context still requires tools. The dialectic supplement remains active in `hybrid` and `context` modes.
+
 ### Cold/Warm Prompt Selection
 
 The dialectic automatically selects between two prompt strategies:
@@ -115,6 +117,8 @@ When pointing Hermes at a self-hosted Honcho server, `hermes honcho setup` (and 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `contextTokens` | `null` (uncapped) | Token budget for auto-injected context per turn. Set to an integer (e.g. 1200) to cap. Truncates at word boundaries |
+| `curatedContextPath` | `null` | Markdown file under `HERMES_HOME/memory` used instead of raw Honcho base context |
+| `curatedContextTokens` | `1000` | Hard token cap for the curated context file |
 | `contextCadence` | `1` | Minimum turns between `context()` API calls (base layer refresh) |
 | `dialecticCadence` | `2` | Minimum turns between `peer.chat()` LLM calls (dialectic layer). Recommended 1–5. In `tools` mode, irrelevant — model calls explicitly |
 | `dialecticDepth` | `1` | Number of `.chat()` passes per dialectic invocation. Clamped to 1–3 |

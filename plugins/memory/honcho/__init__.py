@@ -17,16 +17,29 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import stat
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider
+from hermes_constants import get_hermes_home
 from tools.registry import tool_error
+from tools.threat_patterns import MAX_SCAN_CHARS, scan_for_threats
 
 logger = logging.getLogger(__name__)
+
+_CURATED_CONTEXT_SESSION_LOCK = threading.Lock()
+_CURATED_CONTEXT_SESSION_KEYS: dict[str, None] = {}
+_CURATED_CONTEXT_SESSION_CACHE_MAX = 1024
+_SECURE_OPEN_FLAGS = ("O_DIRECTORY", "O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK")
+_SECURE_DIR_FD_OPEN_SUPPORTED = all(
+    hasattr(os, name) for name in _SECURE_OPEN_FLAGS
+) and os.open in getattr(os, "supports_dir_fd", set())
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +307,8 @@ class HonchoMemoryProvider(MemoryProvider):
 
         # Cron and flush contexts disable the plugin entirely.
         self._cron_skipped = False
+        self._curated_context_injected = False
+        self._curated_session_key: Optional[str] = None
 
     @property
     def name(self) -> str:
@@ -382,6 +397,12 @@ class HonchoMemoryProvider(MemoryProvider):
             self._lazy_init_kwargs = dict(kwargs)
             self._lazy_init_session_id = session_id
             self._session_key = self._resolve_session_key(cfg, session_id, **kwargs)
+            self._curated_session_key = session_id or None
+            if self._curated_session_key:
+                with _CURATED_CONTEXT_SESSION_LOCK:
+                    self._curated_context_injected = (
+                        self._curated_session_key in _CURATED_CONTEXT_SESSION_KEYS
+                    )
 
             # Network-backed session creation can block on Honcho service or DB
             # outages. Startup must fail open for context/hybrid modes, where
@@ -623,6 +644,134 @@ class HonchoMemoryProvider(MemoryProvider):
             return ""
         return "\n\n".join(parts)
 
+    def _curated_context_configured(self) -> bool:
+        return bool(self._config and getattr(self._config, "curated_context_path", None))
+
+    def _mark_curated_context_injected(self) -> None:
+        """Remember one-time curated injection across provider rebuilds."""
+        self._curated_context_injected = True
+        session_key = self._curated_session_key
+        if not session_key:
+            return
+        with _CURATED_CONTEXT_SESSION_LOCK:
+            _CURATED_CONTEXT_SESSION_KEYS[session_key] = None
+            while len(_CURATED_CONTEXT_SESSION_KEYS) > _CURATED_CONTEXT_SESSION_CACHE_MAX:
+                oldest = next(iter(_CURATED_CONTEXT_SESSION_KEYS))
+                del _CURATED_CONTEXT_SESSION_KEYS[oldest]
+
+    def _curated_context_was_injected(self) -> bool:
+        if self._curated_context_injected:
+            return True
+        session_key = self._curated_session_key
+        if not session_key:
+            return False
+        with _CURATED_CONTEXT_SESSION_LOCK:
+            injected = session_key in _CURATED_CONTEXT_SESSION_KEYS
+        self._curated_context_injected = injected
+        return injected
+
+    def _open_curated_context_fd(self) -> Optional[int]:
+        """Open curated Markdown beneath HERMES_HOME/memory without following links."""
+        config = self._config
+        configured_path = getattr(config, "curated_context_path", None) if config else None
+        if not configured_path:
+            return None
+        raw_path = Path(str(configured_path)).expanduser()
+        if raw_path.is_absolute():
+            logger.warning("Honcho curated context path must be relative")
+            return None
+        parts = raw_path.parts
+        if parts and parts[0] == "memory":
+            parts = parts[1:]
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            logger.warning("Honcho curated context path is invalid")
+            return None
+        if Path(parts[-1]).suffix.lower() != ".md":
+            logger.warning("Honcho curated context path must be a Markdown file")
+            return None
+
+        if not _SECURE_DIR_FD_OPEN_SUPPORTED:
+            logger.warning(
+                "Honcho curated context is unavailable: secure descriptor opening "
+                "is not supported on this platform"
+            )
+            return None
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        directory_fds: list[int] = []
+        file_fd: Optional[int] = None
+        try:
+            current_fd = os.open(get_hermes_home(), directory_flags)
+            directory_fds.append(current_fd)
+            current_fd = os.open("memory", directory_flags, dir_fd=current_fd)
+            directory_fds.append(current_fd)
+            for component in parts[:-1]:
+                current_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                directory_fds.append(current_fd)
+            file_fd = os.open(parts[-1], file_flags, dir_fd=current_fd)
+            opened = os.fstat(file_fd)
+            if not stat.S_ISREG(opened.st_mode):
+                os.close(file_fd)
+                file_fd = None
+                logger.warning("Honcho curated context path must be a regular file")
+                return None
+            return file_fd
+        except OSError as exc:
+            if file_fd is not None:
+                try:
+                    os.close(file_fd)
+                except OSError:
+                    pass
+            logger.warning("Honcho curated context open failed: %s", exc)
+            return None
+        finally:
+            for directory_fd in reversed(directory_fds):
+                os.close(directory_fd)
+
+    def _load_curated_base_context(self) -> str:
+        """Load, bound, sanitize, and security-scan curated base context."""
+        config = self._config
+        if not config:
+            return ""
+        file_fd = self._open_curated_context_fd()
+        if file_fd is None:
+            return ""
+        requested_max_chars = max(
+            1, int(getattr(config, "curated_context_tokens", 1000))
+        ) * 4
+        max_chars = min(requested_max_chars, MAX_SCAN_CHARS)
+        try:
+            handle = os.fdopen(file_fd, "r", encoding="utf-8", errors="strict")
+        except (OSError, UnicodeError) as exc:
+            os.close(file_fd)
+            logger.warning("Honcho curated context read failed: %s", exc)
+            return ""
+        try:
+            with handle:
+                text = handle.read(max_chars + 1)
+        except (OSError, UnicodeError) as exc:
+            logger.warning("Honcho curated context read failed: %s", exc)
+            return ""
+        if requested_max_chars > MAX_SCAN_CHARS and len(text) > MAX_SCAN_CHARS:
+            logger.warning(
+                "Honcho curated context exceeds the strict scanner limit of %d characters",
+                MAX_SCAN_CHARS,
+            )
+            return ""
+        truncated = len(text) > max_chars
+        text = sanitize_context(text[:max_chars]).strip()
+        if not text:
+            return ""
+        findings = scan_for_threats(text, scope="strict")
+        if findings:
+            logger.warning(
+                "Honcho curated context blocked by security scan: %s",
+                ", ".join(findings),
+            )
+            return ""
+        suffix = " …" if truncated else ""
+        return f"## Curated Memory Cache\n{text}{suffix}"
+
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
 
@@ -644,14 +793,20 @@ class HonchoMemoryProvider(MemoryProvider):
                 "managed automatically."
             )
         elif self._recall_mode == "tools":
+            injection_note = (
+                " A configured curated base-context file is injected automatically; "
+                "raw Honcho context still requires tools."
+                if self._curated_context_configured()
+                else " No automatic context injection — you must use tools to access memory."
+            )
             header = (
                 "# Honcho Memory\n"
                 "Active (tools-only mode). Use honcho_profile for a quick factual snapshot, "
                 "honcho_search for raw excerpts, honcho_context for raw peer context, "
                 "honcho_reasoning for synthesized answers (pass reasoning_level "
                 "minimal/low/medium/high/max — you pick the depth per call), "
-                "honcho_conclude to save facts about the user. "
-                "No automatic context injection — you must use tools to access memory."
+                "honcho_conclude to save facts about the user."
+                + injection_note
             )
         else:  # hybrid
             header = (
@@ -673,14 +828,25 @@ class HonchoMemoryProvider(MemoryProvider):
         1. Base context from peer.context() — cached, refreshed on context_cadence
         2. Dialectic supplement — cached, refreshed on dialectic_cadence
 
-        Returns empty in tools-only mode and respects the configured injection
-        frequency and context budget.
+        A configured curated file replaces raw Honcho base context. It is also
+        the explicit opt-in exception to tools-only mode's no-injection rule.
         """
         if self._cron_skipped:
             return ""
 
-        # Tools-only mode has no automatic injection.
+        curated_configured = self._curated_context_configured()
+
+        # Tools-only mode never injects raw Honcho context. A curated file is an
+        # explicit, bounded opt-in that does not require a remote session.
         if self._recall_mode == "tools":
+            if not curated_configured or self._is_trivial_prompt(query):
+                return ""
+            if self._curated_context_was_injected():
+                return ""
+            curated = self._load_curated_base_context()
+            if curated:
+                self._mark_curated_context_injected()
+                return self._truncate_to_budget(curated)
             return ""
 
         first_turn_base_deadline = None
@@ -703,9 +869,12 @@ class HonchoMemoryProvider(MemoryProvider):
             if not self._session_ready():
                 return ""
 
-        # First-turn mode suppresses only the base layer; dialectic is independent.
+        # Curated base context is static and persisted in replay, so inject it
+        # once per session. Raw context retains its configured frequency.
         _skip_base = (
-            self._injection_frequency == "first-turn" and self._turn_count > 1
+            self._curated_context_was_injected()
+            if curated_configured
+            else self._injection_frequency == "first-turn" and self._turn_count > 1
         )
 
         # Trivial turns start no work, but may consume a ready pending result.
@@ -716,7 +885,12 @@ class HonchoMemoryProvider(MemoryProvider):
         parts = []
 
         # ----- Layer 1: Base context (representation + card) -----
-        if not _skip_base:
+        if curated_configured and not _skip_base:
+            curated = self._load_curated_base_context()
+            if curated:
+                parts.append(curated)
+                self._mark_curated_context_injected()
+        if not curated_configured and not _skip_base:
             # The first base fetch gets the remaining turn-1 budget. Later
             # refreshes are consumed asynchronously.
             with self._base_context_lock:
@@ -881,6 +1055,26 @@ class HonchoMemoryProvider(MemoryProvider):
             truncated = truncated[:last_space]
         return truncated + " …"
 
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Track curated injection across resets, branches, and replay."""
+        inherited = self._curated_context_was_injected()
+        self._curated_session_key = new_session_id or self._curated_session_key
+        if reset:
+            self._curated_context_injected = False
+            if self._curated_session_key:
+                with _CURATED_CONTEXT_SESSION_LOCK:
+                    _CURATED_CONTEXT_SESSION_KEYS.pop(self._curated_session_key, None)
+        elif inherited:
+            self._mark_curated_context_injected()
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Fire background prefetch threads for the upcoming turn.
 
@@ -905,7 +1099,11 @@ class HonchoMemoryProvider(MemoryProvider):
             self._context_cadence <= 1
             or (self._turn_count - self._last_context_turn) >= self._context_cadence
         )
-        if self._injection_frequency != "first-turn" and context_due:
+        if (
+            not self._curated_context_configured()
+            and self._injection_frequency != "first-turn"
+            and context_due
+        ):
             self._last_context_turn = self._turn_count
             try:
                 self._manager.prefetch_context(self._session_key, query)

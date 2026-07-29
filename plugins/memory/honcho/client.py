@@ -164,6 +164,12 @@ def _parse_int_config(host_val, root_val, default: int) -> int:
     return default
 
 
+def _parse_positive_int_config(host_val, root_val, default: int) -> int:
+    """Parse a strictly positive integer, falling back to default."""
+    value = _parse_int_config(host_val, root_val, default)
+    return value if value > 0 else default
+
+
 def _parse_float_config(host_val, root_val, default: float) -> float:
     """Parse a float config: host wins, then root, then default. Clamped ≥ 0."""
     for val in (host_val, root_val):
@@ -392,6 +398,10 @@ class HonchoClientConfig:
     write_frequency: str | int = "async"
     # Prefetch budget (None = no cap; set to an integer to bound auto-injected context)
     context_tokens: int | None = None
+    # Optional file-backed replacement for Honcho's base context. Paths are
+    # confined to HERMES_HOME by the provider before reading.
+    curated_context_path: str | None = None
+    curated_context_tokens: int = 1000
     # Dialectic (peer.chat) settings
     # reasoning_level: "minimal" | "low" | "medium" | "high" | "max"
     dialectic_reasoning_level: str = "low"
@@ -624,6 +634,14 @@ class HonchoClientConfig:
             context_tokens=_parse_context_tokens(
                 host_block.get("contextTokens"),
                 raw.get("contextTokens"),
+            ),
+            curated_context_path=(
+                _parse_optional_string(host_block, raw, "curatedContextPath") or None
+            ),
+            curated_context_tokens=_parse_positive_int_config(
+                host_block.get("curatedContextTokens"),
+                raw.get("curatedContextTokens"),
+                default=1000,
             ),
             dialectic_reasoning_level=(
                 host_block.get("dialecticReasoningLevel")

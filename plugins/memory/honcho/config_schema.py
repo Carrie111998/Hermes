@@ -291,6 +291,25 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Recall",
         ),
         ProviderField(
+            key="curatedContextPath",
+            label="Curated base context path",
+            kind=KIND_TEXT,
+            description=(
+                "Optional Markdown file under HERMES_HOME/memory that replaces raw Honcho "
+                "base context after strict security scanning."
+            ),
+            placeholder="memory/honcho_curated_context.md",
+            group="Recall",
+        ),
+        ProviderField(
+            key="curatedContextTokens",
+            label="Curated context token cap",
+            kind=KIND_NUMBER,
+            default="1000",
+            description="Hard cap for the curated base-context file.",
+            group="Recall",
+        ),
+        ProviderField(
             key="initOnSessionStart",
             label="Eager init",
             kind=KIND_BOOL,
