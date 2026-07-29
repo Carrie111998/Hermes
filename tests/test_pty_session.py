@@ -85,7 +85,7 @@ async def test_attach_replays_buffer_then_streams_live():
 @pytest.mark.asyncio
 async def test_detach_keeps_draining_into_buffer():
     from hermes_cli.pty_session import PtySession
-    bridge = FakeBridge([b"one", b"", b"two"])
+    bridge = FakeBridge([b"one", b"two"])
     s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
     await s.start()
     ws = FakeWS()
