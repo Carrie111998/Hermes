@@ -897,6 +897,34 @@ class TelegramAdapter(BasePlatformAdapter):
             return {}
         return {"disable_notification": True}
 
+    @staticmethod
+    def _session_owner_id(
+        session_key: str,
+        *,
+        chat_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the user a session belongs to, or None if it is shared.
+
+        ``build_session_key`` appends the participant id last for per-user
+        sessions (``<ns>:telegram:group:<chat_id>[:<thread_id>]:<user_id>``)
+        but omits it for sessions that are shared by design — forum topics
+        with ``thread_sessions_per_user`` off, and DMs, whose trailing
+        component is the chat/thread id instead. Since the callback carries
+        the chat and thread ids, a trailing component that is neither of them
+        is the owning participant; anything else means "no single owner", and
+        the caller keeps the plain allowlist check.
+        """
+        parts = [p for p in str(session_key or "").split(":") if p]
+        if len(parts) < 4:
+            return None
+        last = parts[-1]
+        if chat_id is not None and last == str(chat_id):
+            return None
+        if thread_id is not None and last == str(thread_id):
+            return None
+        return last
+
     def _is_callback_user_authorized(
         self,
         user_id: str,
@@ -6263,6 +6291,35 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
+                session_key = self._approval_state.get(approval_id)
+                if not session_key:
+                    await query.answer(text="This approval has already been resolved.")
+                    return
+
+                # Being allowed to talk to the bot is not the same as owning
+                # this approval. In a group the allowlist admits every member
+                # (and a chat-scoped allowlist admits them without listing any
+                # user at all), so without an owner check any bystander could
+                # tap "Allow Always" on someone else's dangerous command —
+                # running it AND writing it into the permanent allowlist. Mirrors
+                # qqbot's _is_authorized_interaction_for_session.
+                owner_id = self._session_owner_id(
+                    session_key,
+                    chat_id=query_chat_id,
+                    thread_id=query_thread_id,
+                )
+                if owner_id is not None and owner_id != caller_id:
+                    logger.warning(
+                        "[%s] Rejected approval tap from %s on session owned by %s",
+                        self.name, caller_id, owner_id,
+                    )
+                    await query.answer(
+                        text="⛔ Only the user who triggered this command can answer it."
+                    )
+                    return
+
+                # Claim the approval only once the tap is fully authorized, so a
+                # rejected tap cannot consume the prompt for its rightful owner.
                 session_key = self._approval_state.pop(approval_id, None)
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
