@@ -7042,6 +7042,12 @@ def _scan_dashboard_processes(
 
     Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
     """
+    # Shell loop keywords that indicate a supervisor/respawn wrapper rather
+    # than a direct ``hermes dashboard`` invocation.  Wrappers like
+    # ``bash -lc "while true; do hermes dashboard …; sleep 3; done"``
+    # contain the substring "hermes dashboard" but should NOT be killed —
+    # killing the wrapper destroys the supervisor itself (#73379).
+    _LOOP_INDICATORS = ("while true", "while :", "until ", "; do ")
     patterns = [
         "hermes dashboard",
         "hermes_cli.main dashboard",
@@ -7090,6 +7096,7 @@ def _scan_dashboard_processes(
                     pid_str = line[len("ProcessId=") :]
                     if (
                         any(p in current_cmd for p in patterns)
+                        and not any(kw in current_cmd.lower() for kw in _LOOP_INDICATORS)
                         and int(pid_str) != self_pid
                     ):
                         try:
@@ -7123,6 +7130,10 @@ def _scan_dashboard_processes(
                         continue
                     command = parts[1]
                     if any(p in command for p in patterns) and pid != self_pid:
+                        # Skip supervisor/respawn wrappers (#73379).
+                        cmd_lower = command.lower()
+                        if any(kw in cmd_lower for kw in _LOOP_INDICATORS):
+                            continue
                         dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -7802,14 +7813,33 @@ def _kill_stale_dashboard_processes(
     pid_cgroup: dict[int, str | None] = {}
     pid_service: dict[int, str | None] = {}
     pid_cmdline: dict[int, list[str]] = {}
+    pid_ppid: dict[int, int] = {}
     if restart_managed and sys.platform != "win32":
         for pid in pids:
             cg_path = _get_pid_cgroup_path(pid)
             pid_cgroup[pid] = cg_path
             pid_service[pid] = _get_systemd_service_for_pid(pid)
+            # Snapshot the parent PID so we can skip respawning processes
+            # that are supervised by something other than systemd (tmux,
+            # supervisord, runit, etc.).  If PPID != 1 the supervisor will
+            # handle the restart; respawning with start_new_session=True
+            # would detach the child from its supervisor (#73379).
+            try:
+                with open(f"/proc/{pid}/status", encoding="utf-8") as _f:
+                    for _line in _f:
+                        if _line.startswith("PPid:"):
+                            pid_ppid[pid] = int(_line.split()[1])
+                            break
+            except (OSError, IndexError, ValueError):
+                pass
             if not pid_service[pid]:
                 # Manually-started process: preserve its exact argv so we
                 # can respawn it after the update (#40449, #68934).
+                # But skip if the process has a living parent (PPID != 1) —
+                # the supervisor will restart it, and detaching would orphan
+                # it outside its original supervision scope (#73379).
+                if pid_ppid.get(pid, 1) != 1:
+                    continue
                 cmdline = _dashboard_cmdline_for_pid(pid)
                 if cmdline:
                     pid_cmdline[pid] = cmdline
