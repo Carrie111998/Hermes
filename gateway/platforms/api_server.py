@@ -1946,6 +1946,35 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
+    def _resolve_session_tip(self, session_id: Optional[str]) -> Optional[str]:
+        """Follow a compression-continuation chain to its live tip.
+
+        Context compression ends the active session and continues in a new
+        child session.  Resident platforms (Discord, TUI) pick up the rotated
+        id in memory, but stateless API clients re-supply the original
+        ``session_id`` on every request; resuming the ended parent forks a
+        fresh lineage on every turn (#44004).  Best-effort: any failure
+        returns the id unchanged.
+
+        Synchronous (uses ``_ensure_session_db``, not the async variant) so it
+        can be called from the request path without an await — the lookup is a
+        single indexed walk over an already-open connection.
+        """
+        if not session_id:
+            return session_id
+        try:
+            db = self._ensure_session_db()
+            if db is None:
+                return session_id
+            resolved = db.get_compression_tip(session_id)
+        except Exception as e:
+            logger.debug("Compression-tip resolution failed for %s: %s", session_id, e)
+            return session_id
+        if isinstance(resolved, str) and resolved and resolved != session_id:
+            logger.debug("Resolved session %s -> compression tip %s", session_id, resolved)
+            return resolved
+        return session_id
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
