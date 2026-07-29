@@ -118,6 +118,13 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_key_map(raw_key_map: object) -> dict[str, str]:
+    """Return a stable string-to-string Bitwarden alias map from config."""
+    if not isinstance(raw_key_map, dict):
+        return {}
+    return {str(source): str(target) for source, target in raw_key_map.items()}
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     console = Console()
     console.print(
@@ -179,6 +186,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     secrets_cfg = (cfg.setdefault("secrets", {})
                      .setdefault("bitwarden", {}))
     token_env = secrets_cfg.get("access_token_env", "BWS_ACCESS_TOKEN")
+    key_map = _normalize_key_map(secrets_cfg.get("key_map"))
 
     token = (args.access_token or "").strip()
     if not token:
@@ -261,6 +269,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             binary=binary,
             use_cache=False,
             server_url=server_url,
+            key_map=key_map,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"  [red]✗ Fetch failed: {exc}[/red]")
@@ -470,6 +479,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         return 1
 
     server_url = str(bw_cfg.get("server_url", "") or "").strip()
+    key_map = _normalize_key_map(bw_cfg.get("key_map"))
 
     try:
         secrets, warnings = bw.fetch_bitwarden_secrets(
@@ -477,6 +487,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             project_id=project_id,
             use_cache=False,
             server_url=server_url,
+            key_map=key_map,
         )
     except Exception as exc:  # noqa: BLE001
         console.print(f"[red]Fetch failed: {exc}[/red]")

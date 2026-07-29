@@ -309,6 +309,55 @@ def test_fetch_skips_invalid_env_names(monkeypatch, tmp_path):
     assert len(warnings) == 3
 
 
+def test_fetch_maps_human_secret_name_to_env_var(monkeypatch, tmp_path):
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([
+        {"key": "AcqLens Test Login", "value": "opaque-secret"},
+        {"key": "still invalid", "value": "ignored"},
+    ])
+    monkeypatch.setattr(
+        bw.subprocess,
+        "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+
+    secrets, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        use_cache=False,
+        key_map={"AcqLens Test Login": "ACQLENS_TEST_LOGIN"},
+    )
+
+    assert secrets == {"ACQLENS_TEST_LOGIN": "opaque-secret"}
+    assert warnings == ["Skipping secret 'still invalid': not a valid env-var name"]
+
+
+def test_fetch_rejects_invalid_mapped_env_name(monkeypatch, tmp_path):
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "Friendly Name", "value": "opaque"}])
+    monkeypatch.setattr(
+        bw.subprocess,
+        "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+
+    secrets, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        use_cache=False,
+        key_map={"Friendly Name": "not-valid"},
+    )
+
+    assert secrets == {}
+    assert warnings == [
+        "Skipping secret 'Friendly Name': mapped env-var name 'not-valid' is invalid"
+    ]
+
+
 def test_fetch_auth_failure(monkeypatch, tmp_path):
     fake_binary = tmp_path / "bws"
     fake_binary.write_text("")
@@ -386,6 +435,46 @@ def test_fetch_cache_hits(monkeypatch, tmp_path):
     bw.fetch_bitwarden_secrets(access_token="0.t", project_id="p",
                                 binary=fake_binary, cache_ttl_seconds=60)
     assert call_count["n"] == 1  # cached on second call
+
+
+def test_fetch_key_map_isolates_cache_entries(monkeypatch, tmp_path):
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "Friendly Name", "value": "opaque"}])
+    call_count = {"n": 0}
+
+    def fake_run(*a, **kw):
+        call_count["n"] += 1
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+
+    first, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        cache_ttl_seconds=60,
+        key_map={"Friendly Name": "FIRST_ALIAS"},
+    )
+    second, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        cache_ttl_seconds=60,
+        key_map={"Friendly Name": "SECOND_ALIAS"},
+    )
+    second_cached, _ = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        cache_ttl_seconds=60,
+        key_map={"Friendly Name": "SECOND_ALIAS"},
+    )
+
+    assert first == {"FIRST_ALIAS": "opaque"}
+    assert second == {"SECOND_ALIAS": "opaque"}
+    assert second_cached == second
+    assert call_count["n"] == 2
 
 
 def test_fetch_server_url_sets_env(monkeypatch, tmp_path):

@@ -404,8 +404,12 @@ class TestBitwardenSource:
 
         monkeypatch.setattr(bw, "fetch_bitwarden_secrets", _fake_fetch)
         result = BitwardenSource().fetch(
-            {"enabled": True, "project_id": "proj",
-             "server_url": " https://vault.bitwarden.eu "},
+            {
+                "enabled": True,
+                "project_id": "proj",
+                "server_url": " https://vault.bitwarden.eu ",
+                "key_map": {"Friendly Name": "MY_KEY"},
+            },
             tmp_path,
         )
         assert result.ok
@@ -414,6 +418,35 @@ class TestBitwardenSource:
         assert captured["project_id"] == "proj"
         assert captured["server_url"] == "https://vault.bitwarden.eu"
         assert captured["home_path"] == tmp_path
+        assert captured["key_map"] == {"Friendly Name": "MY_KEY"}
+
+    @pytest.mark.parametrize("raw_key_map", [None, [], "not-a-map", 7])
+    def test_fetch_non_mapping_key_map_is_backward_compatible(
+        self, tmp_path, monkeypatch, raw_key_map
+    ):
+        monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.token")
+        import agent.secret_sources.bitwarden as bw
+
+        monkeypatch.setattr(bw, "find_bws", lambda **kw: Path("/fake/bws"))
+        captured = {}
+
+        def _fake_fetch(**kwargs):
+            captured.update(kwargs)
+            return {}, []
+
+        monkeypatch.setattr(bw, "fetch_bitwarden_secrets", _fake_fetch)
+
+        result = BitwardenSource().fetch(
+            {
+                "enabled": True,
+                "project_id": "proj",
+                "key_map": raw_key_map,
+            },
+            tmp_path,
+        )
+
+        assert result.ok
+        assert captured["key_map"] == {}
 
     def test_fetch_runtime_error_classified(self, tmp_path, monkeypatch):
         monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.token")
