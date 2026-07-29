@@ -516,7 +516,7 @@ class SimplexAdapter(BasePlatformAdapter):
             sender_name = contact.get("localDisplayName", "") or contact.get(
                 "profile", {}
             ).get("displayName", "")
-            chat_id = sender_id
+            chat_id = f"{sender_id}|{sender_name}" if sender_name else sender_id
         elif chat_type == "group":
             group_info = chat_info.get("groupInfo", {}) or {}
             group_id = str(group_info.get("groupId", ""))
@@ -838,7 +838,9 @@ class SimplexAdapter(BasePlatformAdapter):
                 )
                 cmd_str = f"/_send #{chat_id[6:]} json {composed}"
             else:
-                cmd_str = f"@{chat_id} {content}"
+                # chat_id format: "5|人可通_1" — use display name for @ command
+                display_name = chat_id.split("|")[-1] if "|" in chat_id else chat_id
+                cmd_str = f"@{display_name} {content}"
 
             await self._send_ws({"corrId": corr_id, "cmd": cmd_str})
 
@@ -972,7 +974,8 @@ class SimplexAdapter(BasePlatformAdapter):
             group_id = chat_id[6:]
             command = f"/_send #{group_id} json {composed}"
         else:
-            command = f"/_send @{chat_id} json {composed}"
+            numeric_id = chat_id.split("|")[0] if "|" in chat_id else chat_id
+            command = f"/_send @{numeric_id} json {composed}"
 
         result = await self._send_command(command)
         if result is not None:
@@ -1028,7 +1031,8 @@ class SimplexAdapter(BasePlatformAdapter):
             group_id = chat_id[6:]
             command = f"/_send #{group_id} json {composed}"
         else:
-            command = f"/_send @{chat_id} json {composed}"
+            numeric_id = chat_id.split("|")[0] if "|" in chat_id else chat_id
+            command = f"/_send @{numeric_id} json {composed}"
 
         result = await self._send_command(command)
         if result is not None:
@@ -1071,7 +1075,8 @@ class SimplexAdapter(BasePlatformAdapter):
             group_id = chat_id[6:]
             command = f"/_send #{group_id} json {composed}"
         else:
-            command = f"/_send @{chat_id} json {composed}"
+            numeric_id = chat_id.split("|")[0] if "|" in chat_id else chat_id
+            command = f"/_send @{numeric_id} json {composed}"
 
         result = await self._send_command(command)
         if result is not None:
