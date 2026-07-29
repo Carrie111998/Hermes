@@ -123,6 +123,7 @@ class TestStdioPidTracking:
         # Should not raise
         _kill_orphaned_mcp_children()
 
+    @pytest.mark.live_system_guard_bypass
     def test_kill_orphaned_handles_dead_pids(self):
         """_kill_orphaned_mcp_children gracefully handles already-dead PIDs."""
         from tools.mcp_tool import (

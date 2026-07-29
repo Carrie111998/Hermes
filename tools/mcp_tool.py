@@ -2313,10 +2313,14 @@ class MCPServerTask:
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
-                    t.cancel()
                     try:
+                        t.cancel()
                         await t
-                    except (asyncio.CancelledError, Exception):
+                    except RuntimeError:
+                        # Loop already closed during task teardown — nothing
+                        # left to cancel.
+                        pass
+                    except asyncio.CancelledError:
                         pass
 
         if self._shutdown_event.is_set():
@@ -2357,10 +2361,15 @@ class MCPServerTask:
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
-                    t.cancel()
                     try:
+                        t.cancel()
                         await t
-                    except (asyncio.CancelledError, Exception):
+                    except RuntimeError:
+                        # Loop already closed (interpreter/task teardown,
+                        # e.g. GC during provider-switch reload) — nothing
+                        # left to cancel.
+                        pass
+                    except asyncio.CancelledError:
                         pass
         if self._shutdown_event.is_set():
             return "shutdown"
@@ -3502,10 +3511,14 @@ class MCPServerTask:
         finally:
             for task in (shutdown_task, reconnect_task):
                 if not task.done():
-                    task.cancel()
                     try:
+                        task.cancel()
                         await task
-                    except (asyncio.CancelledError, Exception):
+                    except RuntimeError:
+                        # Loop already closed during task teardown — nothing
+                        # left to cancel.
+                        pass
+                    except asyncio.CancelledError:
                         pass
 
 
