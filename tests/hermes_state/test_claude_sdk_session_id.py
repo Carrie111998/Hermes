@@ -72,25 +72,23 @@ def _read_only_db_with_probe_error(tmp_path, monkeypatch, message, sql_needle):
 
     real_connect = sqlite3.connect
 
-    class _ProbeErrorConn:
-        def __init__(self, real):
-            self.__dict__["_real"] = real
+    def _connect_with_probe_error(*args, **kwargs):
+        # A real sqlite3.Connection subclass via the factory kwarg — a plain
+        # object proxy dies in sqlite_safe_read._retrofit_tracking's
+        # __class__ swap (object layout differs from TrackedConnection).
+        base = kwargs.get("factory", sqlite3.Connection)
 
-        def execute(self, sql, *args, **kwargs):
-            if sql_needle in sql:
-                raise sqlite3.OperationalError(message)
-            return self.__dict__["_real"].execute(sql, *args, **kwargs)
+        class _ProbeErrorConnection(base):
+            def execute(self, sql, *eargs, **ekwargs):
+                if sql_needle in sql:
+                    raise sqlite3.OperationalError(message)
+                return super().execute(sql, *eargs, **ekwargs)
 
-        def __getattr__(self, name):
-            return getattr(self.__dict__["_real"], name)
-
-        def __setattr__(self, name, value):
-            setattr(self.__dict__["_real"], name, value)
+        kwargs["factory"] = _ProbeErrorConnection
+        return real_connect(*args, **kwargs)
 
     monkeypatch.setattr(
-        hermes_state.sqlite3,
-        "connect",
-        lambda *args, **kwargs: _ProbeErrorConn(real_connect(*args, **kwargs)),
+        hermes_state.sqlite3, "connect", _connect_with_probe_error
     )
     return SessionDB(db_path=db_path, read_only=True)
 
