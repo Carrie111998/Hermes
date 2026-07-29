@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -2167,6 +2168,7 @@ class _ApprovalEntry:
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
+_gateway_approval_ids: dict[str, tuple[str, _ApprovalEntry]] = {}
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
 
@@ -2191,6 +2193,10 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        for entry in entries:
+            approval_id = entry.data.get("approval_id")
+            if approval_id:
+                _gateway_approval_ids.pop(approval_id, None)
     for entry in entries:
         entry.event.set()
 
@@ -2222,6 +2228,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
             targets = [queue.pop(0)]
         if not queue:
             _gateway_queues.pop(session_key, None)
+        for entry in targets:
+            approval_id = entry.data.get("approval_id")
+            if approval_id:
+                _gateway_approval_ids.pop(approval_id, None)
 
     for entry in targets:
         entry.result = choice
@@ -2229,6 +2239,76 @@ def resolve_gateway_approval(session_key: str, choice: str,
             entry.reason = reason
         entry.event.set()
     return len(targets)
+
+
+def has_gateway_approval_id(approval_id: str) -> bool:
+    """Return whether an addressable approval is still pending."""
+    with _lock:
+        return approval_id in _gateway_approval_ids
+
+
+def bind_gateway_approval_recipient(
+    approval_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Bind an addressable approval to the chat where its prompt is delivered."""
+    with _lock:
+        target = _gateway_approval_ids.get(approval_id)
+        if target is None:
+            return False
+        target[1].data["approval_recipient"] = {
+            "platform": str(platform or ""),
+            "chat_id": str(chat_id or ""),
+            "thread_id": str(thread_id or ""),
+        }
+        return True
+
+
+def gateway_approval_recipient_matches(
+    approval_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Return whether *approval_id* was delivered to this command surface."""
+    with _lock:
+        target = _gateway_approval_ids.get(approval_id)
+        if target is None:
+            return False
+        recipient = target[1].data.get("approval_recipient")
+        if not isinstance(recipient, dict):
+            return False
+        return recipient == {
+            "platform": str(platform or ""),
+            "chat_id": str(chat_id or ""),
+            "thread_id": str(thread_id or ""),
+        }
+
+
+def resolve_gateway_approval_by_id(
+    approval_id: str,
+    choice: str,
+    *,
+    reason: Optional[str] = None,
+) -> int:
+    """Resolve one pending approval from any authorized gateway session."""
+    with _lock:
+        target = _gateway_approval_ids.pop(approval_id, None)
+        if target is None:
+            return 0
+        session_key, entry = target
+        queue = _gateway_queues.get(session_key, [])
+        if entry in queue:
+            queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+    entry.result = choice
+    if reason:
+        entry.reason = reason
+    entry.event.set()
+    return 1
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -2274,6 +2354,10 @@ def clear_session(session_key: str) -> None:
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        for entry in entries:
+            approval_id = entry.data.get("approval_id")
+            if approval_id:
+                _gateway_approval_ids.pop(approval_id, None)
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.
@@ -3237,15 +3321,21 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
+    approval_data = dict(approval_data)
+    approval_data.setdefault("approval_id", secrets.token_hex(8))
     entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
+        _gateway_approval_ids[approval_data["approval_id"]] = (session_key, entry)
 
     def _drop_entry() -> None:
         with _lock:
             queue = _gateway_queues.get(session_key, [])
             if entry in queue:
                 queue.remove(entry)
+            approval_id = entry.data.get("approval_id")
+            if approval_id:
+                _gateway_approval_ids.pop(approval_id, None)
             if not queue:
                 _gateway_queues.pop(session_key, None)
 

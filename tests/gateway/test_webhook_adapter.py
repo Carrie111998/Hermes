@@ -1608,6 +1608,26 @@ class TestDeliverCrossPlatformThreadId:
             "12345", "hello", metadata=None
         )
 
+    def test_approval_delivery_context_uses_forwarded_platform_prefix(self):
+        """Approval instructions must use the destination adapter's alias."""
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        mock_target.typed_command_prefix = "!"
+        getattr(adapter.gateway_runner, "adapters")[Platform("slack")] = mock_target
+        chat_id = "webhook:test:d-prefix"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "slack",
+            "deliver_extra": {"chat_id": "C1", "thread_id": "T1"},
+        }
+
+        context = adapter.approval_delivery_context(chat_id)
+
+        assert context == {
+            "platform": "slack",
+            "chat_id": "C1",
+            "thread_id": "T1",
+            "typed_command_prefix": "!",
+        }
+
 
 class TestInsecureNoAuthSafetyRail:
     """connect() refuses to start when INSECURE_NO_AUTH is combined with a

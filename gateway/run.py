@@ -477,6 +477,7 @@ def _format_exec_approval_fallback(
     description: str,
     command_prefix: str,
     *,
+    approval_id: str | None = None,
     allow_permanent: bool = True,
     allow_session: bool = True,
     smart_denied: bool = False,
@@ -487,14 +488,20 @@ def _format_exec_approval_fallback(
     if smart_denied:
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
-    choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
+    approve_target = (
+        f"{command_prefix}approve {approval_id}"
+        if approval_id
+        else f"{command_prefix}approve"
+    )
+    choices = [f"Reply `{approve_target}` to execute this one operation"]
     if not smart_denied and allow_session:
         choices.append(
-            f"`{command_prefix}approve session` to approve this pattern for the session"
+            f"`{approve_target} session` to approve this pattern for the session"
         )
         if allow_permanent:
-            choices.append(f"`{command_prefix}approve always` to approve permanently")
-    choices.append(f"`{command_prefix}deny` to cancel")
+            choices.append(f"`{approve_target} always` to approve permanently")
+    deny_target = f"{command_prefix}deny {approval_id}" if approval_id else f"{command_prefix}deny"
+    choices.append(f"`{deny_target}` to cancel")
     return (
         f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
         + ", ".join(choices[:-1]) + f", or {choices[-1]}."
@@ -22686,6 +22693,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # The callback bridges sync→async to send the approval request
             # to the user immediately.
             from tools.approval import (
+                bind_gateway_approval_recipient,
                 register_gateway_notify,
                 reset_current_session_key,
                 set_current_session_key,
@@ -22711,6 +22719,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                approval_id = approval_data.get("approval_id")
+                approval_context = {
+                    "platform": source.platform.value,
+                    "chat_id": str(_status_chat_id or ""),
+                    "thread_id": str(getattr(source, "thread_id", None) or ""),
+                    "typed_command_prefix": getattr(
+                        _status_adapter, "typed_command_prefix", "/"
+                    ),
+                }
+                context_resolver = getattr(
+                    _status_adapter, "approval_delivery_context", None
+                )
+                if callable(context_resolver):
+                    resolved_context = context_resolver(_status_chat_id)
+                    if isinstance(resolved_context, dict):
+                        approval_context.update(resolved_context)
+                _p = str(approval_context.get("typed_command_prefix") or "/")
+                interactive_desc = desc
+                if approval_id:
+                    bind_gateway_approval_recipient(
+                        approval_id,
+                        str(approval_context.get("platform") or ""),
+                        str(approval_context.get("chat_id") or ""),
+                        str(approval_context.get("thread_id") or ""),
+                    )
+                    interactive_desc += (
+                        f"\n\nIf buttons are unavailable, reply "
+                        f"`{_p}approve {approval_id}` or `{_p}deny {approval_id}`."
+                    )
 
                 # Redact credentials from the command before displaying it in
                 # the approval prompt — Tirith's findings are already redacted,
@@ -22730,7 +22767,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=_status_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
-                                description=desc,
+                                description=interactive_desc,
                                 metadata=_status_thread_metadata,
                                 allow_permanent=approval_data.get("allow_permanent", True),
                                 allow_session=approval_data.get("allow_session", True),
@@ -22758,11 +22795,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # typed prefix so Slack/Matrix users are told the form they
                 # can actually type (`!approve`) — typed "/" is blocked in
                 # Slack threads and reserved by Matrix clients.
-                _p = getattr(_status_adapter, "typed_command_prefix", "/")
                 msg = _format_exec_approval_fallback(
                     cmd,
                     desc,
                     _p,
+                    approval_id=approval_id,
                     allow_permanent=approval_data.get("allow_permanent", True),
                     allow_session=approval_data.get("allow_session", True),
                     smart_denied=approval_data.get("smart_denied", False),

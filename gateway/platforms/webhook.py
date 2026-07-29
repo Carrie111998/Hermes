@@ -463,6 +463,51 @@ class WebhookAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
+    def approval_delivery_context(self, chat_id: str) -> Dict[str, str]:
+        """Describe the actual chat receiving an approval forwarded by this webhook."""
+        delivery = self._delivery_info.get(chat_id, {})
+        platform_name = str(delivery.get("deliver", "webhook"))
+        context = {
+            "platform": "webhook",
+            "chat_id": str(chat_id or ""),
+            "thread_id": "",
+            "typed_command_prefix": self.typed_command_prefix,
+        }
+        try:
+            target_platform = Platform(platform_name)
+        except ValueError:
+            return context
+        if not self.gateway_runner:
+            return context
+
+        adapter = self.gateway_runner.adapters.get(target_platform)
+        if not adapter:
+            for adapter_map in (
+                getattr(self.gateway_runner, "_profile_adapters", None) or {}
+            ).values():
+                if isinstance(adapter_map, dict) and adapter_map.get(target_platform):
+                    adapter = adapter_map[target_platform]
+                    break
+        if not adapter:
+            return context
+
+        extra = delivery.get("deliver_extra", {})
+        target_chat_id = extra.get("chat_id", "")
+        if not target_chat_id:
+            home = self.gateway_runner.config.get_home_channel(target_platform)
+            target_chat_id = home.chat_id if home else ""
+        if not target_chat_id:
+            return context
+
+        return {
+            "platform": target_platform.value,
+            "chat_id": str(target_chat_id),
+            "thread_id": str(
+                extra.get("message_thread_id") or extra.get("thread_id") or ""
+            ),
+            "typed_command_prefix": getattr(adapter, "typed_command_prefix", "/"),
+        }
+
     # ------------------------------------------------------------------
     # HTTP handlers
     # ------------------------------------------------------------------

@@ -5235,19 +5235,42 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, resolve_gateway_approval_by_id,
+            has_blocking_approval, gateway_approval_recipient_matches,
         )
 
-        if not has_blocking_approval(session_key):
+        # Addressable approval ids let an operator answer from the delivery
+        # session when the guarded run belongs to a different session (e.g.
+        # webhook -> Telegram). Bare /approve retains same-session semantics.
+        args = event.get_command_args().strip().lower().split()
+        approval_id_candidate = (
+            args[0]
+            if args and len(args[0]) == 16
+            and all(c in "0123456789abcdef" for c in args[0])
+            else None
+        )
+        approval_id = (
+            approval_id_candidate
+            if approval_id_candidate and gateway_approval_recipient_matches(
+                approval_id_candidate,
+                source.platform.value,
+                source.chat_id,
+                getattr(source, "thread_id", None),
+            )
+            else None
+        )
+        has_pending = (
+            True if approval_id else has_blocking_approval(session_key)
+        )
+        if not has_pending:
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.approval_expired")
             return t("gateway.approve.no_pending")
 
         # Parse args: support "all", "all session", "all always", "session", "always"
-        args = event.get_command_args().strip().lower().split()
         resolve_all = "all" in args
-        remaining = [a for a in args if a != "all"]
+        remaining = [a for a in args if a != "all" and a != approval_id]
 
         if any(a in {"always", "permanent", "permanently"} for a in remaining):
             choice = "always"
@@ -5256,7 +5279,10 @@ class GatewaySlashCommandsMixin:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        if approval_id:
+            count = resolve_gateway_approval_by_id(approval_id, choice)
+        else:
+            count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -5284,10 +5310,34 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, resolve_gateway_approval_by_id,
+            has_blocking_approval, gateway_approval_recipient_matches,
         )
 
-        if not has_blocking_approval(session_key):
+        # A 16-character hex token is an addressable approval id; other
+        # text remains a legacy free-form deny reason.
+        raw_args = event.get_command_args().strip()
+        tokens = raw_args.split()
+        approval_id_candidate = (
+            tokens[0].lower()
+            if tokens and len(tokens[0]) == 16
+            and all(c in "0123456789abcdef" for c in tokens[0].lower())
+            else None
+        )
+        approval_id = (
+            approval_id_candidate
+            if approval_id_candidate and gateway_approval_recipient_matches(
+                approval_id_candidate,
+                source.platform.value,
+                source.chat_id,
+                getattr(source, "thread_id", None),
+            )
+            else None
+        )
+        has_pending = (
+            True if approval_id else has_blocking_approval(session_key)
+        )
+        if not has_pending:
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.deny.stale")
@@ -5296,10 +5346,10 @@ class GatewaySlashCommandsMixin:
         # Parse args: a leading "all" token denies every pending command;
         # anything after it (or the whole arg string when "all" is absent) is
         # captured verbatim as the optional deny reason relayed to the agent.
-        raw_args = event.get_command_args().strip()
-        tokens = raw_args.split()
         resolve_all = bool(tokens) and tokens[0].lower() == "all"
-        if resolve_all:
+        if approval_id:
+            reason = " ".join(tokens[1:]).strip()
+        elif resolve_all:
             reason = raw_args[len(tokens[0]):].strip()
         else:
             reason = raw_args
@@ -5307,10 +5357,15 @@ class GatewaySlashCommandsMixin:
         if reason:
             reason = reason[:280].strip()
 
-        count = resolve_gateway_approval(
-            session_key, "deny", resolve_all=resolve_all,
-            reason=reason or None,
-        )
+        if approval_id:
+            count = resolve_gateway_approval_by_id(
+                approval_id, "deny", reason=reason or None,
+            )
+        else:
+            count = resolve_gateway_approval(
+                session_key, "deny", resolve_all=resolve_all,
+                reason=reason or None,
+            )
         if not count:
             return t("gateway.deny.no_pending")
 

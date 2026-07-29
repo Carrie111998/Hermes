@@ -70,6 +70,7 @@ def _clear_approval_state():
     """Reset all module-level approval state between tests."""
     from tools import approval as mod
     mod._gateway_queues.clear()
+    mod._gateway_approval_ids.clear()
     mod._gateway_notify_cbs.clear()
     mod._session_approved.clear()
     mod._permanent_approved.clear()
@@ -261,6 +262,90 @@ class TestApproveCommand:
         assert "No pending command" in result
 
     @pytest.mark.asyncio
+    async def test_approve_id_resolves_cross_session_approval(self, monkeypatch):
+        from tools import approval as approval_mod
+
+        monkeypatch.setattr(approval_mod, "_get_approval_timeout", lambda: 2)
+        runner = _make_runner()
+        notified = []
+        result_holder = {}
+
+        def _notify(data):
+            approval_mod.bind_gateway_approval_recipient(
+                data["approval_id"], "telegram", "c1"
+            )
+            notified.append(data)
+
+        def _wait_for_decision():
+            result_holder["decision"] = approval_mod._await_gateway_decision(
+                "webhook:route:delivery-1",
+                _notify,
+                {
+                    "command": "rm -rf .git",
+                    "description": "recursive delete",
+                    "pattern_key": "rm_recursive",
+                },
+            )
+
+        t = threading.Thread(target=_wait_for_decision)
+        t.start()
+        for _ in range(50):
+            if notified:
+                break
+            time.sleep(0.02)
+        assert notified
+        approval_id = notified[0]["approval_id"]
+
+        result = await runner._handle_approve_command(
+            _make_event(f"/approve {approval_id}")
+        )
+        t.join(timeout=5)
+
+        assert result is not None
+        assert "approved" in result.lower()
+        assert result_holder["decision"]["resolved"] is True
+        assert result_holder["decision"]["choice"] == "once"
+
+    @pytest.mark.asyncio
+    async def test_approve_unknown_arg_keeps_legacy_same_session_behavior(self):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        session_key = runner._session_key_for_source(_make_source())
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        await runner._handle_approve_command(_make_event("/approve nonsense"))
+
+        assert entry.result == "once"
+        assert entry.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_approve_id_rejects_a_different_delivery_chat(self):
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_approval_ids,
+            _gateway_queues,
+            bind_gateway_approval_recipient,
+        )
+
+        runner = _make_runner()
+        origin_key = "webhook:route:delivery-other"
+        approval_id = "0123456789abcdef"
+        entry = _ApprovalEntry({"command": "test", "approval_id": approval_id})
+        _gateway_queues[origin_key] = [entry]
+        _gateway_approval_ids[approval_id] = (origin_key, entry)
+        bind_gateway_approval_recipient(approval_id, "telegram", "another-chat")
+
+        result = await runner._handle_approve_command(
+            _make_event(f"/approve {approval_id}")
+        )
+
+        assert result is not None
+        assert "No pending command" in result
+        assert not entry.event.is_set()
+
+    @pytest.mark.asyncio
     async def test_approve_stale_old_style_pending(self):
         """Old-style _pending_approvals without blocking event reports expired."""
         runner = _make_runner()
@@ -299,6 +384,33 @@ class TestDenyCommand:
         assert "denied" in result.lower()
         assert entry.event.is_set()
         assert entry.result == "deny"
+
+    @pytest.mark.asyncio
+    async def test_deny_id_resolves_cross_session_approval_with_reason(self):
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_approval_ids,
+            _gateway_queues,
+            bind_gateway_approval_recipient,
+        )
+
+        runner = _make_runner()
+        origin_key = "webhook:route:delivery-2"
+        entry = _ApprovalEntry({"command": "test", "approval_id": "deadbeefcafefeed"})
+        _gateway_queues[origin_key] = [entry]
+        _gateway_approval_ids["deadbeefcafefeed"] = (origin_key, entry)
+        bind_gateway_approval_recipient("deadbeefcafefeed", "telegram", "c1")
+
+        result = await runner._handle_deny_command(
+            _make_event("/deny deadbeefcafefeed not authorized")
+        )
+
+        assert result is not None
+        assert "denied" in result.lower()
+        assert entry.result == "deny"
+        assert entry.reason == "not authorized"
+        assert entry.event.is_set()
+        assert origin_key not in _gateway_queues
 
     @pytest.mark.asyncio
     async def test_deny_all_resolves_all(self):

@@ -2287,6 +2287,7 @@ class TestApprovalTimeoutIsNotConsent:
         """Reset module state and force a tight approval timeout for fast tests."""
         from tools import approval as mod
         mod._gateway_queues.clear()
+        mod._gateway_approval_ids.clear()
         mod._gateway_notify_cbs.clear()
         mod._session_approved.clear()
         mod._permanent_approved.clear()
@@ -2310,6 +2311,7 @@ class TestApprovalTimeoutIsNotConsent:
     def teardown_method(self):
         from tools import approval as mod
         mod._gateway_queues.clear()
+        mod._gateway_approval_ids.clear()
         mod._gateway_notify_cbs.clear()
         for k, v in self._saved_env.items():
             if v is None:
@@ -2397,6 +2399,37 @@ class TestApprovalTimeoutIsNotConsent:
         assert "Silence is not consent" not in r["message"]  # this one IS denied, not timed-out
         assert "NOT consented" in r["message"]
         assert "rephrase" in r["message"].lower()
+
+    def test_addressable_approval_can_be_resolved_from_another_session(self, monkeypatch):
+        """Webhook-delivered approvals must not depend on the reply session key."""
+        from tools import approval as mod
+
+        self._force_short_timeout(monkeypatch, seconds=60)
+        notified = []
+        mod.register_gateway_notify("webhook:route:delivery", lambda data: notified.append(data))
+        result_holder = {}
+
+        def _check():
+            token = mod.set_current_session_key("webhook:route:delivery")
+            try:
+                result_holder["r"] = mod.check_all_command_guards(
+                    "rm -rf .git", "local"
+                )
+            finally:
+                mod.reset_current_session_key(token)
+
+        t = threading.Thread(target=_check)
+        t.start()
+        for _ in range(50):
+            if notified:
+                break
+            time.sleep(0.02)
+        assert notified and len(notified[0]["approval_id"]) == 16
+        approval_id = notified[0]["approval_id"]
+        assert mod.resolve_gateway_approval_by_id(approval_id, "once") == 1
+        t.join(timeout=5)
+        assert result_holder["r"]["approved"] is True
+        assert not mod.has_gateway_approval_id(approval_id)
 
     def test_timeout_emits_post_hook_with_timeout_outcome(self, monkeypatch):
         """Plugins must be able to distinguish timeout from explicit deny.
