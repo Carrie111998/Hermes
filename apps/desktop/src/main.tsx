@@ -1,7 +1,7 @@
 import './styles.css'
-// Side-effect: reports in-flight turns to the main process for the quit guard.
+// Side-effects: apply renderer-owned runtime state before the first app render.
 import './store/active-work'
-// Side-effect: applies the persisted window translucency on load.
+import './store/table-layout'
 import './store/translucency'
 // Dev-only render/state churn counters. MUST precede the `react-dom` import
 // below: react-dom captures the devtools hook at module init, so bippy has to
