@@ -190,3 +190,7 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
+
+# Interrupted lazy-refresh breadcrumb written by Hermes recovery.
+# Runtime state only; never source.
+/.lazy-refresh-incomplete
