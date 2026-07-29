@@ -484,6 +484,56 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
 )
 
 
+# ADHD Output Rules — universal conversational-format governance.
+#
+# Source: ayghri/i-have-adhd (MIT). Adopted Jul 26, 2026.
+#
+# Applied to every session by default (agent.adhd_output_rules: true in
+# config.yaml).  These rules shape conversational responses for readability
+# and action-orientation.  They are deliberately generic: they fit any
+# task-oriented turn but do NOT override a session's own explicitly-defined
+# output format (a cron prompt with a detailed format template, a broadcast
+# brief with priority tags, an exact-format example block, etc.).  When
+# the user's instruction or system_message defines a specific output shape,
+# that shape governs.
+#
+# For sessions that produce broadcast-style reports (market briefs, AI news
+# digests, dashboards) and have their own purpose-built format governance,
+# set ``output_style: broadcast`` in the active profile's config.yaml
+# under the ``agent`` section.  This suppresses this block entirely.
+ADHD_OUTPUT_RULES_GUIDANCE = (
+    "# ADHD Output Rules\n"
+    "These rules shape every response.  Break them when the user explicitly "
+    "asks for a different format, or when a prompt-defined format template "
+    "already governs the output shape.\n"
+    "\n"
+    "## The 10 Rules\n"
+    "1. **Lead with next action** — answer first, context last.\n"
+    "2. **Numbered steps for multi-task answers.**\n"
+    "3. **End with one concrete next action** — name ONE thing under 2 minutes.\n"
+    "4. **Suppress tangents** — finish one topic before surfacing another.\n"
+    "5. **Restate state every turn** — \"Step 3/5 done: X. Next: Y.\"\n"
+    "6. **Specific time estimates in minutes.**\n"
+    "7. **Make wins visible** — concrete what-changed, verifiable.\n"
+    "8. **Matter-of-fact errors** — cause + fix. No \"Uh oh.\"\n"
+    "9. **Cap lists at 5** — split do-now vs later.\n"
+    "10. **No preamble, no recap, no closers** — no \"Great question,\" \"Let me,\" "
+    "\"Hope this helps,\" \"Anything else?\"\n"
+    "\n"
+    "## Pre-Send Check\n"
+    "Before sending, delete: (1) first line if it announces what you're about "
+    "to do, (2) last line if \"anything else?\" or recap, (3) any \"by the way\" "
+    "sidebar, (4) any hedging adverb (\"perhaps,\" \"might\"), (5) any idiom "
+    "(\"circle back\"). Then verify first + last line tell reader what to do "
+    "and what happened.\n"
+    "\n"
+    "## Output Style\n"
+    "When ``output_style: broadcast`` is set in the active configuration, "
+    "these rules do not apply — the session produces structured reports "
+    "with their own format governance."
+)
+
+
 # Guidance injected into the system prompt when the computer_use toolset
 # is active. Universal — works for any model (Claude, GPT, open models).
 # Built per-platform via computer_use_guidance() so Windows/Linux hosts

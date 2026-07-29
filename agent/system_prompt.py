@@ -31,6 +31,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    ADHD_OUTPUT_RULES_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -248,6 +249,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # agent has tools. Static text → byte-stable prompt (no cache hit).
     if agent.valid_tool_names:
         stable_parts.append(STEER_CHANNEL_NOTE)
+
+    # ADHD Output Rules — universal conversational-format governance.
+    # Applied by default to ALL sessions (CLI, gateway, cron).
+    # Opt out by setting ``output_style: broadcast`` in the active
+    # config.yaml or (for crons with their own format governance) by
+    # including an explicit format template in the cron prompt.
+    if getattr(agent, "_adhd_output_rules", True) and getattr(agent, "_output_style", "conversational") != "broadcast":
+        stable_parts.append(ADHD_OUTPUT_RULES_GUIDANCE)
 
     # Computer-use — goes in as its own block rather than being merged into
     # tool_guidance because the content is multi-paragraph. The guidance is

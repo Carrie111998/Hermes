@@ -1755,6 +1755,20 @@ def init_agent(
         except Exception:
             pass
 
+    # ADHD Output Rules — universal conversational-format governance.
+    # Default true (applied to ALL conversational sessions).
+    # Set agent.adhd_output_rules: false to disable globally.
+    agent._adhd_output_rules = bool(_agent_section.get("adhd_output_rules", True))
+
+    # Output style — "conversational" (default, applies ADHD rules) or
+    # "broadcast" (skips ADHD rules for structured-report sessions).
+    # Profiles set this in their own config.yaml under the agent section.
+    _output_style_in = _agent_section.get("output_style", "conversational")
+    if isinstance(_output_style_in, str):
+        agent._output_style = _output_style_in.strip().lower()
+    else:
+        agent._output_style = "conversational"
+
     # Per-platform prompt-hint overrides (config.yaml → platform_hints).
     # Lets an enterprise admin append to or replace Hermes' built-in
     # platform hint for a single messaging platform (e.g. WhatsApp) without
