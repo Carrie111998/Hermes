@@ -206,6 +206,10 @@ def test_qualification_prompt_includes_exact_card_and_epic_output_shapes(conn, p
     assert "earliest unfinished phase" in prompt.lower()
     assert "PO PATH ADDITION" in prompt
     assert '"po_evidence":{"run_id":123' in prompt
+    assert '"sizing":{' in prompt
+    assert '"requirement_feasibility":{' in prompt
+    assert '"development_iteration_budget"' in prompt
+    assert "Every binding required_evidence and done_when" in prompt
 
 
 def test_new_epic_requires_valid_story_decomposition(conn, policy):
@@ -437,7 +441,10 @@ def test_hermes_path_validates_without_product_owner_evidence(conn, policy):
     assert "po_evidence" not in validated
 
 
-def test_po_path_requires_real_completed_product_owner_run_and_artifact(conn, policy):
+def test_po_path_requires_real_completed_product_owner_run_and_artifact(
+    conn, policy, monkeypatch
+):
+    monkeypatch.setattr(kb, "resolve_profile_iteration_budget", lambda _profile: 500)
     intake = _intake(conn, attachments=[{"name": "brief.md", "path": "/tmp/brief.md"}])
     with pytest.raises(qualifier.QualificationValidationError, match="Product Owner run"):
         qualifier.validate_decision(
@@ -460,6 +467,7 @@ def test_po_path_requires_real_completed_product_owner_run_and_artifact(conn, po
         (task_id, "Product brief: /tmp/brief.md"),
     )
     run_id = int(cursor.lastrowid)
+    budget = 500
 
     validated = qualifier.validate_decision(
         conn,
@@ -468,10 +476,93 @@ def test_po_path_requires_real_completed_product_owner_run_and_artifact(conn, po
         decision=_decision(
             qualification_path="po",
             po_evidence={"run_id": run_id, "artifact": "/tmp/brief.md"},
+            sizing={
+                "rationale": "The bounded maintenance card fits one budget.",
+                "configured_iteration_budget": budget,
+                "estimated_turns": min(20, budget),
+                "fits_budget": True,
+            },
+            requirement_feasibility={
+                "rationale": "The existing tests provide an achievable path.",
+                "achievable_requirements": [
+                    {"requirement": "tests", "basis": ["Existing test suite"]},
+                    {"requirement": "green", "basis": ["Existing test suite"]},
+                ],
+                "deferred_findings": [],
+            },
         ),
     )
 
     assert validated["po_evidence"]["run_id"] == run_id
+
+    contradictory = json.loads(json.dumps(validated))
+    contradictory["sizing"]["card_estimates"] = [501]
+    with pytest.raises(
+        qualifier.QualificationValidationError,
+        match="must not include Epic card_estimates",
+    ):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=intake,
+            decision=contradictory,
+        )
+
+    advisory_only = _intake(
+        conn,
+        attachments=[
+            {
+                "kind": "handoff_document",
+                "path": "/tmp/advisory-only.md",
+            }
+        ],
+    )
+    advisory_decision = json.loads(json.dumps(validated))
+    advisory_decision["po_evidence"]["artifact"] = "/tmp/advisory-only.md"
+    conn.execute(
+        "UPDATE task_runs SET summary = ? WHERE id = ?",
+        ("Reviewed /tmp/advisory-only.md", run_id),
+    )
+    with pytest.raises(
+        qualifier.QualificationValidationError,
+        match="advisory handoff documents cannot become",
+    ):
+        qualifier.validate_decision(
+            conn,
+            board_metadata=policy,
+            intake=advisory_only,
+            decision=advisory_decision,
+        )
+
+
+def test_po_epic_rejects_conflicting_summary_estimate(policy, monkeypatch):
+    monkeypatch.setattr(kb, "resolve_profile_iteration_budget", lambda _profile: 500)
+    decision = {
+        "work": {"item_kind": "epic"},
+        "stories": [{}, {}],
+        "handover": {"required_evidence": [], "done_when": []},
+        "sizing": {
+            "rationale": "Both cards fit.",
+            "configured_iteration_budget": 500,
+            "estimated_turns": 499,
+            "card_estimates": [20, 30],
+            "fits_budget": True,
+        },
+        "requirement_feasibility": {
+            "rationale": "No binding evidence in this focused check.",
+            "achievable_requirements": [],
+            "deferred_findings": [],
+        },
+    }
+    errors = []
+
+    qualifier._validate_po_budget_and_feasibility(
+        decision,
+        board_metadata=policy,
+        errors=errors,
+    )
+
+    assert errors == ["Epic estimated_turns must equal the largest card estimate"]
 
 
 @pytest.mark.parametrize(
@@ -803,6 +894,80 @@ def test_epic_qualification_materializes_signed_member_stories_and_dependencies(
         assert len(rows) == 3
         assert {row["request_id"] for row in rows} == {receipt["intake_id"]}
         assert all(row["work_contract_id"] for row in rows)
+
+
+def test_auxiliary_po_qualification_persists_sizing_and_feasibility(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    developer = home / "profiles" / "developer"
+    developer.mkdir(parents=True)
+    (developer / "config.yaml").write_text(
+        "agent:\n  max_turns: 500\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    board = "strict-po-auxiliary"
+    kb.ensure_product_board_defaults(board)
+
+    with kb.connect(board=board) as connection:
+        receipt = qualifier.submit_request(
+            connection,
+            request={"title": "Qualified maintenance"},
+            source="work-inbox:test",
+            attachments=({"name": "brief.md", "path": "/tmp/brief.md"},),
+        )
+        run_task_id = kb.create_task(connection, title="PO discovery")
+        cursor = connection.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status, started_at, ended_at, summary
+            ) VALUES (?, 'productowner', 'backlog', 'done', 1, 2, ?)
+            """,
+            (run_task_id, "Product brief: /tmp/brief.md"),
+        )
+        run_id = int(cursor.lastrowid)
+        metadata = kb.read_board_metadata(board)
+        metadata["qualification"]["required"] = True
+        kb.board_metadata_path(board).write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+        decision = _decision(
+            qualification_path="po",
+            po_evidence={"run_id": run_id, "artifact": "/tmp/brief.md"},
+            sizing={
+                "rationale": "The maintenance card fits one Development budget.",
+                "configured_iteration_budget": 500,
+                "estimated_turns": 20,
+                "fits_budget": True,
+            },
+            requirement_feasibility={
+                "rationale": "The current test suite can verify both conditions.",
+                "achievable_requirements": [
+                    {"requirement": "tests", "basis": ["Existing tests"]},
+                    {"requirement": "green", "basis": ["Existing tests"]},
+                ],
+                "deferred_findings": [],
+            },
+        )
+
+        result = qualifier.qualify_intake(
+            connection,
+            board=board,
+            intake_id=receipt["intake_id"],
+            model_call=lambda _prompt: decision,
+            secret=b"test-only-secret",
+            issued_at=100,
+        )
+        assert result["status"] == "qualified", result
+        task = kb.get_task(connection, result["task_id"])
+        contract = kb.get_work_contract(connection, task.work_contract_id)["contract"]
+
+    assert result["status"] == "qualified"
+    assert contract["sizing"]["estimated_turns"] == 20
+    assert contract["requirement_feasibility"]["achievable_requirements"] == [
+        {"requirement": "tests", "basis": ["Existing tests"]},
+        {"requirement": "green", "basis": ["Existing tests"]},
+    ]
 
 
 def test_invalid_model_decision_retries_once_then_stores_rejection_without_card(

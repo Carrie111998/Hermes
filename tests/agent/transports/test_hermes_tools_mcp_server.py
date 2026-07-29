@@ -368,6 +368,8 @@ class TestCapabilitySets:
             "routing",
             "handover",
             "rules",
+            "sizing",
+            "requirement_feasibility",
             "classification",
             "stories",
         }
@@ -376,6 +378,13 @@ class TestCapabilitySets:
             "assignee",
             "epic_id",
             "dependencies",
+        }
+        assert set(
+            proposal["properties"]["requirement_feasibility"]["required"]
+        ) == {
+            "rationale",
+            "achievable_requirements",
+            "deferred_findings",
         }
 
 
