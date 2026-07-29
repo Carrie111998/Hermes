@@ -4722,6 +4722,8 @@ def get_sessions(
             status_code=400,
             detail="order must be one of: created, recent",
         )
+    limit = max(0, limit)
+    offset = max(0, offset)
     profile_name: Optional[str] = None
     if profile:
         profile_name, _ = _cron_profile_home(profile)
@@ -11568,7 +11570,7 @@ async def get_session_messages(
                 return None
             sid = db.resolve_resume_session_id(sid)
             # Clamp limit to prevent abuse (max 500 per page)
-            _limit = min(limit, 500) if limit is not None else None
+            _limit = min(max(limit, 0), 500) if limit is not None else None
             return sid, _limit, db.get_messages(sid, limit=_limit, offset=offset)
         finally:
             db.close()

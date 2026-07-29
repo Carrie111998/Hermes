@@ -112,6 +112,8 @@ def get_profiles_sessions(
     exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
+    limit = max(0, limit)
+    offset = max(0, offset)
     per_profile = min(max(limit + offset, limit), 500)
 
     merged: List[Dict[str, Any]] = []
