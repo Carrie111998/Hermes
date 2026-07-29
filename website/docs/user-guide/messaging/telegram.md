@@ -1279,8 +1279,6 @@ Tap a button to answer, or tap **Other** to type a free-form response (the next 
 
 Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `3600` seconds). If you don't respond within the timeout, the agent unblocks with a sentinel message and adapts rather than hanging.
 
-By default, `agent.clarify_policy` is `interactive`, so every valid clarify call reaches you. Set it to `blockers_only` when you want Hermes to handle a small, strict set of fully local and reversible engineering questions itself. User-only, business, external, unclassified, and high-impact decisions still render an interactive prompt.
-
 ## Push notification volume
 
 Telegram fires a push notification on every message the bot sends. For long agent turns that emit tool-progress bubbles, streaming updates, and status callbacks, this gets noisy fast. The Telegram adapter has two notification modes:

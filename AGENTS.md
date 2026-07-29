@@ -25,6 +25,14 @@ reviewing any change:
   tool we add is sent on every API call, so the bar for a new *core* tool is
   high. Most new capability should arrive as a CLI command + skill, a
   service-gated tool, or a plugin — not as core surface.
+- **The LLM is the only semantic authority.** Runtime code must not interpret
+  natural-language task, message, prompt, question, answer, title, or command
+  text with keywords, regex grammars, cue lists, scores, classifiers, or
+  semantic routers. The model chooses intent, risk, route, and next action.
+  Deterministic code may validate and execute the model's structured choice;
+  it may enforce identity, permissions, schemas, signatures, idempotency,
+  resource bounds, and exact protocol or state-machine invariants. See
+  `docs/design/llm-semantic-authority.md`.
 
 ## Contribution Rubric — What We Want / What We Don't
 

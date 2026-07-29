@@ -29345,36 +29345,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 question: str,
                 choices,
                 multi_select: bool = False,
-                raw_choices=None,
             ) -> str:
                 from tools import clarify_gateway as _clarify_mod
-                from tools.clarify_tool import autonomy_clarify_response
                 import uuid as _uuid
-
-                _clarify_policy = str(
-                    (user_config.get("agent", {}) or {}).get(
-                        "clarify_policy",
-                        "interactive",
-                    )
-                )
-                _autonomy_response = autonomy_clarify_response(
-                    question,
-                    (
-                        list(raw_choices)
-                        if raw_choices is not None
-                        else (list(choices) if choices else None)
-                    ),
-                    policy=_clarify_policy,
-                    multi_select=multi_select,
-                )
-                if _autonomy_response is not None:
-                    logger.info(
-                        "Auto-resolved routine engineering clarification "
-                        "(session=%s, policy=%s)",
-                        session_key,
-                        _clarify_policy,
-                    )
-                    return _autonomy_response
 
                 if not _status_adapter:
                     return ""
