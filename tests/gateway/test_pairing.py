@@ -650,6 +650,29 @@ class TestRevoke:
             store = PairingStore()
             assert store.revoke("telegram", "nobody") is False
 
+    def test_revoke_invalidates_same_user_pending_codes_only(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            approved_code = store.generate_code("telegram", "user1", "Alice")
+
+            limits = store._load_json(store._rate_limit_path())
+            limits["telegram:user1"] = time.time() - RATE_LIMIT_SECONDS - 1
+            store._save_json(store._rate_limit_path(), limits)
+
+            stale_code = store.generate_code("telegram", "user1", "Alice")
+            other_code = store.generate_code("telegram", "user2", "Bob")
+            store.approve_code("telegram", approved_code)
+
+            assert store.revoke("telegram", "user1") is True
+            pending = store.list_pending("telegram")
+
+            assert [entry["user_id"] for entry in pending] == ["user2"]
+            assert store.approve_code("telegram", stale_code) is None
+            assert store.approve_code("telegram", other_code) == {
+                "user_id": "user2",
+                "user_name": "Bob",
+            }
+
 
 # ---------------------------------------------------------------------------
 # List & clear

@@ -385,7 +385,7 @@ class PairingStore:
         _sync_allowlist_add(platform, normalized_user_id)
 
     def revoke(self, platform: str, user_id: str) -> bool:
-        """Remove a user from the approved list. Returns True if found."""
+        """Remove a user and invalidate their pending codes. Returns True if found."""
         path = self._approved_path(platform)
         with self._lock:
             approved = self._load_json(path)
@@ -398,6 +398,18 @@ class PairingStore:
                 for approved_user_id in matching_ids:
                     del approved[approved_user_id]
                 self._save_json(path, approved)
+                pending_path = self._pending_path(platform)
+                pending = self._load_json(pending_path)
+                stale_entry_ids = [
+                    entry_id
+                    for entry_id, entry in pending.items()
+                    if isinstance(entry, dict)
+                    and self._user_ids_match(platform, entry.get("user_id", ""), user_id)
+                ]
+                for entry_id in stale_entry_ids:
+                    del pending[entry_id]
+                if stale_entry_ids:
+                    self._save_json(pending_path, pending)
                 # Keep the allowlist mirror in sync: revoking a paired user
                 # also removes the entry the approval added (option i). No-op if
                 # the user was added to the allowlist by other means.
