@@ -24,7 +24,7 @@ export interface ChatBarState {
     quickModels?: QuickModelOption[]
   }
   tools: { enabled: boolean; label: string; suggestions?: ContextSuggestion[] }
-  voice: { enabled: boolean; active: boolean }
+  voice: { deviceId?: string; enabled: boolean; active: boolean }
 }
 
 export interface ChatBarProps {

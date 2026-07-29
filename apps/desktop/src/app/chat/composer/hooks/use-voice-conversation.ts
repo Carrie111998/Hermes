@@ -16,6 +16,7 @@ interface PendingVoiceResponse {
 
 interface VoiceConversationOptions {
   busy: boolean
+  deviceId?: string
   enabled: boolean
   onFatalError?: () => void
   onSubmit: (text: string) => Promise<void> | void
@@ -26,6 +27,7 @@ interface VoiceConversationOptions {
 
 export function useVoiceConversation({
   busy,
+  deviceId,
   enabled,
   onFatalError,
   onSubmit,
@@ -198,8 +200,8 @@ export function useVoiceConversation({
     }
 
     try {
-      // VAD tuning mirrors `tools.voice_mode` defaults so the browser loop matches the CLI.
       await handle.start({
+        deviceId,
         silenceLevel: 0.075,
         silenceMs: 1_250,
         idleSilenceMs: 12_000,
@@ -218,7 +220,7 @@ export function useVoiceConversation({
       setStatus('idle')
       onFatalError?.()
     }
-  }, [handle, handleTurn, onFatalError, voiceCopy.couldNotStartSession, voiceCopy.microphoneFailed])
+  }, [handle, deviceId, handleTurn, onFatalError, voiceCopy.couldNotStartSession, voiceCopy.microphoneFailed])
 
   const speak = useCallback(async (text: string) => {
     setStatus('speaking')

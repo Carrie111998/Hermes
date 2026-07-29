@@ -8,6 +8,7 @@ import type { VoiceActivityState, VoiceStatus } from '../types'
 import { useMicRecorder } from './use-mic-recorder'
 
 interface VoiceRecorderOptions {
+  deviceId?: string
   maxRecordingSeconds: number
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   focusInput: () => void
@@ -15,6 +16,7 @@ interface VoiceRecorderOptions {
 }
 
 export function useVoiceRecorder({
+  deviceId,
   maxRecordingSeconds,
   onTranscribeAudio,
   focusInput,

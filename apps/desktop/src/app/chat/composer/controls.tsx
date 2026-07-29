@@ -1,11 +1,14 @@
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { AudioLines, Layers3, Loader2, Square, SteeringWheel } from '@/lib/icons'
+import { AudioLines, Layers3, Loader2, Mic, Square, SteeringWheel } from '@/lib/icons'
 import { cn } from '@/lib/utils'
+import { useMemo } from 'react'
 
+import type { MicrophoneDevice } from './hooks/use-mic-device'
 import type { ConversationStatus } from './hooks/use-voice-conversation'
 import type { ChatBarState, VoiceStatus } from './types'
 
@@ -43,10 +46,13 @@ export function ComposerControls({
   conversation,
   disabled,
   hasComposerPayload,
+  selectedVoiceDeviceId,
   state,
+  voiceDevices,
   voiceStatus,
   onDictate,
-  onSteer
+  onSteer,
+  onChangeVoiceDevice
 }: {
   busy: boolean
   busyAction: 'queue' | 'stop'
@@ -55,10 +61,13 @@ export function ComposerControls({
   conversation: ConversationProps
   disabled: boolean
   hasComposerPayload: boolean
+  selectedVoiceDeviceId?: string | null
   state: ChatBarState
+  voiceDevices?: MicrophoneDevice[]
   voiceStatus: VoiceStatus
   onDictate: () => void
   onSteer: () => void
+  onChangeVoiceDevice?: (deviceId: string | null) => void
 }) {
   const { t } = useI18n()
   const c = t.composer
@@ -69,9 +78,24 @@ export function ComposerControls({
 
   const showVoicePrimary = !busy && !hasComposerPayload
 
+  const selectedLabel = useMemo(() => {
+    const match = voiceDevices?.find(device => device.deviceId === selectedVoiceDeviceId)
+
+    return match?.label ?? ''
+  }, [selectedVoiceDeviceId, voiceDevices])
+
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
       <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
+      {(selectedLabel || voiceDevices?.length) && (
+        <MicDeviceMenu
+          devices={voiceDevices ?? []}
+          disabled={disabled}
+          label={selectedLabel}
+          onChange={onChangeVoiceDevice}
+          selectedDeviceId={selectedVoiceDeviceId}
+        />
+      )}
       {canSteer && (
         <Tip label={c.steer}>
           <Button
@@ -210,9 +234,9 @@ function ConversationPill({
 }
 
 function ConversationIndicator({
-  level,
   listening,
-  speaking
+  speaking,
+  level
 }: {
   level: number
   listening: boolean
@@ -232,6 +256,56 @@ function ConversationIndicator({
 
         return <span className="w-0.5 rounded-full bg-current" key={index} style={{ height: `${height * 100}%` }} />
       })}
+    </span>
+  )
+}
+
+function MicDeviceMenu({
+  devices,
+  disabled,
+  label,
+  onChange,
+  selectedDeviceId
+}: {
+  devices: MicrophoneDevice[]
+  disabled: boolean
+  label: string
+  onChange?: (deviceId: string | null) => void
+  selectedDeviceId?: string | null
+}) {
+  const value = selectedDeviceId ?? ''
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button className={cn(GHOST_ICON_BTN, 'gap-1 px-1.5 text-[0.8rem]')} disabled={disabled} size="icon" type="button" variant="ghost">
+          <Mic size={14} />
+          <MicLabel label={label} />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="max-h-64">
+        {devices.map(device => (
+          <DropdownMenuItem
+            key={device.deviceId}
+            onSelect={() => onChange?.(device.deviceId === value ? null : device.deviceId)}
+          >
+            <span className="truncate">{device.label}</span>
+            {device.deviceId === value && <span className="ml-auto text-xs text-(--ui-accent)">✓</span>}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+function MicLabel({ label }: { label: string }) {
+  if (!label) {
+    return <Mic size={14} />
+  }
+
+  return (
+    <span className="truncate text-xs">
+      {label}
     </span>
   )
 }

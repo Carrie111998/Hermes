@@ -1361,9 +1361,14 @@ export function ChatBar({
       }}
       disabled={disabled}
       hasComposerPayload={hasComposerPayload}
+      selectedVoiceDeviceId={state.voice.deviceId}
       onDictate={dictate}
       onSteer={steerDraft}
+      onChangeVoiceDevice={deviceId => {
+        setState(prev => prev satisfies ChatBarState ? { ...prev, voice: { ...prev.voice, deviceId: deviceId ?? '' } } as ChatBarState : prev)
+      }}
       state={state}
+      voiceDevices={[]}
       voiceStatus={voiceStatus}
     />
   )

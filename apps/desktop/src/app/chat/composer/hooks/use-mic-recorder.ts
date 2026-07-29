@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 type BrowserAudioContext = typeof AudioContext
 
 export interface MicRecorderOptions {
+  deviceId?: string
   onLevel?: (level: number) => void
   onError?: (error: Error) => void
   onSilence?: () => void
@@ -180,9 +181,14 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): { handle: MicRecorde
     let stream: MediaStream
 
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true }
-      })
+      const constraints: MediaStreamConstraints = {
+        audio: {
+          deviceId: options.deviceId ? { exact: options.deviceId } : undefined,
+          echoCancellation: true,
+          noiseSuppression: true
+        }
+      }
+      stream = await navigator.mediaDevices.getUserMedia(constraints)
     } catch (error) {
       throw micError(error, copy)
     }
