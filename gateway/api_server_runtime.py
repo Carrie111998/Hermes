@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from gateway.api_server_shared import AIOHTTP_AVAILABLE, web
+from gateway.skill_egress_guard import SkillEgressGuard
 
 logger = logging.getLogger(__name__)
 
@@ -178,8 +179,8 @@ def _activity_arguments(tool_name: str, args: Any) -> dict[str, str]:
     }
 
 
-def _skill_body_digest(args: Any, result: Any) -> str:
-    """Digest of a successful SKILL.md body load; "" for sub-file reads or failures."""
+def _skill_body_content(args: Any, result: Any) -> str:
+    """Body of a successful main SKILL.md load; "" for sub-files or failures."""
     if not isinstance(args, dict) or str(args.get("file_path") or "").strip():
         return ""
     parsed = result
@@ -194,6 +195,14 @@ def _skill_body_digest(args: Any, result: Any) -> str:
         return ""
     content = parsed.get("content")
     if not isinstance(content, str):
+        return ""
+    return content
+
+
+def _skill_body_digest(args: Any, result: Any) -> str:
+    """Digest of a successful SKILL.md body load; "" for sub-file reads or failures."""
+    content = _skill_body_content(args, result)
+    if not content:
         return ""
     return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
 
@@ -571,6 +580,7 @@ class RuntimeBridgeSession:
         }
         self.deadline_seconds = max(0.001, deadline_ms / 1000) if deadline_ms > 0 else None
         self.loaded_skills: dict[str, str] = {}
+        self.skill_egress_guard = SkillEgressGuard()
         self.local_activities: dict[str, str] = {}
         self.pending: dict[str, _PendingTool] = {}
         self.non_retryable_failures: dict[str, str] = {}
@@ -620,11 +630,59 @@ class RuntimeBridgeSession:
         name = str(args.get("name") or args.get("skill") or "").strip()
         if not self.is_skill_allowed(name):
             return
-        digest = _skill_body_digest(args, result)
-        if not digest:
+        content = _skill_body_content(args, result)
+        if not content:
             return
+        digest = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
         with self.lock:
             self.loaded_skills[name] = digest
+            self.skill_egress_guard.add_skill(name, content)
+
+    def emit_text_delta(self, delta: Any) -> None:
+        if not delta:
+            return
+        with self.lock:
+            protected_turn = self.skill_egress_guard.active
+        if not protected_turn:
+            self.emit("text_delta", {"delta": delta})
+
+    def emit_reasoning_delta(self, delta: Any) -> None:
+        if not delta:
+            return
+        with self.lock:
+            protected_turn = self.skill_egress_guard.active
+        if not protected_turn:
+            self.emit("reasoning_delta", {"delta": delta})
+
+    def protect_final_text(self, text: str, user_message: Any) -> str:
+        with self.lock:
+            leaked = self.skill_egress_guard.matches(text)
+            skill_names = self.skill_egress_guard.skill_names
+        if not leaked:
+            return text
+        logger.warning(
+            "Blocked private Skill body from Runtime output for run %s (skills=%s)",
+            self.run_id,
+            ",".join(skill_names),
+        )
+        user_text = _message_text(user_message)
+        if any("\u3400" <= character <= "\u9fff" for character in user_text):
+            return "我可以说明这个能力的用途、所需输入和可交付结果，但不能提供或重构其内部 Skill 指令。"
+        return (
+            "I can explain this capability's purpose, required inputs, and "
+            "deliverables, but I can't provide or reconstruct its private Skill instructions."
+        )
+
+    def contains_private_skill_content(self, value: Any) -> bool:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        with self.lock:
+            return self.skill_egress_guard.matches(serialized)
 
     def start_local_activity(self, call_id: str, name: str, args: Any) -> None:
         if not call_id or name not in _LOCAL_ACTIVITY_TOOLS:
@@ -736,6 +794,21 @@ class RuntimeBridgeSession:
             return json.dumps({
                 "error": {
                     "code": "runtime_checkpoint_invalid",
+                    "message": message,
+                    "retryable": False,
+                },
+            }, ensure_ascii=False, separators=(",", ":"))
+        if self.contains_private_skill_content({"arguments": args, "checkpoint": checkpoint}):
+            message = "Tool call contained protected Skill content and was blocked."
+            logger.warning(
+                "Blocked private Skill body from Runtime tool call for run %s (tool=%s)",
+                self.run_id,
+                name,
+            )
+            self._halt_tool_loop(name, args, "private_skill_egress_blocked", message, 1)
+            return json.dumps({
+                "error": {
+                    "code": "private_skill_egress_blocked",
                     "message": message,
                     "retryable": False,
                 },
@@ -1092,13 +1165,15 @@ class APIServerRuntimeMixin:
                 conversation_history=history,
                 ephemeral_system_prompt=None,
                 session_id=agent_session_id,
-                stream_delta_callback=lambda delta: session.emit("text_delta", {"delta": delta}) if delta else None,
+                stream_delta_callback=session.emit_text_delta,
+                reasoning_callback=session.emit_reasoning_delta,
                 tool_start_callback=on_tool_start,
                 tool_complete_callback=on_tool_complete,
                 agent_ref=session.agent_ref,
                 agent_configurator=configure_agent,
             )
             text = str((result or {}).get("final_response") or "")
+            text = session.protect_final_text(text, user_message)
             session.emit("usage", usage or {})
             session.emit("completed", {"finish_reason": "stop", "text": text})
         except asyncio.CancelledError:
