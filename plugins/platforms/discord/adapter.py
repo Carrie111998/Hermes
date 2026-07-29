@@ -834,15 +834,23 @@ def _read_dm_role_auth_guild() -> Optional[int]:
     return guild_id if guild_id > 0 else None
 
 
-# Default timeout for Discord interactive button views (exec approval, slash
-# confirm, update prompt, clarify choice). Used when the user has not set
-# ``approvals.discord_prompt_timeout`` in config.yaml. 300s (5 min) matches
-# the previous hardcoded value. Bounded to a sane range — Discord
-# interaction tokens expire from the API's side at ~15 minutes, so 900s is
-# the practical ceiling.
+# Fallback timeout for Discord interactive button views (exec approval, slash
+# confirm, update prompt, clarify choice, model/choice pickers). Only used
+# when neither ``approvals.discord_prompt_timeout`` nor the backend clarify
+# timeout can be resolved (e.g. config.yaml unreadable).
+#
+# The normal path derives the view timeout from the backend wait the buttons
+# are attached to (``clarify.timeout`` / ``agent.clarify_timeout``), so the
+# buttons stay alive exactly as long as the agent is actually waiting. A
+# user who configures the agent to wait indefinitely (``0``) gets buttons
+# that never expire (``timeout=None`` in discord.py).
+#
+# There is deliberately no maximum. Discord's ~15-minute interaction-token
+# expiry applies to responding to an *existing* interaction; these views hang
+# off a normal bot message, so every fresh click mints a new token and a view
+# can stay live indefinitely.
 _DISCORD_PROMPT_TIMEOUT_DEFAULT = 300
 _DISCORD_PROMPT_TIMEOUT_MIN = 30
-_DISCORD_PROMPT_TIMEOUT_MAX = 900
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -852,15 +860,27 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"true", "1", "yes", "on"}
 
 
-def _read_discord_prompt_timeout() -> int:
+def _read_discord_prompt_timeout() -> Optional[float]:
     """Return the timeout (in seconds) for Discord button views.
 
-    Reads ``approvals.discord_prompt_timeout`` from config.yaml. Falls back
-    to the historical 300s default for any missing / malformed value, and
-    clamps the result to ``[_DISCORD_PROMPT_TIMEOUT_MIN,
-    _DISCORD_PROMPT_TIMEOUT_MAX]`` so a typo can't accidentally make
-    interactive prompts disappear (too short) or outlive Discord's own
-    15-minute interaction-token expiry (too long).
+    Resolution order:
+
+    1. ``approvals.discord_prompt_timeout`` if the user set it explicitly,
+    2. else the backend clarify timeout (``clarify.timeout`` /
+       ``agent.clarify_timeout``) that the buttons are attached to,
+    3. else :data:`_DISCORD_PROMPT_TIMEOUT_DEFAULT`.
+
+    ``<= 0`` means *wait forever* — the Hermes convention everywhere else —
+    and is returned as ``None``, which discord.py reads as "this view never
+    expires".  Positive values are clamped up to
+    :data:`_DISCORD_PROMPT_TIMEOUT_MIN` so a typo can't make prompts vanish
+    before anyone can click them.  There is no upper clamp: these views hang
+    off a normal bot message, so each click mints a fresh interaction token
+    and the view can outlive Discord's ~15-minute token expiry.
+
+    Deriving the default from the backend timeout keeps the two in sync — an
+    operator who tells the agent to wait indefinitely gets buttons that wait
+    indefinitely too, with no second config key to discover.
     """
     raw: Any = None
     try:
@@ -868,6 +888,8 @@ def _read_discord_prompt_timeout() -> int:
         cfg = read_raw_config() or {}
         approvals_cfg = cfg.get("approvals", {}) or {}
         raw = approvals_cfg.get("discord_prompt_timeout")
+        if raw is None or raw == "":
+            raw = _resolve_backend_prompt_timeout(cfg)
     except Exception:
         return _DISCORD_PROMPT_TIMEOUT_DEFAULT
     if raw is None or raw == "":
@@ -876,11 +898,24 @@ def _read_discord_prompt_timeout() -> int:
         seconds = int(raw)
     except (TypeError, ValueError):
         return _DISCORD_PROMPT_TIMEOUT_DEFAULT
+    if seconds <= 0:
+        return None  # discord.py: view never expires
     if seconds < _DISCORD_PROMPT_TIMEOUT_MIN:
         return _DISCORD_PROMPT_TIMEOUT_MIN
-    if seconds > _DISCORD_PROMPT_TIMEOUT_MAX:
-        return _DISCORD_PROMPT_TIMEOUT_MAX
     return seconds
+
+
+def _resolve_backend_prompt_timeout(cfg: dict) -> Optional[int]:
+    """Best-effort read of the backend wait the Discord buttons front.
+
+    Returns ``None`` when it can't be determined, letting the caller fall
+    back to :data:`_DISCORD_PROMPT_TIMEOUT_DEFAULT`.
+    """
+    try:
+        from tools.clarify_gateway import resolve_clarify_timeout
+        return resolve_clarify_timeout(cfg)
+    except Exception:
+        return None
 
 
 class DiscordAdapter(BasePlatformAdapter):
@@ -8115,7 +8150,9 @@ def _define_discord_view_classes() -> None:
         Shows four buttons: Allow Once, Allow Session, Always Allow, Deny.
         Clicking a button calls ``resolve_gateway_approval()`` to unblock the
         waiting agent thread — the same mechanism as the text ``/approve`` flow.
-        Only users in the allowed list can click.  Times out after 5 minutes.
+        Only users in the allowed list can click.  View lifetime follows
+        ``_read_discord_prompt_timeout()`` (never expires when the backend
+        wait is unlimited).
         """
 
         def __init__(
@@ -8266,7 +8303,7 @@ def _define_discord_view_classes() -> None:
                     embed = msg.embeds[0] if msg.embeds else None
                     if embed:
                         embed.color = discord.Color.greyple()
-                        embed.set_footer(text="⏱ Prompt expired — no action taken")
+                        embed.set_footer(text="⏱ Buttons expired - reply in chat to answer")
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass  # message deleted or too old to edit
@@ -8285,8 +8322,8 @@ def _define_discord_view_classes() -> None:
         Clicking calls the module-level
         ``tools.slash_confirm.resolve(session_key, confirm_id, choice)``
         which runs the handler the runner stored for this ``session_key``.
-        Only users in the adapter's allowlist can click.  Times out after
-        5 minutes (matches the gateway primitive's timeout).
+        Only users in the adapter's allowlist can click.  View lifetime follows
+        ``_read_discord_prompt_timeout()``, which tracks the backend wait.
         """
 
         def __init__(
@@ -8381,7 +8418,7 @@ def _define_discord_view_classes() -> None:
                     embed = msg.embeds[0] if msg.embeds else None
                     if embed:
                         embed.color = discord.Color.greyple()
-                        embed.set_footer(text="⏱ Prompt expired — no action taken")
+                        embed.set_footer(text="⏱ Buttons expired - reply in chat to answer")
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
@@ -8391,8 +8428,7 @@ def _define_discord_view_classes() -> None:
 
         Clicking a button writes the answer to ``.update_response`` so the
         detached update process can pick it up.  Only authorized users can
-        click.  Times out after 5 minutes (the update process also has a
-        5-minute timeout on its side).
+        click.  View lifetime follows ``_read_discord_prompt_timeout()``.
         """
 
         def __init__(
@@ -8477,7 +8513,7 @@ def _define_discord_view_classes() -> None:
                     embed = msg.embeds[0] if msg.embeds else None
                     if embed:
                         embed.color = discord.Color.greyple()
-                        embed.set_footer(text="⏱ Prompt expired — no action taken")
+                        embed.set_footer(text="⏱ Buttons expired - reply in chat to answer")
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
@@ -8487,7 +8523,7 @@ def _define_discord_view_classes() -> None:
 
         Two-step drill-down: provider dropdown → model dropdown.
         Edits the original message in-place as the user navigates.
-        Times out after 2 minutes.
+        View lifetime follows ``_read_discord_prompt_timeout()``.
         """
 
         def __init__(
@@ -8500,7 +8536,7 @@ def _define_discord_view_classes() -> None:
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
         ):
-            super().__init__(timeout=120)
+            super().__init__(timeout=_read_discord_prompt_timeout())
             self.providers = providers
             self.current_model = current_model
             self.current_provider = current_provider
@@ -8817,7 +8853,7 @@ def _define_discord_view_classes() -> None:
 
         One dropdown, one selection, done — the generic single-level companion
         to ``ModelPickerView``. Auth gating mirrors ``ExecApprovalView``.
-        Times out after 2 minutes.
+        View lifetime follows ``_read_discord_prompt_timeout()``.
         """
 
         def __init__(
@@ -8827,7 +8863,7 @@ def _define_discord_view_classes() -> None:
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
         ):
-            super().__init__(timeout=120)
+            super().__init__(timeout=_read_discord_prompt_timeout())
             self.choices = list(choices)[:25]  # Discord select cap
             self.on_choice_selected = on_choice_selected
             self.allowed_user_ids = allowed_user_ids
@@ -9133,7 +9169,7 @@ def _define_discord_view_classes() -> None:
                     embed = msg.embeds[0] if msg.embeds else None
                     if embed:
                         embed.color = discord.Color.greyple()
-                        embed.set_footer(text="⏱ Prompt expired — no action taken")
+                        embed.set_footer(text="⏱ Buttons expired - reply in chat to answer")
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
