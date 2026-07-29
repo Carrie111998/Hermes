@@ -1070,6 +1070,15 @@ DEFAULT_CONFIG = {
         # a human as chat noise. Doc/markdown/skill-only edits never fire it.
         # Set true to force on everywhere, or false to disable.
         "verify_on_stop": "auto",
+        # By default, an activated fallback model/provider is turn-scoped:
+        # restore_primary_runtime() switches back to the primary model at
+        # the start of the very next turn (see agent/agent_runtime_helpers.py).
+        # Set this true to make a fallback activation "stick" for the rest
+        # of the session instead — once the agent fails over, it stays on
+        # the fallback model until the process/session ends or you switch
+        # models manually. Does not affect the per-turn rate-limit cooldown
+        # guard, which already keeps the fallback active regardless.
+        "sticky_fallback": False,
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
