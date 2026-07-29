@@ -10,8 +10,9 @@ from gateway.session import SessionSource
 
 
 class RestartTestAdapter(BasePlatformAdapter):
-    def __init__(self):
+    def __init__(self, *, interactive_resume: bool = True):
         super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+        self.interactive_resume = interactive_resume
         self.sent: list[str] = []
         self.sent_calls: list[tuple[str, str, object]] = []
 
@@ -49,7 +50,10 @@ def make_restart_source(
 
 def make_restart_runner(
     adapter: BasePlatformAdapter | None = None,
+    *,
+    interactive_resume: bool = True,
 ) -> tuple[GatewayRunner, BasePlatformAdapter]:
+    """Build a runner with the Telegram-like adapter's production default."""
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
@@ -151,7 +155,9 @@ def make_restart_runner(
     runner.session_store._entries = {}
     runner.delivery_router = MagicMock()
 
-    platform_adapter = adapter or RestartTestAdapter()
+    platform_adapter = adapter or RestartTestAdapter(
+        interactive_resume=interactive_resume
+    )
     platform_adapter.set_message_handler(AsyncMock(return_value=None))
     platform_adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
     runner.adapters = {Platform.TELEGRAM: platform_adapter}
