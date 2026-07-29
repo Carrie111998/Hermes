@@ -43,6 +43,8 @@ Usage (see ``tools/mcp_tool.py::_run_stdio``)::
 from __future__ import annotations
 
 import argparse
+import glob
+import json
 import os
 import signal
 import subprocess
@@ -52,6 +54,54 @@ import time
 
 _POLL_INTERVAL_S = 2.0
 _TERM_GRACE_S = 3.0
+
+# mcp-remote (https://github.com/geelen/mcp-remote) serializes concurrent
+# OAuth handshakes against the same remote MCP server URL using a lock file
+# under ~/.mcp-auth/mcp-remote-<version>/<url_hash>_lock.json containing the
+# PID that currently holds it. If the process holding the lock is killed hard
+# (crash, force-quit, kill -9) instead of exiting gracefully, the lock file is
+# never removed. The next mcp-remote invocation against that same server URL
+# then sees a "held" lock from a PID that no longer exists and gets wedged —
+# manifesting to the MCP client as repeated connection failures ("Invalid
+# request parameters" / stuck tool discovery) that look like zombie process
+# buildup. mcp-remote has no self-healing for this case, so sweep dead-PID
+# locks before every stdio MCP spawn (this watchdog already runs on every one).
+
+
+def _cleanup_stale_mcp_remote_locks(mcp_auth_dir: str | None = None) -> None:
+    """Delete ``*_lock.json`` files under ``~/.mcp-auth/`` whose recorded PID
+    is no longer alive.
+
+    Best-effort and intentionally silent on any failure — this is a
+    preflight hygiene step, not something that should ever block or fail
+    the real MCP server launch.
+    """
+    if os.name != "posix":
+        return
+    base = mcp_auth_dir or os.path.expanduser("~/.mcp-auth")
+    try:
+        lock_paths = glob.glob(os.path.join(base, "*", "*_lock.json"))
+    except OSError:
+        return
+    for lock_path in lock_paths:
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pid = int(data.get("pid"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        try:
+            os.kill(pid, 0)
+            # Process exists (or we lack permission to signal it, which on a
+            # single-user dev machine still implies it exists) — leave the
+            # lock alone, a live client genuinely holds it.
+        except ProcessLookupError:
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+        except PermissionError:
+            continue
 
 
 def _is_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
@@ -114,6 +164,10 @@ def main(argv: list[str] | None = None) -> int:
     if not real_argv:
         print("mcp_stdio_watchdog: no command given after '--'", file=sys.stderr)
         return 2
+
+    # Sweep dead-PID mcp-remote OAuth locks before spawning — see module
+    # docstring comment above _cleanup_stale_mcp_remote_locks for why.
+    _cleanup_stale_mcp_remote_locks()
 
     # New process group so we can killpg() the whole tree the real command
     # may spawn (e.g. mcp-remote's own child `node` process), without
