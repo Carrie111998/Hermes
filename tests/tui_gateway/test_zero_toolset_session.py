@@ -1167,3 +1167,73 @@ class TestReloadMcpLiftsRestriction:
         # The restriction is gone: the rebuild asked for every toolset.
         assert seen["enabled_toolsets"] is None
         assert agent.enabled_toolsets is None
+
+
+class TestDesktopBranchInheritsScope:
+    """The Desktop branch route is session.create + parent_session_id.
+
+    Without the field, the child must inherit the parent's scope: branching a
+    session opened without tools must not hand back a tooled child.
+    """
+
+    def _parent(self, server, pinned):
+        return {
+            "session_key": "parent-key",
+            "agent": SimpleNamespace(enabled_toolsets=pinned),
+            "create_enabled_toolsets": pinned,
+            "history": [],
+            "history_lock": threading.Lock(),
+        }
+
+    def _create_child(self, server, monkeypatch, parent, params):
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        calls = _capture_builds(server, monkeypatch)
+        server._sessions["p-sid"] = parent
+        resp = _create(server, {"cols": 80, "parent_session_id": "parent-key", **params})
+        assert "error" not in resp, resp
+        sid = resp["result"]["session_id"]
+        _run_deferred_build(server, monkeypatch, sid)
+        return calls, server._sessions[sid]
+
+    def test_child_inherits_the_empty_parent_scope(self, server, monkeypatch) -> None:
+        calls, child = self._create_child(
+            server, monkeypatch, self._parent(server, []), {}
+        )
+        assert child["create_enabled_toolsets"] == []
+        assert calls[-1]["enabled_toolsets_override"] == []
+        assert child["agent"].enabled_toolsets == []
+
+    def test_child_inherits_a_non_empty_parent_scope(self, server, monkeypatch) -> None:
+        calls, child = self._create_child(
+            server, monkeypatch, self._parent(server, ["file"]), {}
+        )
+        assert child["create_enabled_toolsets"] == ["file"]
+        assert calls[-1]["enabled_toolsets_override"] == ["file"]
+
+    def test_unpinned_parent_leaves_the_child_global(self, server, monkeypatch) -> None:
+        calls, child = self._create_child(
+            server, monkeypatch, self._parent(server, None), {}
+        )
+        assert child["create_enabled_toolsets"] is None
+        assert "enabled_toolsets_override" not in calls[-1]
+
+    def test_explicit_field_wins_over_inheritance(self, server, monkeypatch) -> None:
+        calls, child = self._create_child(
+            server, monkeypatch, self._parent(server, []),
+            {"enabled_toolsets": ["file"]},
+        )
+        assert child["create_enabled_toolsets"] == ["file"]
+        assert calls[-1]["enabled_toolsets_override"] == ["file"]
+
+    def test_explicit_field_is_still_validated(self, server, monkeypatch) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        calls = _capture_builds(server, monkeypatch)
+        server._sessions["p-sid"] = self._parent(server, [])
+        resp = _create(
+            server,
+            {"cols": 80, "parent_session_id": "parent-key", "enabled_toolsets": None},
+        )
+        assert "error" in resp
+        assert not calls

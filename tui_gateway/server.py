@@ -5921,6 +5921,15 @@ def _(rid, params: dict) -> dict:
         create_enabled_toolsets = _requested_enabled_toolsets(params)
     except _ToolsetSelectionError as exc:
         return _err(rid, 4045, str(exc))
+    if create_enabled_toolsets is None and parent_session_id:
+        # Desktop branches a chat through session.create + parent_session_id.
+        # Without an explicit field the child inherits the parent's scope, or
+        # branching a session opened without tools would return a tooled copy.
+        parent_live = _find_live_session_by_key(parent_session_id)
+        if parent_live is not None:
+            inherited = parent_live[1].get("create_enabled_toolsets")
+            if inherited is not None:
+                create_enabled_toolsets = list(inherited)
 
     ready = threading.Event()
     now = time.time()
