@@ -962,14 +962,14 @@ def test_save_custom_provider_references_the_key_instead_of_inlining_it(monkeypa
 
 
 def test_save_custom_provider_migrates_an_existing_plaintext_entry(monkeypatch, tmp_path):
-    """Re-saving a known URL swaps its inline key for the .env reference."""
+    """Re-saving a known slug swaps its inline key for the .env reference."""
     import yaml
-    from hermes_cli.main import _save_custom_provider
+    from hermes_cli.main import _save_custom_provider, _auto_provider_name
 
     existing = {
         "custom_providers": [
             {
-                "name": "Ollama",
+                "name": _auto_provider_name("http://localhost:11434/v1"),
                 "base_url": "http://localhost:11434/v1",
                 "api_key": "sk-legacy",
             }

@@ -4029,55 +4029,78 @@ def _save_custom_provider(
 ):
     """Save a custom endpoint to custom_providers in config.yaml.
 
-    Deduplicates by base_url — if the URL already exists, updates the
-    model name, context_length, and api_mode but doesn't add a duplicate entry.
+    Deduplicates by *canonical slug* (custom:<normalized-name>) — if an entry
+    with the same canonical identity already exists, updates the model name,
+    context_length, and api_mode but doesn't add a duplicate entry. Two providers
+    sharing a base URL with *different* canonical identities are treated as
+    separate entries (#45481).
+
     Uses *name* when provided, otherwise auto-generates from the URL.
 
     When *key_env* is set the caller has already written the key to ``.env``,
     so the entry references it instead of inlining the secret (#69449).
     """
     from hermes_cli.config import load_config, save_config
+    from hermes_cli.providers import custom_provider_slug
 
     cfg = load_config()
     providers = cfg.get("custom_providers") or []
     if not isinstance(providers, list):
         providers = []
 
-    # Check if this URL is already saved — update model/context_length if so
+    # Use provided name or auto-generate from URL
+    if not name:
+        name = _auto_provider_name(base_url)
+
+    # Canonical identity used by the picker/resolver
+    canonical_slug = custom_provider_slug(name)
+
+    def _update_entry(entry: dict) -> bool:
+        """Apply model/context_length/api_mode updates to an existing entry.
+
+        Returns True if any field was changed.
+        """
+        changed = False
+        if model and entry.get("model") != model:
+            entry["model"] = model
+            changed = True
+        if model and context_length:
+            models_cfg = entry.get("models", {})
+            if not isinstance(models_cfg, dict):
+                models_cfg = {}
+            models_cfg[model] = {"context_length": context_length}
+            entry["models"] = models_cfg
+            changed = True
+        if api_mode:
+            if entry.get("api_mode") != api_mode:
+                entry["api_mode"] = api_mode
+                changed = True
+        elif "api_mode" in entry:
+            entry.pop("api_mode", None)
+            changed = True
+        # Always keep base_url, api_key, and key_env in sync with the latest values
+        if entry.get("base_url", "").rstrip("/") != base_url.rstrip("/"):
+            entry["base_url"] = base_url
+            changed = True
+        if key_env and (entry.get("key_env") != key_env or entry.get("api_key")):
+            entry["key_env"] = key_env
+            entry.pop("api_key", None)
+            changed = True
+        elif api_key and entry.get("api_key") != api_key:
+            entry["api_key"] = api_key
+            changed = True
+        return changed
+
+    # Deduplicate by canonical slug (#45533: matching only on raw name caused
+    # silent overwrites when two entries had names like "Foo Bar" and "foo-bar"
+    # which are distinct display names but produce the same picker slug).
     for entry in providers:
-        if isinstance(entry, dict) and entry.get("base_url", "").rstrip(
-            "/"
-        ) == base_url.rstrip("/"):
-            changed = False
-            if model and entry.get("model") != model:
-                entry["model"] = model
-                changed = True
-            if model and context_length:
-                models_cfg = entry.get("models", {})
-                if not isinstance(models_cfg, dict):
-                    models_cfg = {}
-                models_cfg[model] = {"context_length": context_length}
-                entry["models"] = models_cfg
-                changed = True
-            if api_mode:
-                if entry.get("api_mode") != api_mode:
-                    entry["api_mode"] = api_mode
-                    changed = True
-            elif "api_mode" in entry:
-                entry.pop("api_mode", None)
-                changed = True
-            if key_env and (entry.get("key_env") != key_env or entry.get("api_key")):
-                entry["key_env"] = key_env
-                entry.pop("api_key", None)
-                changed = True
+        if isinstance(entry, dict) and custom_provider_slug(entry.get("name", "")) == canonical_slug:
+            changed = _update_entry(entry)
             if changed:
                 cfg["custom_providers"] = providers
                 save_config(cfg)
             return  # already saved, updated if needed
-
-    # Use provided name or auto-generate from URL
-    if not name:
-        name = _auto_provider_name(base_url)
 
     entry = {"name": name, "base_url": base_url}
     if key_env:
