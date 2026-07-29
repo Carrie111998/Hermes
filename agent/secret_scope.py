@@ -27,6 +27,8 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Dict, Mapping, Optional
 
+from agent.configured_secret_redaction import register_secret_values
+
 
 # ── multiplex-active flag ────────────────────────────────────────────────
 # Process-global: set once at gateway startup when gateway.multiplex_profiles
@@ -72,7 +74,11 @@ def set_secret_scope(secrets: Optional[Mapping[str, str]]) -> Token:
     """Install the active profile's secret mapping for the current context.
 
     Returns a token for ``reset_secret_scope``. Pass ``None`` to clear.
+    Registered values only enter the process-local log-redaction registry;
+    ``os.environ`` remains untouched, preserving profile isolation.
     """
+    if secrets is not None:
+        register_secret_values(secrets.values())
     return _SECRET_SCOPE.set(secrets)
 
 

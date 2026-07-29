@@ -4,7 +4,7 @@ Common "why is Hermes doing X to my output / tool calls / commands?" toggles —
 
 ### Secret redaction in tool output
 
-Secret redaction is **on by default** — tool output (terminal stdout, `read_file`, web content, subagent summaries, etc.) is scanned for strings that look like API keys, tokens, and secrets before it enters the conversation context and logs. Leave it enabled for normal use:
+Secret redaction is **on by default** — tool output (terminal stdout, `read_file`, web content, subagent summaries, etc.) is scanned for strings that look like API keys, tokens, and secrets before it enters the conversation context. Persistent logs are always force-redacted and also mask exact values loaded from secret-like environment variables and configuration keys. Leave user-facing redaction enabled for normal use:
 
 ```bash
 hermes config set security.redact_secrets true       # keep enabled globally
@@ -12,7 +12,7 @@ hermes config set security.redact_secrets true       # keep enabled globally
 
 **Restart required.** `security.redact_secrets` is snapshotted at import time — toggling it mid-session (e.g. via `export HERMES_REDACT_SECRETS=false` from a tool call) will NOT take effect for the running process. Tell the user to change it in config from a terminal, then start a new session. This is deliberate — it prevents an LLM from flipping the toggle on itself mid-task.
 
-Disable only when you deliberately need raw credential-like strings for debugging or redactor development:
+Disable only when you deliberately need raw credential-like strings in tool or chat output for debugging or redactor development. This does not disable persistent-log redaction:
 ```bash
 hermes config set security.redact_secrets false
 ```

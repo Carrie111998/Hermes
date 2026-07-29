@@ -169,6 +169,47 @@ class TestSetupLogging:
         content = agent_log.read_text()
         assert "test message for agent.log" in content
 
+    def test_loaded_opaque_secret_is_redacted_while_message_body_is_preserved(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        env_secret = "opaque-runtime-secret-def456"
+        config_secret = "opaque-config-secret-mno345"
+        config_label = "ordinary-config-label"
+        monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+        (hermes_home / ".env").write_text(
+            f"FEISHU_APP_SECRET={env_secret}\n",
+            encoding="utf-8",
+        )
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n  custom:\n    app_secret: "
+            + config_secret
+            + "\n    label: "
+            + config_label
+            + "\n",
+            encoding="utf-8",
+        )
+        load_hermes_dotenv(hermes_home=hermes_home)
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+        logging.getLogger("gateway.run").info(
+            "inbound message body preserved; env=%s config=%s label=%s",
+            env_secret,
+            config_secret,
+            config_label,
+        )
+        hermes_logging.flush_log_queue()
+
+        for log_name in ("agent.log", "gateway.log"):
+            content = (hermes_home / "logs" / log_name).read_text()
+            assert env_secret not in content
+            assert config_secret not in content
+            assert "inbound message body preserved; env=" in content
+            assert config_label in content
+            assert content.count("[REDACTED_CONFIGURED_SECRET]") == 2
+
     def test_warnings_appear_in_both_logs(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home)
 

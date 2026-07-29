@@ -361,6 +361,114 @@ class TestRedactingFormatter:
         assert "abc123def456" not in result
         assert "sk-pro" in result
 
+    def test_redacts_exact_configured_opaque_secret_even_when_pattern_redaction_disabled(
+        self, monkeypatch
+    ):
+        secret = "opaque-configured-value-abc123"
+        monkeypatch.setenv("FEISHU_APP_SECRET", secret)
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        formatter = RedactingFormatter("%(message)s", force_redaction=True)
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="normal diagnostic body contains %s",
+            args=(secret,),
+            exc_info=None,
+        )
+
+        result = formatter.format(record)
+
+        assert secret not in result
+        assert "normal diagnostic body contains" in result
+        assert "[REDACTED_CONFIGURED_SECRET]" in result
+
+    def test_default_formatter_preserves_opt_out_for_console_diagnostics(
+        self, monkeypatch
+    ):
+        secret = "opaque-console-diagnostic-value"
+        monkeypatch.setenv("CONSOLE_SECRET", secret)
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="console=%s",
+            args=(secret,),
+            exc_info=None,
+        )
+
+        assert formatter.format(record) == f"console={secret}"
+
+    def test_does_not_redact_non_secret_environment_values(self, monkeypatch):
+        value = "ordinary-configured-value"
+        monkeypatch.setenv("HERMES_TEST_LABEL", value)
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="label=%s",
+            args=(value,),
+            exc_info=None,
+        )
+
+        assert formatter.format(record) == f"label={value}"
+
+    def test_refresh_api_does_not_return_registered_values(self):
+        from agent.redact import refresh_configured_secret_values
+
+        result = refresh_configured_secret_values(
+            environ={"PROFILE_SECRET": "opaque-private-profile-value"}
+        )
+
+        assert result is None
+
+    def test_refresh_redacts_rotated_secret_and_retains_old_value(self, monkeypatch):
+        from agent.redact import refresh_configured_secret_values
+
+        old_secret = "opaque-old-secret-ghi789"
+        new_secret = "opaque-new-secret-jkl012"
+        monkeypatch.setenv("FEISHU_APP_SECRET", old_secret)
+        formatter = RedactingFormatter("%(message)s", force_redaction=True)
+        monkeypatch.setenv("FEISHU_APP_SECRET", new_secret)
+
+        refresh_configured_secret_values()
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="old=%s new=%s",
+            args=(old_secret, new_secret),
+            exc_info=None,
+        )
+
+        result = formatter.format(record)
+
+        assert old_secret not in result
+        assert new_secret not in result
+        assert result.count("[REDACTED_CONFIGURED_SECRET]") == 2
+
+    def test_ignores_short_values_to_avoid_common_word_corruption(self, monkeypatch):
+        monkeypatch.setenv("TEST_API_TOKEN", "token")
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="token counting remains diagnostic",
+            args=(),
+            exc_info=None,
+        )
+
+        assert formatter.format(record) == "token counting remains diagnostic"
+
 
 class TestPrintenvSimulation:
     """Simulate what happens when the agent runs `env` or `printenv`."""

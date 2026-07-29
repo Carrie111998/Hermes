@@ -1,7 +1,10 @@
 """Tests for the profile-scoped credential primitive (Workstream A / Phase 2)."""
+import logging
+
 import pytest
 
 from agent import secret_scope as ss
+from agent.redact import RedactingFormatter
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +35,31 @@ class TestMultiplexInactiveBackwardCompat:
 
 class TestMultiplexActiveFailClosed:
     """Multiplex on: an unscoped secret read raises instead of leaking."""
+
+    def test_scope_registers_opaque_secret_for_persistent_log_redaction(
+        self, monkeypatch
+    ):
+        secret = "opaque-multiplex-profile-value"
+        monkeypatch.delenv("CUSTOM_AUTH", raising=False)
+        formatter = RedactingFormatter("%(message)s", force_redaction=True)
+
+        token = ss.set_secret_scope({"CUSTOM_AUTH": secret})
+        try:
+            record = logging.LogRecord(
+                name="gateway.run",
+                level=logging.INFO,
+                pathname="",
+                lineno=0,
+                msg="profile credential=%s",
+                args=(secret,),
+                exc_info=None,
+            )
+            result = formatter.format(record)
+        finally:
+            ss.reset_secret_scope(token)
+
+        assert secret not in result
+        assert "[REDACTED_CONFIGURED_SECRET]" in result
 
     def test_unscoped_read_raises(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leaky")
