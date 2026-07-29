@@ -42,6 +42,19 @@ PYTHON = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".venv", "bin"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
+def _make_schema_url(base_url: str, schema_name: str) -> str:
+    """Build a connection string that sets search_path via options.
+
+    Handles both URI format (postgresql://...) and key-value format.
+    For URI format, appends ?options=-csearch_path=... as a query param.
+    For key-value format, appends options=-csearch_path=... directly.
+    """
+    if base_url.startswith("postgresql://") or base_url.startswith("postgres://"):
+        sep = "&" if "?" in base_url else "?"
+        return f"{base_url}{sep}options=-csearch_path%3D{schema_name}"
+    return f"{base_url} options=-csearch_path={schema_name}"
+
+
 @pytest.fixture
 def authority_schema():
     """Create an isolated Postgres schema for the authority store."""
@@ -59,7 +72,7 @@ def authority_schema():
         cur.execute(f"CREATE SCHEMA {schema_name}")
     conn.close()
 
-    authority_url = f"{POSTGRES_URL} options=-csearch_path={schema_name}"
+    authority_url = _make_schema_url(POSTGRES_URL, schema_name)
 
     yield schema_name, authority_url
 
@@ -108,7 +121,7 @@ def provider_schema():
         """)
     conn.close()
 
-    provider_url = f"{POSTGRES_URL} options=-csearch_path={schema_name}"
+    provider_url = _make_schema_url(POSTGRES_URL, schema_name)
 
     yield schema_name, provider_url
 
