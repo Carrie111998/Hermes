@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -338,7 +339,16 @@ def _load_oneshot_resume(
     if not target and isinstance(continue_last, str):
         target = continue_last.strip()
     if not target and continue_last:
-        recent = session_db.search_sessions(source="cli", limit=1)
+        recent = []
+        workspace_key = _resolve_oneshot_workspace_key()
+        if workspace_key:
+            recent = session_db.search_sessions(
+                source="cli",
+                limit=1,
+                workspace_key=workspace_key,
+            )
+        if not recent:
+            recent = session_db.search_sessions(source="cli", limit=1)
         if not recent:
             raise ValueError("No previous CLI session found to continue.")
         target = recent[0]["id"]
@@ -374,6 +384,27 @@ def _load_oneshot_resume(
             os.chdir(saved_cwd)
 
     return resolved_session_id, conversation_history
+
+
+def _resolve_oneshot_workspace_key() -> Optional[str]:
+    """Return the current repo root, or CWD outside a Git workspace."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return os.path.abspath(result.stdout.strip())
+    except Exception:
+        pass
+    try:
+        return os.getcwd()
+    except Exception:
+        return None
 
 
 def _run_agent(
