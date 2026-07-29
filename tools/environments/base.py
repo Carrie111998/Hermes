@@ -729,23 +729,17 @@ class BaseEnvironment(ABC):
         # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
         # writers would pick the SAME temp name, clobber each other's temp
         # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` would be unique per writer,
-        # but macOS ships bash 3.2 which does NOT provide it — the name expands
-        # empty there, so every writer shares one temp path and the race is
-        # back.  ``mktemp`` allocates a per-writer unique path portably across
-        # bash versions.  The template is shell-quoted (Windows/Git-Bash drive
-        # letters, spaces) and the resulting path lives in a shell variable so
-        # every later expansion is consistent.
-        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
-        _snap_tmp = '"$__hermes_snap_tmp"'
-        snapshot_excluded = self._snapshot_excluded_passthrough_names()
+        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
+        # and is genuinely unique per writer, which closes the race.  The
+        # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces)
+        # with ``$BASHPID`` left outside the quotes so it still expands.
+        _snap_tmp = f"{self._snapshot_path}.tmp.{os.getpid()}"
         bootstrap = (
-            f"umask 077\n"
-            f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
-            f"{_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)}\n"
-            # Dump function definitions, filtering out private (``_``-prefixed)
+            f"export -p > {_snap_tmp}\n"
+            f"set +u\n"
+            f"__hermes_fns=$(declare -F | awk '{{print $3}}' | grep -vE '^_[^_]') || true\n"
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
-            # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
+            # by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
             # is line-based: it strips the function *header* line but leaves the
             # orphaned ``{ … }`` body behind, which corrupts the snapshot and
             # makes every sourced command fail (e.g. exit 127).  Selecting the
@@ -850,13 +844,11 @@ class BaseEnvironment(ABC):
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``mktemp`` is used instead of
-        # ``$BASHPID``/``$$`` because macOS bash 3.2 lacks ``$BASHPID`` (it
-        # expands empty, collapsing every writer onto one temp name) and ``$$``
-        # is shared by ``&``-launched subshells.  Template shell-quoted
-        # (Windows/spaces); the allocated path lives in a shell variable.
-        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
-        _snap_tmp = '"$__hermes_snap_tmp"'
+        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
+        # subshell PID — unique per concurrent ``&``-launched writer — so two
+        # writers never share a temp name and clobber each other before the mv.
+        # Static path shlex-quoted (Windows/spaces); ``$BASHPID`` left to expand.
+        _snap_tmp = f"{self._snapshot_path}.tmp.{os.getpid()}"
 
         parts = []
         passthrough_names = self._snapshot_excluded_passthrough_names()

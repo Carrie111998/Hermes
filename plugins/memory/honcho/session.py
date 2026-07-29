@@ -11,8 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, TYPE_CHECKING
 
-from plugins.memory.honcho.client import get_honcho_client
-from plugins.memory.honcho.oauth import redact_tokens as _redact_tokens
+from plugins.memory.honcho.client import get_honcho_client, reset_honcho_client
 
 if TYPE_CHECKING:
     from honcho import Honcho
@@ -425,10 +424,14 @@ class HonchoSessionManager:
             # Already recorded by _authed_call; skip the remaining init calls.
             auth_dead = True
         except Exception as e:
-            logger.warning(
-                "Honcho session '%s' add_peers failed (non-fatal): %s",
-                session_id, e,
-            )
+            if self._is_auth_error(e):
+                reset_honcho_client()
+                logger.warning("Honcho auth error during add_peers for '%s', reset cached client", session_id)
+            else:
+                logger.warning(
+                    "Honcho session '%s' add_peers failed (non-fatal): %s",
+                    session_id, e,
+                )
 
         # Load existing messages via context() - single call for messages + metadata
         existing_messages = []
@@ -468,10 +471,14 @@ class HonchoSessionManager:
                     session_id,
                 )
             except Exception as e:
-                logger.warning(
-                    "Honcho session '%s' loaded (failed to fetch context: %s)",
-                    session_id, e,
-                )
+                if self._is_auth_error(e):
+                    reset_honcho_client()
+                    logger.warning("Honcho auth error during context load for '%s', reset cached client", session_id)
+                else:
+                    logger.warning(
+                        "Honcho session '%s' loaded (failed to fetch context: %s)",
+                        session_id, e,
+                    )
 
         with self._cache_lock:
             honcho_session = self._sessions_cache.get(session_id)
@@ -485,6 +492,17 @@ class HonchoSessionManager:
     def _sanitize_id(self, id_str: str) -> str:
         """Sanitize an ID to match Honcho's pattern: ^[a-zA-Z0-9_-]+"""
         return re.sub(r'[^a-zA-Z0-9_-]', '-', id_str)
+
+    @staticmethod
+    def _is_auth_error(error: BaseException) -> bool:
+        """Best-effort detection of expired/invalid Honcho auth errors."""
+        message = str(error)
+        return (
+            "Invalid or expired access token" in message
+            or "invalid_token" in message
+            or "expired_token" in message
+            or "401" in message
+        )
 
     def _runtime_user_ids(self) -> list[str]:
         """Return runtime identity candidates in lookup order."""
@@ -663,9 +681,13 @@ class HonchoSessionManager:
                 self._cache[session.key] = session
             return True
         except Exception as e:
+            if self._is_auth_error(e):
+                reset_honcho_client()
+                logger.error("Honcho auth error while syncing messages for %s, reset cached client", session.key)
+            else:
+                logger.error("Failed to sync messages to Honcho: %s", e)
             for msg in new_messages:
                 msg["_synced"] = False
-            logger.error("Failed to sync messages to Honcho: %s", e)
             with self._cache_lock:
                 self._cache[session.key] = session
             return False
@@ -699,7 +721,11 @@ class HonchoSessionManager:
                 try:
                     retry_success = self._flush_session(item)
                 except Exception as e2:
-                    logger.error("Honcho async write retry failed, dropping batch: %s", e2)
+                    if self._is_auth_error(e2):
+                        reset_honcho_client()
+                        logger.error("Honcho auth error during async retry, reset cached client")
+                    else:
+                        logger.error("Honcho async write retry failed, dropping batch: %s", e2)
                     continue
 
                 if not retry_success:
@@ -902,7 +928,11 @@ class HonchoSessionManager:
         except HonchoAuthError:
             raise
         except Exception as e:
-            logger.warning("Honcho dialectic query failed: %s", e)
+            if self._is_auth_error(e):
+                reset_honcho_client()
+                logger.warning("Honcho dialectic query auth failure, reset cached client")
+            else:
+                logger.warning("Honcho dialectic query failed: %s", e)
             return ""
 
     def prefetch_context(self, session_key: str, user_message: str | None = None) -> None:
