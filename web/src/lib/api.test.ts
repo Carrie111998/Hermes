@@ -123,3 +123,31 @@ describe("api.setProfileReasoning", () => {
     );
   });
 });
+
+describe("api.setProfileSettings", () => {
+  it("sends model and reasoning together to the requested profile", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({
+      ok: true,
+      provider: "provider-a",
+      model: "model-a",
+      reasoning_effort: "high",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.setProfileSettings("my profile", "provider-a", "model-a", "high");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/profiles/my%20profile/settings",
+      expect.objectContaining({
+        body: JSON.stringify({
+          provider: "provider-a",
+          model: "model-a",
+          effort: "high",
+        }),
+        credentials: "include",
+        method: "PUT",
+      }),
+    );
+  });
+});

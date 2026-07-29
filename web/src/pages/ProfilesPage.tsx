@@ -373,7 +373,7 @@ export default function ProfilesPage() {
   const [settingActive, setSettingActive] = useState<string | null>(null);
 
   const modelKey = (provider: string | null, model: string | null) =>
-    provider && model ? `${provider}\u0000${model}` : "";
+    model ? `${provider ?? ""}\u0000${model}` : "";
 
   const loadModelChoices = useCallback(() => {
     if (modelChoices !== null || modelChoicesLoading.current) return;
@@ -690,15 +690,21 @@ export default function ProfilesPage() {
     if (modelEditChoice && modelChoices?.length && !picked && !unchangedUnlistedModel) {
       return;
     }
+    const changedModel =
+      picked !== undefined && modelEditChoice !== modelEditInitialChoice ? picked : null;
     setModelSaving(true);
     try {
-      if (picked) {
-        await api.setProfileModel(name, picked.provider, picked.model);
-        showToast(`${L.modelSaved}: ${picked.model}`, "success");
+      const settings = await api.setProfileSettings(
+        name,
+        changedModel?.provider ?? null,
+        changedModel?.model ?? null,
+        reasoningEditChoice,
+      );
+      if (changedModel) {
+        showToast(`${L.modelSaved}: ${changedModel.model}`, "success");
       }
-      const reasoning = await api.setProfileReasoning(name, reasoningEditChoice);
       showToast(
-        `${L.reasoningSaved}: ${reasoning.reasoning_effort || L.reasoningUnset}`,
+        `${L.reasoningSaved}: ${settings.reasoning_effort || L.reasoningUnset}`,
         "success",
       );
       setProfiles((prev) =>
@@ -706,8 +712,10 @@ export default function ProfilesPage() {
           p.name === name
             ? {
                 ...p,
-                ...(picked ? { model: picked.model, provider: picked.provider } : {}),
-                reasoning_effort: reasoning.reasoning_effort,
+                ...(changedModel
+                  ? { model: changedModel.model, provider: changedModel.provider }
+                  : {}),
+                reasoning_effort: settings.reasoning_effort,
               }
             : p,
         ),

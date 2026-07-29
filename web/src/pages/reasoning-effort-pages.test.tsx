@@ -22,7 +22,7 @@ vi.mock("@/lib/api", () => ({
     getActiveProfile: vi.fn(),
     getModelOptions: vi.fn(),
     setProfileModel: vi.fn(),
-    setProfileReasoning: vi.fn(),
+    setProfileSettings: vi.fn(),
     getProfileSoul: vi.fn(),
     updateProfileSoul: vi.fn(),
     updateProfileDescription: vi.fn(),
@@ -414,7 +414,12 @@ describe("ProfilesPage reasoning effort selector", () => {
     mockedApi.getModelOptions.mockResolvedValue({
       providers: [{ slug: "provider-a", name: "Provider A", models: ["model-a"] }],
     });
-    mockedApi.setProfileReasoning.mockResolvedValue({ ok: true, reasoning_effort: "high" });
+    mockedApi.setProfileSettings.mockResolvedValue({
+      ok: true,
+      provider: null,
+      model: null,
+      reasoning_effort: "high",
+    });
     mockedApi.setProfileModel.mockResolvedValue({ ok: true, provider: "provider-a", model: "model-a" });
   });
 
@@ -446,6 +451,50 @@ describe("ProfilesPage reasoning effort selector", () => {
     ]);
   });
 
+  it("sends a changed model and reasoning effort in one settings update", async () => {
+    mockedApi.getModelOptions.mockResolvedValue({
+      providers: [
+        { slug: "provider-a", name: "Provider A", models: ["model-a", "model-b"] },
+      ],
+    });
+    mockedApi.setProfileSettings.mockResolvedValue({
+      ok: true,
+      provider: "provider-a",
+      model: "model-b",
+      reasoning_effort: "high",
+    });
+
+    await renderPage(<ProfilesPage />);
+    const actions = container.querySelector<HTMLButtonElement>("button[aria-label='Actions']");
+    await act(async () => actions!.click());
+    const changeModel = [...container.querySelectorAll<HTMLButtonElement>("[role=menuitem]")].find(
+      (button) => button.textContent?.includes("Change model"),
+    );
+    await act(async () => changeModel!.click());
+    await settle();
+
+    const selects = [...container.querySelectorAll<HTMLButtonElement>("button[role=combobox]")];
+    await chooseOption(selects[0], "Provider A · model-b");
+    await chooseOption(selects[1], "High");
+    const save = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent?.trim() === "Save",
+    );
+    expect(save).toBeDefined();
+    await act(async () => {
+      save!.click();
+      await Promise.resolve();
+    });
+    await settle();
+
+    expect(mockedApi.setProfileModel).not.toHaveBeenCalled();
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledWith(
+      "default",
+      "provider-a",
+      "model-b",
+      "high",
+    );
+  });
+
   it("keeps reasoning editing available when no model choices are configured", async () => {
     mockedApi.getProfiles.mockResolvedValue({
       profiles: [
@@ -469,8 +518,10 @@ describe("ProfilesPage reasoning effort selector", () => {
       ],
     });
     mockedApi.getModelOptions.mockResolvedValue({ providers: [] });
-    mockedApi.setProfileReasoning.mockImplementation(async (_name, effort) => ({
+    mockedApi.setProfileSettings.mockImplementation(async (_name, _provider, _model, effort) => ({
       ok: true,
+      provider: null,
+      model: null,
       reasoning_effort: effort,
     }));
 
@@ -500,13 +551,15 @@ describe("ProfilesPage reasoning effort selector", () => {
     });
     await settle();
     expect(mockedApi.setProfileModel).not.toHaveBeenCalled();
-    expect(mockedApi.setProfileReasoning).toHaveBeenCalledWith("default", "high");
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledWith("default", null, null, "high");
   });
 
   it("saves reasoning for an existing model when model choices are unavailable", async () => {
     mockedApi.getModelOptions.mockResolvedValue({ providers: [] });
-    mockedApi.setProfileReasoning.mockImplementation(async (_name, effort) => ({
+    mockedApi.setProfileSettings.mockImplementation(async (_name, _provider, _model, effort) => ({
       ok: true,
+      provider: null,
+      model: null,
       reasoning_effort: effort,
     }));
 
@@ -537,7 +590,7 @@ describe("ProfilesPage reasoning effort selector", () => {
     await settle();
 
     expect(mockedApi.setProfileModel).not.toHaveBeenCalled();
-    expect(mockedApi.setProfileReasoning).toHaveBeenCalledWith("default", "high");
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledWith("default", null, null, "high");
   });
 
   it.each([
@@ -571,8 +624,10 @@ describe("ProfilesPage reasoning effort selector", () => {
       mockedApi.getModelOptions.mockResolvedValue({
         providers: [{ slug: "provider-a", name: "Provider A", models: ["model-a"] }],
       });
-      mockedApi.setProfileReasoning.mockImplementation(async (_name, effort) => ({
+      mockedApi.setProfileSettings.mockImplementation(async (_name, _provider, _model, effort) => ({
         ok: true,
+        provider: null,
+        model: null,
         reasoning_effort: effort,
       }));
 
@@ -611,7 +666,12 @@ describe("ProfilesPage reasoning effort selector", () => {
       await settle();
 
       expect(mockedApi.setProfileModel).not.toHaveBeenCalled();
-      expect(mockedApi.setProfileReasoning).toHaveBeenCalledWith("default", selectedEffort);
+      expect(mockedApi.setProfileSettings).toHaveBeenCalledWith(
+        "default",
+        null,
+        null,
+        selectedEffort,
+      );
     },
   );
 
@@ -638,8 +698,10 @@ describe("ProfilesPage reasoning effort selector", () => {
       ],
     });
     mockedApi.getModelOptions.mockResolvedValue({ providers: [] });
-    mockedApi.setProfileReasoning.mockResolvedValue({
+    mockedApi.setProfileSettings.mockResolvedValue({
       ok: true,
+      provider: null,
+      model: null,
       reasoning_effort: "",
     });
 
@@ -667,7 +729,7 @@ describe("ProfilesPage reasoning effort selector", () => {
       await Promise.resolve();
     });
     await settle();
-    expect(mockedApi.setProfileReasoning).toHaveBeenCalledWith("default", "");
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledWith("default", null, null, "");
   });
 
   it("persists a profile selection through the profile reasoning endpoint", async () => {
@@ -693,7 +755,7 @@ describe("ProfilesPage reasoning effort selector", () => {
       await Promise.resolve();
     });
     await settle();
-    expect(mockedApi.setProfileReasoning).toHaveBeenCalledWith("default", "high");
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledWith("default", null, null, "high");
   });
 
   it("keeps only the latest profile value when the selector is changed rapidly", async () => {
@@ -720,8 +782,8 @@ describe("ProfilesPage reasoning effort selector", () => {
       await Promise.resolve();
     });
     await settle();
-    expect(mockedApi.setProfileReasoning).toHaveBeenCalledTimes(1);
-    expect(mockedApi.setProfileReasoning).toHaveBeenCalledWith("default", "low");
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledTimes(1);
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledWith("default", null, null, "low");
   });
 
   it("restores the persisted profile effort after the page is remounted", async () => {
@@ -747,9 +809,9 @@ describe("ProfilesPage reasoning effort selector", () => {
       ],
     };
     mockedApi.getProfiles.mockResolvedValue(profileResponse);
-    mockedApi.setProfileReasoning.mockImplementation(async (_name, effort) => {
+    mockedApi.setProfileSettings.mockImplementation(async (_name, _provider, _model, effort) => {
       profileResponse.profiles[0].reasoning_effort = effort;
-      return { ok: true, reasoning_effort: effort };
+      return { ok: true, provider: null, model: null, reasoning_effort: effort };
     });
 
     await renderPage(<ProfilesPage />);
@@ -839,7 +901,7 @@ describe("ProfilesPage reasoning effort selector", () => {
       save!.click();
       await Promise.resolve();
     });
-    expect(mockedApi.setProfileReasoning).toHaveBeenCalledWith("default", "medium");
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledWith("default", null, null, "medium");
   });
 
   it("does not persist an unsaved profile selection after leaving and returning", async () => {
@@ -856,7 +918,7 @@ describe("ProfilesPage reasoning effort selector", () => {
     let selects = [...container.querySelectorAll<HTMLButtonElement>("button[role=combobox]")];
     await chooseOption(selects[1], "High");
     expect(selects[1].textContent).toContain("High");
-    expect(mockedApi.setProfileReasoning).not.toHaveBeenCalled();
+    expect(mockedApi.setProfileSettings).not.toHaveBeenCalled();
 
     act(() => root.unmount());
     container.remove();
@@ -864,7 +926,7 @@ describe("ProfilesPage reasoning effort selector", () => {
     await settle();
 
     expect(container.textContent).toContain("Reasoning effort: provider default");
-    expect(mockedApi.setProfileReasoning).not.toHaveBeenCalled();
+    expect(mockedApi.setProfileSettings).not.toHaveBeenCalled();
     selects = [...container.querySelectorAll<HTMLButtonElement>("button[role=combobox]")];
     expect(selects).toHaveLength(0);
   });

@@ -718,6 +718,25 @@ export const api = {
         body: JSON.stringify({ effort }),
       },
     ),
+  setProfileSettings: (
+    name: string,
+    provider: string | null,
+    model: string | null,
+    effort: string,
+  ) =>
+    fetchJSON<{
+      ok: boolean;
+      provider: string | null;
+      model: string | null;
+      reasoning_effort: string;
+    }>(
+      `/api/profiles/${encodeURIComponent(name)}/settings`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: provider ?? "", model: model ?? "", effort }),
+      },
+    ),
   renameProfile: (name: string, newName: string) =>
     fetchJSON<{ ok: boolean; name: string; path: string }>(
       `/api/profiles/${encodeURIComponent(name)}`,

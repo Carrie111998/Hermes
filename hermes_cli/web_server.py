@@ -15214,6 +15214,12 @@ class ProfileReasoningUpdate(BaseModel):
     effort: str = ""
 
 
+class ProfileSettingsUpdate(BaseModel):
+    provider: str
+    model: str
+    effort: str
+
+
 class ProfileDescribeAuto(BaseModel):
     overwrite: bool = False
 
@@ -15246,25 +15252,61 @@ def _read_profile_reasoning_effort(profile_dir: Path) -> str:
         reset_hermes_home_override(token)
 
 
-def _write_profile_reasoning_effort(profile_dir: Path, effort: str) -> str:
-    """Persist or clear a profile's optional main-agent default."""
+def _write_profile_settings(
+    profile_dir: Path,
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    effort: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Persist profile model and reasoning settings in one config write.
+
+    ``provider`` and ``model`` are both omitted for a reasoning-only update;
+    ``effort`` is omitted for the legacy model-only endpoint. Keeping both
+    mutations inside one scoped load/save makes the combined dashboard save
+    atomic from the profile's point of view.
+    """
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    if (provider is None) != (model is None):
+        raise ValueError("provider and model must be provided together")
 
     token = set_hermes_home_override(str(profile_dir))
     try:
         config = load_config()
-        agent = config.get("agent")
-        if not isinstance(agent, dict):
-            agent = {}
-            config["agent"] = agent
-        if effort:
-            agent["reasoning_effort"] = effort
-        else:
-            agent.pop("reasoning_effort", None)
+        if provider is not None and model is not None:
+            provider, model = _normalize_main_model_assignment(provider, model)
+            config["model"] = _apply_main_model_assignment(
+                config.get("model", {}), provider, model
+            )
+        if effort is not None:
+            agent = config.get("agent")
+            if not isinstance(agent, dict):
+                agent = {}
+                config["agent"] = agent
+            if effort:
+                agent["reasoning_effort"] = effort
+            else:
+                agent.pop("reasoning_effort", None)
         save_config(config)
-        return effort
+        return {
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": effort,
+        }
     finally:
         reset_hermes_home_override(token)
+
+
+def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
+    """Write the main model assignment into a specific profile's config.yaml."""
+    _write_profile_settings(profile_dir, provider=provider, model=model)
+
+
+def _write_profile_reasoning_effort(profile_dir: Path, effort: str) -> str:
+    """Persist or clear a profile's optional main-agent default."""
+    _write_profile_settings(profile_dir, effort=effort)
+    return effort
 
 
 def _profile_to_dict(info) -> Dict[str, Any]:
@@ -15360,27 +15402,6 @@ def _profile_setup_command(name: str) -> str:
     """Return the shell command used to configure a profile in the CLI."""
     _resolve_profile_dir(name)
     return "hermes setup" if name == "default" else f"{name} setup"
-
-
-def _write_profile_model(profile_dir: Path, provider: str, model: str) -> None:
-    """Write the main model assignment into a specific profile's config.yaml.
-
-    Scopes ``load_config``/``save_config`` to ``profile_dir`` via the
-    context-local HERMES_HOME override so the write lands in the target
-    profile's config rather than the dashboard process's active profile.
-    Clears any stale ``base_url`` / ``context_length`` the same way
-    ``POST /api/model/set`` does, since the new model may differ.
-    """
-    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-
-    token = set_hermes_home_override(str(profile_dir))
-    try:
-        provider, model = _normalize_main_model_assignment(provider, model)
-        cfg = load_config()
-        cfg["model"] = _apply_main_model_assignment(cfg.get("model", {}), provider, model)
-        save_config(cfg)
-    finally:
-        reset_hermes_home_override(token)
 
 
 def _write_profile_mcp_servers(profile_dir: Path, servers: List["MCPServerCreate"]) -> int:
@@ -15806,6 +15827,37 @@ async def update_profile_reasoning_endpoint(name: str, body: ProfileReasoningUpd
         _log.exception("PUT /api/profiles/%s/reasoning failed", name)
         raise HTTPException(status_code=500, detail=str(e))
     return {"ok": True, "reasoning_effort": saved}
+
+
+@app.put("/api/profiles/{name}/settings")
+async def update_profile_settings_endpoint(name: str, body: ProfileSettingsUpdate):
+    """Atomically update a profile's model and reasoning settings."""
+    profile_dir = _resolve_profile_dir(name)
+    provider = (body.provider or "").strip()
+    model = (body.model or "").strip()
+    if bool(provider) != bool(model):
+        raise HTTPException(
+            status_code=400,
+            detail="provider and model must be provided together or both be empty",
+        )
+    effort = (body.effort or "").strip().lower()
+    if effort not in _REASONING_EFFORT_OPTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="effort must be one of: "
+            + ", ".join(option or "(inherit)" for option in _REASONING_EFFORT_OPTIONS),
+        )
+    try:
+        saved = _write_profile_settings(
+            profile_dir,
+            provider=provider or None,
+            model=model or None,
+            effort=effort,
+        )
+    except Exception as e:
+        _log.exception("PUT /api/profiles/%s/settings failed", name)
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, **saved}
 
 
 @app.post("/api/profiles/{name}/describe-auto")
