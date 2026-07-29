@@ -23,13 +23,108 @@ def test_localstorage_seed_points_hermes_core():
         {"hermes_base_url": "http://127.0.0.1:8642/v1", "hermes_model": "hermes-agent", "api_key": "test-key"}
     )
     seed = core._localstorage_seed(provider)
-    creds = json.loads(seed["settings/credentials/providers"])
-    assert creds["openai-compatible"]["baseUrl"].endswith("/")
-    assert creds["openai-compatible"]["apiKey"] == "test-key"
-    assert seed["settings/consciousness/active-provider"] == "openai-compatible"
-    assert seed["settings/consciousness/active-model"] == "hermes-agent"
-    assert json.loads(seed["settings/providers/added"])["openai-compatible"] is True
+    creds = seed["credentials_patch"]["openai-compatible"]
+    assert creds["baseUrl"].endswith("/")
+    assert creds["apiKey"] == "test-key"
+    assert seed["flat"]["settings/consciousness/active-provider"] == "openai-compatible"
+    assert seed["flat"]["settings/consciousness/active-model"] == "hermes-agent"
+    assert seed["added_patch"]["openai-compatible"] is True
 
+
+def test_localstorage_seed_includes_irodori_tts(monkeypatch):
+    monkeypatch.setattr(
+        core,
+        "tts_payload",
+        lambda values=None: {
+            "ok": True,
+            "source": "hermes_tts.irodori",
+            "hermes_provider": "irodori-tts",
+            "airi_provider": "openai-compatible-audio-speech",
+            "config": {
+                "apiKey": "local",
+                "baseUrl": "http://127.0.0.1:8088/v1/",
+                "model": "irodori-tts",
+                "voice": "hakua",
+            },
+        },
+    )
+    # Bypass tts_payload monkeypatch path used inside seed builder by passing tts directly.
+    provider = core.provider_payload(
+        {"hermes_base_url": "http://127.0.0.1:8642/v1", "hermes_model": "hermes-agent", "api_key": "k"}
+    )
+    tts = {
+        "ok": True,
+        "airi_provider": "openai-compatible-audio-speech",
+        "config": {
+            "apiKey": "local",
+            "baseUrl": "http://127.0.0.1:8088/v1/",
+            "model": "irodori-tts",
+            "voice": "hakua",
+        },
+    }
+    seed = core._localstorage_seed(provider, tts)
+    assert seed["flat"]["settings/speech/active-provider"] == "openai-compatible-audio-speech"
+    assert seed["flat"]["settings/speech/active-model"] == "irodori-tts"
+    assert seed["flat"]["settings/speech/voice"] == "hakua"
+    speech = seed["credentials_patch"]["openai-compatible-audio-speech"]
+    assert speech["baseUrl"] == "http://127.0.0.1:8088/v1/"
+    assert speech["model"] == "irodori-tts"
+    assert speech["voice"] == "hakua"
+
+
+def test_tts_payload_maps_irodori(monkeypatch):
+    monkeypatch.setattr(core, "_hermes_tts_section", lambda: {"provider": "irodori-tts", "irodori": {}})
+
+    class FakeSettings:
+        base_url = "http://127.0.0.1:8088"
+        model = "irodori-tts"
+        voice = "hakua"
+
+    import sys
+    import types
+
+    fake = types.ModuleType("plugins.irodori_tts.core")
+    fake.settings = lambda tts=None: FakeSettings()
+    monkeypatch.setitem(sys.modules, "plugins.irodori_tts.core", fake)
+    # Also support `from plugins.irodori_tts.core import settings`
+    pkg = types.ModuleType("plugins.irodori_tts")
+    pkg.core = fake
+    monkeypatch.setitem(sys.modules, "plugins.irodori_tts", pkg)
+
+    payload = core.tts_payload({})
+    assert payload["ok"] is True
+    assert payload["airi_provider"] == "openai-compatible-audio-speech"
+    assert payload["config"]["baseUrl"].endswith("/v1/")
+    assert payload["config"]["model"] == "irodori-tts"
+    assert payload["config"]["voice"] == "hakua"
+
+
+def test_readback_matches_requires_consciousness_and_key():
+    seed = {
+        "flat": {
+            "settings/consciousness/active-provider": "openai-compatible",
+            "settings/consciousness/active-model": "hermes-agent",
+            "settings/speech/active-provider": "openai-compatible-audio-speech",
+        }
+    }
+    assert core._readback_matches(
+        seed,
+        {
+            "consciousnessProvider": "openai-compatible",
+            "consciousnessModel": "hermes-agent",
+            "openaiCompatibleHasKey": True,
+            "speechProvider": "openai-compatible-audio-speech",
+        },
+    )
+    assert not core._readback_matches(
+        seed,
+        {
+            "consciousnessProvider": "",
+            "consciousnessModel": "",
+            "openaiCompatibleHasKey": True,
+            "speechProvider": "speech-noop",
+        },
+    )
 
 def test_configure_hermes_writes_provider_file_without_secret(tmp_path: Path, monkeypatch):
     repo = tmp_path / "airi"
@@ -124,7 +219,18 @@ def test_start_already_running_reseeds(monkeypatch):
     monkeypatch.setattr(
         core,
         "_cdp_seed_localstorage",
-        lambda port, seed, wait_s=8.0: {"ok": True, "port": port, "keys": list(seed), "reloaded": True},
+        lambda port, seed, wait_s=8.0: {
+            "ok": True,
+            "port": port,
+            "keys": list((seed.get("flat") or seed).keys()),
+            "reloaded": True,
+            "readback": {
+                "consciousnessProvider": "openai-compatible",
+                "consciousnessModel": "hermes-agent",
+                "openaiCompatibleHasKey": True,
+                "speechProvider": "openai-compatible-audio-speech",
+            },
+        },
     )
     monkeypatch.setattr(
         core,
@@ -183,7 +289,16 @@ def test_start_sets_isolated_userdata_and_cdp(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(
         core,
         "_cdp_seed_localstorage",
-        lambda port, seed, wait_s=60.0: {"ok": True, "port": port, "reloaded": True, "keys": list(seed)},
+        lambda port, seed, wait_s=60.0: {
+            "ok": True,
+            "port": port,
+            "reloaded": True,
+            "keys": list((seed.get("flat") or seed).keys()),
+            "readback": {
+                "consciousnessProvider": "openai-compatible",
+                "openaiCompatibleHasKey": True,
+            },
+        },
     )
     monkeypatch.setattr(core, "_write_state", lambda data: captured.update({"state": data}))
     monkeypatch.setattr(core, "_auth_status", lambda values=None, probe=None: {"ready": True, "api_key_configured": True})

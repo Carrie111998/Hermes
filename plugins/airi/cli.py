@@ -11,11 +11,11 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     subs = subparser.add_subparsers(dest="airi_command")
     subs.add_parser(
         "status",
-        help="Show AIRI worker health + Hermes AI-core auth readiness (safe beside Desktop)",
+        help="Show AIRI worker health + AI-provider/TTS sync readiness (safe beside Desktop)",
     )
     sync = subs.add_parser(
         "sync",
-        help="Wire Hermes Agent API_SERVER_KEY into AIRI openai-compatible credentials",
+        help="Wire Hermes AI core + TTS into AIRI (credentials merge + consciousness/speech CDP seed)",
     )
     sync.add_argument("--base-url", default="", help="Hermes OpenAI base URL (default :8642/v1/)")
     sync.add_argument("--model", default="", help="Model id exposed to AIRI (default hermes-agent)")

@@ -44,7 +44,10 @@ Equivalent agent tools: `airi_sync`, `airi_start`, `airi_restart`, `airi_status`
 2. Write `~/.hermes/airi/hermes-provider.json` (baseUrl **with trailing slash**; raw key not persisted).
 3. Probe `GET {baseUrl}models` with Bearer `API_SERVER_KEY` and report `auth.ready`.
 4. Launch `pnpm dev:tamagotchi` with isolated userData, `--remote-debugging-port=9455`, `--remote-allow-origins=*`.
-5. Seed AIRI renderer localStorage (credentials + consciousness) via CDP, then **reload** so Pinia picks up the keys.
+5. Seed AIRI renderer localStorage via CDP (**merge** credentials — do not replace —
+   set consciousness + speech providers), then **Page.reload** and **readback-verify**.
+   TTS: when Hermes `tts.provider` is `irodori-tts`, seed AIRI
+   `openai-compatible-audio-speech` → `http://127.0.0.1:8088/v1/` (model/voice in credentials).
 
 CDP seeding needs `websocket-client` in the Hermes venv (`uv pip install websocket-client`).
 

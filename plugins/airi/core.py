@@ -299,6 +299,191 @@ def provider_payload(values: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
+def _hermes_tts_section() -> dict[str, Any]:
+    """Read non-secret TTS behaviour from config.yaml (provider + nested sections)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        data = load_config_readonly() or {}
+        tts = data.get("tts") or {}
+        return dict(tts) if isinstance(tts, dict) else {}
+    except Exception:
+        return {}
+
+
+def _probe_http(url: str, timeout: float = 2.0) -> dict[str, Any]:
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return {"ok": 200 <= int(resp.status) < 300, "live": True, "status": int(resp.status), "url": url}
+    except urllib.error.HTTPError as exc:
+        gated = exc.code in {401, 403}
+        return {
+            "ok": False,
+            "live": gated or exc.code < 500,
+            "status": int(exc.code),
+            "url": url,
+            "auth_required": gated,
+        }
+    except Exception as exc:
+        return {"ok": False, "live": False, "url": url, "error": str(exc)}
+
+
+def tts_payload(values: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Map Hermes TTS config → AIRI speech provider seed (no secrets echoed).
+
+    Hermes ``tts.provider: irodori-tts`` → AIRI ``openai-compatible-audio-speech``
+    pointed at the local irodori OpenAI-compatible ``/v1/audio/speech`` server.
+    Stage.vue prefers credentials ``model`` / ``voice`` for that provider id.
+    """
+    values = values or {}
+    tts = _hermes_tts_section()
+    provider = str(
+        values.get("tts_provider")
+        or _cfg().get("tts_provider")
+        or tts.get("provider")
+        or ""
+    ).strip().lower()
+
+    # Optional explicit overrides from plugin config / CLI values.
+    if values.get("tts_base_url") or _cfg().get("tts_base_url"):
+        base = _normalize_base_url(str(values.get("tts_base_url") or _cfg().get("tts_base_url")))
+        model = str(values.get("tts_model") or _cfg().get("tts_model") or "tts-1")
+        voice = str(values.get("tts_voice") or _cfg().get("tts_voice") or "alloy")
+        return {
+            "ok": True,
+            "source": "plugin_override",
+            "hermes_provider": provider or "override",
+            "airi_provider": "openai-compatible-audio-speech",
+            "config": {
+                "apiKey": str(values.get("tts_api_key") or "local"),
+                "baseUrl": base,
+                "model": model,
+                "voice": voice,
+            },
+        }
+
+    if provider in {"irodori-tts", "irodori", "irodori_tts"}:
+        irodori = tts.get("irodori") if isinstance(tts.get("irodori"), dict) else {}
+        try:
+            from plugins.irodori_tts.core import settings as irodori_settings
+
+            cfg = irodori_settings(tts)
+            base = _normalize_base_url(cfg.base_url.rstrip("/") + "/v1")
+            model = str(cfg.model)
+            voice = str(cfg.voice)
+        except Exception:
+            base = _normalize_base_url(
+                str(irodori.get("base_url") or irodori.get("url") or "http://127.0.0.1:8088") + "/v1"
+            )
+            model = str(irodori.get("model") or "irodori-tts")
+            voice = str(irodori.get("voice") or "hakua")
+        return {
+            "ok": True,
+            "source": "hermes_tts.irodori",
+            "hermes_provider": provider,
+            "airi_provider": "openai-compatible-audio-speech",
+            "config": {
+                # irodori is local; AIRI still wants a non-empty apiKey field.
+                "apiKey": "local",
+                "baseUrl": base,
+                "model": model,
+                "voice": voice,
+            },
+        }
+
+    if provider in {"openai", "openai-tts"}:
+        _load_hermes_dotenv()
+        openai_cfg = tts.get("openai") if isinstance(tts.get("openai"), dict) else {}
+        key = (
+            str(values.get("tts_api_key") or "").strip()
+            or str(os.environ.get("VOICE_TOOLS_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip()
+            or "local"
+        )
+        return {
+            "ok": bool(key and key != "local"),
+            "source": "hermes_tts.openai",
+            "hermes_provider": provider,
+            "airi_provider": "openai-audio-speech",
+            "config": {
+                "apiKey": key,
+                "baseUrl": _normalize_base_url(
+                    str(openai_cfg.get("base_url") or "https://api.openai.com/v1/")
+                ),
+                "model": str(openai_cfg.get("model") or "gpt-4o-mini-tts"),
+                "voice": str(openai_cfg.get("voice") or "alloy"),
+            },
+        }
+
+    if provider in {"edge", "edge-tts"}:
+        # AIRI has no Edge TTS provider; keep speech-noop and report honestly.
+        return {
+            "ok": False,
+            "source": "hermes_tts.edge",
+            "hermes_provider": provider,
+            "airi_provider": "speech-noop",
+            "config": {},
+            "hint": "Hermes edge TTS has no AIRI counterpart; set tts.provider to irodori-tts",
+        }
+
+    return {
+        "ok": False,
+        "source": "unconfigured",
+        "hermes_provider": provider or None,
+        "airi_provider": "speech-noop",
+        "config": {},
+        "hint": "Set tts.provider (irodori-tts recommended) in ~/.hermes/config.yaml",
+    }
+
+
+def _tts_status(values: dict[str, Any] | None = None) -> dict[str, Any]:
+    """TTS sync readiness for status — never echoes secrets."""
+    values = values or {}
+    payload = tts_payload(values)
+    cfg = payload.get("config") or {}
+    base = str(cfg.get("baseUrl") or "")
+    probe: dict[str, Any] = {}
+    if base and payload.get("airi_provider") not in {None, "speech-noop"}:
+        # irodori exposes /health on the host root (not under /v1).
+        root = base.rstrip("/")
+        if root.endswith("/v1"):
+            root = root[:-3]
+        probe = _probe_http(root.rstrip("/") + "/health")
+        if not probe.get("live"):
+            probe = _probe_http(base.rstrip("/") + "/models")
+    ready = bool(
+        payload.get("ok")
+        and payload.get("airi_provider") not in {None, "speech-noop"}
+        and cfg.get("baseUrl")
+        and cfg.get("model")
+    )
+    return {
+        "ready": ready,
+        "synced_provider": payload.get("airi_provider"),
+        "hermes_provider": payload.get("hermes_provider"),
+        "source": payload.get("source"),
+        "base_url": base or None,
+        "model": cfg.get("model"),
+        "voice": cfg.get("voice"),
+        "server_live": bool(probe.get("live") or probe.get("ok")) if probe else None,
+        "server_status": probe.get("status") if probe else None,
+        "hint": None if ready else payload.get("hint"),
+    }
+
+
+def _provider_runtime_status(values: dict[str, Any] | None = None) -> dict[str, Any]:
+    """AI-provider sync readiness (auth + expected consciousness keys)."""
+    values = values or {}
+    auth = _auth_status(values)
+    return {
+        "ready": bool(auth.get("ready")),
+        "definition_id": "openai-compatible",
+        "base_url": _base_url(values),
+        "model": _model(values),
+        "auth": auth,
+    }
+
+
 def configure_hermes(values: dict[str, Any] | None = None, **_: Any) -> str:
     values = values or {}
     repo = _repo(values)
@@ -314,33 +499,56 @@ def configure_hermes(values: dict[str, Any] | None = None, **_: Any) -> str:
 
     HERMES_AIRI_HOME.mkdir(parents=True, exist_ok=True)
     provider = provider_payload(values)
+    tts = tts_payload(values)
     # Never persist the raw API key on disk; CDP seed keeps it in-memory only.
     disk = json.loads(json.dumps(provider))
     disk["config"].pop("apiKey", None)
     disk["config"]["apiKeyEnv"] = "API_SERVER_KEY"
     path = HERMES_AIRI_HOME / "hermes-provider.json"
     path.write_text(json.dumps(disk, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    tts_disk = json.loads(json.dumps(tts))
+    if isinstance(tts_disk.get("config"), dict):
+        tts_disk["config"].pop("apiKey", None)
+        if tts.get("ok"):
+            tts_disk["config"]["apiKeyEnv"] = "local-or-VOICE_TOOLS_OPENAI_KEY"
+    tts_path = HERMES_AIRI_HOME / "hermes-tts.json"
+    tts_path.write_text(json.dumps(tts_disk, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    seed = _localstorage_seed(provider, tts)
     return _json(
         {
             "ok": True,
             "provider_file": str(path),
+            "tts_file": str(tts_path),
             "provider": disk,
+            "tts": tts_disk,
             "localstorage_seed": {
-                k: ("<redacted>" if "credentials" in k else v)
-                for k, v in _localstorage_seed(provider).items()
+                "flat": {
+                    k: ("<redacted>" if "hint" in k else v)
+                    for k, v in (seed.get("flat") or {}).items()
+                },
+                "credentials_patch_keys": list((seed.get("credentials_patch") or {}).keys()),
+                "added_patch": seed.get("added_patch"),
             },
             "auth": _auth_status(values),
+            "tts_status": _tts_status(values),
         }
     )
 
 
-def _localstorage_seed(provider: dict[str, Any]) -> dict[str, str]:
-    """Keys consumed by AIRI stage-ui Pinia (legacy credentials + consciousness)."""
+def _localstorage_seed(provider: dict[str, Any], tts: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build the AIRI renderer seed plan consumed by CDP (merge-safe).
+
+    AIRI consciousness reads ``settings/consciousness/*`` + credentials.
+    Speech (openai-compatible-audio-speech) prefers credentials ``model``/``voice``.
+    Credentials must be *merged* — a full replace races Pinia defaults and drops
+    other provider stubs (and historically left consciousness empty after reload).
+    """
     cfg = provider.get("config") or {}
     base = str(cfg.get("baseUrl") or "").rstrip("/") + "/"
-    model = str(cfg.get("model") or "hermes")
+    model = str(cfg.get("model") or "hermes-agent")
     api_key = str(cfg.get("apiKey") or "hermes-local")
-    # Stable instance id so re-seeds update the same catalog row.
     instance_id = "hermes-agent-openai-compatible"
     catalog = {
         instance_id: {
@@ -352,17 +560,51 @@ def _localstorage_seed(provider: dict[str, Any]) -> dict[str, str]:
             "validationBypassed": True,
         }
     }
-    return {
-        "settings/credentials/providers": json.dumps(
-            {"openai-compatible": {"apiKey": api_key, "baseUrl": base}},
-            ensure_ascii=False,
-        ),
-        "settings/providers/added": json.dumps({"openai-compatible": True}),
+
+    cred_patch: dict[str, dict[str, Any]] = {
+        "openai-compatible": {"apiKey": api_key, "baseUrl": base},
+    }
+    added_patch: dict[str, bool] = {"openai-compatible": True}
+    flat: dict[str, str] = {
         "settings/consciousness/active-provider": "openai-compatible",
         "settings/consciousness/active-model": model,
         "onboarding/completed": "true",
-        # Hint for newer catalog UIs; IndexedDB remains authoritative for that path.
         "hermes/airi/inference-providers-hint": json.dumps(catalog, ensure_ascii=False),
+    }
+
+    tts = tts or {}
+    tts_cfg = tts.get("config") if isinstance(tts.get("config"), dict) else {}
+    airi_speech = str(tts.get("airi_provider") or "speech-noop")
+    if tts.get("ok") and airi_speech not in {"", "speech-noop"} and tts_cfg.get("baseUrl"):
+        speech_base = str(tts_cfg.get("baseUrl")).rstrip("/") + "/"
+        speech_entry = {
+            "apiKey": str(tts_cfg.get("apiKey") or "local"),
+            "baseUrl": speech_base,
+        }
+        if tts_cfg.get("model"):
+            speech_entry["model"] = str(tts_cfg["model"])
+        if tts_cfg.get("voice"):
+            speech_entry["voice"] = str(tts_cfg["voice"])
+        cred_patch[airi_speech] = speech_entry
+        added_patch[airi_speech] = True
+        flat["settings/speech/active-provider"] = airi_speech
+        flat["settings/speech/active-model"] = str(tts_cfg.get("model") or "")
+        if tts_cfg.get("voice"):
+            flat["settings/speech/voice"] = str(tts_cfg["voice"])
+        # Unmute assistant speech when we deliberately wire a real TTS backend.
+        flat["settings/speech/output-muted"] = "false"
+
+    return {
+        "flat": flat,
+        "credentials_patch": cred_patch,
+        "added_patch": added_patch,
+        "catalog": catalog,
+        # Legacy flat view used by older tests / status redaction.
+        "legacy_keys": {
+            **flat,
+            "settings/credentials/providers": json.dumps(cred_patch, ensure_ascii=False),
+            "settings/providers/added": json.dumps(added_patch, ensure_ascii=False),
+        },
     }
 
 
@@ -423,12 +665,167 @@ def _cdp_call(ws: Any, msg_id: int, method: str, params: dict[str, Any] | None =
     return {"error": {"message": f"timeout waiting for CDP id={msg_id}"}}
 
 
-def _cdp_seed_localstorage(port: int, seed: dict[str, str], wait_s: float = 45.0) -> dict[str, Any]:
+def _cdp_readback_expr() -> str:
+    return """
+(() => {
+  const get = (k) => localStorage.getItem(k);
+  let creds = {};
+  try { creds = JSON.parse(get('settings/credentials/providers') || '{}') || {}; } catch (e) {}
+  const oc = creds['openai-compatible'] || {};
+  const sp = creds['openai-compatible-audio-speech'] || creds['openai-audio-speech'] || {};
+  return {
+    consciousnessProvider: get('settings/consciousness/active-provider') || '',
+    consciousnessModel: get('settings/consciousness/active-model') || '',
+    speechProvider: get('settings/speech/active-provider') || '',
+    speechModel: get('settings/speech/active-model') || '',
+    speechVoice: get('settings/speech/voice') || '',
+    openaiCompatibleBase: oc.baseUrl || '',
+    openaiCompatibleHasKey: !!(oc.apiKey && String(oc.apiKey).length > 0),
+    speechBase: sp.baseUrl || '',
+    speechHasModel: !!(sp.model && String(sp.model).length > 0),
+    speechCredVoice: sp.voice || '',
+  };
+})()
+"""
+
+
+def _cdp_seed_expr(seed: dict[str, Any]) -> str:
+    """Merge-safe localStorage seed (does not clobber unrelated provider stubs)."""
+    flat = seed.get("flat") or {}
+    cred_patch = seed.get("credentials_patch") or {}
+    added_patch = seed.get("added_patch") or {}
+    catalog = seed.get("catalog") or {}
+    return f"""
+(() => {{
+  const credPatch = {json.dumps(cred_patch, ensure_ascii=False)};
+  const addedPatch = {json.dumps(added_patch, ensure_ascii=False)};
+  const flat = {json.dumps(flat, ensure_ascii=False)};
+  const catalog = {json.dumps(catalog, ensure_ascii=False)};
+
+  const mergeJson = (key, patch) => {{
+    let cur = {{}};
+    try {{ cur = JSON.parse(localStorage.getItem(key) || '{{}}') || {{}}; }} catch (e) {{ cur = {{}}; }}
+    if (key === 'settings/credentials/providers') {{
+      for (const [id, cfg] of Object.entries(patch)) {{
+        cur[id] = Object.assign({{}}, cur[id] || {{}}, cfg);
+      }}
+    }} else {{
+      Object.assign(cur, patch);
+    }}
+    localStorage.setItem(key, JSON.stringify(cur));
+    return cur;
+  }};
+
+  mergeJson('settings/credentials/providers', credPatch);
+  mergeJson('settings/providers/added', addedPatch);
+  for (const [k, v] of Object.entries(flat)) {{
+    localStorage.setItem(k, String(v));
+  }}
+
+  // Best-effort IndexedDB upsert for unstorage mount local:providers (airi-local).
+  const idbPromise = new Promise((resolve) => {{
+    try {{
+      const openReq = indexedDB.open('keyval-store');
+      openReq.onerror = () => resolve({{ idb: 'open-failed' }});
+      openReq.onsuccess = () => {{
+        try {{
+          const db = openReq.result;
+          const stores = Array.from(db.objectStoreNames || []);
+          if (!stores.includes('keyval')) {{
+            db.close();
+            resolve({{ idb: 'no-keyval', stores }});
+            return;
+          }}
+          const tx = db.transaction('keyval', 'readwrite');
+          const store = tx.objectStore('keyval');
+          // unstorage indexedb driver keys are typically base-prefixed.
+          const candidates = ['airi-local:providers', 'providers', 'local:providers'];
+          let wrote = false;
+          const tryWrite = (idx) => {{
+            if (idx >= candidates.length) {{
+              db.close();
+              resolve({{ idb: wrote ? 'wrote' : 'missed', stores }});
+              return;
+            }}
+            const key = candidates[idx];
+            const getReq = store.get(key);
+            getReq.onsuccess = () => {{
+              const existing = getReq.result;
+              let next = catalog;
+              if (existing && typeof existing === 'object' && !Array.isArray(existing)) {{
+                next = Object.assign({{}}, existing, catalog);
+              }}
+              const putReq = store.put(next, key);
+              putReq.onsuccess = () => {{ wrote = true; tryWrite(idx + 1); }};
+              putReq.onerror = () => tryWrite(idx + 1);
+            }};
+            getReq.onerror = () => tryWrite(idx + 1);
+          }};
+          tryWrite(0);
+        }} catch (e) {{
+          resolve({{ idb: String(e) }});
+        }}
+      }};
+    }} catch (e) {{
+      resolve({{ idb: String(e) }});
+    }}
+  }});
+
+  return idbPromise.then((idb) => ({{
+    idb,
+    consciousnessProvider: localStorage.getItem('settings/consciousness/active-provider'),
+    consciousnessModel: localStorage.getItem('settings/consciousness/active-model'),
+    speechProvider: localStorage.getItem('settings/speech/active-provider'),
+    speechModel: localStorage.getItem('settings/speech/active-model'),
+  }}));
+}})()
+"""
+
+
+def _readback_matches(seed: dict[str, Any], readback: dict[str, Any]) -> bool:
+    flat = seed.get("flat") or {}
+    want_provider = str(flat.get("settings/consciousness/active-provider") or "openai-compatible")
+    want_model = str(flat.get("settings/consciousness/active-model") or "")
+    if str(readback.get("consciousnessProvider") or "") != want_provider:
+        return False
+    if want_model and str(readback.get("consciousnessModel") or "") != want_model:
+        return False
+    if not readback.get("openaiCompatibleHasKey"):
+        return False
+    want_speech = flat.get("settings/speech/active-provider")
+    if want_speech and str(readback.get("speechProvider") or "") != str(want_speech):
+        return False
+    return True
+
+
+def _cdp_eval_value(reply: dict[str, Any]) -> Any:
+    """Unwrap CDP Runtime.evaluate returnByValue payload."""
+    result = (reply.get("result") or {}).get("result")
+    if isinstance(result, dict) and "value" in result:
+        return result.get("value")
+    return result
+
+
+def _cdp_seed_localstorage(port: int, seed: dict[str, Any], wait_s: float = 45.0) -> dict[str, Any]:
     """Seed AIRI renderer localStorage through Electron remote debugging, then reload.
 
-    Same-document ``localStorage.setItem`` does not update VueUse/Pinia bindings,
-    so a reload is required for consciousness + credentials to take effect.
+    Merge credentials (do not replace). Use CDP ``Page.reload`` (not in-page
+    ``location.reload`` alone) and verify keys after reload; re-seed once if
+    Pinia/auth wiped consciousness.
     """
+    # Accept legacy flat dicts from older callers/tests.
+    if "flat" not in seed and any(str(k).startswith("settings/") for k in seed):
+        seed = {
+            "flat": {
+                k: v
+                for k, v in seed.items()
+                if k not in {"credentials_patch", "added_patch", "catalog"}
+            },
+            "credentials_patch": {},
+            "added_patch": {},
+            "catalog": {},
+        }
+
     deadline = time.time() + wait_s
     page = None
     while time.time() < deadline:
@@ -448,43 +845,7 @@ def _cdp_seed_localstorage(port: int, seed: dict[str, str], wait_s: float = 45.0
             "hint": "uv pip install websocket-client",
         }
 
-    ws_url = str(page["webSocketDebuggerUrl"])
-    # Navigate to chat first so origin allows localStorage, then seed, then reload.
-    nav_expr = (
-        "(() => { try { if (!String(location.hash||'').includes('/chat')) "
-        "{ location.hash = '#/chat'; } return location.href; } catch (e) "
-        "{ return String(e); } })()"
-    )
-    seed_parts = [f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)});" for k, v in seed.items()]
-    # Also mirror into IndexedDB for unstorage `local:providers` when available.
-    catalog_hint = seed.get("hermes/airi/inference-providers-hint") or "{}"
-    idb_expr = f"""
-(() => {{
-  const catalog = {catalog_hint};
-  return new Promise((resolve) => {{
-    try {{
-      const req = indexedDB.open('keyval-store');
-      req.onerror = () => resolve({{idb: 'open-failed'}});
-      req.onsuccess = () => {{
-        try {{
-          const db = req.result;
-          // unstorage indexeddb driver may use different DB names; best-effort only.
-          resolve({{idb: 'opened', stores: Array.from(db.objectStoreNames||[])}});
-        }} catch (e) {{ resolve({{idb: String(e)}}); }}
-      }};
-    }} catch (e) {{ resolve({{idb: String(e)}}); }}
-  }});
-}})()
-"""
-    seed_expr = (
-        "(() => {"
-        + "".join(seed_parts)
-        + " return { keys: Object.keys(localStorage).filter(k => "
-        "k.startsWith('settings/') || k.startsWith('onboarding/') || k.startsWith('hermes/')), "
-        "activeProvider: localStorage.getItem('settings/consciousness/active-provider'), "
-        "hasCreds: !!localStorage.getItem('settings/credentials/providers') }; })()"
-    )
-    try:
+    def _run_once(ws_url: str) -> dict[str, Any]:
         ws = websocket.create_connection(ws_url, timeout=8)
         try:
             msg_id = 1
@@ -492,44 +853,91 @@ def _cdp_seed_localstorage(port: int, seed: dict[str, str], wait_s: float = 45.0
                 ws,
                 msg_id,
                 "Runtime.evaluate",
-                {"expression": nav_expr, "returnByValue": True},
+                {
+                    "expression": (
+                        "(() => { try { if (!String(location.hash||'').includes('/chat')) "
+                        "{ location.hash = '#/chat'; } return location.href; } catch (e) "
+                        "{ return String(e); } })()"
+                    ),
+                    "returnByValue": True,
+                },
             )
             msg_id += 1
-            time.sleep(0.4)
+            time.sleep(0.35)
             seeded = _cdp_call(
                 ws,
                 msg_id,
                 "Runtime.evaluate",
-                {"expression": seed_expr, "returnByValue": True},
+                {
+                    "expression": _cdp_seed_expr(seed),
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                },
             )
             msg_id += 1
-            idb = _cdp_call(
-                ws,
-                msg_id,
-                "Runtime.evaluate",
-                {"expression": idb_expr, "awaitPromise": True, "returnByValue": True},
-            )
+            _cdp_call(ws, msg_id, "Page.enable", {})
             msg_id += 1
-            # Reload so Pinia/useLocalStorage rehydrates from the seeded keys.
-            reloaded = _cdp_call(
+            reloaded = _cdp_call(ws, msg_id, "Page.reload", {"ignoreCache": False})
+            return {
+                "nav": _cdp_eval_value(nav),
+                "seed": _cdp_eval_value(seeded),
+                "reloaded": not bool(reloaded.get("error")),
+            }
+        finally:
+            ws.close()
+
+    def _readback_from(ws_url: str) -> dict[str, Any]:
+        ws = websocket.create_connection(ws_url, timeout=8)
+        try:
+            reply = _cdp_call(
                 ws,
-                msg_id,
+                1,
                 "Runtime.evaluate",
-                {"expression": "location.reload()", "returnByValue": True},
+                {"expression": _cdp_readback_expr(), "returnByValue": True},
             )
         finally:
             ws.close()
-        seed_result = (seeded.get("result") or {})
-        ok = not bool(seed_result.get("exceptionDetails"))
+        value = _cdp_eval_value(reply)
+        return value if isinstance(value, dict) else {}
+
+    try:
+        first = _run_once(str(page["webSocketDebuggerUrl"]))
+        time.sleep(2.5)
+        page2 = _cdp_pick_page(_cdp_targets(port)) or page
+        readback = _readback_from(str(page2["webSocketDebuggerUrl"]))
+        ok = _readback_matches(seed, readback)
+        reseed_pass = False
+        if not ok:
+            page3 = _cdp_pick_page(_cdp_targets(port)) or page2
+            _run_once(str(page3["webSocketDebuggerUrl"]))
+            time.sleep(2.5)
+            page4 = _cdp_pick_page(_cdp_targets(port)) or page3
+            readback = _readback_from(str(page4["webSocketDebuggerUrl"]))
+            ok = _readback_matches(seed, readback)
+            reseed_pass = True
+
         return {
             "ok": ok,
             "port": port,
-            "target": page.get("url"),
-            "keys": list(seed.keys()),
-            "reloaded": not bool((reloaded.get("result") or {}).get("exceptionDetails")),
-            "nav": (nav.get("result") or {}).get("result"),
-            "seed": (seed_result.get("result") if ok else seeded),
-            "idb_probe": (idb.get("result") or {}).get("result"),
+            "target": (page2 or page).get("url"),
+            "keys": list((seed.get("flat") or {}).keys()),
+            "reloaded": bool(first.get("reloaded")),
+            "nav": first.get("nav"),
+            "seed": first.get("seed"),
+            "readback": {
+                "consciousnessProvider": readback.get("consciousnessProvider"),
+                "consciousnessModel": readback.get("consciousnessModel"),
+                "speechProvider": readback.get("speechProvider"),
+                "speechModel": readback.get("speechModel"),
+                "openaiCompatibleHasKey": readback.get("openaiCompatibleHasKey"),
+                "speechBase": readback.get("speechBase"),
+            },
+            "reseeding": reseed_pass,
+            "hint": (
+                None
+                if ok
+                else "CDP seed wrote keys but post-reload readback mismatched — re-run hermes airi sync"
+            ),
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc), "port": port, "target": page.get("url")}
@@ -604,8 +1012,13 @@ def _ensure_rgba_icon(repo: Path) -> dict[str, Any]:
     return result
 
 
+def _build_seed(values: dict[str, Any] | None = None) -> dict[str, Any]:
+    values = values or {}
+    return _localstorage_seed(provider_payload(values), tts_payload(values))
+
+
 def sync(values: dict[str, Any] | None = None, **_: Any) -> str:
-    """One-shot: resolve live Hermes OpenAI core + write provider template."""
+    """One-shot: resolve live Hermes OpenAI core + write provider/TTS templates + CDP seed."""
     values = dict(values or {})
     resolved = _resolve_live_core(values)
     values["hermes_base_url"] = resolved["base_url"]
@@ -614,14 +1027,22 @@ def sync(values: dict[str, Any] | None = None, **_: Any) -> str:
         return _json(cfg_result)
     probe = resolved.get("probe") or (resolved.get("probes") or [None])[-1] or {}
     auth = _auth_status(values, probe=probe)
-    # If worker already running, push credentials again.
+    tts_stat = _tts_status(values)
+    provider_stat = _provider_runtime_status(values)
+    # If worker already running, push credentials + TTS again.
     reseed: dict[str, Any] | None = None
     state = _read_state()
     if _pid_alive(int(state.get("pid") or 0)):
         cdp_port = int(state.get("cdp_port") or DEFAULT_CDP_PORT)
-        provider = provider_payload(values)
-        reseed = _cdp_seed_localstorage(cdp_port, _localstorage_seed(provider), wait_s=10.0)
-        updated = {**state, "cdp_seed": reseed, "hermes_base_url": values["hermes_base_url"], "auth": auth}
+        reseed = _cdp_seed_localstorage(cdp_port, _build_seed(values), wait_s=10.0)
+        updated = {
+            **state,
+            "cdp_seed": reseed,
+            "hermes_base_url": values["hermes_base_url"],
+            "auth": auth,
+            "tts": tts_stat,
+            "provider_sync": provider_stat,
+        }
         _write_state(updated)
     return _json(
         {
@@ -629,15 +1050,18 @@ def sync(values: dict[str, Any] | None = None, **_: Any) -> str:
             "synced": True,
             "worker_role": WORKER_ROLE,
             "provider_file": cfg_result.get("provider_file"),
+            "tts_file": cfg_result.get("tts_file"),
             "hermes_base_url": resolved["base_url"],
             "hermes_model": _model(values),
             "hermes_probe": probe,
             "hermes_probes": resolved.get("probes"),
             "auth": auth,
+            "provider": provider_stat,
+            "tts": tts_stat,
             "cdp_reseed": reseed,
             "architecture": (
                 "AIRI=Hermes process worker (VRM/TTS/UI); "
-                "Hermes api_server=AI core; plugin=supervisor+auth+OSC"
+                "Hermes api_server=AI core; plugin=supervisor+auth+TTS sync+OSC"
             ),
             "next": (
                 ["hermes airi start"]
@@ -683,7 +1107,19 @@ def _worker_health(state: dict[str, Any], values: dict[str, Any] | None = None) 
     page = _cdp_pick_page(cdp_pages) if cdp_pages else None
     probe = _probe_hermes(_base_url(values), api_key=_api_key(values))
     auth = _auth_status(values, probe=probe)
+    tts_stat = _tts_status(values)
+    provider_stat = _provider_runtime_status(values)
     seed = state.get("cdp_seed") if isinstance(state.get("cdp_seed"), dict) else {}
+    readback = seed.get("readback") if isinstance(seed.get("readback"), dict) else {}
+    provider_seeded = None
+    if readback:
+        provider_seeded = bool(
+            readback.get("consciousnessProvider") == "openai-compatible"
+            and readback.get("openaiCompatibleHasKey")
+        )
+    tts_seeded = None
+    if readback and tts_stat.get("synced_provider") not in {None, "speech-noop"}:
+        tts_seeded = readback.get("speechProvider") == tts_stat.get("synced_provider")
     healthy = bool(
         running
         and page
@@ -699,6 +1135,8 @@ def _worker_health(state: dict[str, Any], values: dict[str, Any] | None = None) 
         "cdp_page": (page or {}).get("url"),
         "cdp_targets": len(cdp_pages),
         "auth": auth,
+        "provider": {**provider_stat, "cdp_seeded": provider_seeded},
+        "tts": {**tts_stat, "cdp_seeded": tts_seeded},
         "hermes_probe": {
             "live": probe.get("live") or probe.get("ok"),
             "auth_ok": probe.get("auth_ok"),
@@ -707,6 +1145,7 @@ def _worker_health(state: dict[str, Any], values: dict[str, Any] | None = None) 
             "error": probe.get("error"),
         },
         "last_cdp_seed_ok": seed.get("ok"),
+        "last_cdp_readback": readback or None,
         "state_file": str(_state_file()),
         "concurrent_with_hermes_desktop": CONCURRENT_WITH_DESKTOP,
         "isolation": {
@@ -739,8 +1178,12 @@ def status(values: dict[str, Any] | None = None, **_: Any) -> str:
             "hermes_model": _model(values),
             "hermes_probe": health.get("hermes_probe"),
             "auth": health.get("auth"),
+            "provider": health.get("provider"),
+            "tts": health.get("tts"),
             "provider_file": str(HERMES_AIRI_HOME / "hermes-provider.json"),
             "provider_file_exists": (HERMES_AIRI_HOME / "hermes-provider.json").is_file(),
+            "tts_file": str(HERMES_AIRI_HOME / "hermes-tts.json"),
+            "tts_file_exists": (HERMES_AIRI_HOME / "hermes-tts.json").is_file(),
             "airi_pid": health.get("pid"),
             "airi_running": health.get("running"),
             "cdp_port": health.get("cdp_port"),
@@ -759,7 +1202,7 @@ def status(values: dict[str, Any] | None = None, **_: Any) -> str:
             },
             "architecture": (
                 "AIRI=Hermes process worker; Hermes api_server=AI core; "
-                "plugin=supervisor+auth sync+local OSC"
+                "plugin=supervisor+auth+TTS sync+local OSC"
             ),
         }
     )
@@ -767,14 +1210,16 @@ def status(values: dict[str, Any] | None = None, **_: Any) -> str:
 
 def _seed_running_worker(values: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     cdp_port = int(state.get("cdp_port") or DEFAULT_CDP_PORT)
-    provider = provider_payload(values)
-    seed = _cdp_seed_localstorage(cdp_port, _localstorage_seed(provider), wait_s=8.0)
+    seed = _cdp_seed_localstorage(cdp_port, _build_seed(values), wait_s=8.0)
     auth = _auth_status(values)
+    tts_stat = _tts_status(values)
     updated = {
         **state,
         "cdp_seed": seed,
         "hermes_base_url": _base_url(values),
         "auth": auth,
+        "tts": tts_stat,
+        "provider_sync": _provider_runtime_status(values),
         "worker_role": WORKER_ROLE,
         "last_sync_at": time.time(),
     }
@@ -856,9 +1301,9 @@ def start(values: dict[str, Any] | None = None, **_: Any) -> str:
             }
         )
 
-    provider = provider_payload(values)
-    seed = _cdp_seed_localstorage(cdp_port, _localstorage_seed(provider), wait_s=60.0)
+    seed = _cdp_seed_localstorage(cdp_port, _build_seed(values), wait_s=60.0)
     auth = _auth_status(values)
+    tts_stat = _tts_status(values)
     state = {
         "pid": proc.pid,
         "command": command,
@@ -869,6 +1314,8 @@ def start(values: dict[str, Any] | None = None, **_: Any) -> str:
         "hermes_base_url": _base_url(values),
         "cdp_seed": seed,
         "auth": auth,
+        "tts": tts_stat,
+        "provider_sync": _provider_runtime_status(values),
         "worker_role": WORKER_ROLE,
         "icon": icon_fix,
         "last_sync_at": time.time(),
