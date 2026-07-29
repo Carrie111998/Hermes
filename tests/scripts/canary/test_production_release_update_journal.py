@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import inspect
 import os
 import stat
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, cast
 from unittest.mock import patch
 
 import pytest
 
 from scripts.canary import production_release_update_journal as journal_module
 from scripts.canary import production_release_update_runtime as runtime
+from tests.scripts.canary.test_production_release_update_contract import (
+    _documents,
+)
 from tests.scripts.canary.test_production_release_update_runtime import (
     FakeActions,
     _authority_record as _runtime_authority_record,
@@ -88,10 +92,60 @@ def _configured(
     return journal, intent, transaction
 
 
+def _existing(
+    transaction: Path,
+    *,
+    authority_record: Mapping[str, Any] | None = None,
+    xattr_reader: journal_module._XattrReader | None = None,
+) -> journal_module.ReleaseUpdateJournal:
+    return journal_module.ReleaseUpdateJournal._open_existing_for_test(
+        transaction,
+        authority_record=authority_record or _authority_record(),
+        xattr_reader=xattr_reader,
+    )
+
+
+def _other_authority_record() -> Mapping[str, Any]:
+    _private, trusted, plan, _approval, publication = _documents()
+    return runtime.build_authority_record(
+        publication=publication,
+        trusted_predecessor=trusted,
+        expected_predecessor_trust_sha256=str(trusted["trust_sha256"]),
+        predecessor_current_receipt_sha256=str(
+            plan["predecessor_activation_receipt_sha256"]
+        ),
+    )
+
+
+def _filesystem_snapshot(root: Path) -> tuple[object, ...]:
+    snapshot: list[object] = []
+    for path in sorted(root.rglob("*")):
+        status = path.lstat()
+        payload: bytes | str | None = None
+        if stat.S_ISREG(status.st_mode):
+            payload = path.read_bytes()
+        elif stat.S_ISLNK(status.st_mode):
+            payload = os.readlink(path)
+        snapshot.append(
+            (
+                str(path.relative_to(root)),
+                stat.S_IFMT(status.st_mode),
+                stat.S_IMODE(status.st_mode),
+                status.st_nlink,
+                payload,
+            )
+        )
+    return tuple(snapshot)
+
+
 def _manual_transaction(path: Path) -> None:
     path.mkdir(mode=journal_module.DIRECTORY_MODE, exist_ok=True)
     path.chmod(journal_module.DIRECTORY_MODE)
-    os.chown(path, os.geteuid(), path.parent.stat().st_gid)
+    os.chown(
+        path,
+        os.geteuid(),  # windows-footgun: ok
+        path.parent.stat().st_gid,
+    )
 
 
 def test_nonroot_test_mode_pins_owner_private_parent_group(
@@ -471,6 +525,7 @@ def test_linked_publication_recovery_retries_every_durable_boundary(
 @pytest.mark.parametrize(
     "boundary",
     (
+        "recovery_uncommitted_pending_binding_validated",
         "recovery_uncommitted_pending_removed",
         "recovery_uncommitted_pending_cleanup_fsynced",
     ),
@@ -885,9 +940,420 @@ def test_transaction_parent_path_swap_is_detected_before_publication(
 def test_public_production_constructor_exposes_no_path_or_root_override(
     tmp_path: Path,
 ) -> None:
+    constructor = cast(
+        Callable[..., Any],
+        journal_module.ReleaseUpdateJournal,
+    )
     with pytest.raises(TypeError):
-        journal_module.ReleaseUpdateJournal(
+        constructor(
             (tmp_path / "transaction").resolve(),
             authority_record=_authority_record(),
             require_root=True,
         )
+
+
+def test_public_existing_only_mode_has_no_path_root_or_clock_override() -> None:
+    assert list(
+        inspect.signature(
+            journal_module.ReleaseUpdateJournal.open_existing
+        ).parameters
+    ) == ["authority_record"]
+
+    open_existing = cast(
+        Callable[..., Any],
+        journal_module.ReleaseUpdateJournal.open_existing,
+    )
+    with pytest.raises(TypeError):
+        open_existing(
+            authority_record=_authority_record(),
+            transaction_directory=Path("/tmp/not-production"),
+            require_root=False,
+            now_unix=NOW,
+        )
+
+
+def test_public_existing_only_mode_is_root_and_fixed_path_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(journal_module.sys, "platform", "linux")
+    monkeypatch.setattr(journal_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(journal_module.os, "getegid", lambda: 0)
+
+    existing = journal_module.ReleaseUpdateJournal.open_existing(
+        authority_record=_authority_record(),
+    )
+
+    assert existing.transaction_directory == (
+        journal_module.PRODUCTION_JOURNAL_ROOT
+        / str(_intent()["intent_sha256"])
+    )
+
+    monkeypatch.setattr(journal_module.os, "geteuid", lambda: 1)
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_root_required$",
+    ):
+        journal_module.ReleaseUpdateJournal.open_existing(
+            authority_record=_authority_record(),
+        )
+
+
+def test_public_existing_only_missing_root_is_not_found_and_not_created(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    production_root = (tmp_path / "absent-production-root").resolve()
+    monkeypatch.setattr(
+        journal_module,
+        "PRODUCTION_JOURNAL_ROOT",
+        production_root,
+    )
+    monkeypatch.setattr(journal_module.sys, "platform", "linux")
+    monkeypatch.setattr(journal_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(journal_module.os, "getegid", lambda: 0)
+    before = _filesystem_snapshot(tmp_path)
+
+    existing = journal_module.ReleaseUpdateJournal.open_existing(
+        authority_record=_authority_record(),
+    )
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_not_found$",
+    ):
+        existing.load()
+
+    assert _filesystem_snapshot(tmp_path) == before
+    assert not production_root.exists()
+
+
+@pytest.mark.parametrize("operation", ["load", "append"])
+def test_existing_only_missing_transaction_never_creates(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    tmp_path.chmod(journal_module.DIRECTORY_MODE)
+    transaction = (tmp_path / "transaction").resolve()
+    existing = _existing(transaction)
+    before = _filesystem_snapshot(tmp_path)
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_not_found$",
+    ):
+        if operation == "load":
+            existing.load()
+        else:
+            existing.append(_event(_intent()))
+
+    assert _filesystem_snapshot(tmp_path) == before
+    assert not transaction.exists()
+
+
+@pytest.mark.parametrize("with_unrelated_event", [False, True])
+def test_existing_only_missing_authority_never_publishes_or_cleans(
+    tmp_path: Path,
+    with_unrelated_event: bool,
+) -> None:
+    tmp_path.chmod(journal_module.DIRECTORY_MODE)
+    transaction = (tmp_path / "transaction").resolve()
+    _manual_transaction(transaction)
+    if with_unrelated_event:
+        event_path = transaction / "00000000.json"
+        event_path.write_bytes(
+            journal_module.canonical_json_bytes(
+                _event(_intent())
+            )
+        )
+        event_path.chmod(journal_module.FILE_MODE)
+    existing = _existing(transaction)
+    before = _filesystem_snapshot(tmp_path)
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_authority_missing$",
+    ):
+        existing.load()
+
+    assert _filesystem_snapshot(tmp_path) == before
+    assert not (
+        transaction / journal_module.AUTHORITY_FILE_NAME
+    ).exists()
+    assert not (
+        transaction / journal_module.AUTHORITY_PENDING_NAME
+    ).exists()
+
+
+def test_existing_only_wrong_exact_authority_fails_without_mutation(
+    tmp_path: Path,
+) -> None:
+    journal, _intent_value, transaction = _configured(tmp_path)
+    assert journal.load() == []
+    existing = _existing(
+        transaction,
+        authority_record=_other_authority_record(),
+    )
+    before = _filesystem_snapshot(tmp_path)
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_authority_conflict$",
+    ):
+        existing.load()
+
+    assert _filesystem_snapshot(tmp_path) == before
+
+
+def test_existing_only_does_not_finish_authority_publication(
+    tmp_path: Path,
+) -> None:
+    journal, _intent_value, transaction = _configured(tmp_path)
+    assert journal.load() == []
+    authority = transaction / journal_module.AUTHORITY_FILE_NAME
+    pending = transaction / journal_module.AUTHORITY_PENDING_NAME
+    os.link(authority, pending)
+    before = _filesystem_snapshot(tmp_path)
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_authority_recovery_invalid$",
+    ):
+        _existing(transaction).load()
+
+    assert _filesystem_snapshot(tmp_path) == before
+    assert authority.stat().st_ino == pending.stat().st_ino
+    assert authority.stat().st_nlink == 2
+
+
+def test_existing_only_refuses_pending_only_authority_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    journal, _intent_value, transaction = _configured(tmp_path)
+
+    def crash_before_authority_link(name: str) -> None:
+        if name == "authority_pending_directory_fsynced":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(
+        journal_module,
+        "_checkpoint",
+        crash_before_authority_link,
+    )
+    with pytest.raises(SimulatedCrash):
+        journal.load()
+    pending = transaction / journal_module.AUTHORITY_PENDING_NAME
+    authority = transaction / journal_module.AUTHORITY_FILE_NAME
+    assert pending.exists()
+    assert not authority.exists()
+    before = _filesystem_snapshot(tmp_path)
+
+    monkeypatch.setattr(journal_module, "_checkpoint", lambda _name: None)
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_authority_missing$",
+    ):
+        _existing(transaction).load()
+
+    assert _filesystem_snapshot(tmp_path) == before
+    assert pending.exists()
+    assert not authority.exists()
+
+
+def test_existing_only_exact_load_and_replay_are_inventory_immutable(
+    tmp_path: Path,
+) -> None:
+    journal, intent, transaction = _configured(tmp_path)
+    event = _event(intent)
+    assert journal.append(event) == event
+    existing = _existing(transaction)
+    before = _filesystem_snapshot(tmp_path)
+
+    assert existing.load() == [event]
+    assert existing.append(event) == event
+
+    assert _filesystem_snapshot(tmp_path) == before
+
+
+def test_existing_only_completes_linked_event_recovery_under_exact_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    journal, intent, transaction = _configured(tmp_path)
+    assert journal.load() == []
+    event = _event(intent)
+
+    def crash_after_link(name: str) -> None:
+        if name == "final_linked":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(journal_module, "_checkpoint", crash_after_link)
+    with pytest.raises(SimulatedCrash):
+        journal.append(event)
+    pending = transaction / ".00000000.pending"
+    final = transaction / "00000000.json"
+    assert pending.stat().st_ino == final.stat().st_ino
+    assert pending.stat().st_nlink == 2
+
+    monkeypatch.setattr(journal_module, "_checkpoint", lambda _name: None)
+    existing = _existing(transaction)
+    assert existing.load() == [event]
+    assert not pending.exists()
+    assert final.stat().st_nlink == 1
+
+
+def test_existing_only_rejects_transaction_and_authority_symlinks_unchanged(
+    tmp_path: Path,
+) -> None:
+    tmp_path.chmod(journal_module.DIRECTORY_MODE)
+    target = (tmp_path / "target").resolve()
+    _manual_transaction(target)
+    transaction_link = (tmp_path / "transaction-link").resolve()
+    transaction_link.symlink_to(target, target_is_directory=True)
+    before_transaction = _filesystem_snapshot(tmp_path)
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_directory_invalid$",
+    ):
+        _existing(transaction_link).load()
+    assert _filesystem_snapshot(tmp_path) == before_transaction
+
+    authority_root = (tmp_path / "authority-case").resolve()
+    authority_root.mkdir(mode=journal_module.DIRECTORY_MODE)
+    authority_root.chmod(journal_module.DIRECTORY_MODE)
+    journal, _intent_value, transaction = _configured(authority_root)
+    assert journal.load() == []
+    authority = transaction / journal_module.AUTHORITY_FILE_NAME
+    detached = authority_root / "detached-authority"
+    authority.rename(detached)
+    authority.symlink_to(detached)
+    before_authority = _filesystem_snapshot(authority_root)
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_file_invalid$",
+    ):
+        _existing(transaction).load()
+    assert _filesystem_snapshot(authority_root) == before_authority
+
+
+def test_existing_only_rejects_authority_hardlink_and_xattr_unchanged(
+    tmp_path: Path,
+) -> None:
+    hardlink_root = (tmp_path / "hardlink-case").resolve()
+    hardlink_root.mkdir(mode=journal_module.DIRECTORY_MODE)
+    hardlink_root.chmod(journal_module.DIRECTORY_MODE)
+    journal, _intent_value, transaction = _configured(hardlink_root)
+    assert journal.load() == []
+    authority = transaction / journal_module.AUTHORITY_FILE_NAME
+    os.link(authority, hardlink_root / "external-authority-link")
+    before_hardlink = _filesystem_snapshot(hardlink_root)
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_file_invalid$",
+    ):
+        _existing(transaction).load()
+    assert _filesystem_snapshot(hardlink_root) == before_hardlink
+
+    xattr_root = (tmp_path / "xattr-case").resolve()
+    xattr_root.mkdir(mode=journal_module.DIRECTORY_MODE)
+    xattr_root.chmod(journal_module.DIRECTORY_MODE)
+    journal, _intent_value, transaction = _configured(xattr_root)
+    assert journal.load() == []
+    before_xattr = _filesystem_snapshot(xattr_root)
+
+    def authority_xattr(descriptor: int) -> tuple[str, ...]:
+        return (
+            ("user.injected",)
+            if stat.S_ISREG(os.fstat(descriptor).st_mode)
+            else ()
+        )
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_extended_metadata_invalid$",
+    ):
+        _existing(
+            transaction,
+            xattr_reader=authority_xattr,
+        ).load()
+    assert _filesystem_snapshot(xattr_root) == before_xattr
+
+
+def test_existing_only_pending_recovery_detects_transaction_path_swap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    journal, intent, transaction = _configured(tmp_path)
+    assert journal.load() == []
+    event = _event(intent)
+
+    def crash_after_link(name: str) -> None:
+        if name == "final_linked":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(journal_module, "_checkpoint", crash_after_link)
+    with pytest.raises(SimulatedCrash):
+        journal.append(event)
+    moved = tmp_path / "detached-transaction"
+
+    def swap(name: str) -> None:
+        if name == "recovery_final_directory_fsynced":
+            transaction.rename(moved)
+            _manual_transaction(transaction)
+
+    monkeypatch.setattr(journal_module, "_checkpoint", swap)
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_directory_changed$",
+    ):
+        _existing(transaction).load()
+
+    pending = moved / ".00000000.pending"
+    final = moved / "00000000.json"
+    assert pending.exists()
+    assert pending.stat().st_ino == final.stat().st_ino
+    assert pending.stat().st_nlink == 2
+    assert sorted(transaction.iterdir()) == []
+
+
+def test_existing_only_uncommitted_pending_path_swap_preserves_detached_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    journal, intent, transaction = _configured(tmp_path)
+    assert journal.load() == []
+    event = _event(intent)
+
+    def crash_before_link(name: str) -> None:
+        if name == "pending_directory_fsynced":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(journal_module, "_checkpoint", crash_before_link)
+    with pytest.raises(SimulatedCrash):
+        journal.append(event)
+    pending_name = ".00000000.pending"
+    pending = transaction / pending_name
+    assert pending.exists()
+    assert pending.stat().st_nlink == 1
+    assert not (transaction / "00000000.json").exists()
+    moved = tmp_path / "detached-transaction"
+
+    def swap_before_unlink(name: str) -> None:
+        if name == "recovery_uncommitted_pending_binding_validated":
+            transaction.rename(moved)
+            _manual_transaction(transaction)
+
+    monkeypatch.setattr(journal_module, "_checkpoint", swap_before_unlink)
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match=r"^release_update_journal_directory_changed$",
+    ):
+        _existing(transaction).load()
+
+    detached_pending = moved / pending_name
+    assert detached_pending.exists()
+    assert detached_pending.stat().st_nlink == 1
+    assert not (moved / "00000000.json").exists()
+    assert sorted(transaction.iterdir()) == []
