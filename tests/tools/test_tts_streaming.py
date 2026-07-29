@@ -151,6 +151,53 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     assert captured["client"]["api_key"] == "cfg-key"
 
 
+def test_openai_streamer_defaults_to_official_pcm_sample_rate():
+    assert ts.OpenAIStreamer({}, {}).sample_rate == 24000
+
+
+@pytest.mark.parametrize("pcm_sample_rate", [0, -1, True, 48000.5, "invalid"])
+def test_openai_streamer_rejects_non_positive_integer_sample_rate(pcm_sample_rate):
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        ts.OpenAIStreamer({}, {"pcm_sample_rate": pcm_sample_rate})
+
+
+def test_openai_streamer_uses_configured_pcm_sample_rate_from_real_config(
+    tmp_path, monkeypatch
+):
+    from tools import tts_tool
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "tts:\n"
+        "  provider: openai\n"
+        "  openai:\n"
+        "    api_key: test-key\n"
+        "    pcm_sample_rate: 48000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        ts.OpenAIStreamer,
+        "stream",
+        lambda self, text: iter((b"\x01\x00" * 50,)),
+    )
+
+    sd, _out = _sd_mock()
+    q = _drain_queue(["Hello there, this is a full sentence."])
+    stop, done = threading.Event(), threading.Event()
+
+    with patch.object(tts_tool, "_import_sounddevice", return_value=sd):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    sd.OutputStream.assert_called_once_with(
+        samplerate=48000,
+        channels=1,
+        dtype="int16",
+    )
+    assert done.is_set()
+
+
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
 
 
