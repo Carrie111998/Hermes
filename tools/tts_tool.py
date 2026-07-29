@@ -1559,7 +1559,29 @@ def _generate_openai_tts(
             create_kwargs["instructions"] = instructions
         if language:
             create_kwargs["extra_body"] = {"lang_code": language}
-        response = client.audio.speech.create(**create_kwargs)
+
+        try:
+            response = client.audio.speech.create(**create_kwargs)
+        except Exception as exc:
+            # Some OpenAI-compatible TTS backends (e.g. Kokoro/Speaches)
+            # reject response_format=opus outright (HTTP 4xx). Retry with a
+            # widely-supported format, then let _repair_ogg_container (called
+            # by text_to_speech_tool) transcode back to Ogg/Opus when needed.
+            if (
+                response_format == "opus"
+                and hasattr(exc, "status_code")
+                and isinstance(exc.status_code, int)
+                and 400 <= exc.status_code < 500
+            ):
+                logger.warning(
+                    "TTS: server rejected response_format=opus (HTTP %s: %s) "
+                    "— retrying with mp3; post-synthesis repair will transcode",
+                    exc.status_code, exc,
+                )
+                create_kwargs["response_format"] = "mp3"
+                response = client.audio.speech.create(**create_kwargs)
+            else:
+                raise
 
         response.stream_to_file(output_path)
         return output_path
