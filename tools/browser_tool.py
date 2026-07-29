@@ -4205,7 +4205,12 @@ def browser_vision(
     """
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
-        return camofox_vision(question, annotate, task_id)
+        return camofox_vision(
+            question,
+            annotate=annotate,
+            full_page=full_page,
+            task_id=task_id,
+        )
 
     import base64
     import uuid as uuid_mod
@@ -4360,23 +4365,22 @@ def browser_vision(
         # is too late for native-vision routes: a multi-megabyte full-page PNG
         # would already be retained in the next request and every retry.
         _screenshot_bytes = screenshot_path.read_bytes()
-        _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
-        data_url = f"data:image/png;base64,{_screenshot_b64}"
+        from tools.vision_tools import _bounded_browser_screenshot_data_url
 
-        from tools.vision_tools import _RESIZE_TARGET_BYTES, _resize_image_for_vision
-
-        if len(data_url) > _RESIZE_TARGET_BYTES:
-            logger.info(
-                "browser_vision: bounding screenshot attachment (%.1f MB) to ~%.0f MB",
-                len(data_url) / (1024 * 1024),
-                _RESIZE_TARGET_BYTES / (1024 * 1024),
-            )
-            resized_data_url = _resize_image_for_vision(
-                screenshot_path,
-                mime_type="image/png",
-            )
-            if resized_data_url:
-                data_url = resized_data_url
+        data_url = _bounded_browser_screenshot_data_url(
+            screenshot_path, mime_type="image/png"
+        )
+        if data_url is None:
+            return json.dumps({
+                "success": False,
+                "code": "browser_vision_attachment_unbounded",
+                "error": (
+                    "Screenshot was retained locally but could not be bounded "
+                    "safely for model context. Use the screenshot_path locally "
+                    "or capture a smaller viewport."
+                ),
+                "screenshot_path": str(screenshot_path),
+            }, ensure_ascii=False)
 
         # Fast path: when native image routing is in effect for the active main
         # model, attach the screenshot directly instead of describing it through
