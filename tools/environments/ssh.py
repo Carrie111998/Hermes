@@ -173,7 +173,10 @@ class SSHEnvironment(BaseEnvironment):
             stdin=subprocess.DEVNULL,
         )
 
-        scp_cmd = ["scp", "-o", f"ControlPath={self.control_socket}"]
+        scp_cmd = ["scp"]
+        # Windows OpenSSH does not support Unix-domain ControlMaster sockets.
+        if os.name != "nt":
+            scp_cmd.extend(["-o", f"ControlPath={self.control_socket}"])
         if self.port != 22:
             scp_cmd.extend(["-P", str(self.port)])
         if self.key_path:
