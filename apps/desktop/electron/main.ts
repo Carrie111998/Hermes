@@ -40,6 +40,7 @@ import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import { canImportHermesCli, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
+import { backendStartSuppressionReason } from './backend-start-suppression'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
@@ -2874,6 +2875,10 @@ async function applyUpdates(opts = {}) {
         '(a second Hermes window or a terminal running hermes?). Close it and retry.'
 
       emitUpdateProgress({ stage: 'error', message, percent: null })
+      // Clear the in-flight latch BEFORE restarting: the recovery startHermes()
+      // is itself gated on !updateInFlight (see the guard in startHermes), so
+      // the backend would stay down without this.
+      updateInFlight = false
       startHermes().catch(() => {})
 
       return { ok: false, error: message }
@@ -2896,6 +2901,7 @@ async function applyUpdates(opts = {}) {
 
         rememberLog(`[updates] venv-blocked: ${scanOutcome.result.processes.length} process(es) hold the install`)
         emitUpdateProgress({ stage: 'error', message, percent: null })
+        updateInFlight = false
         startHermes().catch(() => {})
 
         return { ok: false, error: 'venv-blocked', message }
@@ -2906,6 +2912,7 @@ async function applyUpdates(opts = {}) {
 
         rememberLog(`[updates] venv-blocker probe failed: ${scanOutcome.error}`)
         emitUpdateProgress({ stage: 'error', message, percent: null })
+        updateInFlight = false
         startHermes().catch(() => {})
 
         return { ok: false, error: 'venv-probe-failed', message }
@@ -7868,6 +7875,17 @@ function profileRouteOptions(profile) {
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
+  // An update in flight is tearing down backends and handing off to the
+  // detached updater; a pool respawn here re-locks the venv and trips the
+  // venv-blocker preflight. Mirror the guard in startHermes(). Remote pool
+  // entries spawn no local child, but refusing uniformly keeps the update
+  // window quiet and avoids a half-torn-down pool racing the handoff.
+  const suppression = backendStartSuppressionReason(updateInFlight)
+
+  if (suppression) {
+    throw new Error(suppression)
+  }
+
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
@@ -8193,6 +8211,20 @@ async function startHermes() {
   // the failure overlay.
   if (bootstrapFailure) {
     throw bootstrapFailure
+  }
+
+  // An update in flight has already torn down the backend and is about to hand
+  // off to the detached updater. Any respawn here (renderer getConnection(),
+  // wake/reconnect recovery, a pool dial) re-locks the venv's python and its
+  // native .pyd files, so the pre-handoff scanVenvBlockers preflight finds a
+  // holder and aborts with "venv-blocked" — the update becomes structurally
+  // impossible while the app is open. Refuse to (re)spawn a local backend for
+  // the duration of the update; releaseBackendLockForUpdate restarts it if the
+  // update itself fails to hand off.
+  const suppression = backendStartSuppressionReason(updateInFlight)
+
+  if (suppression) {
+    throw new Error(suppression)
   }
 
   if (backendStartFailure) {
