@@ -10477,6 +10477,27 @@ class AdaptiveNutritionCoordinator:
                 )
             else:
                 self.store.append_customer_action_continuity(continuity)
+    def _registered_customer_runtime(self) -> object:
+        from checkin_cli.customer_admin import load_runtime_customer_registry
+
+        try:
+            registry = load_runtime_customer_registry(self.profile_root)
+            matches = tuple(
+                runtime
+                for runtime in registry.customers
+                if getattr(getattr(runtime, "spec", None), "customer_key", None)
+                == self.customer_key
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise AdaptiveWorkflowError(
+                "registered customer runtime is unavailable"
+            ) from exc
+        if len(matches) != 1:
+            raise AdaptiveWorkflowError(
+                "registered customer runtime is unavailable"
+            )
+        return matches[0]
+
     def preview_registered_daily_projection(
         self,
         proposal: NutritionProposal,
@@ -10492,7 +10513,9 @@ class AdaptiveNutritionCoordinator:
             ) from exc
         evaluation_day = getattr(proposal.snapshot, "evaluation_day", None)
         if type(evaluation_day) is not date:
-            raise AdaptiveWorkflowError("approved proposal evaluation day is invalid")
+            raise AdaptiveWorkflowError(
+                "approved proposal evaluation day is invalid"
+            )
         next_check = (
             f"{(evaluation_day + timedelta(days=1)).isoformat()}T08:00:00+09:00"
         )
@@ -10508,10 +10531,13 @@ class AdaptiveNutritionCoordinator:
                 criterion_atom="adherence_recorded",
                 next_check_kst=next_check,
             )
-            for index, action in enumerate(self._customer_action_texts(proposal), 1)
+            for index, action in enumerate(
+                self._customer_action_texts(proposal),
+                1,
+            )
         )
         return build_registered_daily_customer_projection(
-            self.customer_runtime,
+            self._registered_customer_runtime(),
             proposal,
             actions=actions,
             next_check=next_check,
@@ -10565,7 +10591,7 @@ class AdaptiveNutritionCoordinator:
             as_of_kst_day=as_of_kst_day,
         )
         return build_registered_daily_customer_projection(
-            self.customer_runtime,
+            self._registered_customer_runtime(),
             proposal,
             actions=selected,
             next_check=selected[0].next_check_kst,
@@ -10642,6 +10668,7 @@ class AdaptiveNutritionCoordinator:
                     )
                     if last_fingerprint != final_fingerprint:
                         raise AdaptiveWorkflowError("adaptive approval authority is stale")
+                    self._proposal_body_pins(proposal, last_context[2])
                     self._append_approved_action_continuity(proposal)
                     payload = self._approval_payload(proposal, last_context[2], actor)
                     approved = self._append_locked(
@@ -12011,6 +12038,7 @@ class AdaptiveNutritionCoordinator:
                 "delivery_attempt_consumed": "consumed",
                 "delivery_receipt_recorded": "receipt-started",
                 "delivery_unknown": "delivery_unknown",
+                "delivery_preflight_rejected": "preflight-rejected",
                 "delivered": "delivered",
                 "audit_pending": "audit_pending",
                 "sent_audited": "sent_audited",
@@ -12081,8 +12109,24 @@ class AdaptiveNutritionCoordinator:
                 "sent_audited",
             ),
         }
-        if canonical not in allowed_sequences:
-            raise AdaptiveWorkflowError("adaptive delivery projection sequence is invalid")
+        normalized = tuple(
+            state
+            for state in canonical
+            if state != "preflight-rejected"
+        )
+        preflight_positions = tuple(
+            index
+            for index, state in enumerate(canonical)
+            if state == "preflight-rejected"
+        )
+        if (
+            normalized not in allowed_sequences
+            or any(index != 1 for index in preflight_positions)
+            or len(preflight_positions) > 1
+        ):
+            raise AdaptiveWorkflowError(
+                "adaptive delivery projection sequence is invalid"
+            )
         return canonical
     def _delivery_status_without_reconciliation(
         self,
@@ -12635,7 +12679,7 @@ class AdaptiveNutritionCoordinator:
                 )
             ).hexdigest()
             pins = self._proposal_body_pins(proposal, spec)
-            reader = getattr(_events, "_read_events", None)
+            reader = getattr(self.canonical_event_source, "_read_events", None)
             if not callable(reader):
                 raise AdaptiveWorkflowError("canonical customer evidence is unavailable")
             rendered = self._registered_daily_projection(
@@ -12889,30 +12933,6 @@ class AdaptiveNutritionCoordinator:
                 reason="cancelled",
             )
         except Exception as exc:
-            try:
-                consumed = any(
-                    isinstance(row, Mapping)
-                    and row.get("event_type") == "delivery_attempt_consumed"
-                    and isinstance(row.get("payload"), Mapping)
-                    and row["payload"].get(
-                        "reservation_id",
-                        row["payload"].get("delivery_id"),
-                    )
-                    == delivery_id
-                    for row in self.store.read()
-                )
-            except (OSError, TypeError, ValueError):
-                consumed = True
-            if not consumed:
-                return self._append_delivery_preflight_rejected(
-                    delivery_id=delivery_id,
-                    proposal_digest=proposal.digest,
-                    registration_digest=attempt_payload.get(
-                        "registration_digest"
-                    ),
-                    attempt_event_id=reservation_event_id,
-                    reason=type(exc).__name__,
-                )
             return self._append_delivery_unknown(
                 delivery_id=delivery_id,
                 proposal_digest=proposal.digest,
@@ -13742,35 +13762,42 @@ class TelegramCustomerTransport:
         reservation_id: str,
     ) -> Mapping[str, object]:
         """Deliver only an immutable, committed adaptive reservation."""
-        if (
-            not isinstance(reservation_id, str)
-            or re.fullmatch(r"[a-f0-9]{64}", reservation_id) is None
-        ):
-            raise RuntimeError("adaptive delivery reservation is invalid")
-        adaptive = self._adaptive_coordinator(customer_key)
-        store = adaptive.store
-        locked = getattr(store, "locked", None)
-        if not callable(locked):
-            raise RuntimeError("adaptive delivery ledger lock is unavailable")
+        try:
+            if (
+                not isinstance(reservation_id, str)
+                or re.fullmatch(r"[a-f0-9]{64}", reservation_id) is None
+            ):
+                raise RuntimeError("adaptive delivery reservation is invalid")
+            adaptive = self._adaptive_coordinator(customer_key)
+            store = adaptive.store
+            locked = getattr(store, "locked", None)
+            if not callable(locked):
+                raise RuntimeError(
+                    "adaptive delivery ledger lock is unavailable"
+                )
+            with adaptive._authority_lock():
+                (
+                    _customer,
+                    _data_root,
+                    _spec,
+                    _events,
+                    live_source_digest,
+                    live_artifacts,
+                    _epoch_path,
+                    _epoch,
+                    live_registration_binding,
+                ) = adaptive._production_context(
+                    require_activation=True,
+                    require_delivery=True,
+                )
+        except AdaptiveTransportPreflightRejected:
+            raise
+        except Exception as exc:
+            raise AdaptiveTransportPreflightRejected(str(exc)) from exc
         body: str
         canonical_destination: object
         strict_sender: Callable[..., object]
         send_kwargs: dict[str, object]
-        with adaptive._authority_lock():
-            (
-                _customer,
-                _data_root,
-                _spec,
-                _events,
-                live_source_digest,
-                live_artifacts,
-                _epoch_path,
-                _epoch,
-                live_registration_binding,
-            ) = adaptive._production_context(
-                require_activation=True,
-                require_delivery=True,
-            )
         live_delivery_pins = {
             "source_digest": live_source_digest,
             "policy_digest": live_artifacts.policy_digest,

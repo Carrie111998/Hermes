@@ -630,6 +630,20 @@ def _rewrite_persisted_proposal(
             payload = row.get("payload")
             if isinstance(payload, dict):
                 rewritten["payload"] = rewrite_value(payload)
+                if row.get("event_type") == "customer_action_continuity":
+                    continuity = dict(rewritten["payload"])
+                    continuity["action_id"] = digest({
+                        "customer_key": continuity["customer_key"],
+                        "approved_proposal_digest": continuity[
+                            "approved_proposal_digest"
+                        ],
+                        "revision": continuity["revision"],
+                        "effective_kst_day": continuity[
+                            "effective_kst_day"
+                        ],
+                        "action_atom": continuity["action_atom"],
+                    })
+                    rewritten["payload"] = continuity
             dedupe_key = rewritten.get("dedupe_key")
             if isinstance(dedupe_key, str):
                 rewritten["dedupe_key"] = dedupe_key.replace(
@@ -1398,9 +1412,8 @@ def test_missing_goal_prompts_and_never_sends(tmp_path):
     p,_=c.create_proposal(topic_id=59, observations=rows(date(2026,7,14)), evaluation_day=date(2026,7,14), policy=CustomerPolicy(date(2026,7,1),"fat_loss"), current_target=MacroTarget(2300,290,150,60), protein_g=150, fat_g=60)
     assert p.decision is Decision.OBSERVE
     operator_card = c.render_proposal(p, topic_id=59)
-    assert "검토 필요" in operator_card
-    assert "고객 목표 정보가 없어 목표 범위를 확정하지 못했습니다." in operator_card
-    assert "customer_goal_input_required" not in operator_card
+    assert "결정: observe" in operator_card
+    assert "customer_goal_input_required" in operator_card
     assert not hasattr(c, "send")
 
 
@@ -1784,23 +1797,15 @@ def test_callback_claim_race_dispatches_create_once(tmp_path, monkeypatch):
         release.set()
         winner = winner_future.result(timeout=10)
     assert winner["status"] == "card"
-    assert "테스트 전용" in winner["text"]
+    assert "고객 전달 미리보기" in winner["text"]
     assert "고객: Client" in winner["text"]
-    assert "KST day:" in winner["text"]
-    assert "revision: 1" in winner["text"]
-    assert "state: proposed" in winner["text"]
-    assert "진행 1/4 · 제안 검토 중 · 다음: 승인하기" in winner["text"]
-    assert [button["label"] for button in winner["buttons"]] == [
-        "1/4 승인하기",
-        "고급 · 내용 보기",
-        "고급 · 메모 수정",
-        "고급 · 보류",
-        "이전",
-    ]
+    assert "revision:" not in winner["text"]
+    assert "state:" not in winner["text"]
+    assert winner["buttons"][0]["label"] == "승인하고 보내기"
     assert [
         button["callback_data"].rsplit(":", 1)[-1]
         for button in winner["buttons"]
-    ] == ["approve", "view", "edit_note", "hold", "back"]
+    ] == ["approve_and_send", "edit_note", "hold", "view"]
     assert calls == [1]
     assert sum(row["event_type"] == "plan_proposed" for row in coordinator.store.read()) == 1
     token = callback.split(":")[1]
@@ -1818,29 +1823,16 @@ def test_operator_card_exposes_only_state_appropriate_primary_action(tmp_path, m
     service, _address = _adaptive_callback_service(coordinator, tmp_path)
     registration_digest = coordinator._registration_pin(proposal, required=True)
     expectations = {
-        "approved": (
-            "2/4 활성화하기",
-            "activate",
-            "진행 2/4 · 승인 완료 · 다음: 활성화하기",
-        ),
-        "activated": (
-            "3/4 고객 전송 허용",
-            "delivery_enable",
-            "진행 3/4 · 활성화 완료 · 다음: 고객 전송 허용",
-        ),
-        "delivery_enabled": (
-            "4/4 고객에게 전송",
-            "send",
-            "진행 4/4 · 전송 허용됨 · 다음: 고객에게 전송",
-        ),
-        "delivery_revoked": (
-            "고객 전송 다시 허용",
-            "delivery_enable",
-            "안전 잠금 · 고객 전송 비활성화",
-        ),
+        state: ("승인하고 보내기", "approve_and_send")
+        for state in (
+            "approved",
+            "activated",
+            "delivery_enabled",
+            "delivery_revoked",
+        )
     }
 
-    for state, (label, action, progress) in expectations.items():
+    for state, (label, action) in expectations.items():
         buttons = service._card_buttons(
             customer_key=coordinator.customer_key,
             proposal=proposal,
@@ -1863,8 +1855,8 @@ def test_operator_card_exposes_only_state_appropriate_primary_action(tmp_path, m
             state=state,
             body="검토 본문",
         )
-        assert progress in text
-        assert envelope["state"] == state
+        assert "고객 전달 미리보기" in text
+        assert "state" not in envelope
 
 
 @pytest.mark.parametrize(
@@ -1963,11 +1955,10 @@ def test_callback_claim_race_dispatches_mutation_once(tmp_path, monkeypatch):
         release.set()
         winner = winner_future.result(timeout=10)
     assert winner["status"] == "card"
-    assert "테스트 전용" in winner["text"]
+    assert "고객 전달 미리보기" in winner["text"]
     assert "고객: Client" in winner["text"]
-    assert "KST day:" in winner["text"]
-    assert f"revision: {proposal.revision + 1}" in winner["text"]
-    assert "state: held" in winner["text"]
+    assert "revision:" not in winner["text"]
+    assert "state:" not in winner["text"]
     assert calls == [1]
     assert sum(row["event_type"] == "plan_edited" for row in coordinator.store.read()) == 1
     token = callback.split(":")[1]
@@ -2001,11 +1992,10 @@ def test_operator_edit_note_returns_identity_envelope(tmp_path, monkeypatch):
     )
 
     assert card["status"] == "card"
-    assert "테스트 전용" in card["text"]
+    assert "고객 전달 미리보기" in card["text"]
     assert "고객: Client" in card["text"]
-    assert "KST day:" in card["text"]
-    assert f"revision: {proposal.revision + 1}" in card["text"]
-    assert "state: edited" in card["text"]
+    assert "revision:" not in card["text"]
+    assert "state:" not in card["text"]
 
 def test_publish_pending_card_recovers_once(tmp_path):
     review = AdaptiveReviewOperator("review-user", "review-chat", 59, 1)
@@ -2562,7 +2552,7 @@ def test_real_telegram_transport_checks_authority_before_consuming_reservation(
         assert consumed[0]["payload"]["risk_policy_document_digest"]
         assert len(strict_calls) == 1
     else:
-        assert result["event_type"] == "delivery_unknown"
+        assert result["event_type"] == "delivery_preflight_rejected"
         assert consumed == []
         assert strict_calls == []
 
@@ -3244,21 +3234,21 @@ def test_delivery_reservation_revalidation_records_unknown_for_each_authority_ch
         if row["event_type"] == "delivery_attempt_started"
         and row["payload"].get("provider_receipt") is None
     ]
-    unknown = [
+    rejected = [
         row
         for row in rows
-        if row["event_type"] == "delivery_unknown"
+        if row["event_type"] == "delivery_preflight_rejected"
         and row["payload"].get("proposal_digest") == proposal.digest
     ]
     assert revalidation_count["value"] == 2
     assert len(reservations) == 1
-    assert len(unknown) == 1
+    assert len(rejected) == 1
     reservation_payload = reservations[0]["payload"]
-    unknown_payload = unknown[0]["payload"]
-    assert unknown_payload["delivery_id"] == reservation_payload["delivery_id"]
-    assert unknown_payload["reservation_id"] == reservation_payload["reservation_id"]
-    assert unknown_payload["attempt_event_id"] == reservations[0]["event_id"]
-    assert unknown_payload["registration_digest"] == reservation_payload["registration_digest"]
+    rejected_payload = rejected[0]["payload"]
+    assert rejected_payload["delivery_id"] == reservation_payload["delivery_id"]
+    assert rejected_payload["reservation_id"] == reservation_payload["reservation_id"]
+    assert rejected_payload["attempt_event_id"] == reservations[0]["event_id"]
+    assert rejected_payload["registration_digest"] == reservation_payload["registration_digest"]
     assert calls == []
 
     with pytest.raises(AdaptiveWorkflowError):
@@ -3270,7 +3260,10 @@ def test_delivery_reservation_revalidation_records_unknown_for_each_authority_ch
             )
         )
     assert calls == []
-    assert sum(row["event_type"] == "delivery_unknown" for row in coordinator.store.read()) == 1
+    assert sum(
+        row["event_type"] == "delivery_preflight_rejected"
+        for row in coordinator.store.read()
+    ) == 1
 
 
 @pytest.mark.parametrize("mutation", ("source", "registration"))
@@ -3530,6 +3523,7 @@ def test_p2_p6_fresh_revisions_have_exact_terminal_rows_and_provider_counts(
                 "delivery_receipt_recorded",
                 "delivery_attempt_consumed",
                 "delivery_unknown",
+                "delivery_preflight_rejected",
                 "delivered",
                 "sent_audited",
                 "audit_pending",
@@ -3549,6 +3543,12 @@ def test_p2_p6_fresh_revisions_have_exact_terminal_rows_and_provider_counts(
 
     def linked_unknown(rows):
         return next(row for row in rows if row["event_type"] == "delivery_unknown")
+    def linked_preflight(rows):
+        return next(
+            row
+            for row in rows
+            if row["event_type"] == "delivery_preflight_rejected"
+        )
     def durable_states(rows):
         return list(AdaptiveNutritionCoordinator.project_delivery_attempt(rows))
 
@@ -3829,19 +3829,21 @@ def test_p2_p6_fresh_revisions_have_exact_terminal_rows_and_provider_counts(
         row["event_type"] for row in rows_for_delivery
     ] == [
         "delivery_attempt_started",
-        "delivery_unknown",
+        "delivery_preflight_rejected",
     ]
     assert durable_states(rows_for_delivery) == [
         "reservation-started",
-        "delivery_unknown",
+        "preflight-rejected",
     ]
-    unknown = linked_unknown(rows_for_delivery)
+    rejected = linked_preflight(rows_for_delivery)
     started = reservation(rows_for_delivery)
-    assert unknown["payload"]["delivery_id"] == started["payload"]["delivery_id"]
-    assert unknown["payload"]["reservation_id"] == started["payload"]["reservation_id"]
-    assert unknown["payload"]["attempt_event_id"] == started["event_id"]
-    assert unknown["payload"]["reason"] == "delivery_revoked_after_reservation"
-    assert adaptive_delivery_result_text(unknown) == unknown_text
+    assert rejected["payload"]["delivery_id"] == started["payload"]["delivery_id"]
+    assert rejected["payload"]["reservation_id"] == started["payload"]["reservation_id"]
+    assert rejected["payload"]["attempt_event_id"] == started["event_id"]
+    assert rejected["payload"]["reason"] == "delivery_revoked_after_reservation"
+    assert adaptive_delivery_result_text(rejected) == (
+        "고객 전송 전에 안전하게 중단되었습니다. 최신 검토 카드에서 다시 시도해 주세요."
+    )
     assert not any(
         row["event_type"] == "delivery_attempt_consumed"
         for row in rows_for_delivery
@@ -3880,38 +3882,40 @@ def test_p2_p6_fresh_revisions_have_exact_terminal_rows_and_provider_counts(
         row["event_type"] for row in rows_for_delivery
     ] == [
         "delivery_attempt_started",
-        "delivery_unknown",
+        "delivery_preflight_rejected",
     ]
     assert durable_states(rows_for_delivery) == [
         "reservation-started",
-        "delivery_unknown",
+        "preflight-rejected",
     ]
-    unknown = linked_unknown(rows_for_delivery)
+    rejected = linked_preflight(rows_for_delivery)
     started = reservation(rows_for_delivery)
-    assert unknown["payload"]["delivery_id"] == started["payload"]["delivery_id"]
-    assert unknown["payload"]["reservation_id"] == started["payload"]["reservation_id"]
-    assert unknown["payload"]["attempt_event_id"] == started["event_id"]
-    assert unknown["payload"]["reason"] == "owner_changed_after_reservation"
-    assert adaptive_delivery_result_text(unknown) == unknown_text
+    assert rejected["payload"]["delivery_id"] == started["payload"]["delivery_id"]
+    assert rejected["payload"]["reservation_id"] == started["payload"]["reservation_id"]
+    assert rejected["payload"]["attempt_event_id"] == started["event_id"]
+    assert rejected["payload"]["reason"] == "owner_changed_after_reservation"
+    assert adaptive_delivery_result_text(rejected) == (
+        "고객 전송 전에 안전하게 중단되었습니다. 최신 검토 카드에서 다시 시도해 주세요."
+    )
     assert not any(
         row["event_type"] == "delivery_attempt_consumed"
         for row in rows_for_delivery
     )
     assert provider_calls == []
     coordinator.authority.owner = SimpleNamespace(key=OWNER_TRIPLE)
-    with pytest.raises(AdaptiveWorkflowError):
-        asyncio.run(
-            coordinator.deliver_latest_once(
-                proposal.digest,
-                chat_id="-100",
-                operator_id=_production_operator_capability(
-                    coordinator,
-                    "send",
-                    proposal=proposal,
-                ),
-            )
+    retry = asyncio.run(
+        coordinator.deliver_latest_once(
+            proposal.digest,
+            chat_id="-100",
+            operator_id=_production_operator_capability(
+                coordinator,
+                "send",
+                proposal=proposal,
+            ),
         )
-    assert provider_calls == []
+    )
+    assert retry["event_type"] == "sent_audited"
+    assert len(provider_calls) == 1
     disable_feature_flags(coordinator, data_root, proposal)
 def test_missing_review_operator_version_is_rejected():
     assert AdaptiveNutritionConfig.from_extra(
