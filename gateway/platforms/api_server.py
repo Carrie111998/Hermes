@@ -2413,6 +2413,14 @@ class APIServerAdapter(BasePlatformAdapter):
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
         reasoning_config = GatewayRunner._load_reasoning_config()
+        if reasoning_config is not None:
+            # Reasoning visibility (display.show_reasoning) is independent of
+            # effort — Gemini/Vertex map include_thoughts onto thinking_config
+            # so hidden thought summaries are never returned in content.
+            reasoning_config = {
+                **reasoning_config,
+                "include_thoughts": GatewayRunner._load_show_reasoning(),
+            }
         model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
