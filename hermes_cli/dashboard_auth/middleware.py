@@ -59,6 +59,10 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/api/mcp/oauth/callback/",
     "/assets/",
     "/favicon.ico",
+    # Safari/iPadOS fetches the Home Screen icon outside the SPA's fetch
+    # wrapper and may not preserve the Dashboard session cookie. Keep it
+    # alongside the generic favicon as a public static asset.
+    "/apple-touch-icon.png",
     "/ds-assets/",
     "/fonts/",
     "/fonts-terminal/",

@@ -1889,6 +1889,9 @@ DEFAULT_CONFIG = {
     "display": {
         "compact": False,
         "personality": "",
+        # Optional profile-local PNG/JPEG used for Safari's Add to Home Screen
+        # icon. Relative paths resolve within this profile's HERMES_HOME.
+        "web_app_icon": "",
         "resume_display": "full",
         # Recap tuning for /resume and startup resume. The defaults match the
         # historical hardcoded values; expose them as config so power users can
