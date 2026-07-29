@@ -501,6 +501,30 @@ export type TimelineDisplayMetadata =
       duration_seconds?: number
     }
 
+export interface SessionPresenceRecord {
+  client?: string
+  cwd?: string
+  endpoint?: string
+  expires_at?: number
+  host?: string
+  instance_id?: string
+  metadata?: Record<string, unknown>
+  model?: string
+  pid?: number
+  profile?: string
+  session_id: string
+  session_key?: string
+  source?: string
+  status?: string
+  title?: string
+  updated_at?: number
+  version?: number
+}
+
+export interface SessionPresenceListResponse {
+  sessions: SessionPresenceRecord[]
+}
+
 export interface SessionMessage {
   codex_reasoning_items?: unknown
   content: unknown

@@ -97,6 +97,7 @@ import { usePromptActions } from '../session/hooks/use-prompt-actions'
 import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
+import { useSessionPresence } from '../session/hooks/use-session-presence'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
 import { newSessionOpensTab, startWorkspaceSession } from '../session/workspace-session-target'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
@@ -429,6 +430,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     branchStoredSession,
     createBackendSessionForSend,
     openNewSessionTile,
+    openPresenceSession,
     removeSession,
     resumeSession,
     selectSidebarItem,
@@ -452,6 +454,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     syncSessionStateToView,
     updateSessionState
   })
+
+  useSessionPresence(gatewayState, requestGateway)
 
   // A profile switch/create drops to a fresh new-session draft so the
   // previously open session doesn't bleed across contexts. Skip initial value.
@@ -853,6 +857,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onNavigate: selectSidebarItem,
     onNewSessionInWorkspace: path => startSessionInWorkspace(path, { openTab: true }),
     onNewSessionSplit: dir => void openNewSessionTile(dir),
+    onOpenPresenceSession: record => void openPresenceSession(record),
     onPasteClipboardImage: opts => composer.pasteClipboardImage(opts),
     onPickFiles: () => void composer.pickContextPaths('file'),
     onPickFolders: () => void composer.pickContextPaths('folder'),
