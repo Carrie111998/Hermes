@@ -509,3 +509,156 @@ class TestFeishuAdaptiveDelay:
         adapter._handle_message_with_guards.assert_called_once()
         text = adapter._handle_message_with_guards.call_args[0][0].text
         assert "continuation text" in text
+
+
+# =====================================================================
+# Cross-platform dispatch cancellation regression
+# =====================================================================
+
+def _make_whatsapp_adapter():
+    from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+
+    adapter = object.__new__(WhatsAppAdapter)
+    adapter._platform = Platform.WHATSAPP
+    adapter.config = PlatformConfig(enabled=True, token="test-token")
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._text_batch_delay_seconds = 0.01
+    adapter._text_batch_split_delay_seconds = 0.03
+    adapter.handle_message = AsyncMock()
+    return adapter
+
+
+def _make_weixin_adapter():
+    from gateway.platforms.weixin import WeixinAdapter
+
+    adapter = object.__new__(WeixinAdapter)
+    adapter._platform = Platform.WEIXIN
+    adapter.config = PlatformConfig(enabled=True, token="test-token")
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._text_batch_delay_seconds = 0.01
+    adapter._text_batch_split_delay_seconds = 0.03
+    adapter.handle_message = AsyncMock()
+    return adapter
+
+
+def _make_simplex_adapter():
+    from plugins.platforms.simplex.adapter import SimplexAdapter
+
+    adapter = object.__new__(SimplexAdapter)
+    adapter._platform = Platform("simplex")
+    adapter.config = PlatformConfig(enabled=True, token="test-token")
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._text_batch_delay = 0.01
+    adapter.handle_message = AsyncMock()
+    return adapter
+
+
+_DISPATCH_CANCEL_CASES = (
+    pytest.param(_make_discord_adapter, Platform.DISCORD, False, "handle_message", id="discord"),
+    pytest.param(_make_matrix_adapter, Platform.MATRIX, False, "handle_message", id="matrix"),
+    pytest.param(_make_wecom_adapter, Platform.WECOM, False, "handle_message", id="wecom"),
+    pytest.param(_make_whatsapp_adapter, Platform.WHATSAPP, False, "handle_message", id="whatsapp"),
+    pytest.param(_make_weixin_adapter, Platform.WEIXIN, False, "handle_message", id="weixin"),
+    pytest.param(_make_telegram_adapter, Platform.TELEGRAM, False, "handle_message", id="telegram"),
+    pytest.param(_make_simplex_adapter, Platform("simplex"), False, "handle_message", id="simplex"),
+    pytest.param(
+        _make_feishu_adapter,
+        Platform.FEISHU,
+        True,
+        "_handle_message_with_guards",
+        id="feishu",
+    ),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("factory,platform,async_enqueue,handler_attr", _DISPATCH_CANCEL_CASES)
+async def test_follow_up_does_not_cancel_started_dispatch(
+    factory, platform, async_enqueue, handler_attr
+):
+    adapter = factory()
+    if hasattr(adapter, "_text_batch_delay_seconds"):
+        adapter._text_batch_delay_seconds = 0.01
+        adapter._text_batch_split_delay_seconds = 0.03
+
+    handle_started = asyncio.Event()
+    release_handle = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    first_completed = asyncio.Event()
+    call_count = 0
+
+    async def slow_handle(event):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            handle_started.set()
+            try:
+                await release_handle.wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                raise
+            first_completed.set()
+
+    setattr(adapter, handler_attr, slow_handle)
+
+    async def enqueue(text: str) -> None:
+        result = adapter._enqueue_text_event(_make_event(text, platform))
+        if async_enqueue:
+            await result
+
+    await enqueue("batch 1")
+    await asyncio.wait_for(handle_started.wait(), timeout=1.0)
+    await enqueue("batch 2 follow-up")
+    await asyncio.sleep(0.02)
+
+    assert not first_cancelled.is_set()
+    assert any("::dispatch::" in str(key) for key in adapter._pending_text_batch_tasks)
+
+    release_handle.set()
+    await asyncio.wait_for(first_completed.wait(), timeout=1.0)
+
+    tasks = list(adapter._pending_text_batch_tasks.values())
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_shared_text_batch_aggregator_protects_started_dispatch():
+    from gateway.platforms.helpers import TextBatchAggregator
+
+    handle_started = asyncio.Event()
+    release_handle = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    first_completed = asyncio.Event()
+    call_count = 0
+
+    async def slow_handle(event):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            handle_started.set()
+            try:
+                await release_handle.wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                raise
+            first_completed.set()
+
+    batcher = TextBatchAggregator(handler=slow_handle, batch_delay=0.01)
+    batcher.enqueue(_make_event("batch 1", Platform.DISCORD), "session")
+    await asyncio.wait_for(handle_started.wait(), timeout=1.0)
+    batcher.enqueue(_make_event("batch 2", Platform.DISCORD), "session")
+    await asyncio.sleep(0.02)
+
+    assert not first_cancelled.is_set()
+    assert any("::dispatch::" in key for key in batcher._pending_tasks)
+
+    release_handle.set()
+    await asyncio.wait_for(first_completed.wait(), timeout=1.0)
+    batcher.cancel_all()

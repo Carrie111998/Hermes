@@ -1320,10 +1320,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
+            if self._pending_text_batch_tasks.get(key) is not current_task:
+                return
             event = self._pending_text_batches.pop(key, None)
             if not event:
                 return
-            await self.handle_message(event)
+            from gateway.platforms.helpers import dispatch_text_batch_safely
+            await dispatch_text_batch_safely(
+                self.handle_message, event, self._pending_text_batch_tasks, key
+            )
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)

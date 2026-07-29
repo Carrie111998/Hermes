@@ -152,23 +152,28 @@ class TextBatchAggregator:
 
     async def _flush(self, key: str) -> None:
         """Wait then dispatch the batched event for *key*."""
-        current_task = self._pending_tasks.get(key)
-        pending = self._pending.get(key)
-        last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
+        current_task = asyncio.current_task()
+        try:
+            pending = self._pending.get(key)
+            last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
 
-        # Use longer delay when the last chunk looks like a split message
-        delay = self._split_delay if last_len >= self._split_threshold else self._batch_delay
-        await asyncio.sleep(delay)
+            # Use longer delay when the last chunk looks like a split message
+            delay = self._split_delay if last_len >= self._split_threshold else self._batch_delay
+            await asyncio.sleep(delay)
+            if self._pending_tasks.get(key) is not current_task:
+                return
 
-        event = self._pending.pop(key, None)
-        if event:
-            try:
-                await self._handler(event)
-            except Exception:
-                logger.exception("[TextBatchAggregator] Error dispatching batched event for %s", key)
-
-        if self._pending_tasks.get(key) is current_task:
-            self._pending_tasks.pop(key, None)
+            event = self._pending.pop(key, None)
+            if event:
+                try:
+                    await dispatch_text_batch_safely(
+                        self._handler, event, self._pending_tasks, key
+                    )
+                except Exception:
+                    logger.exception("[TextBatchAggregator] Error dispatching batched event for %s", key)
+        finally:
+            if self._pending_tasks.get(key) is current_task:
+                self._pending_tasks.pop(key, None)
 
     def cancel_all(self) -> None:
         """Cancel all pending flush tasks."""
@@ -177,6 +182,30 @@ class TextBatchAggregator:
                 task.cancel()
         self._pending_tasks.clear()
         self._pending.clear()
+
+
+async def dispatch_text_batch_safely(handler, event, task_map, key: str) -> None:
+    """Run a flushed batch without letting a new debounce timer cancel it.
+
+    The dispatch task is stored under a unique sibling key in ``task_map``.
+    A follow-up message therefore cancels only the session's debounce owner,
+    while adapter shutdown code that already drains the task map can still
+    see and manage the in-flight dispatch.
+    """
+    dispatch_task = asyncio.create_task(handler(event))
+    dispatch_key = f"{key}::dispatch::{id(dispatch_task)}"
+    task_map[dispatch_key] = dispatch_task
+
+    def _cleanup(done: asyncio.Task) -> None:
+        if task_map.get(dispatch_key) is done:
+            task_map.pop(dispatch_key, None)
+        if not done.cancelled():
+            # Observe detached failures when the outer debounce task was
+            # cancelled while the shielded dispatch continued running.
+            done.exception()
+
+    dispatch_task.add_done_callback(_cleanup)
+    await asyncio.shield(dispatch_task)
 
 
 # ─── Markdown Stripping ──────────────────────────────────────────────────────

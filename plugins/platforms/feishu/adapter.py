@@ -3765,6 +3765,8 @@ class FeishuAdapter(BasePlatformAdapter):
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
+            if self._pending_text_batch_tasks.get(key) is not current_task:
+                return
             await self._flush_text_batch_now(key)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
@@ -3781,7 +3783,13 @@ class FeishuAdapter(BasePlatformAdapter):
             key,
             len(event.text or ""),
         )
-        await self._handle_message_with_guards(event)
+        from gateway.platforms.helpers import dispatch_text_batch_safely
+        await dispatch_text_batch_safely(
+            self._handle_message_with_guards,
+            event,
+            self._pending_text_batch_tasks,
+            key,
+        )
 
     # =========================================================================
     # Message content extraction and resource download
