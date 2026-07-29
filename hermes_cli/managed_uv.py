@@ -911,7 +911,129 @@ def _release_repair_lock(lock: _RepairLock) -> None:
             pass
 
 
+def _terminate_venv_holders(
+    matches: list[tuple[int, str, str]],
+    *,
+    timeout_seconds: float = 5.0,
+) -> list[tuple[int, str, str]]:
+    """Force-kill processes holding the venv, then wait for handle release.
+
+    The renamer needs every ``.pyd``/``.dll`` under ``venv\\\\`` unmapped so the
+    directory rename succeeds. The updater's pre-flight guard already exits
+    most holders, but the Desktop app's backend (``hermes serve``) respawns
+    within seconds, and ``uv``/Python subprocesses spawned earlier in the
+    update can leak as detached children whose ``Path`` is *outside* the
+    hermes-agent dir but whose ``.pyd`` handles are still under ``venv\\\\``.
+
+    The kill is force-only — these processes are guaranteed to be either
+    Hermes-owned (the gateway pool, the Desktop backend) or short-lived
+    updater subprocesses (``uv``, ``pip``) that ``repair_vulnerable_runtime``
+    respawns cleanly. We exclude ``os.getpid()`` and ancestors already in the
+    detector, so killing here is bounded to "things we know are blocking
+    the rename."
+
+    Returns the subset of ``matches`` that survived the kill window — caller
+    re-checks via ``_detect_venv_python_processes()`` to confirm. Never raises
+    (psutil failures degrade to an empty survivor list with a logged warning).
+    """
+    if not matches:
+        return []
+    try:
+        import psutil
+    except Exception:
+        return list(matches)
+
+    # Build the (pid -> name, cmdline) lookup up front so we can log *what*
+    # we killed even if the psutil handle is gone after termination.
+    by_pid: dict[int, tuple[str, str]] = {
+        int(pid): (name, cmdline) for pid, name, cmdline in matches
+    }
+    killed: list[int] = []
+    skipped_access_denied: list[int] = []
+    for entry in matches:
+        pid = int(entry[0])
+        try:
+            proc = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            skipped_access_denied.append(pid)
+            continue
+        except Exception as exc:
+            logger.warning("psutil.Process(%d) failed during venv-holder kill: %s", pid, exc)
+            continue
+        try:
+            proc.kill()
+            killed.append(pid)
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            skipped_access_denied.append(pid)
+        except Exception as exc:
+            logger.warning("kill() on PID %d failed during venv-holder release: %s", pid, exc)
+
+    if killed:
+        preview = ", ".join(str(p) for p in killed[:6])
+        more = "" if len(killed) <= 6 else f" (+{len(killed) - 6} more)"
+        print(f"  → Released {len(killed)} venv-holder process(es) for runtime swap: {preview}{more}")
+    if skipped_access_denied:
+        preview = ", ".join(str(p) for p in skipped_access_denied[:6])
+        print(f"  ⚠ Could not access {len(skipped_access_denied)} holder PID(s): {preview}")
+
+    if not killed:
+        # Nothing was killed. If anything was AccessDenied, those are real
+        # survivors (we couldn't touch them). Otherwise every detected PID
+        # was NoSuchProcess (already gone), so nothing can be holding the
+        # venv -- return an empty survivor list, NOT the original matches,
+        # which would otherwise wrongly trigger a bail-out.
+        if not skipped_access_denied:
+            return []
+        survivors = list(skipped_access_denied)
+    else:
+        # Poll for process exit so the OS releases the file handles BEFORE we
+        # hand control back to the renamer. psutil.wait_procs gives us the
+        # popen-style "gone + returncode" with a single timeout.
+        gone: set[int] = set()
+        try:
+            procs = [psutil.Process(pid) for pid in killed]
+            for proc in psutil.wait_procs(procs, timeout=timeout_seconds):
+                if proc.returncode is not None or not proc.is_running():
+                    gone.add(int(proc.pid))
+        except Exception as exc:
+            logger.warning("wait_procs after venv-holder kill failed: %s", exc)
+
+        survivors = [pid for pid in killed if pid not in gone]
+        # Anything we never managed to kill (AccessDenied, etc.) is a survivor too.
+        for pid in skipped_access_denied:
+            if pid not in survivors:
+                survivors.append(pid)
+
+    if survivors:
+        survivor_pids = ", ".join(str(p) for p in survivors[:6])
+        names = ", ".join(
+            f"{pid}={by_pid.get(pid, ('?', ''))[0]}" for pid in survivors[:6]
+        )
+        print(
+            f"  ⚠ {len(survivors)} venv-holder process(es) did not exit in "
+            f"{timeout_seconds:.0f}s: {survivor_pids} ({names})"
+        )
+    return [(p, *by_pid.get(p, ("?", ""))) for p in survivors]
+
+
 def _windows_runtime_holders() -> tuple[bool, str]:
+    """Gate the runtime swap on Windows venv holders.
+
+    On Windows the rename of ``venv\\\\`` fails (WinError 5) when any process
+    is holding ``.pyd``/``.dll`` files under it. The updater's pre-flight
+    already killed the obvious holders (Hermes.exe + hermes-agent-mapped
+    processes), but the Desktop app's ``hermes serve`` backend and short-lived
+    ``uv``/Python subprocesses can respawn between pre-flight and the rename.
+
+    Rather than bail out and force the user to manually close the Desktop
+    app, we one-shot kill the detected holders and re-check. If anything
+    survives (AccessDenied, parent re-spawning faster than we can kill), we
+    bail out and surface the survivors so the user can intervene manually.
+    """
     if platform.system() != "Windows":
         return False, ""
     main_module = sys.modules.get("hermes_cli.main")
@@ -922,9 +1044,12 @@ def _windows_runtime_holders() -> tuple[bool, str]:
         holders = detector()
     except Exception as exc:
         return True, f"could not verify Windows venv holders: {exc}"
-    if holders:
-        pids = ", ".join(str(item[0]) for item in holders[:6])
-        return True, f"other Hermes processes still hold the venv (PID {pids})"
+    if not holders:
+        return False, ""
+    survivors = _terminate_venv_holders(holders)
+    if survivors:
+        pids = ", ".join(str(item[0]) for item in survivors[:6])
+        return True, f"other Hermes processes still hold the venv after release attempt (PID {pids})"
     return False, ""
 
 

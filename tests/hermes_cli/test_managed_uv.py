@@ -552,7 +552,66 @@ class TestRuntimeRepair:
         assert reacquired is not None
         _release_repair_lock(reacquired)
 
-    def test_windows_holders_refuse_runtime_mutation(self, tmp_path, monkeypatch):
+    def test_windows_holders_killable_proceeds_with_repair(self, tmp_path, monkeypatch):
+        """When the helper can kill every detected venv holder, runtime
+        repair proceeds normally -- this is the new auto-release contract
+        that prevents the WinError 5 SQLite swap from soft-failing every
+        time the Desktop app respawns its backend."""
+        from hermes_cli.managed_uv import repair_vulnerable_runtime
+
+        root, live, sentinel = _make_runtime_install(tmp_path, windows=True)
+        current = _runtime_info(live / "Scripts" / "python.exe", (3, 50, 4))
+        fixed_info = _runtime_info(
+            live / "Scripts" / "python.exe", (3, 53, 1)
+        )
+        old_main = SimpleNamespace(
+            _detect_venv_python_processes=lambda: [
+                (1729, "python.exe", "hermes gateway run")
+            ]
+        )
+        monkeypatch.setitem(sys.modules, "hermes_cli.main", old_main)
+
+        # _terminate_venv_holders returns [] (kill succeeded, all gone).
+        monkeypatch.setattr(
+            "hermes_cli.managed_uv._terminate_venv_holders",
+            lambda matches, timeout_seconds=5.0: [],
+        )
+
+        # Stage a fake fixed generation so the repair pipeline can complete.
+        generation = root / ".hermes-runtime" / "python" / "generation-test"
+        candidate_python = generation / "Scripts" / "python.exe"
+        candidate_python.parent.mkdir(parents=True, exist_ok=True)
+        candidate_python.write_text("candidate", encoding="utf-8")
+        fixed_info = _runtime_info(candidate_python, (3, 53, 1))
+
+        with patch("hermes_cli.managed_uv.platform.system", return_value="Windows"), \
+             patch(
+                 "hermes_cli.managed_uv.probe_sqlite_runtime",
+                 side_effect=[current, current, fixed_info],
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._install_safe_python_generation",
+                 return_value=(generation, candidate_python, fixed_info),
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._stage_candidate_venv",
+                 return_value=generation,
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._smoke_candidate_venv",
+                 return_value=(True, "", fixed_info),
+             ):
+            result = repair_vulnerable_runtime("uv.exe", project_root=root)
+
+        assert result.status == "repaired", (
+            f"expected repair to proceed after killing holders, got {result.status!r}: {result.detail!r}"
+        )
+        assert "PID 1729" not in (result.detail or "")
+
+    def test_windows_holders_unkillable_skips_repair(self, tmp_path, monkeypatch):
+        """When the helper cannot kill the holders (AccessDenied, respawning
+        faster than we can kill), runtime repair bails out with the survivor
+        PIDs in the detail message -- so the user can intervene manually."""
         from hermes_cli.managed_uv import repair_vulnerable_runtime
 
         root, live, sentinel = _make_runtime_install(tmp_path, windows=True)
@@ -563,6 +622,12 @@ class TestRuntimeRepair:
             ]
         )
         monkeypatch.setitem(sys.modules, "hermes_cli.main", old_main)
+
+        # Holder survives the kill window -- helper returns it as a survivor.
+        monkeypatch.setattr(
+            "hermes_cli.managed_uv._terminate_venv_holders",
+            lambda matches, timeout_seconds=5.0: list(matches),
+        )
 
         with patch("hermes_cli.managed_uv.platform.system", return_value="Windows"), \
              patch(
@@ -575,7 +640,8 @@ class TestRuntimeRepair:
             result = repair_vulnerable_runtime("uv.exe", project_root=root)
 
         assert result.status == "skipped"
-        assert "PID 1729" in result.detail
+        assert "1729" in result.detail
+        assert "release attempt" in result.detail
         assert sentinel.read_text(encoding="utf-8") == "live"
         assert not (root / ".hermes-runtime").exists()
         mock_install.assert_not_called()
@@ -1295,3 +1361,197 @@ class TestRepairRetriesAfterUvRefresh:
         assert "replacement environment" in result.detail
         assert len(attempts) == 2
         assert sentinel.read_text(encoding="utf-8") == "live"
+
+
+# ---------------------------------------------------------------------------
+# _terminate_venv_holders — runtime holder release for the SQLite swap
+# ---------------------------------------------------------------------------
+
+class TestTerminateVenvHolders:
+    """The SQLite runtime swap needs `venv/` unmappable; we kill holders, then
+    wait for the OS to release the handles. These tests pin both halves so the
+    behavior doesn't drift back to a pure bail-out."""
+
+    def test_empty_matches_is_noop(self):
+        from hermes_cli.managed_uv import _terminate_venv_holders
+        assert _terminate_venv_holders([]) == []
+
+    def test_kills_named_pids_and_waits(self, monkeypatch):
+        """Successful kill + successful wait -> empty survivor list."""
+        from hermes_cli import managed_uv
+        import sys as _sys
+
+        gone_procs = []
+
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+            def kill(self):
+                gone_procs.append(self.pid)
+
+        class _FakePsutil:
+            Process = FakeProc
+            NoSuchProcess = Exception
+            AccessDenied = Exception
+            @staticmethod
+            def wait_procs(procs, timeout):
+                # Pretend every process we asked about exited within the timeout.
+                return [SimpleNamespace(pid=p.pid, returncode=0, is_running=lambda: False) for p in procs]
+
+        monkeypatch.setitem(_sys.modules, "psutil", _FakePsutil())
+
+        survivors = managed_uv._terminate_venv_holders(
+            [(1234, "python.exe", "venv/Scripts/python.exe -m hermes_cli.main serve"),
+             (5678, "uv.exe", "uv sync --locked")]
+        )
+        assert survivors == []
+        assert sorted(gone_procs) == [1234, 5678]
+
+    def test_survivors_returned_when_wait_times_out(self, monkeypatch):
+        """If a kill happens but the process is still alive after timeout,
+        we surface it as a survivor so the caller can bail out."""
+        from hermes_cli import managed_uv
+        import sys as _sys
+
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+            def kill(self):
+                pass
+
+        class _FakePsutil:
+            Process = FakeProc
+            NoSuchProcess = Exception
+            AccessDenied = Exception
+            @staticmethod
+            def wait_procs(procs, timeout):
+                # Pretend PID 1234 died, PID 5678 is still alive.
+                return [SimpleNamespace(pid=1234, returncode=0, is_running=lambda: False)]
+
+        monkeypatch.setitem(_sys.modules, "psutil", _FakePsutil())
+
+        survivors = managed_uv._terminate_venv_holders(
+            [(1234, "python.exe", "cmd1"), (5678, "uv.exe", "cmd2")]
+        )
+        survivor_pids = [s[0] for s in survivors]
+        assert 5678 in survivor_pids
+        assert 1234 not in survivor_pids
+
+    def test_access_denied_pids_are_survivors(self, monkeypatch):
+        """When psutil can't open the process, treat it as a survivor -- we
+        never want to silently drop a holder we couldn't kill."""
+        from hermes_cli import managed_uv
+        import sys as _sys
+
+        class _AccessDenied(Exception):
+            pass
+
+        class _NoSuchProcess(Exception):
+            pass
+
+        def fake_process(pid):
+            raise _AccessDenied(pid)
+
+        class _FakePsutil:
+            Process = staticmethod(fake_process)
+            AccessDenied = _AccessDenied
+            NoSuchProcess = _NoSuchProcess
+            @staticmethod
+            def wait_procs(procs, timeout):
+                return []
+
+        monkeypatch.setitem(_sys.modules, "psutil", _FakePsutil())
+
+        survivors = managed_uv._terminate_venv_holders([(9999, "python.exe", "locked")])
+        assert [s[0] for s in survivors] == [9999]
+
+    def test_no_holders_passes_through_cleanly(self, monkeypatch):
+        """If psutil says every detected process is already gone, we treat
+        them as NoSuchProcess -- the helper skips them and survivors is []."""
+        from hermes_cli import managed_uv
+        import sys as _sys
+
+        class _FakePsutil:
+            class NoSuchProcess(Exception):
+                pass
+
+            AccessDenied = type("AccessDenied", (Exception,), {})
+
+            @staticmethod
+            def Process(pid):
+                raise _FakePsutil.NoSuchProcess(pid)
+
+            @staticmethod
+            def wait_procs(procs, timeout):
+                return []
+
+        monkeypatch.setitem(_sys.modules, "psutil", _FakePsutil())
+        holders = [(1, "a", "b"), (2, "c", "d")]
+        survivors = managed_uv._terminate_venv_holders(holders)
+        # Every match raises NoSuchProcess on lookup -- the process is gone,
+        # so the helper skips it (not killed, not retained as survivor).
+        assert survivors == []
+
+
+# ---------------------------------------------------------------------------
+# _windows_runtime_holders — gate the rename on holder release
+# ---------------------------------------------------------------------------
+
+class TestWindowsRuntimeHolders:
+    """Verify the gate attempts release instead of just bailing out."""
+
+    def test_no_holders_returns_unblocked(self, monkeypatch):
+        from hermes_cli import managed_uv
+        import sys as _sys
+
+        fake_main = SimpleNamespace(_detect_venv_python_processes=lambda: [])
+        monkeypatch.setitem(_sys.modules, "hermes_cli.main", fake_main)
+        monkeypatch.setattr(managed_uv.platform, "system", lambda: "Windows")
+
+        blocked, detail = managed_uv._windows_runtime_holders()
+        assert blocked is False
+        assert detail == ""
+
+    def test_holders_with_successful_release_returns_unblocked(self, monkeypatch):
+        from hermes_cli import managed_uv
+        import sys as _sys
+
+        fake_main = SimpleNamespace(
+            _detect_venv_python_processes=lambda: [(42, "python.exe", "serve")]
+        )
+        monkeypatch.setitem(_sys.modules, "hermes_cli.main", fake_main)
+        monkeypatch.setattr(managed_uv.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(
+            managed_uv, "_terminate_venv_holders", lambda matches, timeout_seconds=5.0: []
+        )
+
+        blocked, detail = managed_uv._windows_runtime_holders()
+        assert blocked is False
+        assert detail == ""
+
+    def test_holders_with_survivors_returns_blocked(self, monkeypatch):
+        from hermes_cli import managed_uv
+        import sys as _sys
+
+        fake_main = SimpleNamespace(
+            _detect_venv_python_processes=lambda: [(42, "python.exe", "serve")]
+        )
+        monkeypatch.setitem(_sys.modules, "hermes_cli.main", fake_main)
+        monkeypatch.setattr(managed_uv.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(
+            managed_uv,
+            "_terminate_venv_holders",
+            lambda matches, timeout_seconds=5.0: [(42, "python.exe", "serve")],
+        )
+
+        blocked, detail = managed_uv._windows_runtime_holders()
+        assert blocked is True
+        assert "42" in detail
+        assert "release attempt" in detail
+
+    def test_non_windows_returns_unblocked(self, monkeypatch):
+        from hermes_cli import managed_uv
+        monkeypatch.setattr(managed_uv.platform, "system", lambda: "Linux")
+        blocked, detail = managed_uv._windows_runtime_holders()
+        assert blocked is False
+        assert detail == ""
