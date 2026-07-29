@@ -49,16 +49,21 @@ def test_cold_start_opens_already_at_90pct_warns():
     assert "credits.usage" in _cold_start_notices(s)
 
 
-def test_cold_start_grant_exhausted_warns_and_grant_spent():
+def test_cold_start_grant_exhausted_stays_silent():
+    """Cap reached but top-up funds remain → NO notice at cold start.
+
+    The usage band is suppressed whenever purchased (top-up) credits exist (the
+    sub-cap gauge is the wrong denominator for an account that can keep
+    spending). grant_spent is gated on an in-session crossing (seen_grant_unspent)
+    — a session that OPENS in this state is observing a steady state, not an
+    event, so re-announcing it every session open is noise. /usage carries it."""
     s = _state(
         remaining_micros=12_340_000, subscription_micros=0,
         subscription_limit_micros=20_000_000, subscription_limit_usd="20.00",
         purchased_micros=12_340_000, denominator_kind="subscription_cap", paid_access=True,
     )
     assert s.used_fraction == 1.0
-    keys = _cold_start_notices(s)
-    assert "credits.usage" in keys
-    assert "credits.grant_spent" in keys
+    assert _cold_start_notices(s) == []
 
 
 def test_cold_start_depleted_warns():
@@ -123,22 +128,29 @@ def test_dev_fixtures_drive_cold_start():
 
 class _FakeAgent:
     """Minimal agent surface for the seed helper: state slots + an emit that runs
-    the real policy against the latch."""
+    the real policy against the latch (mirroring run_agent._emit_credits_notices,
+    including the free-model suppression flag)."""
 
-    def __init__(self, provider="nous"):
-        from agent.credits_tracker import evaluate_credits_notices
+    def __init__(self, provider="nous", model=""):
+        from agent.credits_tracker import evaluate_credits_notices, is_free_tier_model
 
         self.provider = provider
+        self.model = model
         self._credits_state = None
         self._credits_session_start_micros = None
         self._credits_latch = {"active": set(), "seen_below_90": False, "usage_band": None}
         self.emitted: list = []
         self._eval = evaluate_credits_notices
+        self._is_free = is_free_tier_model
 
     def _emit_credits_notices(self):
         if self._credits_state is None:
             return
-        show, clear = self._eval(self._credits_state, self._credits_latch)
+        show, clear = self._eval(
+            self._credits_state,
+            self._credits_latch,
+            model_is_free=self._is_free(self.model),
+        )
         self.emitted.append(([n.key for n in show], clear))
 
 
@@ -169,10 +181,46 @@ def test_seed_fires_depleted_at_session_open():
     assert a.emitted == [(["credits.depleted"], [])]
 
 
+def test_seed_depleted_suppressed_on_free_model():
+    """A session that opens depleted but on a Nous ``:free`` model must NOT show
+    the depleted banner — inference works fine on the free tier."""
+    a = _FakeAgent(model="nvidia/nemotron-3-ultra:free")
+    assert _seed(a, "depleted") is True
+    assert a.emitted == [([], [])]
+
+
 def test_seed_healthy_no_notice():
     a = _FakeAgent()
     assert _seed(a, "healthy") is True
     assert a.emitted == [([], [])]
+
+
+def test_seed_grant_exhausted_stays_silent():
+    """A session that OPENS with the grant already spent and top-up remaining is a
+    steady STATE, not an event. The seed must not re-announce it on every session
+    open (/usage carries the balance); only a live in-session crossing may fire
+    grant_spent. This is the every-session "Grant spent · $X top-up left" nag fix."""
+    a = _FakeAgent()
+    assert _seed(a, "grant_exhausted") is True
+    assert a._credits_state is not None
+    assert a.emitted == [([], [])]
+
+
+def test_live_crossing_after_seed_still_fires_grant_spent():
+    """The gate opens when the session observes the grant NOT yet spent — a healthy
+    seed followed by a grant-exhausted header is a real in-session crossing and must
+    still announce grant_spent once."""
+    a = _FakeAgent()
+    assert _seed(a, "healthy") is True
+    a.emitted = []
+    a._credits_state = _state(  # the grant_exhausted shape, as a live header would carry it
+        remaining_micros=12_340_000, subscription_micros=0,
+        subscription_limit_micros=20_000_000, subscription_limit_usd="20.00",
+        purchased_micros=12_340_000, purchased_usd="12.34",
+        denominator_kind="subscription_cap", paid_access=True,
+    )
+    a._emit_credits_notices()
+    assert a.emitted == [(["credits.grant_spent"], [])]
 
 
 def test_seed_is_idempotent():

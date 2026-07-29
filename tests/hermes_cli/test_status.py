@@ -3,15 +3,16 @@ from types import SimpleNamespace
 from hermes_cli.status import show_status
 
 
-def test_show_status_includes_tavily_key(monkeypatch, capsys, tmp_path):
+def test_show_status_all_does_not_print_tavily_key_value(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TAVILY_API_KEY", "tvly-1234567890abcdef")
+    sentinel = "NONSECRET_SENTINEL_VALUE_DO_NOT_PRINT_123456"
+    monkeypatch.setenv("TAVILY_API_KEY", sentinel)
 
-    show_status(SimpleNamespace(all=False, deep=False))
+    show_status(SimpleNamespace(all=True, deep=False))
 
     output = capsys.readouterr().out
     assert "Tavily" in output
-    assert "tvly...cdef" in output
+    assert sentinel not in output
 
 
 def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys, tmp_path):
@@ -27,7 +28,7 @@ def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys,
     monkeypatch.setattr(status_mod, "resolve_requested_provider", lambda requested=None: "openai-codex", raising=False)
     monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "openai-codex", raising=False)
     monkeypatch.setattr(status_mod, "provider_label", lambda provider: "OpenAI Codex", raising=False)
-    monkeypatch.setattr(auth_mod, "get_nous_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status_local", lambda: {}, raising=False)
     monkeypatch.setattr(auth_mod, "get_codex_auth_status", lambda: {}, raising=False)
     monkeypatch.setattr(auth_mod, "get_xai_oauth_auth_status", lambda: {}, raising=False)
     monkeypatch.setattr(gateway_mod, "find_gateway_pids", lambda exclude_pids=None: [], raising=False)
@@ -58,7 +59,7 @@ def test_show_status_reports_nous_auth_error(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(status_mod, "provider_label", lambda provider: "OpenAI Codex", raising=False)
     monkeypatch.setattr(
         auth_mod,
-        "get_nous_auth_status",
+        "get_nous_auth_status_local",
         lambda: {
             "logged_in": False,
             "portal_base_url": "https://portal.nousresearch.com",
@@ -97,7 +98,7 @@ def test_show_status_reports_nous_inference_key_without_portal_login(monkeypatch
     monkeypatch.setattr(status_mod, "provider_label", lambda provider: "OpenAI Codex", raising=False)
     monkeypatch.setattr(
         auth_mod,
-        "get_nous_auth_status",
+        "get_nous_auth_status_local",
         lambda: {
             "logged_in": False,
             "inference_credential_present": True,
@@ -149,7 +150,7 @@ def _base_xai_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(status_mod, "resolve_requested_provider", lambda requested=None: "openai-codex", raising=False)
     monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "openai-codex", raising=False)
     monkeypatch.setattr(status_mod, "provider_label", lambda provider: "OpenAI Codex", raising=False)
-    monkeypatch.setattr(auth_mod, "get_nous_auth_status", lambda: {}, raising=False)
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status_local", lambda: {}, raising=False)
     monkeypatch.setattr(auth_mod, "get_codex_auth_status", lambda: {}, raising=False)
     monkeypatch.setattr(auth_mod, "get_qwen_auth_status", lambda: {}, raising=False)
     monkeypatch.setattr(auth_mod, "get_minimax_oauth_auth_status", lambda: {}, raising=False)
@@ -314,7 +315,7 @@ class TestShowStatusXaiOAuth:
         """Nous/Codex/MiniMax rows must still appear when xAI import fails."""
         import hermes_cli.auth as auth_mod
         status_mod = _base_xai_mocks(monkeypatch, tmp_path)
-        monkeypatch.setattr(auth_mod, "get_nous_auth_status",
+        monkeypatch.setattr(auth_mod, "get_nous_auth_status_local",
                             lambda: {"logged_in": True}, raising=False)
         monkeypatch.delattr(auth_mod, "get_xai_oauth_auth_status", raising=False)
 
