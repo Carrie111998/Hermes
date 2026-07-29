@@ -1198,3 +1198,104 @@ async def test_capabilities_advertises_session_model_lock(adapter):
         "method": "POST",
         "path": "/api/sessions/{session_id}/model",
     }
+
+
+def _sse_event_payload(body: str, event_name: str) -> dict:
+    """Return the JSON payload of the first ``event_name`` frame in an SSE body."""
+    import json as _json
+
+    current = None
+    for line in body.splitlines():
+        if line.startswith("event: "):
+            current = line[len("event: "):].strip()
+        elif line.startswith("data: ") and current == event_name:
+            return _json.loads(line[len("data: "):])
+    raise AssertionError(f"no {event_name} event in SSE body: {body[:400]}")
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_reports_partial_completion(adapter, session_db):
+    """A truncated turn must not be streamed as a complete one.
+
+    Every non-streaming session surface derives the flag from the run result
+    (``bool(result.get("partial"))``); the SSE ``assistant.completed`` event
+    hardcoded ``False``, so an SSE client renders a cut-off answer as if the
+    agent had finished.
+    """
+    session_id = session_db.create_session("partial-stream-session", "api_server")
+
+    async def fake_run(**kwargs):
+        kwargs["stream_delta_callback"]("Half an ans")
+        return (
+            {
+                "final_response": "Half an ans",
+                "session_id": session_id,
+                "partial": True,
+            },
+            {"total_tokens": 3},
+        )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "long question"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    assert _sse_event_payload(body, "assistant.completed")["partial"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_reports_interrupted_completion(adapter, session_db):
+    """A user-interrupted turn must be flagged as interrupted, not clean."""
+    session_id = session_db.create_session("interrupted-stream-session", "api_server")
+
+    async def fake_run(**kwargs):
+        kwargs["stream_delta_callback"]("Working on i")
+        return (
+            {
+                "final_response": "Working on i",
+                "session_id": session_id,
+                "interrupted": True,
+            },
+            {"total_tokens": 3},
+        )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "do a thing"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    assert _sse_event_payload(body, "assistant.completed")["interrupted"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_reports_clean_completion(adapter, session_db):
+    """A normal turn still reports neither flag."""
+    session_id = session_db.create_session("clean-stream-session", "api_server")
+
+    async def fake_run(**kwargs):
+        kwargs["stream_delta_callback"]("All done.")
+        return ({"final_response": "All done.", "session_id": session_id}, {"total_tokens": 2})
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "hi"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    payload = _sse_event_payload(body, "assistant.completed")
+    assert payload["partial"] is False
+    assert payload["interrupted"] is False
