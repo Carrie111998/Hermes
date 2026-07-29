@@ -288,10 +288,17 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-2.5-pro",
     ],
     "gemini": [
-        "gemini-3.1-pro-preview",
-        "gemini-3-pro-preview",
-        "gemini-3.6-flash",
-        "gemini-3.1-flash-lite-preview",
+        # Verified against Google's own /v1beta/openai/models endpoint
+        # (issue #73825) -- the previous entries here (gemini-3.1-pro-preview,
+        # gemini-3-pro-preview, gemini-3.6-flash, gemini-3.1-flash-lite-preview)
+        # only exist on OpenRouter, not on Google's direct API; selecting one
+        # 404'd silently. This is only the offline/no-credentials fallback --
+        # provider_model_ids() queries the live endpoint first and only
+        # falls back to this list if that's unreachable or unconfigured.
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
     ],
     "zai": [
         "glm-5.2",
@@ -2531,8 +2538,6 @@ _MODELS_DEV_PREFERRED: frozenset[str] = frozenset({
     "nvidia",
     "huggingface",
     "zai",
-    "gemini",
-    "google",
 })
 
 
@@ -2660,6 +2665,36 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     return live
         except Exception:
             pass
+    if normalized == "gemini":
+        # Query Google's live API directly rather than trusting models.dev's
+        # third-party-aggregated "google" catalog (previously merged via
+        # _MODELS_DEV_PREFERRED) or the hand-curated static list -- both
+        # have listed 3.x model IDs that don't exist on Google's own API,
+        # silently 404ing at call time (issue #73825). Uses the
+        # OpenAI-compatible /v1beta/openai surface (Gemini's own documented
+        # compat layer) specifically because it returns the standard
+        # {"data": [{"id": ...}]} shape fetch_api_models() already parses --
+        # the native /v1beta/models endpoint uses a different response
+        # shape ({"models": [{"name": "models/<id>", ...}]}) that would
+        # need separate parsing. normalize_provider() already canonicalizes
+        # a raw "google" input to "gemini" before this function runs.
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+
+            creds = resolve_api_key_provider_credentials("gemini")
+            api_key = str(creds.get("api_key") or "").strip()
+            if api_key:
+                live = fetch_api_models(
+                    api_key, "https://generativelanguage.googleapis.com/v1beta/openai"
+                )
+                if live:
+                    return live
+        except Exception:
+            pass
+        # Live fetch failed or no credentials configured: fall back to the
+        # curated static list (verified against Google's own API, not
+        # models.dev) rather than merging models.dev data.
+        return list(_PROVIDER_MODELS.get("gemini", []))
     if normalized == "anthropic":
         model_cfg = _get_model_config_dict()
         cfg_provider = normalize_provider(str(model_cfg.get("provider", "") or ""))
