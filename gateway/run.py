@@ -22194,11 +22194,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def enqueue(
             self, identity: str, route_key: tuple, payload: dict,
         ) -> "asyncio.Future | None":
-            """Create a PENDING entry. Returns Future or None if capped."""
+            """Create a PENDING entry. Returns Future or None if capped or duplicate."""
             import asyncio as _asyncio
             with self._lock:
                 if len(self._entries) >= self.BATCH_CAPACITY:
                     return None
+                existing = self._entries.get(identity)
+                if existing is not None and existing["state"] not in self._TERMINAL:
+                    return None  # already pending/claimed; not terminal
                 future = _asyncio.get_running_loop().create_future()
                 self._entries[identity] = {
                     "identity": identity,
