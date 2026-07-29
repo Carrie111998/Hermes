@@ -312,7 +312,7 @@ def _validate_release_base(spec: OwnerRuntimeBuildSpec) -> None:
     if (
         not stat.S_ISDIR(item.st_mode)
         or stat.S_ISLNK(item.st_mode)
-        or item.st_uid != os.getuid()
+        or item.st_uid != os.getuid()  # windows-footgun: ok — POSIX owner boundary
         or stat.S_IMODE(item.st_mode) & 0o022
     ):
         raise ProductionOwnerRuntimePackagingError(
@@ -332,7 +332,7 @@ def _fsync_directory(path: Path) -> None:
         if (
             not stat.S_ISDIR(before.st_mode)
             or stat.S_ISLNK(before.st_mode)
-            or before.st_uid != os.getuid()
+            or before.st_uid != os.getuid()  # windows-footgun: ok — POSIX owner boundary
             or stat.S_IMODE(before.st_mode) & 0o022
             or (before.st_dev, before.st_ino)
             != (opened.st_dev, opened.st_ino)
@@ -392,7 +392,7 @@ def _revision_lock(spec: OwnerRuntimeBuildSpec) -> Iterator[None]:
                 not stat.S_ISREG(existing.st_mode)
                 or stat.S_ISLNK(existing.st_mode)
                 or existing.st_nlink != 1
-                or existing.st_uid != os.getuid()
+                or existing.st_uid != os.getuid()  # windows-footgun: ok — POSIX owner boundary
                 or stat.S_IMODE(existing.st_mode) != 0o600
                 or existing.st_size != 0
             ):
@@ -406,7 +406,7 @@ def _revision_lock(spec: OwnerRuntimeBuildSpec) -> Iterator[None]:
             not stat.S_ISREG(opened.st_mode)
             or stat.S_ISLNK(path_state.st_mode)
             or opened.st_nlink != 1
-            or opened.st_uid != os.getuid()
+            or opened.st_uid != os.getuid()  # windows-footgun: ok — POSIX owner boundary
             or stat.S_IMODE(opened.st_mode) != 0o600
             or opened.st_size != 0
             or (opened.st_dev, opened.st_ino)
@@ -472,7 +472,7 @@ def _validate_incomplete_marker(
         if (
             not stat.S_ISREG(before.st_mode)
             or stat.S_ISLNK(before.st_mode)
-            or before.st_uid != os.getuid()
+            or before.st_uid != os.getuid()  # windows-footgun: ok — POSIX owner boundary
             or before.st_nlink != 1
             or before.st_size != len(payload)
             or stat.S_IMODE(before.st_mode) & 0o022
@@ -562,7 +562,7 @@ def _validate_release_root(spec: OwnerRuntimeBuildSpec) -> os.stat_result:
     if (
         not stat.S_ISDIR(item.st_mode)
         or stat.S_ISLNK(item.st_mode)
-        or item.st_uid != os.getuid()
+        or item.st_uid != os.getuid()  # windows-footgun: ok — POSIX owner boundary
         or stat.S_IMODE(item.st_mode) & 0o022
         or stat.S_IMODE(item.st_mode) not in _RECOVERABLE_ROOT_MODES
     ):
@@ -591,7 +591,7 @@ def _rename_release_root(
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISDIR(opened.st_mode)
-            or opened.st_uid != os.getuid()
+            or opened.st_uid != os.getuid()  # windows-footgun: ok — POSIX owner boundary
             or (opened.st_dev, opened.st_ino)
             != (root_state.st_dev, root_state.st_ino)
             or stat.S_IMODE(opened.st_mode) != original_mode

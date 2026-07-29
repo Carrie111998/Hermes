@@ -1352,8 +1352,8 @@ def rotate_unit_input_authority(
         or os.geteuid() != 0  # windows-footgun: ok — Linux production boundary
     ):
         raise UnitInputRotationError("unit_input_rotation_requires_linux_root")
-    uid = 0 if require_root else os.geteuid()
-    gid = 0 if require_root else os.getegid()
+    uid = 0 if require_root else os.geteuid()  # windows-footgun: ok — POSIX boundary
+    gid = 0 if require_root else os.getegid()  # windows-footgun: ok — POSIX boundary
     if require_root and (
         package.CUTOVER_STAGED_ROOT != PRODUCTION_STAGED_ROOT
         or package.STAGED_UNIT_INPUT_PLAN_PATH
