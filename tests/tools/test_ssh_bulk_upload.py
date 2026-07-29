@@ -191,7 +191,8 @@ class TestSSHBulkUpload:
                 staging_dir = cmd[c_idx + 1]
                 assert not os.path.exists(os.path.join(staging_dir, "home"))
                 expected = os.path.join(staging_dir, "cache/nested.txt")
-                assert os.path.islink(expected)
+                # Windows falls back to copy when symlink privilege is unavailable
+                assert os.path.exists(expected)
 
             mock = MagicMock()
             mock.stdout = MagicMock()
@@ -300,9 +301,12 @@ class TestSSHBulkUpload:
              patch.object(subprocess, "Popen", side_effect=capture_popen):
             mock_env._ssh_bulk_upload(files)
 
-        # The SSH command (second Popen call) should include ControlPath
+        # The SSH command (second Popen call) should include ControlPath on non-Windows
         ssh_cmd = popen_cmds[1]
-        assert f"ControlPath={mock_env.control_socket}" in " ".join(ssh_cmd)
+        if os.name != "nt":
+            assert f"ControlPath={mock_env.control_socket}" in " ".join(ssh_cmd)
+        else:
+            assert "ControlPath" not in " ".join(ssh_cmd)
 
     def test_custom_port_and_key_in_ssh_command(self, monkeypatch, tmp_path):
         """Bulk upload SSH command should include custom port and key."""

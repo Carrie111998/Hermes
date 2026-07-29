@@ -82,9 +82,13 @@ class SSHEnvironment(BaseEnvironment):
 
     def _build_ssh_command(self, extra_args: list | None = None) -> list:
         cmd = ["ssh"]
-        cmd.extend(["-o", f"ControlPath={self.control_socket}"])
-        cmd.extend(["-o", "ControlMaster=auto"])
-        cmd.extend(["-o", "ControlPersist=300"])
+        # Windows OpenSSH does not support Unix-domain ControlMaster sockets.
+        # Skip ControlMaster options on Windows to avoid
+        # "getsockname failed: Not a socket" errors.
+        if os.name != "nt":
+            cmd.extend(["-o", f"ControlPath={self.control_socket}"])
+            cmd.extend(["-o", "ControlMaster=auto"])
+            cmd.extend(["-o", "ControlPersist=300"])
         cmd.extend(["-o", "BatchMode=yes"])
         cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
         cmd.extend(["-o", "ConnectTimeout=10"])
@@ -169,7 +173,10 @@ class SSHEnvironment(BaseEnvironment):
             stdin=subprocess.DEVNULL,
         )
 
-        scp_cmd = ["scp", "-o", f"ControlPath={self.control_socket}"]
+        scp_cmd = ["scp"]
+        # Windows OpenSSH does not support Unix-domain ControlMaster sockets.
+        if os.name != "nt":
+            scp_cmd.extend(["-o", f"ControlPath={self.control_socket}"])
         if self.port != 22:
             scp_cmd.extend(["-P", str(self.port)])
         if self.key_path:
