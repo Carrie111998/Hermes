@@ -6688,7 +6688,8 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
-    Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
+    Reasons: ``"blocker_auth"`` (quota/auth error — deferred once per
+    failed attempt), ``"rate_limit_cooldown"`` (quota retry cooldown),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
     rate_limited: list[str] = field(default_factory=list)
@@ -7891,12 +7892,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
-        reset on a timer; auth needs human action), so we defer to the
-        next tick. The existing ``consecutive_failures`` counter still
-        trips the auto-block circuit breaker after ``failure_limit``
-        consecutive failures, so a persistent auth error eventually
-        blocks via the normal path — but a transient 429 gets a few
-        ticks of recovery first.
+        reset on a timer; auth needs human action), so we defer for one
+        tick per failed attempt. The following tick is allowed to probe
+        again so the existing ``consecutive_failures`` counter can trip
+        the auto-block circuit breaker after ``failure_limit`` failures.
 
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
@@ -7916,7 +7915,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, consecutive_failures "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -7960,9 +7960,29 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # crash/completion supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 2. Quota / auth blocker: retrying immediately will not help. Defer
+    #    exactly once for each failure-count value, then allow one bounded
+    #    probe. Without that probe the guard runs before claim/spawn, so the
+    #    failure counter never advances and the task remains ready forever.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
+        latest_guard = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'respawn_guarded' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest_guard is not None and latest_guard["payload"]:
+            try:
+                guard_payload = json.loads(latest_guard["payload"])
+            except (TypeError, ValueError):
+                guard_payload = {}
+            if (
+                guard_payload.get("reason") == "blocker_auth"
+                and guard_payload.get("failures")
+                == int(row["consecutive_failures"] or 0)
+            ):
+                return None
         return "blocker_auth"
 
     # 3. Completed run within guard window — proof of recent success.
@@ -8216,7 +8236,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, consecutive_failures FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -8358,10 +8378,9 @@ def _dispatch_once_locked(
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
         # the task gets a chance to clear (rate limits often reset in
-        # seconds-to-minutes); the existing consecutive_failures counter
-        # still trips the auto-block circuit breaker after failure_limit
-        # consecutive failures, so a persistent auth error eventually
-        # blocks via the normal path rather than on first occurrence.
+        # seconds-to-minutes). blocker_auth is deferred once per failed
+        # attempt, then a bounded probe is allowed so consecutive_failures
+        # can reach failure_limit instead of the card staying ready forever.
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
@@ -8370,9 +8389,13 @@ def _dispatch_once_locked(
             # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
                 with write_txn(conn):
+                    payload = {"reason": guard_reason}
+                    if guard_reason == "blocker_auth":
+                        payload["failures"] = int(
+                            row["consecutive_failures"] or 0
+                        )
                     _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
+                        conn, row["id"], "respawn_guarded", payload,
                     )
             continue
         if dry_run:

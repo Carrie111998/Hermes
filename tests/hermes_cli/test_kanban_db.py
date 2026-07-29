@@ -1989,6 +1989,48 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_dispatch_respawn_guard_allows_bounded_retry_after_one_deferred_tick(
+    kanban_home, all_assignees_spawnable
+):
+    """A deterministic blocker must not leave a task ready forever.
+
+    The first failed attempt is deferred for one dispatcher tick.  The next
+    tick must probe again so the normal consecutive-failure circuit breaker
+    can block a task whose underlying failure persists.
+    """
+    attempts = []
+
+    def failing_spawn(task, workspace):
+        attempts.append(task.id)
+        raise PermissionError("Permission denied")
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="persistent-permission", assignee="alice")
+
+        first = kb.dispatch_once(
+            conn, spawn_fn=failing_spawn, failure_limit=2,
+        )
+        assert t not in first.auto_blocked
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.get_task(conn, t).consecutive_failures == 1
+
+        deferred = kb.dispatch_once(
+            conn, spawn_fn=failing_spawn, failure_limit=2,
+        )
+        assert (t, "blocker_auth") in deferred.respawn_guarded
+        assert kb.get_task(conn, t).status == "ready"
+
+        retried = kb.dispatch_once(
+            conn, spawn_fn=failing_spawn, failure_limit=2,
+        )
+        task = kb.get_task(conn, t)
+
+    assert attempts == [t, t]
+    assert t in retried.auto_blocked
+    assert task.status == "blocked"
+    assert task.consecutive_failures == 2
+
+
 def test_dispatch_respawn_guard_skips_recent_success(
     kanban_home, all_assignees_spawnable
 ):
