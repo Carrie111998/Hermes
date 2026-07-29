@@ -26,7 +26,8 @@ import {
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
   OFFICIAL_REPO_HTTPS_URL,
-  officialHttpsOnlyGitArgs
+  officialHttpsOnlyGitArgs,
+  officialHttpsOnlyGitEnv
 } from './update-remote'
 
 test('canonicalGitHubRemote normalizes SSH and HTTPS forms to the same value', () => {
@@ -90,6 +91,21 @@ test('official HTTPS Git commands deny protocol rewrites to SSH', () => {
     OFFICIAL_REPO_HTTPS_URL,
     'main'
   ])
+})
+
+test('official HTTPS Git commands override inherited protocol permissions', () => {
+  const inherited = {
+    PATH: '/usr/bin',
+    GIT_ALLOW_PROTOCOL: 'ssh',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'protocol.ssh.allow',
+    GIT_CONFIG_VALUE_0: 'always'
+  }
+
+  const secured = officialHttpsOnlyGitEnv(inherited)
+
+  assert.equal(secured.PATH, '/usr/bin')
+  assert.equal(secured.GIT_ALLOW_PROTOCOL, 'https')
 })
 
 test('update branch names reject refspec metacharacters', () => {

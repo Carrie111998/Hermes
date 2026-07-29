@@ -65,6 +65,12 @@ function officialHttpsOnlyGitArgs(args: string[]) {
   return ['-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', ...args]
 }
 
+function officialHttpsOnlyGitEnv(
+  env: Record<string, string | undefined>
+): Record<string, string | undefined> {
+  return { ...env, GIT_ALLOW_PROTOCOL: 'https' }
+}
+
 function isRefspecSafeBranchName(branch: unknown) {
   const value = String(branch || '').trim()
 
@@ -78,5 +84,6 @@ export {
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
   OFFICIAL_REPO_HTTPS_URL,
-  officialHttpsOnlyGitArgs
+  officialHttpsOnlyGitArgs,
+  officialHttpsOnlyGitEnv
 }

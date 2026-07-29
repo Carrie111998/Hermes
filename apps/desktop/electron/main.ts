@@ -206,7 +206,8 @@ import {
   isOfficialSshRemote,
   isRefspecSafeBranchName,
   OFFICIAL_REPO_HTTPS_URL,
-  officialHttpsOnlyGitArgs
+  officialHttpsOnlyGitArgs,
+  officialHttpsOnlyGitEnv
 } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
@@ -2436,7 +2437,11 @@ async function resolveHealedBranch(updateRoot, branch) {
   const officialSshRemote = isOfficialSshRemote(originUrl)
   const remote = officialSshRemote ? OFFICIAL_REPO_HTTPS_URL : 'origin'
   const probeArgs = ['ls-remote', '--exit-code', '--heads', remote, branch]
-  const probe = await runGit(officialSshRemote ? officialHttpsOnlyGitArgs(probeArgs) : probeArgs, { cwd: updateRoot })
+
+  const probe = await runGit(officialSshRemote ? officialHttpsOnlyGitArgs(probeArgs) : probeArgs, {
+    cwd: updateRoot,
+    env: officialSshRemote ? officialHttpsOnlyGitEnv(process.env) : undefined
+  })
 
   if (probe.code !== 2) {
     return branch
@@ -2509,7 +2514,10 @@ async function checkUpdates() {
           OFFICIAL_REPO_HTTPS_URL,
           `+refs/heads/${branch}:${targetRef}`
         ]),
-        { cwd: updateRoot }
+        {
+          cwd: updateRoot,
+          env: officialHttpsOnlyGitEnv(process.env)
+        }
       )
     : await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
 
