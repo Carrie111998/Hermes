@@ -5,6 +5,39 @@
 
 ---
 
+## 2026-07-26 自定义端点检测 + 启动进度条 + 更新检测修复
+
+- **自定义端点"未配置"bug（第3次复现）：** onboarding 把 API key 写到 `model.api_key`，但设置页面只去 `providers[slug].api_key` 找，永远找不到。之前 7/24(commit 430145c93) 和 7/25(commit 7d5f574cb) 已修过，改为只检查 `base_url` 存在性——被上游合并引入的 `hasApiKey` 检查覆盖导致复现。修复：恢复 `hasEndpoint = Boolean(baseUrl)`，同时后端 `_normalize_config_for_web` 增加 `model_has_api_key` 布尔值（不泄露 key 明文）。
+- **启动进度条消失：** `desktop-onboarding-overlay.tsx` 中 `configured===null`（启动中）的 early-return 返回了纯转圈，挡住了 `<Preparing>` 进度条。修复：删除 early-return，恢复 fall-through。
+- **install.ps1 git init 假性失败：** `$ErrorActionPreference="Stop"` 把 git 的 stderr hint（如 `hint: Using 'master'...`）当致命错误，导致 git init/remote/commit 被中断。修复：git 操作块临时切 EAP 为 Continue。
+- **更新检测逻辑：** checkUpdates 在 `.git` 不存在时走 HTTP fallback 而非报错；更新成功后刷新 bootstrap marker 的 pinnedCommit 防止假更新提示；PATH 加入 PortableGit；resolveHermesCliBinary 支持 venv python.exe fallback。
+- **API key 表单一闪而过：** Picker 组件在 `providers===null`（未加载完）时直接 fall-through 到 ApiKeyForm。修复：加 loading 占位符。
+- **涉及文件：** `providers-settings.tsx`, `web_server.py`, `desktop-onboarding-overlay.tsx`, `main.cjs`, `update-http-fallback.cjs`, `install.ps1`
+
+## 2026-07-25 VM 启动 + 中转站 + 全量汉化
+
+- **launcher3 未调 install.ps1 导致 config.yaml 缺失：** launcher3.exe 解压后直接启动 Qiji.exe，后端 fallback 到 DEFAULT_CONFIG(language=en)。修复：在 launcher3.cs 解压后、启动前用 C# 直接初始化数据目录（设 QIJI_HOME + 删旧 HERMES_HOME + 创建 config.yaml language=zh）。
+- **VM 无系统 Git：** findGitBash/resolveGitBinary 硬编码 'hermes' 在 VM 上找不到。改用 HERMES_HOME 环境变量。
+- **中转站默认地址补 /v1：** `https://www.aicps.vip` → `https://www.aicps.vip/v1`。
+- **cmd 窗口不退出：** launcher3.cs 改 `UseShellExecute=true` + `/target:winexe` + AllocConsole/FreeConsole。
+- **checkUpdates HTTP fallback：** git spawn 失败时 fallback 到 Gitee HTTP API。
+- **provider 汉化：** model_catalog.py 清空 GFW 封锁的 raw.githubusercontent fallback URLs；全量汉化 credential-key-ui/model-settings/uninstall-section/onboarding。
+- **涉及文件：** `launcher3.cs`, `main.cjs`, `install.ps1`, `onboarding-overlay.tsx`, `model_catalog.py`, 多个 i18n 文件
+
+## 2026-07-24 提供方汉化 + 模型中文名 + UTF-8 编码修复
+
+- **provider 显示名映射：** 新增 `providerDisplayName()` 映射表——OpenAI/Anthropic/谷歌/智谱/通义千问/月之暗面/百川/星火/混元/豆包等。
+- **模型中文名映射：** `model-status-label.ts` 新增映射表——通义千问/智谱GLM/DeepSeek/文心一言/Kimi 等。
+- **bootstrap-runner UTF-8 乱码：** install.ps1 在中文 Windows 上输出 GBK，但 Node stream 被设为 utf8 解码导致乱码。改为 `-Command` 模式先设 `[Console]::OutputEncoding=UTF8`。
+- **涉及文件：** `model-settings.tsx`, `model-status-label.ts`, `main.cjs`, 多个 i18n 文件
+
+## 2026-07-23 build.ps1 WSL UNC 路径 + asar 打包修复
+
+- **WSL UNC 路径解析：** build.ps1 从 WSL 路径（`\\wsl.localhost\Ubuntu\...`）运行时，`wslRepoRoot` 被错误计算。改为检测 UNC 前缀直接提取 WSL 内部路径。
+- **asar 只打包 dist 导致 Electron 退化默认页：** asar pack 只打包了 dist/（前端），漏了 electron/main.cjs 等主进程文件，Electron 找不到 package.json 的 main 入口。修复：创建 staging 目录（dist+electron+assets+public+package.json）后完整 pack。
+
+---
+
 ## 2026-07-08 客户安装时间优化 (NTFS Move + Vendor 瘦身)
 
 - **目标：** 减少客户机器上的安装时间（用户原话"客户体验感比我自己重要"）

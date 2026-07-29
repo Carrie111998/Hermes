@@ -105,3 +105,67 @@ if (Test-Path $rgSrc) {
 4. **ffmpeg 被排除需要同步更新 install.ps1 的 staging 逻辑。** 已经更新：install.ps1 L207-220 添加注释说明 ffmpeg 是可选依赖（video_gen 技能需要时再下载），不会影响安装。install.ps1 的 ffmpeg 检查逻辑（L1568-1712）保持不变，用户如果需要 TTS 功能可以手动安装 ffmpeg（scoop/choco/winget）。
 
 ---
+
+## 坑20：install.ps1 git init 假性失败（ErrorActionPreference="Stop"）
+
+**严重度：★★☆☆☆（更新功能失效，但不影响安装和正常使用）**
+
+**现象：** install.ps1 在执行 `git init` + `git remote add` + `git commit` 三步时，第一步 `git init` 就抛出异常终止，后续步骤被跳过。日志显示 `[vendor] WARNING: Git init failed at step 'init'`。但 git init 实际上已经成功执行了——只是它的 stderr hint 被误判为致命错误。
+
+**根因：** install.ps1 的 `$ErrorActionPreference = "Stop"`（脚本默认设置）导致 PowerShell 把**任何** stderr 输出当作 terminating error。git 在 init 时会往 stderr 写 hint 文本：
+
+```
+hint: Using 'master' as the name for the initial branch. ...
+```
+
+这是 git 的正常提示（建议改名 default 分支），不是错误。但 PowerShell 在 `Stop` 模式下把它当异常抛出，中断了 `git init` 后面的 `remote add` 和 `commit`。
+
+**修复：** git 操作块内临时切换 ErrorActionPreference：
+
+```powershell
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    git init ...
+    git remote add ...
+    git commit ...
+} catch {
+    $gitInitOk = $false
+} finally {
+    $ErrorActionPreference = $prevEAP
+}
+```
+
+**教训：** 在 `$ErrorActionPreference="Stop"` 的 PowerShell 脚本中调用原生命令（git/curl/robocopy）时，必须临时切回 `Continue`，否则命令的正常 stderr 输出会被误判为致命错误。
+
+---
+
+## 坑21：自定义端点"未配置"bug 反复复现（api_key 存储路径不一致）
+
+**严重度：★★★☆☆（用户配了 key 但设置页显示未配置，影响信任）**
+
+**现象：** 用户通过 onboarding 配置中转站 API key 后，设置→提供方→账号的"自定义端点"卡片仍显示"未配置自定义端点"。此 bug 已复现 3 次（7/24、7/25、7/26）。
+
+**根因：** onboarding 和设置页面对 API key 的存储/读取路径不一致：
+
+| 操作 | 写入位置 | 读取位置 |
+|------|---------|---------|
+| onboarding 保存 | `model.api_key`（通过 `/api/model/set`） | — |
+| 设置页面检测 | — | `providers[slug].api_key`（永远找不到） |
+
+onboarding 的 `saveOnboardingLocalEndpoint` 调用 `setModelAssignment({ provider: 'custom', api_key })`，key 被写到 `config.yaml` 的 `model.api_key`。但 `CustomEndpointCard` 组件检查 key 时去 `providers` 块下找——两个路径完全不同。
+
+**修复历史：**
+
+1. **7/24 commit 430145c93：** 改为只检查 `base_url` 存在性（`hasEndpoint = Boolean(baseUrl)`），不检查 key。
+2. **7/25 commit 7d5f574cb：** 从 `/api/config` 的扁平化字段 `model_base_url` 读取。
+3. **7/26 commit 854b65ceb：** 上游合并引入了 `hasApiKey` 检查，导致 bug 复现。再次恢复为 `hasEndpoint = Boolean(baseUrl)`。
+
+**最终修复：**
+- 前端：`hasEndpoint = Boolean(baseUrl)`——只要有 base_url 就算已配置（onboarding 时 base_url + key 一起写）
+- 后端：`_normalize_config_for_web` 增加 `model_has_api_key` 布尔值，供前端参考
+- 本地 endpoint（Ollama 等不需要 key）也能正确显示为"已配置"
+
+**教训：** 上游合并时，如果上游代码引入了与白标定制冲突的逻辑（如新增 `hasApiKey` 检查），合并后必须验证白标功能是否被覆盖。这个 bug 已经因为上游合并复现了 3 次，后续合并要特别注意 `providers-settings.tsx` 的 `CustomEndpointCard`。
+
+---
