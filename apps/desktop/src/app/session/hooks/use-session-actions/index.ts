@@ -34,6 +34,7 @@ import {
   $yoloActive,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
+  sessionAliasIds,
   sessionPinId,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
@@ -67,7 +68,7 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+import type { SessionCreateResponse, SessionInfo, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -90,6 +91,18 @@ import {
   toBranchMessages,
   upsertOptimisticSession
 } from './utils'
+
+function pinnedAliasesFor(session: SessionInfo | null | undefined, fallbackId: string): Set<string> {
+  const aliases = new Set<string>([fallbackId])
+
+  if (session) {
+    for (const id of sessionAliasIds(session)) {
+      aliases.add(id)
+    }
+  }
+
+  return aliases
+}
 
 interface SessionActionsOptions {
   activeSessionId: string | null
@@ -1307,9 +1320,10 @@ export function useSessionActions({
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
       const previousPinned = $pinnedSessionIds.get()
-      // Pins are keyed on the durable lineage-root id; the stored id may be the
-      // live tip after compression. Drop both so the pin can't linger.
-      const removedPinId = removed ? sessionPinId(removed) : storedSessionId
+      // Pins may be keyed on ANY lineage alias — older app versions pinned the
+      // live tip, projected compression rows pin an intermediate segment. Drop
+      // the whole alias set so a pin can't resurrect a deleted segment.
+      const removedPinAliases = pinnedAliasesFor(removed, storedSessionId)
       const removedIds = [storedSessionId, removed?.id, removed?._lineage_root_id]
 
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
@@ -1319,7 +1333,7 @@ export function useSessionActions({
       // the delete RPC is in flight, so a racing refresh can't flash it back.
       tombstoneSessions(removedIds)
       beginSessionMutation(removedIds)
-      $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== removedPinId))
+      $pinnedSessionIds.set(previousPinned.filter(id => !removedPinAliases.has(id)))
 
       // Tear down before awaiting so the route effect can't resume the
       // doomed session via the stale /<sid> URL.
@@ -1406,16 +1420,16 @@ export function useSessionActions({
       const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
       const previousPinned = $pinnedSessionIds.get()
-      // Pins are keyed on the durable lineage-root id; the stored id may be the
-      // live tip after compression. Drop both so the pin can't linger.
-      const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
+      // Same alias rule as delete above: retire every lineage id so an
+      // archived segment can't be resurrected by a stale pin.
+      const archivedPinAliases = pinnedAliasesFor(archived, storedSessionId)
       const archivedIds = [storedSessionId, archived?.id, archived?._lineage_root_id]
 
       // Soft-hide: drop from the sidebar immediately, keep the data.
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       tombstoneSessions(archivedIds)
       beginSessionMutation(archivedIds)
-      $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
+      $pinnedSessionIds.set(previousPinned.filter(id => !archivedPinAliases.has(id)))
 
       if (wasSelected) {
         startFreshSessionDraft(true)
