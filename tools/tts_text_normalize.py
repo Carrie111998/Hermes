@@ -258,7 +258,34 @@ def flatten_newlines_for_payload(text: str) -> str:
     return text.strip()
 
 
-def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
+def apply_pronunciation_substitutions(text: str, substitutions: dict | None) -> str:
+    """Replace words in *text* using a case-insensitive whole-word match.
+
+    *substitutions* maps a source word to its phonetic replacement.  The
+    match is case-insensitive and anchored on word boundaries (``\\b``) so
+    partial matches inside larger words are skipped.  The replacement's
+    exact casing is preserved — the replacement string is inserted verbatim
+    regardless of how the source word appeared in the text.
+
+    Returns *text* unchanged when *substitutions* is empty or ``None``.
+    """
+    if not text or not substitutions:
+        return text
+
+    result = text
+    for word, replacement in substitutions.items():
+        if not word:
+            continue
+        pattern = re.compile(r"\b" + re.escape(word) + r"\b", flags=re.IGNORECASE)
+        result = pattern.sub(replacement, result)
+    return result
+
+
+def prepare_spoken_text(
+    text: str,
+    max_chars: int | None = 4000,
+    pronunciation_substitutions: dict | None = None,
+) -> str:
     """Return a TTS-friendly script from assistant text.
 
     Deterministic cleanup, not a semantic rewrite: it removes ``<think>``
@@ -267,8 +294,15 @@ def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
     turns visual line formatting into speakable sentence pauses, and flattens
     the result to a single line so newline-sensitive providers (Kokoro) speak
     the whole script.
+
+    When *pronunciation_substitutions* is a non-empty dict, each key→value
+    pair is applied as a case-insensitive whole-word replacement **before**
+    markdown stripping, so substitutions operate on the raw text.
     """
-    spoken = strip_nonspoken_blocks(text)
+    spoken = text
+    if pronunciation_substitutions:
+        spoken = apply_pronunciation_substitutions(spoken, pronunciation_substitutions)
+    spoken = strip_nonspoken_blocks(spoken)
     spoken = strip_markdown_for_tts(spoken)
     spoken = normalize_symbols_for_tts(spoken)
     spoken = smooth_whitespace_for_tts(spoken)

@@ -2818,15 +2818,20 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
+    tts_config = _load_tts_config()
+
+    # Extract pronunciation substitutions from config and apply them during
+    # spoken-text preparation (before markdown stripping).
+    pronunciation = tts_config.get("pronunciation", {})
+    substitutions = pronunciation.get("substitutions", {}) if isinstance(pronunciation, dict) else {}
+
     try:
         from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
+        text = prepare_spoken_text(text, max_chars=None, pronunciation_substitutions=substitutions)
     except Exception:
         text = text.strip()
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
-
-    tts_config = _load_tts_config()
 
     # When the model supplies a speed parameter, inject it into the config
     # so all downstream provider functions pick it up uniformly.
