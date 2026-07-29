@@ -12,6 +12,14 @@ that use 198.18.0.0/15 or 100.64.0.0/10).  Even when disabled, cloud
 metadata hostnames (metadata.google.internal, 169.254.169.254) are
 **always** blocked — those are never legitimate agent targets.
 
+For environments where disabling private-address protection would be too
+broad, ``security.url_safety_doh_url`` selects a trusted DNS-over-HTTPS JSON
+endpoint for A/AAAA resolution.  Once configured, resolution failures fail
+closed rather than falling back to potentially poisoned system DNS. Hermes-
+owned direct HTTP transports also connect to the validated DoH result,
+preserving the existing DNS-rebinding/TOCTOU protection. Explicit HTTP proxies
+remain a separate trusted egress boundary because they resolve the destination.
+
 Limitations:
   - DNS rebinding (TOCTOU): an attacker-controlled DNS server with TTL=0
     can return a public IP for the check, then a private IP for the actual
@@ -27,9 +35,11 @@ Limitations:
 
 import ipaddress
 import logging
+import math
 import os
 import socket
 import asyncio
+from collections.abc import Mapping
 import re
 from typing import Any, Optional
 from urllib.parse import parse_qsl, quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
@@ -38,6 +48,10 @@ from hermes_constants import get_hermes_home_override
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+class DoHResolutionError(socket.gaierror):
+    """A configured DoH policy could not be read or satisfied."""
 
 
 # ── Proxy detection ──────────────────────────────────────────
@@ -53,6 +67,133 @@ _PROXY_ENV_VARS = (
 def _proxy_is_configured() -> bool:
     """Return True when at least one HTTP proxy env var is set."""
     return any(os.environ.get(v) for v in _PROXY_ENV_VARS)
+
+
+def _configured_doh_resolver() -> tuple[str, float]:
+    """Return the configured URL-safety DoH endpoint and timeout."""
+    from hermes_cli.config import read_raw_config
+
+    try:
+        cfg = read_raw_config(strict=True)
+    except Exception as exc:
+        raise DoHResolutionError(
+            f"Unable to read URL-safety DoH policy: {exc}"
+        ) from exc
+    security = cfg.get("security", {})
+    if not isinstance(security, dict):
+        raise DoHResolutionError("URL-safety security config must be a mapping")
+
+    if "url_safety_doh_url" not in security:
+        url = ""
+    else:
+        raw_url = security["url_safety_doh_url"]
+        if not isinstance(raw_url, str):
+            raise DoHResolutionError("URL-safety DoH endpoint must be a string")
+        url = raw_url.strip()
+    try:
+        timeout = float(security.get("url_safety_doh_timeout", 5))
+    except (TypeError, ValueError):
+        timeout = 5.0
+    if not math.isfinite(timeout):
+        timeout = 5.0
+    return url, min(max(timeout, 0.5), 30.0)
+
+
+def _resolve_hostname_via_doh(hostname: str, url: str, timeout: float) -> list[str]:
+    """Resolve A and AAAA records through a trusted DNS-over-HTTPS endpoint."""
+    import httpx
+
+    endpoint = urlparse(url)
+    if endpoint.scheme.lower() != "https" or not endpoint.hostname:
+        raise DoHResolutionError("URL-safety DoH endpoint must be an HTTPS URL")
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    try:
+        with httpx.Client(
+            timeout=timeout, follow_redirects=False, trust_env=False
+        ) as client:
+            for query_type in ("A", "AAAA"):
+                response = client.get(
+                    url,
+                    params={"name": hostname, "type": query_type},
+                    headers={"accept": "application/dns-json"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise DoHResolutionError(
+                        f"DoH response was not an object for {hostname} ({query_type})"
+                    )
+                status = payload.get("Status")
+                if type(status) is not int or status != 0:
+                    raise DoHResolutionError(
+                        f"DoH resolution failed for {hostname} ({query_type})"
+                    )
+                answers = payload.get("Answer", [])
+                if not isinstance(answers, list):
+                    raise DoHResolutionError(
+                        f"DoH response had invalid answers for {hostname} ({query_type})"
+                    )
+                for answer in answers:
+                    if not isinstance(answer, dict):
+                        raise DoHResolutionError(
+                            f"DoH response had an invalid answer for {hostname} ({query_type})"
+                        )
+                    record_type = answer.get("type")
+                    value = answer.get("data")
+                    if (
+                        type(record_type) is not int
+                        or not isinstance(value, str)
+                        or not value.strip()
+                    ):
+                        raise DoHResolutionError(
+                            f"DoH response had an invalid answer for {hostname} ({query_type})"
+                        )
+                    if record_type not in {1, 28}:
+                        continue
+                    value = value.strip()
+                    try:
+                        parsed_ip = ipaddress.ip_address(value)
+                    except ValueError as exc:
+                        raise DoHResolutionError(
+                            f"DoH response had an invalid IP for {hostname}: {value!r}"
+                        ) from exc
+                    expected_version = 4 if record_type == 1 else 6
+                    if parsed_ip.version != expected_version:
+                        raise DoHResolutionError(
+                            f"DoH response had the wrong address family for {hostname}: {value!r}"
+                        )
+                    normalized = str(parsed_ip)
+                    if normalized not in seen:
+                        resolved.append(normalized)
+                        seen.add(normalized)
+    except DoHResolutionError:
+        raise
+    except Exception as exc:
+        raise DoHResolutionError(f"DoH request failed for {hostname}: {exc}") from exc
+
+    if not resolved:
+        raise DoHResolutionError(f"DoH returned no address records for {hostname}")
+    return resolved
+
+
+def _resolve_hostname_ips(
+    hostname: str,
+    doh_resolver: Optional[tuple[str, float]] = None,
+) -> list[str]:
+    """Resolve a hostname using configured DoH or the system resolver."""
+    try:
+        return [str(ipaddress.ip_address(hostname))]
+    except ValueError:
+        pass
+
+    doh_url, doh_timeout = doh_resolver or _configured_doh_resolver()
+    if doh_url:
+        return _resolve_hostname_via_doh(hostname, doh_url, doh_timeout)
+
+    addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    return [sockaddr[0] for _family, _, _, _, sockaddr in addr_info]
 
 
 def normalize_url_for_request(url: str) -> str:
@@ -369,23 +510,34 @@ def is_always_blocked_url(url: str) -> bool:
                 return True
             return False
 
-        # Hostname → resolve and check every answer.  DNS failure is NOT
-        # always-blocked (caller's ordinary path handles that).
+        # An ordinary system-DNS failure alone does not prove that a hostname
+        # is metadata, so the caller's normal SSRF path handles it. A configured
+        # DoH failure is different: browser paths may intentionally skip that
+        # normal path, so the unconditional floor must fail closed here.
         try:
-            addr_info = socket.getaddrinfo(
-                hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+            resolved_ips = _resolve_hostname_ips(hostname)
+        except DoHResolutionError as exc:
+            logger.warning(
+                "Blocked request because configured DoH policy failed for %s: %s",
+                hostname,
+                exc,
             )
+            return True
         except socket.gaierror:
             return False
 
-        for _family, _, _, _, sockaddr in addr_info:
-            ip_str = sockaddr[0]
+        for resolved_ip in resolved_ips:
+            ip_str = resolved_ip
             if '%' in ip_str:
                 ip_str = ip_str.split('%')[0]
             try:
                 resolved = ipaddress.ip_address(ip_str)
             except ValueError:
-                logger.warning("Unparseable IP address %r for hostname %s — skipping address", sockaddr[0], hostname)
+                logger.warning(
+                    "Unparseable IP address %r for hostname %s — skipping address",
+                    resolved_ip,
+                    hostname,
+                )
                 continue
             if resolved in _ALWAYS_BLOCKED_IPS or any(
                 resolved in net for net in _ALWAYS_BLOCKED_NETWORKS
@@ -443,9 +595,13 @@ def is_safe_url(url: str) -> bool:
 
         allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
 
+        # Snapshot the resolver config so a configured DoH failure cannot race
+        # into the legacy proxy-side DNS delegation path below.
+        doh_resolver = _configured_doh_resolver()
+
         # Try to resolve and check IP
         try:
-            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            resolved_ips = _resolve_hostname_ips(hostname, doh_resolver)
         except socket.gaierror:
             # DNS resolution failed.  In sandbox / proxy environments
             # (NVIDIA OpenShell, Docker + Squid, etc.) the host may
@@ -463,7 +619,7 @@ def is_safe_url(url: str) -> bool:
                 ipaddress.ip_address(hostname)
             except ValueError:
                 _is_literal_ip = False
-            if not _is_literal_ip and _proxy_is_configured():
+            if not doh_resolver[0] and not _is_literal_ip and _proxy_is_configured():
                 logger.debug(
                     "DNS resolution failed for %s — proxy configured, "
                     "allowing through for proxy-side resolution",
@@ -473,15 +629,19 @@ def is_safe_url(url: str) -> bool:
             logger.warning("Blocked request — DNS resolution failed for: %s", hostname)
             return False
 
-        for family, _, _, _, sockaddr in addr_info:
-            ip_str = sockaddr[0]
+        for resolved_ip in resolved_ips:
+            ip_str = resolved_ip
             if '%' in ip_str:
                 ip_str = ip_str.split('%')[0]
             try:
                 ip = ipaddress.ip_address(ip_str)
             except ValueError:
                 # Still unparseable after scope ID strip — fail closed
-                logger.warning("Blocked request — unparseable IP address %r for hostname %s", sockaddr[0], hostname)
+                logger.warning(
+                    "Blocked request — unparseable IP address %r for hostname %s",
+                    resolved_ip,
+                    hostname,
+                )
                 return False
 
             # Always block cloud metadata IPs and link-local, even with toggle on
@@ -555,9 +715,7 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
     allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
 
     try:
-        addr_info = socket.getaddrinfo(
-            hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
-        )
+        resolved_ips = _resolve_hostname_ips(hostname)
     except socket.gaierror as exc:
         raise SSRFConnectionBlocked(
             f"Blocked request - DNS resolution failed for: {hostname}"
@@ -565,15 +723,15 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
 
     safe_ips: list[str] = []
     seen: set[str] = set()
-    for _family, _, _, _, sockaddr in addr_info:
-        ip_str = sockaddr[0]
+    for resolved_ip in resolved_ips:
+        ip_str = resolved_ip
         if "%" in ip_str:
             ip_str = ip_str.split("%")[0]
         try:
             ip = ipaddress.ip_address(ip_str)
         except ValueError as exc:
             raise SSRFConnectionBlocked(
-                f"Blocked request - unparseable IP address {sockaddr[0]!r} for hostname {hostname}"
+                f"Blocked request - unparseable IP address {resolved_ip!r} for hostname {hostname}"
             ) from exc
 
         if ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS):
@@ -752,19 +910,38 @@ def ssrf_safe_http_transport(**kwargs: Any) -> Any:
     return _Transport(**kwargs)
 
 
-def _install_ssrf_guard_on_async_transport(transport: Any, schemes_by_origin_var: Any) -> None:
+def _validate_direct_async_transport(transport: Any) -> None:
+    import httpcore
+    import httpx
+
     state = getattr(transport, "__dict__", {}) if transport is not None else {}
-    if transport is None or state.get("_hermes_ssrf_guarded", False):
+    if transport is None:
         return
+    if type(transport) is not httpx.AsyncHTTPTransport:
+        raise SSRFConnectionBlocked("Unsupported async httpx transport cannot be made SSRF-safe")
+    if state.get("_hermes_ssrf_guarded", False) or "handle_async_request" in state:
+        raise SSRFConnectionBlocked("Unsupported async httpx transport cannot be made SSRF-safe")
 
     pool = state.get("_pool")
-    if pool is None or not hasattr(pool, "_network_backend"):
+    pool_state = getattr(pool, "__dict__", {}) if pool is not None else {}
+    if (
+        type(pool) is not httpcore.AsyncConnectionPool
+        or "handle_async_request" in pool_state
+    ):
         raise SSRFConnectionBlocked("Unsupported async httpx transport cannot be made SSRF-safe")
-    pool._network_backend = _SSRFGuardedAsyncNetworkBackend(schemes_by_origin_var)
+    if getattr(transport, "handle_async_request", None) is None:
+        raise SSRFConnectionBlocked("Unsupported async httpx transport cannot be made SSRF-safe")
 
-    handle_async_request = getattr(transport, "handle_async_request", None)
-    if handle_async_request is None:
-        raise SSRFConnectionBlocked("Unsupported async httpx transport cannot be made SSRF-safe")
+
+def _install_ssrf_guard_on_async_transport(transport: Any, schemes_by_origin_var: Any) -> None:
+    _validate_direct_async_transport(transport)
+    if transport is None:
+        return
+
+    state = transport.__dict__
+    pool = state["_pool"]
+    pool._network_backend = _SSRFGuardedAsyncNetworkBackend(schemes_by_origin_var)
+    handle_async_request = transport.handle_async_request
 
     async def guarded_handle_async_request(request: Any) -> Any:
         token = schemes_by_origin_var.set(_origin_scheme_context(request))
@@ -777,19 +954,35 @@ def _install_ssrf_guard_on_async_transport(transport: Any, schemes_by_origin_var
     transport._hermes_ssrf_guarded = True
 
 
-def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any) -> None:
+def _validate_direct_transport(transport: Any) -> None:
+    import httpcore
+    import httpx
+
     state = getattr(transport, "__dict__", {}) if transport is not None else {}
-    if transport is None or state.get("_hermes_ssrf_guarded", False):
+    if transport is None:
         return
+    if type(transport) is not httpx.HTTPTransport:
+        raise SSRFConnectionBlocked("Unsupported httpx transport cannot be made SSRF-safe")
+    if state.get("_hermes_ssrf_guarded", False) or "handle_request" in state:
+        raise SSRFConnectionBlocked("Unsupported httpx transport cannot be made SSRF-safe")
 
     pool = state.get("_pool")
-    if pool is None or not hasattr(pool, "_network_backend"):
+    pool_state = getattr(pool, "__dict__", {}) if pool is not None else {}
+    if type(pool) is not httpcore.ConnectionPool or "handle_request" in pool_state:
         raise SSRFConnectionBlocked("Unsupported httpx transport cannot be made SSRF-safe")
-    pool._network_backend = _SSRFGuardedNetworkBackend(schemes_by_origin_var)
+    if getattr(transport, "handle_request", None) is None:
+        raise SSRFConnectionBlocked("Unsupported httpx transport cannot be made SSRF-safe")
 
-    handle_request = getattr(transport, "handle_request", None)
-    if handle_request is None:
-        raise SSRFConnectionBlocked("Unsupported httpx transport cannot be made SSRF-safe")
+
+def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any) -> None:
+    _validate_direct_transport(transport)
+    if transport is None:
+        return
+
+    state = transport.__dict__
+    pool = state["_pool"]
+    pool._network_backend = _SSRFGuardedNetworkBackend(schemes_by_origin_var)
+    handle_request = transport.handle_request
 
     def guarded_handle_request(request: Any) -> Any:
         token = schemes_by_origin_var.set(_origin_scheme_context(request))
@@ -802,14 +995,70 @@ def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any)
     transport._hermes_ssrf_guarded = True
 
 
+def _transport_uses_explicit_proxy(transport: Any, *, asynchronous: bool) -> bool:
+    """Return whether an httpx transport delegates connection ownership to a proxy."""
+    import httpcore
+    import httpx
+
+    state = getattr(transport, "__dict__", {}) if transport is not None else {}
+    pool = state.get("_pool")
+    expected_transport = httpx.AsyncHTTPTransport if asynchronous else httpx.HTTPTransport
+    if type(transport) is not expected_transport:
+        return False
+    if state.get("_hermes_ssrf_guarded", False) or any(
+        name in state for name in ("handle_request", "handle_async_request")
+    ):
+        return False
+    pool_state = getattr(pool, "__dict__", {}) if pool is not None else {}
+    if any(name in pool_state for name in ("handle_request", "handle_async_request")):
+        return False
+    expected_pools = (
+        {httpcore.AsyncHTTPProxy, httpcore.AsyncSOCKSProxy}
+        if asynchronous
+        else {httpcore.HTTPProxy, httpcore.SOCKSProxy}
+    )
+    return type(pool) in expected_pools
+
+
+def _validate_supplied_transports(kwargs: dict[str, Any], *, asynchronous: bool) -> None:
+    """Validate caller-owned routing objects before constructing or mutating a client."""
+    transports = [kwargs.get("transport")]
+    mounts = kwargs.get("mounts")
+    if isinstance(mounts, Mapping):
+        transports.extend(mounts.values())
+
+    seen: set[int] = set()
+    for transport in transports:
+        if transport is None or id(transport) in seen:
+            continue
+        seen.add(id(transport))
+        if _transport_uses_explicit_proxy(transport, asynchronous=asynchronous):
+            continue
+        if asynchronous:
+            _validate_direct_async_transport(transport)
+        else:
+            _validate_direct_transport(transport)
+
+
 def _install_ssrf_guard_on_async_client(client: Any) -> None:
     import contextvars
 
     schemes_by_origin_var = contextvars.ContextVar("hermes_ssrf_async_origin_schemes")
     state = getattr(client, "__dict__", {})
-    _install_ssrf_guard_on_async_transport(
-        state.get("_transport"), schemes_by_origin_var
-    )
+    default_transport = state.get("_transport")
+    transports = [default_transport, *state.get("_mounts", {}).values()]
+    seen: set[int] = set()
+    direct_transports = []
+    for transport in transports:
+        if transport is None or id(transport) in seen:
+            continue
+        seen.add(id(transport))
+        if _transport_uses_explicit_proxy(transport, asynchronous=True):
+            continue
+        _validate_direct_async_transport(transport)
+        direct_transports.append(transport)
+    for transport in direct_transports:
+        _install_ssrf_guard_on_async_transport(transport, schemes_by_origin_var)
 
 
 def _install_ssrf_guard_on_client(client: Any) -> None:
@@ -817,9 +1066,20 @@ def _install_ssrf_guard_on_client(client: Any) -> None:
 
     schemes_by_origin_var = contextvars.ContextVar("hermes_ssrf_origin_schemes")
     state = getattr(client, "__dict__", {})
-    _install_ssrf_guard_on_transport(
-        state.get("_transport"), schemes_by_origin_var
-    )
+    default_transport = state.get("_transport")
+    transports = [default_transport, *state.get("_mounts", {}).values()]
+    seen: set[int] = set()
+    direct_transports = []
+    for transport in transports:
+        if transport is None or id(transport) in seen:
+            continue
+        seen.add(id(transport))
+        if _transport_uses_explicit_proxy(transport, asynchronous=False):
+            continue
+        _validate_direct_transport(transport)
+        direct_transports.append(transport)
+    for transport in direct_transports:
+        _install_ssrf_guard_on_transport(transport, schemes_by_origin_var)
 
 
 def create_ssrf_safe_async_client(**kwargs: Any) -> Any:
@@ -833,8 +1093,21 @@ def create_ssrf_safe_async_client(**kwargs: Any) -> Any:
     """
     import httpx
 
+    kwargs["trust_env"] = False
+    _validate_supplied_transports(kwargs, asynchronous=True)
     client = httpx.AsyncClient(**kwargs)
-    _install_ssrf_guard_on_async_client(client)
+    try:
+        _install_ssrf_guard_on_async_client(client)
+    except Exception:
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(client.aclose())
+        else:
+            loop.create_task(client.aclose())
+        raise
     return client
 
 
@@ -842,8 +1115,14 @@ def create_ssrf_safe_client(**kwargs: Any) -> Any:
     """Create an ``httpx.Client`` with connect-time SSRF validation."""
     import httpx
 
+    kwargs["trust_env"] = False
+    _validate_supplied_transports(kwargs, asynchronous=False)
     client = httpx.Client(**kwargs)
-    _install_ssrf_guard_on_client(client)
+    try:
+        _install_ssrf_guard_on_client(client)
+    except Exception:
+        client.close()
+        raise
     return client
 
 

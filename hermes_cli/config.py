@@ -2922,6 +2922,14 @@ DEFAULT_CONFIG = {
     # Pre-exec security scanning via tirith
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
+        # Optional trusted DNS-over-HTTPS JSON endpoint for URL SSRF checks and
+        # direct-transport connect-time IP pinning. Useful when a VPN/TUN proxy
+        # returns fake benchmark-range addresses from the system resolver.
+        # DoH requests bypass environment proxies, so the endpoint must be
+        # directly reachable. Empty preserves the system DNS default; failures
+        # never fall back when configured.
+        "url_safety_doh_url": "",
+        "url_safety_doh_timeout": 5,
         "redact_secrets": True,
         "tirith_enabled": True,
         "tirith_path": "tirith",
@@ -7492,40 +7500,52 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 
-def read_raw_config() -> Dict[str, Any]:
+def read_raw_config(*, strict: bool = False) -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
 
-    Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
-    be parsed.  Use this for lightweight config reads where you just need a
-    single value and don't want the overhead of ``load_config()``'s deep-merge
-    + migration pipeline.
+    Returns the raw YAML dict, or ``{}`` if the file doesn't exist. By default,
+    unreadable or malformed files also return ``{}`` for backward compatibility.
+    Pass ``strict=True`` for security-sensitive reads that must distinguish a
+    missing file from an unreadable or malformed existing policy.
 
-    Cached on the config file's (mtime_ns, size) — same strategy as
-    ``load_config()``. Returns a deepcopy on every call since some callers
-    mutate the result before passing to ``save_config()``.
+    Non-strict reads are cached on the config file's (mtime_ns, size) — same
+    strategy as ``load_config()``. Strict reads always reopen the file so a
+    permission or I/O failure after a prior successful read still fails closed.
+    Returns a deepcopy on every call since some callers mutate the result before
+    passing to ``save_config()``.
     """
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
             st = config_path.stat()
             cache_key = (st.st_mtime_ns, st.st_size)
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            if strict:
+                raise
             return {}
 
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
+        if not strict and cached is not None and cached[:2] == cache_key:
             return copy.deepcopy(cached[2])
 
         try:
             with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
+                data = fast_safe_load(f)
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
+            if strict:
+                raise
             return {}
 
         if not isinstance(data, dict):
-            data = {}
+            if strict:
+                raise ValueError(f"Expected a YAML mapping in {config_path}")
+            # Do not cache the normalized fallback: a later security-sensitive
+            # strict read must still be able to detect the malformed file.
+            return {}
         _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
         return data
 

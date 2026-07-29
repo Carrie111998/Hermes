@@ -509,9 +509,31 @@ security:
 
 SSRF 防护对面向互联网的使用始终有效，DNS 失败被视为阻止（故障关闭）。重定向链在每一跳都会重新验证，以防止基于重定向的绕过。
 
+#### 为 Fake-IP 解析器配置可信 DNS-over-HTTPS
+
+VPN 和 TUN 代理模式有时会让系统解析器返回 `198.18.0.0/15` 等保留网段中的合成地址。与其关闭 SSRF 防护，不如为 URL 安全检查配置一个可信的 DNS-over-HTTPS JSON 端点：
+
+```yaml
+security:
+  url_safety_doh_url: "https://1.1.1.1/dns-query"
+  url_safety_doh_timeout: 5
+```
+
+超时会规范化到 `0.5`–`30` 秒，并按每次 DoH 请求传给 httpx。`NaN`、无穷大等无效或非有限值会使用安全的五秒默认值。httpx 会把该值分别应用于连接、读取、写入和连接池阶段；它不是整个请求的总截止时间。每轮解析会依次查询 A、AAAA，并在第一次失败时立即终止。一次成功的 Hermes 自有直连请求通常会发出四个 DoH HTTP 调用：URL 预检查阶段两个，打开 socket 前重新解析阶段两个。一次成功的代理路由请求会执行两个预检查调用，最终解析则由代理完成。失败耗时取决于失败发生在哪个查询和网络阶段，而不是配置值的固定倍数。
+
+端点必须实现 DNS JSON API（`application/dns-json`），而不能只支持 RFC 8484 二进制 DNS message 格式。Hermes 会同时查询 A 和 AAAA 记录。Hermes 自有的直接 HTTP transport 会在连接时重新执行一次 DoH 查询，独立验证这组新结果，并把本次 socket 连接固定到经过验证的 IP，同时保留原始主机名用于 Host、SNI 和证书检查，从而保留 DNS rebinding 防护。配置 DoH 后，超时、异常响应、DNS 错误或配置文件不可读都会被阻止；Hermes 不会回退到可能已被污染的系统 DNS。字面 IP URL 和云元数据端点仍受正常 SSRF 规则约束。
+
+DoH 查询固定使用 `trust_env=False`，不会读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 等环境代理设置，使可信解析器的选择不受环境代理影响。因此 DoH 端点必须能够直连。在只能通过代理联网的环境中，需要单独允许直连该端点，或者不要启用此选项；配置后端点不可达时会故障关闭。
+
+Hermes 自有的 SSRF-safe 目标客户端也会强制使用 `trust_env=False`，即使调用方尝试启用它也不会继承环境代理。因此环境代理变量无法把最终解析移出 validated-IP transport；只有 Hermes 通过 httpx proxy mount 等方式显式配置的代理才会被使用。
+
+每次 URL 安全检查都会把目标主机名发送给所选 DoH 提供商；提供商可能按照自己的日志和保留政策观察查询及源 IP，请选择你信任的服务。A/AAAA 查询也会在目标请求之前增加网络延迟。
+
+这类显式配置的 HTTP 代理仍是一个独立的可信出口边界：最终目标解析由代理执行，因此 Hermes 无法把代理端连接固定到 DoH 结果。请使用其 DNS 和私网出口策略都可信的代理。即使配置了代理，Hermes 的 DoH 预检查失败也仍会阻止请求。
+
 #### 有意允许私有 URL
 
-某些场景确实需要访问私有/内部 URL——将 `home.arpa` 解析到 RFC 1918 空间的家庭网络、仅限局域网的 Ollama/llama.cpp 端点、内部 wiki、云元数据调试等。对于这些情况，提供了一个全局选项：
+某些场景确实需要访问私有/内部 URL——将 `home.arpa` 解析到 RFC 1918 空间的家庭网络、仅限局域网的 Ollama/llama.cpp 端点、内部 wiki、云元数据调试等。如果可信 DoH 不适合该场景，也可以使用全局选项：
 
 ```yaml
 security:

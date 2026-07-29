@@ -1,7 +1,18 @@
 """Tests for SSRF protection in url_safety module."""
 
+import asyncio
+import base64
+from collections import UserDict
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
 import socket
+import ssl
+import threading
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -11,18 +22,39 @@ from tools.url_safety import (
     is_always_blocked_url,
     normalize_url_for_request,
     redirect_target_from_response,
+    create_ssrf_safe_client,
     create_ssrf_safe_async_client,
     SSRFConnectionBlocked,
     _SSRFGuardedAsyncNetworkBackend,
     _MAX_SSRF_CONNECT_IPS,
     _resolved_http_connect_ips,
     _is_blocked_ip,
+    _configured_doh_resolver,
     _global_allow_private_urls,
     _reset_allow_private_cache,
 )
 
 import ipaddress
 import pytest
+
+
+_TLS_FIXTURE_DIR = Path(__file__).parents[1] / "fixtures" / "url_safety_tls"
+
+
+@contextmanager
+def _running_test_server(handler, *, tls_context=None):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    if tls_context is not None:
+        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "test HTTPS server thread did not terminate"
 
 
 class TestNormalizeUrlForRequest:
@@ -81,6 +113,449 @@ class TestIsSafeUrl:
             (2, 1, 6, "", ("93.184.216.34", 0)),
         ]):
             assert is_safe_url("https://example.com/image.png") is True
+
+    def test_configured_doh_public_answer_overrides_fake_ip_dns(self):
+        queries = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                assert kwargs["trust_env"] is False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, url, *, params, headers):
+                assert url == "https://1.1.1.1/dns-query"
+                assert headers["accept"] == "application/dns-json"
+                queries.append(params["type"])
+                answers = (
+                    [
+                        {
+                            "name": "example.com",
+                            "type": 5,
+                            "TTL": 60,
+                            "data": "edge.example.net.",
+                        },
+                        {
+                            "name": "edge.example.net",
+                            "type": 1,
+                            "TTL": 60,
+                            "data": "93.184.216.34",
+                        },
+                    ]
+                    if params["type"] == "A"
+                    else []
+                )
+                return FakeResponse({"Status": 0, "Answer": answers})
+
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+                "url_safety_doh_timeout": 5,
+            }
+        }
+        fake_ip_answer = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.1.10", 0)),
+        ]
+
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch("socket.getaddrinfo", return_value=fake_ip_answer),
+            patch("httpx.Client", FakeClient),
+        ):
+            assert is_safe_url("https://example.com/") is True
+
+        assert queries == ["A", "AAAA"]
+
+    def test_configured_doh_private_answer_is_blocked(self):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch(
+                "tools.url_safety._resolve_hostname_via_doh",
+                return_value=["192.168.1.10"],
+            ),
+        ):
+            assert is_safe_url("https://example.com/") is False
+
+    def test_configured_doh_mixed_public_and_private_ipv6_is_blocked(self):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch(
+                "tools.url_safety._resolve_hostname_via_doh",
+                return_value=["93.184.216.34", "fd00::10"],
+            ),
+        ):
+            assert is_safe_url("https://example.com/") is False
+
+    def test_configured_doh_metadata_answer_is_always_blocked(self):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch(
+                "tools.url_safety._resolve_hostname_via_doh",
+                return_value=["169.254.169.254"],
+            ),
+        ):
+            assert is_safe_url("https://attacker.example/") is False
+
+    def test_configured_doh_failure_does_not_fallback_to_system_dns(self):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch(
+                "tools.url_safety._resolve_hostname_via_doh",
+                side_effect=socket.gaierror("DoH unavailable"),
+            ),
+            patch("socket.getaddrinfo") as system_resolve,
+        ):
+            assert is_safe_url("https://example.com/") is False
+
+        system_resolve.assert_not_called()
+
+    @pytest.mark.parametrize("invalid_url", [None, False, 0, [], {}])
+    def test_non_string_doh_url_fails_closed_without_system_dns(self, invalid_url):
+        config = {"security": {"url_safety_doh_url": invalid_url}}
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch("socket.getaddrinfo") as system_resolve,
+        ):
+            assert is_safe_url("https://example.com/") is False
+            system_resolve.assert_not_called()
+
+    def test_configured_doh_failure_stays_blocked_with_proxy_configured(self):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {"HTTPS_PROXY": "http://127.0.0.1:8080"},
+                clear=False,
+            ),
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch(
+                "tools.url_safety._resolve_hostname_via_doh",
+                side_effect=socket.gaierror("DoH unavailable"),
+            ),
+            patch("socket.getaddrinfo") as system_resolve,
+        ):
+            assert is_safe_url("https://example.com/") is False
+
+        system_resolve.assert_not_called()
+
+    def test_literal_ip_does_not_use_configured_doh(self):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch("tools.url_safety._resolve_hostname_via_doh") as doh_resolve,
+        ):
+            assert is_safe_url("https://93.184.216.34/") is True
+
+        doh_resolve.assert_not_called()
+
+    @pytest.mark.parametrize("timeout", ["nan", "inf", "-inf"])
+    def test_configured_doh_non_finite_timeout_uses_safe_default(self, timeout):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+                "url_safety_doh_timeout": timeout,
+            }
+        }
+        with patch("hermes_cli.config.read_raw_config", return_value=config):
+            assert _configured_doh_resolver() == (
+                "https://1.1.1.1/dns-query",
+                5.0,
+            )
+
+    @pytest.mark.parametrize(
+        ("timeout", "expected"),
+        [(-1, 0.5), (0, 0.5), (31, 30.0)],
+    )
+    def test_configured_doh_timeout_is_clamped(self, timeout, expected):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+                "url_safety_doh_timeout": timeout,
+            }
+        }
+        with patch("hermes_cli.config.read_raw_config", return_value=config):
+            assert _configured_doh_resolver() == (
+                "https://1.1.1.1/dns-query",
+                expected,
+            )
+
+    def test_configured_doh_non_https_endpoint_fails_closed(self):
+        config = {
+            "security": {
+                "url_safety_doh_url": "http://127.0.0.1/dns-query",
+            }
+        }
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch("socket.getaddrinfo") as system_resolve,
+        ):
+            assert is_safe_url("https://example.com/") is False
+            assert is_always_blocked_url("https://attacker.example/") is True
+
+        system_resolve.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            [],
+            {"Status": False, "Answer": []},
+            {"Status": "0", "Answer": []},
+            {"Status": 2, "Answer": []},
+            {"Status": 0, "Answer": {}},
+            {"Status": 0, "Answer": ""},
+            {"Status": 0, "Answer": "not-a-list"},
+            {"Status": 0, "Answer": [False]},
+            {
+                "Status": 0,
+                "Answer": [{"type": True, "data": "93.184.216.34"}],
+            },
+            {
+                "Status": 0,
+                "Answer": [{"type": 1, "data": "2001:4860:4860::8888"}],
+            },
+            {
+                "Status": 0,
+                "Answer": [
+                    {"type": 1, "data": "93.184.216.34"},
+                    {"type": 28, "data": "not-an-ip"},
+                ],
+            },
+            {
+                "Status": 0,
+                "Answer": [
+                    {"type": 28, "data": "2606:4700:4700::1111"},
+                    {"type": 1, "data": "169.254.169.254"},
+                ],
+            },
+        ],
+    )
+    def test_configured_doh_malformed_json_fails_closed(self, payload):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return payload
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch("httpx.Client", FakeClient),
+            patch("socket.getaddrinfo") as system_resolve,
+        ):
+            assert is_safe_url("https://example.com/") is False
+            assert is_always_blocked_url("https://attacker.example/") is True
+
+        system_resolve.assert_not_called()
+
+    def test_configured_doh_malformed_a_blocks_even_when_aaaa_is_valid(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, *_args, params, **_kwargs):
+                if params["type"] == "A":
+                    return FakeResponse({"Status": 0, "Answer": [False]})
+                return FakeResponse({
+                    "Status": 0,
+                    "Answer": [
+                        {
+                            "type": 28,
+                            "data": "2606:2800:220:1:248:1893:25c8:1946",
+                        },
+                    ],
+                })
+
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch("httpx.Client", FakeClient),
+        ):
+            assert is_safe_url("https://example.com/") is False
+
+    def test_configured_doh_aaaa_only_answer_is_allowed(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, *_args, params, **_kwargs):
+                answers = (
+                    []
+                    if params["type"] == "A"
+                    else [
+                        {
+                            "type": 28,
+                            "data": "2606:2800:220:1:248:1893:25c8:1946",
+                        },
+                    ]
+                )
+                return FakeResponse({"Status": 0, "Answer": answers})
+
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch("httpx.Client", FakeClient),
+        ):
+            assert is_safe_url("https://example.com/") is True
+
+    @pytest.mark.parametrize(
+        "config_text",
+        [
+            "[not, a, mapping]\n",
+            "null\n",
+            "false\n",
+            "0\n",
+            '""\n',
+            "security: []\n",
+            "security: [unterminated\n",
+        ],
+    )
+    def test_malformed_existing_config_fails_closed(
+        self, monkeypatch, tmp_path, config_text
+    ):
+        from hermes_cli.config import read_raw_config
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            config_text,
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        # A prior non-strict caller must not normalize/cache away malformed data.
+        read_raw_config()
+        with patch("socket.getaddrinfo") as system_resolve:
+            assert is_safe_url("https://example.com/") is False
+            assert is_always_blocked_url("https://attacker.example/") is True
+
+        system_resolve.assert_not_called()
+
+    def test_strict_config_read_rechecks_readability_after_cache(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli.config import read_raw_config
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "security:\n"
+            '  url_safety_doh_url: "https://resolver.example/dns-query"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        assert read_raw_config()["security"]["url_safety_doh_url"]
+
+        with (
+            patch("builtins.open", side_effect=PermissionError("config unreadable")),
+            patch(
+                "tools.url_safety._resolve_hostname_via_doh",
+                return_value=["93.184.216.34"],
+            ) as doh_resolve,
+            patch("socket.getaddrinfo") as system_resolve,
+        ):
+            assert is_safe_url("https://example.com/") is False
+
+        doh_resolve.assert_not_called()
+        system_resolve.assert_not_called()
 
     def test_ftp_scheme_blocked(self):
         """Only http/https should be allowed for fetch tools."""
@@ -357,6 +832,240 @@ class TestAsyncIsSafeUrl:
 
 
 class TestSSRFGuardedHttpxClient:
+    def test_sync_client_forces_environment_proxy_bypass(self):
+        client = object()
+        with (
+            patch("httpx.Client", return_value=client) as constructor,
+            patch("tools.url_safety._install_ssrf_guard_on_client") as install_guard,
+        ):
+            result = create_ssrf_safe_client(trust_env=True)
+
+        assert result is client
+        assert constructor.call_args.kwargs["trust_env"] is False
+        install_guard.assert_called_once_with(client)
+
+    def test_async_client_forces_environment_proxy_bypass(self):
+        client = object()
+        with (
+            patch("httpx.AsyncClient", return_value=client) as constructor,
+            patch(
+                "tools.url_safety._install_ssrf_guard_on_async_client"
+            ) as install_guard,
+        ):
+            result = create_ssrf_safe_async_client(trust_env=True)
+
+        assert result is client
+        assert constructor.call_args.kwargs["trust_env"] is False
+        install_guard.assert_called_once_with(client)
+
+    def test_config_yaml_to_doh_json_to_validated_ip_dial(self, monkeypatch, tmp_path):
+        """Exercise config, TLS DoH, preflight, guarded dial, Host, and SNI."""
+        cert_path = _TLS_FIXTURE_DIR / "test-cert.pem"
+        key_path = tmp_path / "test-key.pem"
+        key_path.write_bytes(
+            base64.b64decode(
+                (_TLS_FIXTURE_DIR / "test-key.pem.b64").read_bytes().strip(),
+                validate=True,
+            )
+        )
+
+        destination_requests = []
+        destination_sni = []
+
+        class DestinationHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                destination_requests.append((self.path, self.headers.get("host")))
+                body = b"validated destination"
+                self.send_response(200)
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        doh_queries = []
+        doh_sni = []
+
+        class DoHHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                parsed = urlsplit(self.path)
+                query = parse_qs(parsed.query)
+                query_type = query.get("type", [""])[0]
+                hostname = query.get("name", [""])[0]
+                doh_queries.append(
+                    (parsed.path, hostname, query_type, self.headers.get("host"))
+                )
+                answers = (
+                    [{"name": hostname, "type": 1, "TTL": 60, "data": "127.0.0.1"}]
+                    if query_type == "A"
+                    else []
+                )
+                body = json.dumps({"Status": 0, "Answer": answers}).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/dns-json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        doh_tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        doh_tls_context.load_cert_chain(cert_path, key_path)
+        doh_tls_context.set_servername_callback(
+            lambda _socket, server_name, _context: doh_sni.append(server_name)
+        )
+        destination_tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        destination_tls_context.load_cert_chain(cert_path, key_path)
+        destination_tls_context.set_servername_callback(
+            lambda _socket, server_name, _context: destination_sni.append(server_name)
+        )
+        client_tls_context = ssl.create_default_context(cafile=str(cert_path))
+        real_httpx_client = httpx.Client
+        client_options = []
+
+        def client_trusting_test_certificate(**kwargs):
+            client_options.append(dict(kwargs))
+            kwargs.setdefault("verify", client_tls_context)
+            return real_httpx_client(**kwargs)
+
+        real_getaddrinfo = socket.getaddrinfo
+        system_dns_hosts = []
+
+        def reject_destination_system_dns(host, *args, **kwargs):
+            normalized_host = host.decode() if isinstance(host, bytes) else host
+            system_dns_hosts.append(normalized_host)
+            if normalized_host == "integration.example":
+                raise AssertionError("destination hostname reached the system resolver")
+            return real_getaddrinfo(host, *args, **kwargs)
+
+        with (
+            _running_test_server(
+                DestinationHandler, tls_context=destination_tls_context
+            ) as destination,
+            _running_test_server(DoHHandler, tls_context=doh_tls_context) as doh,
+        ):
+            hermes_home = tmp_path / "hermes-home"
+            hermes_home.mkdir()
+            (hermes_home / "config.yaml").write_text(
+                "security:\n"
+                "  allow_private_urls: true\n"
+                f"  url_safety_doh_url: https://localhost:{doh.server_port}/dns-query\n"
+                "  url_safety_doh_timeout: 2\n",
+                encoding="utf-8",
+            )
+            monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+            monkeypatch.setattr(httpx, "Client", client_trusting_test_certificate)
+            monkeypatch.setattr(socket, "getaddrinfo", reject_destination_system_dns)
+            _reset_allow_private_cache()
+            target_url = (
+                f"https://integration.example:{destination.server_port}/payload"
+            )
+            try:
+                assert is_safe_url(target_url) is True
+                with create_ssrf_safe_client(
+                    trust_env=False, timeout=5, verify=client_tls_context
+                ) as client:
+                    sync_response = client.get(target_url)
+
+                async def async_roundtrip():
+                    assert await async_is_safe_url(target_url) is True
+                    async with create_ssrf_safe_async_client(
+                        trust_env=False, timeout=5, verify=client_tls_context
+                    ) as client:
+                        return await client.get(target_url)
+
+                async_response = asyncio.run(async_roundtrip())
+            finally:
+                _reset_allow_private_cache()
+
+        assert sync_response.status_code == 200
+        assert sync_response.text == "validated destination"
+        assert async_response.status_code == 200
+        assert async_response.text == "validated destination"
+        assert doh_queries == [
+            (
+                "/dns-query",
+                "integration.example",
+                query_type,
+                f"localhost:{doh.server_port}",
+            )
+            for _resolution_pass in range(4)
+            for query_type in ("A", "AAAA")
+        ]
+        assert doh_sni == ["localhost"] * len(doh_queries)
+        assert "integration.example" not in system_dns_hosts
+        assert destination_requests == [
+            ("/payload", f"integration.example:{destination.server_port}"),
+            ("/payload", f"integration.example:{destination.server_port}"),
+        ]
+        assert destination_sni == ["integration.example", "integration.example"]
+        assert any(
+            options.get("follow_redirects") is False
+            and options.get("trust_env") is False
+            for options in client_options
+        )
+
+    def test_connect_resolution_uses_configured_doh(self):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+                "url_safety_doh_timeout": 5,
+            }
+        }
+        fake_ip_answer = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.1.10", 443)),
+        ]
+
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch(
+                "tools.url_safety._resolve_hostname_via_doh",
+                return_value=["93.184.216.34"],
+            ) as doh_resolve,
+            patch("socket.getaddrinfo", return_value=fake_ip_answer),
+        ):
+            ips = _resolved_http_connect_ips("example.com", 443, "https")
+
+        assert ips == ["93.184.216.34"]
+        doh_resolve.assert_called_once_with(
+            "example.com", "https://1.1.1.1/dns-query", 5.0
+        )
+
+    def test_connect_doh_transport_failure_is_blocked_without_dns_fallback(self):
+        import httpx
+
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+
+        class FailingClient:
+            def __init__(self, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, url, *, params, headers):
+                request = httpx.Request("GET", url)
+                raise httpx.ConnectError("DoH unavailable", request=request)
+
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch("httpx.Client", FailingClient),
+            patch("socket.getaddrinfo") as system_resolve,
+        ):
+            with pytest.raises(SSRFConnectionBlocked, match="DNS resolution failed"):
+                _resolved_http_connect_ips("example.com", 443, "https")
+
+        system_resolve.assert_not_called()
+
     def test_connect_resolution_caps_safe_ip_candidates(self):
         answers = [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"93.184.216.{idx}", 80))
@@ -445,9 +1154,145 @@ class TestSSRFGuardedHttpxClient:
         with pytest.raises(SSRFConnectionBlocked, match="Unsupported async httpx transport"):
             create_ssrf_safe_async_client(transport=CustomTransport())
 
+    def test_sync_client_rejects_custom_http_transport_subclass_mount(self):
+        class DelegatingTransport(httpx.HTTPTransport):
+            def handle_request(self, request):
+                raise AssertionError("custom transport must never execute")
+
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported httpx transport"):
+            create_ssrf_safe_client(mounts={"all://": DelegatingTransport()})
+
+    def test_async_client_rejects_custom_http_transport_subclass_mount(self):
+        class DelegatingTransport(httpx.AsyncHTTPTransport):
+            async def handle_async_request(self, request):
+                raise AssertionError("custom transport must never execute")
+
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported async httpx transport"):
+            create_ssrf_safe_async_client(mounts={"all://": DelegatingTransport()})
+
+    def test_sync_client_rejection_does_not_mutate_primary_transport(self):
+        class UnsupportedTransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                return httpx.Response(200, request=request)
+
+        primary = httpx.HTTPTransport()
+        original_backend = primary._pool._network_backend
+        original_close = primary.close
+        closed = False
+
+        def track_close():
+            nonlocal closed
+            closed = True
+            original_close()
+
+        primary.close = track_close
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported httpx transport"):
+            create_ssrf_safe_client(
+                transport=primary,
+                mounts=UserDict({"all://": UnsupportedTransport()}),
+            )
+
+        assert closed is False
+        assert primary._pool._network_backend is original_backend
+        assert not getattr(primary, "_hermes_ssrf_guarded", False)
+        assert "handle_request" not in primary.__dict__
+
+    def test_async_client_rejection_does_not_mutate_primary_transport(self):
+        class UnsupportedAsyncTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                return httpx.Response(200, request=request)
+
+        primary = httpx.AsyncHTTPTransport()
+        original_backend = primary._pool._network_backend
+        original_aclose = primary.aclose
+        closed = False
+
+        async def track_aclose():
+            nonlocal closed
+            closed = True
+            await original_aclose()
+
+        primary.aclose = track_aclose
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported async httpx transport"):
+            create_ssrf_safe_async_client(
+                transport=primary,
+                mounts=UserDict({"all://": UnsupportedAsyncTransport()}),
+            )
+
+        assert closed is False
+        assert primary._pool._network_backend is original_backend
+        assert not getattr(primary, "_hermes_ssrf_guarded", False)
+        assert "handle_async_request" not in primary.__dict__
+
+    def test_client_rejects_spoofed_proxy_pool(self):
+        fake_proxy_type = type("HTTPProxy", (), {"__module__": "httpcore"})
+        transport = httpx.HTTPTransport()
+        transport._pool = fake_proxy_type()
+
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported httpx transport"):
+            create_ssrf_safe_client(mounts={"all://": transport})
+
+    def test_sync_client_rejects_proxy_transport_instance_override(self):
+        transport = httpx.HTTPTransport(proxy="http://proxy.example:8080")
+
+        def bypass(request):
+            return httpx.Response(200, request=request)
+
+        transport.handle_request = bypass
+
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported httpx transport"):
+            create_ssrf_safe_client(mounts={"all://": transport})
+
+    def test_async_client_rejects_proxy_transport_instance_override(self):
+        transport = httpx.AsyncHTTPTransport(proxy="http://proxy.example:8080")
+
+        async def bypass(request):
+            return httpx.Response(200, request=request)
+
+        transport.handle_async_request = bypass
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported async httpx transport"):
+            create_ssrf_safe_async_client(mounts={"all://": transport})
+
+    def test_client_rejects_spoofed_guard_marker(self):
+        transport = httpx.HTTPTransport()
+        transport._hermes_ssrf_guarded = True
+
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported httpx transport"):
+            create_ssrf_safe_client(mounts={"all://": transport})
+
+    def test_client_rejects_direct_pool_instance_override(self):
+        transport = httpx.HTTPTransport()
+
+        def bypass(request):
+            return httpx.Response(200, request=request)
+
+        transport._pool.handle_request = bypass
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported httpx transport"):
+            create_ssrf_safe_client(mounts={"all://": transport})
+
+    def test_client_rejects_proxy_pool_instance_override(self):
+        transport = httpx.HTTPTransport(proxy="http://proxy.example:8080")
+
+        def bypass(request):
+            return httpx.Response(200, request=request)
+
+        transport._pool.handle_request = bypass
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported httpx transport"):
+            create_ssrf_safe_client(mounts={"all://": transport})
+
+    def test_async_client_rejects_proxy_pool_instance_override(self):
+        transport = httpx.AsyncHTTPTransport(proxy="http://proxy.example:8080")
+
+        async def bypass(request):
+            return httpx.Response(200, request=request)
+
+        transport._pool.handle_async_request = bypass
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported async httpx transport"):
+            create_ssrf_safe_async_client(mounts={"all://": transport})
+
     @pytest.mark.asyncio
-    async def test_async_client_preserves_env_proxy_mounts(self, monkeypatch):
-        """Installing the guard must not disable or rewrite httpx env proxy setup."""
+    async def test_async_client_ignores_environment_proxy_mounts(self, monkeypatch):
+        """Ambient proxy variables cannot move resolution outside the guard."""
         for proxy_var in (
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -468,17 +1313,110 @@ class TestSSRFGuardedHttpxClient:
                 for transport in client.__dict__.get("_mounts", {}).values()
                 if transport is not None
             ]
-            assert proxy_transports
+            assert proxy_transports == []
             assert type(client._transport._pool._network_backend).__name__ == (
                 "_SSRFGuardedAsyncNetworkBackend"
             )
-            assert all(
-                type(transport._pool._network_backend).__name__
-                != "_SSRFGuardedAsyncNetworkBackend"
-                for transport in proxy_transports
-            )
         finally:
             await client.aclose()
+
+    def test_sync_client_guards_direct_mount_but_trusts_explicit_proxy_mount(self):
+        direct_transport = httpx.HTTPTransport()
+        proxy_transport = httpx.HTTPTransport(proxy="http://proxy.example:8080")
+        client = create_ssrf_safe_client(
+            mounts={"http://": direct_transport, "https://": proxy_transport}
+        )
+        try:
+            assert direct_transport._hermes_ssrf_guarded is True
+            assert type(direct_transport._pool._network_backend).__name__ == (
+                "_SSRFGuardedNetworkBackend"
+            )
+            assert not getattr(proxy_transport, "_hermes_ssrf_guarded", False)
+            assert type(proxy_transport._pool).__name__ == "HTTPProxy"
+        finally:
+            client.close()
+
+    @pytest.mark.parametrize(
+        "proxy_url,pool_name",
+        [
+            ("http://proxy.example:8080", "HTTPProxy"),
+            ("socks5://proxy.example:1080", "SOCKSProxy"),
+        ],
+    )
+    def test_sync_client_trusts_explicit_primary_proxy_transport(
+        self, proxy_url, pool_name
+    ):
+        transport = httpx.HTTPTransport(proxy=proxy_url)
+        client = create_ssrf_safe_client(transport=transport)
+        try:
+            assert client._transport is transport
+            assert type(transport._pool).__name__ == pool_name
+            assert not getattr(transport, "_hermes_ssrf_guarded", False)
+        finally:
+            client.close()
+
+    @pytest.mark.parametrize("placement", ["primary", "mount"])
+    def test_sync_client_rejects_async_proxy_transport(self, placement):
+        transport = httpx.AsyncHTTPTransport(proxy="http://proxy.example:8080")
+        kwargs = (
+            {"transport": transport}
+            if placement == "primary"
+            else {"mounts": {"all://": transport}}
+        )
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported httpx transport"):
+            create_ssrf_safe_client(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_async_client_guards_direct_mount_but_trusts_explicit_proxy_mount(
+        self,
+    ):
+        direct_transport = httpx.AsyncHTTPTransport()
+        proxy_transport = httpx.AsyncHTTPTransport(
+            proxy="http://proxy.example:8080"
+        )
+        client = create_ssrf_safe_async_client(
+            mounts={"http://": direct_transport, "https://": proxy_transport}
+        )
+        try:
+            assert direct_transport._hermes_ssrf_guarded is True
+            assert type(direct_transport._pool._network_backend).__name__ == (
+                "_SSRFGuardedAsyncNetworkBackend"
+            )
+            assert not getattr(proxy_transport, "_hermes_ssrf_guarded", False)
+            assert type(proxy_transport._pool).__name__ == "AsyncHTTPProxy"
+        finally:
+            await client.aclose()
+
+    @pytest.mark.parametrize(
+        "proxy_url,pool_name",
+        [
+            ("http://proxy.example:8080", "AsyncHTTPProxy"),
+            ("socks5://proxy.example:1080", "AsyncSOCKSProxy"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_async_client_trusts_explicit_primary_proxy_transport(
+        self, proxy_url, pool_name
+    ):
+        transport = httpx.AsyncHTTPTransport(proxy=proxy_url)
+        client = create_ssrf_safe_async_client(transport=transport)
+        try:
+            assert client._transport is transport
+            assert type(transport._pool).__name__ == pool_name
+            assert not getattr(transport, "_hermes_ssrf_guarded", False)
+        finally:
+            await client.aclose()
+
+    @pytest.mark.parametrize("placement", ["primary", "mount"])
+    def test_async_client_rejects_sync_proxy_transport(self, placement):
+        transport = httpx.HTTPTransport(proxy="http://proxy.example:8080")
+        kwargs = (
+            {"transport": transport}
+            if placement == "primary"
+            else {"mounts": {"all://": transport}}
+        )
+        with pytest.raises(SSRFConnectionBlocked, match="Unsupported async httpx transport"):
+            create_ssrf_safe_async_client(**kwargs)
 
 
 class TestIsBlockedIp:
@@ -776,6 +1714,27 @@ class TestIsAlwaysBlockedUrl:
             (2, 1, 6, "", ("169.254.169.254", 0)),
         ]):
             assert is_always_blocked_url("http://attacker-controlled.example.com/") is True
+
+    def test_hostname_resolving_to_imds_via_configured_doh_always_blocked(self):
+        config = {
+            "security": {
+                "url_safety_doh_url": "https://1.1.1.1/dns-query",
+            }
+        }
+        fake_ip_answer = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.1.10", 0)),
+        ]
+        with (
+            patch("hermes_cli.config.read_raw_config", return_value=config),
+            patch(
+                "tools.url_safety._resolve_hostname_via_doh",
+                return_value=["169.254.169.254"],
+            ),
+            patch("socket.getaddrinfo", return_value=fake_ip_answer),
+        ):
+            assert (
+                is_always_blocked_url("http://attacker-controlled.example.com/") is True
+            )
 
     def test_scope_id_imds_in_floor_blocked(self):
         """A scope-ID suffix on an IPv4-mapped IMDS address resolving in the

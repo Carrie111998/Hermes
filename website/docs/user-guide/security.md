@@ -652,9 +652,66 @@ All URL-capable tools (web search, web extract, vision, browser) validate URLs b
 
 SSRF protection is always active for internet-facing use and DNS failures are treated as blocked (fail-closed). Redirect chains are re-validated at each hop to prevent redirect-based bypasses.
 
+#### Trusted DNS-over-HTTPS for fake-IP resolvers
+
+VPN and TUN proxy modes sometimes make the system resolver return synthetic
+addresses from reserved ranges such as `198.18.0.0/15`. Instead of disabling
+SSRF protection, configure a trusted DNS-over-HTTPS JSON endpoint for URL
+safety checks:
+
+```yaml
+security:
+  url_safety_doh_url: "https://1.1.1.1/dns-query"
+  url_safety_doh_timeout: 5
+```
+
+The timeout is normalized to `0.5`–`30` seconds and passed to httpx for each DoH
+request. Invalid or non-finite values such as `NaN` and infinity use the safe
+five-second default. httpx applies this value separately to connect, read,
+write, and pool phases; it is not a total request deadline. Each resolution
+pass queries A and then AAAA sequentially and stops at the first failure. A
+successful Hermes-owned direct request normally makes four DoH HTTP calls: two
+during URL preflight and two in a fresh pass immediately before opening the
+socket. A successful proxy-routed request makes the two preflight calls, while
+final resolution occurs at the proxy. Failure latency depends on the failing
+query and network phase rather than a fixed multiple of the configured value.
+
+The endpoint must implement the DNS JSON API (`application/dns-json`), not only
+the RFC 8484 binary DNS-message format. Hermes queries both A and AAAA records.
+Hermes-owned direct HTTP transports perform a fresh DoH lookup at connect time,
+validate the new results independently, and pin that socket attempt to a validated
+IP while preserving the original hostname for Host, SNI, and certificate checks.
+When DoH is configured, a timeout, malformed response, DNS error, or unreadable
+configuration is blocked; Hermes never falls back to potentially poisoned system
+DNS. Literal IP URLs and cloud metadata endpoints remain subject to the normal
+SSRF rules.
+
+DoH lookup requests are made with `trust_env=False`. They do not use
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, or related environment settings, which
+keeps the trusted resolver decision independent of an ambient proxy. The DoH
+endpoint must therefore be directly reachable. In proxy-only networks, either
+permit direct access to that endpoint or leave this option disabled; an
+unreachable configured endpoint fails closed.
+
+Hermes-owned SSRF-safe destination clients also force `trust_env=False`, even if
+a caller attempts to enable it. Ambient proxy variables therefore cannot move
+the final lookup outside the validated-IP transport. Only a proxy explicitly
+configured by Hermes (for example through an httpx proxy mount) is used.
+
+Each URL safety check sends the requested hostname to the selected DoH provider,
+which can observe the query and source IP according to its own logging and
+retention policy. Choose a provider you trust. A/AAAA lookups also add network
+latency before the destination request.
+
+Such an explicitly configured HTTP proxy remains a separate trusted egress boundary:
+the proxy performs the final destination lookup, so Hermes cannot pin that
+proxy-side connection to the DoH result. Use a proxy whose DNS and private-network
+egress policy you trust. A failed Hermes DoH precheck is still blocked even when
+a proxy is configured.
+
 #### Intentionally allowing private URLs
 
-Some setups legitimately need private/internal URL access — home networks that resolve `home.arpa` to RFC 1918 space, LAN-only Ollama/llama.cpp endpoints, internal wikis, cloud metadata debugging, and the like. For those cases there's a global opt-out:
+Some setups legitimately need private/internal URL access — home networks that resolve `home.arpa` to RFC 1918 space, LAN-only Ollama/llama.cpp endpoints, internal wikis, cloud metadata debugging, and the like. When trusted DoH does not fit the use case, there is also a global opt-out:
 
 ```yaml
 security:
