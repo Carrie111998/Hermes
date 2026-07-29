@@ -2998,6 +2998,19 @@ def _session_toolset_selection(session: dict) -> list[str] | None:
     return list(stored) if stored is not None else None
 
 
+def _reported_toolset_selection(session: dict | None) -> set[str] | None:
+    """Toolsets to mark enabled for a client, or ``None`` when all of them are.
+
+    ``set()`` and ``None`` must stay apart: an empty set is a session scoped to
+    no toolset at all, while ``None`` is "no explicit scope" and keeps the
+    historical "everything is enabled" answer.
+    """
+    selection = (
+        _session_toolset_selection(session) if session else _load_enabled_toolsets()
+    )
+    return set(selection) if selection is not None else None
+
+
 def _toolset_selection_conflict(session: dict, requested: list[str] | None) -> bool:
     """Would reusing ``session`` silently ignore ``requested``?
 
@@ -15564,11 +15577,7 @@ def _(rid, params: dict) -> dict:
         from toolsets import get_all_toolsets, get_toolset_info
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            set(getattr(session["agent"], "enabled_toolsets", []) or [])
-            if session
-            else set(_load_enabled_toolsets() or [])
-        )
+        enabled = _reported_toolset_selection(session)
 
         items = []
         for name in sorted(get_all_toolsets().keys()):
@@ -15580,7 +15589,7 @@ def _(rid, params: dict) -> dict:
                     "name": name,
                     "description": info["description"],
                     "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
+                    "enabled": True if enabled is None else name in enabled,
                     "tools": info["resolved_tools"],
                 }
             )
@@ -15596,7 +15605,7 @@ def _(rid, params: dict) -> dict:
 
         session = _sessions.get(params.get("session_id", ""))
         enabled = (
-            getattr(session["agent"], "enabled_toolsets", None)
+            _session_toolset_selection(session)
             if session
             else _load_enabled_toolsets()
         )
@@ -15704,11 +15713,7 @@ def _(rid, params: dict) -> dict:
         from toolsets import get_all_toolsets, get_toolset_info
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            set(getattr(session["agent"], "enabled_toolsets", []) or [])
-            if session
-            else set(_load_enabled_toolsets() or [])
-        )
+        enabled = _reported_toolset_selection(session)
 
         items = []
         for name in sorted(get_all_toolsets().keys()):
@@ -15720,7 +15725,7 @@ def _(rid, params: dict) -> dict:
                     "name": name,
                     "description": info["description"],
                     "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
+                    "enabled": True if enabled is None else name in enabled,
                 }
             )
         return _ok(rid, {"toolsets": items})

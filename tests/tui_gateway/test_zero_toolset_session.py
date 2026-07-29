@@ -538,3 +538,85 @@ class TestRebuilds:
         agent = SimpleNamespace(enabled_toolsets=None)
         kwargs = server._background_agent_kwargs(agent, "task-2")
         assert kwargs["enabled_toolsets"] == ["terminal", "file"]
+
+
+def _reporting_server():
+    # Real toolsets/model_tools registry: these RPCs answer from it, so a
+    # mocked hermes_constants would make the answer meaningless.
+    import tui_gateway.server as server
+
+    return server
+
+
+def _list_toolsets(server, method: str, session: dict | None) -> list[dict]:
+    sessions = {"s-report": session} if session is not None else {}
+    with patch.dict(server._sessions, sessions, clear=True):
+        params = {"session_id": "s-report"} if session is not None else {}
+        resp = server._methods[method]("r-report", params)
+    assert "error" not in resp, resp
+    return resp["result"]["toolsets"]
+
+
+def _show_tools(server, session: dict | None) -> dict:
+    sessions = {"s-report": session} if session is not None else {}
+    with patch.dict(server._sessions, sessions, clear=True):
+        params = {"session_id": "s-report"} if session is not None else {}
+        resp = server._methods["tools.show"]("r-show", params)
+    assert "error" not in resp, resp
+    return resp["result"]
+
+
+@pytest.mark.parametrize("method", ["tools.list", "toolsets.list"])
+class TestToolsetReporting:
+    def test_empty_selection_reports_every_toolset_disabled(self, method) -> None:
+        server = _reporting_server()
+        session = {"session_key": "k", "agent": SimpleNamespace(enabled_toolsets=[])}
+        items = _list_toolsets(server, method, session)
+        assert items, "expected the toolset catalog to be non-empty"
+        assert [i["name"] for i in items if i["enabled"]] == []
+
+    def test_explicit_selection_reports_only_that_toolset(self, method) -> None:
+        server = _reporting_server()
+        session = {"session_key": "k", "agent": SimpleNamespace(enabled_toolsets=["file"])}
+        items = _list_toolsets(server, method, session)
+        assert [i["name"] for i in items if i["enabled"]] == ["file"]
+
+    def test_absent_selection_still_reports_everything_enabled(self, method) -> None:
+        server = _reporting_server()
+        session = {"session_key": "k", "agent": SimpleNamespace(enabled_toolsets=None)}
+        items = _list_toolsets(server, method, session)
+        assert all(i["enabled"] for i in items)
+
+    def test_prebuild_session_reports_its_pinned_empty_selection(self, method) -> None:
+        server = _reporting_server()
+        session = {"session_key": "k", "agent": None, "create_enabled_toolsets": []}
+        items = _list_toolsets(server, method, session)
+        assert [i["name"] for i in items if i["enabled"]] == []
+
+    def test_no_session_keeps_the_global_answer(self, method, monkeypatch) -> None:
+        server = _reporting_server()
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: None)
+        items = _list_toolsets(server, method, None)
+        assert all(i["enabled"] for i in items)
+
+    def test_response_shape_is_unchanged(self, method) -> None:
+        server = _reporting_server()
+        session = {"session_key": "k", "agent": SimpleNamespace(enabled_toolsets=[])}
+        items = _list_toolsets(server, method, session)
+        for item in items:
+            assert {"name", "description", "tool_count", "enabled"} <= set(item)
+            assert isinstance(item["enabled"], bool)
+
+
+class TestToolsShowReporting:
+    def test_empty_selection_shows_no_tool(self) -> None:
+        server = _reporting_server()
+        session = {"session_key": "k", "agent": SimpleNamespace(enabled_toolsets=[])}
+        result = _show_tools(server, session)
+        assert result["total"] == 0
+        assert result["sections"] == []
+
+    def test_absent_selection_still_shows_tools(self) -> None:
+        server = _reporting_server()
+        session = {"session_key": "k", "agent": SimpleNamespace(enabled_toolsets=None)}
+        assert _show_tools(server, session)["total"] > 0
