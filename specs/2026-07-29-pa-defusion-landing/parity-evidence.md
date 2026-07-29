@@ -16,8 +16,14 @@
 
 The Hermes reconcile base was `origin/main` at
 `08efbfb67b3c69400dd2845a8e805296e3de6287`. The final Hermes delta is 11
-paths, 180 insertions and 54 deletions. The intersection-by-intersection
+paths, 184 insertions and 54 deletions. The intersection-by-intersection
 disposition is in `conflict-resolution-log.md`.
+
+The landing WB expressly defines Branch B as D1-17/21/23/24. That instruction
+supersedes the original Phase-1 evidence's D1-23 exclusion for one narrow
+change: `gateway/platforms/whatsapp.py` now reads neutral `_pa_local_time`
+first and retains `_tgg_sgt` as a legacy fallback. No other WhatsApp renderer
+behavior was moved into Phase 1.
 
 ## Parity bar
 

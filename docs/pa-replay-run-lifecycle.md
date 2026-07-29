@@ -56,6 +56,10 @@ are part of the canonical source manifest, a plan created before this contract
 change has a different digest; finish or abandon an in-flight run with its
 original code version rather than mixing versions.
 
+The neutral replay-envelope landing also changes the corpus digest by stopping
+live `_tgg_source_ref` / `_tgg_sgt` dual-writes. Finish or abandon an in-flight
+run created before that landing with its original code version.
+
 The command writes:
 
 - `run-manifest.json` — state machine, target descriptor/baseline digests, attempt digests, gate result.

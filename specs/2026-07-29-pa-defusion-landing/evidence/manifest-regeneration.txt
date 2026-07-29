@@ -1,1 +1,6 @@
+$ python3 deploy/tgg/christopher/scripts/build_pa_agent_manifest.py --app-root . --manifest deploy/tgg/christopher/pa-agent.hermes.manifest.json
 {"check": false, "file_count": 578, "manifest": "/Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/deploy/tgg/christopher/pa-agent.hermes.manifest.json", "ok": true}
+$ python3 deploy/tgg/christopher/scripts/build_pa_agent_manifest.py --app-root . --manifest deploy/tgg/christopher/pa-agent.hermes.manifest.json --check
+{"check": true, "file_count": 578, "manifest": "/Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/deploy/tgg/christopher/pa-agent.hermes.manifest.json", "ok": true}
+$ git diff --exit-code -- deploy/tgg/christopher/pa-agent.hermes.manifest.json
+manifest_diff_rc=0

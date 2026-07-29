@@ -1,7 +1,8 @@
+$ uv run --extra sandbox --extra dev python -m pytest tests/gateway/test_durable_jsonl_consumer.py tests/test_pa_business_facts.py tests/test_python_sandbox_tool.py -q
 bringing up nodes...
 bringing up nodes...
 
 ........................................................................ [ 36%]
 ........................................................................ [ 72%]
-.............s.....s..s.s.s..s.s.s.s....................                 [100%]
-191 passed, 9 skipped in 15.71s
+.................s...s.s.s.s.s.s..s.s...................                 [100%]
+191 passed, 9 skipped in 15.84s

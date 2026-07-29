@@ -26,7 +26,7 @@
 | `daa65fa9b5` `client_url` producer | Shared business-fact output. | Preserved unchanged; the producer remains config-driven. |
 | `1f7437c250` `media_ref` promotion and document delivery | Shared document-delivery path. | Preserved unchanged after neutralizing the validator call described above; focused document and consumer tests passed. |
 | `8bc917de55` SQLite dataset materialization | Shared materialization path. | Preserved unchanged; selection remains configuration-driven via dataset `type: sqlite`. |
-| Branch B replay envelope | Branch A had temporarily dual-written neutral and `_tgg_*` metadata. | `2d7287b160` makes neutral keys canonical, reads neutral keys first with legacy fallback, and keeps explicit legacy fixture coverage rather than retaining a live TGG write path. |
+| Branch B replay envelope / D1-23 | Branch A had temporarily dual-written neutral and `_tgg_*` metadata because its original Phase-1 evidence deferred the live WhatsApp reader. | This landing WB explicitly includes D1-23 and D1-24 in Branch B, superseding that earlier exclusion for the narrow reader migration. `2d7287b160` makes neutral keys canonical, changes `gateway/platforms/whatsapp.py` to read neutral local time first with legacy fallback, and keeps explicit legacy fixture coverage rather than retaining a live TGG write path. No broader renderer change is included. |
 
 ## Explicitly not treated as 2026-07-28 intersections
 
@@ -40,5 +40,9 @@ expand Phase 1 to remove them.
 
 - No runtime module moved or was renamed.
 - The only new path in the final stack is a replay test fixture.
+- The narrow D1-23 WhatsApp reader migration is in scope because this landing
+  WB expressly names Branch B as D1-17/21/23/24. It supersedes the original
+  Phase-1 evidence's D1-23 exclusion only for neutral-first local-time reading
+  with legacy fallback.
 - The preserved MTU commit `b9c6ab5431` was not included.
 - No main branch, deployed runtime, client host, or MTU process was changed.

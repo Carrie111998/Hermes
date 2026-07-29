@@ -1,5 +1,6 @@
+$ uv run --extra sandbox --extra dev python -m pytest tests/gateway/test_replay_orchestrator.py tests/gateway/test_replay_runner.py tests/gateway/test_whatsapp_turn_debounce.py -q
 bringing up nodes...
 bringing up nodes...
 
 .................................................                        [100%]
-49 passed in 7.83s
+49 passed in 7.20s

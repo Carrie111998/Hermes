@@ -1,8 +1,19 @@
 diff --git a/docs/pa-replay-run-lifecycle.md b/docs/pa-replay-run-lifecycle.md
-index 4121d378fe..2cf1ab0029 100644
+index 4121d378fe..71ff6ff911 100644
 --- a/docs/pa-replay-run-lifecycle.md
 +++ b/docs/pa-replay-run-lifecycle.md
-@@ -130,13 +130,16 @@ hermes replay-run rollback \
+@@ -56,6 +56,10 @@ are part of the canonical source manifest, a plan created before this contract
+ change has a different digest; finish or abandon an in-flight run with its
+ original code version rather than mixing versions.
+ 
++The neutral replay-envelope landing also changes the corpus digest by stopping
++live `_tgg_source_ref` / `_tgg_sgt` dual-writes. Finish or abandon an in-flight
++run created before that landing with its original code version.
++
+ The command writes:
+ 
+ - `run-manifest.json` — state machine, target descriptor/baseline digests, attempt digests, gate result.
+@@ -130,13 +134,16 @@ hermes replay-run rollback \
  Inspect current state:
  
  ```bash
