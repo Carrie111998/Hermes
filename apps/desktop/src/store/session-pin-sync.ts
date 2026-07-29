@@ -56,9 +56,10 @@ function writePin(id: string, pinned: boolean, profile?: null | string): Promise
 /**
  * Adopt the server's pin state for every row in the current page.
  *
- * Runs before the push pass so a remote pin is already in the local set by the
- * time we reconcile — it gets marked as mirrored rather than echoed straight
- * back as a redundant PATCH.
+ * Runs after the push pass so a new local pin or unpin has already installed
+ * its `unconfirmed` guard before a stale list row can contradict it. Remote
+ * changes are still adopted without an echo because they are marked mirrored
+ * when pulled.
  */
 function pullRemotePins(): void {
   const local = new Set($pinnedSessionIds.get())
@@ -99,8 +100,6 @@ function reconcile(): void {
     return
   }
 
-  pullRemotePins()
-
   const current = new Set($pinnedSessionIds.get())
 
   // Unpinned: anything we were tracking that's no longer in the set.
@@ -136,6 +135,8 @@ function reconcile(): void {
       pending.add(id)
     })
   }
+
+  pullRemotePins()
 }
 
 // Sync once, then re-sync on pin-set and session-list changes. Call once per app.

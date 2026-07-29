@@ -40,16 +40,16 @@ afterEach(() => {
 
 describe('watchSessionPins', () => {
   it('mirrors a new pin as pinned=true with the row profile', async () => {
-    $sessions.set([row('a', { profile: 'work' })])
+    $sessions.set([row('a', { pinned: false, profile: 'work' })])
     $pinnedSessionIds.set(['a'])
     await flush()
 
+    expect($pinnedSessionIds.get()).toContain('a')
     expect(patch).toHaveBeenCalledWith('a', true, 'work')
   })
 
   it('mirrors an unpin as pinned=false', async () => {
-    $sessions.set([row('b')])
-    $pinnedSessionIds.set(['b'])
+    $sessions.set([row('b', { pinned: true })])
     await flush()
     patch.mockClear()
 
