@@ -45,6 +45,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from tools.registry import tool_error
+
 logger = logging.getLogger("tools.tool_search")
 
 _SCHEMA_LITERAL_KEYS = frozenset({"const", "default", "enum", "example", "examples"})
@@ -871,7 +873,7 @@ def dispatch_tool_search(args: Dict[str, Any],
         config = load_config()
     query = str(args.get("query") or "").strip()
     if not query:
-        return json.dumps({"error": "query is required"}, ensure_ascii=False)
+        return tool_error("query is required")
 
     raw_limit = args.get("limit")
     if raw_limit is None:
@@ -895,14 +897,12 @@ def dispatch_tool_describe(args: Dict[str, Any],
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
     name = str(args.get("name") or "").strip()
     if not name:
-        return json.dumps({"error": "name is required"}, ensure_ascii=False)
+        return tool_error("name is required")
     if not is_deferrable_tool_name(name):
-        return json.dumps({
-            "error": (
-                f"'{name}' is not a deferrable tool. If you see it in the tools list "
-                "already, call it directly; otherwise check the spelling against tool_search."
-            ),
-        }, ensure_ascii=False)
+        return tool_error(
+            f"'{name}' is not a deferrable tool. If you see it in the tools list "
+            "already, call it directly; otherwise check the spelling against tool_search."
+        )
     _, deferrable = classify_tools(current_tool_defs)
     for td in deferrable:
         fn = td.get("function") or {}
@@ -912,9 +912,9 @@ def dispatch_tool_describe(args: Dict[str, Any],
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {}),
             }, ensure_ascii=False)
-    return json.dumps({
-        "error": f"'{name}' is not currently available. Re-run tool_search to refresh.",
-    }, ensure_ascii=False)
+    return tool_error(
+        f"'{name}' is not currently available. Re-run tool_search to refresh."
+    )
 
 
 def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
@@ -1050,19 +1050,17 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         if isinstance(required, list) and required:
             missing = [r for r in required if isinstance(r, str) and r not in args]
             if missing:
-                return json.dumps({
-                    "error": (
-                        f"tool_call to '{name}' is missing required argument(s): "
-                        f"{', '.join(missing)}. The tool was NOT invoked."
-                    ),
-                    "path": "arguments",
-                    "constraint": "required",
-                    "parameters": params,
-                    "hint": (
+                return tool_error(
+                    f"tool_call to '{name}' is missing required argument(s): "
+                    f"{', '.join(missing)}. The tool was NOT invoked.",
+                    path="arguments",
+                    constraint="required",
+                    parameters=params,
+                    hint=(
                         "Retry tool_call with 'arguments' matching the parameters "
                         "schema above."
                     ),
-                }, ensure_ascii=False)
+                )
 
         validation_schema = _schema_for_local_validation(params)
         if _schema_has_external_ref(validation_schema):
@@ -1106,19 +1104,17 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         detail = re.sub(r"\s+", " ", str(validation_error.message)).strip()
         if len(detail) > 600:
             detail = detail[:597] + "..."
-        return json.dumps({
-            "error": (
-                f"tool_call to '{name}' failed argument validation at {path} "
-                f"({constraint}): {detail}. The tool was NOT invoked."
-            ),
-            "path": path,
-            "constraint": constraint,
-            "parameters": params,
-            "hint": (
+        return tool_error(
+            f"tool_call to '{name}' failed argument validation at {path} "
+            f"({constraint}): {detail}. The tool was NOT invoked.",
+            path=path,
+            constraint=constraint,
+            parameters=params,
+            hint=(
                 "Retry tool_call with 'arguments' matching the parameters "
                 "schema above."
             ),
-        }, ensure_ascii=False)
+        )
     except Exception:  # pragma: no cover — never block dispatch on validator bugs
         logger.debug("validate_deferred_call_args failed for %s", name, exc_info=True)
         return None
