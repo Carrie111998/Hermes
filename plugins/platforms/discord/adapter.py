@@ -3819,6 +3819,10 @@ class DiscordAdapter(BasePlatformAdapter):
             pass
 
         try:
+            # OS media helper — scrub credentials, same rule as the voice
+            # TTS/STT and playback subprocesses (#56332 / #70342).
+            from tools.environments.local import hermes_subprocess_env
+
             proc = subprocess.run(
                 [
                     "ffprobe",
@@ -3832,6 +3836,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 text=True,
                 timeout=5,
                 stdin=subprocess.DEVNULL,
+                env=hermes_subprocess_env(inherit_credentials=False),
             )
             if proc.returncode == 0:
                 raw = (proc.stdout or "").strip()
