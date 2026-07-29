@@ -882,6 +882,68 @@ class WebhookAdapter(BasePlatformAdapter):
                 route_config.get("deliver_extra", {}), payload
             ),
         }
+
+        # Discord routes can create the event thread before the agent starts.
+        # This leaves only a compact, templated index message in the parent
+        # channel while routing every agent/status message into the thread.
+        deliver_extra = deliver_config["deliver_extra"]
+        thread_starter = deliver_extra.get("thread_starter")
+        if (
+            deliver_config["deliver"] == "discord"
+            and deliver_extra.get("create_thread")
+            and thread_starter
+        ):
+            starter_delivery = {
+                "deliver": "discord",
+                "deliver_extra": dict(deliver_extra),
+            }
+            starter_delivery["deliver_extra"].pop("thread_starter", None)
+            try:
+                starter_result = await self._direct_deliver(
+                    str(thread_starter), starter_delivery
+                )
+            except Exception:
+                logger.exception(
+                    "[webhook] Discord thread starter failed route=%s delivery=%s",
+                    route_name,
+                    delivery_id,
+                )
+                self._seen_deliveries.pop(delivery_id, None)
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "Thread creation failed",
+                        "delivery_id": delivery_id,
+                    },
+                    status=502,
+                )
+
+            created_thread_id = (
+                starter_result.raw_response.get("thread_id")
+                if starter_result.success
+                and isinstance(starter_result.raw_response, dict)
+                else None
+            )
+            if not created_thread_id:
+                logger.warning(
+                    "[webhook] Discord thread starter rejected route=%s delivery=%s error=%s",
+                    route_name,
+                    delivery_id,
+                    starter_result.error,
+                )
+                self._seen_deliveries.pop(delivery_id, None)
+                return web.json_response(
+                    {
+                        "status": "error",
+                        "error": "Thread creation failed",
+                        "delivery_id": delivery_id,
+                    },
+                    status=502,
+                )
+
+            deliver_extra["thread_id"] = str(created_thread_id)
+            deliver_extra.pop("create_thread", None)
+            deliver_extra.pop("thread_starter", None)
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
@@ -1403,10 +1465,29 @@ class WebhookAdapter(BasePlatformAdapter):
                     error=f"No chat_id or home channel for {platform_name}",
                 )
 
-        # Pass thread_id from deliver_extra so Telegram forum topics work
+        # Pass platform-specific thread routing/creation hints through the
+        # common adapter metadata channel. An explicit thread_id wins over
+        # create_thread so all later sends from one webhook run stay together.
         metadata = None
         thread_id = extra.get("message_thread_id") or extra.get("thread_id")
         if thread_id:
             metadata = {"thread_id": thread_id}
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        if platform_name == "discord" and extra.get("create_thread") and not thread_id:
+            metadata = metadata or {}
+            metadata["create_thread"] = True
+            if extra.get("thread_name"):
+                metadata["thread_name"] = extra["thread_name"]
+
+        result = await adapter.send(chat_id, content, metadata=metadata)
+        # Agent-mode webhooks may emit interim messages before their final
+        # answer. Once Discord creates the event thread, pin subsequent sends
+        # for this delivery to that same thread instead of creating siblings.
+        if (
+            platform_name == "discord"
+            and result.success
+            and isinstance(result.raw_response, dict)
+            and result.raw_response.get("thread_id")
+        ):
+            extra["thread_id"] = str(result.raw_response["thread_id"])
+        return result

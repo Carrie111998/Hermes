@@ -86,7 +86,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `script` | No | Filter/transform script under `~/.hermes/scripts/`. The webhook payload is passed as JSON on stdin. JSON object stdout replaces the payload before templating; text stdout is exposed as `script_output`; empty stdout, `[SILENT]`, or a nonzero exit code ignores the webhook. |
 | `skills` | No | List of skill names to load for the agent run. |
 | `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
-| `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
+| `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. For Discord, `create_thread: true` creates a thread per event; optional `thread_starter` makes a compact parent-channel message before the agent starts, and `thread_name` controls the thread title. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
 
 ### Full example
@@ -225,6 +225,40 @@ webhooks:
 ```
 
 If `chat_id` is not provided in `deliver_extra`, the delivery falls back to the home channel configured for the target platform.
+
+### Discord Thread Delivery
+
+Set `create_thread: true` to create a fresh Discord thread for each webhook
+delivery. By default, the first agent response becomes the thread starter and
+any later messages from the same webhook run are routed into that thread.
+
+Set `thread_starter` to create the thread immediately, before the agent starts.
+The rendered `thread_starter` is the only webhook message posted in the parent
+channel; all agent status messages and findings are routed into its thread.
+
+```yaml
+platforms:
+  webhook:
+    extra:
+      routes:
+        alerts:
+          events: ["alert"]
+          prompt: "Investigate this alert: {__raw__}"
+          deliver: "discord"
+          deliver_extra:
+            chat_id: "123456789012345678"
+            create_thread: true
+            thread_starter: "Investigating alert: {alert.name}"
+            thread_name: "Alert: {alert.name}"
+```
+
+The bot needs Discord's **Create Public Threads** and **Send Messages in
+Threads** permissions in the target channel. `thread_starter` and `thread_name`
+support the same payload templates as other `deliver_extra` values.
+`thread_name` is truncated to Discord's 100-character thread-name limit. If
+`chat_id` is omitted, the Discord home channel is used. If creating the starter
+thread fails, Hermes returns HTTP 502 and does not start the agent, allowing the
+webhook provider to retry safely.
 
 ---
 
