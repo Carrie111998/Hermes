@@ -245,6 +245,12 @@ RUN mkdir -p /opt/hermes/bin && \
 # (.github/workflows/docker.yml) passes ${{ github.sha }} so
 # every published image has it.
 ARG HERMES_GIT_SHA=
+ARG HERMES_BUILD_TIMESTAMP=
+ARG RELEASE_ID=
+LABEL org.opencontainers.image.source="https://github.com/majiayu000/hermes-agent" \
+      org.opencontainers.image.revision="${HERMES_GIT_SHA}" \
+      org.opencontainers.image.created="${HERMES_BUILD_TIMESTAMP}" \
+      org.opencontainers.image.version="${RELEASE_ID}"
 RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
         printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
     fi
