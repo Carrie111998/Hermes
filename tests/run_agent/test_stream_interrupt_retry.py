@@ -180,7 +180,8 @@ class TestStreamInterruptBeforeRetry:
 
         This reproduces the race where the outer stale detector aborts an SSE
         connection, but the old iterator still yields one more chunk before
-        surfacing the connection error that triggers the retry.
+        surfacing the connection error.  Once a delta was delivered the
+        wrapper must preserve that partial and never replay the request.
         """
         import httpx
         import time
@@ -237,6 +238,8 @@ class TestStreamInterruptBeforeRetry:
 
         delivered = "".join(deltas)
         assert "old late" not in delivered
-        assert "new final" in delivered
-        assert response.choices[0].message.content == "new final"
+        assert "new final" not in delivered
+        assert "old start" in (response.choices[0].message.content or "")
+        assert response.choices[0].message.tool_calls is None
+        assert getattr(response, "_stream_no_retry", False) is True
         assert mock_abort.called

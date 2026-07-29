@@ -23,6 +23,8 @@ Fix (mirrors the #67142 Anthropic ownership discipline):
    FD release is deferred to GC so it cannot happen under a borrowing
    thread's live SSL BIO.
 """
+import socket
+import struct
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -155,11 +157,11 @@ class TestStaleWatchdogNeverClosesSharedClient:
     @patch("run_agent.AIAgent._replace_primary_openai_client")
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_mid_tool_retry_cleanup_does_not_replace_primary(
+    def test_mid_tool_partial_cleanup_does_not_replace_primary(
         self, mock_close, mock_create, mock_replace, monkeypatch,
     ):
-        """Connection drop mid tool-call → silent retry closes only the
-        request-local client; the shared primary is left alone."""
+        """Connection drop mid tool-call preserves a partial and closes only
+        the request-local client; the shared primary is left alone."""
         from tests.run_agent.test_streaming import _make_tool_call_delta
 
         monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
@@ -193,8 +195,10 @@ class TestStaleWatchdogNeverClosesSharedClient:
         agent = _make_agent()
         response = agent._interruptible_streaming_api_call({})
 
-        assert attempts["n"] == 2
-        assert response.choices[0].message.tool_calls
+        assert attempts["n"] == 1
+        assert response.choices[0].message.tool_calls is None
+        assert getattr(response, "_stream_no_retry", False) is True
+        assert "Stream stalled" in (response.choices[0].message.content or "")
         mock_replace.assert_not_called()
 
 
@@ -241,3 +245,115 @@ class TestReplacePrimaryRetiresInsteadOfClosing:
         agent = _make_agent()
         # Must not raise.
         agent._retire_shared_openai_client(None, reason="unit_test")
+
+
+class TestRealSocketTerminationSignals:
+    """Drive real incomplete chunked reads through the wrapper."""
+
+    @pytest.mark.parametrize("termination", ["fin", "rst"])
+    def test_partial_sse_fin_or_rst_does_not_retry(
+        self, termination, monkeypatch,
+    ):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", 0))
+        except PermissionError:
+            listener.close()
+            pytest.skip("sandbox forbids loopback bind for the RST probe")
+        listener.listen(1)
+        listener.settimeout(0.2)
+        port = listener.getsockname()[1]
+        attempts = []
+        server_errors = []
+        stop = threading.Event()
+        delta_seen = threading.Event()
+
+        payload = (
+            b'data: {"id":"chatcmpl-real","object":"chat.completion.chunk",'
+            b'"created":1,"model":"test/model","choices":[{"index":0,'
+            b'"delta":{"role":"assistant","content":"partial over socket"},'
+            b'"finish_reason":null}]}\n\n'
+        )
+        response = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Connection: close\r\n\r\n"
+            + f"{len(payload):X}\r\n".encode()
+            + payload
+            + b"\r\n"
+        )
+
+        def _serve():
+            while not stop.is_set():
+                try:
+                    peer, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                attempts.append(1)
+                try:
+                    peer.settimeout(2)
+                    request = b""
+                    while b"\r\n\r\n" not in request:
+                        request += peer.recv(4096)
+                    headers, body = request.split(b"\r\n\r\n", 1)
+                    content_length = 0
+                    for line in headers.split(b"\r\n")[1:]:
+                        name, _, value = line.partition(b":")
+                        if name.lower() == b"content-length":
+                            content_length = int(value.strip())
+                            break
+                    while len(body) < content_length:
+                        body += peer.recv(4096)
+                    peer.sendall(response)
+                    delta_seen.wait(timeout=2)
+                    if termination == "rst":
+                        peer.setsockopt(
+                            socket.SOL_SOCKET,
+                            socket.SO_LINGER,
+                            struct.pack("ii", 1, 0),
+                        )
+                    else:
+                        peer.shutdown(socket.SHUT_WR)
+                except Exception as exc:  # pragma: no cover - diagnostic only
+                    server_errors.append(exc)
+                finally:
+                    peer.close()
+
+        server = threading.Thread(target=_serve, daemon=True)
+        server.start()
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+        monkeypatch.setenv("no_proxy", "127.0.0.1")
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key="test-key",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            max_retries=0,
+        )
+        agent = _make_agent()
+        agent._create_request_openai_client = lambda **_kwargs: client
+        agent._close_request_openai_client = (
+            lambda request_client, **_kwargs: request_client.close()
+        )
+        agent.stream_delta_callback = lambda _text: delta_seen.set()
+
+        try:
+            wrapper_response = agent._interruptible_streaming_api_call({
+                "model": "test/model",
+                "messages": [{"role": "user", "content": "test"}],
+            })
+        finally:
+            stop.set()
+            listener.close()
+            server.join(timeout=2)
+
+        assert server_errors == []
+        assert len(attempts) == 1
+        assert wrapper_response.choices[0].message.content == "partial over socket"
+        assert wrapper_response.choices[0].message.tool_calls is None
+        assert getattr(wrapper_response, "_stream_no_retry", False) is True
