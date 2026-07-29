@@ -147,6 +147,31 @@ class TestValidateSignature:
         req = _mock_request(headers={"X-Hub-Signature-256": "sha256=deadbeef"})
         assert adapter._validate_signature(req, body, secret) is False
 
+    def test_validate_fireflies_signature_valid(self):
+        """Valid Fireflies X-Hub-Signature is accepted."""
+        adapter = _make_adapter()
+        body = b'{"event": "Transcription completed"}'
+        secret = "fireflies-secret-42"
+        sig = _github_signature(body, secret)
+        req = _mock_request(headers={"X-Hub-Signature": sig})
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_validate_fireflies_lowercase_signature_valid(self):
+        """Fireflies' lowercase x-hub-signature form is accepted."""
+        adapter = _make_adapter()
+        body = b'{"event": "Transcription completed"}'
+        secret = "fireflies-secret-42"
+        sig = _github_signature(body, secret)
+        req = _mock_request(headers={"x-hub-signature": sig})
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_validate_fireflies_signature_invalid(self):
+        """Wrong Fireflies X-Hub-Signature is rejected."""
+        adapter = _make_adapter()
+        body = b'{"event": "Transcription completed"}'
+        req = _mock_request(headers={"X-Hub-Signature": "sha256=deadbeef"})
+        assert adapter._validate_signature(req, body, "fireflies-secret-42") is False
+
     def test_validate_gitlab_token(self):
         """GitLab plain-token match via X-Gitlab-Token."""
         adapter = _make_adapter()
