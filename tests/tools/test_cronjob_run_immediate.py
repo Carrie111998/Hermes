@@ -7,7 +7,10 @@ last_run_at stayed null forever. Now action='run' claims the job (at-most-once,
 blocking a concurrent tick) and fires it inline via the shared run_one_job body.
 """
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from tools.cronjob_tools import cronjob, _execute_job_now
 
@@ -31,6 +34,179 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
         m_run.assert_called_once()                       # fired via the shared body
+
+    def test_execute_job_now_reuses_live_gateway_delivery_context(self):
+        """An in-gateway manual run must deliver on the gateway-owned loop."""
+        loop = SimpleNamespace(is_running=lambda: True, is_closed=lambda: False)
+        adapters = {"matrix": object()}
+        runner = SimpleNamespace(
+            _running=True,
+            _gateway_loop=loop,
+            adapters=adapters,
+        )
+        ran = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+
+        with patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch("tools.cronjob_tools.get_job", return_value=ran):
+            result = _execute_job_now(dict(_JOB))
+
+        assert result["success"] is True
+        m_run.assert_called_once_with(dict(_JOB), adapters=adapters, loop=loop)
+
+    def test_execute_job_now_uses_active_multiplex_profile_adapters(self, tmp_path):
+        """A secondary-profile run must never inherit the primary bot adapter."""
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        loop = SimpleNamespace(is_running=lambda: True, is_closed=lambda: False)
+        primary_adapters = {"matrix": object()}
+        secondary_adapters = {"matrix": object()}
+        runner = SimpleNamespace(
+            _running=True,
+            _gateway_loop=loop,
+            adapters=primary_adapters,
+            _profile_adapters={"coder": secondary_adapters},
+            config=SimpleNamespace(multiplex_profiles=True),
+        )
+        ran = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+        profiles_root = tmp_path / "hermes-root" / "profiles"
+        profile_home = profiles_root / "coder"
+        profile_home.mkdir(parents=True)
+        home_token = set_hermes_home_override(str(profile_home))
+
+        try:
+            with patch("gateway.run._gateway_runner_ref", return_value=runner), \
+                 patch("hermes_cli.profiles._get_profiles_root", return_value=profiles_root), \
+                 patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+                 patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+                 patch("tools.cronjob_tools.get_job", return_value=ran):
+                result = _execute_job_now(dict(_JOB))
+        finally:
+            reset_hermes_home_override(home_token)
+
+        assert result["success"] is True
+        m_run.assert_called_once_with(
+            dict(_JOB), adapters=secondary_adapters, loop=loop
+        )
+
+    @pytest.mark.parametrize(
+        "multiplex_metadata",
+        [True, False, None],
+        ids=["enabled", "disabled", "missing"],
+    )
+    @pytest.mark.parametrize(
+        "registry_present",
+        [False, True],
+        ids=["registry-absent", "registry-lacks-matrix"],
+    )
+    def test_secondary_context_never_borrows_primary_transport(
+        self, tmp_path, multiplex_metadata, registry_present
+    ):
+        """Scoped secondary turns fail closed regardless of runner metadata."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.delivery import resolve_delivery_transport
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.cronjob_tools import _get_live_gateway_delivery_context
+
+        loop = SimpleNamespace(is_running=lambda: True, is_closed=lambda: False)
+        primary_adapter = object()
+        secondary_adapters = (
+            {Platform.TELEGRAM: object()} if registry_present else None
+        )
+        runner = SimpleNamespace(
+            _running=True,
+            _gateway_loop=loop,
+            adapters={Platform.MATRIX: primary_adapter},
+            _profile_adapters=(
+                {"coder": secondary_adapters} if registry_present else {}
+            ),
+        )
+        if multiplex_metadata is not None:
+            runner.config = SimpleNamespace(
+                multiplex_profiles=multiplex_metadata
+            )
+        profiles_root = tmp_path / "hermes-root" / "profiles"
+        profile_home = profiles_root / "coder"
+        profile_home.mkdir(parents=True)
+        home_token = set_hermes_home_override(str(profile_home))
+
+        try:
+            with patch("gateway.run._gateway_runner_ref", return_value=runner), \
+                 patch(
+                     "hermes_cli.profiles._get_profiles_root",
+                     return_value=profiles_root,
+                 ):
+                context = _get_live_gateway_delivery_context()
+        finally:
+            reset_hermes_home_override(home_token)
+
+        config = GatewayConfig(
+            platforms={Platform.MATRIX: PlatformConfig(enabled=True)}
+        )
+        transport = resolve_delivery_transport(
+            Platform.MATRIX,
+            config,
+            context[0] if context is not None else None,
+        )
+        if registry_present:
+            assert context is not None
+            assert context[0] is secondary_adapters
+            assert context[1] is loop
+        else:
+            assert context is None
+        assert transport is None
+
+    def test_execute_job_now_preserves_standalone_call_without_live_gateway(self):
+        """CLI-only execution keeps the existing standalone delivery path."""
+        ran = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+
+        with patch("gateway.run._gateway_runner_ref", return_value=None), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch("tools.cronjob_tools.get_job", return_value=ran):
+            result = _execute_job_now(dict(_JOB))
+
+        assert result["success"] is True
+        m_run.assert_called_once_with(dict(_JOB))
+
+    @pytest.mark.parametrize(
+        ("runner_running", "loop_running", "loop_closed"),
+        [
+            (False, True, False),
+            (True, False, False),
+            (True, True, True),
+        ],
+    )
+    def test_execute_job_now_rejects_stale_gateway_delivery_context(
+        self, runner_running, loop_running, loop_closed
+    ):
+        """Startup/shutdown races must fall back instead of crossing loops."""
+        loop = SimpleNamespace(
+            is_running=lambda: loop_running,
+            is_closed=lambda: loop_closed,
+        )
+        runner = SimpleNamespace(
+            _running=runner_running,
+            _gateway_loop=loop,
+            adapters={"matrix": object()},
+        )
+        ran = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+
+        with patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch("tools.cronjob_tools.get_job", return_value=ran):
+            result = _execute_job_now(dict(_JOB))
+
+        assert result["success"] is True
+        m_run.assert_called_once_with(dict(_JOB))
 
     def test_run_reconciles_external_provider_after_claimed_execution(self):
         """A direct run must re-arm Chronos after it advances next_run_at.

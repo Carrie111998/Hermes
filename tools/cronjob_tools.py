@@ -12,7 +12,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from hermes_constants import display_hermes_home
+from hermes_constants import (
+    display_hermes_home,
+    get_hermes_home,
+    get_process_hermes_home,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -565,6 +569,52 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _get_live_gateway_delivery_context() -> Optional[tuple[Any, Any]]:
+    """Return the active gateway's adapter map and owning event loop.
+
+    Manual cron runs execute inside the synchronous tool worker, not the cron
+    ticker thread.  Reusing a live async adapter without also scheduling on its
+    gateway-owned loop crosses event-loop ownership (notably for Matrix's
+    aiohttp client).  Keep standalone callers lightweight by consulting the
+    already-imported gateway module rather than importing the gateway stack.
+    """
+    gateway_run = sys.modules.get("gateway.run")
+    if gateway_run is None:
+        return None
+
+    try:
+        runner_ref = getattr(gateway_run, "_gateway_runner_ref")
+        runner = runner_ref()
+        if runner is None or not getattr(runner, "_running", False):
+            return None
+
+        loop = getattr(runner, "_gateway_loop", None)
+        if loop is None or loop.is_closed() or not loop.is_running():
+            return None
+
+        adapters = getattr(runner, "adapters", None)
+        # The per-turn HERMES_HOME ContextVar survives tool-thread dispatch,
+        # while get_process_hermes_home() identifies the gateway-owned primary
+        # home. A scoped secondary must have its own registry entry regardless
+        # of potentially stale/missing multiplex config metadata; otherwise fail
+        # closed instead of borrowing primary credentials.
+        if get_hermes_home().resolve() != get_process_hermes_home().resolve():
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile_name = get_active_profile_name() or "default"
+            profile_maps = getattr(runner, "_profile_adapters", None) or {}
+            adapters = profile_maps.get(profile_name)
+            if adapters is None:
+                return None
+        if adapters is None:
+            return None
+        return adapters, loop
+    except Exception:
+        # A stale weakref or a loop racing gateway shutdown must preserve the
+        # pre-existing standalone delivery path rather than break manual runs.
+        return None
+
+
 def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
@@ -602,7 +652,15 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        # Inside a running gateway, forward the live adapters together with
+        # their owning loop so async delivery stays on the same loop as the
+        # connected clients. CLI-only callers retain the standalone path.
+        delivery_context = _get_live_gateway_delivery_context()
+        if delivery_context is None:
+            processed = run_one_job(job)
+        else:
+            adapters, loop = delivery_context
+            processed = run_one_job(job, adapters=adapters, loop=loop)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
