@@ -187,6 +187,125 @@ def _patch_judge(monkeypatch, verdicts):
     monkeypatch.setattr(goals, "judge_goal", _fake_judge)
 
 
+def _patch_judge_failing(monkeypatch, *, transport=False, parse=False,
+                         reason="judge error: InternalServerError"):
+    """judge_goal's no-verdict shape: it reports failure AS verdict 'continue'."""
+    def _fake_judge(goal, response, subgoals=None, background_processes=None, **_kw):
+        return "continue", reason, parse, None, transport
+
+    monkeypatch.setattr(goals, "judge_goal", _fake_judge)
+
+
+def test_loop_gives_up_when_judge_unreachable(monkeypatch):
+    """A judge outage must not drain the whole turn budget.
+
+    Regression for the observed incident: runs ending "exhausted its turn
+    budget (15/15) ... last judge verdict: judge error: InternalServerError".
+    judge_goal reports an unreachable judge as verdict "continue", so a loop
+    that reads only the verdict re-pokes the worker until the budget dies —
+    with the card's work potentially already finished.
+    """
+    _patch_judge_failing(monkeypatch, transport=True)
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-judge-down",
+        goal_text="ship it",
+        run_turn=lambda p: turns.append(p) or "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block on a judge outage"),
+        max_turns=15,
+        first_response="did the work",
+    )
+    assert res["outcome"] == "judge_unavailable"
+    assert "unreachable" in res["reason"]
+    # Bailed out early instead of burning all 15 turns.
+    assert len(turns) < goals.MAX_CONSECUTIVE_JUDGE_FAILURES + 1
+    assert res["turns_used"] < 15
+
+
+def test_loop_gives_up_when_judge_reply_unparseable(monkeypatch):
+    """Same for a reachable judge emitting garbage — the model is broken,
+    not the card."""
+    _patch_judge_failing(monkeypatch, parse=True,
+                         reason="judge reply was not JSON")
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-judge-garbage",
+        goal_text="ship it",
+        run_turn=lambda p: "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=15,
+        first_response="did the work",
+    )
+    assert res["outcome"] == "judge_unavailable"
+    assert "unparseable" in res["reason"]
+
+
+@pytest.mark.parametrize("verdict,reason", [
+    ("continue", goals.JUDGE_REASON_NO_CLIENT),
+    ("skipped", goals.JUDGE_REASON_EMPTY_GOAL),
+])
+def test_loop_gives_up_when_judge_never_ran(monkeypatch, verdict, reason):
+    """judge_goal also answers locally, WITHOUT setting either failure flag.
+
+    A missing/unloadable auxiliary client is a steady state, not a blip: every
+    call returns it, so a loop reading only the verdict re-pokes the worker
+    until the budget dies — the original incident, made permanent.
+    """
+    monkeypatch.setattr(
+        goals, "judge_goal",
+        lambda goal, response, subgoals=None, background_processes=None, **_kw:
+            (verdict, reason, False, None, False),
+    )
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-no-client",
+        goal_text="ship it",
+        run_turn=lambda p: turns.append(p) or "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=15,
+        first_response="did the work",
+    )
+    assert res["outcome"] == "judge_unavailable"
+    assert res["turns_used"] < 15, "must not drain the budget"
+
+
+def test_real_rejection_is_not_mistaken_for_a_missing_judge():
+    """The no-verdict check must not swallow genuine 'not done' verdicts."""
+    assert goals.judge_reason_is_no_verdict("continue", "criteria not met") is False
+    assert goals.judge_reason_is_no_verdict("continue",
+                                            goals.JUDGE_REASON_NO_CLIENT) is True
+
+
+def test_loop_recovers_when_judge_comes_back(monkeypatch):
+    """A transient blip must not end the run — the counter resets."""
+    seq = [("continue", "judge error: Timeout", False, True),
+           ("continue", "keep going", False, False),
+           ("done", "looks complete", False, False)]
+
+    def _fake_judge(goal, response, subgoals=None, background_processes=None, **_kw):
+        v, r, p, t = seq.pop(0) if seq else ("done", "ok", False, False)
+        return v, r, p, None, t
+
+    monkeypatch.setattr(goals, "judge_goal", _fake_judge)
+    statuses = iter(["running", "running", "running", "done"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t-blip",
+        goal_text="ship it",
+        run_turn=lambda p: "working",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=15,
+        first_response="started",
+    )
+    assert res["outcome"] != "judge_unavailable"
+
+
 def test_loop_stops_when_worker_already_completed(monkeypatch):
     # Worker called kanban_complete on its first turn — no judging needed.
     _patch_judge(monkeypatch, ["continue"])  # should never be consulted

@@ -3252,6 +3252,39 @@ def _inherit_notify_subs(
     )
 
 
+def worker_scope_violation(task_id: str) -> Optional[str]:
+    """Message when a dispatcher-spawned worker mutates a foreign task.
+
+    A worker process has ``HERMES_KANBAN_TASK`` set to its own task id, and
+    is narrowly scoped to that one task: a buggy or prompt-injected worker
+    passing some other id could corrupt sibling or cross-tenant runs (#19534).
+
+    Operators and orchestrator profiles have no ``HERMES_KANBAN_TASK`` in
+    their environment and are deliberately unrestricted — routing profiles
+    legitimately close out children and reopen blocked cards.
+
+    Lives here, in the shared data layer, because both completion paths need
+    it: the ``kanban_complete`` tool enforced this while
+    ``hermes kanban complete`` did not, so a worker with a shell could close
+    another worker's card just by using the CLI. Duplicated enforcement is
+    what let the judge-gate bug exist in two places at once; one
+    implementation, two callers.
+
+    Returns ``None`` when allowed, else a human-readable reason. Callers wrap
+    it in their own error convention.
+    """
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not env_tid:
+        return None
+    if task_id != env_tid:
+        return (
+            f"worker is scoped to task {env_tid}; refusing to mutate "
+            f"{task_id}. Use a comment to hand off information to other "
+            f"tasks, or create a follow-up card."
+        )
+    return None
+
+
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None

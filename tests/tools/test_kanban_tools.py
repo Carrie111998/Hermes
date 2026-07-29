@@ -653,8 +653,13 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
         return "continue", "missing verification evidence", False, None, False
 
-    monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
-    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+    # The gate imports judge_goal from hermes_cli.goals at call time and
+    # probes availability via kanban_judge_gate.judge_available, so patch
+    # both at their source.
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", mock_judge_goal)
+    monkeypatch.setattr(
+        "hermes_cli.kanban_judge_gate.judge_available", lambda: True
+    )
 
     # Attempt to complete should be rejected
     out = kt._handle_complete({"summary": "I did some stuff but not X"})
@@ -709,8 +714,10 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
     def fail_if_called(goal, last_response, *, timeout=30.0, subgoals=None):
         raise AssertionError("judge_goal must not run when no judge is available")
 
-    monkeypatch.setattr("tools.kanban_tools.judge_goal", fail_if_called)
-    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: False)
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", fail_if_called)
+    monkeypatch.setattr(
+        "hermes_cli.kanban_judge_gate.judge_available", lambda: False
+    )
 
     out = kt._handle_complete({"summary": "done enough"})
     d = json.loads(out)

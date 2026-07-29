@@ -72,6 +72,29 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 
+#: Consecutive no-verdict judge calls (unreachable or unparseable) tolerated by
+#: the kanban goal loop before it gives up. Deliberately lower than the
+#: interactive limits above: an unattended card that cannot be judged should
+#: stop early with an honest reason rather than silently spend its whole turn
+#: budget re-poking a worker whose work may already be finished.
+MAX_CONSECUTIVE_JUDGE_FAILURES = 3
+
+#: Reasons judge_goal returns WITHOUT contacting the judge, and without
+#: setting parse_failed/transport_failed. Consumers must treat these as
+#: "no verdict", not as a finding about the work. The auxiliary-client one
+#: especially: an import/config failure is a STEADY STATE, so every call
+#: returns it and a loop reading only the verdict re-pokes forever.
+JUDGE_REASON_NO_CLIENT = "auxiliary client unavailable"
+JUDGE_REASON_EMPTY_GOAL = "empty goal"
+
+
+def judge_reason_is_no_verdict(verdict: str, reason: str) -> bool:
+    """True when judge_goal answered locally instead of judging."""
+    if verdict == "skipped":
+        return True
+    return (reason or "").strip() in {JUDGE_REASON_NO_CLIENT,
+                                      JUDGE_REASON_EMPTY_GOAL}
+
 
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
@@ -890,7 +913,7 @@ def judge_goal(
     judge doesn't burn the entire turn budget.
     """
     if not goal.strip():
-        return "skipped", "empty goal", False, None, False
+        return "skipped", JUDGE_REASON_EMPTY_GOAL, False, None, False
     if not last_response.strip():
         # No substantive reply this turn — almost certainly not done yet.
         return "continue", "empty response (nothing to evaluate)", False, None, False
@@ -899,7 +922,7 @@ def judge_goal(
         from agent.auxiliary_client import call_llm
     except Exception as exc:
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
-        return "continue", "auxiliary client unavailable", False, None, False
+        return "continue", JUDGE_REASON_NO_CLIENT, False, None, False
 
     # Build the prompt. Priority: contract > subgoals > plain. When both a
     # contract and subgoals exist, the subgoals are appended into the
@@ -1713,6 +1736,9 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    # Consecutive judge calls that returned no usable verdict (unreachable or
+    # unparseable). Reset by any real verdict.
+    consecutive_judge_failures = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -1737,9 +1763,52 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        verdict, reason, parse_failed, _wait, transport_failed = judge_goal(goal_text, last_response)
         if verdict == "wait":
             verdict = "continue"
+
+        # A judge we could not reach, or whose reply we could not parse, has
+        # told us nothing about the card. It reports that as verdict
+        # "continue" (see judge_goal), so consuming it as a real verdict
+        # silently converts a judge outage into "keep going" — the worker
+        # burns its whole turn budget and the run ends blocked with the work
+        # already done. That is the exact incident this loop was implicated
+        # in: runs ending "exhausted its turn budget (15/15) ... last judge
+        # verdict: judge error: InternalServerError".
+        #
+        # The interactive /goal loop already tracks this (see
+        # consecutive_transport_failures above); this loop did not. Bail out
+        # early with an honest reason instead of draining the budget.
+        no_verdict = judge_reason_is_no_verdict(verdict, reason)
+        if transport_failed or parse_failed or no_verdict:
+            consecutive_judge_failures += 1
+            if transport_failed:
+                kind = "unreachable"
+            elif parse_failed:
+                kind = "unparseable"
+            else:
+                # Local short-circuit: the judge was never consulted.
+                # Usually a permanent config problem, so bailing out
+                # beats re-poking the worker until the budget dies.
+                kind = "unavailable"
+            _log(
+                f"kanban goal loop: judge {kind} "
+                f"({consecutive_judge_failures}/{MAX_CONSECUTIVE_JUDGE_FAILURES}) "
+                f"- {_truncate(reason, 120)}"
+            )
+            if consecutive_judge_failures >= MAX_CONSECUTIVE_JUDGE_FAILURES:
+                _log(f"kanban goal loop: task {task_id} stopping — judge {kind}")
+                return {
+                    "outcome": "judge_unavailable",
+                    "turns_used": turns_used,
+                    "reason": f"goal judge {kind}: {reason}",
+                }
+            # Don't act on a non-verdict: re-poke without treating it as
+            # progress toward "done" or toward the finalize nudge.
+            verdict = "continue"
+        else:
+            consecutive_judge_failures = 0
+
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
         if verdict == "done":
