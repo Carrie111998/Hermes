@@ -31,6 +31,11 @@ export default defineConfig([
       'react-hooks/refs': 'warn',
       'react-hooks/preserve-manual-memoization': 'warn',
       'react-hooks/static-components': 'warn',
+      // Promoted into js.configs.recommended in ESLint 10. Kept at 'warn' so
+      // the ESLint 10 upgrade stays a dependency-only change.
+      // TODO: clean up the flagged sites and promote these back to 'error'.
+      'no-useless-assignment': 'warn',
+      'preserve-caught-error': 'warn',
     },
   },
 ])
