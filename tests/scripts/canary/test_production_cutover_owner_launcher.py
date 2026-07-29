@@ -9,8 +9,9 @@ import shlex
 import stat
 import struct
 import subprocess
+import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
@@ -1305,6 +1306,11 @@ def test_authority_lock_reuses_only_a_proven_inherited_descriptor(
     )
     monkeypatch.setattr(
         authority_lock.os,
+        "get_inheritable",
+        lambda descriptor: descriptor == 7,
+    )
+    monkeypatch.setattr(
+        authority_lock.os,
         "set_inheritable",
         lambda descriptor, value: inherited.append((descriptor, value)),
     )
@@ -1316,7 +1322,7 @@ def test_authority_lock_reuses_only_a_proven_inherited_descriptor(
         7,
         authority_lock.fcntl.LOCK_EX | authority_lock.fcntl.LOCK_NB,
     )]
-    assert inherited == [(7, True)]
+    assert inherited == [(7, True), (7, True)]
 
     monkeypatch.setenv(authority_lock.INHERITED_LOCK_FD_ENV, "2")
     with pytest.raises(
@@ -1337,15 +1343,299 @@ def test_authority_lock_preserves_errors_from_the_protected_body(
     monkeypatch.setattr(
         authority_lock.activation,
         "_host_activation_lock",
-        nullcontext,
+        lambda: nullcontext(7),
+    )
+    monkeypatch.setattr(authority_lock.sys, "platform", "linux")
+    monkeypatch.setattr(
+        authority_lock,
+        "_validate_lock_identity",
+        lambda _descriptor: None,
+    )
+    inheritable: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        authority_lock.os,
+        "get_inheritable",
+        lambda _descriptor: False,
+    )
+    monkeypatch.setattr(
+        authority_lock.os,
+        "set_inheritable",
+        lambda descriptor, value: inheritable.append(
+            (descriptor, value)
+        ),
     )
     body_error = RuntimeError("protected body failed")
 
     with pytest.raises(RuntimeError) as caught:
         with authority_lock.authority_activation_lock(require_root=True):
+            assert (
+                os.environ[authority_lock.INHERITED_LOCK_FD_ENV]
+                == "7"
+            )
             raise body_error
 
     assert caught.value is body_error
+    assert authority_lock.INHERITED_LOCK_FD_ENV not in os.environ
+    assert inheritable == [(7, True), (7, False)]
+
+
+def test_authority_lock_reports_inheritability_probe_failure_stably(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        authority_lock.INHERITED_LOCK_FD_ENV,
+        raising=False,
+    )
+    monkeypatch.setattr(authority_lock.sys, "platform", "linux")
+    monkeypatch.setattr(
+        authority_lock.activation,
+        "_host_activation_lock",
+        lambda: nullcontext(7),
+    )
+    monkeypatch.setattr(
+        authority_lock,
+        "_validate_lock_identity",
+        lambda _descriptor: None,
+    )
+
+    def _probe_failure(_descriptor: int) -> bool:
+        raise OSError("probe failed")
+
+    monkeypatch.setattr(
+        authority_lock.os,
+        "get_inheritable",
+        _probe_failure,
+    )
+    restore_calls: list[tuple[int, bool]] = []
+    monkeypatch.setattr(
+        authority_lock.os,
+        "set_inheritable",
+        lambda descriptor, value: restore_calls.append(
+            (descriptor, value)
+        ),
+    )
+
+    with pytest.raises(
+        authority_lock.AuthorityActivationLockError,
+        match="production_authority_activation_lock_unavailable",
+    ):
+        with authority_lock.authority_activation_lock(require_root=True):
+            raise AssertionError("unreachable")
+
+    assert authority_lock.INHERITED_LOCK_FD_ENV not in os.environ
+    assert restore_calls == []
+
+
+def test_authority_lock_publishes_exact_outer_descriptor_for_nested_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        authority_lock.INHERITED_LOCK_FD_ENV,
+        raising=False,
+    )
+    monkeypatch.setattr(authority_lock.sys, "platform", "linux")
+    monkeypatch.setattr(
+        authority_lock.activation,
+        "_host_activation_lock",
+        lambda: nullcontext(11),
+    )
+    validated: list[int] = []
+    flocked: list[tuple[int, int]] = []
+    inheritable: list[tuple[int, bool]] = []
+    inheritable_state = {11: False}
+    monkeypatch.setattr(
+        authority_lock,
+        "_validate_lock_identity",
+        lambda descriptor: validated.append(descriptor),
+    )
+    monkeypatch.setattr(
+        authority_lock.fcntl,
+        "flock",
+        lambda descriptor, operation: flocked.append(
+            (descriptor, operation)
+        ),
+    )
+    monkeypatch.setattr(
+        authority_lock.os,
+        "get_inheritable",
+        lambda descriptor: inheritable_state[descriptor],
+    )
+
+    def _set_inheritable(descriptor: int, value: bool) -> None:
+        inheritable.append((descriptor, value))
+        inheritable_state[descriptor] = value
+
+    monkeypatch.setattr(
+        authority_lock.os,
+        "set_inheritable",
+        _set_inheritable,
+    )
+
+    with authority_lock.authority_activation_lock(require_root=True):
+        assert os.environ[authority_lock.INHERITED_LOCK_FD_ENV] == "11"
+        with authority_lock.authority_activation_lock(require_root=True):
+            assert os.environ[authority_lock.INHERITED_LOCK_FD_ENV] == "11"
+
+    assert authority_lock.INHERITED_LOCK_FD_ENV not in os.environ
+    assert validated == [11, 11, 11, 11]
+    assert flocked == [(
+        11,
+        authority_lock.fcntl.LOCK_EX | authority_lock.fcntl.LOCK_NB,
+    )]
+    assert inheritable == [
+        (11, True),
+        (11, False),
+    ]
+
+
+def test_authority_lock_serializes_real_kernel_thread_contention(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "activation.lock"
+    lock_path.write_bytes(b"")
+    monkeypatch.delenv(
+        authority_lock.INHERITED_LOCK_FD_ENV,
+        raising=False,
+    )
+    monkeypatch.setattr(authority_lock.sys, "platform", "linux")
+    monkeypatch.setattr(
+        authority_lock,
+        "_validate_lock_identity",
+        lambda _descriptor: None,
+    )
+
+    order: list[str] = []
+    order_guard = threading.Lock()
+
+    @contextmanager
+    def _kernel_host_lock():
+        descriptor = os.open(lock_path, os.O_RDWR)
+        try:
+            authority_lock.fcntl.flock(
+                descriptor,
+                authority_lock.fcntl.LOCK_EX
+                | authority_lock.fcntl.LOCK_NB,
+            )
+            with order_guard:
+                order.append(
+                    f"{threading.current_thread().name}:host-enter"
+                )
+            yield descriptor
+        finally:
+            with order_guard:
+                order.append(
+                    f"{threading.current_thread().name}:host-exit"
+                )
+            authority_lock.fcntl.flock(
+                descriptor,
+                authority_lock.fcntl.LOCK_UN,
+            )
+            os.close(descriptor)
+
+    monkeypatch.setattr(
+        authority_lock.activation,
+        "_host_activation_lock",
+        _kernel_host_lock,
+    )
+
+    outer_entered = threading.Event()
+    release_outer = threading.Event()
+    contender_waiting_at_mutex = threading.Event()
+    contender_entered = threading.Event()
+    errors: list[BaseException] = []
+    active = {"count": 0, "maximum": 0}
+
+    class _ObservedRLock:
+        def __init__(self) -> None:
+            self._lock = threading.RLock()
+
+        def __enter__(self):
+            if threading.current_thread().name == "contender":
+                contender_waiting_at_mutex.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+            return False
+
+    monkeypatch.setattr(
+        authority_lock,
+        "_PROCESS_ACTIVATION_MUTEX",
+        _ObservedRLock(),
+    )
+
+    def _enter_body(
+        *,
+        entered: threading.Event,
+        release: threading.Event | None = None,
+    ) -> None:
+        try:
+            with authority_lock.authority_activation_lock(
+                require_root=True
+            ):
+                with order_guard:
+                    active["count"] += 1
+                    active["maximum"] = max(
+                        active["maximum"],
+                        active["count"],
+                    )
+                    order.append(
+                        f"{threading.current_thread().name}:body-enter"
+                    )
+                entered.set()
+                if release is not None:
+                    assert release.wait(timeout=5)
+                with order_guard:
+                    order.append(
+                        f"{threading.current_thread().name}:body-exit"
+                    )
+                    active["count"] -= 1
+        except BaseException as exc:
+            errors.append(exc)
+
+    outer = threading.Thread(
+        target=_enter_body,
+        name="outer",
+        kwargs={
+            "entered": outer_entered,
+            "release": release_outer,
+        },
+    )
+    contender = threading.Thread(
+        target=_enter_body,
+        name="contender",
+        kwargs={
+            "entered": contender_entered,
+        },
+    )
+
+    outer.start()
+    assert outer_entered.wait(timeout=5)
+    contender.start()
+    assert contender_waiting_at_mutex.wait(timeout=5)
+    assert not contender_entered.is_set()
+
+    release_outer.set()
+    outer.join(timeout=5)
+    contender.join(timeout=5)
+
+    assert not outer.is_alive()
+    assert not contender.is_alive()
+    assert errors == []
+    assert active == {"count": 0, "maximum": 1}
+    assert order == [
+        "outer:host-enter",
+        "outer:body-enter",
+        "outer:body-exit",
+        "outer:host-exit",
+        "contender:host-enter",
+        "contender:body-enter",
+        "contender:body-exit",
+        "contender:host-exit",
+    ]
+    assert authority_lock.INHERITED_LOCK_FD_ENV not in os.environ
 
 
 def test_unit_input_rotation_archives_triplet_and_exact_replay_is_idempotent(
