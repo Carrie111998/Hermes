@@ -1136,6 +1136,11 @@ def try_recover_primary_transport(
     already manage connection pools and retries server-side — if our
     retries through them are exhausted, one more rebuilt client won't help.
     """
+    # LPV2 extraction opts out per agent instance: its ``retry=0`` contract
+    # permits no rebuilt-client primary attempt after the app-level attempt.
+    # Unmarked Hermes agents retain the existing recovery behavior.
+    if getattr(agent, "_disable_primary_transport_recovery", False):
+        return False
     if agent._fallback_activated:
         return False
 
