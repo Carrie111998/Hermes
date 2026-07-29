@@ -172,3 +172,44 @@ class TestLatencyFlagResolution:
         config_path.write_text(json.dumps({'apiKey': 'k', 'timeout': 30}))
         cfg = HonchoClientConfig.from_global_config(config_path=config_path)
         assert cfg.timeout == 30.0
+
+
+class TestCuratedContextConfig:
+    def test_defaults_are_disabled_and_bounded(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({"apiKey": "k"}))
+
+        cfg = HonchoClientConfig.from_global_config(config_path=config_path)
+
+        assert cfg.curated_context_path is None
+        assert cfg.curated_context_tokens == 1000
+
+    def test_host_block_wins_over_root(self, tmp_path):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k",
+            "curatedContextPath": "root.md",
+            "curatedContextTokens": 800,
+            "hosts": {"hermes": {
+                "curatedContextPath": "host.md",
+                "curatedContextTokens": 200,
+            }},
+        }))
+
+        cfg = HonchoClientConfig.from_global_config(config_path=config_path)
+
+        assert cfg.curated_context_path == "host.md"
+        assert cfg.curated_context_tokens == 200
+
+    @pytest.mark.parametrize("value", [0, -1, "invalid"])
+    def test_invalid_budget_uses_safe_nonzero_value(self, tmp_path, value):
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({
+            "apiKey": "k",
+            "curatedContextPath": "curated.md",
+            "curatedContextTokens": value,
+        }))
+
+        cfg = HonchoClientConfig.from_global_config(config_path=config_path)
+
+        assert cfg.curated_context_tokens == 1000
