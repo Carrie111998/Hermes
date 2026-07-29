@@ -19940,6 +19940,12 @@ def start_server(
     _is_loopback = host in ("127.0.0.1", "localhost", "::1")
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
+        # Do not let a stale/half-open WebSocket keep shutdown suspended until
+        # the service manager's much longer stop timeout.  Once this grace
+        # window expires uvicorn cancels connection tasks, which lets the
+        # lifespan teardown close the keep-alive PTY registry and reap its
+        # child process groups deterministically.
+        timeout_graceful_shutdown=15.0,
         # proxy_headers defaults to False so _ws_client_is_allowed sees
         # the real connection peer rather than X-Forwarded-For's rewritten
         # value (which would defeat the loopback gate when behind a reverse

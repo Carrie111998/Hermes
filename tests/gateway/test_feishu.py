@@ -1,6 +1,7 @@
 """Tests for the Feishu gateway integration."""
 
 import asyncio
+import gc
 import json
 import os
 import tempfile
@@ -710,6 +711,54 @@ class TestAdapterModule(unittest.TestCase):
         self.assertEqual(fake_client._reconnect_nonce, 2)
         self.assertEqual(fake_client._reconnect_interval, 3)
         self.assertEqual(fake_client._ping_interval, 4)
+
+    def test_runtime_ws_loop_retrieves_completed_task_exceptions(self):
+        import sys
+        from types import ModuleType
+
+        unhandled = []
+
+        class _FakeWSClient:
+            def start(self):
+                loop = sys.modules["lark_oapi.ws.client"].loop
+                loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+                async def fail_after_clean_close():
+                    raise RuntimeError("simulated clean-close task result")
+
+                loop.create_task(fail_after_clean_close())
+                loop.run_until_complete(asyncio.sleep(0))
+                gc.collect()
+                raise RuntimeError("stop test client")
+
+        fake_adapter = SimpleNamespace(
+            _ws_thread_loop=None,
+            _ws_reconnect_nonce=2,
+            _ws_reconnect_interval=3,
+            _ws_ping_interval=4,
+            _ws_ping_timeout=5,
+        )
+        fake_client_module = ModuleType("lark_oapi.ws.client")
+        fake_client_module.loop = None
+        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_ws_module = ModuleType("lark_oapi.ws")
+        fake_ws_module.client = fake_client_module
+        fake_root_module = ModuleType("lark_oapi")
+        fake_root_module.ws = fake_ws_module
+
+        original_modules = sys.modules.copy()
+        sys.modules["lark_oapi"] = fake_root_module
+        sys.modules["lark_oapi.ws"] = fake_ws_module
+        sys.modules["lark_oapi.ws.client"] = fake_client_module
+        try:
+            from plugins.platforms.feishu.adapter import _run_official_feishu_ws_client
+
+            _run_official_feishu_ws_client(_FakeWSClient(), fake_adapter)
+        finally:
+            sys.modules.clear()
+            sys.modules.update(original_modules)
+
+        assert unhandled == []
 
 
 def _admits_group(adapter, message, sender_id, chat_id=""):
