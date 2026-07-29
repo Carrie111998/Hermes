@@ -672,6 +672,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    review_required=args.get("review_required"),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -771,6 +772,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                review_required=args.get("review_required"),
             )
             if not ok:
                 return tool_error(
@@ -1464,6 +1466,64 @@ def _board_schema_prop() -> dict[str, str]:
     """
     return {"type": "string", "description": _DESC_BOARD}
 
+
+def _review_required_schema_prop() -> dict[str, Any]:
+    """Schema fragment for the optional ``review_required`` effect payload.
+
+    Repository-only / default-off candidate (see
+    :mod:`hermes_cli.kanban_effects`). Absent → behavior is unchanged. When
+    present it is schema-validated; an invalid payload is rejected with a typed
+    error and no state change. On a normal board (no effect tables installed)
+    a valid payload is validated but recorded as a no-op — the feature is not
+    live.
+    """
+    return {
+        "type": "object",
+        "description": (
+            "Optional, experimental (repository-only, default-off) "
+            "review-required effect. Declares that a GitHub PR must pass "
+            "review at an exact head before downstream QA/Release work "
+            "proceeds. Omit unless a board has explicitly opted into the "
+            "effect harness — otherwise it is validated and ignored."
+        ),
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["review_required"],
+                "description": "Effect kind. Must be 'review_required'.",
+            },
+            "repo": {
+                "type": "string",
+                "description": "GitHub repo as 'owner/name'.",
+            },
+            "pr_number": {
+                "type": "integer",
+                "description": "Positive PR number.",
+            },
+            "head_sha": {
+                "type": "string",
+                "description": "Exact 40-character hex commit sha of the PR head.",
+            },
+            "required_checks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional required-check policy names that must all "
+                    "conclude successfully."
+                ),
+            },
+            "downstream_task_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional pre-created QA/Release card ids to re-parent "
+                    "under the authoritative review card when it is created."
+                ),
+            },
+        },
+        "required": ["kind", "repo", "pr_number", "head_sha"],
+    }
+
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
@@ -1621,6 +1681,7 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task in-flight so you can fix the path and retry."
                 ),
             },
+            "review_required": _review_required_schema_prop(),
             "board": _board_schema_prop(),
         },
         "required": [],
@@ -1665,6 +1726,7 @@ KANBAN_BLOCK_SCHEMA = {
                     "Omit only if none apply."
                 ),
             },
+            "review_required": _review_required_schema_prop(),
             "board": _board_schema_prop(),
         },
         "required": ["reason"],
