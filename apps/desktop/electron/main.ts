@@ -10266,6 +10266,7 @@ ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
   return readFileDataUrlForIpc(filePath, {
     maxBytes: dataUrlReadMaxBytesFromMb(dataUrlReadMaxMb),
     mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'File preview' })),
+    missingAsEmpty: true,
     purpose: 'File preview'
   })
 })
