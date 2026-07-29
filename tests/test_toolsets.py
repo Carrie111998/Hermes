@@ -1,6 +1,10 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
-from tools.registry import ToolRegistry
+import importlib
+
+import pytest
+
+from tools.registry import ToolRegistry, registry
 from toolsets import (
     TOOLSETS,
     get_toolset,
@@ -187,6 +191,57 @@ class TestCreateCustomToolset:
             assert validate_toolset("_test_custom") is True
         finally:
             del TOOLSETS["_test_custom"]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "delegation-read-only-discovery",
+            "delegation-immutable-read-only-review",
+        ],
+    )
+    def test_sealed_toolsets_reject_all_runtime_replacement(self, name):
+        original = resolve_toolset(name)
+        with pytest.raises(PermissionError, match="sealed toolset"):
+            create_custom_toolset(name, "malicious", ["patch"], ["terminal"])
+        with pytest.raises(PermissionError, match="sealed toolset"):
+            TOOLSETS[name] = {"description": "malicious", "tools": ["patch"]}
+        with pytest.raises(TypeError):
+            TOOLSETS[name]["tools"] = ["patch"]
+        with pytest.raises(PermissionError, match="sealed toolset"):
+            TOOLSETS.__ior__(
+                {name: {"description": "malicious", "tools": ["patch"]}}
+            )
+        assert resolve_toolset(name) == original
+
+    def test_sealed_toolset_aliases_are_rejected(self):
+        reg = ToolRegistry()
+        with pytest.raises(PermissionError, match="cannot be aliased"):
+            reg.register_toolset_alias(
+                "review-alias", "delegation-immutable-read-only-review"
+            )
+        with pytest.raises(PermissionError, match="cannot be aliased"):
+            reg.register_toolset_alias(
+                "delegation-read-only-discovery", "terminal"
+            )
+
+    @pytest.mark.parametrize("name", ["read_file", "search_files", "web_search", "web_extract"])
+    def test_protected_tool_handlers_reject_override_and_deregister(self, name):
+        importlib.import_module(
+            "tools.file_tools" if name in {"read_file", "search_files"} else "tools.web_tools"
+        )
+        entry = registry.get_entry(name)
+        assert entry is not None and entry.protected
+        with pytest.raises(PermissionError, match="protected tool"):
+            registry.register(
+                name=name,
+                toolset=entry.toolset,
+                schema=_make_schema(name, "malicious"),
+                handler=_dummy_handler,
+                override=True,
+            )
+        with pytest.raises(PermissionError, match="protected tool"):
+            registry.deregister(name)
+        assert registry.get_entry(name) is entry
 
 
 class TestRegistryOwnedToolsets:

@@ -106,11 +106,33 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
 
+    exact_models = codex_models.fetch_live_codex_model_ids(access_token="tok")
     models = codex_models._fetch_models_from_api(access_token="tok")
 
+    assert exact_models == ["gpt-5.5", "gpt-5.3-codex-spark"]
     assert "gpt-5.5" in models
     assert "gpt-5.3-codex-spark" in models
     assert "gpt-5-internal" not in models
+
+
+def test_live_catalog_helper_is_exact_and_failure_preserves_picker_fallback(monkeypatch):
+    from hermes_cli import codex_models
+
+    monkeypatch.setattr(
+        codex_models,
+        "fetch_live_codex_model_ids",
+        lambda token: ["gpt-5.4"],
+    )
+    picker_models = codex_models._fetch_models_from_api("tok")
+    assert picker_models[0] == "gpt-5.4"
+    assert "gpt-5.6-sol" in picker_models
+
+    monkeypatch.setattr(
+        codex_models,
+        "fetch_live_codex_model_ids",
+        lambda token: None,
+    )
+    assert codex_models._fetch_models_from_api("tok") == []
 
 
 def test_fetch_from_api_sends_chatgpt_account_id_header(monkeypatch):

@@ -124,8 +124,13 @@ def _extract_chatgpt_account_id(access_token: str) -> Optional[str]:
         return None
 
 
-def _fetch_models_from_api(access_token: str) -> List[str]:
-    """Fetch available models from the Codex API. Returns visible models sorted by priority."""
+def fetch_live_codex_model_ids(access_token: str) -> Optional[List[str]]:
+    """Return exact model slugs advertised for this OAuth account.
+
+    ``None`` means the live catalog could not be read. Unlike the model picker
+    helper, this function never adds synthetic forward-compatible slugs, so it
+    is safe for fail-closed execution-profile availability checks.
+    """
     try:
         import httpx
         headers = {"Authorization": f"Bearer {access_token}"}
@@ -138,12 +143,12 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
             timeout=10,
         )
         if resp.status_code != 200:
-            return []
+            return None
         data = resp.json()
         entries = data.get("models", []) if isinstance(data, dict) else []
     except Exception as exc:
         logger.debug("Failed to fetch Codex models from API: %s", exc)
-        return []
+        return None
 
     sortable = []
     for item in entries:
@@ -165,7 +170,15 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
         sortable.append((rank, slug))
 
     sortable.sort(key=lambda x: (x[0], x[1]))
-    return _add_forward_compat_models([slug for _, slug in sortable])
+    return [slug for _, slug in sortable]
+
+
+def _fetch_models_from_api(access_token: str) -> List[str]:
+    """Fetch picker models, including intentional forward-compat entries."""
+    exact_models = fetch_live_codex_model_ids(access_token)
+    if exact_models is None:
+        return []
+    return _add_forward_compat_models(exact_models)
 
 
 def _read_default_model(codex_home: Path) -> Optional[str]:

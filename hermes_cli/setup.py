@@ -3082,6 +3082,8 @@ def _blank_slate_minimal_toolsets(config: dict):
     config.setdefault("platform_toolsets", {})["cli"] = sorted(keep)
 
     try:
+        from collections.abc import Mapping
+
         from toolsets import TOOLSETS
         from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _get_plugin_toolset_keys
 
@@ -3093,9 +3095,9 @@ def _blank_slate_minimal_toolsets(config: dict):
         for k, tdef in TOOLSETS.items():
             if k.startswith("hermes-"):
                 continue  # platform composites — not user-facing toolsets
-            if isinstance(tdef, dict) and tdef.get("includes"):
+            if isinstance(tdef, Mapping) and tdef.get("includes"):
                 continue  # composite groupings, not leaf toolsets
-            if isinstance(tdef, dict) and tdef.get("posture"):
+            if isinstance(tdef, Mapping) and tdef.get("posture"):
                 continue  # posture toolsets (e.g. coding) are session-level
                 # selections made by agent/coding_context.py — not permanent
                 # user-facing disables. Adding them here causes model_tools

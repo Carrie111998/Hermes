@@ -455,6 +455,26 @@ class TestBuiltinDiscovery:
         assert imported == ["tools.alpha"]
         mock_import.assert_called_once_with("tools.alpha")
 
+    def test_discovers_guarded_module_scope_registration(self, tmp_path):
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "guarded.py").write_text(
+            "from tools.registry import registry\n"
+            "if registry.get_entry('guarded') is None:\n"
+            "    registry.register(name='guarded', toolset='x', schema={}, handler=lambda *_a, **_k: '{}')\n",
+            encoding="utf-8",
+        )
+        (tools_dir / "helper.py").write_text(
+            "def register_later(registry):\n"
+            "    registry.register(name='later', toolset='x', schema={}, handler=lambda *_a, **_k: '{}')\n",
+            encoding="utf-8",
+        )
+
+        with patch("tools.registry.importlib.import_module") as mock_import:
+            imported = discover_builtin_tools(tools_dir)
+
+        assert imported == ["tools.guarded"]
+        mock_import.assert_called_once_with("tools.guarded")
 
 class TestEmojiMetadata:
     """Verify per-tool emoji registration and lookup."""

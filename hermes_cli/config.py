@@ -2458,6 +2458,14 @@ DEFAULT_CONFIG = {
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
     "delegation": {
+        # Optional trusted named profiles selected by delegate_task's
+        # execution_profile field. Each entry must exactly pin: allowed_role,
+        # provider, runtime, model, reasoning, tool_profile, max_concurrency,
+        # and fallback="NONE". Named profiles are OpenAI/Codex-only and
+        # intentionally non-mutating: only SCOUT and REVIEWER roles are accepted;
+        # WRITER is rejected until an enforceable workspace boundary exists.
+        # Empty preserves profile-less native behavior.
+        "profiles": {},
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents

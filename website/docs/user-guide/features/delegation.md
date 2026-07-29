@@ -153,9 +153,94 @@ delegation:
 
 If omitted, subagents use the same model as the parent.
 
+## Trusted Named Execution Profiles
+
+For non-mutating workflows that must pin a Scout or Reviewer's semantic role,
+model, reasoning, read-only tools, concurrency, and fallback policy together,
+install the two canonical tuples below under `delegation.profiles` and select
+only their name with `execution_profile`:
+
+```yaml
+delegation:
+  profiles:
+    delegate-scout:
+      allowed_role: SCOUT
+      provider: openai
+      runtime: codex
+      model: gpt-5.6-luna
+      reasoning: max
+      tool_profile: read-only-discovery
+      max_concurrency: 1
+      fallback: NONE
+    delegate-reviewer:
+      allowed_role: REVIEWER
+      provider: openai
+      runtime: codex
+      model: gpt-5.6-sol
+      reasoning: xhigh
+      tool_profile: immutable-read-only-review
+      max_concurrency: 1
+      fallback: NONE
+```
+
+```python
+delegate_task(
+    goal="Inventory the affected symbols without modifying files",
+    execution_profile="delegate-scout"
+)
+
+# Review only after the parent has frozen the exact candidate.
+delegate_task(
+    goal="Review the frozen candidate without modifying it",
+    execution_profile="delegate-reviewer"
+)
+```
+
+Profile definitions are immutable name-bound contracts. Only the exact
+`delegate-scout` and `delegate-reviewer` tuples shown above are accepted;
+missing, extra, renamed, swapped, or modified fields, unavailable provider
+credentials, and requests over a profile's concurrency limit fail closed. Named profiles are
+always native `role="leaf"`; prompt input cannot promote one to an orchestrator
+or override its provider, model, reasoning, tool capability, or no-fallback
+policy. Codex runtime profiles declare `provider: openai` and resolve through
+the `openai-codex` OAuth runtime. Other providers and runtimes are rejected for
+named profiles; profile-less delegation retains its existing provider support.
+
+For a batch, a top-level `execution_profile` is validated and used as the
+default for each task that omits its own value. A task-level profile overrides
+that default. An unknown or removed top-level profile is rejected even when
+every task supplies an override, so it cannot silently degrade to profile-less
+delegation.
+
+Named profiles intentionally accept only `SCOUT` and `REVIEWER`. Any raw
+`WRITER` role is rejected, with or without an execution profile, because Hermes
+does not yet enforce a workspace write
+boundary across file, terminal, process, and nested execution tools. Ordinary
+implementation remains owned by the parent; use a separately qualified isolated
+execution route when a distinct Writer must own the candidate. Calls without an
+execution profile retain the legacy delegation behavior but do not gain the
+named profile's least-privilege guarantee.
+
+After constructing a named child, Hermes attests its provider, wire mode, model,
+reasoning configuration, actual tool names, exact enabled toolset, fallback
+chain, and credential-pool state before the first child event or LLM call. A
+successful attestation creates the `execution_profile` receipt returned by later
+success, timeout, and runtime-error results. Config, role, profile, catalog, and
+attestation rejections happen before an attested child exists, so those responses
+contain an error but no execution receipt. Calls that omit `execution_profile`
+preserve the existing inherited/configured delegation behavior.
+
 ## Inherited Tool Access
 
-`delegate_task` does not accept a model-facing `toolsets` parameter. Each subagent inherits the parent's enabled toolsets so the model cannot grant a child capabilities that the parent does not have. Configure the parent's tools before starting the conversation if delegated work needs additional capabilities.
+`delegate_task` does not accept a model-facing `toolsets` parameter. Calls without
+an execution profile inherit the parent's enabled toolsets. Named profiles instead
+use their trusted exact tool bundle, so the model cannot grant itself additional
+capabilities. The two bundle definitions and their built-in `read_file`,
+`search_files`, `web_search`, and `web_extract` registry entries are protected
+against runtime replacement, deregistration, plugin/MCP aliasing, and refresh
+overlays. Configure the parent before starting the conversation if profile-less
+delegated work needs additional capabilities; canonical named profiles cannot be
+extended.
 
 Certain tools are blocked for subagents even when the parent has them:
 - `delegation` — blocked for leaf subagents (the default). Retained for `role="orchestrator"` children, bounded by `max_spawn_depth` — see [Depth Limit and Nested Orchestration](#depth-limit-and-nested-orchestration) below.

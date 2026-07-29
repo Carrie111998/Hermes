@@ -23,7 +23,8 @@ Usage:
     all_tools = resolve_toolset("full_stack")
 """
 
-from typing import List, Dict, Any, Set, Optional
+from types import MappingProxyType
+from typing import List, Dict, Any, Mapping, Set, Optional
 
 
 # Shared tool list for CLI and all messaging platform toolsets.
@@ -196,7 +197,27 @@ TOOLSETS = {
         "tools": ["read_file", "write_file", "patch", "search_files"],
         "includes": []
     },
-    
+
+    # Named native-delegation profiles. Keep these as exact tool-name bundles:
+    # using the broader `file` toolset for Scout/Reviewer would silently grant
+    # write_file and patch, defeating least privilege.
+    "delegation-read-only-discovery": {
+        "description": "Read-only repository and web discovery for a named Scout",
+        "tools": ["read_file", "search_files", "web_search", "web_extract"],
+        "includes": [],
+        "posture": True,
+        "sealed": True,
+    },
+
+    "delegation-immutable-read-only-review": {
+        "description": "Read-only local packet and source inspection for a named Reviewer",
+        "tools": ["read_file", "search_files"],
+        "includes": [],
+        "posture": True,
+        "sealed": True,
+    },
+
+
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
         "tools": ["text_to_speech"],
@@ -586,6 +607,83 @@ TOOLSETS = {
 }
 
 
+_SEALED_TOOLSET_DEFINITIONS: Mapping[str, Mapping[str, Any]] = MappingProxyType(
+    {
+        "delegation-read-only-discovery": MappingProxyType(
+            {
+                "description": "Read-only repository and web discovery for a named Scout",
+                "tools": ("read_file", "search_files", "web_search", "web_extract"),
+                "includes": (),
+                "posture": True,
+                "sealed": True,
+            }
+        ),
+        "delegation-immutable-read-only-review": MappingProxyType(
+            {
+                "description": "Read-only local packet and source inspection for a named Reviewer",
+                "tools": ("read_file", "search_files"),
+                "includes": (),
+                "posture": True,
+                "sealed": True,
+            }
+        ),
+    }
+)
+
+
+class _ToolsetDefinitions(dict):
+    """Mutable custom-toolset map with immutable reserved authority bundles."""
+
+    @staticmethod
+    def _reject_reserved(name: str) -> None:
+        if name in _SEALED_TOOLSET_DEFINITIONS:
+            raise PermissionError(f"sealed toolset {name!r} is immutable")
+
+    def __setitem__(self, name, value):
+        self._reject_reserved(name)
+        return super().__setitem__(name, value)
+
+    def __delitem__(self, name):
+        self._reject_reserved(name)
+        return super().__delitem__(name)
+
+    def pop(self, name, *default):
+        self._reject_reserved(name)
+        return super().pop(name, *default)
+
+    def update(self, *args, **kwargs):
+        incoming = dict(*args, **kwargs)
+        for name in incoming:
+            self._reject_reserved(name)
+        return super().update(incoming)
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def setdefault(self, name, default=None):
+        if name in _SEALED_TOOLSET_DEFINITIONS:
+            return self[name]
+        return super().setdefault(name, default)
+
+    def popitem(self):
+        for name in reversed(self):
+            if name not in _SEALED_TOOLSET_DEFINITIONS:
+                value = self[name]
+                super().__delitem__(name)
+                return name, value
+        raise PermissionError("cannot remove sealed toolsets")
+
+    def clear(self):
+        raise PermissionError("cannot clear toolsets while sealed bundles are installed")
+
+
+_toolset_definitions: Dict[str, Any] = dict(TOOLSETS)
+for _sealed_name, _sealed_definition in _SEALED_TOOLSET_DEFINITIONS.items():
+    _toolset_definitions[_sealed_name] = _sealed_definition
+TOOLSETS = _ToolsetDefinitions(_toolset_definitions)
+
+
 
 def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[str, Any]]:
     """
@@ -608,7 +706,15 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
             registry/MCP-only toolsets AND registry-derived aliases return None
             (they have no static counterpart).
     """
-    toolset = TOOLSETS.get(name)
+    toolset: Optional[Mapping[str, Any]] = (
+        _SEALED_TOOLSET_DEFINITIONS.get(name) or TOOLSETS.get(name)
+    )
+
+    # Sealed internal bundles are authority contracts, not plugin extension
+    # points. Their authored membership must remain exact even when normal
+    # callers request registry overlays.
+    if toolset and toolset.get("sealed"):
+        include_registry = False
 
     if not include_registry:
         # Static view only: return the built-in definition (copying the nested
@@ -625,7 +731,7 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
     try:
         from tools.registry import registry
     except Exception:
-        return toolset if toolset else None
+        return dict(toolset) if toolset else None
 
     if toolset:
         merged_tools = sorted(
@@ -756,6 +862,12 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
                 pass
 
         return []
+
+    if toolset.get("sealed"):
+        # Keep any recursively included definitions static as well. Current
+        # sealed bundles are leaves, but carrying the invariant here prevents a
+        # future include from reopening plugin/registry membership.
+        include_registry = False
 
     # Collect direct tools
     tools = set(toolset.get("tools", []))
@@ -898,6 +1010,8 @@ def create_custom_toolset(
         tools (List[str]): Direct tools to include
         includes (List[str]): Other toolsets to include
     """
+    if name in _SEALED_TOOLSET_DEFINITIONS:
+        raise PermissionError(f"sealed toolset {name!r} is immutable")
     TOOLSETS[name] = {
         "description": description,
         "tools": tools or [],

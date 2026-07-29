@@ -34,11 +34,19 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
+from tools.delegation_profiles import (
+    ExecutionProfileError,
+    configured_profile_names,
+    profile_semaphore,
+    require_profile_model_available,
+    resolve_execution_profile,
+)
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
+_EXECUTION_PROFILE_UNSET = object()
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -476,6 +484,21 @@ def _normalize_role(r: Optional[str]) -> str:
         return r_norm
     logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
     return "leaf"
+
+
+def _is_retired_writer_role(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().casefold().replace("_", "-")
+    return normalized in {"writer", "delegate-writer"}
+
+
+def _validate_explicit_profile_name(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ExecutionProfileError(
+            "execution_profile must be an exact nonblank string when supplied"
+        )
+    return value
 
 
 def _get_max_concurrent_children() -> int:
@@ -1190,6 +1213,142 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+def _attest_execution_profile_child(
+    child: Any, launch_contract: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Attest a named child before it can emit events or make an LLM call."""
+    if launch_contract is None:
+        return None
+
+    from hermes_constants import parse_reasoning_effort
+
+    expected_tools = set(launch_contract["expectedTools"])
+    required_tools = {"read_file", "search_files"}
+    actual_tools = set(getattr(child, "valid_tool_names", set()) or set())
+    raw_schemas = list(getattr(child, "tools", None) or [])
+    schema_entries: List[tuple[int, str, Dict[str, Any]]] = []
+    malformed_schema_indexes: List[int] = []
+    schemas_by_name: Dict[str, Dict[str, Any]] = {}
+    duplicate_schema_names = set()
+    for index, tool in enumerate(raw_schemas):
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type") != "function"
+            or not isinstance(function, dict)
+            or not isinstance(name, str)
+            or not name
+            or name != name.strip()
+        ):
+            malformed_schema_indexes.append(index)
+            continue
+        schema_entries.append((index, name, function))
+        if name in schemas_by_name:
+            duplicate_schema_names.add(name)
+        schemas_by_name[name] = function
+    schema_tools = set(schemas_by_name)
+    expected_reasoning = parse_reasoning_effort(launch_contract["reasoning"])
+    actual_enabled = list(getattr(child, "enabled_toolsets", None) or [])
+    actual_fallback_chain = list(getattr(child, "_fallback_chain", None) or [])
+    actual_pool = getattr(child, "_credential_pool", None)
+
+    checks = {
+        "provider": (
+            getattr(child, "provider", None),
+            launch_contract["resolvedProvider"],
+        ),
+        "runtime mode": (
+            getattr(child, "api_mode", None),
+            launch_contract["runtimeMode"],
+        ),
+        "model": (getattr(child, "model", None), launch_contract["model"]),
+        "reasoning": (getattr(child, "reasoning_config", None), expected_reasoning),
+        "enabled toolsets": (
+            actual_enabled,
+            launch_contract["enabledToolsets"],
+        ),
+        "fallback chain": (actual_fallback_chain, []),
+        "credential pool": (actual_pool is not None, False),
+        "fallback activated": (
+            bool(getattr(child, "_fallback_activated", False)),
+            False,
+        ),
+    }
+    mismatches = [
+        f"{field}: actual={actual!r}, expected={expected!r}"
+        for field, (actual, expected) in checks.items()
+        if type(actual) is not type(expected) or actual != expected
+    ]
+    unexpected_tools = actual_tools - expected_tools
+    if unexpected_tools:
+        mismatches.append(
+            f"valid tools outside canonical allowlist: {sorted(unexpected_tools)!r}"
+        )
+    missing_required_tools = required_tools - actual_tools
+    if missing_required_tools:
+        mismatches.append(
+            f"required tools missing: {sorted(missing_required_tools)!r}"
+        )
+    if malformed_schema_indexes:
+        mismatches.append(
+            f"malformed tool schema entries at indexes: {malformed_schema_indexes!r}"
+        )
+    if duplicate_schema_names:
+        mismatches.append(
+            f"duplicate tool schema names: {sorted(duplicate_schema_names)!r}"
+        )
+    if len(raw_schemas) != len(actual_tools):
+        mismatches.append(
+            f"tool schema cardinality mismatch: schemas={len(raw_schemas)!r}, "
+            f"valid={len(actual_tools)!r}"
+        )
+    if schema_tools != actual_tools:
+        mismatches.append(
+            f"tool schema/name mismatch: schemas={sorted(schema_tools)!r}, "
+            f"valid={sorted(actual_tools)!r}"
+        )
+    from tools.registry import registry
+
+    invalid_protected_tools = [
+        f"{name}@{index}"
+        for index, name, schema in schema_entries
+        if not registry.attest_protected_tool(name, schema)
+    ]
+    if invalid_protected_tools:
+        mismatches.append(
+            "tool implementation/schema does not match protected baseline: "
+            f"{invalid_protected_tools!r}"
+        )
+    if mismatches:
+        try:
+            child.close()
+        except Exception:
+            pass
+        raise ExecutionProfileError(
+            f"execution profile {launch_contract['requestedProfile']!r}: "
+            "runtime attestation failed (" + "; ".join(mismatches) + ")"
+        )
+
+    return {
+        "requestedProfile": launch_contract["requestedProfile"],
+        "allowedRole": launch_contract["allowedRole"],
+        "declaredProvider": launch_contract["declaredProvider"],
+        "runtime": launch_contract["runtime"],
+        "runtimeMode": getattr(child, "api_mode"),
+        "resolvedProvider": getattr(child, "provider"),
+        "model": getattr(child, "model"),
+        "reasoning": launch_contract["reasoning"],
+        "toolProfile": launch_contract["toolProfile"],
+        "enabledToolsets": actual_enabled,
+        "tools": sorted(actual_tools),
+        "maxConcurrency": launch_contract["maxConcurrency"],
+        "fallback": "NONE",
+        "fallbackChainLength": 0,
+        "credentialPoolEnabled": False,
+    }
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1206,6 +1365,11 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_reasoning_effort: Any = None,
+    disable_fallback: bool = False,
+    exact_toolsets: bool = False,
+    execution_profile_receipt: Optional[Dict[str, Any]] = None,
+    execution_profile_semaphore=None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1267,7 +1431,17 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    if exact_toolsets:
+        if not toolsets:
+            raise ExecutionProfileError(
+                "named execution profile resolved without an exact toolset"
+            )
+        # Trusted named profiles own their complete capability set. Do not
+        # intersect it with the parent's surface and do not append parent MCP
+        # toolsets: either behavior would make the runtime differ from the
+        # profile receipt.
+        child_toolsets = list(toolsets)
+    elif toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
@@ -1291,7 +1465,9 @@ def _build_child_agent(
     # child so model_tools subtracts the blocked names AFTER composite
     # expansion, and the restriction survives later registry/MCP refreshes.
     raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
-    if isinstance(raw_parent_disabled, (list, tuple, set)):
+    if exact_toolsets:
+        inherited_disabled = []
+    elif isinstance(raw_parent_disabled, (list, tuple, set)):
         inherited_disabled = [str(name) for name in raw_parent_disabled]
     else:
         inherited_disabled = []
@@ -1433,14 +1609,18 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: named profile > delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (
+            override_reasoning_effort
+            if override_reasoning_effort is not None
+            else delegation_cfg.get("reasoning_effort")
+        )
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1459,7 +1639,11 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = (
+        None
+        if disable_fallback
+        else (getattr(parent_agent, "_fallback_chain", None) or None)
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1552,6 +1736,11 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    execution_profile_receipt = _attest_execution_profile_child(
+        child, execution_profile_receipt
+    )
+    setattr(child, "_execution_profile_receipt", execution_profile_receipt)
+    setattr(child, "_execution_profile_semaphore", execution_profile_semaphore)
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1566,13 +1755,16 @@ def _build_child_agent(
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
 
-    # Share a credential pool with the child when possible so subagents can
-    # rotate credentials on rate limits instead of getting pinned to one key.
-    child_pool = _resolve_child_credential_pool(
-        effective_provider, parent_agent, effective_base_url
-    )
-    if child_pool is not None:
-        child._credential_pool = child_pool
+    # Share a credential pool with profile-less children so native delegation
+    # can rotate on rate limits. A named profile has already been preflighted
+    # against one exact account catalog and declares fallback=NONE; rotating to
+    # another account would invalidate that evidence and is therefore disabled.
+    if not disable_fallback:
+        child_pool = _resolve_child_credential_pool(
+            effective_provider, parent_agent, effective_base_url
+        )
+        if child_pool is not None:
+            setattr(child, "_credential_pool", child_pool)
 
     # Register child for interrupt propagation
     if hasattr(parent_agent, "_active_children"):
@@ -1972,6 +2164,7 @@ def _run_single_child(
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    assert child is not None, "delegated child must be built before execution"
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -2177,12 +2370,26 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context():
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+            semaphore = getattr(child, "_execution_profile_semaphore", None)
+            slot_acquired = False
+            if semaphore is not None:
+                slot_acquired = semaphore.acquire(blocking=False)
+                if not slot_acquired:
+                    receipt = getattr(child, "_execution_profile_receipt", None) or {}
+                    profile_name = receipt.get("requestedProfile", "<unknown>")
+                    raise ExecutionProfileError(
+                        f"execution profile {profile_name!r}: concurrency limit reached"
+                    )
+            try:
+                with delegated_child_context():
+                    return child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
+            finally:
+                if semaphore is not None and slot_acquired:
+                    semaphore.release()
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -2286,6 +2493,9 @@ def _run_single_child(
                 "duration_seconds": duration,
                 "timeout_seconds": child_timeout if is_timeout else None,
                 "timed_out_after_seconds": duration if is_timeout else None,
+                "execution_profile": getattr(
+                    child, "_execution_profile_receipt", None
+                ),
                 "timeout_phase": (
                     "before_first_llm_call" if is_timeout and child_api_calls == 0
                     else "after_llm_calls" if is_timeout
@@ -2398,6 +2608,9 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            "execution_profile": getattr(
+                child, "_execution_profile_receipt", None
+            ),
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -2536,6 +2749,9 @@ def _run_single_child(
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
+            "execution_profile": getattr(
+                child, "_execution_profile_receipt", None
+            ),
             "_child_role": getattr(child, "_delegate_role", None),
         }
 
@@ -2782,6 +2998,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    execution_profile: Any = _EXECUTION_PROFILE_UNSET,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2789,8 +3006,8 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, and execution_profile)
+      - Batch:  provide tasks array [{goal, context, role, execution_profile}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2801,6 +3018,39 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    # Retired Writer authority and malformed explicit profile requests must fail
+    # before config, credentials, transcripts, child construction, or events.
+    if _is_retired_writer_role(role):
+        return tool_error("Retired delegation role 'WRITER' is not available.")
+    top_profile_supplied = execution_profile is not _EXECUTION_PROFILE_UNSET
+    if top_profile_supplied:
+        try:
+            execution_profile = _validate_explicit_profile_name(execution_profile)
+        except ExecutionProfileError as exc:
+            return tool_error(str(exc))
+
+    recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
+    if tasks_error:
+        return tool_error(tasks_error)
+    if recovered_tasks is not None:
+        tasks = recovered_tasks
+    if tasks is not None and not isinstance(tasks, list):
+        return tool_error("tasks must be an array of task objects")
+
+    if isinstance(tasks, list):
+        for index, raw_task in enumerate(tasks):
+            if not isinstance(raw_task, dict):
+                continue
+            if _is_retired_writer_role(raw_task.get("role")):
+                return tool_error(
+                    f"Task {index}: retired delegation role 'WRITER' is not available."
+                )
+            if "execution_profile" in raw_task:
+                try:
+                    _validate_explicit_profile_name(raw_task["execution_profile"])
+                except ExecutionProfileError as exc:
+                    return tool_error(f"Task {index}: {exc}")
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -2856,25 +3106,22 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    # Resolve legacy/default credentials lazily only if a profile-less task is
+    # present. A named profile must not be blocked by an unrelated stale
+    # delegation.provider setting.
+    default_creds: Optional[Dict[str, Any]] = None
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
-    recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
-    if tasks_error:
-        return tool_error(tasks_error)
-    if recovered_tasks is not None:
-        tasks = recovered_tasks
-
     if tasks and isinstance(tasks, list):
+        if top_profile_supplied:
+            try:
+                # The top-level profile is the batch default. Validate it even
+                # when every task supplies an override so an unknown/removed
+                # profile can never be silently ignored.
+                resolve_execution_profile(cfg, execution_profile)
+            except ExecutionProfileError as exc:
+                return tool_error(f"Batch: {exc}")
         if len(tasks) > max_children:
             return tool_error(
                 f"Too many tasks: {len(tasks)} provided, but "
@@ -2885,14 +3132,27 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        single_task = {
+            "goal": goal,
+            "context": context,
+            # Preserve the raw role until named-profile validation. Legacy
+            # profile-less delegation still normalizes it below.
+            "role": role,
+        }
+        if top_profile_supplied:
+            single_task["execution_profile"] = execution_profile
+        task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Validate each task has a goal
+    # Validate and resolve every task before creating transcripts or children.
+    # This is the fail-closed boundary: no partial fan-out on an invalid,
+    # unknown, unavailable, over-concurrency, or role-mismatched profile.
+    normalized_tasks: List[Dict[str, Any]] = []
+    profile_counts: Dict[str, int] = {}
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(
@@ -2900,6 +3160,79 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        normalized = dict(task)
+        if _is_retired_writer_role(normalized.get("role")):
+            return tool_error(
+                f"Task {i}: retired delegation role 'WRITER' is not available."
+            )
+        task_profile_supplied = "execution_profile" in normalized
+        if task_profile_supplied:
+            try:
+                profile_name = _validate_explicit_profile_name(
+                    normalized["execution_profile"]
+                )
+            except ExecutionProfileError as exc:
+                return tool_error(f"Task {i}: {exc}")
+        elif top_profile_supplied:
+            profile_name = execution_profile
+        else:
+            profile_name = None
+        if profile_name is not None:
+            normalized["execution_profile"] = profile_name
+        try:
+            profile = resolve_execution_profile(cfg, profile_name)
+        except ExecutionProfileError as exc:
+            return tool_error(f"Task {i}: {exc}")
+
+        if profile is None:
+            if default_creds is None:
+                try:
+                    default_creds = _resolve_delegation_credentials(cfg, parent_agent)
+                except ValueError as exc:
+                    return tool_error(str(exc))
+            normalized["_execution_profile"] = None
+            normalized["_execution_profile_receipt"] = None
+            normalized["_execution_profile_semaphore"] = None
+            normalized["_credentials"] = default_creds
+        else:
+            requested_role = normalized.get("role")
+            if requested_role is None or requested_role == "":
+                requested_role = role
+            if requested_role is None or requested_role == "":
+                effective_role = "leaf"
+            elif isinstance(requested_role, str) and requested_role.strip().lower() == "leaf":
+                effective_role = "leaf"
+            else:
+                effective_role = None
+            if effective_role != "leaf":
+                return tool_error(
+                    f"Task {i}: execution_profile {profile.name!r} requires "
+                    "native role='leaf'; no other or malformed role can override "
+                    "a named execution profile."
+                )
+            profile_counts[profile.name] = profile_counts.get(profile.name, 0) + 1
+            if profile_counts[profile.name] > profile.max_concurrency:
+                return tool_error(
+                    f"Task {i}: execution_profile {profile.name!r} allows at "
+                    f"most {profile.max_concurrency} concurrent task(s)."
+                )
+            try:
+                task_creds = _resolve_delegation_credentials(
+                    profile.delegation_config(cfg), parent_agent
+                )
+                require_profile_model_available(profile, task_creds.get("api_key"))
+                launch_contract = profile.launch_contract(
+                    resolved_provider=task_creds.get("provider"),
+                    runtime_mode=task_creds.get("api_mode"),
+                )
+            except (ExecutionProfileError, ValueError) as exc:
+                return tool_error(f"Task {i}: {exc}")
+            normalized["_execution_profile"] = profile
+            normalized["_execution_profile_receipt"] = launch_contract
+            normalized["_execution_profile_semaphore"] = profile_semaphore(profile)
+            normalized["_credentials"] = task_creds
+        normalized_tasks.append(normalized)
+    task_list = normalized_tasks
 
     overall_start = time.monotonic()
     results = []
@@ -2945,27 +3278,45 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
-        child = _build_child_preserving_parent_tools(
-            task_index=i,
-            goal=t["goal"],
-            context=t.get("context"),
-            # Subagents always inherit the parent's toolsets; the model
-            # cannot choose or narrow them (no model-facing toolsets arg).
-            toolsets=None,
-            model=creds["model"],
-            max_iterations=effective_max_iter,
-            task_count=n_tasks,
-            parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
-            role=effective_role,
-        )
+        task_creds = t["_credentials"]
+        profile = t["_execution_profile"]
+        try:
+            child = _build_child_preserving_parent_tools(
+                task_index=i,
+                goal=t["goal"],
+                context=t.get("context"),
+                # Profile-less children preserve native inheritance. Named
+                # profiles use a trusted exact tool bundle; the model only chose
+                # the allowlisted profile name, never these toolsets directly.
+                toolsets=(profile.enabled_toolsets if profile is not None else None),
+                model=task_creds["model"],
+                max_iterations=effective_max_iter,
+                task_count=n_tasks,
+                parent_agent=parent_agent,
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_reasoning_effort=(
+                    profile.reasoning if profile is not None else None
+                ),
+                disable_fallback=(profile is not None),
+                exact_toolsets=(profile is not None),
+                execution_profile_receipt=t["_execution_profile_receipt"],
+                execution_profile_semaphore=t["_execution_profile_semaphore"],
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
+                role=effective_role,
+            )
+        except ExecutionProfileError as exc:
+            for _built_index, _built_task, built_child in children:
+                try:
+                    built_child.close()
+                except Exception:
+                    pass
+            return tool_error(f"Task {i}: {exc}")
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -3327,7 +3678,11 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=(
+                task_list[0]["_credentials"]["model"]
+                if len({t["_credentials"]["model"] for t in task_list}) == 1
+                else None
+            ),
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -3831,6 +4186,42 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
+    try:
+        profile_names = configured_profile_names(_load_config())
+    except ExecutionProfileError:
+        profile_names = []
+    profile_description = (
+        "Select a trusted named non-mutating delegation execution profile. "
+        "Scout and Reviewer profiles pin semantic role, OpenAI/Codex runtime/model/"
+        "reasoning, exact read-only tools, concurrency, and no-fallback policy. "
+        "Named Writer profiles are not supported; implementation remains owned "
+        "by the parent or an isolated execution route."
+    )
+    tasks_schema = overrides_params["properties"]["tasks"]
+    tasks_schema["items"] = dict(tasks_schema["items"])
+    tasks_schema["items"]["properties"] = {
+        key: dict(value)
+        for key, value in tasks_schema["items"]["properties"].items()
+    }
+    if profile_names:
+        top_profile = overrides_params["properties"]["execution_profile"]
+        top_profile["enum"] = profile_names
+        top_profile["description"] = (
+            profile_description
+            + " In batch mode this is the validated default for tasks that omit "
+            "their own execution_profile. Configured values: "
+            + ", ".join(profile_names)
+            + "."
+        )
+        task_profile = tasks_schema["items"]["properties"]["execution_profile"]
+        task_profile["enum"] = profile_names
+        task_profile["description"] = (
+            profile_description + " This per-task value overrides the batch default."
+        )
+    else:
+        overrides_params["properties"].pop("execution_profile", None)
+        tasks_schema["items"]["properties"].pop("execution_profile", None)
+
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,
@@ -3886,6 +4277,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "execution_profile": {
+                            "type": "string",
+                            "description": "Trusted named profile for this task.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3898,6 +4293,10 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "execution_profile": {
+                "type": "string",
+                "description": "Trusted named profile for a single delegated task.",
             },
             "background": {
                 "type": "boolean",
@@ -3970,6 +4369,11 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        execution_profile=(
+            args["execution_profile"]
+            if "execution_profile" in args
+            else _EXECUTION_PROFILE_UNSET
+        ),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

@@ -40,11 +40,22 @@ def _is_registry_register_call(node: ast.AST) -> bool:
     )
 
 
-def _module_registers_tools(module_path: Path) -> bool:
-    """Return True when the module contains a top-level ``registry.register(...)`` call.
+def _contains_module_scope_register(node: ast.AST) -> bool:
+    if _is_registry_register_call(node):
+        return True
+    if isinstance(node, ast.If):
+        return any(
+            _contains_module_scope_register(statement)
+            for statement in (*node.body, *node.orelse)
+        )
+    return False
 
-    Only inspects module-body statements so that helper modules which happen
-    to call ``registry.register()`` inside a function are not picked up.
+
+def _module_registers_tools(module_path: Path) -> bool:
+    """Return True for direct or guarded module-scope tool registration.
+
+    Function/class bodies remain excluded so helper modules that merely define
+    a registration helper are not imported as self-registering built-ins.
 
     A cheap text prefilter avoids the ``ast.parse`` cost for files that do not
     mention both ``registry`` and ``register`` — a necessary condition for a
@@ -61,7 +72,7 @@ def _module_registers_tools(module_path: Path) -> bool:
     except SyntaxError:
         return False
 
-    return any(_is_registry_register_call(stmt) for stmt in tree.body)
+    return any(_contains_module_scope_register(stmt) for stmt in tree.body)
 
 
 def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
@@ -91,11 +102,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "protected",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 protected=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -114,6 +127,21 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.protected = protected
+
+
+_PROTECTED_TOOL_CONTRACTS = {
+    "read_file": ("file", "tools.file_tools", "_handle_read_file", "READ_FILE_SCHEMA"),
+    "search_files": ("file", "tools.file_tools", "_handle_search_files", "SEARCH_FILES_SCHEMA"),
+    "web_search": ("web", "tools.web_tools", "_handle_web_search", "WEB_SEARCH_SCHEMA"),
+    "web_extract": ("web", "tools.web_tools", "_handle_web_extract", "WEB_EXTRACT_SCHEMA"),
+}
+_PROTECTED_TOOLSET_NAMES = frozenset(
+    {
+        "delegation-read-only-discovery",
+        "delegation-immutable-read-only-review",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +247,9 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: Dict[str, ToolEntry] = {}
+        self._protected_baselines: Dict[
+            str, tuple[ToolEntry, Callable, str, str]
+        ] = {}
         # Durable map: plugin module namespace (handler.__globals__["__name__"])
         # -> operator opt-in for built-in override. Populated at plugin load and
         # never cleared, so a plugin's override authorization is bound to the
@@ -276,6 +307,49 @@ class ToolRegistry:
         with self._lock:
             return self._tools.get(name)
 
+    @staticmethod
+    def _schema_fingerprint(schema: object) -> str:
+        try:
+            return json.dumps(
+                schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _canonical_protected_objects(
+        name: str,
+    ) -> tuple[Callable, object] | None:
+        contract = _PROTECTED_TOOL_CONTRACTS.get(name)
+        if contract is None:
+            return None
+        _toolset, module_name, handler_name, schema_name = contract
+        module = sys.modules.get(module_name)
+        if module is None:
+            return None
+        handler = getattr(module, handler_name, None)
+        schema = getattr(module, schema_name, None)
+        if not callable(handler) or schema is None:
+            return None
+        return handler, schema
+
+    def attest_protected_tool(self, name: str, exposed_schema: object) -> bool:
+        """Verify a child tool against the immutable built-in registry baseline."""
+        with self._lock:
+            baseline = self._protected_baselines.get(name)
+            current = self._tools.get(name)
+            if baseline is None or current is None:
+                return False
+            baseline_entry, baseline_handler, schema_fingerprint, toolset = baseline
+            return (
+                current is baseline_entry
+                and current.protected
+                and current.handler is baseline_handler
+                and current.toolset == toolset
+                and self._schema_fingerprint(current.schema) == schema_fingerprint
+                and self._schema_fingerprint(exposed_schema) == schema_fingerprint
+            )
+
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
         return sorted({entry.toolset for entry in self._snapshot_entries()})
@@ -289,6 +363,8 @@ class ToolRegistry:
 
     def register_toolset_alias(self, alias: str, toolset: str) -> None:
         """Register an explicit alias for a canonical toolset name."""
+        if alias in _PROTECTED_TOOLSET_NAMES or toolset in _PROTECTED_TOOLSET_NAMES:
+            raise PermissionError("sealed delegation toolsets cannot be aliased")
         with self._lock:
             existing = self._toolset_aliases.get(alias)
             if existing and existing != toolset:
@@ -376,6 +452,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        protected: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -387,6 +464,39 @@ class ToolRegistry:
         """
         with self._lock:
             existing = self._tools.get(name)
+            contract = _PROTECTED_TOOL_CONTRACTS.get(name)
+            if contract is not None:
+                expected_toolset, expected_module, _handler_name, _schema_name = contract
+                canonical = self._canonical_protected_objects(name)
+                if not protected:
+                    raise PermissionError(f"protected tool {name!r} cannot be replaced")
+                if toolset != expected_toolset:
+                    raise PermissionError(
+                        f"protected tool {name!r} must remain in toolset "
+                        f"{expected_toolset!r}"
+                    )
+                if (
+                    canonical is None
+                    or handler is not canonical[0]
+                    or schema is not canonical[1]
+                ):
+                    raise PermissionError(
+                        f"protected tool {name!r} must use canonical objects from "
+                        f"{expected_module!r}"
+                    )
+            elif protected:
+                raise PermissionError(f"tool {name!r} has no protected contract")
+
+            if existing and existing.protected:
+                baseline = self._protected_baselines.get(name)
+                if (
+                    baseline is not None
+                    and existing is baseline[0]
+                    and handler is baseline[1]
+                    and self._schema_fingerprint(schema) == baseline[2]
+                ):
+                    return
+                raise PermissionError(f"protected tool {name!r} is immutable")
             if existing and existing.toolset != toolset:
                 if override:
                     _owner = self._plugin_owner_of(handler)
@@ -435,7 +545,16 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                protected=protected,
             )
+            if contract is not None:
+                entry = self._tools[name]
+                self._protected_baselines[name] = (
+                    entry,
+                    handler,
+                    self._schema_fingerprint(schema),
+                    toolset,
+                )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
             # get_toolset_requirements -> TOOLSET_REQUIREMENTS["check_fn"], which
@@ -466,6 +585,8 @@ class ToolRegistry:
             entry = self._tools.get(name)
             if entry is None:
                 return
+            if entry.protected:
+                raise PermissionError(f"protected tool {name!r} cannot be deregistered")
             if not entry.toolset.startswith("mcp-"):
                 caller_mod = self._caller_module()
                 owner = self._plugin_owner_of(entry.handler)

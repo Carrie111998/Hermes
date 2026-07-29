@@ -1211,28 +1211,40 @@ WEB_EXTRACT_SCHEMA = {
     }
 }
 
-registry.register(
-    name="web_search",
-    toolset="web",
-    schema=WEB_SEARCH_SCHEMA,
-    handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=check_web_api_key,
-    requires_env=_web_requires_env(),
-    emoji="🔍",
-    max_result_size_chars=100_000,
-)
-registry.register(
-    name="web_extract",
-    toolset="web",
-    schema=WEB_EXTRACT_SCHEMA,
-    handler=lambda args, **kw: web_extract_tool(
+def _handle_web_search(args, **kw):
+    return web_search_tool(args.get("query", ""), limit=args.get("limit", 5))
+
+
+def _handle_web_extract(args, **kw):
+    return web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [],
         "markdown",
         char_limit=args.get("char_limit"),
-    ),
-    check_fn=check_web_api_key,
-    requires_env=_web_requires_env(),
-    is_async=True,
-    emoji="📄",
-    max_result_size_chars=100_000,
-)
+    )
+
+
+if registry.get_entry("web_search") is None:
+    registry.register(
+        name="web_search",
+        toolset="web",
+        schema=WEB_SEARCH_SCHEMA,
+        handler=_handle_web_search,
+        check_fn=check_web_api_key,
+        requires_env=_web_requires_env(),
+        emoji="🔍",
+        max_result_size_chars=100_000,
+        protected=True,
+    )
+if registry.get_entry("web_extract") is None:
+    registry.register(
+        name="web_extract",
+        toolset="web",
+        schema=WEB_EXTRACT_SCHEMA,
+        handler=_handle_web_extract,
+        check_fn=check_web_api_key,
+        requires_env=_web_requires_env(),
+        is_async=True,
+        emoji="📄",
+        max_result_size_chars=100_000,
+        protected=True,
+    )

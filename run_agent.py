@@ -6918,7 +6918,7 @@ class AIAgent:
         #     gateway session the async result would route back to.
         # The schema-level `background` param is intentionally ignored here.
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
-        return _delegate_task(
+        delegate_kwargs = dict(
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
@@ -6927,6 +6927,9 @@ class AIAgent:
             background=(not _is_subagent),
             parent_agent=self,
         )
+        if "execution_profile" in function_args:
+            delegate_kwargs["execution_profile"] = function_args["execution_profile"]
+        return _delegate_task(**delegate_kwargs)
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
