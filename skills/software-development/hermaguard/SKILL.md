@@ -1,6 +1,6 @@
 ---
 name: hermaguard
-description: "Adversarial 3-agent bug-hunting code review. Parallel subagents attack code from different angles — edge cases, adversarial attack surfaces, blast radius. Read-only — reports findings, does not fix. Opt-in. Complement to simplify-code."
+description: "Adversarial 3-agent bug-hunting code review. Read-only."
 version: 1.0.0
 author: KENSEI (Sahil Saghir)
 license: MIT
@@ -26,13 +26,12 @@ chained workflow is:
 Implement → Verify (tests pass) → Simplify → Hermaguard → Fix → Simplify → Commit
 ```
 
-**Based on:** Trail of Bits `differential-review` (8-phase security review),
-BMAD `edge-case-hunter` (exhaustive path tracer), BMAD `adversarial-general`
-(cynical reviewer persona), BMAD `bmad-code-review` (3-layer parallel review),
-dementev-dev `adversarial-review` (Claude↔Codex iterative loop),
-Anthropic `claude-code-security-review` (CI/CD security action), and the
-Reddit adversarial prompt hack (community-validated adversarial stance).
-Full research at `references/cross-implementation-analysis.md`.
+Synthesised from Trail of Bits `differential-review` (8-phase security
+review), BMAD `edge-case-hunter` (exhaustive path tracer), BMAD
+`adversarial-general` (cynical reviewer persona), BMAD `bmad-code-review`
+(3-layer parallel review), dementev-dev `adversarial-review` (Claude and
+Codex iterative loop), Anthropic `claude-code-security-review` (CI/CD
+security action), and a community-validated adversarial prompt hack.
 
 ## When to Use
 
@@ -114,7 +113,11 @@ If no code changes found, say so and stop.
 ### Phase 2 — Launch three reviewers in parallel
 
 Use `delegate_task` **batch mode** — pass all three tasks in one `tasks`
-array so they run concurrently. Each reviewer has different scope and stance:
+array so they run concurrently. Each reviewer has different scope and stance.
+
+> **Note:** `delegate_task` does not allow per-child toolset selection.
+> Children inherit the parent's toolset. Scope each agent through
+> instructions, not toolset configuration.
 
 #### Agent 1: Edge Case Hunter
 
@@ -154,7 +157,8 @@ An empty array `[]` is valid when no unhandled paths are found.
 #### Agent 2: Adversarial Reviewer
 
 **Scope:** Full file contents of changed files (`read_file` each file).
-Give this agent `terminal`, `file`, and `search` toolsets.
+This agent inherits the parent toolset — use `read_file` and `search_files`
+for file access.
 
 **Stance:** "Your job is to break confidence in the change, not to validate
 it." Default to skepticism. Assume the change can fail in subtle, high-cost,
@@ -200,9 +204,9 @@ concrete trigger, performance micro-optimisations.
 
 #### Agent 3: Blast Radius + Integration
 
-**Scope:** Full file contents + call graph analysis. Give this agent
-`terminal`, `file`, and `search` toolsets — it needs `grep`/`rg` to trace
-callers and callees.
+**Scope:** Full file contents + call graph analysis. This agent inherits
+the parent toolset — use `search_files` and `terminal` to trace callers
+and callees.
 
 **Stance:** Strategic — zoom out. A change that's locally correct can still
 break the system. Your job: map the wider impact.
@@ -258,7 +262,10 @@ After all 3 subagents return:
 3. **Cross-reference:** If Agent 3 found a caller that Agent 2 flagged as
    vulnerable, escalate severity
 4. **Write report to disk** (mandatory — don't just summarise in chat):
-   `/tmp/hermaguard/hermaguard-{timestamp}-{short-hash}.md`
+   Use the platform's temporary directory (e.g. `tempfile.gettempdir()`
+   on Python, `os.tmpdir()` on Node, `$TMPDIR` or `/tmp` on Linux/macOS,
+   `%TEMP%` on Windows):
+   `{tmpdir}/hermaguard/hermaguard-{timestamp}-{short-hash}.md`
 
 **Report structure:**
 
@@ -335,11 +342,11 @@ No fixes applied. Findings are for you to fix.
 
 - **Don't guard code you don't understand.** Mark findings as lower confidence
   if the call graph is unclear.
-- **Don't fabricate findings.** An empty agent report IS valid. False positives
-  erode trust faster than missed bugs.
-- **Don't let the adversarial agent go soft.** If it returns "no findings,"
-  ask it to re-examine — adversarial reviewers should ALWAYS find something
-  worth noting, even if LOW severity.
+- **Don't fabricate findings.** An empty agent report IS valid. False
+  positives erode trust faster than missed bugs.
+- **Don't demand findings from adversarial agents.** If the evidence does
+  not support a finding, return `[]`. An evidence-backed empty result
+  is always better than a fabricated LOW-severity entry.
 - **Don't mix guarding with simplification.** Guard after simplify, never
   during.
 - **Report file is mandatory.** Don't just summarise in chat — write the full
