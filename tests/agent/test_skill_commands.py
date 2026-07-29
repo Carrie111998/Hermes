@@ -761,6 +761,61 @@ class TestSkillDirectoryHeader:
         assert str(skill_dir / "scripts" / "run.js") in msg
         assert f"node {skill_dir}/scripts/foo.js" in msg
 
+    def test_docker_header_uses_container_skill_dir_not_host_path(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "host-home" / ".hermes"
+        skills_dir = hermes_home / "skills"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            skill_dir = _make_skill(
+                skills_dir,
+                "docker-skill",
+                body="Run ${HERMES_SKILL_DIR}/scripts/do.sh",
+            )
+            (skill_dir / "scripts").mkdir()
+            (skill_dir / "scripts" / "run.js").write_text("console.log('hi')")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/docker-skill")
+
+        assert msg is not None
+        assert str(hermes_home) not in msg
+        assert "[Skill directory: /root/.hermes/skills/docker-skill]" in msg
+        assert "Run /root/.hermes/skills/docker-skill/scripts/do.sh" in msg
+        assert "scripts/run.js  ->  /root/.hermes/skills/docker-skill/scripts/run.js" in msg
+        assert "node /root/.hermes/skills/docker-skill/scripts/foo.js" in msg
+
+    def test_docker_external_skill_header_uses_external_mount(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "host-home" / ".hermes"
+        skills_dir = hermes_home / "skills"
+        external_root = tmp_path / "external-skills"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_root]),
+        ):
+            skill_dir = _make_skill(
+                external_root,
+                "external-docker-skill",
+                body="Run ${HERMES_SKILL_DIR}/scripts/do.sh",
+            )
+            (skill_dir / "scripts").mkdir()
+            (skill_dir / "scripts" / "run.js").write_text("console.log('hi')")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/external-docker-skill")
+
+        assert msg is not None
+        assert str(external_root) not in msg
+        visible_dir = "/root/.hermes/external_skills/0/external-docker-skill"
+        assert f"[Skill directory: {visible_dir}]" in msg
+        assert f"Run {visible_dir}/scripts/do.sh" in msg
+        assert f"scripts/run.js  ->  {visible_dir}/scripts/run.js" in msg
+        assert f"node {visible_dir}/scripts/foo.js" in msg
+
 
 class TestTemplateVarSubstitution:
     """``${HERMES_SKILL_DIR}`` and ``${HERMES_SESSION_ID}`` in SKILL.md body

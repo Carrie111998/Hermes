@@ -289,6 +289,61 @@ def get_skills_directory_mount(
     return mounts
 
 
+def to_agent_visible_skill_path(
+    host_path: str,
+    container_base: str = "/root/.hermes",
+) -> str:
+    """Translate a host skill path to the path visible in the active sandbox.
+
+    Docker mounts the profile's local skills directory at
+    ``/root/.hermes/skills`` and configured external skill directories at
+    ``/root/.hermes/external_skills/<index>``. Model-visible skill prompts and
+    ``skill_view`` output should point at those container paths instead of
+    leaking host-absolute paths (for example ``/Users/alice/.hermes``).
+    """
+    if os.environ.get("TERMINAL_ENV", "local") != "docker":
+        return host_path
+
+    if not host_path:
+        return host_path
+
+    try:
+        path = Path(host_path).expanduser().resolve()
+    except Exception:
+        return host_path
+
+    # The returned path is for a Linux container even when Hermes is running
+    # on a native Windows host, so do not build it with pathlib.Path (which
+    # would render backslashes on Windows).
+    container_root = container_base.rstrip("/")
+
+    try:
+        skills_dir = (_resolve_hermes_home() / "skills").resolve()
+        rel = path.relative_to(skills_dir)
+        return posixpath.join(container_root, "skills", rel.as_posix())
+    except Exception:
+        pass
+
+    try:
+        from agent.skill_utils import get_external_skills_dirs
+
+        for idx, ext_dir in enumerate(get_external_skills_dirs()):
+            try:
+                rel = path.relative_to(ext_dir.resolve())
+            except Exception:
+                continue
+            return posixpath.join(
+                container_root,
+                "external_skills",
+                str(idx),
+                rel.as_posix(),
+            )
+    except Exception:
+        pass
+
+    return host_path
+
+
 _safe_skills_tempdir: Path | None = None
 
 
