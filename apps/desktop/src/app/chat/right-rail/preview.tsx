@@ -14,15 +14,18 @@ import { PaneTab, PaneTabLabel } from '@/components/ui/pane-tab'
 import { Tip } from '@/components/ui/tooltip'
 import { translateNow, useI18n } from '@/i18n'
 import { formatCombo } from '@/lib/keybinds/combo'
+import { ChevronLeft } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $panesFlipped, $rightRailActiveTabId, selectRightRailTab } from '@/store/layout'
 import {
+  $previewCanGoBack,
   $previewReloadRequest,
   $previewTabs,
   closeOtherRightRailTabs,
   closeRightRail,
   closeRightRailTab,
   closeRightRailTabsToRight,
+  previewGoBack,
   type PreviewTarget
 } from '@/store/preview'
 import { $dirtyPreviewUrls } from '@/store/preview-edit'
@@ -56,6 +59,7 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
   const panesFlipped = useStore($panesFlipped)
   const previewTabs = useStore($previewTabs)
   const dirtyPreviewUrls = useStore($dirtyPreviewUrls)
+  const canGoBack = useStore($previewCanGoBack)
 
   const tabs = useMemo(
     () =>
@@ -95,6 +99,18 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
       style={{ paddingTop: 'var(--right-rail-top-inset, 0px)' }}
     >
       <div className="group/rail-tabs flex h-(--titlebar-height) shrink-0 bg-(--ui-sidebar-surface-background)">
+        {canGoBack && (
+          <Tip label={t.preview.web.goBack}>
+            <button
+              aria-label={t.preview.web.goBack}
+              className="ml-1.5 grid size-6 shrink-0 self-center place-items-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--ui-control-hover-background) hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring [-webkit-app-region:no-drag]"
+              onClick={() => previewGoBack()}
+              type="button"
+            >
+              <ChevronLeft className="size-4" />
+            </button>
+          </Tip>
+        )}
         <div
           className="flex min-w-0 flex-1 overflow-x-auto overflow-y-hidden overscroll-x-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           role="tablist"

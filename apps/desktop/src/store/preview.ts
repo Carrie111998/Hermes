@@ -146,6 +146,21 @@ export const $previewOpenRequest = atom(0)
 export const $previewServerRestart = atom<PreviewServerRestart | null>(null)
 export const $previewServerRestartStatus = computed($previewServerRestart, restart => restart?.status ?? 'idle')
 
+/** Whether the active web preview can navigate back (attachment image → report). */
+export const $previewCanGoBack = atom(false)
+
+let previewGoBackHandler: (() => void) | null = null
+
+/** Register the active preview pane's goBack implementation (or clear on unmount). */
+export function setPreviewGoBackHandler(handler: (() => void) | null) {
+  previewGoBackHandler = handler
+}
+
+/** Invoke the active preview pane's goBack, if any. */
+export function previewGoBack() {
+  previewGoBackHandler?.()
+}
+
 export function previewTabId(target: PreviewTarget): RightRailTabId {
   return `${target.kind}:${target.url}`
 }

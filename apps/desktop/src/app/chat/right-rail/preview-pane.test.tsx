@@ -86,4 +86,50 @@ describe('PreviewPane console state', () => {
 
     expect(setTitlebarToolGroup).toHaveBeenCalledTimes(initialCalls)
   })
+
+  it('surfaces a Back titlebar tool once the webview can go back', async () => {
+    const setTitlebarToolGroup = vi.fn()
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          setTitlebarToolGroup={setTitlebarToolGroup}
+          target={{
+            kind: 'url',
+            label: 'Preview',
+            source: 'http://localhost:5174',
+            url: 'http://localhost:5174'
+          }}
+        />
+      )
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement & {
+      canGoBack?: () => boolean
+      goBack?: () => void
+    }
+
+    expect(webview).toBeInstanceOf(HTMLElement)
+
+    const goBack = vi.fn()
+    webview.canGoBack = () => true
+    webview.goBack = goBack
+
+    await act(async () => {
+      webview.dispatchEvent(Object.assign(new Event('did-navigate'), { url: 'http://localhost:5174/shot.png' }))
+      webview.dispatchEvent(new Event('did-stop-loading'))
+    })
+
+    const latestTools = setTitlebarToolGroup.mock.calls.at(-1)?.[1] as Array<{ id: string; onSelect: () => void }>
+    const backTool = latestTools.find(tool => tool.id === 'preview-back')
+
+    expect(backTool).toBeTruthy()
+
+    act(() => {
+      backTool?.onSelect()
+    })
+
+    expect(goBack).toHaveBeenCalledTimes(1)
+  })
 })
