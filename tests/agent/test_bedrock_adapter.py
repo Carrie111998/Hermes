@@ -28,6 +28,18 @@ def _mock_botocore_session(*, return_value=None, side_effect=None):
         yield session_mod.get_session
 
 
+@pytest.fixture(autouse=True)
+def _isolate_bedrock_client_caches():
+    """Prevent cached mock clients from leaking into later test modules."""
+    from agent.bedrock_adapter import reset_client_cache
+
+    reset_client_cache()
+    try:
+        yield
+    finally:
+        reset_client_cache()
+
+
 # ---------------------------------------------------------------------------
 # AWS credential detection
 # ---------------------------------------------------------------------------

@@ -467,6 +467,23 @@ class TestResolveDeliveryTarget:
 class TestRoutingIntents:
     """``all`` routing intent expands at fire time."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_home_targets(self, monkeypatch):
+        """Start each routing-intent test with no inherited home channels."""
+        from cron import scheduler
+
+        for platform in scheduler._iter_home_target_platforms():
+            env_var = scheduler._resolve_home_env_var(platform)
+            if not env_var:
+                continue
+            monkeypatch.delenv(env_var, raising=False)
+            monkeypatch.delenv(f"{env_var}_THREAD_ID", raising=False)
+            legacy = scheduler._LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
+            if legacy:
+                monkeypatch.delenv(legacy, raising=False)
+                monkeypatch.delenv(f"{legacy}_THREAD_ID", raising=False)
+        monkeypatch.delenv("TELEGRAM_CRON_THREAD_ID", raising=False)
+
     def test_all_expands_to_every_connected_home_channel(self, monkeypatch):
         """deliver='all' fans out to every platform with a configured home channel."""
         from cron.scheduler import _resolve_delivery_targets
@@ -508,16 +525,18 @@ class TestRoutingIntents:
 
     def test_all_with_no_connected_channels_returns_empty(self, monkeypatch):
         """deliver='all' with nothing connected returns [] — delivery is recorded as failed upstream."""
-        from cron.scheduler import _resolve_delivery_targets
+        from cron import scheduler
 
-        for var in ("TELEGRAM_HOME_CHANNEL", "DISCORD_HOME_CHANNEL", "SLACK_HOME_CHANNEL",
-                    "SIGNAL_HOME_CHANNEL", "MATRIX_HOME_ROOM", "MATTERMOST_HOME_CHANNEL",
-                    "SMS_HOME_CHANNEL", "EMAIL_HOME_ADDRESS", "DINGTALK_HOME_CHANNEL",
-                    "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL",
-                    "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL"):
-            monkeypatch.delenv(var, raising=False)
+        for platform in scheduler._iter_home_target_platforms():
+            env_var = scheduler._resolve_home_env_var(platform)
+            if not env_var:
+                continue
+            monkeypatch.delenv(env_var, raising=False)
+            legacy = scheduler._LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
+            if legacy:
+                monkeypatch.delenv(legacy, raising=False)
 
-        assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
+        assert scheduler._resolve_delivery_targets({"deliver": "all", "origin": None}) == []
 
     def test_origin_comma_all_preserves_origin_first(self, monkeypatch):
         """'origin,all' delivers to the origin platform plus every other home channel."""

@@ -22,6 +22,7 @@ of the message string.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -35,6 +36,16 @@ import pytest
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+
+def _is_runtime_module(name: str) -> bool:
+    return (
+        name == "run_agent"
+        or name in {"agent", "tools"}
+        or name.startswith("agent.")
+        or name.startswith("tools.")
+        or name.startswith("hermes_")
+    )
 
 
 class _MockHandler(BaseHTTPRequestHandler):
@@ -134,26 +145,59 @@ def agent_env():
     prev_home = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
-    # Import fresh so the patched conversation_loop is exercised even when the
-    # module was imported earlier in the same worker.
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
-    from run_agent import AIAgent
-
-    agent = AIAgent(
-        api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
-        provider="openai-compat", model="test-model",
-        max_iterations=10, enabled_toolsets=[],
-        quiet_mode=True, skip_context_files=True, skip_memory=True,
-        save_trajectories=False, platform="cli",
-    )
-    agent.valid_tool_names = {"terminal", "read_file", "write_file", "execute_code", "session_search"}
+    original_modules = {
+        name: module for name, module in sys.modules.items()
+        if _is_runtime_module(name)
+    }
+    root_logger = logging.getLogger()
+    original_root_handlers = list(root_logger.handlers)
+    original_root_level = root_logger.level
 
     try:
+        # Import fresh so the patched conversation_loop is exercised even when
+        # the module was imported earlier in the same worker. Restore the exact
+        # module objects afterwards so already-collected tests do not retain
+        # functions whose globals differ from the modules patch() resolves.
+        for name in original_modules:
+            sys.modules.pop(name, None)
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key", base_url=f"http://127.0.0.1:{port}/v1",
+            provider="openai-compat", model="test-model",
+            max_iterations=10, enabled_toolsets=[],
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            save_trajectories=False, platform="cli",
+        )
+        agent.valid_tool_names = {"terminal", "read_file", "write_file", "execute_code", "session_search"}
+
         yield agent, _MockHandler
     finally:
         srv.shutdown()
+        srv.server_close()
+        t.join(timeout=2)
+
+        runtime_logging = sys.modules.get("hermes_logging")
+        if runtime_logging is not original_modules.get("hermes_logging"):
+            reset_logging = getattr(runtime_logging, "_reset_queued_handlers", None)
+            if reset_logging is not None:
+                reset_logging()
+
+        for handler in list(root_logger.handlers):
+            root_logger.removeHandler(handler)
+        for handler in original_root_handlers:
+            root_logger.addHandler(handler)
+        root_logger.setLevel(original_root_level)
+
+        for name in list(sys.modules):
+            if _is_runtime_module(name):
+                del sys.modules[name]
+        sys.modules.update(original_modules)
+        for name, module in original_modules.items():
+            parent_name, separator, child_name = name.rpartition(".")
+            if separator and parent_name in original_modules:
+                setattr(original_modules[parent_name], child_name, module)
+
         shutil.rmtree(test_home, ignore_errors=True)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
