@@ -3,7 +3,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import { bulkArchiveSessions, deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
@@ -13,7 +13,7 @@ import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { $activeGatewayProfile, $newChatProfile, $profileScope, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   beginSessionMutation,
   endSessionMutation,
@@ -58,6 +58,7 @@ import {
 } from '@/store/session'
 import {
   $sessionTiles,
+  $workingSessionIds,
   closeSessionTile,
   dropSessionState,
   openSessionTile,
@@ -67,7 +68,7 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+import type { SessionCreateResponse, SessionInfo, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -1449,7 +1450,50 @@ export function useSessionActions({
     [copy, runtimeIdByStoredSessionIdRef, selectedStoredSessionId, sessionStateByRuntimeIdRef, startFreshSessionDraft]
   )
 
+  const archiveAllSessions = useCallback(async () => {
+    clearNotifications()
+
+    const previousSessions = $sessions.get()
+    const preserveIds = new Set<string>([...$pinnedSessionIds.get(), ...$workingSessionIds.get()])
+
+    if (selectedStoredSessionId) {
+      preserveIds.add(selectedStoredSessionId)
+    }
+
+    if (activeSessionId) {
+      preserveIds.add(activeSessionId)
+    }
+
+    for (const session of previousSessions) {
+      if (session.id === selectedStoredSessionId || session.id === activeSessionId) {
+        preserveIds.add(sessionPinId(session))
+      }
+    }
+
+    const shouldPreserve = (session: SessionInfo) =>
+      preserveIds.has(session.id) || (session._lineage_root_id != null && preserveIds.has(session._lineage_root_id))
+
+    const keptSessions = previousSessions.filter(shouldPreserve)
+    setSessions(keptSessions)
+
+    try {
+      const result = await bulkArchiveSessions([...preserveIds], $profileScope.get())
+      notify({
+        durationMs: 2_500,
+        kind: 'success',
+        message: result.archived === 1 ? 'Archived 1 session' : `Archived ${result.archived} sessions`
+      })
+
+      return result
+    } catch (err) {
+      setSessions(previousSessions)
+      notifyError(err, 'Archive all failed')
+      throw err
+    }
+  }, [activeSessionId, selectedStoredSessionId])
+
   return {
+    archiveAllSessions,
     archiveSession,
     branchCurrentSession,
     branchStoredSession,

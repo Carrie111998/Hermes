@@ -11,6 +11,7 @@ export type GatewayRequester = ReturnType<typeof useGatewayRequest>['requestGate
 /** The ChatSidebar handlers the controller owns — forwarded verbatim. */
 export type SidebarActions = Pick<
   ComponentProps<typeof ChatSidebar>,
+  | 'onArchiveAllSessions'
   | 'onArchiveSession'
   | 'onBranchSession'
   | 'onDeleteSession'

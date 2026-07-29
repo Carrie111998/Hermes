@@ -57,6 +57,7 @@ export function latestChatActions(actions: ChatActions): ChatActions {
 
 export function latestSidebarActions(actions: SidebarActions): SidebarActions {
   return {
+    onArchiveAllSessions: (...args) => actions.onArchiveAllSessions(...args),
     onArchiveSession: (...args) => actions.onArchiveSession(...args),
     onBranchSession: (...args) => actions.onBranchSession(...args),
     onDeleteSession: (...args) => actions.onDeleteSession(...args),

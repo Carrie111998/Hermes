@@ -34,6 +34,7 @@ function makeChatActions(): ChatActions {
 
 function makeSidebarActions(): SidebarActions {
   return {
+    onArchiveAllSessions: vi.fn(),
     onArchiveSession: vi.fn(),
     onBranchSession: vi.fn(),
     onDeleteSession: vi.fn(),
