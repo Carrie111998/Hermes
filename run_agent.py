@@ -600,7 +600,7 @@ class AIAgent:
 
             self._session_db = SessionDB()
             return self._session_db
-        except Exception as exc:
+        except Exception:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
             return None
 
@@ -2004,7 +2004,27 @@ class AIAgent:
                 if isinstance(item, dict)
             }
 
-            for _msg_idx, msg in enumerate(messages):
+            # Bounded scan: skip the longest identity-matched prefix of the
+            # list snapshot taken at the end of the previous successful flush.
+            # Every message in that snapshot was already given its final
+            # disposition (written+stamped, stamped as durable history, or
+            # skipped as ephemeral scaffolding / non-dict), and no code path
+            # pops _DB_PERSISTED_MARKER from a live dict in place (compression
+            # strips markers on fresh copies, which breaks identity here and
+            # forces a full re-scan). Identity match ⇒ identical skip decision,
+            # so starting after the matched prefix is behavior-preserving.
+            _scan_start = 0
+            _prev_prefix = getattr(self, "_db_flush_scan_prefix", None)
+            if isinstance(_prev_prefix, list):
+                _limit = min(len(_prev_prefix), len(messages))
+                while (
+                    _scan_start < _limit
+                    and messages[_scan_start] is _prev_prefix[_scan_start]
+                ):
+                    _scan_start += 1
+
+            for _msg_idx in range(_scan_start, len(messages)):
+                msg = messages[_msg_idx]
                 if not isinstance(msg, dict):
                     continue
                 # Never write ephemeral recovery scaffolding to the session
@@ -2153,8 +2173,14 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+            # Snapshot for the bounded scan above — only on full success, so
+            # a partially-processed list can never be treated as settled.
+            self._db_flush_scan_prefix = messages[:]
             return True
         except Exception as e:
+            # Force a full re-scan on the next flush: an exception mid-loop
+            # leaves messages with mixed dispositions.
+            self._db_flush_scan_prefix = None
             logger.warning("Session DB append_message failed: %s", e)
             return False
 
@@ -3865,6 +3891,7 @@ class AIAgent:
           - process_registry entries for task_id (user's bg shells)
           - terminal sandbox for task_id (cwd, env, shell state)
           - browser daemon for task_id (open tabs, cookies)
+          - computer-use backend for task_id (native target and browser refs)
           - memory provider (has its own lifecycle; keeps running)
 
         We DO close:
@@ -3921,6 +3948,7 @@ class AIAgent:
         - Background processes tracked in ProcessRegistry
         - Terminal sandbox environments
         - Browser daemon sessions
+        - Computer-use backend sessions and target/ref state
         - Active child agents (subagent delegation)
         - OpenAI/httpx client connections
 
@@ -3948,7 +3976,19 @@ class AIAgent:
         except Exception:
             pass
 
-        # 4. Close active child agents
+        # 4. Release the session-owned computer-use backend.  This ends the
+        # exact cua-driver session, drops typed-browser refs/grants, and stops
+        # a private embedded daemon when Hermes YOLO selected unrestricted
+        # mode.  The import is lazy so sessions without computer_use retain
+        # the narrow core footprint.
+        try:
+            from tools.computer_use import release_computer_use_session
+
+            release_computer_use_session(task_id)
+        except Exception:
+            pass
+
+        # 5. Close active child agents
         try:
             with self._active_children_lock:
                 children = list(self._active_children)
@@ -3961,7 +4001,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 6. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -3970,14 +4010,14 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5b. Close the cached per-request wire client (reused across
+        # 6b. Close the cached per-request wire client (reused across
         # sequential LLM calls; see _create_request_openai_client).
         try:
             self._close_cached_request_openai_client(reason="agent_close")
         except Exception:
             pass
 
-        # 6. Free conversation history.  Mirrors _release_evicted_agent_soft's
+        # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't
         # be reused.  Drops the reference proactively rather than waiting for
@@ -3988,7 +4028,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 7. Finalize the owned SQLite session row unless this agent is only a
+        # 8. Finalize the owned SQLite session row unless this agent is only a
         # temporary helper that deliberately handed session ownership forward
         # (manual compression helpers that rotate to a continuation session_id,
         # or background-review forks that share the live parent's session_id and
@@ -6738,10 +6778,13 @@ class AIAgent:
         *,
         logger=None,
         session_id: str = None,
+        cursor=None,
     ) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.sanitize_tool_call_arguments``."""
         from agent.agent_runtime_helpers import sanitize_tool_call_arguments
-        return sanitize_tool_call_arguments(messages, logger=logger, session_id=session_id)
+        return sanitize_tool_call_arguments(
+            messages, logger=logger, session_id=session_id, cursor=cursor
+        )
 
     def _should_sanitize_tool_calls(self) -> bool:
         """Determine if tool_calls need sanitization for strict APIs.
