@@ -167,6 +167,14 @@ and the process that starts Hermes may need Full Disk Access to read
   cannot create a new group from a list of recipients.
 - **Message effects, polls** — supported by `spectrum-ts` but not yet
   exposed; the sidecar is the natural place to add them.
+- **Cron/standalone sends require a running gateway.** Processes outside
+  the gateway (cron subprocesses, `hermes send`) cannot spawn the sidecar;
+  they authenticate to the gateway's live sidecar via the runtime record at
+  `<hermes-home>/runtime/photon-sidecar.json` (written after the sidecar's
+  `/healthz` readiness check, `0600`, removed on stop/failed start). Also
+  note that shared/free-tier Photon lines cannot INITIATE conversations
+  with numbers that never texted the line — that's Photon-side policy, not
+  a Hermes limitation.
 
 ## Upgrading spectrum-ts
 

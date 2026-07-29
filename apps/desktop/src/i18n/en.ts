@@ -194,7 +194,7 @@ export const en: Translations = {
     search: 'Search',
     searchTitle: 'Search sessions, views, and actions',
     swapSidebarSides: 'Swap sidebar sides',
-        hideRightSidebar: 'Hide right sidebar',
+    hideRightSidebar: 'Hide right sidebar',
     showRightSidebar: 'Show right sidebar',
     muteHaptics: 'Mute haptics',
     unmuteHaptics: 'Unmute haptics',
@@ -264,6 +264,8 @@ export const en: Translations = {
       'view.prevTerminal': 'Previous terminal',
       'view.closeTerminal': 'Close terminal',
       'view.terminalSelection': 'Send terminal selection to composer',
+      'view.terminalCopy': 'Copy terminal selection',
+      'view.terminalPaste': 'Paste into terminal',
       'view.closeTab': 'Close tab',
       'view.reopenTab': 'Reopen closed tab',
       'view.flipPanes': 'Swap sidebar sides',
@@ -349,8 +351,7 @@ export const en: Translations = {
     },
     plugins: {
       title: 'Desktop plugins',
-      blurb:
-        'Bundled or dropped into the desktop-plugins folder. Disable to unload live.',
+      blurb: 'Bundled or dropped into the desktop-plugins folder. Disable to unload live.',
       count: n => `${n} installed`,
       openFolder: 'Open plugins folder',
       rescan: 'Rescan',
@@ -363,8 +364,7 @@ export const en: Translations = {
     },
     notifications: {
       title: 'Notifications',
-      intro:
-        'OS notifications (not in-app toasts). Per device.',
+      intro: 'OS notifications (not in-app toasts). Per device.',
       enableAll: 'Enable notifications',
       enableAllDesc: 'Off silences every notification below.',
       focusedHint: 'Completion alerts only fire while Hermes is in the background.',
@@ -428,8 +428,7 @@ export const en: Translations = {
     },
     appearance: {
       title: 'Appearance',
-      intro:
-        'Desktop-only. Mode is brightness; theme is palette and chat chrome.',
+      intro: 'Desktop-only. Mode is brightness; theme is palette and chat chrome.',
       colorMode: 'Color Mode',
       colorModeDesc: 'Pick a fixed mode or let Hermes follow your system setting.',
       toolViewTitle: 'Tool Call Display',
@@ -541,6 +540,9 @@ export const en: Translations = {
       builtinOnly: 'Built-in only',
       notSet: 'Not set',
       commaSeparated: 'comma-separated values',
+      searchPlaceholder: 'Search…',
+      noResults: 'No results found',
+      systemDefault: 'System default',
       loading: 'Loading Hermes configuration...',
       emptyTitle: 'Nothing to configure',
       emptyDesc: 'This section has no adjustable settings.',
@@ -549,7 +551,12 @@ export const en: Translations = {
       imported: 'Config imported',
       invalidJson: 'Invalid config JSON',
       keepAwakeTitle: 'Keep computer awake',
-      keepAwakeDesc: 'Stop this machine from sleeping so long or overnight runs keep going. The display can still dim.'
+      keepAwakeDesc: 'Stop this machine from sleeping so long or overnight runs keep going. The display can still dim.',
+      attachmentSizeTitle: 'Max preview / image load size',
+      attachmentSizeDesc:
+        'How big a local file Desktop will load for previews and image attach, in MB. Default is 16. Remote non-image attach uses a separate 256 MB cap. Setting this very high loads the whole file into memory and can freeze or crash the app.',
+      attachmentSizeUnit: 'MB',
+      attachmentSizeLabel: 'Max preview / image load size in megabytes'
     },
     quickEntry: {
       enabledTitle: 'Quick Entry',
@@ -1956,6 +1963,9 @@ export const en: Translations = {
     voiceDictation: 'Voice dictation',
     speakReplies: 'Read replies aloud',
     stopSpeakingReplies: 'Stop reading replies aloud',
+    wakeWordListening: phrase => `Wake word: "${phrase}" — listening`,
+    wakeWordOff: phrase => `Wake word: "${phrase}" — off`,
+    wakeWordPausedVoice: phrase => `Wake word: "${phrase}" — paused during voice chat`,
     lookupLoading: 'Looking up…',
     lookupNoMatches: 'No matches.',
     lookupTry: 'Try',
@@ -2444,7 +2454,7 @@ export const en: Translations = {
       starmap: 'Memory Graph',
       openStarmap: 'Open memory graph',
       turnRunning: 'Running',
-            contextUsage: 'Context usage',
+      contextUsage: 'Context usage',
       contextUsagePanel: {
         categories: {
           conversation: 'Conversation',
@@ -2462,8 +2472,8 @@ export const en: Translations = {
         title: 'Context Usage',
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
-            session: 'Session',
-            yoloOn: 'YOLO on — auto-approving dangerous commands. Shift+click toggles globally.',
+      session: 'Session',
+      yoloOn: 'YOLO on — auto-approving dangerous commands. Shift+click toggles globally.',
       yoloOff: 'YOLO off. Shift+click toggles globally.',
       modelNone: 'none',
       noModel: 'no model',
