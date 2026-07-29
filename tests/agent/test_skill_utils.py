@@ -6,6 +6,7 @@ from agent.skill_utils import (
     extract_skill_config_vars,
     extract_skill_conditions,
     get_disabled_skill_names,
+    get_enabled_skill_names,
     get_external_skills_dirs,
     is_excluded_skill_path,
     is_external_skill_path,
@@ -172,6 +173,90 @@ def test_skill_config_raw_cache_invalidates_on_config_edit(tmp_path, monkeypatch
     os.utime(config_path, None)
 
     assert get_disabled_skill_names() == {"new-skill"}
+
+
+def test_enabled_skill_names_absent_means_unrestricted(tmp_path, monkeypatch):
+    """Missing skills.enabled preserves the historical load-all behaviour."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "skills:\n  disabled: [legacy-skill]\n", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    from agent import skill_utils
+    skill_utils._external_dirs_cache_clear()
+
+    assert get_enabled_skill_names() is None
+
+
+def test_enabled_skill_names_normalizes_values(tmp_path, monkeypatch):
+    """An explicit allowlist is returned as a normalized set."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "skills:\n  enabled: [research, ' coding ', '']\n", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    from agent import skill_utils
+    skill_utils._external_dirs_cache_clear()
+
+    assert get_enabled_skill_names() == {"research", "coding"}
+
+
+def test_enabled_skill_names_empty_list_means_no_skills(tmp_path, monkeypatch):
+    """An explicitly empty allowlist disables every skill."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "skills:\n  enabled: []\n", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    from agent import skill_utils
+    skill_utils._external_dirs_cache_clear()
+
+    assert get_enabled_skill_names() == set()
+
+
+def test_enabled_and_disabled_skills_use_allowlist_precedence(tmp_path, monkeypatch):
+    """An explicitly enabled skill remains loadable even if also disabled."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "skills:\n"
+        "  enabled: [keep-me, only-me]\n"
+        "  disabled: [keep-me, block-me]\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    from agent import skill_utils
+    skill_utils._external_dirs_cache_clear()
+
+    assert get_enabled_skill_names() == {"keep-me", "only-me"}
+    assert get_disabled_skill_names() == {"block-me"}
+
+
+def test_enabled_skill_names_still_honors_platform_disabled(tmp_path, monkeypatch):
+    """Platform gates remain authoritative even for allowlisted skills."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "skills:\n"
+        "  enabled: [keep-me, telegram-blocked]\n"
+        "  platform_disabled:\n"
+        "    telegram: [telegram-blocked]\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    from agent import skill_utils
+    skill_utils._external_dirs_cache_clear()
+
+    assert get_enabled_skill_names() == {"keep-me", "telegram-blocked"}
+    assert get_disabled_skill_names(platform="telegram") == {"telegram-blocked"}
 
 
 def test_is_external_skill_path_matches_configured_external_dir(tmp_path, monkeypatch):

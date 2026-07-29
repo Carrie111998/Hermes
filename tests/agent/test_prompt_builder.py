@@ -16,6 +16,7 @@ from agent.prompt_builder import (
     _find_git_root,
     _strip_yaml_frontmatter,
     build_skills_system_prompt,
+    clear_skills_system_prompt_cache,
     build_nous_subscription_prompt,
     build_context_files_prompt,
     CONTEXT_FILE_MAX_CHARS,
@@ -424,6 +425,24 @@ class TestBuildSkillsSystemPrompt:
         assert "python-debug" in result
         assert "Debug Python scripts" in result
         assert "available_skills" in result
+
+    def test_enabled_allowlist_filters_prompt_and_empty_is_explicit(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for name in ("keep", "drop"):
+            d = tmp_path / "skills" / "general" / name
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {name} description\n---\n"
+            )
+
+        (tmp_path / "config.yaml").write_text("skills:\n  enabled: [keep]\n")
+        result = build_skills_system_prompt()
+        assert "keep" in result
+        assert "drop" not in result
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        (tmp_path / "config.yaml").write_text("skills:\n  enabled: []\n")
+        assert build_skills_system_prompt() == ""
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
