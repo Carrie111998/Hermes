@@ -44,6 +44,15 @@ program questioning the invoice. See `general-store/README.md` for the full brea
 what's a working prototype versus what still needs a real payment processor, a real tax
 rate, and real book details wired in — none of that is invented here.
 
+## Launch blueprint
+
+`LAUNCH_BLUEPRINT.md` defines the operator-grade Definition of Done for taking
+this prototype live: storefront UX, parent/child shopping psychology, funding
+program guardrails, service monetization, checkout/fulfillment operations, launch
+gates, deployment/shareable-URL decisions, and first-sale workflow. Use it as the
+canonical readiness checklist before removing prototype labels or publishing
+commerce paths.
+
 ## Editing
 
 Edit `src/page.html` for the main page, or anything under `store/src/` or
