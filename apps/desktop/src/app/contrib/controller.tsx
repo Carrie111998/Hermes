@@ -2,6 +2,12 @@ import { useStore } from '@nanostores/react'
 import { computed } from 'nanostores'
 import type { CSSProperties, ReactElement, PointerEvent as ReactPointerEvent } from 'react'
 
+import {
+  $artifactsPaneOpen,
+  $artifactsPaneRevealRequest,
+  closeArtifactsPane,
+  openArtifactsPane
+} from '@/app/artifacts/pane-state'
 import { PREVIEW_RAIL_MAX_WIDTH, PREVIEW_RAIL_MIN_WIDTH } from '@/app/chat/right-rail'
 import { SessionStatusDot } from '@/app/chat/session-status-dot'
 import { PALETTE_AREA, type PaletteContribution } from '@/app/command-palette/contrib'
@@ -72,7 +78,7 @@ import {
 import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
 import { $workspaceIsPage } from '../routes'
 
-import { FilesPane, LogsPane, PreviewRailPane, ReviewPaneContent } from './panes'
+import { ArtifactsPaneContent, FilesPane, LogsPane, PreviewRailPane, ReviewPaneContent } from './panes'
 import { ContribWiring, WiredPane } from './wiring'
 
 /**
@@ -212,6 +218,20 @@ registry.registerMany([
       maxWidth: PREVIEW_RAIL_MAX_WIDTH
     },
     render: () => idle(<PreviewRailPane />)
+  },
+  {
+    id: 'artifacts-pane',
+    area: 'panes',
+    title: 'artifacts',
+    data: {
+      placement: 'right',
+      collapsible: true,
+      dock: { pane: 'files', pos: 'left' },
+      width: FILE_BROWSER_DEFAULT_WIDTH,
+      minWidth: FILE_BROWSER_MIN_WIDTH,
+      maxWidth: FILE_BROWSER_MAX_WIDTH
+    },
+    render: () => idle(<ArtifactsPaneContent />)
   },
   {
     id: 'review',
@@ -589,6 +609,19 @@ bindPaneCollapse(
 const $previewVisible = computed($previewTabs, tabs => tabs.length > 0)
 
 bindPaneVisibility('preview', $previewVisible, closeRightRail)
+
+bindPaneVisibility('artifacts-pane', $artifactsPaneOpen, closeArtifactsPane, openArtifactsPane)
+
+$artifactsPaneRevealRequest.listen(() => {
+  dockPaneBeside('artifacts-pane', 'files')
+  const side = treeSideOfPane('artifacts-pane')
+
+  if (side) {
+    setTreeSideCollapsed(side, false)
+  }
+
+  revealTreePane('artifacts-pane')
+})
 
 // Logs are optional chrome: off by default, toggled from ⌘K, persisted.
 const $logsOpen = persistentAtom('hermes.desktop.logsOpen', false, Codecs.bool)

@@ -1,6 +1,7 @@
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { memo, useCallback, useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 
 import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { PageLoader } from '@/components/page-loader'
@@ -16,9 +17,10 @@ import {
   PaginationPrevious
 } from '@/components/ui/pagination'
 import { RowButton } from '@/components/ui/row-button'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip } from '@/components/ui/tooltip'
-import { getSessionMessages, listAllProfileSessions } from '@/hermes'
-import { type Translations, useI18n } from '@/i18n'
+import { getSessionMessages } from '@/hermes'
+import { translateNow, type Translations, useI18n } from '@/i18n'
 import { resolveBrandIcon } from '@/lib/brand-icon'
 import {
   ExternalLink,
@@ -28,13 +30,17 @@ import {
   urlSlugTitleLabel,
   useLinkTitle
 } from '@/lib/external-link'
-import { FileImage, FileText, FolderOpen, Link2, Loader2, RefreshCw } from '@/lib/icons'
+import { ChevronDown, ChevronRight, FileImage, FileText, FolderOpen, Link2, Loader2, RefreshCw } from '@/lib/icons'
 import { downloadGatewayMediaFile, isRemoteGateway } from '@/lib/media'
 import { normalize } from '@/lib/text'
 import { fmtDayTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
+import { $activeProjectId, $projectScope, $projectTree, fetchProjectSessions } from '@/store/projects'
+import { $currentCwd, $selectedStoredSessionId } from '@/store/session'
+import type { SessionInfo } from '@/types/hermes'
 
+import type { SidebarProjectTree } from '../chat/sidebar/projects/workspace-groups'
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
 import { openSession } from '../open-session'
@@ -42,12 +48,16 @@ import { PageSearchShell } from '../page-search-shell'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import {
+  ALL_ARTIFACT_PROJECTS,
   ARTIFACT_FILTERS,
   type ArtifactFilter,
   artifactImageSrc,
   type ArtifactRecord,
-  collectArtifactsForSession
+  artifactSessionsForProject,
+  collectArtifactsForSession,
+  preferredArtifactProjectId
 } from './artifact-utils'
+import { openArtifactsPane } from './pane-state'
 
 function formatArtifactTime(timestamp: number): string {
   return fmtDayTime.format(new Date(timestamp))
@@ -110,57 +120,195 @@ interface ArtifactsViewProps extends React.ComponentProps<'section'> {
   setStatusbarItemGroup?: SetStatusbarItemGroup
 }
 
+const PROJECT_SESSION_BATCH = 12
+
+interface ProjectArtifactsState {
+  artifacts: ArtifactRecord[] | null
+  loadingMore: boolean
+  loadedSessions: number
+  sessions: SessionInfo[]
+}
+
+const EMPTY_PROJECT_ARTIFACTS: ProjectArtifactsState = {
+  artifacts: null,
+  loadingMore: false,
+  loadedSessions: 0,
+  sessions: []
+}
+
+function mergeArtifacts(current: ArtifactRecord[], incoming: ArtifactRecord[]): ArtifactRecord[] {
+  const byId = new Map(current.map(artifact => [artifact.id, artifact]))
+
+  for (const artifact of incoming) {
+    byId.set(artifact.id, artifact)
+  }
+
+  return [...byId.values()].sort((left, right) => right.timestamp - left.timestamp)
+}
+
+async function artifactsFromSessions(sessions: readonly SessionInfo[]): Promise<ArtifactRecord[]> {
+  const results = await Promise.allSettled(sessions.map(session => getSessionMessages(session.id, session.profile)))
+  const artifacts: ArtifactRecord[] = []
+
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      artifacts.push(...collectArtifactsForSession(sessions[index], result.value.messages))
+    }
+  })
+
+  return artifacts
+}
+
+/** Project-local progressive loader. It asks the backend for one authoritative
+ * project membership tree, then reads message histories in bounded batches.
+ * No global session list and no eager work for other projects. */
+function useProjectArtifacts(project: null | SidebarProjectTree, batchSize = PROJECT_SESSION_BATCH) {
+  const [state, setState] = useState<ProjectArtifactsState>(EMPTY_PROJECT_ARTIFACTS)
+  const [reload, setReload] = useState(0)
+  const generationRef = useRef(0)
+
+  useEffect(() => {
+    let active = true
+    const generation = ++generationRef.current
+
+    if (!project) {
+      setState(EMPTY_PROJECT_ARTIFACTS)
+
+      return () => {
+        active = false
+      }
+    }
+
+    setState(EMPTY_PROJECT_ARTIFACTS)
+    void fetchProjectSessions(project.id)
+      .then(async hydrated => {
+        if (!active || generation !== generationRef.current) {
+          return
+        }
+
+        const sessions = artifactSessionsForProject(hydrated ?? project)
+        const first = sessions.slice(0, batchSize)
+        const artifacts = await artifactsFromSessions(first)
+
+        if (active && generation === generationRef.current) {
+          setState({
+            artifacts,
+            loadingMore: false,
+            loadedSessions: first.length,
+            sessions
+          })
+        }
+      })
+      .catch(err => {
+        if (active && generation === generationRef.current) {
+          notifyError(err, translateNow('artifacts.failedLoad'))
+          setState({ artifacts: [], loadingMore: false, loadedSessions: 0, sessions: [] })
+        }
+      })
+
+    return () => {
+      active = false
+    }
+  }, [batchSize, project, reload])
+
+  const loadMore = useCallback(async () => {
+    const next = state.sessions.slice(state.loadedSessions, state.loadedSessions + batchSize)
+
+    if (!next.length || state.loadingMore) {
+      return
+    }
+
+    setState(current => ({ ...current, loadingMore: true }))
+    const generation = generationRef.current
+    const incoming = await artifactsFromSessions(next)
+
+    if (generation !== generationRef.current) {
+      return
+    }
+
+    setState(current => ({
+      ...current,
+      artifacts: mergeArtifacts(current.artifacts ?? [], incoming),
+      loadedSessions: Math.min(current.sessions.length, current.loadedSessions + next.length),
+      loadingMore: false
+    }))
+  }, [batchSize, state.loadedSessions, state.loadingMore, state.sessions])
+
+  return {
+    ...state,
+    hasMore: state.loadedSessions < state.sessions.length,
+    loadMore,
+    refresh: () => setReload(value => value + 1)
+  }
+}
+
 export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...props }: ArtifactsViewProps) {
   const { t } = useI18n()
   const a = t.artifacts
   const navigate = useNavigate()
-  const [artifacts, setArtifacts] = useState<ArtifactRecord[] | null>(null)
+  const location = useLocation()
+  const projectTree = useStore($projectTree)
+  const projectScope = useStore($projectScope)
+  const activeProjectId = useStore($activeProjectId)
+  const currentCwd = useStore($currentCwd)
+  const selectedSessionId = useStore($selectedStoredSessionId)
   const [query, setQuery] = useState('')
-
   const [kindFilter, setKindFilter] = useRouteEnumParam('tab', ARTIFACT_FILTERS, 'all')
-
   const [failedImageIds, setFailedImageIds] = useState<Set<string>>(() => new Set())
   const [imagePage, setImagePage] = useState(1)
   const [filePage, setFilePage] = useState(1)
 
-  const [refreshing, setRefreshing] = useState(false)
+  const preferredProject = useMemo(
+    () =>
+      preferredArtifactProjectId({
+        activeProjectId,
+        currentCwd,
+        projectScope,
+        projects: projectTree,
+        selectedSessionId
+      }),
+    [activeProjectId, currentCwd, projectScope, projectTree, selectedSessionId]
+  )
 
-  const refreshArtifacts = useCallback(async () => {
-    setRefreshing(true)
+  const rawProject = useMemo(() => new URLSearchParams(location.search).get('project'), [location.search])
 
-    try {
-      const sessions = (await listAllProfileSessions(30, 1)).sessions
-      const results = await Promise.allSettled(sessions.map(session => getSessionMessages(session.id, session.profile)))
-      const nextArtifacts: ArtifactRecord[] = []
+  const selectedProjectId =
+    rawProject === ALL_ARTIFACT_PROJECTS || projectTree.some(project => project.id === rawProject)
+      ? rawProject
+      : preferredProject
 
-      results.forEach((result, index) => {
-        if (result.status !== 'fulfilled') {
-          return
-        }
+  const selectedProject = projectTree.find(project => project.id === selectedProjectId) ?? null
+  const projectArtifacts = useProjectArtifacts(selectedProject)
+  const artifacts = projectArtifacts.artifacts
 
-        const session = sessions[index]
-        nextArtifacts.push(...collectArtifactsForSession(session, result.value.messages))
-      })
+  const setSelectedProject = useCallback(
+    (projectId: string) => {
+      const params = new URLSearchParams(location.search)
 
-      setArtifacts(nextArtifacts.sort((left, right) => right.timestamp - left.timestamp))
-    } catch (err) {
-      notifyError(err, a.failedLoad)
-      setArtifacts([])
-    } finally {
-      setRefreshing(false)
-    }
-  }, [a])
+      if (projectId === preferredProject) {
+        params.delete('project')
+      } else {
+        params.set('project', projectId)
+      }
 
-  useRefreshHotkey(refreshArtifacts)
+      navigate(
+        {
+          hash: location.hash,
+          pathname: location.pathname,
+          search: params.size ? `?${params.toString()}` : ''
+        },
+        { replace: true }
+      )
+    },
+    [location.hash, location.pathname, location.search, navigate, preferredProject]
+  )
 
-  useEffect(() => {
-    void refreshArtifacts()
-  }, [refreshArtifacts])
+  useRefreshHotkey(projectArtifacts.refresh)
 
   useEffect(() => {
     setImagePage(1)
     setFilePage(1)
-  }, [artifacts, kindFilter, query])
+  }, [artifacts, kindFilter, query, selectedProjectId])
 
   const visibleArtifacts = useMemo(() => {
     if (!artifacts) {
@@ -243,6 +391,9 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     }
   }, [artifacts])
 
+  const allProjects = selectedProjectId === ALL_ARTIFACT_PROJECTS
+  const refreshing = !allProjects && artifacts === null
+
   const openArtifact = useCallback(
     async (href: string) => {
       try {
@@ -291,7 +442,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
       activeTab={kindFilter}
       onSearchChange={setQuery}
       onTabChange={id => setKindFilter(id as typeof kindFilter)}
-      searchHidden={counts.all === 0}
+      searchHidden={!allProjects && counts.all === 0}
       searchHints={searchHints}
       searchPlaceholder={a.search}
       searchTrailingAction={
@@ -300,7 +451,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
             aria-label={refreshing ? a.refreshing : a.refresh}
             className="text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground"
             disabled={refreshing}
-            onClick={() => void refreshArtifacts()}
+            onClick={projectArtifacts.refresh}
             size="icon-titlebar"
             variant="ghost"
           >
@@ -316,65 +467,283 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
         { id: 'link', label: a.tabLinks, meta: artifacts ? counts.link : null }
       ]}
     >
-      {!artifacts ? (
-        <PageLoader label={a.indexing} />
-      ) : visibleArtifacts.length === 0 ? (
-        <div className="grid h-full place-items-center px-6 text-center">
-          <div>
-            <div className="text-sm font-medium">{a.noArtifactsTitle}</div>
-            <div className="mt-1 text-xs text-muted-foreground">{a.noArtifactsDesc}</div>
-          </div>
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-(--ui-stroke-tertiary) px-3">
+          <span className="shrink-0 text-xs font-medium text-(--ui-text-secondary)">{a.projectLibrary}</span>
+          <Select onValueChange={setSelectedProject} value={selectedProjectId ?? ''}>
+            <SelectTrigger className="h-7 min-w-0 max-w-64 flex-1 rounded-md text-xs">
+              <SelectValue placeholder={a.noProjects} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={ALL_ARTIFACT_PROJECTS}>{a.allProjects}</SelectItem>
+              {projectTree.map(project => (
+                <SelectItem key={project.id} value={project.id}>
+                  {project.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button onClick={openArtifactsPane} size="sm" type="button" variant="ghost">
+            <FileText className="size-3.5" />
+            {a.openSidebar}
+          </Button>
         </div>
-      ) : (
-        <div className="h-full overflow-y-auto [scrollbar-gutter:stable]">
-          <div className="flex flex-col gap-3 px-3 pb-2">
-            {visibleImageArtifacts.length > 0 && (
-              <section className="flex flex-col">
-                <div className="sticky top-0 z-10 -mx-3 flex h-7 items-center gap-3 overflow-x-auto bg-background px-3">
-                  <ArtifactsPagination
-                    className="ml-auto justify-end px-0"
-                    itemLabel={a.itemsImage}
-                    onPageChange={setImagePage}
-                    page={currentImagePage}
-                    pageSize={24}
-                    total={visibleImageArtifacts.length}
-                  />
-                </div>
-                <div className="grid grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] items-start gap-2 pt-1.5">
-                  {pagedImageArtifacts.map(artifact => (
-                    <ArtifactImageCard
-                      artifact={artifact}
-                      failedImage={failedImageIds.has(artifact.id)}
-                      key={artifact.id}
-                      onImageError={markImageFailed}
-                      onOpenChat={sessionId => openSession(sessionId, navigate)}
-                    />
-                  ))}
-                </div>
-              </section>
-            )}
 
-            {visibleFileArtifacts.length > 0 && (
-              <section className="flex flex-col">
-                <div className="sticky top-0 z-10 -mx-3 flex h-7 items-center gap-3 overflow-x-auto bg-background px-3">
-                  <ArtifactsPagination
-                    className="ml-auto justify-end px-0"
-                    itemLabel={itemsLabel(kindFilter, a)}
-                    onPageChange={setFilePage}
-                    page={currentFilePage}
-                    pageSize={100}
-                    total={visibleFileArtifacts.length}
-                  />
-                </div>
-                <div className="overflow-x-auto rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-chat-bubble-background)">
-                  <ArtifactTable artifacts={pagedFileArtifacts} ctx={cellCtx} filter={kindFilter} />
-                </div>
-              </section>
-            )}
+        {projectTree.length === 0 ? (
+          <div className="grid min-h-0 flex-1 place-items-center px-6 text-center">
+            <div>
+              <div className="text-sm font-medium">{a.noProjects}</div>
+              <div className="mt-1 text-xs text-muted-foreground">{a.noProjectsDesc}</div>
+            </div>
           </div>
+        ) : allProjects ? (
+          <AllProjectsArtifacts
+            filter={kindFilter}
+            onOpenArtifact={openArtifact}
+            onOpenChat={sessionId => openSession(sessionId, navigate)}
+            onOpenProject={setSelectedProject}
+            projects={projectTree}
+            query={query}
+          />
+        ) : !artifacts ? (
+          <PageLoader label={a.indexingProject(selectedProject?.label ?? '')} />
+        ) : visibleArtifacts.length === 0 ? (
+          <div className="grid min-h-0 flex-1 place-items-center px-6 text-center">
+            <div>
+              <div className="text-sm font-medium">{a.noArtifactsTitle}</div>
+              <div className="mt-1 text-xs text-muted-foreground">{a.noArtifactsDesc}</div>
+            </div>
+          </div>
+        ) : (
+          <div className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]">
+            <div className="flex flex-col gap-3 px-3 pb-3">
+              {visibleImageArtifacts.length > 0 && (
+                <section className="flex flex-col">
+                  <div className="sticky top-0 z-10 -mx-3 flex h-7 items-center gap-3 overflow-x-auto bg-background px-3">
+                    <ArtifactsPagination
+                      className="ml-auto justify-end px-0"
+                      itemLabel={a.itemsImage}
+                      onPageChange={setImagePage}
+                      page={currentImagePage}
+                      pageSize={24}
+                      total={visibleImageArtifacts.length}
+                    />
+                  </div>
+                  <div className="grid grid-cols-[repeat(auto-fill,minmax(11rem,1fr))] items-start gap-2 pt-1.5">
+                    {pagedImageArtifacts.map(artifact => (
+                      <ArtifactImageCard
+                        artifact={artifact}
+                        failedImage={failedImageIds.has(artifact.id)}
+                        key={artifact.id}
+                        onImageError={markImageFailed}
+                        onOpenChat={sessionId => openSession(sessionId, navigate)}
+                      />
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {visibleFileArtifacts.length > 0 && (
+                <section className="flex flex-col">
+                  <div className="sticky top-0 z-10 -mx-3 flex h-7 items-center gap-3 overflow-x-auto bg-background px-3">
+                    <ArtifactsPagination
+                      className="ml-auto justify-end px-0"
+                      itemLabel={itemsLabel(kindFilter, a)}
+                      onPageChange={setFilePage}
+                      page={currentFilePage}
+                      pageSize={100}
+                      total={visibleFileArtifacts.length}
+                    />
+                  </div>
+                  <div className="overflow-x-auto rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-chat-bubble-background)">
+                    <ArtifactTable artifacts={pagedFileArtifacts} ctx={cellCtx} filter={kindFilter} />
+                  </div>
+                </section>
+              )}
+
+              {projectArtifacts.hasMore && (
+                <Button
+                  className="self-center"
+                  disabled={projectArtifacts.loadingMore}
+                  onClick={() => void projectArtifacts.loadMore()}
+                  size="sm"
+                  variant="outline"
+                >
+                  {projectArtifacts.loadingMore && <Loader2 className="animate-spin" />}
+                  {a.loadMoreSessions(projectArtifacts.loadedSessions, projectArtifacts.sessions.length)}
+                </Button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </PageSearchShell>
+  )
+}
+
+function AllProjectsArtifacts({
+  filter,
+  onOpenArtifact,
+  onOpenChat,
+  onOpenProject,
+  projects,
+  query
+}: {
+  filter: ArtifactFilter
+  onOpenArtifact: (href: string) => void | Promise<void>
+  onOpenChat: (sessionId: string) => void
+  onOpenProject: (projectId: string) => void
+  projects: readonly SidebarProjectTree[]
+  query: string
+}) {
+  const { t } = useI18n()
+  const [visibleProjects, setVisibleProjects] = useState(20)
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2 [scrollbar-gutter:stable]">
+      <div className="mx-auto flex w-full max-w-4xl flex-col gap-1.5">
+        <p className="px-1 pb-1 text-xs text-(--ui-text-tertiary)">{t.artifacts.allProjectsHint}</p>
+        {projects.slice(0, visibleProjects).map(project => (
+          <ProjectArtifactGroup
+            filter={filter}
+            key={project.id}
+            onOpenArtifact={onOpenArtifact}
+            onOpenChat={onOpenChat}
+            onOpenProject={onOpenProject}
+            project={project}
+            query={query}
+          />
+        ))}
+        {visibleProjects < projects.length && (
+          <Button
+            className="mx-auto mt-1"
+            onClick={() => setVisibleProjects(count => count + 20)}
+            size="sm"
+            variant="outline"
+          >
+            {t.sidebar.loadMore}
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ProjectArtifactGroup({
+  filter,
+  onOpenArtifact,
+  onOpenChat,
+  onOpenProject,
+  project,
+  query
+}: {
+  filter: ArtifactFilter
+  onOpenArtifact: (href: string) => void | Promise<void>
+  onOpenChat: (sessionId: string) => void
+  onOpenProject: (projectId: string) => void
+  project: SidebarProjectTree
+  query: string
+}) {
+  const { t } = useI18n()
+  const [expanded, setExpanded] = useState(false)
+  const data = useProjectArtifacts(expanded ? project : null, 8)
+
+  const visible = useMemo(() => {
+    const q = normalize(query)
+
+    return (data.artifacts ?? []).filter(artifact => {
+      if (filter !== 'all' && artifact.kind !== filter) {
+        return false
+      }
+
+      return (
+        !q ||
+        artifact.label.toLowerCase().includes(q) ||
+        artifact.value.toLowerCase().includes(q) ||
+        artifact.sessionTitle.toLowerCase().includes(q)
+      )
+    })
+  }, [data.artifacts, filter, query])
+
+  return (
+    <section className="overflow-hidden rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-chat-bubble-background)">
+      <div className="flex min-h-10 items-center gap-2 px-2">
+        <Button
+          aria-expanded={expanded}
+          className="min-w-0 flex-1 justify-start px-1.5"
+          onClick={() => setExpanded(value => !value)}
+          size="sm"
+          variant="ghost"
+        >
+          {expanded ? <ChevronDown className="size-3.5 shrink-0" /> : <ChevronRight className="size-3.5 shrink-0" />}
+          <span className="truncate font-medium">{project.label}</span>
+          <span className="ml-auto shrink-0 text-[0.6875rem] font-normal text-(--ui-text-tertiary)">
+            {t.artifacts.sessionCount(project.sessionCount)}
+          </span>
+        </Button>
+        <Button onClick={() => onOpenProject(project.id)} size="xs" variant="textStrong">
+          {t.artifacts.openProject}
+        </Button>
+      </div>
+
+      {expanded && (
+        <div className="border-t border-(--ui-stroke-tertiary) px-2 py-1.5">
+          {!data.artifacts ? (
+            <div className="flex h-16 items-center justify-center gap-2 text-xs text-(--ui-text-tertiary)">
+              <Loader2 className="size-3.5 animate-spin" />
+              {t.artifacts.indexingProject(project.label)}
+            </div>
+          ) : visible.length === 0 ? (
+            <div className="px-2 py-5 text-center text-xs text-(--ui-text-tertiary)">
+              {t.artifacts.noArtifactsInProject}
+            </div>
+          ) : (
+            <div className="divide-y divide-(--ui-stroke-tertiary)">
+              {visible.slice(0, 20).map(artifact => {
+                const Icon = artifact.kind === 'image' ? FileImage : artifact.kind === 'link' ? Link2 : FileText
+
+                return (
+                  <div className="flex items-center gap-1 hover:bg-(--ui-control-hover-background)" key={artifact.id}>
+                    <button
+                      className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left"
+                      onClick={() => void onOpenArtifact(artifact.href)}
+                      type="button"
+                    >
+                      <Icon className="size-3.5 shrink-0 text-(--ui-text-tertiary)" />
+                      <span className="min-w-0 flex-1 truncate text-xs">{artifact.label}</span>
+                    </button>
+                    <span className="max-w-40 truncate text-[0.6875rem] text-(--ui-text-tertiary)">
+                      {artifact.sessionTitle}
+                    </span>
+                    <Button
+                      className="mr-1 shrink-0"
+                      onClick={() => onOpenChat(artifact.sessionId)}
+                      size="xs"
+                      variant="textStrong"
+                    >
+                      {t.artifacts.chat}
+                    </Button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
+          {data.hasMore && (
+            <Button
+              className="mx-auto mt-1 flex"
+              disabled={data.loadingMore}
+              onClick={() => void data.loadMore()}
+              size="xs"
+              variant="ghost"
+            >
+              {data.loadingMore && <Loader2 className="animate-spin" />}
+              {t.artifacts.loadMoreSessions(data.loadedSessions, data.sessions.length)}
+            </Button>
+          )}
         </div>
       )}
-    </PageSearchShell>
+    </section>
   )
 }
 

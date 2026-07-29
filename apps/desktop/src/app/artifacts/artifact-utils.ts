@@ -2,6 +2,8 @@ import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
 import { filePathFromMediaPath, isRemoteGateway, mediaExternalUrl } from '@/lib/media'
 import type { SessionInfo, SessionMessage } from '@/types/hermes'
 
+import type { SidebarProjectTree } from '../chat/sidebar/projects/workspace-groups'
+
 export type ArtifactKind = 'image' | 'file' | 'link'
 export type ArtifactFilter = 'all' | ArtifactKind
 export const ARTIFACT_FILTERS: readonly ArtifactFilter[] = ['all', 'image', 'file', 'link']
@@ -15,6 +17,109 @@ export interface ArtifactRecord {
   sessionId: string
   sessionTitle: string
   timestamp: number
+}
+
+export const ALL_ARTIFACT_PROJECTS = '__all_artifact_projects__'
+
+/** Sessions the backend assigned to a hydrated project, newest first.
+ *  Overview nodes only carry `previewSessions`; project detail nodes carry the
+ *  complete repo/lane tree. Combining both lets callers use one model without
+ *  inventing renderer-side project membership. */
+export function artifactSessionsForProject(project: SidebarProjectTree): SessionInfo[] {
+  const byId = new Map<string, SessionInfo>()
+
+  for (const session of project.previewSessions ?? []) {
+    byId.set(session.id, session)
+  }
+
+  for (const repo of project.repos) {
+    for (const group of repo.groups) {
+      for (const session of group.sessions) {
+        byId.set(session.id, session)
+      }
+    }
+  }
+
+  return [...byId.values()].sort(
+    (left, right) => (right.last_active || right.started_at || 0) - (left.last_active || left.started_at || 0)
+  )
+}
+
+export interface PreferredArtifactProjectInput {
+  activeProjectId?: null | string
+  currentCwd?: null | string
+  projectScope?: null | string
+  projects: readonly SidebarProjectTree[]
+  selectedSessionId?: null | string
+}
+
+const normalizePath = (value: null | string | undefined): string =>
+  (value ?? '').replaceAll('\\', '/').replace(/\/+$/, '')
+
+const pathContains = (parent: string, child: string): boolean =>
+  child === parent || child.startsWith(parent.endsWith('/') ? parent : `${parent}/`)
+
+/** Pick the project the user is working in without reconstructing membership:
+ *  explicit project scope wins; then a session already present in the
+ *  authoritative tree; then backend active-project; finally a longest path
+ *  match against backend-owned project/repo/lane paths. */
+export function preferredArtifactProjectId({
+  activeProjectId,
+  currentCwd,
+  projectScope,
+  projects,
+  selectedSessionId
+}: PreferredArtifactProjectInput): string | null {
+  const known = (id: null | string | undefined) => Boolean(id && projects.some(project => project.id === id))
+
+  if (projectScope && projectScope !== '__all_projects__' && known(projectScope)) {
+    return projectScope
+  }
+
+  if (selectedSessionId) {
+    const owner = projects.find(project =>
+      artifactSessionsForProject(project).some(
+        session => session.id === selectedSessionId || session._lineage_root_id === selectedSessionId
+      )
+    )
+
+    if (owner) {
+      return owner.id
+    }
+  }
+
+  if (known(activeProjectId)) {
+    return activeProjectId!
+  }
+
+  const cwd = normalizePath(currentCwd)
+
+  if (cwd) {
+    let match: string | null = null
+    let matchLength = -1
+
+    for (const project of projects) {
+      const paths = [
+        project.path,
+        ...project.repos.flatMap(repo => [repo.path, ...repo.groups.map(group => group.path)])
+      ]
+
+      for (const candidate of paths) {
+        const path = normalizePath(candidate)
+
+        if (path && pathContains(path, cwd) && path.length > matchLength) {
+          match = project.id
+          matchLength = path.length
+        }
+      }
+    }
+
+    if (match) {
+      return match
+    }
+  }
+
+  return projects[0]?.id ?? null
 }
 
 const MARKDOWN_IMAGE_RE = /!\[([^\]]*)\]\(([^)\s]+)\)/g
