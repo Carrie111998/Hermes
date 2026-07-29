@@ -444,7 +444,6 @@ class WebhookAdapter(BasePlatformAdapter):
     @staticmethod
     def _delivery_ledger_context_for_route(
         delivery: Mapping[str, Any],
-        terminal_delivery: Mapping[str, Any],
     ) -> Optional[Dict[str, Any]]:
         raw_extra = delivery.get("deliver_extra")
         if not isinstance(raw_extra, Mapping):
@@ -456,12 +455,13 @@ class WebhookAdapter(BasePlatformAdapter):
             in {"chat_id", "thread_id", "message_thread_id", "repo", "pr_number"}
         }
         route_chat_id = _rendered_route_identity(safe_extra.get("chat_id"))
-        safe_extra["chat_id"] = (
-            route_chat_id
-            or normalize_delivery_identity(
-                terminal_delivery.get("correlation_id")
-            )
-        )
+        if route_chat_id:
+            safe_extra["chat_id"] = route_chat_id
+        else:
+            # The strict terminal marker carries the deterministic fallback.
+            # Do not guess it at admission: a restored route with no chat_id
+            # will use that marker exactly as the live path does.
+            safe_extra.pop("chat_id", None)
         return project_delivery_ledger_context(
             {
                 "version": DELIVERY_LEDGER_CONTEXT_VERSION,
@@ -549,7 +549,6 @@ class WebhookAdapter(BasePlatformAdapter):
         obligation_id = None
         context = self._delivery_ledger_context_for_route(
             delivery,
-            terminal_delivery,
         )
         metadata = {TERMINAL_DELIVERY_METADATA_KEY: terminal_delivery}
         if context is None:
@@ -559,39 +558,53 @@ class WebhookAdapter(BasePlatformAdapter):
             )
 
         from gateway.delivery_ledger import (
+            DeliveryConflictError,
+            TERMINAL_ATTEMPT_ALREADY_DELIVERED,
+            TERMINAL_ATTEMPT_IN_PROGRESS,
+            begin_terminal_attempt,
             compute_obligation_id,
-            ledger_enabled,
-            mark_attempting,
-            record_obligation,
         )
 
-        if ledger_enabled():
-            try:
-                obligation_id = compute_obligation_id(
-                    str(chat_id),
-                    terminal_delivery["delivery_id"],
-                    "",
-                )
-                record_obligation(
-                    obligation_id=obligation_id,
-                    session_key=str(chat_id),
-                    platform=Platform.WEBHOOK.value,
-                    chat_id=str(chat_id),
-                    thread_id=None,
-                    content=content,
-                    delivery_context=context,
-                    delivery_metadata=metadata,
-                    preserve_existing=True,
-                )
-                mark_attempting(obligation_id)
-            except Exception:
-                logger.exception(
-                    "terminal webhook delivery ledger record failed"
-                )
-                return SendResult(
-                    success=False,
-                    error="Terminal webhook delivery could not be journaled",
-                )
+        try:
+            obligation_id = compute_obligation_id(
+                str(chat_id),
+                terminal_delivery["delivery_id"],
+                "",
+            )
+            decision = begin_terminal_attempt(
+                obligation_id=obligation_id,
+                session_key=str(chat_id),
+                platform=Platform.WEBHOOK.value,
+                chat_id=str(chat_id),
+                thread_id=None,
+                content=content,
+                delivery_context=context,
+                delivery_metadata=metadata,
+            )
+        except DeliveryConflictError as exc:
+            logger.warning(
+                "terminal webhook provider identity conflict for %s: %s",
+                chat_id,
+                exc,
+            )
+            return SendResult(
+                success=False,
+                error="Terminal webhook delivery conflicts with durable identity",
+            )
+        except Exception:
+            logger.exception("terminal webhook delivery ledger record failed")
+            return SendResult(
+                success=False,
+                error="Terminal webhook delivery could not be journaled",
+            )
+
+        if decision == TERMINAL_ATTEMPT_ALREADY_DELIVERED:
+            return SendResult(success=True)
+        if decision == TERMINAL_ATTEMPT_IN_PROGRESS:
+            return SendResult(
+                success=False,
+                error="Terminal webhook delivery is already attempting",
+            )
 
         try:
             result = await self._dispatch_delivery(
@@ -599,12 +612,12 @@ class WebhookAdapter(BasePlatformAdapter):
                 delivery,
                 terminal_delivery=terminal_delivery,
             )
-        except Exception as exc:
+        except Exception:
             if obligation_id is not None:
                 try:
                     from gateway.delivery_ledger import mark_failed
 
-                    mark_failed(obligation_id, str(exc))
+                    mark_failed(obligation_id, "terminal dispatch raised")
                 except Exception:
                     logger.debug(
                         "terminal webhook delivery ledger update failed",
@@ -619,13 +632,38 @@ class WebhookAdapter(BasePlatformAdapter):
                 if result.success:
                     mark_delivered(obligation_id)
                 else:
-                    mark_failed(obligation_id, str(result.error or ""))
+                    mark_failed(obligation_id, "terminal target rejected")
             except Exception:
                 logger.debug(
                     "terminal webhook delivery ledger update failed",
                     exc_info=True,
                 )
         return result
+
+    async def redeliver_claimed_obligation(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Send a startup-claimed terminal envelope without reopening its row."""
+        delivery = self._delivery_info.get(str(chat_id))
+        if delivery is None:
+            return SendResult(
+                success=False,
+                error="Webhook delivery route is unavailable",
+            )
+        terminal_delivery = self._terminal_delivery_for_route(delivery, metadata)
+        if terminal_delivery is None:
+            return SendResult(
+                success=False,
+                error="Recovered terminal webhook envelope is invalid",
+            )
+        return await self._dispatch_delivery(
+            content,
+            delivery,
+            terminal_delivery=terminal_delivery,
+        )
 
     async def send(
         self,
@@ -1126,6 +1164,88 @@ class WebhookAdapter(BasePlatformAdapter):
                 profile,
             ),
         }
+
+        # The 202 contract begins only after the rendered callback route and
+        # accepted-turn identity are durable. This row is deliberately
+        # privacy-bounded: no prompt, payload, secret, tool data, or output is
+        # stored until a terminal envelope is atomically attached later.
+        admission_context = self._delivery_ledger_context_for_route(
+            deliver_config,
+        )
+        if admission_context is None:
+            self._seen_deliveries.pop(delivery_id, None)
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "Callback route is not replay-safe",
+                    "delivery_id": delivery_id,
+                },
+                status=503,
+            )
+        try:
+            from gateway.delivery_ledger import (
+                ADMISSION_DUPLICATE,
+                DeliveryConflictError,
+                compute_obligation_id,
+                record_accepted_route,
+            )
+
+            admission_id = compute_obligation_id(
+                session_chat_id,
+                deliver_config["_hermes_delivery_id"],
+                "",
+            )
+            admission = await asyncio.to_thread(
+                record_accepted_route,
+                obligation_id=admission_id,
+                session_key=session_chat_id,
+                platform=Platform.WEBHOOK.value,
+                chat_id=session_chat_id,
+                thread_id=None,
+                delivery_context=admission_context,
+            )
+        except DeliveryConflictError:
+            logger.warning(
+                "[webhook] Conflicting durable identity route=%s delivery=%s",
+                route_name,
+                delivery_id,
+            )
+            return web.json_response(
+                {
+                    "status": "conflict",
+                    "error": "Provider delivery identity conflict",
+                    "delivery_id": delivery_id,
+                },
+                status=409,
+            )
+        except Exception:
+            # Let a provider retry after transient storage failure. A 202 is
+            # never returned unless the accepted callback route is durable.
+            self._seen_deliveries.pop(delivery_id, None)
+            logger.exception(
+                "[webhook] Durable callback admission failed route=%s delivery=%s",
+                route_name,
+                delivery_id,
+            )
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "Callback admission unavailable",
+                    "delivery_id": delivery_id,
+                },
+                status=503,
+            )
+        if admission == ADMISSION_DUPLICATE:
+            logger.info(
+                "[webhook] Durable duplicate route=%s delivery=%s",
+                route_name,
+                delivery_id,
+            )
+            return web.json_response(
+                {"status": "duplicate", "delivery_id": delivery_id},
+                status=200,
+            )
+
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
@@ -1163,9 +1283,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # once the agent run actually finishes (``handle_message`` itself is
         # fire-and-forget: it spawns ``_process_message_background`` and
         # returns before the run starts, so nothing can be closed here).
-        task = asyncio.create_task(self.handle_message(event))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        await self.handle_message(event)
 
         return web.json_response(
             {

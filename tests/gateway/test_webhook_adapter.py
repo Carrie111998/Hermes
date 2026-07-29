@@ -1057,8 +1057,8 @@ class TestIdempotency:
             assert data["status"] == "duplicate"
 
     @pytest.mark.asyncio
-    async def test_expired_delivery_id_allows_reprocess(self):
-        """After TTL expires, the same delivery ID is accepted again."""
+    async def test_expired_memory_id_does_not_bypass_durable_admission(self):
+        """The durable provider identity remains idempotent beyond memory TTL."""
         routes = {"idem": {"secret": _INSECURE_NO_AUTH, "prompt": "test"}}
         adapter = _make_adapter(routes=routes)
         adapter._idempotency_ttl = 1  # 1 second TTL for test speed
@@ -1075,7 +1075,9 @@ class TestIdempotency:
             adapter._seen_deliveries["delivery-456"] = time.time() - 3700
 
             resp2 = await cli.post("/webhooks/idem", json={"x": 1}, headers=headers)
-            assert resp2.status == 202  # re-accepted
+            assert resp2.status == 200
+            assert (await resp2.json())["status"] == "duplicate"
+            adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_svix_id_used_as_delivery_id_for_deduplication(self):

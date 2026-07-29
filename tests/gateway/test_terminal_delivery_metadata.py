@@ -359,25 +359,25 @@ async def test_segment_break_interim_then_final_marks_only_true_turn_final(
 
 
 @pytest.mark.asyncio
-async def test_retry_reprojects_same_accepted_turn_identity() -> None:
+async def test_delivered_replay_is_idempotent_without_second_egress() -> None:
     adapter, target = _webhook_adapter()
     chat_id = _seed_delivery(adapter)
 
-    await adapter.send(
+    first = await adapter.send(
         chat_id,
         "complete response",
         metadata=_terminal_metadata(delivery_id="external-first"),
     )
-    await adapter.send(
+    replay = await adapter.send(
         chat_id,
-        "complete response retry",
+        "complete response",
         metadata=_terminal_metadata(delivery_id="external-retry"),
     )
 
-    first, retry = target.send.await_args_list
-    first_marker = first.kwargs["metadata"][TERMINAL_DELIVERY_METADATA_KEY]
-    retry_marker = retry.kwargs["metadata"][TERMINAL_DELIVERY_METADATA_KEY]
-    assert first_marker == retry_marker == {
+    assert first.success is replay.success is True
+    target.send.assert_awaited_once()
+    marker = target.send.await_args.kwargs["metadata"][TERMINAL_DELIVERY_METADATA_KEY]
+    assert marker == {
         "version": 1,
         "outcome": "success",
         "correlation_id": "correlation-1",
@@ -536,7 +536,7 @@ async def test_terminal_callback_fails_closed_when_ledger_write_fails(
         raise OSError("synthetic ledger failure")
 
     monkeypatch.setattr(
-        "gateway.delivery_ledger.record_obligation",
+        "gateway.delivery_ledger.begin_terminal_attempt",
         _fail_record,
     )
 
@@ -549,6 +549,42 @@ async def test_terminal_callback_fails_closed_when_ledger_write_fails(
     assert result.success is False
     assert result.error == "Terminal webhook delivery could not be journaled"
     target.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_http_202_fails_closed_when_durable_admission_fails(
+    monkeypatch,
+) -> None:
+    _fake_web(monkeypatch)
+    adapter, _target = _webhook_adapter()
+    adapter._routes["managed"] = {
+        "secret": "INSECURE_NO_AUTH",
+        "prompt": "{text}",
+        "deliver": "telegram",
+        "deliver_extra": {"chat_id": "{correlation_id}"},
+    }
+    adapter.handle_message = AsyncMock()
+
+    def _fail_admission(**_kwargs) -> None:
+        raise OSError("synthetic admission failure")
+
+    monkeypatch.setattr(
+        "gateway.delivery_ledger.record_accepted_route",
+        _fail_admission,
+    )
+    response = await adapter._handle_webhook(
+        _request(
+            route_name="managed",
+            delivery_id="provider-delivery-1",
+            payload={"text": "private prompt", "correlation_id": "correlation-1"},
+        )
+    )
+
+    assert response.status == 503
+    assert response.payload["status"] == "error"
+    adapter.handle_message.assert_not_awaited()
+    assert "provider-delivery-1" not in adapter._seen_deliveries
+    assert adapter._delivery_info == {}
 
 
 @pytest.mark.asyncio
@@ -762,6 +798,304 @@ async def test_crash_before_callback_acceptance_replays_on_fresh_adapter(
 
 
 @pytest.mark.asyncio
+async def test_admission_restart_restores_route_then_delivers_final(
+    monkeypatch,
+    ella_callback_platform,
+) -> None:
+    _fake_web(monkeypatch)
+    secret = "admission-signing-secret"
+    adapter, _ = _webhook_adapter(ella_callback_platform)
+    adapter._routes["managed"] = {
+        "secret": secret,
+        "prompt": "private-prompt-{private_input}",
+        "deliver": "ella_callback",
+        "deliver_extra": {
+            "chat_id": "{correlation_id}",
+            "api_key": "{private_secret}",
+            "tool_calls": "{private_tool}",
+            "oauth_state": "{private_oauth}",
+            "model_output": "{private_output}",
+        },
+    }
+    adapter.handle_message = AsyncMock()
+
+    response = await adapter._handle_webhook(
+        _request(
+            route_name="managed",
+            delivery_id="provider-delivery-admitted",
+            payload={
+                "private_input": "prompt-private-value",
+                "private_secret": "secret-private-value",
+                "private_tool": "tool-private-value",
+                "private_oauth": "oauth-private-value",
+                "private_output": "output-private-value",
+                "correlation_id": "opaque-correlation-42",
+            },
+            secret=secret,
+        )
+    )
+
+    assert response.status == 202
+    with dl._connect() as conn:
+        row = conn.execute("SELECT * FROM delivery_obligations").fetchone()
+        columns = [
+            item[1]
+            for item in conn.execute(
+                "PRAGMA table_info(delivery_obligations)"
+            ).fetchall()
+        ]
+    assert row is not None
+    durable_row = dict(zip(columns, row))
+    obligation_id = durable_row["obligation_id"]
+    state = durable_row["state"]
+    content = durable_row["content"]
+    context_json = durable_row["delivery_context_json"]
+    metadata_json = durable_row["delivery_metadata_json"]
+    last_error = durable_row["last_error"]
+    assert state == "accepted"
+    assert content == ""
+    assert metadata_json is None
+    assert last_error is None
+    assert json.loads(context_json) == {
+        "version": 1,
+        "deliver": "ella_callback",
+        "deliver_extra": {"chat_id": "opaque-correlation-42"},
+        "delivery_id": adapter._delivery_info[
+            "webhook:managed:provider-delivery-admitted"
+        ]["_hermes_delivery_id"],
+    }
+    durable_admission = "|".join(
+        str(value) for value in durable_row.values() if value is not None
+    )
+    assert all(
+        forbidden not in durable_admission
+        for forbidden in (
+            "prompt-private-value",
+            "secret-private-value",
+            "tool-private-value",
+            "oauth-private-value",
+            "output-private-value",
+            "admission-signing-secret",
+            "private-prompt",
+            "api_key",
+            "tool_calls",
+            "oauth_state",
+            "model_output",
+        )
+    )
+
+    fresh_adapter, fresh_target = _webhook_adapter(ella_callback_platform)
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {
+        Platform.WEBHOOK: fresh_adapter,
+        ella_callback_platform: fresh_target,
+    }
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.WEBHOOK: PlatformConfig(enabled=True),
+            ella_callback_platform: PlatformConfig(enabled=True),
+        }
+    )
+    fresh_adapter.gateway_runner = runner
+    runner.session_store = None
+    store = MagicMock()
+    store._store = None
+    store.clear_resume_pending = AsyncMock()
+    runner._async_session_store = store
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+
+    redelivered = await runner._redeliver_pending_obligations()
+
+    assert redelivered == 0
+    fresh_target.send.assert_not_awaited()
+    store.clear_resume_pending.assert_not_awaited()
+    assert (
+        fresh_adapter._delivery_info[
+            "webhook:managed:provider-delivery-admitted"
+        ]["deliver_extra"]["chat_id"]
+        == "opaque-correlation-42"
+    )
+
+    result = await fresh_adapter.send(
+        "webhook:managed:provider-delivery-admitted",
+        "terminal output required for callback recovery",
+        metadata=_terminal_metadata(
+            correlation_id="provider-delivery-admitted",
+            delivery_id="provider-delivery-admitted",
+        ),
+    )
+
+    assert result.success is True
+    fresh_target.send.assert_awaited_once()
+    callback = fresh_target.send.await_args
+    assert callback.args[:2] == (
+        "opaque-correlation-42",
+        "terminal output required for callback recovery",
+    )
+    assert set(callback.kwargs["metadata"]) == {TERMINAL_DELIVERY_METADATA_KEY}
+    with dl._connect() as conn:
+        terminal_row = conn.execute(
+            """SELECT state, content, delivery_metadata_json
+               FROM delivery_obligations WHERE obligation_id=?""",
+            (obligation_id,),
+        ).fetchone()
+    assert terminal_row[0] == "delivered"
+    assert terminal_row[1] == "terminal output required for callback recovery"
+    assert json.loads(terminal_row[2]) == callback.kwargs["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_differing_terminal_body_after_rejection_conflicts_without_replay(
+    monkeypatch,
+) -> None:
+    adapter, target = _webhook_adapter()
+    chat_id = _seed_delivery(adapter)
+    target.send.side_effect = [
+        SendResult(
+            success=False,
+            error="private-provider-error-must-not-persist",
+        ),
+        SendResult(success=True),
+    ]
+
+    first = await adapter.send(
+        chat_id,
+        "first terminal body",
+        metadata=_terminal_metadata(),
+    )
+    with dl._connect() as conn:
+        failed_state, failed_error = conn.execute(
+            "SELECT state, last_error FROM delivery_obligations"
+        ).fetchone()
+    assert (failed_state, failed_error) == (
+        "failed",
+        "terminal target rejected",
+    )
+    replacement = await adapter.send(
+        chat_id,
+        "different replacement body",
+        metadata=_terminal_metadata(),
+    )
+
+    assert first.success is False
+    assert replacement.success is False
+    assert "conflicts" in (replacement.error or "")
+    assert target.send.await_count == 1
+    with dl._connect() as conn:
+        state, stored_content = conn.execute(
+            "SELECT state, content FROM delivery_obligations"
+        ).fetchone()
+    assert (state, stored_content) == ("conflict", "first terminal body")
+    with dl._connect() as conn:
+        durable_values = "|".join(
+            str(value)
+            for value in conn.execute(
+                "SELECT * FROM delivery_obligations"
+            ).fetchone()
+            if value is not None
+        )
+    assert "private-provider-error-must-not-persist" not in durable_values
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    assert dl.sweep_recoverable(deliverable_platforms={"webhook"}) == []
+
+
+@pytest.mark.asyncio
+async def test_differing_terminal_body_during_attempt_conflicts_fail_closed(
+    monkeypatch,
+) -> None:
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    adapter, target = _webhook_adapter()
+    chat_id = _seed_delivery(adapter)
+    target.send.side_effect = SimulatedProcessCrash()
+    with pytest.raises(SimulatedProcessCrash):
+        await adapter.send(
+            chat_id,
+            "body journaled before crash",
+            metadata=_terminal_metadata(),
+        )
+
+    conflicting = await adapter.send(
+        chat_id,
+        "different body after crash",
+        metadata=_terminal_metadata(),
+    )
+
+    assert conflicting.success is False
+    assert "conflicts" in (conflicting.error or "")
+    assert target.send.await_count == 1
+    with dl._connect() as conn:
+        state, stored_content = conn.execute(
+            "SELECT state, content FROM delivery_obligations"
+        ).fetchone()
+    assert (state, stored_content) == ("conflict", "body journaled before crash")
+    monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    assert dl.sweep_recoverable(deliverable_platforms={"webhook"}) == []
+
+
+@pytest.mark.asyncio
+async def test_differing_terminal_body_after_delivery_never_reopens() -> None:
+    adapter, target = _webhook_adapter()
+    chat_id = _seed_delivery(adapter)
+
+    delivered = await adapter.send(
+        chat_id,
+        "delivered body",
+        metadata=_terminal_metadata(),
+    )
+    conflicting = await adapter.send(
+        chat_id,
+        "different body after delivery",
+        metadata=_terminal_metadata(),
+    )
+
+    assert delivered.success is True
+    assert conflicting.success is False
+    assert target.send.await_count == 1
+    with dl._connect() as conn:
+        state, stored_content = conn.execute(
+            "SELECT state, content FROM delivery_obligations"
+        ).fetchone()
+    assert (state, stored_content) == ("delivered", "delivered body")
+
+
+@pytest.mark.asyncio
+async def test_same_terminal_body_retries_from_failed_then_stays_delivered() -> None:
+    adapter, target = _webhook_adapter()
+    chat_id = _seed_delivery(adapter)
+    target.send.side_effect = [
+        SendResult(success=False, error="definitive rejection"),
+        SendResult(success=True),
+    ]
+
+    first = await adapter.send(
+        chat_id,
+        "stable terminal body",
+        metadata=_terminal_metadata(),
+    )
+    retry = await adapter.send(
+        chat_id,
+        "stable terminal body",
+        metadata=_terminal_metadata(),
+    )
+    replay = await adapter.send(
+        chat_id,
+        "stable terminal body",
+        metadata=_terminal_metadata(),
+    )
+
+    assert first.success is False
+    assert retry.success is replay.success is True
+    assert target.send.await_count == 2
+    with dl._connect() as conn:
+        state = conn.execute(
+            "SELECT state FROM delivery_obligations"
+        ).fetchone()[0]
+    assert state == "delivered"
+
+
+@pytest.mark.asyncio
 async def test_fresh_adapter_without_durable_route_fails_instead_of_logging() -> None:
     adapter, target = _webhook_adapter()
 
@@ -871,11 +1205,19 @@ async def test_same_signed_provider_delivery_keeps_identity_across_restart(
             secret=secret,
         )
     )
-    replay_identity = restarted_adapter._delivery_info[
-        "webhook:managed:provider-delivery-1"
-    ]["_hermes_delivery_id"]
+    with dl._connect() as conn:
+        durable_context = json.loads(
+            conn.execute(
+                """SELECT delivery_context_json FROM delivery_obligations
+                   WHERE chat_id=?""",
+                ("webhook:managed:provider-delivery-1",),
+            ).fetchone()[0]
+        )
 
-    assert first.status == replay.status == 202
-    assert first_identity == replay_identity
+    assert first.status == 202
+    assert replay.status == 200
+    assert replay.payload["status"] == "duplicate"
+    assert restarted_adapter._delivery_info == {}
+    assert first_identity == durable_context["delivery_id"]
     assert first_identity != "provider-delivery-1"
     assert len(first_identity) == 64

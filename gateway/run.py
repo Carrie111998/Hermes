@@ -7642,19 +7642,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
                 ledger_enabled,
+                mark_abandoned,
                 mark_delivered,
                 mark_failed,
                 sweep_recoverable,
             )
 
-            if not ledger_enabled():
-                return 0
             # Only claim rows we can actually send this boot: self.adapters
             # holds a platform only after its connect() succeeded, and each
             # claim spends one of the row's three redelivery attempts.
             _deliverable = {
                 getattr(p, "value", str(p)) for p in self.adapters
             }
+            if not ledger_enabled():
+                # The config gate still disables the best-effort general
+                # messaging ledger. Managed webhook callbacks are different:
+                # their HTTP 202 contract requires durable admission/recovery.
+                _deliverable.intersection_update({Platform.WEBHOOK.value})
             claimed = await asyncio.to_thread(
                 sweep_recoverable, None, deliverable_platforms=_deliverable
             )
@@ -7680,6 +7684,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
             delivery_context = row.get("delivery_context")
+            restored = False
             if delivery_context is not None:
                 restore_context = getattr(
                     adapter,
@@ -7700,10 +7705,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 if not restored:
                     try:
-                        mark_failed(
-                            row["obligation_id"],
-                            "delivery context restore failed",
-                        )
+                        if row.get("state") == "accepted":
+                            mark_abandoned(
+                                row["obligation_id"],
+                                "accepted delivery context restore failed",
+                            )
+                        else:
+                            mark_failed(
+                                row["obligation_id"],
+                                "delivery context restore failed",
+                            )
                     except Exception:
                         logger.debug(
                             "obligation %s: failed to record context error",
@@ -7711,6 +7722,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             exc_info=True,
                         )
                     continue
+            if row.get("state") == "accepted":
+                if delivery_context is None:
+                    try:
+                        mark_abandoned(
+                            row["obligation_id"],
+                            "accepted delivery context is unavailable",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "obligation %s: failed to abandon invalid admission",
+                            row["obligation_id"],
+                            exc_info=True,
+                        )
+                # Admission rows restore only the route needed by the upcoming
+                # startup-resumed turn. They have no terminal content to send,
+                # consume no retry attempt, and must leave resume_pending set.
+                continue
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
@@ -7722,11 +7750,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata.update(delivery_metadata)
             metadata = metadata or None
             try:
-                result = await adapter.send(
-                    chat_id=row["chat_id"],
-                    content=content,
-                    metadata=metadata,
+                redeliver_claimed = getattr(
+                    type(adapter),
+                    "redeliver_claimed_obligation",
+                    None,
                 )
+                if callable(redeliver_claimed):
+                    result = await redeliver_claimed(
+                        adapter,
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
+                else:
+                    result = await adapter.send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
             except Exception as send_err:
                 logger.warning(
                     "obligation %s: redelivery send raised: %s",
@@ -7744,9 +7785,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"], row["attempts"],
                     )
                 else:
+                    durable_error = (
+                        "recovered terminal callback failed"
+                        if delivery_context is not None
+                        else str(getattr(result, "error", "") or "send failed")
+                    )
                     mark_failed(
                         row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
+                        durable_error,
                     )
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
