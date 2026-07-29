@@ -13,6 +13,7 @@ import asyncio
 import ipaddress
 import logging
 import socket
+import threading
 from typing import Iterable, Optional
 
 import httpx
@@ -20,6 +21,8 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _TELEGRAM_API_HOST = "api.telegram.org"
+_proxy_hint_emitted = False
+_proxy_hint_lock = threading.Lock()
 
 # DNS-over-HTTPS providers used to discover Telegram API IPs that may differ
 # from the (potentially unreachable) IP returned by the local system resolver.
@@ -66,6 +69,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
     def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
         self._fallback_ips = list(dict.fromkeys(_normalize_fallback_ips(fallback_ips)))
         proxy_url = _resolve_proxy_url(target_hosts=[_TELEGRAM_API_HOST, *self._fallback_ips])
+        self._proxy_configured = bool(proxy_url or transport_kwargs.get("proxy"))
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
         transport_kwargs.setdefault("limits", self._POOL_LIMITS)
@@ -154,6 +158,13 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
 
         if last_error is None:
             raise RuntimeError("All Telegram fallback IPs exhausted but no error was recorded")
+        # Every path (primary DNS + all fallback IPs) failed to connect. When the
+        # whole api.telegram.org address space is unreachable — e.g. an ISP-level
+        # block (common in India and other regions) — fallback IPs cannot help
+        # because they live in the same blocked ranges. A proxy is the only
+        # remedy. Surface that once, actionably, instead of only per-IP failures.
+        if not self._proxy_configured:
+            _emit_proxy_hint_once(len(self._fallback_ips))
         raise last_error
 
     async def aclose(self) -> None:
@@ -163,6 +174,28 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             self._fallbacks.clear()
         for transport in transports:
             await transport.aclose()
+
+
+def _emit_proxy_hint_once(fallback_count: int) -> None:
+    """Log the all-paths-dead remedy once across all transports in this process."""
+    global _proxy_hint_emitted
+
+    with _proxy_hint_lock:
+        if _proxy_hint_emitted:
+            return
+        _proxy_hint_emitted = True
+
+    logger.warning(
+        "[Telegram] Primary DNS path and all %d fallback IP(s) are unreachable. "
+        "If your network blocks api.telegram.org (e.g. an ISP-level Telegram block, "
+        "common in some regions), fallback IPs cannot help because they are in the same "
+        "blocked ranges. Two remedies: (1) set a Cloudflare Worker reverse proxy as "
+        "the bot's API endpoint via gateway.platforms.telegram.extra.base_url "
+        "(https://<worker>.workers.dev/bot) to bypass the local network block; "
+        "or (2) set TELEGRAM_PROXY=socks5h://<host>:<port> in your .env to route the "
+        "Bot API through a reachable SOCKS exit (httpx speaks SOCKS natively).",
+        fallback_count,
+    )
 
 
 def _normalize_fallback_ips(values: Iterable[str]) -> list[str]:
