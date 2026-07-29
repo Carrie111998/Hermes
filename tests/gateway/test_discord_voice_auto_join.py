@@ -241,6 +241,82 @@ async def test_auto_join_skipped_when_already_connected_to_that_channel(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_auto_join_follows_allowed_user_when_switching_channels(monkeypatch, adapter):
+    adapter._voice_auto_join_cfg = {
+        "auto_join_on_user_join": True,
+        "auto_join_users": ["42"],
+        "auto_join_voice_channels": ["Development"],
+    }
+    adapter._allowed_user_ids = {"42"}
+    bot = await _connect_adapter(monkeypatch, adapter)
+    adapter.join_voice_channel = AsyncMock(return_value=True)
+
+    guild = SimpleNamespace(id=1)
+    member = _make_member(42, guild)
+    general = SimpleNamespace(id=98, name="General")
+    development = SimpleNamespace(id=99, name="Development")
+
+    await bot._events["on_voice_state_update"](
+        member,
+        _make_voice_state(general),
+        _make_voice_state(development),
+    )
+
+    adapter.join_voice_channel.assert_awaited_once_with(development)
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_auto_join_ignores_unconfigured_voice_channel(monkeypatch, adapter):
+    adapter._voice_auto_join_cfg = {
+        "auto_join_on_user_join": True,
+        "auto_join_users": ["42"],
+        "auto_join_voice_channels": ["Development"],
+    }
+    adapter._allowed_user_ids = {"42"}
+    bot = await _connect_adapter(monkeypatch, adapter)
+    adapter.join_voice_channel = AsyncMock(return_value=True)
+
+    guild = SimpleNamespace(id=1)
+    member = _make_member(42, guild)
+    general = SimpleNamespace(id=98, name="General")
+
+    await bot._events["on_voice_state_update"](
+        member,
+        _make_voice_state(None),
+        _make_voice_state(general),
+    )
+
+    adapter.join_voice_channel.assert_not_awaited()
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_auto_join_accepts_scalar_user_and_channel_config(monkeypatch, adapter):
+    adapter._voice_auto_join_cfg = {
+        "auto_join_on_user_join": True,
+        "auto_join_users": 42,
+        "auto_join_voice_channels": "Development",
+    }
+    adapter._allowed_user_ids = {"42"}
+    bot = await _connect_adapter(monkeypatch, adapter)
+    adapter.join_voice_channel = AsyncMock(return_value=True)
+
+    guild = SimpleNamespace(id=1)
+    member = _make_member(42, guild)
+    development = SimpleNamespace(id=99, name="Development")
+
+    await bot._events["on_voice_state_update"](
+        member,
+        _make_voice_state(None),
+        _make_voice_state(development),
+    )
+
+    adapter.join_voice_channel.assert_awaited_once_with(development)
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_manual_voice_join_path_unaffected(monkeypatch, adapter):
     """Sanity: with auto-join disabled (the default), on_voice_state_update
     must still run its existing join/leave/switch tracking without raising,

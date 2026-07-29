@@ -2351,6 +2351,7 @@ DEFAULT_CONFIG = {
         "voice": {
             "auto_join_on_user_join": False,
             "auto_join_users": [],
+            "auto_join_voice_channels": [],
         },
     },
 

@@ -1464,16 +1464,35 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Purely additive: does not alter existing tracking/logging
                 # above, and reuses the same join_voice_channel() path (and
                 # its own per-guild lock) that /voice join calls.
-                if joined and not getattr(member, "bot", False):
+                # Follow configured users both when they initially join and when
+                # they switch into this profile's assigned channel.
+                if (joined or switched) and not getattr(member, "bot", False):
                     auto_cfg = getattr(adapter_self, "_voice_auto_join_cfg", None) or {}
                     if auto_cfg.get("auto_join_on_user_join"):
-                        trigger_users = auto_cfg.get("auto_join_users") or []
-                        member_matches_trigger_list = (
-                            not trigger_users
-                            or str(member.id) in {str(u) for u in trigger_users}
-                            or (member.name and member.name in {str(u) for u in trigger_users})
+                        configured_channels = auto_cfg.get("auto_join_voice_channels") or []
+                        if not isinstance(configured_channels, (list, tuple, set)):
+                            configured_channels = [configured_channels]
+                        configured_channel_keys = {
+                            str(channel).strip().casefold()
+                            for channel in configured_channels
+                            if str(channel).strip()
+                        }
+                        destination_channel = after.channel
+                        channel_matches = (
+                            not configured_channel_keys
+                            or str(getattr(destination_channel, "id", "")).casefold() in configured_channel_keys
+                            or str(getattr(destination_channel, "name", "")).casefold() in configured_channel_keys
                         )
-                        if member_matches_trigger_list and adapter_self._is_allowed_user(
+                        trigger_users = auto_cfg.get("auto_join_users") or []
+                        if not isinstance(trigger_users, (list, tuple, set)):
+                            trigger_users = [trigger_users]
+                        trigger_user_keys = {str(user) for user in trigger_users}
+                        member_matches_trigger_list = (
+                            not trigger_user_keys
+                            or str(member.id) in trigger_user_keys
+                            or (member.name and member.name in trigger_user_keys)
+                        )
+                        if channel_matches and member_matches_trigger_list and adapter_self._is_allowed_user(
                             str(member.id), member, guild=member.guild, is_dm=False
                         ):
                             # Already connected to this exact channel in this
@@ -4516,6 +4535,9 @@ class DiscordAdapter(BasePlatformAdapter):
         defaults: Dict[str, Any] = {
             "auto_join_on_user_join": False,
             "auto_join_users": [],
+            # Optional voice channel IDs or names assigned to this profile.
+            # Empty means any destination channel.
+            "auto_join_voice_channels": [],
             # Optional text channel used as the session anchor for automatic VC
             # joins. Without an anchor, auto-join could hear/transcribe but had
             # nowhere to route the synthetic MessageEvent.

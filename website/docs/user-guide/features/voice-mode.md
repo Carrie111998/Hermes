@@ -394,20 +394,23 @@ By default the bot only joins a voice channel when you run `/voice join`. If you
 ```yaml
 discord:
   voice:
-    auto_join_on_user_join: true   # default: false — opt-in only
-    auto_join_users: []            # optional allowlist; empty = any allowed user
+    auto_join_on_user_join: true       # default: false — opt-in only
+    auto_join_users: []                # optional IDs/usernames; scalar also accepted
+    auto_join_voice_channels: []       # optional channel IDs/names; empty = any
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `auto_join_on_user_join` | `false` | When `true`, the bot calls the same join logic as `/voice join` as soon as a qualifying user enters a voice channel it isn't already in. |
-| `auto_join_users` | `[]` | Optional list of Discord user IDs or usernames. Empty means any user who already passes `DISCORD_ALLOWED_USERS` / `DISCORD_ALLOWED_ROLES` can trigger auto-join. Non-empty restricts triggering to just these users (they must still pass the existing allowlist). |
+| `auto_join_users` | `[]` | Optional Discord user ID or username, or a list of them. Empty means any user who already passes `DISCORD_ALLOWED_USERS` / `DISCORD_ALLOWED_ROLES` can trigger auto-join. Non-empty restricts triggering to those users (they must still pass the existing allowlist). |
+| `auto_join_voice_channels` | `[]` | Optional voice channel ID or name, or a list of them. Empty allows any voice channel. Assigning channels per profile prevents every profile from following the same user into the same VC. |
 
 Notes:
 
 - The bot **never** auto-joins in response to another bot joining a voice channel.
 - Auto-join reuses the exact `join_voice_channel()` path (and its per-guild lock) used by `/voice join` — it does not open a second connection or bypass any existing voice permission checks.
-- If the bot is already connected to the channel the user joined, nothing happens (no-op).
+- The bot follows a qualifying user both on their initial join and when they switch into a configured destination channel.
+- If the bot is already connected to the destination channel, nothing happens (no-op).
 - This is purely additive: `/voice join` and `/voice leave` keep working exactly as before, whether or not auto-join is enabled.
 
 ### How It Works
