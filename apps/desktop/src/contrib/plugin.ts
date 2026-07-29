@@ -12,7 +12,7 @@
  * through the plugin host loader (next phase); this is that seam.
  */
 
-import { pluginRest, type PluginRestOptions, pluginSocket } from '@/hermes'
+import { pluginDownload, pluginRest, type PluginRestOptions, pluginSocket, revealDownload } from '@/hermes'
 import { createPluginI18n, type PluginI18n } from '@/i18n'
 import { readKey, writeKey } from '@/lib/storage'
 
@@ -54,6 +54,18 @@ export interface PluginContext {
    *  returned. Resolves to a no-op on OAuth remotes — treat it as an
    *  accelerator over your polling, never a replacement. */
   socket: (path: string, onMessage: (data: unknown) => void) => () => void
+  /** Hand the user a FILE from this plugin's namespace. `rest` decodes every
+   *  response as JSON, so it corrupts binary payloads; this fetches the bytes
+   *  in the main process, prompts for a save location, and writes with
+   *  collision resolution. Resolves `{ canceled: true }` if the user dismisses
+   *  the dialog — that's a normal outcome, not an error. */
+  download: (
+    path: string,
+    opts?: { filename?: string; timeoutMs?: number }
+  ) => Promise<{ canceled: boolean; filePath?: string }>
+  /** Reveal a saved download in Finder/Explorer/Files — the natural follow-up
+   *  to `download`. Resolves false on shells that don't support it. */
+  revealDownload: (filePath: string) => Promise<boolean>
   /** Plugin-scoped persistence. */
   storage: PluginStorage
   /** Plugin-scoped i18n: ship + register locale bundles under this plugin,
@@ -115,6 +127,8 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
     onDispose: fn => void track(fn),
     rest: <T>(path: string, opts?: PluginRestOptions) => pluginRest<T>(pluginId, path, opts),
     socket: (path, onMessage) => track(pluginSocket(pluginId, path, onMessage)),
+    download: (path, opts) => pluginDownload(pluginId, path, opts),
+    revealDownload,
     storage: createPluginStorage(pluginId),
     i18n: createPluginI18n(pluginId, track)
   }

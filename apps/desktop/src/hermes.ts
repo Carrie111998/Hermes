@@ -1,5 +1,6 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
+import type { HermesPluginDownloadResult } from '@/global'
 import type {
   ActionResponse,
   ActionStatusResponse,
@@ -301,6 +302,41 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
     timeoutMs: opts.timeoutMs,
     ...profileScoped()
   })
+}
+
+/** The plugin binary door — `pluginRest`'s counterpart for bytes. `pluginRest`
+ *  decodes every response as JSON, so it corrupts a PNG or a PDF; and the
+ *  renderer can't fetch the URL itself (file:// origin, and the plugin API
+ *  doesn't accept a query token). Main fetches, prompts for a location, and
+ *  writes. Scoped the same way — `path` is relative to `/api/plugins/<id>`,
+ *  and main re-derives the namespace rather than trusting an assembled URL.
+ *  Resolves `{ canceled: true }` when the user dismisses the dialog. */
+export async function pluginDownload(
+  pluginId: string,
+  path: string,
+  opts: { filename?: string; timeoutMs?: number } = {}
+): Promise<HermesPluginDownloadResult> {
+  const download = window.hermesDesktop?.pluginDownload
+
+  // Older shells (renderer updated ahead of the Electron bundle) lack the
+  // channel — surface it as a plain failure the caller can toast.
+  if (!download) {
+    throw new Error('This version of Hermes Desktop cannot download plugin files.')
+  }
+
+  return download({
+    pluginId,
+    path: pluginPathSuffix('pluginDownload', path),
+    filename: opts.filename,
+    timeoutMs: opts.timeoutMs,
+    ...profileScoped()
+  })
+}
+
+/** Reveal a previously downloaded file in Finder/Explorer/Files. No-ops on a
+ *  shell that predates the channel. */
+export async function revealDownload(filePath: string): Promise<boolean> {
+  return (await window.hermesDesktop?.pluginRevealDownload?.(filePath)) ?? false
 }
 
 /** The plugin WebSocket door — the live twin of `pluginRest`, scoped the same
