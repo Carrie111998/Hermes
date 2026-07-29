@@ -51,6 +51,28 @@ def test_message_editing_capability_follows_descriptor():
     assert _adapter(supports_edit=True).SUPPORTS_MESSAGE_EDITING is True
 
 
+def test_edit_support_does_not_imply_explicit_finalize_contract():
+    """supports_edit is availability, not a negotiated finalize requirement."""
+    assert _adapter(supports_edit=True).REQUIRES_EDIT_FINALIZE is False
+
+
+def test_reconnect_descriptor_refresh_updates_live_edit_capability():
+    """A fresh descriptor updates the live scalar capability surface."""
+    a = _adapter(supports_edit=True)
+    refreshed = make_desc(
+        supports_edit=False,
+        max_message_length=2000,
+        markdown_dialect="plain",
+    )
+
+    a._apply_descriptor(refreshed)
+
+    assert a.descriptor is refreshed
+    assert a.SUPPORTS_MESSAGE_EDITING is False
+    assert a.MAX_MESSAGE_LENGTH == 2000
+    assert a.supports_code_blocks is False
+
+
 def test_len_fn_utf16_counts_code_units():
     a = _adapter(len_unit="utf16")
     # An astral-plane emoji is two UTF-16 code units.
@@ -99,6 +121,15 @@ class _CaptureTransport:
         self.sent = action
         self.sent_platform = platform
         return {"success": True, "message_id": "m1"}
+
+
+class _PerPlatformCaptureTransport(_CaptureTransport):
+    def __init__(self, descriptors):
+        super().__init__()
+        self._descriptors = descriptors
+
+    def descriptor_for_platform(self, platform):
+        return self._descriptors.get(platform)
 
 
 def _make_event(chat_id="chan-1", scope_id="scope-9"):
@@ -184,7 +215,7 @@ async def test_send_preserves_explicit_scope_id():
 
 
 @pytest.mark.asyncio
-async def test_edit_forwards_scope_platform_without_undocumented_finalize():
+async def test_edit_forwards_scope_and_platform_without_undocumented_finalize():
     t = _CaptureTransport()
     a = RelayAdapter(PlatformConfig(), make_desc(platform="discord"), transport=t)
     event = _make_event(chat_id="chan-1", scope_id="scope-9")
@@ -225,6 +256,26 @@ async def test_edit_is_rejected_when_descriptor_disables_it():
     assert result.success is False
     assert result.error == "Not supported"
     assert t.sent is None
+
+
+@pytest.mark.asyncio
+async def test_edit_uses_per_platform_descriptor_for_multiplexed_chats():
+    primary = make_desc(platform="telegram", supports_edit=False)
+    secondary = make_desc(platform="discord", supports_edit=True)
+    t = _PerPlatformCaptureTransport(
+        {"telegram": primary, "discord": secondary}
+    )
+    a = RelayAdapter(PlatformConfig(), primary, transport=t)
+    a._platform_by_chat["discord-chat"] = "discord"
+    a._platform_by_chat["telegram-chat"] = "telegram"
+
+    allowed = await a.edit_message("discord-chat", "message-1", "reply")
+    rejected = await a.edit_message("telegram-chat", "message-2", "reply")
+
+    assert allowed.success is True
+    assert rejected.success is False
+    assert rejected.error == "Not supported"
+    assert t.sent["chat_id"] == "discord-chat"
 
 
 @pytest.mark.asyncio

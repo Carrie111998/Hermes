@@ -151,6 +151,31 @@ async def test_outbound_round_trips_with_correlation(server):
 
 
 @pytest.mark.asyncio
+async def test_multi_platform_descriptor_callback_only_adopts_primary():
+    """Secondary descriptors stay per-platform and cannot overwrite scalar caps."""
+    t = WebSocketRelayTransport(
+        "ws://127.0.0.1:1",
+        "discord",
+        "appShared",
+        identities=[("discord", "appShared"), ("telegram", "botShared")],
+    )
+    seen = []
+    t.set_descriptor_handler(seen.append)
+
+    primary = dict(DESCRIPTOR, platform="discord", max_message_length=2000)
+    secondary = dict(DESCRIPTOR, platform="telegram", max_message_length=4096)
+    await t._handle_frame(json.dumps({"type": "descriptor", "descriptor": secondary}))
+    await t._handle_frame(json.dumps({"type": "descriptor", "descriptor": primary}))
+
+    assert [descriptor.platform for descriptor in seen] == ["discord"]
+    assert t._descriptor is not None and t._descriptor.platform == "discord"
+    discord = t.descriptor_for_platform("discord")
+    telegram = t.descriptor_for_platform("telegram")
+    assert discord is not None and discord.max_message_length == 2000
+    assert telegram is not None and telegram.max_message_length == 4096
+
+
+@pytest.mark.asyncio
 async def test_edit_outbound_round_trips_with_full_wire_action(server):
     """Prove the edit operation crosses the production WebSocket transport."""
     t = WebSocketRelayTransport(server.url, "discord", "appShared")
@@ -162,7 +187,6 @@ async def test_edit_outbound_round_trips_with_full_wire_action(server):
             "chat_id": "chan1",
             "message_id": "msg1",
             "content": "final text",
-            "finalize": True,
             "metadata": {"scope_id": "guildA"},
         }
         result = await t.send_outbound(action, platform="discord")

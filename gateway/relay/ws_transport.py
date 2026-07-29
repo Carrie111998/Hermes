@@ -844,24 +844,29 @@ class WebSocketRelayTransport:
             # platforms onto whichever descriptor arrived last.
             if descriptor.platform:
                 self._descriptors_by_platform[descriptor.platform] = descriptor
-            # The FIRST descriptor of this connection generation is the session
-            # default (the primary identity's) — later arrivals must NOT
-            # overwrite it, or the scalar capability surface silently becomes
-            # last-writer-wins across platforms.
-            is_primary = self._descriptor is None
+            # The configured first identity is the session default. Descriptor
+            # frames may arrive out of order, so arrival order is not enough to
+            # choose the scalar capability surface in a multiplexed connection.
+            primary_platform = self._identities[0][0] if self._identities else self._platform
+            is_primary = descriptor.platform == primary_platform or (
+                len(self._identities) == 1 and not descriptor.platform
+            )
             if is_primary:
                 self._descriptor = descriptor
-            # Only the first descriptor is the adapter's scalar/default profile.
-            # Later descriptors remain available through descriptor_for_platform;
-            # applying them here would make multi-platform capability state
-            # depend on arrival order. A reconnect resets _descriptor, so its
-            # first descriptor still refreshes the live adapter.
+            # Secondary descriptors remain available through
+            # descriptor_for_platform; applying them to the scalar surface would
+            # make capability state depend on arrival order. A reconnect resets
+            # _descriptor, so the configured primary descriptor refreshes it.
             # Phase 7 Unit 7d-B: a received descriptor means the WS upgrade auth
             # passed and the connector accepted us — record that we've handshaked
             # at least once, so a LATER 4401 close is read as a revocation
             # (opt-out), not a cold-start race.
             self._handshake_succeeded = True
-            if self._descriptor_ready is not None and not self._descriptor_ready.done():
+            if (
+                self._descriptor_ready is not None
+                and is_primary
+                and not self._descriptor_ready.done()
+            ):
                 self._descriptor_ready.set_result(descriptor)
             if is_primary and self._descriptor_handler is not None:
                 try:
