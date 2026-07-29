@@ -132,3 +132,89 @@ def test_secondary_open_policy_fails_startup_guard(monkeypatch):
     assert violation is not None
     assert "wecom" in violation
     assert "open policy" in violation
+
+
+def _clear_whatsapp_auth_env(monkeypatch) -> None:
+    for key in (
+        "GATEWAY_ALLOW_ALL_USERS",
+        "WHATSAPP_ALLOW_ALL_USERS",
+        "WHATSAPP_DM_POLICY",
+        "WHATSAPP_GROUP_POLICY",
+        "WECOM_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_open_policy_violations_reports_every_offender(monkeypatch):
+    """The gate must surface all offenders, not short-circuit on the first."""
+    from gateway.run import _own_policy_open_violations
+
+    _clear_whatsapp_auth_env(monkeypatch)
+
+    cfg = GatewayConfig()
+    cfg.platforms = {
+        Platform.WHATSAPP: PlatformConfig(enabled=True, extra={"dm_policy": "open"}),
+        Platform.WECOM: PlatformConfig(enabled=True, extra={"group_policy": "open"}),
+        Platform.TELEGRAM: PlatformConfig(enabled=True),
+    }
+
+    offenders = {platform for platform, _ in _own_policy_open_violations(cfg)}
+    assert offenders == {Platform.WHATSAPP, Platform.WECOM}
+
+
+def test_open_policy_quarantines_offender_and_keeps_gateway_up(monkeypatch):
+    """A misconfigured platform is disabled; healthy ones keep serving.
+
+    Regression for the case where an enabled-but-unpaired WhatsApp aborted the
+    whole gateway, taking a perfectly healthy Telegram down with it.
+    """
+    from gateway.run import _own_policy_open_violations
+
+    _clear_whatsapp_auth_env(monkeypatch)
+
+    cfg = GatewayConfig()
+    cfg.platforms = {
+        Platform.WHATSAPP: PlatformConfig(enabled=True, extra={"dm_policy": "open"}),
+        Platform.TELEGRAM: PlatformConfig(enabled=True),
+    }
+
+    violations = _own_policy_open_violations(cfg)
+    for platform, _ in violations:
+        cfg.platforms[platform].enabled = False
+
+    assert cfg.platforms[Platform.WHATSAPP].enabled is False
+    assert cfg.platforms[Platform.TELEGRAM].enabled is True
+    # Something is still enabled, so startup must not be aborted.
+    assert any(pc.enabled for pc in cfg.platforms.values())
+
+
+def test_open_policy_opt_in_keeps_platform_enabled(monkeypatch):
+    """The platform allow-all flag still suppresses the gate entirely."""
+    from gateway.run import _own_policy_open_violations
+
+    _clear_whatsapp_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOW_ALL_USERS", "true")
+
+    cfg = GatewayConfig()
+    cfg.platforms = {
+        Platform.WHATSAPP: PlatformConfig(enabled=True, extra={"dm_policy": "open"}),
+    }
+
+    assert _own_policy_open_violations(cfg) == []
+
+
+def test_open_policy_all_platforms_offending_leaves_nothing_enabled(monkeypatch):
+    """When every platform fails the gate, nothing remains to serve."""
+    from gateway.run import _own_policy_open_violations
+
+    _clear_whatsapp_auth_env(monkeypatch)
+
+    cfg = GatewayConfig()
+    cfg.platforms = {
+        Platform.WHATSAPP: PlatformConfig(enabled=True, extra={"dm_policy": "open"}),
+    }
+
+    for platform, _ in _own_policy_open_violations(cfg):
+        cfg.platforms[platform].enabled = False
+
+    assert not any(pc.enabled for pc in cfg.platforms.values())
