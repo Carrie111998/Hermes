@@ -377,6 +377,17 @@ class TestBuildConverseKwargs:
         assert kwargs["system"] is not None
         assert len(kwargs["messages"]) >= 1
 
+    def test_temperature_is_included_for_models_that_support_sampling(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="meta.llama3-70b-instruct-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=0.2,
+        )
+
+        assert kwargs["inferenceConfig"]["temperature"] == 0.2
+
     def test_includes_tools(self):
         from agent.bedrock_adapter import build_converse_kwargs
         tools = [{"type": "function", "function": {

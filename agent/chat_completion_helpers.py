@@ -1137,6 +1137,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             messages=anthropic_messages,
             tools=tools_for_api,
             max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
+            temperature=agent.temperature,
             reasoning_config=agent.reasoning_config,
             is_oauth=agent._is_anthropic_oauth,
             preserve_dots=agent._anthropic_preserve_dots(),
@@ -1163,6 +1164,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             messages=api_messages,
             tools=tools_for_api,
             max_tokens=agent.max_tokens or 4096,
+            temperature=agent.temperature,
             region=region,
             guardrail_config=guardrail,
         )
@@ -1323,6 +1325,12 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             base_url=agent.base_url,
             timeout=agent._resolved_api_call_timeout(),
             max_tokens=agent.max_tokens,
+            # Model-specific constraints are resolved before choosing the
+            # provider-profile path too. Without these, registered profiles
+            # would bypass the same fixed/omit guard used by legacy providers.
+            fixed_temperature=_fixed_temp,
+            omit_temperature=_omit_temp,
+            temperature=agent.temperature,
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
@@ -1355,6 +1363,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         base_url=agent.base_url,
         timeout=agent._resolved_api_call_timeout(),
         max_tokens=agent.max_tokens,
+        temperature=agent.temperature,
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,

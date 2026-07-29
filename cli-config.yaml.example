@@ -72,6 +72,14 @@ model:
   #   Set only if you want to deliberately limit individual response length.
   #
 # max_tokens: 8192
+#
+# temperature: Sampling randomness for the main model (0.0–2.0).
+#   Leave unset to preserve the provider/model default. Hermes forwards this
+#   to regular chat-completions, native Gemini generateContent, Anthropic
+#   Messages, and Bedrock Converse transports. Some model/provider profiles
+#   pin or omit it when their API requires that.
+#
+# temperature: 0.2
 
   # ── Custom request headers (optional) ─────────────────────────────────────
   #

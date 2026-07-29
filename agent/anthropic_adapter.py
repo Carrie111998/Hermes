@@ -2691,6 +2691,7 @@ def build_anthropic_kwargs(
     base_url: str | None = None,
     fast_mode: bool = False,
     drop_context_1m_beta: bool = False,
+    temperature: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for anthropic.messages.create().
 
@@ -2830,6 +2831,9 @@ def build_anthropic_kwargs(
 
     if system:
         kwargs["system"] = system
+
+    if temperature is not None:
+        kwargs["temperature"] = temperature
 
     if anthropic_tools:
         kwargs["tools"] = anthropic_tools
