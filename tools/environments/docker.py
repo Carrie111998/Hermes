@@ -1458,22 +1458,15 @@ class DockerEnvironment(BaseEnvironment):
             self._container_id = result.stdout.strip()
             logger.info(f"Started container {container_name} ({self._container_id[:12]})")
 
-        # Build the init-time env forwarding args (used only by init_session
-        # to inject host env vars into the snapshot; subsequent commands get
-        # them from the snapshot file).
+        # Build the init-time environment. Non-sensitive shell state can still
+        # persist through the snapshot; sensitive names are filtered centrally.
         self._init_env_args = self._build_init_env_args()
 
         # Initialize session snapshot inside the container
         self.init_session()
 
-    def _build_init_env_args(self) -> list[str]:
-        """Build -e KEY=VALUE args for injecting host env vars into init_session.
-
-        These are used once during init_session() so that export -p captures
-        them into the snapshot.  Subsequent execute() calls don't need -e flags.
-        """
-        exec_env: dict[str, str] = dict(self._env)
-
+    def _resolve_forward_env(self) -> dict[str, str]:
+        """Resolve values for the existing explicit and skill allowlists."""
         explicit_forward_keys = set(self._forward_env)
         passthrough_keys: set[str] = set()
         try:
@@ -1491,17 +1484,33 @@ class DockerEnvironment(BaseEnvironment):
         }
         forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
+        resolved: dict[str, str] = {}
         for key in sorted(forward_keys):
             value = os.getenv(key)
             if not value:
                 value = hermes_env.get(key)
             if value:
-                exec_env[key] = value
+                resolved[key] = value
+        return resolved
 
-        args = []
-        for key in sorted(exec_env):
-            args.extend(["-e", f"{key}={exec_env[key]}"])
+    @staticmethod
+    def _docker_env_args(env: dict[str, str]) -> list[str]:
+        """Convert an environment mapping to sorted Docker ``-e`` arguments."""
+        args: list[str] = []
+        for key in sorted(env):
+            args.extend(["-e", f"{key}={env[key]}"])
         return args
+
+    def _build_command_env_args(self) -> list[str]:
+        """Build transient ``docker exec -e`` args for allowlisted forwarding."""
+        return self._docker_env_args(self._resolve_forward_env())
+
+    def _build_init_env_args(self) -> list[str]:
+        """Build ``-e`` args for the login-shell snapshot bootstrap."""
+        exec_env: dict[str, str] = dict(self._env)
+        exec_env.update(self._resolve_forward_env())
+
+        return self._docker_env_args(exec_env)
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
@@ -1512,10 +1521,15 @@ class DockerEnvironment(BaseEnvironment):
         if stdin_data is not None:
             cmd.append("-i")
 
-        # Only inject -e env args during init_session (login=True).
-        # Subsequent commands get env vars from the snapshot.
+        # Bootstrap gets the full init environment. Later commands get only
+        # explicitly allowlisted forwarding values; this keeps credentials
+        # available without ever making the snapshot their storage channel.
         if login:
             cmd.extend(self._init_env_args)
+        else:
+            # Resolve at execution time because a skill can register required
+            # environment variables after the Docker session was bootstrapped.
+            cmd.extend(self._build_command_env_args())
 
         cmd.extend([self._container_id])
 

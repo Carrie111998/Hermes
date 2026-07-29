@@ -1,6 +1,8 @@
 import logging
 from io import StringIO
+from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -346,6 +348,119 @@ def test_init_env_args_never_forwards_blank_secret(monkeypatch):
     # The key must not appear at all — not even as an empty -e MY_SECRET= flag.
     assert not any(a.startswith("MY_SECRET=") for a in args)
     assert "MY_SECRET" not in " ".join(args)
+
+
+def test_command_env_args_include_only_allowlisted_forwarding(monkeypatch):
+    """Per-command forwarding must not expand beyond existing allowlists."""
+    from tools import env_passthrough
+
+    env = _make_execute_only_env(["EXPLICIT_TOKEN"])
+    env._env = {"STATIC_TOKEN": "container-level-value"}
+
+    monkeypatch.setenv("EXPLICIT_TOKEN", "explicit-value")
+    monkeypatch.setenv("SKILL_TOKEN", "skill-value")
+    monkeypatch.setenv("UNLISTED_TOKEN", "must-not-forward")
+    monkeypatch.setattr(env_passthrough, "get_all_passthrough", lambda: {"SKILL_TOKEN"})
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    args = env._build_command_env_args()
+
+    assert args == [
+        "-e",
+        "EXPLICIT_TOKEN=explicit-value",
+        "-e",
+        "SKILL_TOKEN=skill-value",
+    ]
+    assert "UNLISTED_TOKEN" not in " ".join(args)
+    assert "STATIC_TOKEN" not in " ".join(args)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_sensitive_forward_env_is_available_but_never_snapshotted(
+    monkeypatch,
+    tmp_path,
+):
+    """A real command receives allowlisted secrets without persisting them."""
+    from tools import env_passthrough
+
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        """#!/usr/bin/env bash
+set -e
+case "$1" in
+  version) printf 'Docker version 99.0\\n' ;;
+  image) printf 'null\\n' ;;
+  run) printf 'fake-container-id\\n' ;;
+  exec)
+    shift
+    forwarded=()
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -i) shift ;;
+        -e) forwarded+=("$2"); shift 2 ;;
+        *) break ;;
+      esac
+    done
+    shift
+    exec env -i PATH="$PATH" HOME="$HOME" LANG=C.UTF-8 "${forwarded[@]}" "$@"
+    ;;
+  *) exit 0 ;;
+esac
+"""
+    )
+    fake_docker.chmod(0o755)
+
+    name = "EXPLICIT_API_TOKEN"
+    value = "forwarded-only-for-this-command"
+    skill_name = "SKILL_API_TOKEN"
+    skill_value = "registered-after-bootstrap"
+    passthrough: set[str] = set()
+    monkeypatch.setenv(name, value)
+    monkeypatch.setenv(skill_name, skill_value)
+    monkeypatch.setattr(docker_env, "find_docker", lambda: str(fake_docker))
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+    monkeypatch.setattr(env_passthrough, "get_all_passthrough", lambda: passthrough)
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: ([], {}, []),
+    )
+    docker_env._cgroup_limits_ok = True
+
+    env = _make_dummy_env(
+        cwd=str(tmp_path),
+        forward_env=[name],
+        persist_across_processes=False,
+    )
+    try:
+        bootstrap_snapshot = Path(env._snapshot_path).read_text()
+        assert name not in bootstrap_snapshot
+        assert value not in bootstrap_snapshot
+        assert skill_name not in bootstrap_snapshot
+        assert skill_value not in bootstrap_snapshot
+
+        passthrough.add(skill_name)
+        result = env.execute(f'printf "%s:%s" "${name}" "${skill_name}"')
+        assert result["returncode"] == 0, result["output"]
+        assert result["output"] == f"{value}:{skill_value}"
+
+        post_command_snapshot = Path(env._snapshot_path).read_text()
+        assert name not in post_command_snapshot
+        assert value not in post_command_snapshot
+        assert skill_name not in post_command_snapshot
+        assert skill_value not in post_command_snapshot
+
+        monkeypatch.delenv(name)
+        monkeypatch.delenv(skill_name)
+        passthrough.clear()
+        follow_up = env.execute(
+            f'printf "%s:%s" "${{{name}:-missing}}" "${{{skill_name}:-missing}}"'
+        )
+        assert follow_up["returncode"] == 0, follow_up["output"]
+        assert follow_up["output"] == "missing:missing"
+    finally:
+        env.cleanup()
+        env.wait_for_cleanup()
 
 
 # ── docker_env tests ──────────────────────────────────────────────
