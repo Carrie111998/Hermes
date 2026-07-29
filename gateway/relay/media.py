@@ -90,8 +90,27 @@ class RelayMediaClient:
         return make_upgrade_token(self._gateway_id, self._secret)
 
     def is_relay_media_url(self, url: str) -> bool:
-        """Is ``url`` a connector re-host reference (needs our bearer to GET)?"""
-        return "/relay/media/" in (url or "")
+        """Is ``url`` a connector re-host reference (needs our bearer to GET)?
+
+        Only URLs whose *origin* (scheme + host + port) matches the configured
+        connector base URL are treated as relay-media references.  External
+        origins that happen to contain ``/relay/media/`` in their path must
+        **not** receive our bearer token (GH-71559).
+        """
+        if not url or not self._base_url:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(url)
+            base = urllib.parse.urlparse(self._base_url)
+        except Exception:
+            return False
+        if parsed.scheme != base.scheme:
+            return False
+        if (parsed.hostname or "").lower() != (base.hostname or "").lower():
+            return False
+        if parsed.port != base.port:
+            return False
+        return parsed.path.startswith("/relay/media/")
 
     async def upload(
         self,
