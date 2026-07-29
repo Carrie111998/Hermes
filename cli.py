@@ -1258,6 +1258,19 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
     except Exception as e:
         logger.warning("CLI cleanup memory shutdown failed: %s", e, exc_info=True)
 
+    # End the session in SQLite so auto_prune can reclaim it (#73848).
+    # Pre-0.19 compression ended sessions by splitting; in-place compression
+    # removed that path, leaving CLI/worker sessions immortal.
+    try:
+        _agent = _active_agent_ref
+        if _agent is not None:
+            _sdb = getattr(_agent, "_session_db", None)
+            _sid = getattr(_agent, "session_id", None)
+            if _sdb and _sid:
+                _sdb.end_session(_sid, "cli_exit")
+    except Exception as e:
+        logger.debug("CLI cleanup end_session failed: %s", e)
+
 
 def _should_emit_cleanup_session_finalize(session_id: str | None) -> bool:
     if not _single_query_finalize_attempted_session_ids:
