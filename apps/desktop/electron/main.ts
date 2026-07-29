@@ -115,11 +115,13 @@ import {
   switchBranch
 } from './git-worktree-ops'
 import {
+  ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
   DATA_URL_READ_DEFAULT_MAX_MB,
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret as encryptDesktopSecretStrict,
+  readFileDataUrlForIpc,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
@@ -190,6 +192,7 @@ import {
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
+import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import {
   computeWindowOptions,
@@ -2876,6 +2879,39 @@ async function applyUpdates(opts = {}) {
       return { ok: false, error: message }
     }
 
+    // Preflight: after releasing our own backends, check for remaining
+    // Hermes processes running from this venv.  The updater normally refuses
+    // when it detects a holder, but because the updater is spawned detached
+    // with stdio:ignore, the user never sees that refusal and the update
+    // silently fails.  This preflight detects holders early and gives the
+    // user an actionable error.  Windows-only; the .pyd lock hazard is a
+    // Windows phenomenon.  ALL failures (blocked, missing python, timeout,
+    // malformed output, missing psutil) abort the handoff — never proceed
+    // to the detached updater when the venv state is unknown.
+    if (IS_WINDOWS) {
+      const scanOutcome = await scanVenvBlockers(updateRoot)
+
+      if (scanOutcome.kind === 'blocked') {
+        const message = formatBlockerMessage(scanOutcome.result)
+
+        rememberLog(`[updates] venv-blocked: ${scanOutcome.result.processes.length} process(es) hold the install`)
+        emitUpdateProgress({ stage: 'error', message, percent: null })
+        startHermes().catch(() => {})
+
+        return { ok: false, error: 'venv-blocked', message }
+      }
+
+      if (scanOutcome.kind === 'probe-failure') {
+        const message = formatProbeFailedMessage()
+
+        rememberLog(`[updates] venv-blocker probe failed: ${scanOutcome.error}`)
+        emitUpdateProgress({ stage: 'error', message, percent: null })
+        startHermes().catch(() => {})
+
+        return { ok: false, error: 'venv-probe-failed', message }
+      }
+    }
+
     // Detached so the updater outlives this process — it needs us GONE before
     // `hermes update` will run (the venv shim is locked while we live).
     const child = spawnUpdaterProcess(updater, updaterArgs, {
@@ -4891,6 +4927,45 @@ function closePreviewWatchers() {
   for (const id of previewWatchers.keys()) {
     stopPreviewFileWatch(id)
   }
+}
+
+/** Watch a DIRECTORY for entry churn (folders appearing/vanishing) — the
+ *  disk-plugin door's "new plugin folder" signal, replacing the renderer's 5s
+ *  readdir poll. Same registry + change channel as the preview file watchers
+ *  (the renderer reconciles on any tick; per-file edits stay on their own
+ *  watches), so stopPreviewFileWatch/closePreviewWatchers manage these too. */
+function watchDirectory(rawDir) {
+  const watchDir = path.resolve(String(rawDir || ''))
+
+  if (!fs.existsSync(watchDir) || !fs.statSync(watchDir).isDirectory()) {
+    throw new Error(`Not a directory: ${watchDir}`)
+  }
+
+  const id = crypto.randomBytes(12).toString('base64url')
+  let timer = null
+
+  const watcher = fs.watch(watchDir, () => {
+    if (timer) {
+      clearTimeout(timer)
+    }
+
+    timer = setTimeout(() => {
+      timer = null
+      sendPreviewFileChanged({ id, path: watchDir, url: pathToFileURL(watchDir).toString() })
+    }, PREVIEW_WATCH_DEBOUNCE_MS)
+  })
+
+  previewWatchers.set(id, {
+    close: () => {
+      if (timer) {
+        clearTimeout(timer)
+      }
+
+      watcher.close()
+    }
+  })
+
+  return { id, path: watchDir }
 }
 
 // Best-effort read of a gateway's advertised auth providers, cached per base
@@ -10120,14 +10195,23 @@ ipcMain.handle('hermes:data-url-read-max:set', (_event, maxMb) => {
 })
 
 ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
-  const { resolvedPath } = await resolveReadableFileForIpc(filePath, {
+  return readFileDataUrlForIpc(filePath, {
     maxBytes: dataUrlReadMaxBytesFromMb(dataUrlReadMaxMb),
+    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'File preview' })),
     purpose: 'File preview'
   })
+})
 
-  const data = await fs.promises.readFile(resolvedPath)
-
-  return `data:${mimeTypeForPath(resolvedPath)};base64,${data.toString('base64')}`
+// Remote attachment transfer is independent of the preview / Settings path.
+// Keep a finite cap so Electron + base64 memory stays bounded while archives
+// can exceed the default 16 MiB preview ceiling (and still fit the gateway
+// WebSocket frame limit after base64 expansion).
+ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
+  return readFileDataUrlForIpc(filePath, {
+    maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
+    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
+    purpose: 'Attachment upload'
+  })
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
@@ -10198,6 +10282,12 @@ ipcMain.handle('hermes:writeClipboard', (_event, text) => {
   return true
 })
 
+// Paired reader for the GUI terminal's paste chord: the renderer's
+// navigator.clipboard.readText() throws "Document is not focused" whenever a
+// portaled overlay has focus, and there's no way to route a read through the
+// canvas. The main process has no such gate.
+ipcMain.handle('hermes:readClipboard', () => clipboard.readText())
+
 ipcMain.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
 
 ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
@@ -10238,6 +10328,8 @@ ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
 )
 
 ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(String(url || '')))
+
+ipcMain.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(dir || '')))
 
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 

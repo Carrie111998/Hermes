@@ -30,12 +30,14 @@ Usage::
 import logging
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -121,7 +123,7 @@ XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
 # DeepInfra STT base URL now resolved via hermes_cli.models.deepinfra_base_url (shared).
 
-SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".oga", ".opus", ".aac", ".flac"}
+SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".oga", ".opus", ".aac", ".flac", ".caf"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
@@ -652,13 +654,43 @@ def _terminate_command_stt_process_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def _run_command_stt(command: str, timeout: float) -> subprocess.CompletedProcess:
-    """Run a command-provider shell command with process-tree timeout cleanup.
+def _command_stt_env_passthrough(config: Dict[str, Any]) -> list:
+    """Return the provider's ``env_passthrough`` allowlist (opt-out of scrub).
 
-    Mirrors ``tools.tts_tool._run_command_tts``.
+    Command providers legitimately reference their own API keys in the shell
+    template (curl one-liners). The child env is scrubbed of Hermes secrets by
+    default; ``env_passthrough: [MY_API_KEY, ...]`` copies the named variables
+    back from the parent environment so a trusted template keeps working.
+    Mirrors ``tools.tts_tool._command_provider_env_passthrough``.
+    """
+    raw = config.get("env_passthrough")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _run_command_stt(
+    command: str,
+    timeout: float,
+    env_passthrough: Optional[list] = None,
+) -> subprocess.CompletedProcess:
+    """Run a command-provider shell command with process-tree idle cleanup.
+
+    Mirrors ``tools.tts_tool._run_command_tts``: ``timeout`` is an IDLE
+    timeout, reset whenever the command emits output on stdout/stderr —
+    a slow-but-alive provider survives, a silently stalled one is killed
+    (same progress-based stuck detection as the TTS runner, #50081).
+    Child env is scrubbed of Hermes secrets (salvage of #56332) while still
+    propagating delegated-child lineage markers when applicable.
     """
     from agent.delegation_context import delegated_child_subprocess_env
+    from tools.environments.local import hermes_subprocess_env
 
+    scrubbed = hermes_subprocess_env(inherit_credentials=False)
+    for key in env_passthrough or []:
+        value = os.environ.get(key)
+        if value is not None:
+            scrubbed[key] = value
     popen_kwargs: Dict[str, Any] = {
         "shell": True,
         "stdout": subprocess.PIPE,
@@ -668,7 +700,7 @@ def _run_command_stt(command: str, timeout: float) -> subprocess.CompletedProces
         # must not raise in the reader threads on non-UTF-8 Windows (#45099).
         "encoding": "utf-8",
         "errors": "replace",
-        "env": delegated_child_subprocess_env(),
+        "env": delegated_child_subprocess_env(scrubbed),
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -676,21 +708,89 @@ def _run_command_stt(command: str, timeout: float) -> subprocess.CompletedProces
         popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(command, **popen_kwargs, stdin=subprocess.DEVNULL)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _terminate_command_stt_process_tree(proc)
+    output_queue: "queue.Queue[tuple[str, Optional[str]]]" = queue.Queue()
+    chunks: Dict[str, list] = {"stdout": [], "stderr": []}
+    open_streams = {"stdout", "stderr"}
+
+    def read_stream(name: str, stream: Any) -> None:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        read1 = getattr(getattr(stream, "buffer", None), "read1", None)
         try:
-            stdout, stderr = proc.communicate(timeout=1)
-        except Exception:
-            stdout = getattr(exc, "output", None)
-            stderr = getattr(exc, "stderr", None)
-        raise subprocess.TimeoutExpired(
-            command,
-            timeout,
-            output=stdout,
-            stderr=stderr,
-        ) from exc
+            while True:
+                if read1 is None:
+                    chunk = stream.read(65536)
+                else:
+                    data = read1(65536)
+                    chunk = data.decode(encoding, errors="replace")
+                if not chunk:
+                    break
+                output_queue.put((name, chunk))
+        finally:
+            output_queue.put((name, None))
+
+    readers = [
+        threading.Thread(
+            target=read_stream,
+            args=("stdout", proc.stdout),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_stream,
+            args=("stderr", proc.stderr),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    while open_streams:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            name, chunk = output_queue.get(timeout=min(0.05, remaining))
+        except queue.Empty:
+            continue
+        if chunk is None:
+            open_streams.discard(name)
+            continue
+        chunks[name].append(chunk)
+        deadline = time.monotonic() + timeout
+
+    if not timed_out:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+
+    if timed_out:
+        _terminate_command_stt_process_tree(proc)
+        for reader in readers:
+            reader.join(timeout=0.5)
+        while True:
+            try:
+                name, chunk = output_queue.get_nowait()
+            except queue.Empty:
+                break
+            if chunk:
+                chunks[name].append(chunk)
+        stdout = "".join(chunks["stdout"])
+        stderr = "".join(chunks["stderr"])
+        try:
+            raise subprocess.TimeoutExpired(command, timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise subprocess.TimeoutExpired(
+                command,
+                timeout,
+                output=stdout,
+                stderr=stderr,
+            ) from exc
+
+    stdout = "".join(chunks["stdout"])
+    stderr = "".join(chunks["stderr"])
 
     if proc.returncode:
         raise subprocess.CalledProcessError(
@@ -802,7 +902,11 @@ def _transcribe_command_stt(
                 audio.name, provider_name,
             )
             try:
-                result = _run_command_stt(command, timeout)
+                result = _run_command_stt(
+                    command,
+                    timeout,
+                    env_passthrough=_command_stt_env_passthrough(config),
+                )
             except subprocess.TimeoutExpired:
                 return {
                     "success": False,
@@ -1491,6 +1595,32 @@ def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], 
         return None, f"Failed to convert audio for local STT: {details}"
 
 
+def _convert_caf_to_wav(file_path: str) -> Optional[str]:
+    """Convert CAF to WAV using ffmpeg or afconvert (macOS)."""
+    audio_path = Path(file_path)
+    wav_path = os.path.join(audio_path.parent, f"{audio_path.stem}.wav")
+    ffmpeg = _find_ffmpeg_binary()
+    if ffmpeg:
+        try:
+            subprocess.run([ffmpeg, "-y", "-i", file_path, wav_path],
+                check=True, capture_output=True, text=True,
+                timeout=300, stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags())
+            return wav_path
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning("ffmpeg CAF to WAV failed for %s: %s", file_path, e)
+    afconvert = shutil.which("afconvert")
+    if afconvert:
+        try:
+            subprocess.run([afconvert, file_path, wav_path, "-d", "LEI16", "-f", "WAVE"],
+                check=True, capture_output=True, text=True,
+                timeout=300, stdin=subprocess.DEVNULL)
+            return wav_path
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning("afconvert CAF to WAV failed for %s: %s", file_path, e)
+    return None
+
+
 def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]:
     """Run the configured local STT command template and read back a .txt transcript."""
     command_template = _get_local_command_template()
@@ -1519,13 +1649,24 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
                 language=shlex.quote(language),
                 model=shlex.quote(normalized_model),
             )
-            # User-provided templates (env var) may contain shell syntax; auto-detected commands are safe for list mode.
-            use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
-            if use_shell:
-                subprocess.run(command, shell=True, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
-            else:
-                subprocess.run(shlex.split(command), check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
-            
+            # Scrub Hermes secrets from the child env (sibling path to #56332 /
+            # _run_command_stt — this local-whisper path previously inherited
+            # the full process environment).
+            from tools.environments.local import hermes_subprocess_env
+
+            child_env = hermes_subprocess_env(inherit_credentials=False)
+            subprocess.run(
+                shlex.split(command),
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                stdin=subprocess.DEVNULL,
+                env=child_env,
+                creationflags=windows_hide_flags(),
+            )
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
             if not txt_files:
@@ -2103,6 +2244,15 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
           - "error" (str, optional): Error message if success is False
           - "provider" (str, optional): Which provider was used
     """
+    # Refuse to feed a credential / secret store (auth.json, .env, OAuth
+    # tokens, mcp-tokens/, ...) to an STT provider: an external provider would
+    # ship its plaintext contents to a third-party API. Mirrors the local-input
+    # read guard added to image-gen (587be5b5b) and xAI video-gen (104232979).
+    from agent.file_safety import get_read_block_error
+    blocked = get_read_block_error(file_path)
+    if blocked:
+        return {"success": False, "transcript": "", "error": blocked}
+
     # Apply common path validation before provider resolution so invalid files
     # cannot trigger provider setup or lazy installation. The remote-upload
     # size cap is enforced separately below, only for non-local providers.
@@ -2124,6 +2274,15 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
         error = _validate_audio_file_size(Path(file_path))
         if error:
             return error
+
+    # Convert CAF (iMessage voice notes) to WAV for cloud STT providers.
+    if Path(file_path).suffix.lower() == ".caf" and provider not in ("local", "local_command"):
+        converted = _convert_caf_to_wav(file_path)
+        if converted:
+            file_path = converted
+        else:
+            return {"success": False, "transcript": "",
+                    "error": "CAF audio could not be converted to WAV."}
 
     if provider == "local":
         local_cfg = stt_config.get("local") or {}
@@ -2238,6 +2397,15 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
 
 def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
     """Safely validate, preprocess supported inputs, and dispatch transcription."""
+    # Refuse to feed a credential / secret store (auth.json, .env, OAuth
+    # tokens, mcp-tokens/, ...) to an STT provider — before ANY validation or
+    # preprocessing, so the refusal names the real reason rather than a
+    # format error. Mirrors the image-gen / video-gen read guards.
+    from agent.file_safety import get_read_block_error
+    blocked = get_read_block_error(file_path)
+    if blocked:
+        return {"success": False, "transcript": "", "error": blocked}
+
     # Cap .silk sources before the decoder runs (decoder safety). For all
     # other inputs the remote-upload size cap is provider-scoped and enforced
     # in _transcribe_prepared_audio, so local whisper can handle big files.
@@ -2289,6 +2457,42 @@ def _is_local_or_private_url(url: str) -> bool:
             return False
     except Exception:
         return False
+
+
+def transcribe_audio_local_fallback(
+    file_path: str,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Try an already-installed local STT backend without changing config.
+
+    This is intended for passive inbound-media recovery after the configured
+    provider has failed. It deliberately does not lazy-install dependencies or
+    fall through to another cloud provider.
+    """
+    error = _validate_audio_file(file_path)
+    if error:
+        return error
+
+    stt_config = _load_stt_config()
+    local_cfg = stt_config.get("local") or {}
+    local_model = model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
+
+    if _HAS_FASTER_WHISPER:
+        return _transcribe_local(
+            file_path,
+            _normalize_local_model(local_model),
+        )
+    if _has_local_command():
+        return _transcribe_local_command(
+            file_path,
+            _normalize_local_command_model(local_model),
+        )
+    return {
+        "success": False,
+        "transcript": "",
+        "error": "No installed local STT backend is available.",
+        "provider": "local",
+    }
 
 
 def _resolve_openai_audio_client_config() -> tuple[str, str]:
