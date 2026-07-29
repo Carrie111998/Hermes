@@ -35,6 +35,24 @@ class TestResolveAgentCwd:
         monkeypatch.chdir(tmp_path)
         assert resolve_agent_cwd() == tmp_path
 
+    def test_container_cwd_missing_on_host_is_silent(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CWD", "/workspace")
+        monkeypatch.chdir(tmp_path)
+
+        assert resolve_agent_cwd() == tmp_path
+        assert "TERMINAL_CWD does not exist" not in caplog.text
+
+    def test_local_cwd_missing_on_host_still_warns(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "gone"))
+        monkeypatch.chdir(tmp_path)
+
+        assert resolve_agent_cwd() == tmp_path
+        assert "TERMINAL_CWD does not exist" in caplog.text
+
     def test_expands_leading_tilde(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_CWD", "~")
         assert resolve_agent_cwd() == Path(os.path.expanduser("~"))
@@ -73,6 +91,13 @@ class TestResolveContextCwd:
         missing = tmp_path / "gone"
         monkeypatch.setenv("TERMINAL_CWD", str(missing))
         assert resolve_context_cwd() is None
+
+    def test_container_context_cwd_missing_on_host_is_silent(self, monkeypatch, caplog):
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CWD", "/workspace")
+
+        assert resolve_context_cwd() is None
+        assert "TERMINAL_CWD does not exist" not in caplog.text
 
     def test_returns_install_tree_when_explicitly_configured(self, monkeypatch):
         # An EXPLICITLY configured install-tree cwd is honored verbatim — the

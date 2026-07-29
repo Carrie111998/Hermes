@@ -28,6 +28,21 @@ _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 # AGENTS.md as authoritative project context. Context discovery must never
 # resolve here.
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
+
+
+def _cwd_is_backend_local() -> bool:
+    """True when configured paths belong to a remote/container filesystem."""
+    backend = os.environ.get("TERMINAL_ENV", "").strip().lower()
+    return backend in _CONTAINER_BACKENDS
+
+
+def _warn_missing_cwd(label: str, value: str) -> None:
+    # `/workspace` and similar paths are valid inside container backends but
+    # intentionally absent on the host gateway. Warn only when the configured
+    # path is expected to name a host directory.
+    if not _cwd_is_backend_local():
+        logger.warning("%s does not exist: %s", label, value)
 
 
 def _is_install_tree(p: Path) -> bool:
@@ -63,13 +78,13 @@ def resolve_agent_cwd() -> Path:
         p = Path(override).expanduser()
         if p.is_dir():
             return p
-        logger.warning("configured working directory does not exist: %s", override)
+        _warn_missing_cwd("configured working directory", override)
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         p = Path(raw).expanduser()
         if p.is_dir():
             return p
-        logger.warning("TERMINAL_CWD does not exist: %s", raw)
+        _warn_missing_cwd("TERMINAL_CWD", raw)
     return Path(os.getcwd())
 
 
@@ -86,7 +101,7 @@ def resolve_context_cwd() -> Path | None:
     if override:
         p = Path(override).expanduser()
         if not p.is_dir():
-            logger.warning("configured working directory does not exist: %s", override)
+            _warn_missing_cwd("configured working directory", override)
         else:
             return p
         return None
@@ -94,7 +109,7 @@ def resolve_context_cwd() -> Path | None:
     if raw:
         p = Path(raw).expanduser()
         if not p.is_dir():
-            logger.warning("TERMINAL_CWD does not exist: %s", raw)
+            _warn_missing_cwd("TERMINAL_CWD", raw)
         else:
             return p
     return None
