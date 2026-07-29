@@ -2820,13 +2820,14 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
 
-    # Extract pronunciation substitutions from config and apply them during
-    # spoken-text preparation (before markdown stripping).
-    pronunciation = tts_config.get("pronunciation", {})
-    substitutions = pronunciation.get("substitutions", {}) if isinstance(pronunciation, dict) else {}
-
+    # Extract and validate pronunciation substitutions before cleanup.  Invalid
+    # user config is a no-op rather than disabling all TTS normalization.
     try:
-        from tools.tts_text_normalize import prepare_spoken_text
+        from tools.tts_text_normalize import (
+            get_pronunciation_substitutions,
+            prepare_spoken_text,
+        )
+        substitutions = get_pronunciation_substitutions(tts_config)
         text = prepare_spoken_text(text, max_chars=None, pronunciation_substitutions=substitutions)
     except Exception:
         text = text.strip()

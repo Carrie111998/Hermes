@@ -153,7 +153,7 @@ The rewrite uses `auxiliary.tts_audio_tags` and defaults to your main chat model
 
 Hermes can replace specific words in TTS text before sending them to any provider. This is useful for names or terms that TTS engines mispronounce — for example, "Tahlia" should be spoken as "Tarlia".
 
-Substitutions use case-insensitive whole-word matching, so `Tahlia`, `tahlia`, and `TAHLIA` all get replaced, but `Tahlias` does not. The replacement's exact casing is preserved.
+Substitutions use case-insensitive literal matching and only match terms that are not adjacent to a word character. Thus `Tahlia`, `tahlia`, and `TAHLIA` all get replaced, but `Tahlias` does not; punctuation-bearing terms such as `C++` and `.NET` are also supported. Replacement text is inserted literally, including backslashes.
 
 ```yaml
 # In ~/.hermes/config.yaml

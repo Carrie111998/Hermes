@@ -1,3 +1,5 @@
+import pytest
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 from tools.tts_text_normalize import apply_pronunciation_substitutions, prepare_spoken_text
@@ -97,6 +99,41 @@ def test_pronunciation_special_regex_chars_escaped():
     # the literal "foo.bar" matches, not "fooxbar".
     result = apply_pronunciation_substitutions("foo.bar and fooxbar", {"foo.bar": "qux"})
     assert result == "qux and fooxbar"
+
+
+def test_pronunciation_replacement_is_literal():
+    """Backslashes and backreference-like text are inserted verbatim."""
+    replacement = r"say \1 from C:\voices"
+    assert apply_pronunciation_substitutions("Tahlia", {"Tahlia": replacement}) == replacement
+
+
+def test_pronunciation_non_word_boundaries_support_technical_terms():
+    """Terms ending or starting in punctuation still match as standalone literals."""
+    substitutions = {"C++": "C plus plus", ".NET": "dot net"}
+    result = apply_pronunciation_substitutions("C++ and .NET, not XC++ or .NETwork", substitutions)
+    assert result == "C plus plus and dot net, not XC++ or .NETwork"
+
+
+@pytest.mark.parametrize(
+    "substitutions",
+    ["Tahlia: Tarlia", ["Tahlia", "Tarlia"], {"Tahlia": 123}, {123: "Tarlia"}],
+)
+def test_pronunciation_invalid_config_is_a_noop(substitutions):
+    """Malformed user config must not break or partially alter spoken text."""
+    assert apply_pronunciation_substitutions("Hello Tahlia", substitutions) == "Hello Tahlia"
+    assert prepare_spoken_text(
+        "## Hello **Tahlia**",
+        pronunciation_substitutions=substitutions,
+    ) == "Hello Tahlia."
+
+
+def test_pronunciation_is_single_pass_and_order_independent():
+    """Replacement output is not fed back through another configured key."""
+    forward = {"alpha": "beta", "beta": "gamma"}
+    reverse = {"beta": "gamma", "alpha": "beta"}
+    expected = "beta gamma"
+    assert apply_pronunciation_substitutions("alpha beta", forward) == expected
+    assert apply_pronunciation_substitutions("alpha beta", reverse) == expected
 
 
 def test_pronunciation_preserves_replacement_casing():

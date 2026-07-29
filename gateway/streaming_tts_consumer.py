@@ -73,6 +73,9 @@ class StreamingTTSConsumer:
         self._loop = loop
         self._metadata = metadata
 
+        from tools.tts_text_normalize import get_pronunciation_substitutions
+        self._pronunciation_substitutions = get_pronunciation_substitutions(tts_config)
+
         # Resolve the streaming provider once. If unavailable, the consumer is
         # inactive and the gateway falls back to whole-file TTS.
         self._streamer = resolve_streaming_provider(tts_config)
@@ -319,6 +322,14 @@ class StreamingTTSConsumer:
         if self._handle is None or self._handle.aborted:
             return
 
+        # Apply only the pronunciation rewrite here, before the existing
+        # per-clause cleanup.  Running the full spoken-text pipeline a second
+        # time would duplicate normalization and could alter chunk boundaries.
+        from tools.tts_text_normalize import apply_pronunciation_substitutions
+        clause = apply_pronunciation_substitutions(
+            clause,
+            self._pronunciation_substitutions,
+        )
         cleaned = self._strip_markdown_for_tts(clause)
         if not cleaned or not cleaned.strip():
             return

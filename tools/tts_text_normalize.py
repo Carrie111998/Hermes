@@ -258,33 +258,66 @@ def flatten_newlines_for_payload(text: str) -> str:
     return text.strip()
 
 
-def apply_pronunciation_substitutions(text: str, substitutions: dict | None) -> str:
-    """Replace words in *text* using a case-insensitive whole-word match.
+def get_pronunciation_substitutions(tts_config: object) -> dict[str, str]:
+    """Return a validated pronunciation map from a TTS config object.
 
-    *substitutions* maps a source word to its phonetic replacement.  The
-    match is case-insensitive and anchored on word boundaries (``\\b``) so
-    partial matches inside larger words are skipped.  The replacement's
-    exact casing is preserved — the replacement string is inserted verbatim
-    regardless of how the source word appeared in the text.
-
-    Returns *text* unchanged when *substitutions* is empty or ``None``.
+    A malformed map is rejected as a whole rather than partially applied, so a
+    typo in user configuration cannot produce surprising partial substitutions.
+    Empty source strings are ignored because they cannot identify a term.
     """
-    if not text or not substitutions:
+    if not isinstance(tts_config, dict):
+        return {}
+    pronunciation = tts_config.get("pronunciation")
+    if not isinstance(pronunciation, dict):
+        return {}
+    substitutions = pronunciation.get("substitutions")
+    return _validate_pronunciation_substitutions(substitutions)
+
+
+def _validate_pronunciation_substitutions(substitutions: object) -> dict[str, str]:
+    if not isinstance(substitutions, dict):
+        return {}
+    if not all(isinstance(source, str) and isinstance(replacement, str)
+               for source, replacement in substitutions.items()):
+        return {}
+    return {source: replacement for source, replacement in substitutions.items() if source}
+
+
+def apply_pronunciation_substitutions(text: str, substitutions: object) -> str:
+    """Apply a validated pronunciation map in one case-insensitive pass.
+
+    Source terms are treated as literals and must not touch an adjacent word
+    character.  This supports punctuation-bearing terms such as ``C++`` and
+    ``.NET`` where ``\\b`` boundaries do not work.  A callback inserts the
+    configured replacement literally, including backslashes.  One alternation
+    handles all terms so replacement output is never matched again.
+    """
+    validated = _validate_pronunciation_substitutions(substitutions)
+    if not text or not validated:
         return text
 
-    result = text
-    for word, replacement in substitutions.items():
-        if not word:
-            continue
-        pattern = re.compile(r"\b" + re.escape(word) + r"\b", flags=re.IGNORECASE)
-        result = pattern.sub(replacement, result)
-    return result
+    # Longest terms win when one literal is a prefix of another.  The remaining
+    # sort keys make ambiguous case-insensitive duplicates deterministic and
+    # independent of mapping insertion order.
+    sources = sorted(validated, key=lambda source: (-len(source), source.casefold(), source))
+    replacements: dict[str, str] = {}
+    alternatives: list[str] = []
+    for index, source in enumerate(sources):
+        group_name = f"term_{index}"
+        alternatives.append(f"(?P<{group_name}>{re.escape(source)})")
+        replacements[group_name] = validated[source]
+
+    pattern = re.compile(
+        rf"(?<!\w)(?:{'|'.join(alternatives)})(?!\w)",
+        flags=re.IGNORECASE,
+    )
+    return pattern.sub(lambda match: replacements[match.lastgroup or ""], text)
 
 
 def prepare_spoken_text(
     text: str,
     max_chars: int | None = 4000,
-    pronunciation_substitutions: dict | None = None,
+    pronunciation_substitutions: object = None,
 ) -> str:
     """Return a TTS-friendly script from assistant text.
 
@@ -295,13 +328,12 @@ def prepare_spoken_text(
     the result to a single line so newline-sensitive providers (Kokoro) speak
     the whole script.
 
-    When *pronunciation_substitutions* is a non-empty dict, each key→value
-    pair is applied as a case-insensitive whole-word replacement **before**
-    markdown stripping, so substitutions operate on the raw text.
+    When *pronunciation_substitutions* is a valid non-empty ``dict[str, str]``,
+    each source→replacement pair is applied case-insensitively without matching
+    adjacent word characters **before** markdown stripping, so substitutions
+    operate on the raw text.
     """
-    spoken = text
-    if pronunciation_substitutions:
-        spoken = apply_pronunciation_substitutions(spoken, pronunciation_substitutions)
+    spoken = apply_pronunciation_substitutions(text, pronunciation_substitutions)
     spoken = strip_nonspoken_blocks(spoken)
     spoken = strip_markdown_for_tts(spoken)
     spoken = normalize_symbols_for_tts(spoken)

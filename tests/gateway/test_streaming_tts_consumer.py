@@ -351,6 +351,32 @@ class TestStreamerFormatAndLooping:
             tts_streaming.resolve_streaming_provider = original_resolve
             loop.close()
 
+    def test_pronunciation_config_reaches_streaming_provider_without_rechunking(self):
+        async def run(loop):
+            streamer = FakeStreamer(chunks_per_clause=1)
+            adapter = FakeVoiceAdapter()
+            import tools.tts_streaming as tts_streaming
+
+            original_resolve = tts_streaming.resolve_streaming_provider
+            tts_streaming.resolve_streaming_provider = lambda *_args, **_kwargs: streamer
+            try:
+                config = {
+                    "pronunciation": {
+                        "substitutions": {"C++": "C plus plus", "alpha": "beta"},
+                    },
+                }
+                consumer = StreamingTTSConsumer(adapter, "chat1", config, loop)
+                consumer.start()
+                consumer.on_delta("Use C++ first. Then alpha second. ")
+                consumer.finish()
+
+                assert await consumer.wait_complete(timeout=5.0) is True
+                assert streamer.spoken_texts == ["Use C plus plus first. Then beta second."]
+            finally:
+                tts_streaming.resolve_streaming_provider = original_resolve
+
+        _run_test(run)
+
 
 class TestGatewayIntegrationSeam:
     """The actual adapter seam is per-turn, not chat-only."""
