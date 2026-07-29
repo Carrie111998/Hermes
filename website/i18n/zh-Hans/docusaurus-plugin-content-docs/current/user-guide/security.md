@@ -210,23 +210,33 @@ command_allowlist:
 
 ### 平台允许列表
 
-在 `~/.hermes/.env` 中以逗号分隔的值设置允许的用户 ID：
+在 `~/.hermes/config.yaml` 中设置允许的用户 ID，或回退到环境变量：
+
+```yaml
+# config.yaml —— 推荐用于非密钥设置
+gateway:
+  platforms:
+    telegram:
+      extra:
+        allow_from: "123456789,987654321"  # DM 用户允许列表
+        group_allow_from: "111222333,444555666"  # 仅限群组的用户允许列表
+  telegram:
+    allowed_chats:
+      - "-1001234567890"  # 群组聊天 ID 允许列表（任何成员均可触发）
+```
+
+环境变量（config.yaml 中未设置时的回退）：
 
 ```bash
-# 平台专属允许列表
-TELEGRAM_ALLOWED_USERS=123456789,987654321
+# 在 ~/.hermes/.env 中 —— 环境变量仍然有效，但 config.yaml 是
+# 非密钥设置的首选。机器人 token 和 API 密钥始终放在 .env 中。
+TELEGRAM_BOT_TOKEN=123456789:ABCdef...   # 始终在 .env 中（此为密钥）
+
+# 跨平台允许列表
+GATEWAY_ALLOWED_USERS=123456789
 DISCORD_ALLOWED_USERS=111222333444555666
 WHATSAPP_ALLOWED_USERS=15551234567
 SLACK_ALLOWED_USERS=U01ABC123
-
-# 跨平台允许列表（对所有平台均检查）
-GATEWAY_ALLOWED_USERS=123456789
-
-# 每平台允许所有用户（谨慎使用）
-DISCORD_ALLOW_ALL_USERS=true
-
-# 全局允许所有用户（极度谨慎使用）
-GATEWAY_ALLOW_ALL_USERS=true
 ```
 
 :::warning
@@ -234,8 +244,8 @@ GATEWAY_ALLOW_ALL_USERS=true
 
 ```
 No user allowlists configured. All unauthorized users will be denied.
-Set GATEWAY_ALLOW_ALL_USERS=true in ~/.hermes/.env to allow open access,
-or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id).
+Set GATEWAY_ALLOW_ALL_USERS=true in your config or platform section
+to allow open access, or configure platform allowlists.
 ```
 :::
 

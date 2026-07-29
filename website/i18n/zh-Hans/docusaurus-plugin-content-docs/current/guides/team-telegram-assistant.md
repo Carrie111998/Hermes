@@ -93,14 +93,22 @@ hermes gateway setup
 
 ### 方式 B：手动配置
 
-在 `~/.hermes/.env` 中添加以下内容：
+将你的机器人 token（此为密钥）添加到 `~/.hermes/.env`：
 
 ```bash
-# Telegram bot token from BotFather
-TELEGRAM_BOT_TOKEN=7123456789:AAH1bGciOiJSUzI1NiIsInR5cCI6Ikp...
+# 来自 BotFather 的 Telegram 机器人 token（此为密钥，始终放在 .env 中）
+TELEGRAM_BOT_TOKEN=7123456789:***...
+```
 
-# Your Telegram user ID (numeric)
-TELEGRAM_ALLOWED_USERS=123456789
+将你的用户 ID（非密钥设置）添加到 `~/.hermes/config.yaml`：
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        # 你的 Telegram 用户 ID（数字）——多个用户用逗号分隔
+        allow_from: "123456789"
 ```
 
 ### 查找你的用户 ID
@@ -109,7 +117,7 @@ TELEGRAM_ALLOWED_USERS=123456789
 
 1. 在 Telegram 上给 [@userinfobot](https://t.me/userinfobot) 发消息
 2. 它会立即回复你的数字用户 ID
-3. 将该数字填入 `TELEGRAM_ALLOWED_USERS`
+3. 将该数字填入 `config.yaml` 中的 `allow_from` 字段
 
 :::info
 Telegram 用户 ID 是永久性数字，例如 `123456789`。它与可以更改的 `@username` 不同。白名单中请始终使用数字 ID。
@@ -191,19 +199,22 @@ hermes gateway status
 
 现在让你的队友获得访问权限。有两种方式。
 
-### 方式 A：静态白名单
+### 方式 A：静态白名单（config.yaml）
 
-收集每位团队成员的 Telegram 用户 ID（让他们给 [@userinfobot](https://t.me/userinfobot) 发消息），然后以逗号分隔的列表形式添加：
+收集每位团队成员的 Telegram 用户 ID（让他们给 [@userinfobot](https://t.me/userinfobot) 发消息），然后添加到 `~/.hermes/config.yaml`：
 
-```bash
-# 在 ~/.hermes/.env 中
-TELEGRAM_ALLOWED_USERS=123456789,987654321,555555555
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        allow_from: "123456789,987654321,555555555"
 ```
 
 修改后重启 gateway：
 
 ```bash
-hermes gateway stop && hermes gateway start
+hermes gateway restart
 ```
 
 ### 方式 B：私信配对（推荐用于团队）
@@ -260,11 +271,15 @@ hermes pairing clear-pending
 
 **方式 1：** 在机器人所在的任意 Telegram 群组或聊天中使用 `/sethome` 命令。
 
-**方式 2：** 在 `~/.hermes/.env` 中手动设置：
+**方式 2：** 在 `~/.hermes/config.yaml` 中手动设置：
 
-```bash
-TELEGRAM_HOME_CHANNEL=-1001234567890
-TELEGRAM_HOME_CHANNEL_NAME="Team Updates"
+```yaml
+gateway:
+  platforms:
+    telegram:
+      home_channel:
+        chat_id: "-1001234567890"
+        name: "Team Updates"
 ```
 
 要查找频道 ID，可将 [@userinfobot](https://t.me/userinfobot) 添加到群组——它会报告该群组的聊天 ID。
@@ -372,20 +387,11 @@ Cron 任务的 prompt 在完全全新的会话中运行，不保留任何先前�
 
 在共享团队机器人上，使用 Docker 作为终端后端，让 agent 命令在容器中运行，而非直接在宿主机上运行：
 
-```bash
-# 在 ~/.hermes/.env 中
-TERMINAL_BACKEND=docker
-TERMINAL_DOCKER_IMAGE=nikolaik/python-nodejs:python3.11-nodejs20
-```
-
-或在 `~/.hermes/config.yaml` 中：
-
 ```yaml
+# 在 ~/.hermes/config.yaml 中
 terminal:
   backend: docker
-  container_cpu: 1
-  container_memory: 5120
-  container_persistent: true
+  docker_image: nikolaik/python-nodejs:python3.11-nodejs20
 ```
 
 这样即使有人要求机器人执行破坏性操作，你的宿主系统也受到保护。
