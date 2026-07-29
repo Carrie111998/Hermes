@@ -6083,7 +6083,23 @@ def _ensure_lazy_server_connected(
         )
 
     with connect_lock:
+        # Re-validate under the per-server lock: if _clear_lazy_server_catalog_registration
+        # ran between releasing _lock and acquiring connect_lock, our lock is now orphaned
+        # and config/catalog are gone. Bail out so the caller retries with fresh state.
         with _lock:
+            if _lazy_connect_locks.get(server_name) is not connect_lock:
+                return _lazy_connect_error(
+                    "mcp_catalog_unavailable",
+                    f"Static MCP catalog for '{server_name}' was cleared; retry.",
+                )
+            # Re-read config/expected in case they were replaced
+            config = _lazy_server_configs.get(server_name)
+            expected = _lazy_server_catalogs.get(server_name)
+            if config is None or expected is None:
+                return _lazy_connect_error(
+                    "mcp_catalog_unavailable",
+                    f"Static MCP catalog for '{server_name}' is unavailable; refresh it first.",
+                )
             connected = _servers.get(server_name)
             if connected is not None:
                 if (
