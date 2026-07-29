@@ -3822,9 +3822,10 @@ def _handle_auth_error_and_retry(
       2. If yes, set the server's ``_reconnect_event`` so the server task
          tears down the current MCP session and rebuilds it with fresh
          credentials. Wait briefly for ``_ready`` to re-fire.
-      3. Retry the operation once. Return the retry result if it produced
-         a non-error JSON payload. Otherwise return the ``needs_reauth``
-         error dict so the model stops hallucinating manual refresh.
+      3. Retry the operation once. Return any completed retry result as-is,
+         including application-level error payloads, because the response
+         proves the transport is reachable. Only a retry that raises falls
+         through to the ``needs_reauth`` error below.
       4. Return None if ``exc`` is not an auth error, signalling the
          caller to use the generic error path.
 
