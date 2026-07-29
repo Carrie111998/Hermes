@@ -464,7 +464,7 @@ function AttachmentsSection({
               {/* Clicking the row OPENS it — reading the artifact an agent just
                   produced is the common case; saving a copy is the rare one. */}
               <button
-                className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm text-left text-[0.75rem] text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)"
+                className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm text-left text-[0.75rem] text-(--ui-text-tertiary) transition-colors hover:text-(--ui-text-secondary)"
                 onClick={() => onOpen(attachment)}
                 title={k.openAttachment}
                 type="button"
@@ -472,16 +472,14 @@ function AttachmentsSection({
                 <Codicon className="shrink-0" name="file" size="0.75rem" />
                 <span className="truncate">{attachment.filename}</span>
               </button>
-              <Button
+              <button
                 aria-label={k.downloadAttachment}
-                className="shrink-0 opacity-0 group-hover/att:opacity-100 group-focus-within/att:opacity-100"
+                className="grid size-5 shrink-0 place-items-center rounded text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:opacity-100 group-hover/att:opacity-100"
                 onClick={() => onDownload(attachment)}
-                size="icon-xs"
-                title={k.downloadAttachment}
-                variant="ghost"
+                type="button"
               >
                 <Codicon name="cloud-download" size="0.7rem" />
-              </Button>
+              </button>
             </li>
           ))}
         </ul>
