@@ -1,9 +1,3 @@
-# The Compresr Hermes integration lives in the `compresr` PyPI package
-# (module `compresr.integrations.hermes`). Install it into the SAME
-# interpreter that runs Hermes, then restart:
-#
-#     pip install 'compresr>=2.8.4'
-#
-# Hermes does not auto-install repo-plugin dependencies; this file documents
-# the runtime requirement for operators and CI.
+# Hermes does not auto-install repo-plugin dependencies: install into the
+# same interpreter that runs Hermes (`pip install 'compresr>=2.8.4'`).
 compresr>=2.8.4

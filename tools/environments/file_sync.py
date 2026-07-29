@@ -171,10 +171,9 @@ class FileSyncManager:
         Transactional: state only committed if ALL operations succeed.
         On failure, state rolls back so the next cycle retries everything.
 
-        By default a transport failure is logged and swallowed (best-effort
-        background sync). Pass ``raise_on_error=True`` when the caller must know
-        the upload landed (e.g. a cache write whose path is read back later);
-        the error is then re-raised after rollback.
+        Failures are logged and swallowed by default (best-effort background
+        sync); ``raise_on_error=True`` re-raises after rollback for callers
+        that must know the upload landed.
         """
         if not force and not os.environ.get(_FORCE_SYNC_ENV):
             now = _monotonic()

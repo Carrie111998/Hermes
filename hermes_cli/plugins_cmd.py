@@ -411,10 +411,8 @@ def _plugin_requires_env(source: str, locator: Optional[str]) -> list:
 
 
 def _prompt_requires_env_for_key(key: str, console) -> None:
-    """After enabling ``key``, prompt for any secrets it declares that aren't
-    set yet (saved to ~/.hermes/.env). Resolves the plugin's ``requires_env``
-    from its manifest/entry-point module. No-op when nothing is missing; never
-    blocks enabling on error."""
+    """Prompt for ``key``'s declared secrets that aren't set yet (saved to
+    ~/.hermes/.env); never blocks enabling on error."""
     try:
         source = ""
         locator = None
@@ -936,8 +934,6 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
     else:
         console.print(f"[dim]Plugin '{key}' is already enabled.[/dim]")
 
-    # Prompt for any secrets the plugin declares that aren't set yet, saving
-    # them to ~/.hermes/.env. No-op if none are missing.
     _prompt_requires_env_for_key(key, console)
 
     # Built-in tool override is a privileged grant. Bundled plugins ship with

@@ -179,9 +179,8 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
             mod.register(collector)
             if collector.engine:
                 return collector.engine
-            # register() ran but registered nothing: the plugin declined (e.g.
-            # missing credentials). Respect that instead of resurrecting it via
-            # the subclass scan below.
+            # register() registered nothing: the plugin declined (e.g. missing
+            # credentials) — don't resurrect it via the subclass scan below.
             return None
         except Exception as e:
             logger.debug("register() failed for %s: %s", name, e)

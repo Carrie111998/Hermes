@@ -1,13 +1,6 @@
-"""Tests for the out-of-tree, SDK-backed ``compresr`` plugin shim.
-
-These pin the two things this repo is responsible for (the SDK owns the rest):
-
-1. The shim wires Compresr's cache subdir into the generic out-of-tree cache
-   surface so cached files are visible on non-Local backends (Docker/Modal/SSH)
-   — which an out-of-tree plugin cannot achieve without the widened core.
-   Exercised against the REAL translator (not the SDK test suite's faked one).
-2. The shim fails open when the ``compresr`` package is absent, and delegates
-   to the SDK's ``register`` when present.
+"""Tests for the ``compresr`` plugin shim — the two things this repo owns
+(the SDK owns the rest): cache-subdir wiring, exercised against the real
+translator, and fail-open/delegation around the optional SDK import.
 """
 
 import importlib
@@ -109,7 +102,6 @@ def test_shim_fails_open_without_sdk(isolated_cache_dirs, hermes_home, monkeypat
         _blocking_import("compresr", real=__import__),
     )
     shim = _load_shim()
-    # Must not raise even though the SDK is absent.
     shim.register(object())
     # Wiring still happened (it precedes the SDK import).
     assert any(new == "cache/compresr/tool-output" for new, _ in cf._CACHE_DIRS)

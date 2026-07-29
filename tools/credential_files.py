@@ -401,12 +401,10 @@ _CACHE_DIRS: list[tuple[str, str]] = [
 def register_cache_dir(new_subpath: str, old_name: Optional[str] = None) -> None:
     """Register an extra ``HERMES_HOME`` cache subdir for remote-backend mirroring.
 
-    Lets an out-of-tree plugin persist files under ``HERMES_HOME/<new_subpath>``
-    and have them participate in the same machinery core cache dirs use: Docker
-    mounts, host→container/remote path translation, and per-file sync. Without it
-    the plugin's cache lives only on the host and is unreadable on
-    Docker/Modal/SSH. Idempotent. ``old_name`` is an optional legacy dir name
-    (defaults to ``new_subpath``).
+    Gives an out-of-tree plugin's cache the same Docker mounts, path
+    translation, and per-file sync as core cache dirs — without this it is
+    unreadable on Docker/Modal/SSH. Idempotent. ``old_name`` is an optional
+    legacy dir name (defaults to ``new_subpath``).
     """
     subpath = (new_subpath or "").strip().strip("/")
     if not subpath:

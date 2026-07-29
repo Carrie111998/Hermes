@@ -1,10 +1,7 @@
 """Loader must respect a register() that declines to provide an engine.
 
-A context-engine plugin's ``register(ctx)`` may intentionally register
-nothing (missing credentials, unmet dependency). The loader used to fall
-through to the subclass scan and instantiate the engine class anyway,
-bypassing the plugin's own availability gate — selecting a dead engine
-instead of falling back to the built-in compressor.
+It used to fall through to the subclass scan and instantiate the engine
+anyway, bypassing the plugin's own availability gate (e.g. a missing API key).
 """
 
 import textwrap

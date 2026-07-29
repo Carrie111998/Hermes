@@ -2,11 +2,8 @@ name: compresr
 version: 1.0.0
 kind: backend
 description: >-
-  Context and tool-output compression via Compresr.
-  Out-of-tree, SDK-backed: all logic ships in the `compresr` PyPI package
-  (compresr.integrations.hermes); this plugin is a thin shim. Cuts token cost
-  of context compaction and large tool outputs. Fail-open, inert without an
-  API key.
+  Context and tool-output compression via Compresr. Thin shim over the
+  `compresr` PyPI SDK; fail-open, inert without an API key.
 author: Compresr
 homepage: https://compresr.ai
 requires_env:

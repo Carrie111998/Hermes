@@ -1,10 +1,8 @@
-"""Compresr Hermes plugin — a thin, out-of-tree shim over the ``compresr`` SDK.
+"""Compresr Hermes plugin — a thin shim over the ``compresr`` PyPI SDK.
 
-All compression logic ships in the ``compresr`` PyPI package
-(``compresr.integrations.hermes``). This shim only registers Compresr's
-tool-output cache subdir so cached files resolve on Docker/Modal/SSH backends,
-then delegates to the SDK's ``register(ctx)``. Requires ``pip install compresr``
-in the interpreter that runs Hermes; fail-open and inert without it or an API key.
+Registers Compresr's tool-output cache subdir (so cached files resolve on
+Docker/Modal/SSH backends), then delegates to the SDK's ``register(ctx)``.
+Fail-open: inert without the SDK or an API key.
 """
 
 from __future__ import annotations
@@ -14,9 +12,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Literal fallback used only when the SDK isn't importable yet (so cache wiring
-# still happens before the delegate below reports the missing package). When the
-# SDK is present its cache.CACHE_SUBPATH is the single source of truth.
+# Used only when the SDK isn't importable, so cache wiring still happens;
+# otherwise the SDK's cache.CACHE_SUBPATH is the source of truth.
 _FALLBACK_CACHE_SUBPATH = "cache/compresr/tool-output"
 
 _INSTALL_HINT = (
@@ -43,8 +40,7 @@ def register(ctx: Any) -> None:
     try:
         from compresr.integrations.hermes.plugin import register as _sdk_register
     except ImportError:
-        # Inert/fail-open state (plugin enabled but SDK not installed) — warn,
-        # not error, to match sibling plugins and avoid tripping error alerting.
+        # Warn, not error: the fail-open state shouldn't trip error alerting.
         logger.warning(_INSTALL_HINT)
         return
     _sdk_register(ctx)
