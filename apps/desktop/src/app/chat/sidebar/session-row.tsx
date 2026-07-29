@@ -16,6 +16,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
+import { sessionPinId } from '@/store/session'
 import { $attentionSessionIds } from '@/store/session-states'
 
 import { SessionStatusDot } from '../session-status-dot'
@@ -138,6 +139,8 @@ function SidebarSessionRowImpl({
           dragging && 'z-10 cursor-grabbing bg-(--ui-sidebar-surface-background)',
           className
         )}
+        // The list drop-zone's insertion slot (`sidebar/session-drop.ts`).
+        data-session-slot={session.id}
         data-working={isWorking ? 'true' : undefined}
         onPointerDown={event => {
           // Reorder drags belong to dnd-kit (the grab handle); the ⋯ actions
@@ -151,7 +154,16 @@ function SidebarSessionRowImpl({
             return
           }
 
-          startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event)
+          startSessionDrag(
+            {
+              id: session.id,
+              pinId: sessionPinId(session),
+              pinned: isPinned,
+              profile: session.profile || 'default',
+              title
+            },
+            event
+          )
         }}
         // Hovering a row from another profile (the all-profiles view) telegraphs
         // a cross-profile resume — start that backend's spawn now so the click

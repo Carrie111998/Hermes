@@ -10,7 +10,10 @@
  *     that edge (the zone sheet morphs to the half);
  *   - a chat zone's CENTER / the composer → link: insert an `@session` chip
  *     into that surface's composer (ChatDropOverlay owns the visual);
- *   - anything else (sidebar, terminal, gutters) → deny.
+ *   - the sidebar's PINNED / SESSIONS list → pin, unpin, or reorder at the
+ *     hovered slot (sidebar/session-drop.ts owns that resolution, and it
+ *     wins over the zone test — the sidebar hosts no chat surface);
+ *   - anything else (terminal, gutters, the rest of the sidebar) → deny.
  *
  * Zones that don't host a chat surface are NOT targets — the overlay never
  * lights them, so a release there must not commit either (one truth).
@@ -52,6 +55,18 @@ import { openSessionTile, type TileDock } from '@/store/session-states'
 
 import { requestComposerInsertRefs } from './composer/focus'
 import { type SessionDragPayload, sessionInlineRef, sessionLabel } from './composer/inline-refs'
+import {
+  commitSessionListDrop,
+  publishSessionListDrop,
+  resolveSessionListDrop,
+  type SessionListDrop,
+  type SessionListSnapshot,
+  snapshotSessionLists
+} from './sidebar/session-drop'
+
+/** Shared, field-identical instance so the hint never churns while the
+ *  pointer moves inside a sidebar list (see `sameHint`). */
+const SIDEBAR_LIST_HINT: DropHint = { kind: 'group' }
 
 /** A chat surface's drag-start geometry: the anchor pane id it advertises
  *  (`data-session-anchor`) and the composer a link drop routes to
@@ -106,11 +121,13 @@ export function startSessionDrag(
   let surfaces: SurfaceSnapshot[] = []
   let composers: ZoneRect[] = []
   let zoneHost = new Map<string, null | string>()
+  let sessionLists: SessionListSnapshot[] = []
 
   // Commit intent, updated per resolved move (the machinery flushes the final
   // move before commit, so these always match the released-at position).
   let split: { anchor: string; before?: null | string; pos: TileDock } | null = null
   let link: null | string = null
+  let listDrop: null | SessionListDrop = null
 
   // The drag SOURCE (sidebar row or tile tab). Captured synchronously — React
   // clears `currentTarget` after the pointerdown handler returns, but this runs
@@ -130,6 +147,7 @@ export function startSessionDrag(
       surfaces = snapshotSurfaces()
       composers = queryAllVisible('[data-slot="composer-root"]').map(snapRect)
       zoneHost = new Map(zones.map(zone => [zone.id, chatZonePane(zone.id)]))
+      sessionLists = snapshotSessionLists()
       source?.style.setProperty('opacity', '0.45')
       // The same sentinel the zone overlay + chat surfaces key off — the
       // whole drop language (sheets, pills, caret, link overlay) lights up.
@@ -140,9 +158,26 @@ export function startSessionDrag(
       if (source) {
         source.style.opacity = restoreOpacity
       }
+
+      publishSessionListDrop(null)
     },
 
     resolveMove(x, y): DropHint | null {
+      // The sidebar's own lists win over the zone hit test: they sit inside a
+      // zone that hosts no chat surface, which would otherwise deny the drop.
+      listDrop = resolveSessionListDrop(sessionLists, payload, x, y)
+      publishSessionListDrop(listDrop)
+
+      if (listDrop) {
+        split = null
+        link = null
+
+        // A hint with no zone lights nothing (the list draws its own
+        // insertion line) — it only tells the machinery this is a real
+        // target, so the cursor stays "grabbing" instead of "no-drop".
+        return SIDEBAR_LIST_HINT
+      }
+
       const zone = zones.find(z => rectContains(z.rect, x, y))
       const host = zone ? zoneHost.get(zone.id) : null
 
@@ -183,7 +218,9 @@ export function startSessionDrag(
     },
 
     onCommit() {
-      if (split) {
+      if (listDrop) {
+        commitSessionListDrop(sessionLists, listDrop, payload)
+      } else if (split) {
         openSessionTile(payload.id, split.pos, split.anchor, split.before)
         // A tile for this session may already exist (openSessionTile is
         // idempotent — e.g. persisted from an earlier run): a drop must never
