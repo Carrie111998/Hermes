@@ -222,6 +222,56 @@ class TestDefaultContextLengths:
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
 
+    def test_claude_5_family_1m_context(self):
+        """Claude 5 (Opus 5 / Sonnet 5) must resolve to 1M, not the 200K catch-all.
+
+        ``DEFAULT_CONTEXT_LENGTHS`` carries a ``"claude": 200000`` catch-all for
+        the older families. Without explicit Claude 5 entries, longest-first
+        substring matching lands ``claude-opus-5`` on that catch-all and the
+        window is under-reported by 5x — the compaction threshold is then
+        computed against 200K and long sessions compact far earlier than they
+        need to. Bedrock's ``AnthropicBedrock`` client already ships the
+        ``context-1m-2025-08-07`` beta, so the capacity is there.
+
+        Regional inference prefixes (``us.``/``global.``) and vendor prefixes
+        (``anthropic/``) must all resolve, and the older 200K families must
+        keep resolving to 200K so the catch-all is not broken.
+        """
+        from agent.model_metadata import get_model_context_length
+        from unittest.mock import patch as mock_patch
+
+        expected_keys = {
+            "claude-opus-5": 1_000_000,
+            "claude-sonnet-5": 1_000_000,
+        }
+        for key, value in expected_keys.items():
+            assert key in DEFAULT_CONTEXT_LENGTHS, f"{key} missing"
+            assert DEFAULT_CONTEXT_LENGTHS[key] == value, (
+                f"{key} should be {value}, got {DEFAULT_CONTEXT_LENGTHS[key]}"
+            )
+
+        with mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.get_cached_context_length", return_value=None):
+            cases = [
+                # Claude 5 — 1M
+                ("claude-opus-5", 1_000_000),
+                ("claude-sonnet-5", 1_000_000),
+                ("us.anthropic.claude-opus-5", 1_000_000),
+                ("us.anthropic.claude-sonnet-5", 1_000_000),
+                ("global.anthropic.claude-opus-5", 1_000_000),
+                ("anthropic/claude-opus-5", 1_000_000),
+                # Older families must still hit the 200K catch-all
+                ("claude-sonnet-4-5", 200_000),
+                ("claude-haiku-4-5", 200_000),
+                ("claude-3-opus-20240229", 200_000),
+            ]
+            for model_id, expected_ctx in cases:
+                actual = get_model_context_length(model_id)
+                assert actual == expected_ctx, (
+                    f"{model_id}: expected {expected_ctx}, got {actual}"
+                )
+
     def test_glm_52_context_1m(self):
         """GLM-5.2 must resolve to 1M, not the generic GLM fallback of 202K.
 
