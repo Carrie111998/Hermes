@@ -1,0 +1,2647 @@
+nodeid_population=221
+bringing up nodes...
+bringing up nodes...
+
+................F........F.....F.....................F....F............. [ 11%]
+...........F....F..................F...F........F.............F....FF... [ 23%]
+FFF.............F.......F.....F.....................F.......F........... [ 35%]
+...F.........FF....................F..F..F.F.F..................F..F..F. [ 47%]
+.F.F..................F.....F........................................... [ 59%]
+........................................................................ [ 71%]
+........................................................................ [ 83%]
+........................................................................ [ 94%]
+..............................minimax device-code poll failed (session=Y45bZwJmnAGoEt1rCoPfWw): MiniMax OAuth error: {"error":"invalid_grant","error_description":"invalid or expired code"}
+.                                          [100%]
+==================================== ERRORS ====================================
+___________________ ERROR collecting tests/acp/test_entry.py ___________________
+ImportError while importing test module '/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/acp/test_entry.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/acp/test_entry.py:5: in <module>
+    import acp
+E   ModuleNotFoundError: No module named 'acp'
+__________________ ERROR collecting tests/acp/test_events.py ___________________
+ImportError while importing test module '/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/acp/test_events.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/acp/test_events.py:11: in <module>
+    import acp
+E   ModuleNotFoundError: No module named 'acp'
+__________________ ERROR collecting tests/acp/test_mcp_e2e.py __________________
+ImportError while importing test module '/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/acp/test_mcp_e2e.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/acp/test_mcp_e2e.py:17: in <module>
+    import acp
+E   ModuleNotFoundError: No module named 'acp'
+________________ ERROR collecting tests/acp/test_permissions.py ________________
+ImportError while importing test module '/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/acp/test_permissions.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/acp/test_permissions.py:8: in <module>
+    from acp.schema import (
+E   ModuleNotFoundError: No module named 'acp'
+_____________ ERROR collecting tests/acp/test_ping_suppression.py ______________
+ImportError while importing test module '/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/acp/test_ping_suppression.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/acp/test_ping_suppression.py:19: in <module>
+    from acp.exceptions import RequestError
+E   ModuleNotFoundError: No module named 'acp'
+__________________ ERROR collecting tests/acp/test_server.py ___________________
+ImportError while importing test module '/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/acp/test_server.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/acp/test_server.py:10: in <module>
+    import acp
+E   ModuleNotFoundError: No module named 'acp'
+___________________ ERROR collecting tests/acp/test_tools.py ___________________
+ImportError while importing test module '/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/acp/test_tools.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/acp/test_tools.py:5: in <module>
+    from acp_adapter.tools import (
+acp_adapter/tools.py:9: in <module>
+    import acp
+E   ModuleNotFoundError: No module named 'acp'
+___________ ERROR collecting tests/acp_adapter/test_acp_commands.py ____________
+ImportError while importing test module '/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/acp_adapter/test_acp_commands.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/acp_adapter/test_acp_commands.py:5: in <module>
+    from acp.schema import TextContentBlock
+E   ModuleNotFoundError: No module named 'acp'
+____________ ERROR collecting tests/acp_adapter/test_acp_images.py _____________
+ImportError while importing test module '/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/acp_adapter/test_acp_images.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/acp_adapter/test_acp_images.py:4: in <module>
+    from acp.schema import (
+E   ModuleNotFoundError: No module named 'acp'
+=================================== FAILURES ===================================
+_ TestBuildAuthMethods.test_build_auth_methods_returns_provider_and_terminal_when_configured _
+[gw0] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.acp.test_auth.TestBuildAuthMethods object at 0x106f92550>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x106ead090>
+
+    def test_build_auth_methods_returns_provider_and_terminal_when_configured(self, monkeypatch):
+        monkeypatch.setattr("acp_adapter.auth.detect_provider", lambda: "openrouter")
+    
+>       methods = build_auth_methods()
+                  ^^^^^^^^^^^^^^^^^^^^
+
+tests/acp/test_auth.py:75: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def build_auth_methods() -> list[Any]:
+        """Return registry-compatible ACP auth methods for Hermes.
+    
+        The official ACP registry validates that agents advertise at least one
+        usable auth method during the initial handshake. A fresh Zed install may
+        not have Hermes provider credentials configured yet, so Hermes always
+        advertises a terminal setup method. When credentials are already present,
+        it also advertises the resolved provider as the default agent-managed
+        runtime credential method.
+        """
+>       from acp.schema import AuthMethodAgent, TerminalAuthMethod
+E       ModuleNotFoundError: No module named 'acp'
+
+acp_adapter/auth.py:40: ModuleNotFoundError
+______ TestSpawnAsyncDiagnostic.test_spawns_subprocess_and_writes_output _______
+[gw22] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.gateway.test_shutdown_forensics.TestSpawnAsyncDiagnostic object at 0x107ce82d0>
+tmp_path = PosixPath('/private/var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-71/popen-gw22/test_spawns_subprocess_and_wri0')
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only diagnostic")
+    def test_spawns_subprocess_and_writes_output(self, tmp_path):
+        log_path = tmp_path / "diag.log"
+        pid = sf.spawn_async_diagnostic(log_path, "SIGTERM", timeout_seconds=3.0)
+>       assert pid is not None and pid > 0
+E       assert (None is not None)
+
+tests/gateway/test_shutdown_forensics.py:158: AssertionError
+_ TestBuildAuthMethods.test_build_auth_methods_returns_terminal_setup_when_unconfigured _
+[gw0] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.acp.test_auth.TestBuildAuthMethods object at 0x106f932d0>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x1083c3950>
+
+    def test_build_auth_methods_returns_terminal_setup_when_unconfigured(self, monkeypatch):
+        monkeypatch.setattr("acp_adapter.auth.detect_provider", lambda: None)
+    
+>       methods = build_auth_methods()
+                  ^^^^^^^^^^^^^^^^^^^^
+
+tests/acp/test_auth.py:88: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def build_auth_methods() -> list[Any]:
+        """Return registry-compatible ACP auth methods for Hermes.
+    
+        The official ACP registry validates that agents advertise at least one
+        usable auth method during the initial handshake. A fresh Zed install may
+        not have Hermes provider credentials configured yet, so Hermes always
+        advertises a terminal setup method. When credentials are already present,
+        it also advertises the resolved provider as the default agent-managed
+        runtime credential method.
+        """
+>       from acp.schema import AuthMethodAgent, TerminalAuthMethod
+E       ModuleNotFoundError: No module named 'acp'
+
+acp_adapter/auth.py:40: ModuleNotFoundError
+_ TestGatewaySystemServiceRouting.test_systemd_restart_gracefully_restarts_running_service_and_waits _
+[gw20] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_gateway_service.TestGatewaySystemServiceRouting object at 0x10a775e50>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10c36ac50>
+capsys = <_pytest.capture.CaptureFixture object at 0x10c79f690>
+
+    def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
+        calls = []
+    
+        monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid",
+            lambda: 654,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+        )
+    
+        # Simulate systemctl reset-failed/restart followed by an active unit.
+        # A plain start does not break systemd's auto-restart timer once the
+        # old gateway has exited with the planned restart code.
+        def fake_subprocess_run(cmd, **kwargs):
+            if "reset-failed" in cmd:
+                calls.append(("reset-failed", cmd))
+                return SimpleNamespace(stdout="", returncode=0)
+            if "restart" in cmd:
+                calls.append(("restart", cmd))
+                return SimpleNamespace(stdout="", returncode=0)
+            raise AssertionError(f"Unexpected systemctl call: {cmd}")
+    
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_subprocess_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_systemd_service_restart",
+            lambda system=False, previous_pid=None: calls.append(("wait", system, previous_pid)) or True,
+        )
+    
+>       gateway_cli.systemd_restart()
+
+tests/hermes_cli/test_gateway_service.py:776: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_cli/gateway.py:2574: in systemd_restart
+    _preflight_user_systemd()
+hermes_cli/gateway.py:1503: in _preflight_user_systemd
+    _raise_user_systemd_unavailable(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+username = 'pcloffice'
+
+    def _raise_user_systemd_unavailable(username: str, *, reason: str, fix_hint: str) -> None:
+        """Build a user-facing error message and raise UserSystemdUnavailableError."""
+        msg = (
+            f"{reason}\n"
+            "  systemctl --user cannot reach the user D-Bus session in this shell.\n"
+            "\n"
+            "  To fix:\n"
+            f"{fix_hint}\n"
+            "\n"
+            "  Alternative: run the gateway in the foreground (stays up until\n"
+            "  you exit / close the terminal):\n"
+            "    hermes gateway run"
+        )
+>       raise UserSystemdUnavailableError(msg)
+E       hermes_cli.gateway.UserSystemdUnavailableError: User D-Bus session is not available (not supported on this platform).
+E         systemctl --user cannot reach the user D-Bus session in this shell.
+E       
+E         To fix:
+E         sudo loginctl enable-linger pcloffice
+E       
+E         Alternative: run the gateway in the foreground (stays up until
+E         you exit / close the terminal):
+E           hermes gateway run
+
+hermes_cli/gateway.py:1526: UserSystemdUnavailableError
+_______ TestRunOauthSetupToken.test_returns_token_from_credential_files ________
+[gw0] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.agent.test_anthropic_adapter.TestRunOauthSetupToken object at 0x1070bdd50>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x108f97550>
+tmp_path = PosixPath('/private/var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-71/popen-gw0/test_returns_token_from_creden0')
+
+    def test_returns_token_from_credential_files(self, monkeypatch, tmp_path):
+        """After subprocess completes, reads credentials from Claude Code files."""
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    
+        # Pre-create credential files that will be found after subprocess
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "from-cred-file",
+                "refreshToken": "refresh",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+    
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+>           token = run_oauth_setup_token()
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/test_anthropic_adapter.py:454: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+agent/anthropic_adapter.py:1024: in run_oauth_setup_token
+    creds = read_claude_code_credentials()
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent/anthropic_adapter.py:732: in read_claude_code_credentials
+    kc_creds = _read_claude_code_credentials_from_keychain()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent/anthropic_adapter.py:698: in _read_claude_code_credentials_from_keychain
+    data = json.loads(raw)
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+s = <MagicMock name='run().stdout.strip()' id='4466904080'>, cls = None
+object_hook = None, parse_float = None, parse_int = None, parse_constant = None
+object_pairs_hook = None, kw = {}
+
+    def loads(s, *, cls=None, object_hook=None, parse_float=None,
+            parse_int=None, parse_constant=None, object_pairs_hook=None, **kw):
+        """Deserialize ``s`` (a ``str``, ``bytes`` or ``bytearray`` instance
+        containing a JSON document) to a Python object.
+    
+        ``object_hook`` is an optional function that will be called with the
+        result of any object literal decode (a ``dict``). The return value of
+        ``object_hook`` will be used instead of the ``dict``. This feature
+        can be used to implement custom decoders (e.g. JSON-RPC class hinting).
+    
+        ``object_pairs_hook`` is an optional function that will be called with the
+        result of any object literal decoded with an ordered list of pairs.  The
+        return value of ``object_pairs_hook`` will be used instead of the ``dict``.
+        This feature can be used to implement custom decoders.  If ``object_hook``
+        is also defined, the ``object_pairs_hook`` takes priority.
+    
+        ``parse_float``, if specified, will be called with the string
+        of every JSON float to be decoded. By default this is equivalent to
+        float(num_str). This can be used to use another datatype or parser
+        for JSON floats (e.g. decimal.Decimal).
+    
+        ``parse_int``, if specified, will be called with the string
+        of every JSON int to be decoded. By default this is equivalent to
+        int(num_str). This can be used to use another datatype or parser
+        for JSON integers (e.g. float).
+    
+        ``parse_constant``, if specified, will be called with one of the
+        following strings: -Infinity, Infinity, NaN.
+        This can be used to raise an exception if invalid JSON numbers
+        are encountered.
+    
+        To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
+        kwarg; otherwise ``JSONDecoder`` is used.
+        """
+        if isinstance(s, str):
+            if s.startswith('\ufeff'):
+                raise JSONDecodeError("Unexpected UTF-8 BOM (decode using utf-8-sig)",
+                                      s, 0)
+        else:
+            if not isinstance(s, (bytes, bytearray)):
+>               raise TypeError(f'the JSON object must be str, bytes or bytearray, '
+                                f'not {s.__class__.__name__}')
+E               TypeError: the JSON object must be str, bytes or bytearray, not MagicMock
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/json/__init__.py:339: TypeError
+_ TestGatewaySystemServiceRouting.test_systemd_restart_uses_systemd_main_pid_when_pid_file_is_missing _
+[gw20] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_gateway_service.TestGatewaySystemServiceRouting object at 0x10a7761d0>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10ae7e110>
+capsys = <_pytest.capture.CaptureFixture object at 0x10a9c2290>
+
+    def test_systemd_restart_uses_systemd_main_pid_when_pid_file_is_missing(self, monkeypatch, capsys):
+        calls = []
+    
+        monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_read_systemd_unit_properties",
+            lambda system=False: {
+                "ActiveState": "active",
+                "SubState": "running",
+                "Result": "success",
+                "ExecMainStatus": "0",
+                "MainPID": "777",
+            },
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
+        )
+        monkeypatch.setattr(gateway_cli, "_run_systemctl", lambda args, **kwargs: calls.append(args) or SimpleNamespace(stdout="", returncode=0))
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_systemd_service_restart",
+            lambda system=False, previous_pid=None: calls.append(("wait", system, previous_pid)) or True,
+        )
+    
+>       gateway_cli.systemd_restart()
+
+tests/hermes_cli/test_gateway_service.py:816: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_cli/gateway.py:2574: in systemd_restart
+    _preflight_user_systemd()
+hermes_cli/gateway.py:1503: in _preflight_user_systemd
+    _raise_user_systemd_unavailable(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+username = 'pcloffice'
+
+    def _raise_user_systemd_unavailable(username: str, *, reason: str, fix_hint: str) -> None:
+        """Build a user-facing error message and raise UserSystemdUnavailableError."""
+        msg = (
+            f"{reason}\n"
+            "  systemctl --user cannot reach the user D-Bus session in this shell.\n"
+            "\n"
+            "  To fix:\n"
+            f"{fix_hint}\n"
+            "\n"
+            "  Alternative: run the gateway in the foreground (stays up until\n"
+            "  you exit / close the terminal):\n"
+            "    hermes gateway run"
+        )
+>       raise UserSystemdUnavailableError(msg)
+E       hermes_cli.gateway.UserSystemdUnavailableError: User D-Bus session is not available (not supported on this platform).
+E         systemctl --user cannot reach the user D-Bus session in this shell.
+E       
+E         To fix:
+E         sudo loginctl enable-linger pcloffice
+E       
+E         Alternative: run the gateway in the foreground (stays up until
+E         you exit / close the terminal):
+E           hermes gateway run
+
+hermes_cli/gateway.py:1526: UserSystemdUnavailableError
+____________ TestRunOauthSetupToken.test_returns_token_from_env_var ____________
+[gw0] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.agent.test_anthropic_adapter.TestRunOauthSetupToken object at 0x1070be3d0>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10849b150>
+tmp_path = PosixPath('/private/var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-71/popen-gw0/test_returns_token_from_env_va0')
+
+    def test_returns_token_from_env_var(self, monkeypatch, tmp_path):
+        """Falls back to CLAUDE_CODE_OAUTH_TOKEN env var when no cred files."""
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "from-env-var")
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+    
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+>           token = run_oauth_setup_token()
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/test_anthropic_adapter.py:472: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+agent/anthropic_adapter.py:1024: in run_oauth_setup_token
+    creds = read_claude_code_credentials()
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent/anthropic_adapter.py:732: in read_claude_code_credentials
+    kc_creds = _read_claude_code_credentials_from_keychain()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent/anthropic_adapter.py:698: in _read_claude_code_credentials_from_keychain
+    data = json.loads(raw)
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+s = <MagicMock name='run().stdout.strip()' id='4433690896'>, cls = None
+object_hook = None, parse_float = None, parse_int = None, parse_constant = None
+object_pairs_hook = None, kw = {}
+
+    def loads(s, *, cls=None, object_hook=None, parse_float=None,
+            parse_int=None, parse_constant=None, object_pairs_hook=None, **kw):
+        """Deserialize ``s`` (a ``str``, ``bytes`` or ``bytearray`` instance
+        containing a JSON document) to a Python object.
+    
+        ``object_hook`` is an optional function that will be called with the
+        result of any object literal decode (a ``dict``). The return value of
+        ``object_hook`` will be used instead of the ``dict``. This feature
+        can be used to implement custom decoders (e.g. JSON-RPC class hinting).
+    
+        ``object_pairs_hook`` is an optional function that will be called with the
+        result of any object literal decoded with an ordered list of pairs.  The
+        return value of ``object_pairs_hook`` will be used instead of the ``dict``.
+        This feature can be used to implement custom decoders.  If ``object_hook``
+        is also defined, the ``object_pairs_hook`` takes priority.
+    
+        ``parse_float``, if specified, will be called with the string
+        of every JSON float to be decoded. By default this is equivalent to
+        float(num_str). This can be used to use another datatype or parser
+        for JSON floats (e.g. decimal.Decimal).
+    
+        ``parse_int``, if specified, will be called with the string
+        of every JSON int to be decoded. By default this is equivalent to
+        int(num_str). This can be used to use another datatype or parser
+        for JSON integers (e.g. float).
+    
+        ``parse_constant``, if specified, will be called with one of the
+        following strings: -Infinity, Infinity, NaN.
+        This can be used to raise an exception if invalid JSON numbers
+        are encountered.
+    
+        To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
+        kwarg; otherwise ``JSONDecoder`` is used.
+        """
+        if isinstance(s, str):
+            if s.startswith('\ufeff'):
+                raise JSONDecodeError("Unexpected UTF-8 BOM (decode using utf-8-sig)",
+                                      s, 0)
+        else:
+            if not isinstance(s, (bytes, bytearray)):
+>               raise TypeError(f'the JSON object must be str, bytes or bytearray, '
+                                f'not {s.__class__.__name__}')
+E               TypeError: the JSON object must be str, bytes or bytearray, not MagicMock
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/json/__init__.py:339: TypeError
+_____ TestSystemdServiceRefresh.test_systemd_start_refreshes_outdated_unit _____
+[gw18] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_gateway_service.TestSystemdServiceRefresh object at 0x10a3e3350>
+tmp_path = PosixPath('/private/var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-71/popen-gw18/test_systemd_start_refreshes_o0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x1094d6350>
+
+    def test_systemd_start_refreshes_outdated_unit(self, tmp_path, monkeypatch):
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text("old unit\n", encoding="utf-8")
+    
+        monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+        monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+    
+        calls = []
+    
+        def fake_run(cmd, check=True, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+    
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+    
+>       gateway_cli.systemd_start()
+
+tests/hermes_cli/test_gateway_service.py:79: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_cli/gateway.py:2535: in systemd_start
+    _preflight_user_systemd()
+hermes_cli/gateway.py:1503: in _preflight_user_systemd
+    _raise_user_systemd_unavailable(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+username = 'pcloffice'
+
+    def _raise_user_systemd_unavailable(username: str, *, reason: str, fix_hint: str) -> None:
+        """Build a user-facing error message and raise UserSystemdUnavailableError."""
+        msg = (
+            f"{reason}\n"
+            "  systemctl --user cannot reach the user D-Bus session in this shell.\n"
+            "\n"
+            "  To fix:\n"
+            f"{fix_hint}\n"
+            "\n"
+            "  Alternative: run the gateway in the foreground (stays up until\n"
+            "  you exit / close the terminal):\n"
+            "    hermes gateway run"
+        )
+>       raise UserSystemdUnavailableError(msg)
+E       hermes_cli.gateway.UserSystemdUnavailableError: User D-Bus session is not available (not supported on this platform).
+E         systemctl --user cannot reach the user D-Bus session in this shell.
+E       
+E         To fix:
+E         sudo loginctl enable-linger pcloffice
+E       
+E         Alternative: run the gateway in the foreground (stays up until
+E         you exit / close the terminal):
+E           hermes gateway run
+
+hermes_cli/gateway.py:1526: UserSystemdUnavailableError
+_ TestGatewaySystemServiceRouting.test_systemd_restart_reports_start_limit_hit _
+[gw20] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_gateway_service.TestGatewaySystemServiceRouting object at 0x10a776e90>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10ae0cc90>
+capsys = <_pytest.capture.CaptureFixture object at 0x10a794710>
+
+    def test_systemd_restart_reports_start_limit_hit(self, monkeypatch, capsys):
+        calls = []
+    
+        monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None: False)
+    
+        def fake_run_systemctl(args, **kwargs):
+            calls.append(args)
+            if args[0] == "show":
+                return SimpleNamespace(stdout="ActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\nMainPID=0\n", stderr="", returncode=0)
+            if args[0] == "reset-failed":
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
+            if args[0] == "restart":
+                raise subprocess.CalledProcessError(
+                    1,
+                    ["systemctl", "--user", *args],
+                    stderr="Job failed. See result 'start-limit-hit'.",
+                )
+            raise AssertionError(f"Unexpected args: {args}")
+    
+        monkeypatch.setattr(gateway_cli, "_run_systemctl", fake_run_systemctl)
+    
+>       gateway_cli.systemd_restart()
+
+tests/hermes_cli/test_gateway_service.py:869: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_cli/gateway.py:2574: in systemd_restart
+    _preflight_user_systemd()
+hermes_cli/gateway.py:1503: in _preflight_user_systemd
+    _raise_user_systemd_unavailable(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+username = 'pcloffice'
+
+    def _raise_user_systemd_unavailable(username: str, *, reason: str, fix_hint: str) -> None:
+        """Build a user-facing error message and raise UserSystemdUnavailableError."""
+        msg = (
+            f"{reason}\n"
+            "  systemctl --user cannot reach the user D-Bus session in this shell.\n"
+            "\n"
+            "  To fix:\n"
+            f"{fix_hint}\n"
+            "\n"
+            "  Alternative: run the gateway in the foreground (stays up until\n"
+            "  you exit / close the terminal):\n"
+            "    hermes gateway run"
+        )
+>       raise UserSystemdUnavailableError(msg)
+E       hermes_cli.gateway.UserSystemdUnavailableError: User D-Bus session is not available (not supported on this platform).
+E         systemctl --user cannot reach the user D-Bus session in this shell.
+E       
+E         To fix:
+E         sudo loginctl enable-linger pcloffice
+E       
+E         Alternative: run the gateway in the foreground (stays up until
+E         you exit / close the terminal):
+E           hermes gateway run
+
+hermes_cli/gateway.py:1526: UserSystemdUnavailableError
+_________ TestRunOauthSetupToken.test_returns_none_when_no_creds_found _________
+[gw0] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.agent.test_anthropic_adapter.TestRunOauthSetupToken object at 0x1070bea90>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10849ac10>
+tmp_path = PosixPath('/private/var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-71/popen-gw0/test_returns_none_when_no_cred0')
+
+    def test_returns_none_when_no_creds_found(self, monkeypatch, tmp_path):
+        """Returns None when subprocess completes but no credentials are found."""
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+    
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+>           token = run_oauth_setup_token()
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/agent/test_anthropic_adapter.py:485: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+agent/anthropic_adapter.py:1024: in run_oauth_setup_token
+    creds = read_claude_code_credentials()
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent/anthropic_adapter.py:732: in read_claude_code_credentials
+    kc_creds = _read_claude_code_credentials_from_keychain()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent/anthropic_adapter.py:698: in _read_claude_code_credentials_from_keychain
+    data = json.loads(raw)
+           ^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+s = <MagicMock name='run().stdout.strip()' id='4411697424'>, cls = None
+object_hook = None, parse_float = None, parse_int = None, parse_constant = None
+object_pairs_hook = None, kw = {}
+
+    def loads(s, *, cls=None, object_hook=None, parse_float=None,
+            parse_int=None, parse_constant=None, object_pairs_hook=None, **kw):
+        """Deserialize ``s`` (a ``str``, ``bytes`` or ``bytearray`` instance
+        containing a JSON document) to a Python object.
+    
+        ``object_hook`` is an optional function that will be called with the
+        result of any object literal decode (a ``dict``). The return value of
+        ``object_hook`` will be used instead of the ``dict``. This feature
+        can be used to implement custom decoders (e.g. JSON-RPC class hinting).
+    
+        ``object_pairs_hook`` is an optional function that will be called with the
+        result of any object literal decoded with an ordered list of pairs.  The
+        return value of ``object_pairs_hook`` will be used instead of the ``dict``.
+        This feature can be used to implement custom decoders.  If ``object_hook``
+        is also defined, the ``object_pairs_hook`` takes priority.
+    
+        ``parse_float``, if specified, will be called with the string
+        of every JSON float to be decoded. By default this is equivalent to
+        float(num_str). This can be used to use another datatype or parser
+        for JSON floats (e.g. decimal.Decimal).
+    
+        ``parse_int``, if specified, will be called with the string
+        of every JSON int to be decoded. By default this is equivalent to
+        int(num_str). This can be used to use another datatype or parser
+        for JSON integers (e.g. float).
+    
+        ``parse_constant``, if specified, will be called with one of the
+        following strings: -Infinity, Infinity, NaN.
+        This can be used to raise an exception if invalid JSON numbers
+        are encountered.
+    
+        To use a custom ``JSONDecoder`` subclass, specify it with the ``cls``
+        kwarg; otherwise ``JSONDecoder`` is used.
+        """
+        if isinstance(s, str):
+            if s.startswith('\ufeff'):
+                raise JSONDecodeError("Unexpected UTF-8 BOM (decode using utf-8-sig)",
+                                      s, 0)
+        else:
+            if not isinstance(s, (bytes, bytearray)):
+>               raise TypeError(f'the JSON object must be str, bytes or bytearray, '
+                                f'not {s.__class__.__name__}')
+E               TypeError: the JSON object must be str, bytes or bytearray, not MagicMock
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/json/__init__.py:339: TypeError
+____ TestSystemdServiceRefresh.test_systemd_restart_refreshes_outdated_unit ____
+[gw18] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_gateway_service.TestSystemdServiceRefresh object at 0x10a3e3a90>
+tmp_path = PosixPath('/private/var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/pytest-of-pcloffice/pytest-71/popen-gw18/test_systemd_restart_refreshes0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x109f54fd0>
+
+    def test_systemd_restart_refreshes_outdated_unit(self, tmp_path, monkeypatch):
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text("old unit\n", encoding="utf-8")
+    
+        monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+        monkeypatch.setattr(gateway_cli, "generate_systemd_unit", lambda system=False, run_as_user=None: "new unit\n")
+    
+        calls = []
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(gateway_cli, "_recover_pending_systemd_restart", lambda system=False, previous_pid=None: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_systemd_service_restart",
+            lambda system=False, previous_pid=None: calls.append(("wait", system, previous_pid)) or True,
+        )
+    
+        def fake_run(cmd, check=True, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+    
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+    
+>       gateway_cli.systemd_restart()
+
+tests/hermes_cli/test_gateway_service.py:109: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_cli/gateway.py:2574: in systemd_restart
+    _preflight_user_systemd()
+hermes_cli/gateway.py:1503: in _preflight_user_systemd
+    _raise_user_systemd_unavailable(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+username = 'pcloffice'
+
+    def _raise_user_systemd_unavailable(username: str, *, reason: str, fix_hint: str) -> None:
+        """Build a user-facing error message and raise UserSystemdUnavailableError."""
+        msg = (
+            f"{reason}\n"
+            "  systemctl --user cannot reach the user D-Bus session in this shell.\n"
+            "\n"
+            "  To fix:\n"
+            f"{fix_hint}\n"
+            "\n"
+            "  Alternative: run the gateway in the foreground (stays up until\n"
+            "  you exit / close the terminal):\n"
+            "    hermes gateway run"
+        )
+>       raise UserSystemdUnavailableError(msg)
+E       hermes_cli.gateway.UserSystemdUnavailableError: User D-Bus session is not available (not supported on this platform).
+E         systemctl --user cannot reach the user D-Bus session in this shell.
+E       
+E         To fix:
+E         sudo loginctl enable-linger pcloffice
+E       
+E         Alternative: run the gateway in the foreground (stays up until
+E         you exit / close the terminal):
+E           hermes gateway run
+
+hermes_cli/gateway.py:1526: UserSystemdUnavailableError
+_ TestGatewaySystemServiceRouting.test_systemd_restart_recovers_failed_planned_restart _
+[gw20] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_gateway_service.TestGatewaySystemServiceRouting object at 0x10a777510>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10a381bd0>
+capsys = <_pytest.capture.CaptureFixture object at 0x10a204450>
+
+    def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
+        monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr(
+            "gateway.status.read_runtime_status",
+            lambda: {"restart_requested": True, "gateway_state": "stopped"},
+        )
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+    
+        calls = []
+        started = {"value": False}
+    
+        def fake_subprocess_run(cmd, **kwargs):
+            if "show" in cmd:
+                if not started["value"]:
+                    return SimpleNamespace(
+                        stdout=(
+                            "ActiveState=failed\n"
+                            "SubState=failed\n"
+                            "Result=exit-code\n"
+                            f"ExecMainStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}\n"
+                        ),
+                        returncode=0,
+                    )
+                return SimpleNamespace(
+                    stdout="ActiveState=active\nSubState=running\nResult=success\nExecMainStatus=0\n",
+                    returncode=0,
+                )
+            if "reset-failed" in cmd:
+                calls.append(("reset-failed", cmd))
+                return SimpleNamespace(stdout="", returncode=0)
+            if "start" in cmd:
+                started["value"] = True
+                calls.append(("start", cmd))
+                return SimpleNamespace(stdout="", returncode=0)
+            raise AssertionError(f"Unexpected command: {cmd}")
+    
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_subprocess_run)
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid",
+            lambda: 999 if started["value"] else None,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_runtime_status_for_pid",
+            lambda pid: {"pid": pid, "gateway_state": "running"},
+        )
+    
+>       gateway_cli.systemd_restart()
+
+tests/hermes_cli/test_gateway_service.py:925: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hermes_cli/gateway.py:2574: in systemd_restart
+    _preflight_user_systemd()
+hermes_cli/gateway.py:1503: in _preflight_user_systemd
+    _raise_user_systemd_unavailable(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+username = 'pcloffice'
+
+    def _raise_user_systemd_unavailable(username: str, *, reason: str, fix_hint: str) -> None:
+        """Build a user-facing error message and raise UserSystemdUnavailableError."""
+        msg = (
+            f"{reason}\n"
+            "  systemctl --user cannot reach the user D-Bus session in this shell.\n"
+            "\n"
+            "  To fix:\n"
+            f"{fix_hint}\n"
+            "\n"
+            "  Alternative: run the gateway in the foreground (stays up until\n"
+            "  you exit / close the terminal):\n"
+            "    hermes gateway run"
+        )
+>       raise UserSystemdUnavailableError(msg)
+E       hermes_cli.gateway.UserSystemdUnavailableError: User D-Bus session is not available (not supported on this platform).
+E         systemctl --user cannot reach the user D-Bus session in this shell.
+E       
+E         To fix:
+E         sudo loginctl enable-linger pcloffice
+E       
+E         Alternative: run the gateway in the foreground (stays up until
+E         you exit / close the terminal):
+E           hermes gateway run
+
+hermes_cli/gateway.py:1526: UserSystemdUnavailableError
+_____________ TestSupportsSystemdServicesWSL.test_wsl_with_systemd _____________
+[gw8] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_gateway_wsl.TestSupportsSystemdServicesWSL object at 0x108463690>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x109686710>
+
+    def test_wsl_with_systemd(self, monkeypatch):
+        """WSL + working systemd → True."""
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: True)
+        monkeypatch.setattr(gateway, "_wsl_systemd_operational", lambda: True)
+>       assert gateway.supports_systemd_services() is True
+E       assert False is True
+E        +  where False = <function supports_systemd_services at 0x107e3e520>()
+E        +    where <function supports_systemd_services at 0x107e3e520> = gateway.supports_systemd_services
+
+tests/hermes_cli/test_gateway_wsl.py:133: AssertionError
+_______ TestFileDedup.test_write_rejects_status_text_with_small_framing ________
+[gw27] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_read_guards.TestFileDedup testMethod=test_write_rejects_status_text_with_small_framing>
+mock_ops = <MagicMock name='_get_file_ops' id='4417115792'>
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_rejects_status_text_with_small_framing(self, mock_ops):
+        """write_file rejects small wrappers around the status text too.
+    
+        Real-world corruption shapes aren't always the verbatim message — the
+        model sometimes prepends a short note or appends a trailing comment
+        before calling write_file.  A short, status-dominated write is still
+        corruption, not legitimate file content.
+        """
+        fake = MagicMock()
+        fake.write_file = MagicMock()
+        mock_ops.return_value = fake
+    
+        wrapped = "Note: " + _READ_DEDUP_STATUS_MESSAGE + "\n\n(continuing.)"
+        result = json.loads(write_file_tool(
+            self._tmpfile,
+            wrapped,
+            task_id="guard",
+        ))
+    
+        self.assertIn("error", result)
+>       self.assertIn("internal read_file status text", result["error"])
+E       AssertionError: 'internal read_file status text' not found in 'Refusing to write to sensitive system path: /var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/tmpxuh95yfa/dedup_test.txt\nUse the terminal tool with sudo if you need to modify system files.'
+
+tests/tools/test_file_read_guards.py:222: AssertionError
+_________________ test_systemctl_unrelated_unit_passes_through _________________
+[gw3] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+    def test_systemctl_unrelated_unit_passes_through():
+        """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
+        # Use --dry-run so we don't actually try to restart anything; just
+        # verify the guard doesn't block the call. systemctl supports
+        # --dry-run via the privileged API; on user scope it usually fails
+        # quickly without side effects.
+>       r = subprocess.run(
+            ["systemctl", "--user", "show", "fake-not-real-unit"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+tests/test_live_system_guard_self_test.py:245: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/conftest.py:862: in _guarded
+    return real(cmd, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:548: in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/conftest.py:880: in __init__
+    super().__init__(cmd, *args, **kwargs)
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Popen: returncode: 255 args: ['systemctl', '--user', 'show', 'fake-not-real...>
+args = ['systemctl', '--user', 'show', 'fake-not-real-unit']
+executable = b'systemctl', preexec_fn = None, close_fds = True, pass_fds = ()
+cwd = None, env = None, startupinfo = None, creationflags = 0, shell = False
+p2cread = -1, p2cwrite = -1, c2pread = 16, c2pwrite = 17, errread = 18
+errwrite = 19, restore_signals = True, gid = None, gids = None, uid = None
+umask = -1, start_new_session = False, process_group = -1
+
+    def _execute_child(self, args, executable, preexec_fn, close_fds,
+                       pass_fds, cwd, env,
+                       startupinfo, creationflags, shell,
+                       p2cread, p2cwrite,
+                       c2pread, c2pwrite,
+                       errread, errwrite,
+                       restore_signals,
+                       gid, gids, uid, umask,
+                       start_new_session, process_group):
+        """Execute program (POSIX version)"""
+    
+        if isinstance(args, (str, bytes)):
+            args = [args]
+        elif isinstance(args, os.PathLike):
+            if shell:
+                raise TypeError('path-like args is not allowed when '
+                                'shell is true')
+            args = [args]
+        else:
+            args = list(args)
+    
+        if shell:
+            # On Android the default shell is at '/system/bin/sh'.
+            unix_shell = ('/system/bin/sh' if
+                      hasattr(sys, 'getandroidapilevel') else '/bin/sh')
+            args = [unix_shell, "-c"] + args
+            if executable:
+                args[0] = executable
+    
+        if executable is None:
+            executable = args[0]
+    
+        sys.audit("subprocess.Popen", executable, args, cwd, env)
+    
+        if (_USE_POSIX_SPAWN
+                and os.path.dirname(executable)
+                and preexec_fn is None
+                and not close_fds
+                and not pass_fds
+                and cwd is None
+                and (p2cread == -1 or p2cread > 2)
+                and (c2pwrite == -1 or c2pwrite > 2)
+                and (errwrite == -1 or errwrite > 2)
+                and not start_new_session
+                and process_group == -1
+                and gid is None
+                and gids is None
+                and uid is None
+                and umask < 0):
+            self._posix_spawn(args, executable, env, restore_signals,
+                              p2cread, p2cwrite,
+                              c2pread, c2pwrite,
+                              errread, errwrite)
+            return
+    
+        orig_executable = executable
+    
+        # For transferring possible exec failure from child to parent.
+        # Data format: "exception name:hex errno:description"
+        # Pickle is not used; it is complex and involves memory allocation.
+        errpipe_read, errpipe_write = os.pipe()
+        # errpipe_write must not be in the standard io 0, 1, or 2 fd range.
+        low_fds_to_close = []
+        while errpipe_write < 3:
+            low_fds_to_close.append(errpipe_write)
+            errpipe_write = os.dup(errpipe_write)
+        for low_fd in low_fds_to_close:
+            os.close(low_fd)
+        try:
+            try:
+                # We must avoid complex work that could involve
+                # malloc or free in the child process to avoid
+                # potential deadlocks, thus we do all this here.
+                # and pass it to fork_exec()
+    
+                if env is not None:
+                    env_list = []
+                    for k, v in env.items():
+                        k = os.fsencode(k)
+                        if b'=' in k:
+                            raise ValueError("illegal environment variable name")
+                        env_list.append(k + b'=' + os.fsencode(v))
+                else:
+                    env_list = None  # Use execv instead of execve.
+                executable = os.fsencode(executable)
+                if os.path.dirname(executable):
+                    executable_list = (executable,)
+                else:
+                    # This matches the behavior of os._execvpe().
+                    executable_list = tuple(
+                        os.path.join(os.fsencode(dir), executable)
+                        for dir in os.get_exec_path(env))
+                fds_to_keep = set(pass_fds)
+                fds_to_keep.add(errpipe_write)
+                self.pid = _fork_exec(
+                        args, executable_list,
+                        close_fds, tuple(sorted(map(int, fds_to_keep))),
+                        cwd, env_list,
+                        p2cread, p2cwrite, c2pread, c2pwrite,
+                        errread, errwrite,
+                        errpipe_read, errpipe_write,
+                        restore_signals, start_new_session,
+                        process_group, gid, gids, uid, umask,
+                        preexec_fn, _USE_VFORK)
+                self._child_created = True
+            finally:
+                # be sure the FD is closed no matter what
+                os.close(errpipe_write)
+    
+            self._close_pipe_fds(p2cread, p2cwrite,
+                                 c2pread, c2pwrite,
+                                 errread, errwrite)
+    
+            # Wait for exec to fail or succeed; possibly raising an
+            # exception (limited in size)
+            errpipe_data = bytearray()
+            while True:
+                part = os.read(errpipe_read, 50000)
+                errpipe_data += part
+                if not part or len(errpipe_data) > 50000:
+                    break
+        finally:
+            # be sure the FD is closed no matter what
+            os.close(errpipe_read)
+    
+        if errpipe_data:
+            try:
+                pid, sts = os.waitpid(self.pid, 0)
+                if pid == self.pid:
+                    self._handle_exitstatus(sts)
+                else:
+                    self.returncode = sys.maxsize
+            except ChildProcessError:
+                pass
+    
+            try:
+                exception_name, hex_errno, err_msg = (
+                        errpipe_data.split(b':', 2))
+                # The encoding here should match the encoding
+                # written in by the subprocess implementations
+                # like _posixsubprocess
+                err_msg = err_msg.decode()
+            except ValueError:
+                exception_name = b'SubprocessError'
+                hex_errno = b'0'
+                err_msg = 'Bad exception data from child: {!r}'.format(
+                              bytes(errpipe_data))
+            child_exception_type = getattr(
+                    builtins, exception_name.decode('ascii'),
+                    SubprocessError)
+            if issubclass(child_exception_type, OSError) and hex_errno:
+                errno_num = int(hex_errno, 16)
+                if err_msg == "noexec:chdir":
+                    err_msg = ""
+                    # The error must be from chdir(cwd).
+                    err_filename = cwd
+                elif err_msg == "noexec":
+                    err_msg = ""
+                    err_filename = None
+                else:
+                    err_filename = orig_executable
+                if errno_num != 0:
+                    err_msg = os.strerror(errno_num)
+                if err_filename is not None:
+>                   raise child_exception_type(errno_num, err_msg, err_filename)
+E                   FileNotFoundError: [Errno 2] No such file or directory: 'systemctl'
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:1955: FileNotFoundError
+________ test_browser_manage_connect_default_local_reports_launch_hint _________
+[gw25] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10a5fc3d0>
+
+    def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+        emitted: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            server,
+            "_emit",
+            lambda evt, sid, payload=None: emitted.append((evt, payload or {})),
+        )
+        fake = types.SimpleNamespace(
+            cleanup_all_browsers=lambda: None,
+            _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
+        )
+        with patch.dict(sys.modules, {"tools.browser_tool": fake}):
+            _stub_urlopen(monkeypatch, ok=False)
+            with (
+                patch(
+                    "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                ),
+                patch(
+                    "hermes_cli.browser_connect.get_chrome_debug_candidates",
+                    return_value=[],
+                ),
+            ):
+                resp = server.handle_request(
+                    {
+                        "id": "1",
+                        "method": "browser.manage",
+                        "params": {
+                            "action": "connect",
+                            "session_id": "sess-1",
+                            "url": "http://localhost:9222",
+                        },
+                    }
+                )
+    
+        assert resp["result"]["connected"] is False
+        assert resp["result"]["url"] == "http://127.0.0.1:9222"
+        assert (
+            resp["result"]["messages"][0]
+            == "Chrome isn't running with remote debugging — attempting to launch..."
+        )
+>       assert any(
+            "No Chrome/Chromium executable was found" in line
+            for line in resp["result"]["messages"]
+        )
+E       assert False
+E        +  where False = any(<generator object test_browser_manage_connect_default_local_reports_launch_hint.<locals>.<genexpr> at 0x10cd145f0>)
+
+tests/test_tui_gateway_server.py:4018: AssertionError
+______________ TestPatchStaleness.test_patch_warns_on_stale_file _______________
+[gw6] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_staleness.TestPatchStaleness testMethod=test_patch_warns_on_stale_file>
+mock_ops = <MagicMock name='_get_file_ops' id='4529088848'>
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_warns_on_stale_file(self, mock_ops):
+        """Patch should warn if the target file changed since last read."""
+        mock_ops.return_value = _make_fake_ops("original line\n", 15)
+        read_file_tool(self._tmpfile, task_id="p1")
+    
+        time.sleep(0.05)
+        with open(self._tmpfile, "w") as f:
+            f.write("externally modified\n")
+    
+        result = json.loads(patch_tool(
+            mode="replace", path=self._tmpfile,
+            old_string="original", new_string="patched",
+            task_id="p1",
+        ))
+>       self.assertIn("_warning", result)
+E       AssertionError: '_warning' not found in {'error': 'Refusing to write to sensitive system path: /var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/tmpf5hg0voh/patch_test.txt\nUse the terminal tool with sudo if you need to modify system files.'}
+
+tests/tools/test_file_staleness.py:238: AssertionError
+_______________ TestSupportsSystemdServicesWSL.test_native_linux _______________
+[gw8] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_gateway_wsl.TestSupportsSystemdServicesWSL object at 0x108480390>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x108565550>
+
+    def test_native_linux(self, monkeypatch):
+        """Native Linux (not WSL) → True without checking systemd."""
+        monkeypatch.setattr(gateway, "is_linux", lambda: True)
+        monkeypatch.setattr(gateway, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway, "is_wsl", lambda: False)
+>       assert gateway.supports_systemd_services() is True
+E       assert False is True
+E        +  where False = <function supports_systemd_services at 0x107e3e520>()
+E        +    where <function supports_systemd_services at 0x107e3e520> = gateway.supports_systemd_services
+
+tests/hermes_cli/test_gateway_wsl.py:148: AssertionError
+_____ TestWriteInvalidatesDedup.test_write_does_not_invalidate_other_tasks _____
+[gw27] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_read_guards.TestWriteInvalidatesDedup testMethod=test_write_does_not_invalidate_other_tasks>
+mock_ops = <MagicMock name='_get_file_ops' id='4474079632'>
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_does_not_invalidate_other_tasks(self, mock_ops):
+        """Writing in task A should not invalidate dedup for task B."""
+        fake = MagicMock()
+        fake.read_file = lambda path, offset=1, limit=500: _FakeReadResult(
+            content="original content\n", total_lines=1, file_size=18,
+        )
+        fake.write_file = lambda path, content: MagicMock(
+            to_dict=lambda: {"success": True, "path": path}
+        )
+        mock_ops.return_value = fake
+    
+        # Both tasks read the file.
+        read_file_tool(self._tmpfile, task_id="taskA")
+        read_file_tool(self._tmpfile, task_id="taskB")
+    
+        # Task A writes.
+        write_file_tool(self._tmpfile, "new\n", task_id="taskA")
+    
+        # Task A's dedup should be invalidated.
+        rA = json.loads(read_file_tool(self._tmpfile, task_id="taskA"))
+>       self.assertNotEqual(rA.get("dedup"), True,
+                            "Writing task's dedup should be invalidated")
+E       AssertionError: True == True : Writing task's dedup should be invalidated
+
+tests/tools/test_file_read_guards.py:746: AssertionError
+____ TestSlashEphemeralAck.test_send_uses_response_url_when_context_exists _____
+[gw8] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.gateway.test_slack.TestSlashEphemeralAck object at 0x108460110>
+adapter = <gateway.platforms.slack.SlackAdapter object at 0x10960b250>
+
+    @pytest.mark.asyncio
+    async def test_send_uses_response_url_when_context_exists(self, adapter):
+        """send() should POST to response_url for slash command replies."""
+        import time
+        adapter._slash_command_contexts[("C_SLASH", "U_SLASH")] = {
+            "response_url": "https://hooks.slack.com/commands/T123/456/abc",
+            "ts": time.monotonic(),
+        }
+    
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+    
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+    
+>       with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
+
+tests/gateway/test_slack.py:2994: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/unittest/mock.py:1430: in __enter__
+    self.target = self.getter()
+                  ^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'gateway.platforms.slack.aiohttp'
+
+    def resolve_name(name):
+        """
+        Resolve a name to an object.
+    
+        It is expected that `name` will be a string in one of the following
+        formats, where W is shorthand for a valid Python identifier and dot stands
+        for a literal period in these pseudo-regexes:
+    
+        W(.W)*
+        W(.W)*:(W(.W)*)?
+    
+        The first form is intended for backward compatibility only. It assumes that
+        some part of the dotted name is a package, and the rest is an object
+        somewhere within that package, possibly nested inside other objects.
+        Because the place where the package stops and the object hierarchy starts
+        can't be inferred by inspection, repeated attempts to import must be done
+        with this form.
+    
+        In the second form, the caller makes the division point clear through the
+        provision of a single colon: the dotted name to the left of the colon is a
+        package to be imported, and the dotted name to the right is the object
+        hierarchy within that package. Only one import is needed in this form. If
+        it ends with the colon, then a module object is returned.
+    
+        The function will return an object (which might be a module), or raise one
+        of the following exceptions:
+    
+        ValueError - if `name` isn't in a recognised format
+        ImportError - if an import failed when it shouldn't have
+        AttributeError - if a failure occurred when traversing the object hierarchy
+                         within the imported package to get to the desired object.
+        """
+        global _NAME_PATTERN
+        if _NAME_PATTERN is None:
+            # Lazy import to speedup Python startup time
+            import re
+            dotted_words = r'(?!\d)(\w+)(\.(?!\d)(\w+))*'
+            _NAME_PATTERN = re.compile(f'^(?P<pkg>{dotted_words})'
+                                       f'(?P<cln>:(?P<obj>{dotted_words})?)?$',
+                                       re.UNICODE)
+    
+        m = _NAME_PATTERN.match(name)
+        if not m:
+            raise ValueError(f'invalid format: {name!r}')
+        gd = m.groupdict()
+        if gd.get('cln'):
+            # there is a colon - a one-step import is all that's needed
+            mod = importlib.import_module(gd['pkg'])
+            parts = gd.get('obj')
+            parts = parts.split('.') if parts else []
+        else:
+            # no colon - have to iterate to find the package boundary
+            parts = name.split('.')
+            modname = parts.pop(0)
+            # first part *must* be a module/package.
+            mod = importlib.import_module(modname)
+            while parts:
+                p = parts[0]
+                s = f'{modname}.{p}'
+                try:
+                    mod = importlib.import_module(s)
+                    parts.pop(0)
+                    modname = s
+                except ImportError:
+                    break
+        # if we reach this point, mod is the module, already imported, and
+        # parts is the list of parts in the object hierarchy to be traversed, or
+        # an empty list if just the module is wanted.
+        result = mod
+        for p in parts:
+>           result = getattr(result, p)
+                     ^^^^^^^^^^^^^^^^^^
+E           AttributeError: module 'gateway.platforms.slack' has no attribute 'aiohttp'
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/pkgutil.py:715: AttributeError
+_________ TestWriteInvalidatesDedup.test_write_invalidates_all_offsets _________
+[gw27] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_read_guards.TestWriteInvalidatesDedup testMethod=test_write_invalidates_all_offsets>
+mock_ops = <MagicMock name='_get_file_ops' id='4455340176'>
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_invalidates_all_offsets(self, mock_ops):
+        """A write invalidates dedup entries for ALL offset/limit combos."""
+        fake = MagicMock()
+        fake.read_file = lambda path, offset=1, limit=500: _FakeReadResult(
+            content="line1\nline2\nline3\n", total_lines=3, file_size=20,
+        )
+        fake.write_file = lambda path, content: MagicMock(
+            to_dict=lambda: {"success": True, "path": path}
+        )
+        mock_ops.return_value = fake
+    
+        # Read with different offsets to populate multiple dedup entries.
+        read_file_tool(self._tmpfile, offset=1, limit=100, task_id="off")
+        read_file_tool(self._tmpfile, offset=50, limit=100, task_id="off")
+    
+        # Write — should invalidate BOTH dedup entries.
+        write_file_tool(self._tmpfile, "replaced\n", task_id="off")
+    
+        # Both reads should return fresh content.
+        r1 = json.loads(read_file_tool(self._tmpfile, offset=1, limit=100, task_id="off"))
+        r2 = json.loads(read_file_tool(self._tmpfile, offset=50, limit=100, task_id="off"))
+>       self.assertNotEqual(r1.get("dedup"), True,
+                            "offset=1 should not dedup after write")
+E       AssertionError: True == True : offset=1 should not dedup after write
+
+tests/tools/test_file_read_guards.py:688: AssertionError
+____________ FileToolsIntegrationTests.test_net_new_file_no_warning ____________
+[gw3] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_state_registry.FileToolsIntegrationTests testMethod=test_net_new_file_no_warning>
+
+    def test_net_new_file_no_warning(self):
+        p = os.path.join(self._tmpdir, "brand_new.txt")
+        # Nobody has read or written this before.
+        w = json.loads(write_file_tool(path=p, content="hi\n", task_id="agentX"))
+        self.assertFalse(w.get("_warning"))
+>       self.assertNotIn("error", w)
+E       AssertionError: 'error' unexpectedly found in {'error': 'Refusing to write to sensitive system path: /var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/hermes_file_state_int_1iciqeun/brand_new.txt\nUse the terminal tool with sudo if you need to modify system files.'}
+
+tests/tools/test_file_state_registry.py:283: AssertionError
+_____________________ test_systemctl_status_passes_through _____________________
+[gw12] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+    def test_systemctl_status_passes_through():
+        """Read-only systemctl probes (status/show/list-units) are fine."""
+        # Run with check=False so we don't fail on the gateway's exit code.
+>       r = subprocess.run(
+            ["systemctl", "--user", "status", "hermes-gateway", "--no-pager"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+tests/test_live_system_guard_self_test.py:210: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/conftest.py:862: in _guarded
+    return real(cmd, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:548: in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/conftest.py:880: in __init__
+    super().__init__(cmd, *args, **kwargs)
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Popen: returncode: 255 args: ['systemctl', '--user', 'status', 'hermes-gate...>
+args = ['systemctl', '--user', 'status', 'hermes-gateway', '--no-pager']
+executable = b'systemctl', preexec_fn = None, close_fds = True, pass_fds = ()
+cwd = None, env = None, startupinfo = None, creationflags = 0, shell = False
+p2cread = -1, p2cwrite = -1, c2pread = 16, c2pwrite = 17, errread = 18
+errwrite = 19, restore_signals = True, gid = None, gids = None, uid = None
+umask = -1, start_new_session = False, process_group = -1
+
+    def _execute_child(self, args, executable, preexec_fn, close_fds,
+                       pass_fds, cwd, env,
+                       startupinfo, creationflags, shell,
+                       p2cread, p2cwrite,
+                       c2pread, c2pwrite,
+                       errread, errwrite,
+                       restore_signals,
+                       gid, gids, uid, umask,
+                       start_new_session, process_group):
+        """Execute program (POSIX version)"""
+    
+        if isinstance(args, (str, bytes)):
+            args = [args]
+        elif isinstance(args, os.PathLike):
+            if shell:
+                raise TypeError('path-like args is not allowed when '
+                                'shell is true')
+            args = [args]
+        else:
+            args = list(args)
+    
+        if shell:
+            # On Android the default shell is at '/system/bin/sh'.
+            unix_shell = ('/system/bin/sh' if
+                      hasattr(sys, 'getandroidapilevel') else '/bin/sh')
+            args = [unix_shell, "-c"] + args
+            if executable:
+                args[0] = executable
+    
+        if executable is None:
+            executable = args[0]
+    
+        sys.audit("subprocess.Popen", executable, args, cwd, env)
+    
+        if (_USE_POSIX_SPAWN
+                and os.path.dirname(executable)
+                and preexec_fn is None
+                and not close_fds
+                and not pass_fds
+                and cwd is None
+                and (p2cread == -1 or p2cread > 2)
+                and (c2pwrite == -1 or c2pwrite > 2)
+                and (errwrite == -1 or errwrite > 2)
+                and not start_new_session
+                and process_group == -1
+                and gid is None
+                and gids is None
+                and uid is None
+                and umask < 0):
+            self._posix_spawn(args, executable, env, restore_signals,
+                              p2cread, p2cwrite,
+                              c2pread, c2pwrite,
+                              errread, errwrite)
+            return
+    
+        orig_executable = executable
+    
+        # For transferring possible exec failure from child to parent.
+        # Data format: "exception name:hex errno:description"
+        # Pickle is not used; it is complex and involves memory allocation.
+        errpipe_read, errpipe_write = os.pipe()
+        # errpipe_write must not be in the standard io 0, 1, or 2 fd range.
+        low_fds_to_close = []
+        while errpipe_write < 3:
+            low_fds_to_close.append(errpipe_write)
+            errpipe_write = os.dup(errpipe_write)
+        for low_fd in low_fds_to_close:
+            os.close(low_fd)
+        try:
+            try:
+                # We must avoid complex work that could involve
+                # malloc or free in the child process to avoid
+                # potential deadlocks, thus we do all this here.
+                # and pass it to fork_exec()
+    
+                if env is not None:
+                    env_list = []
+                    for k, v in env.items():
+                        k = os.fsencode(k)
+                        if b'=' in k:
+                            raise ValueError("illegal environment variable name")
+                        env_list.append(k + b'=' + os.fsencode(v))
+                else:
+                    env_list = None  # Use execv instead of execve.
+                executable = os.fsencode(executable)
+                if os.path.dirname(executable):
+                    executable_list = (executable,)
+                else:
+                    # This matches the behavior of os._execvpe().
+                    executable_list = tuple(
+                        os.path.join(os.fsencode(dir), executable)
+                        for dir in os.get_exec_path(env))
+                fds_to_keep = set(pass_fds)
+                fds_to_keep.add(errpipe_write)
+                self.pid = _fork_exec(
+                        args, executable_list,
+                        close_fds, tuple(sorted(map(int, fds_to_keep))),
+                        cwd, env_list,
+                        p2cread, p2cwrite, c2pread, c2pwrite,
+                        errread, errwrite,
+                        errpipe_read, errpipe_write,
+                        restore_signals, start_new_session,
+                        process_group, gid, gids, uid, umask,
+                        preexec_fn, _USE_VFORK)
+                self._child_created = True
+            finally:
+                # be sure the FD is closed no matter what
+                os.close(errpipe_write)
+    
+            self._close_pipe_fds(p2cread, p2cwrite,
+                                 c2pread, c2pwrite,
+                                 errread, errwrite)
+    
+            # Wait for exec to fail or succeed; possibly raising an
+            # exception (limited in size)
+            errpipe_data = bytearray()
+            while True:
+                part = os.read(errpipe_read, 50000)
+                errpipe_data += part
+                if not part or len(errpipe_data) > 50000:
+                    break
+        finally:
+            # be sure the FD is closed no matter what
+            os.close(errpipe_read)
+    
+        if errpipe_data:
+            try:
+                pid, sts = os.waitpid(self.pid, 0)
+                if pid == self.pid:
+                    self._handle_exitstatus(sts)
+                else:
+                    self.returncode = sys.maxsize
+            except ChildProcessError:
+                pass
+    
+            try:
+                exception_name, hex_errno, err_msg = (
+                        errpipe_data.split(b':', 2))
+                # The encoding here should match the encoding
+                # written in by the subprocess implementations
+                # like _posixsubprocess
+                err_msg = err_msg.decode()
+            except ValueError:
+                exception_name = b'SubprocessError'
+                hex_errno = b'0'
+                err_msg = 'Bad exception data from child: {!r}'.format(
+                              bytes(errpipe_data))
+            child_exception_type = getattr(
+                    builtins, exception_name.decode('ascii'),
+                    SubprocessError)
+            if issubclass(child_exception_type, OSError) and hex_errno:
+                errno_num = int(hex_errno, 16)
+                if err_msg == "noexec:chdir":
+                    err_msg = ""
+                    # The error must be from chdir(cwd).
+                    err_filename = cwd
+                elif err_msg == "noexec":
+                    err_msg = ""
+                    err_filename = None
+                else:
+                    err_filename = orig_executable
+                if errno_num != 0:
+                    err_msg = os.strerror(errno_num)
+                if err_filename is not None:
+>                   raise child_exception_type(errno_num, err_msg, err_filename)
+E                   FileNotFoundError: [Errno 2] No such file or directory: 'systemctl'
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:1955: FileNotFoundError
+______ TestWriteInvalidatesDedup.test_write_invalidates_dedup_same_second ______
+[gw27] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_read_guards.TestWriteInvalidatesDedup testMethod=test_write_invalidates_dedup_same_second>
+mock_ops = <MagicMock name='_get_file_ops' id='4473760976'>
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_invalidates_dedup_same_second(self, mock_ops):
+        """read→write→read within the same mtime second returns fresh content.
+    
+        This is the core #13144 scenario: on filesystems with ≥1ms mtime
+        granularity, a write that lands in the same timestamp as the prior
+        read would previously cause the second read to return a stale dedup
+        stub because the mtime comparison saw no change.
+        """
+        fake = MagicMock()
+        fake.read_file = lambda path, offset=1, limit=500: _FakeReadResult(
+            content="original content\n", total_lines=1, file_size=18,
+        )
+        fake.write_file = lambda path, content: MagicMock(
+            to_dict=lambda: {"success": True, "path": path}
+        )
+        mock_ops.return_value = fake
+    
+        # 1. Read — populates dedup cache.
+        r1 = json.loads(read_file_tool(self._tmpfile, task_id="wr"))
+        self.assertNotEqual(r1.get("dedup"), True)
+    
+        # 2. Write — must invalidate dedup for this path.
+        #    (No sleep — we intentionally stay in the same mtime second.)
+        write_file_tool(self._tmpfile, "new content\n", task_id="wr")
+    
+        # 3. Read again — should get full content, NOT dedup stub.
+        fake.read_file = lambda path, offset=1, limit=500: _FakeReadResult(
+            content="new content\n", total_lines=1, file_size=13,
+        )
+        r2 = json.loads(read_file_tool(self._tmpfile, task_id="wr"))
+>       self.assertNotEqual(r2.get("dedup"), True,
+                            "read after write must not return dedup stub")
+E       AssertionError: True == True : read after write must not return dedup stub
+
+tests/tools/test_file_read_guards.py:662: AssertionError
+___ TestSlashEphemeralAck.test_send_slash_ephemeral_fallback_on_post_failure ___
+[gw8] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.gateway.test_slack.TestSlashEphemeralAck object at 0x10849fa10>
+adapter = <gateway.platforms.slack.SlackAdapter object at 0x107b50d90>
+
+    @pytest.mark.asyncio
+    async def test_send_slash_ephemeral_fallback_on_post_failure(self, adapter):
+        """_send_slash_ephemeral returns success=True even if POST fails."""
+        import time
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/bad",
+            "ts": time.monotonic(),
+        }
+    
+        mock_resp = AsyncMock()
+        mock_resp.status = 500
+        mock_resp.text = AsyncMock(return_value="Internal Server Error")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+    
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+    
+>       with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
+
+tests/gateway/test_slack.py:3041: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/unittest/mock.py:1430: in __enter__
+    self.target = self.getter()
+                  ^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'gateway.platforms.slack.aiohttp'
+
+    def resolve_name(name):
+        """
+        Resolve a name to an object.
+    
+        It is expected that `name` will be a string in one of the following
+        formats, where W is shorthand for a valid Python identifier and dot stands
+        for a literal period in these pseudo-regexes:
+    
+        W(.W)*
+        W(.W)*:(W(.W)*)?
+    
+        The first form is intended for backward compatibility only. It assumes that
+        some part of the dotted name is a package, and the rest is an object
+        somewhere within that package, possibly nested inside other objects.
+        Because the place where the package stops and the object hierarchy starts
+        can't be inferred by inspection, repeated attempts to import must be done
+        with this form.
+    
+        In the second form, the caller makes the division point clear through the
+        provision of a single colon: the dotted name to the left of the colon is a
+        package to be imported, and the dotted name to the right is the object
+        hierarchy within that package. Only one import is needed in this form. If
+        it ends with the colon, then a module object is returned.
+    
+        The function will return an object (which might be a module), or raise one
+        of the following exceptions:
+    
+        ValueError - if `name` isn't in a recognised format
+        ImportError - if an import failed when it shouldn't have
+        AttributeError - if a failure occurred when traversing the object hierarchy
+                         within the imported package to get to the desired object.
+        """
+        global _NAME_PATTERN
+        if _NAME_PATTERN is None:
+            # Lazy import to speedup Python startup time
+            import re
+            dotted_words = r'(?!\d)(\w+)(\.(?!\d)(\w+))*'
+            _NAME_PATTERN = re.compile(f'^(?P<pkg>{dotted_words})'
+                                       f'(?P<cln>:(?P<obj>{dotted_words})?)?$',
+                                       re.UNICODE)
+    
+        m = _NAME_PATTERN.match(name)
+        if not m:
+            raise ValueError(f'invalid format: {name!r}')
+        gd = m.groupdict()
+        if gd.get('cln'):
+            # there is a colon - a one-step import is all that's needed
+            mod = importlib.import_module(gd['pkg'])
+            parts = gd.get('obj')
+            parts = parts.split('.') if parts else []
+        else:
+            # no colon - have to iterate to find the package boundary
+            parts = name.split('.')
+            modname = parts.pop(0)
+            # first part *must* be a module/package.
+            mod = importlib.import_module(modname)
+            while parts:
+                p = parts[0]
+                s = f'{modname}.{p}'
+                try:
+                    mod = importlib.import_module(s)
+                    parts.pop(0)
+                    modname = s
+                except ImportError:
+                    break
+        # if we reach this point, mod is the module, already imported, and
+        # parts is the list of parts in the object hierarchy to be traversed, or
+        # an empty list if just the module is wanted.
+        result = mod
+        for p in parts:
+>           result = getattr(result, p)
+                     ^^^^^^^^^^^^^^^^^^
+E           AttributeError: module 'gateway.platforms.slack' has no attribute 'aiohttp'
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/pkgutil.py:715: AttributeError
+_____________ TestPtyWebSocket.test_streams_child_stdout_to_client _____________
+[gw4] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_web_server.TestPtyWebSocket object at 0x10c6df590>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10bbf2e90>
+
+    def test_streams_child_stdout_to_client(self, monkeypatch):
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_chat_argv",
+            lambda resume=None, sidecar_url=None: (
+                ["/bin/sh", "-c", "printf hermes-ws-ok"],
+                None,
+                None,
+            ),
+        )
+        with self.client.websocket_connect(self._url()) as conn:
+            # Drain frames until we see the needle or time out.  TestClient's
+            # recv_bytes blocks; loop until we have the signal byte string.
+            buf = b""
+            import time
+    
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    frame = conn.receive_bytes()
+                except Exception:
+                    break
+                if frame:
+                    buf += frame
+                if b"hermes-ws-ok" in buf:
+                    break
+>           assert b"hermes-ws-ok" in buf
+E           AssertionError: assert b'hermes-ws-ok' in b''
+
+tests/hermes_cli/test_web_server.py:2156: AssertionError
+__ TestStalenessCheck.test_relative_path_uses_live_cwd_for_staleness_tracking __
+[gw27] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_staleness.TestStalenessCheck testMethod=test_relative_path_uses_live_cwd_for_staleness_tracking>
+mock_ops = <MagicMock name='_get_file_ops' id='4456641552'>
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_relative_path_uses_live_cwd_for_staleness_tracking(self, mock_ops):
+        """Relative-path stale tracking must follow the live terminal cwd."""
+        start_dir = os.path.join(self._tmpdir, "start")
+        live_dir = os.path.join(self._tmpdir, "worktree")
+        os.makedirs(start_dir, exist_ok=True)
+        os.makedirs(live_dir, exist_ok=True)
+    
+        start_file = os.path.join(start_dir, "shared.txt")
+        live_file = os.path.join(live_dir, "shared.txt")
+        with open(start_file, "w") as f:
+            f.write("start copy\n")
+        with open(live_file, "w") as f:
+            f.write("live copy\n")
+    
+        fake_ops = _make_fake_ops("live copy\n", 10)
+        fake_ops.env = SimpleNamespace(cwd=live_dir)
+        fake_ops.cwd = start_dir
+        mock_ops.return_value = fake_ops
+    
+        from tools import file_tools
+    
+        with file_tools._file_ops_lock:
+            previous = file_tools._file_ops_cache.get("live_task")
+            file_tools._file_ops_cache["live_task"] = fake_ops
+    
+        try:
+            with patch.dict(os.environ, {"TERMINAL_CWD": start_dir}, clear=False):
+                read_file_tool("shared.txt", task_id="live_task")
+    
+                time.sleep(0.05)
+                with open(live_file, "w") as f:
+                    f.write("live copy modified elsewhere\n")
+    
+                result = json.loads(
+                    write_file_tool("shared.txt", "replacement", task_id="live_task")
+                )
+        finally:
+            with file_tools._file_ops_lock:
+                if previous is None:
+                    file_tools._file_ops_cache.pop("live_task", None)
+                else:
+                    file_tools._file_ops_cache["live_task"] = previous
+    
+>       self.assertIn("_warning", result)
+E       AssertionError: '_warning' not found in {'error': 'Refusing to write to sensitive system path: shared.txt\nUse the terminal tool with sudo if you need to modify system files.'}
+
+tests/tools/test_file_staleness.py:196: AssertionError
+_ FileToolsIntegrationTests.test_sibling_agent_write_surfaces_warning_through_handler _
+[gw3] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_state_registry.FileToolsIntegrationTests testMethod=test_sibling_agent_write_surfaces_warning_through_handler>
+
+    def test_sibling_agent_write_surfaces_warning_through_handler(self):
+        p = self._write_seed("shared.txt")
+        r = json.loads(read_file_tool(path=p, task_id="agentA"))
+        self.assertNotIn("error", r)
+    
+        w_b = json.loads(write_file_tool(path=p, content="B wrote\n", task_id="agentB"))
+>       self.assertNotIn("error", w_b)
+E       AssertionError: 'error' unexpectedly found in {'error': 'Refusing to write to sensitive system path: /var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/hermes_file_state_int_2zbxtaan/shared.txt\nUse the terminal tool with sudo if you need to modify system files.'}
+
+tests/tools/test_file_state_registry.py:238: AssertionError
+------------------------------ Captured log call -------------------------------
+INFO     tools.file_tools:file_tools.py:380 Creating new local environment for task default...
+INFO     tools.environments.base:base.py:388 Session snapshot created (session=c74ad54c6761, cwd=/Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline)
+INFO     tools.file_tools:file_tools.py:429 local environment ready for task default
+______________________ test_systemctl_show_passes_through ______________________
+[gw12] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+    def test_systemctl_show_passes_through():
+>       r = subprocess.run(
+            ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+tests/test_live_system_guard_self_test.py:220: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/conftest.py:862: in _guarded
+    return real(cmd, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:548: in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/conftest.py:880: in __init__
+    super().__init__(cmd, *args, **kwargs)
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Popen: returncode: 255 args: ['systemctl', '--user', 'show', 'hermes-gatewa...>
+args = ['systemctl', '--user', 'show', 'hermes-gateway', '--no-pager']
+executable = b'systemctl', preexec_fn = None, close_fds = True, pass_fds = ()
+cwd = None, env = None, startupinfo = None, creationflags = 0, shell = False
+p2cread = -1, p2cwrite = -1, c2pread = 16, c2pwrite = 17, errread = 18
+errwrite = 19, restore_signals = True, gid = None, gids = None, uid = None
+umask = -1, start_new_session = False, process_group = -1
+
+    def _execute_child(self, args, executable, preexec_fn, close_fds,
+                       pass_fds, cwd, env,
+                       startupinfo, creationflags, shell,
+                       p2cread, p2cwrite,
+                       c2pread, c2pwrite,
+                       errread, errwrite,
+                       restore_signals,
+                       gid, gids, uid, umask,
+                       start_new_session, process_group):
+        """Execute program (POSIX version)"""
+    
+        if isinstance(args, (str, bytes)):
+            args = [args]
+        elif isinstance(args, os.PathLike):
+            if shell:
+                raise TypeError('path-like args is not allowed when '
+                                'shell is true')
+            args = [args]
+        else:
+            args = list(args)
+    
+        if shell:
+            # On Android the default shell is at '/system/bin/sh'.
+            unix_shell = ('/system/bin/sh' if
+                      hasattr(sys, 'getandroidapilevel') else '/bin/sh')
+            args = [unix_shell, "-c"] + args
+            if executable:
+                args[0] = executable
+    
+        if executable is None:
+            executable = args[0]
+    
+        sys.audit("subprocess.Popen", executable, args, cwd, env)
+    
+        if (_USE_POSIX_SPAWN
+                and os.path.dirname(executable)
+                and preexec_fn is None
+                and not close_fds
+                and not pass_fds
+                and cwd is None
+                and (p2cread == -1 or p2cread > 2)
+                and (c2pwrite == -1 or c2pwrite > 2)
+                and (errwrite == -1 or errwrite > 2)
+                and not start_new_session
+                and process_group == -1
+                and gid is None
+                and gids is None
+                and uid is None
+                and umask < 0):
+            self._posix_spawn(args, executable, env, restore_signals,
+                              p2cread, p2cwrite,
+                              c2pread, c2pwrite,
+                              errread, errwrite)
+            return
+    
+        orig_executable = executable
+    
+        # For transferring possible exec failure from child to parent.
+        # Data format: "exception name:hex errno:description"
+        # Pickle is not used; it is complex and involves memory allocation.
+        errpipe_read, errpipe_write = os.pipe()
+        # errpipe_write must not be in the standard io 0, 1, or 2 fd range.
+        low_fds_to_close = []
+        while errpipe_write < 3:
+            low_fds_to_close.append(errpipe_write)
+            errpipe_write = os.dup(errpipe_write)
+        for low_fd in low_fds_to_close:
+            os.close(low_fd)
+        try:
+            try:
+                # We must avoid complex work that could involve
+                # malloc or free in the child process to avoid
+                # potential deadlocks, thus we do all this here.
+                # and pass it to fork_exec()
+    
+                if env is not None:
+                    env_list = []
+                    for k, v in env.items():
+                        k = os.fsencode(k)
+                        if b'=' in k:
+                            raise ValueError("illegal environment variable name")
+                        env_list.append(k + b'=' + os.fsencode(v))
+                else:
+                    env_list = None  # Use execv instead of execve.
+                executable = os.fsencode(executable)
+                if os.path.dirname(executable):
+                    executable_list = (executable,)
+                else:
+                    # This matches the behavior of os._execvpe().
+                    executable_list = tuple(
+                        os.path.join(os.fsencode(dir), executable)
+                        for dir in os.get_exec_path(env))
+                fds_to_keep = set(pass_fds)
+                fds_to_keep.add(errpipe_write)
+                self.pid = _fork_exec(
+                        args, executable_list,
+                        close_fds, tuple(sorted(map(int, fds_to_keep))),
+                        cwd, env_list,
+                        p2cread, p2cwrite, c2pread, c2pwrite,
+                        errread, errwrite,
+                        errpipe_read, errpipe_write,
+                        restore_signals, start_new_session,
+                        process_group, gid, gids, uid, umask,
+                        preexec_fn, _USE_VFORK)
+                self._child_created = True
+            finally:
+                # be sure the FD is closed no matter what
+                os.close(errpipe_write)
+    
+            self._close_pipe_fds(p2cread, p2cwrite,
+                                 c2pread, c2pwrite,
+                                 errread, errwrite)
+    
+            # Wait for exec to fail or succeed; possibly raising an
+            # exception (limited in size)
+            errpipe_data = bytearray()
+            while True:
+                part = os.read(errpipe_read, 50000)
+                errpipe_data += part
+                if not part or len(errpipe_data) > 50000:
+                    break
+        finally:
+            # be sure the FD is closed no matter what
+            os.close(errpipe_read)
+    
+        if errpipe_data:
+            try:
+                pid, sts = os.waitpid(self.pid, 0)
+                if pid == self.pid:
+                    self._handle_exitstatus(sts)
+                else:
+                    self.returncode = sys.maxsize
+            except ChildProcessError:
+                pass
+    
+            try:
+                exception_name, hex_errno, err_msg = (
+                        errpipe_data.split(b':', 2))
+                # The encoding here should match the encoding
+                # written in by the subprocess implementations
+                # like _posixsubprocess
+                err_msg = err_msg.decode()
+            except ValueError:
+                exception_name = b'SubprocessError'
+                hex_errno = b'0'
+                err_msg = 'Bad exception data from child: {!r}'.format(
+                              bytes(errpipe_data))
+            child_exception_type = getattr(
+                    builtins, exception_name.decode('ascii'),
+                    SubprocessError)
+            if issubclass(child_exception_type, OSError) and hex_errno:
+                errno_num = int(hex_errno, 16)
+                if err_msg == "noexec:chdir":
+                    err_msg = ""
+                    # The error must be from chdir(cwd).
+                    err_filename = cwd
+                elif err_msg == "noexec":
+                    err_msg = ""
+                    err_filename = None
+                else:
+                    err_filename = orig_executable
+                if errno_num != 0:
+                    err_msg = os.strerror(errno_num)
+                if err_filename is not None:
+>                   raise child_exception_type(errno_num, err_msg, err_filename)
+E                   FileNotFoundError: [Errno 2] No such file or directory: 'systemctl'
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:1955: FileNotFoundError
+____ TestSlashEphemeralAck.test_send_slash_ephemeral_fallback_on_exception _____
+[gw8] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.gateway.test_slack.TestSlashEphemeralAck object at 0x10849dd50>
+adapter = <gateway.platforms.slack.SlackAdapter object at 0x10794a850>
+
+    @pytest.mark.asyncio
+    async def test_send_slash_ephemeral_fallback_on_exception(self, adapter):
+        """_send_slash_ephemeral returns success=True even if aiohttp raises."""
+        import time
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/timeout",
+            "ts": time.monotonic(),
+        }
+    
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(side_effect=Exception("connection timeout"))
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+    
+>       with patch("gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session):
+
+tests/gateway/test_slack.py:3061: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/unittest/mock.py:1430: in __enter__
+    self.target = self.getter()
+                  ^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'gateway.platforms.slack.aiohttp'
+
+    def resolve_name(name):
+        """
+        Resolve a name to an object.
+    
+        It is expected that `name` will be a string in one of the following
+        formats, where W is shorthand for a valid Python identifier and dot stands
+        for a literal period in these pseudo-regexes:
+    
+        W(.W)*
+        W(.W)*:(W(.W)*)?
+    
+        The first form is intended for backward compatibility only. It assumes that
+        some part of the dotted name is a package, and the rest is an object
+        somewhere within that package, possibly nested inside other objects.
+        Because the place where the package stops and the object hierarchy starts
+        can't be inferred by inspection, repeated attempts to import must be done
+        with this form.
+    
+        In the second form, the caller makes the division point clear through the
+        provision of a single colon: the dotted name to the left of the colon is a
+        package to be imported, and the dotted name to the right is the object
+        hierarchy within that package. Only one import is needed in this form. If
+        it ends with the colon, then a module object is returned.
+    
+        The function will return an object (which might be a module), or raise one
+        of the following exceptions:
+    
+        ValueError - if `name` isn't in a recognised format
+        ImportError - if an import failed when it shouldn't have
+        AttributeError - if a failure occurred when traversing the object hierarchy
+                         within the imported package to get to the desired object.
+        """
+        global _NAME_PATTERN
+        if _NAME_PATTERN is None:
+            # Lazy import to speedup Python startup time
+            import re
+            dotted_words = r'(?!\d)(\w+)(\.(?!\d)(\w+))*'
+            _NAME_PATTERN = re.compile(f'^(?P<pkg>{dotted_words})'
+                                       f'(?P<cln>:(?P<obj>{dotted_words})?)?$',
+                                       re.UNICODE)
+    
+        m = _NAME_PATTERN.match(name)
+        if not m:
+            raise ValueError(f'invalid format: {name!r}')
+        gd = m.groupdict()
+        if gd.get('cln'):
+            # there is a colon - a one-step import is all that's needed
+            mod = importlib.import_module(gd['pkg'])
+            parts = gd.get('obj')
+            parts = parts.split('.') if parts else []
+        else:
+            # no colon - have to iterate to find the package boundary
+            parts = name.split('.')
+            modname = parts.pop(0)
+            # first part *must* be a module/package.
+            mod = importlib.import_module(modname)
+            while parts:
+                p = parts[0]
+                s = f'{modname}.{p}'
+                try:
+                    mod = importlib.import_module(s)
+                    parts.pop(0)
+                    modname = s
+                except ImportError:
+                    break
+        # if we reach this point, mod is the module, already imported, and
+        # parts is the list of parts in the object hierarchy to be traversed, or
+        # an empty list if just the module is wanted.
+        result = mod
+        for p in parts:
+>           result = getattr(result, p)
+                     ^^^^^^^^^^^^^^^^^^
+E           AttributeError: module 'gateway.platforms.slack' has no attribute 'aiohttp'
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/pkgutil.py:715: AttributeError
+____________ TestPtyWebSocket.test_client_input_reaches_child_stdin ____________
+[gw4] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_web_server.TestPtyWebSocket object at 0x10c6dfc10>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10e081550>
+
+    def test_client_input_reaches_child_stdin(self, monkeypatch):
+        # ``cat`` echoes stdin back, so a write → read round-trip proves
+        # the full duplex path.
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_chat_argv",
+            lambda resume=None, sidecar_url=None: (["/bin/cat"], None, None),
+        )
+        with self.client.websocket_connect(self._url()) as conn:
+            conn.send_bytes(b"round-trip-payload\n")
+            buf = b""
+            import time
+    
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+>               frame = conn.receive_bytes()
+                        ^^^^^^^^^^^^^^^^^^^^
+
+tests/hermes_cli/test_web_server.py:2173: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <starlette.testclient.WebSocketTestSession object at 0x10dc42f90>
+
+    def receive_bytes(self) -> bytes:
+        message = self.receive()
+        self._raise_on_close(message)
+>       return cast(bytes, message["bytes"])
+                           ^^^^^^^^^^^^^^^^
+E       KeyError: 'bytes'
+
+../edna-1a61fede-41cb9170/.venv/lib/python3.11/site-packages/starlette/testclient.py:187: KeyError
+______ TestFileDedup.test_write_allows_large_file_that_quotes_status_text ______
+[gw3] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_read_guards.TestFileDedup testMethod=test_write_allows_large_file_that_quotes_status_text>
+mock_ops = <MagicMock name='_get_file_ops' id='4481446416'>
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_allows_large_file_that_quotes_status_text(self, mock_ops):
+        """Legitimate large content that happens to quote the status is allowed.
+    
+        Hermes' own docs / SKILL.md files may legitimately mention the dedup
+        message verbatim.  Only short, status-dominated writes are rejected —
+        a normal file that contains the message as one line out of many must
+        still write successfully.
+        """
+        fake = MagicMock()
+        fake.write_file = lambda path, content: MagicMock(
+            to_dict=lambda: {"success": True, "path": path}
+        )
+        mock_ops.return_value = fake
+    
+        # Build content that contains the status text but is much larger,
+        # so the status doesn't "dominate" — this is a legitimate file.
+        large_content = (
+            "# Skill reference\n\n"
+            "Example internal message (do not write back):\n\n"
+            f"    {_READ_DEDUP_STATUS_MESSAGE}\n\n"
+            + ("This is documentation content. " * 200)
+        )
+        result = json.loads(write_file_tool(
+            self._tmpfile,
+            large_content,
+            task_id="guard",
+        ))
+    
+>       self.assertNotIn("error", result)
+E       AssertionError: 'error' unexpectedly found in {'error': 'Refusing to write to sensitive system path: /var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/tmp6shbo7vl/dedup_test.txt\nUse the terminal tool with sudo if you need to modify system files.'}
+
+tests/tools/test_file_read_guards.py:254: AssertionError
+________ TestStalenessCheck.test_warning_when_file_modified_externally _________
+[gw27] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_staleness.TestStalenessCheck testMethod=test_warning_when_file_modified_externally>
+mock_ops = <MagicMock name='_get_file_ops' id='4461152208'>
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_warning_when_file_modified_externally(self, mock_ops):
+        """Read, then external modify, then write — should warn."""
+        mock_ops.return_value = _make_fake_ops("original content\n", 18)
+        read_file_tool(self._tmpfile, task_id="t1")
+    
+        # Simulate external modification
+        time.sleep(0.05)
+        with open(self._tmpfile, "w") as f:
+            f.write("someone else changed this\n")
+    
+        result = json.loads(write_file_tool(self._tmpfile, "new content", task_id="t1"))
+>       self.assertIn("_warning", result)
+E       AssertionError: '_warning' not found in {'error': 'Refusing to write to sensitive system path: /var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/tmpjfkmaq9r/stale_test.txt\nUse the terminal tool with sudo if you need to modify system files.'}
+
+tests/tools/test_file_staleness.py:117: AssertionError
+___________________ test_systemctl_list_units_passes_through ___________________
+[gw12] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+    def test_systemctl_list_units_passes_through():
+>       r = subprocess.run(
+            ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+tests/test_live_system_guard_self_test.py:230: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/conftest.py:862: in _guarded
+    return real(cmd, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:548: in run
+    with Popen(*popenargs, **kwargs) as process:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/conftest.py:880: in __init__
+    super().__init__(cmd, *args, **kwargs)
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:1026: in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <Popen: returncode: 255 args: ['systemctl', '--user', 'list-units', 'fake-no...>
+args = ['systemctl', '--user', 'list-units', 'fake-not-real-unit*', '--no-pager']
+executable = b'systemctl', preexec_fn = None, close_fds = True, pass_fds = ()
+cwd = None, env = None, startupinfo = None, creationflags = 0, shell = False
+p2cread = -1, p2cwrite = -1, c2pread = 16, c2pwrite = 17, errread = 18
+errwrite = 19, restore_signals = True, gid = None, gids = None, uid = None
+umask = -1, start_new_session = False, process_group = -1
+
+    def _execute_child(self, args, executable, preexec_fn, close_fds,
+                       pass_fds, cwd, env,
+                       startupinfo, creationflags, shell,
+                       p2cread, p2cwrite,
+                       c2pread, c2pwrite,
+                       errread, errwrite,
+                       restore_signals,
+                       gid, gids, uid, umask,
+                       start_new_session, process_group):
+        """Execute program (POSIX version)"""
+    
+        if isinstance(args, (str, bytes)):
+            args = [args]
+        elif isinstance(args, os.PathLike):
+            if shell:
+                raise TypeError('path-like args is not allowed when '
+                                'shell is true')
+            args = [args]
+        else:
+            args = list(args)
+    
+        if shell:
+            # On Android the default shell is at '/system/bin/sh'.
+            unix_shell = ('/system/bin/sh' if
+                      hasattr(sys, 'getandroidapilevel') else '/bin/sh')
+            args = [unix_shell, "-c"] + args
+            if executable:
+                args[0] = executable
+    
+        if executable is None:
+            executable = args[0]
+    
+        sys.audit("subprocess.Popen", executable, args, cwd, env)
+    
+        if (_USE_POSIX_SPAWN
+                and os.path.dirname(executable)
+                and preexec_fn is None
+                and not close_fds
+                and not pass_fds
+                and cwd is None
+                and (p2cread == -1 or p2cread > 2)
+                and (c2pwrite == -1 or c2pwrite > 2)
+                and (errwrite == -1 or errwrite > 2)
+                and not start_new_session
+                and process_group == -1
+                and gid is None
+                and gids is None
+                and uid is None
+                and umask < 0):
+            self._posix_spawn(args, executable, env, restore_signals,
+                              p2cread, p2cwrite,
+                              c2pread, c2pwrite,
+                              errread, errwrite)
+            return
+    
+        orig_executable = executable
+    
+        # For transferring possible exec failure from child to parent.
+        # Data format: "exception name:hex errno:description"
+        # Pickle is not used; it is complex and involves memory allocation.
+        errpipe_read, errpipe_write = os.pipe()
+        # errpipe_write must not be in the standard io 0, 1, or 2 fd range.
+        low_fds_to_close = []
+        while errpipe_write < 3:
+            low_fds_to_close.append(errpipe_write)
+            errpipe_write = os.dup(errpipe_write)
+        for low_fd in low_fds_to_close:
+            os.close(low_fd)
+        try:
+            try:
+                # We must avoid complex work that could involve
+                # malloc or free in the child process to avoid
+                # potential deadlocks, thus we do all this here.
+                # and pass it to fork_exec()
+    
+                if env is not None:
+                    env_list = []
+                    for k, v in env.items():
+                        k = os.fsencode(k)
+                        if b'=' in k:
+                            raise ValueError("illegal environment variable name")
+                        env_list.append(k + b'=' + os.fsencode(v))
+                else:
+                    env_list = None  # Use execv instead of execve.
+                executable = os.fsencode(executable)
+                if os.path.dirname(executable):
+                    executable_list = (executable,)
+                else:
+                    # This matches the behavior of os._execvpe().
+                    executable_list = tuple(
+                        os.path.join(os.fsencode(dir), executable)
+                        for dir in os.get_exec_path(env))
+                fds_to_keep = set(pass_fds)
+                fds_to_keep.add(errpipe_write)
+                self.pid = _fork_exec(
+                        args, executable_list,
+                        close_fds, tuple(sorted(map(int, fds_to_keep))),
+                        cwd, env_list,
+                        p2cread, p2cwrite, c2pread, c2pwrite,
+                        errread, errwrite,
+                        errpipe_read, errpipe_write,
+                        restore_signals, start_new_session,
+                        process_group, gid, gids, uid, umask,
+                        preexec_fn, _USE_VFORK)
+                self._child_created = True
+            finally:
+                # be sure the FD is closed no matter what
+                os.close(errpipe_write)
+    
+            self._close_pipe_fds(p2cread, p2cwrite,
+                                 c2pread, c2pwrite,
+                                 errread, errwrite)
+    
+            # Wait for exec to fail or succeed; possibly raising an
+            # exception (limited in size)
+            errpipe_data = bytearray()
+            while True:
+                part = os.read(errpipe_read, 50000)
+                errpipe_data += part
+                if not part or len(errpipe_data) > 50000:
+                    break
+        finally:
+            # be sure the FD is closed no matter what
+            os.close(errpipe_read)
+    
+        if errpipe_data:
+            try:
+                pid, sts = os.waitpid(self.pid, 0)
+                if pid == self.pid:
+                    self._handle_exitstatus(sts)
+                else:
+                    self.returncode = sys.maxsize
+            except ChildProcessError:
+                pass
+    
+            try:
+                exception_name, hex_errno, err_msg = (
+                        errpipe_data.split(b':', 2))
+                # The encoding here should match the encoding
+                # written in by the subprocess implementations
+                # like _posixsubprocess
+                err_msg = err_msg.decode()
+            except ValueError:
+                exception_name = b'SubprocessError'
+                hex_errno = b'0'
+                err_msg = 'Bad exception data from child: {!r}'.format(
+                              bytes(errpipe_data))
+            child_exception_type = getattr(
+                    builtins, exception_name.decode('ascii'),
+                    SubprocessError)
+            if issubclass(child_exception_type, OSError) and hex_errno:
+                errno_num = int(hex_errno, 16)
+                if err_msg == "noexec:chdir":
+                    err_msg = ""
+                    # The error must be from chdir(cwd).
+                    err_filename = cwd
+                elif err_msg == "noexec":
+                    err_msg = ""
+                    err_filename = None
+                else:
+                    err_filename = orig_executable
+                if errno_num != 0:
+                    err_msg = os.strerror(errno_num)
+                if err_filename is not None:
+>                   raise child_exception_type(errno_num, err_msg, err_filename)
+E                   FileNotFoundError: [Errno 2] No such file or directory: 'systemctl'
+
+../../../.local/share/uv/python/cpython-3.11.15-macos-aarch64-none/lib/python3.11/subprocess.py:1955: FileNotFoundError
+_______________ TestPtyWebSocket.test_resize_escape_is_forwarded _______________
+[gw4] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.hermes_cli.test_web_server.TestPtyWebSocket object at 0x10c6e42d0>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10b05fb50>
+
+    def test_resize_escape_is_forwarded(self, monkeypatch):
+        # Resize escape gets intercepted and applied via TIOCSWINSZ, then the
+        # child reads the TTY ioctl directly. Avoid tput because CI may not set
+        # TERM for non-interactive shells.
+        import sys
+    
+        winsize_script = (
+            "import fcntl, struct, termios, time; "
+            "time.sleep(0.15); "
+            "rows, cols, *_ = struct.unpack('HHHH', "
+            "fcntl.ioctl(0, termios.TIOCGWINSZ, b'\\0' * 8)); "
+            "print(cols); print(rows)"
+        )
+        monkeypatch.setattr(
+            self.ws_module,
+            "_resolve_chat_argv",
+            # sleep gives the test time to push the resize before the child reads the ioctl.
+            lambda resume=None, sidecar_url=None: (
+                [sys.executable, "-c", winsize_script],
+                None,
+                None,
+            ),
+        )
+        with self.client.websocket_connect(self._url()) as conn:
+            conn.send_text("\x1b[RESIZE:99;41]")
+            buf = b""
+            import time
+    
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+>               frame = conn.receive_bytes()
+                        ^^^^^^^^^^^^^^^^^^^^
+
+tests/hermes_cli/test_web_server.py:2210: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <starlette.testclient.WebSocketTestSession object at 0x10d6d6190>
+
+    def receive_bytes(self) -> bytes:
+        message = self.receive()
+        self._raise_on_close(message)
+>       return cast(bytes, message["bytes"])
+                           ^^^^^^^^^^^^^^^^
+E       KeyError: 'bytes'
+
+../edna-1a61fede-41cb9170/.venv/lib/python3.11/site-packages/starlette/testclient.py:187: KeyError
+__________ TestFileDedup.test_write_rejects_internal_read_status_text __________
+[gw3] darwin -- Python 3.11.15 /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/bin/python
+
+self = <tests.tools.test_file_read_guards.TestFileDedup testMethod=test_write_rejects_internal_read_status_text>
+mock_ops = <MagicMock name='_get_file_ops' id='4457855056'>
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_rejects_internal_read_status_text(self, mock_ops):
+        """write_file must not persist internal read_file status text."""
+        fake = MagicMock()
+        fake.write_file = MagicMock()
+        mock_ops.return_value = fake
+    
+        result = json.loads(write_file_tool(
+            self._tmpfile,
+            _READ_DEDUP_STATUS_MESSAGE,
+            task_id="guard",
+        ))
+    
+        self.assertIn("error", result)
+>       self.assertIn("internal read_file status text", result["error"])
+E       AssertionError: 'internal read_file status text' not found in 'Refusing to write to sensitive system path: /var/folders/s9/3_6wbwsd2qqfnlr4z9lxsbgr0000gn/T/tmpi786jdoz/dedup_test.txt\nUse the terminal tool with sudo if you need to modify system files.'
+
+tests/tools/test_file_read_guards.py:198: AssertionError
+=============================== warnings summary ===============================
+tests/gateway/test_api_server.py: 95 warnings
+  /Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/gateway/test_api_server.py:377: NotAppKeyWarning: It is recommended to use web.AppKey instances for keys.
+  https://docs.aiohttp.org/en/stable/web_advanced.html#application-s-config
+    app["api_server_adapter"] = adapter
+
+tests/gateway/test_api_server_jobs.py: 35 warnings
+  /Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/gateway/test_api_server_jobs.py:54: NotAppKeyWarning: It is recommended to use web.AppKey instances for keys.
+  https://docs.aiohttp.org/en/stable/web_advanced.html#application-s-config
+    app["api_server_adapter"] = adapter
+
+tests/gateway/test_api_server_multimodal.py::TestResponsesMultimodalHTTP::test_input_image_canonicalized_and_forwarded
+tests/gateway/test_api_server_multimodal.py::TestChatCompletionsMultimodalHTTP::test_file_part_returns_400
+tests/gateway/test_api_server_multimodal.py::TestChatCompletionsMultimodalHTTP::test_inline_image_preserved_to_run_agent
+tests/gateway/test_api_server_multimodal.py::TestResponsesMultimodalHTTP::test_input_file_returns_400
+tests/gateway/test_api_server_multimodal.py::TestChatCompletionsMultimodalHTTP::test_text_only_array_collapses_to_string
+tests/gateway/test_api_server_multimodal.py::TestChatCompletionsMultimodalHTTP::test_non_image_data_url_returns_400
+  /Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/gateway/test_api_server_multimodal.py:132: NotAppKeyWarning: It is recommended to use web.AppKey instances for keys.
+  https://docs.aiohttp.org/en/stable/web_advanced.html#application-s-config
+    app["api_server_adapter"] = adapter
+
+tests/gateway/test_api_server_runs.py: 21 warnings
+  /Users/pcloffice/pcl/_worktrees/edna-1a61fede-baseline/tests/gateway/test_api_server_runs.py:48: NotAppKeyWarning: It is recommended to use web.AppKey instances for keys.
+  https://docs.aiohttp.org/en/stable/web_advanced.html#application-s-config
+    app["api_server_adapter"] = adapter
+
+tests/gateway/test_webhook_adapter.py::TestHTTPHandling::test_unknown_route_returns_404
+  /Users/pcloffice/pcl/_worktrees/edna-1a61fede-41cb9170/.venv/lib/python3.11/site-packages/psutil/__init__.py:999: RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never awaited
+    reverse_ppid_map[ppid].append(pid)
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/acp/test_auth.py::TestBuildAuthMethods::test_build_auth_methods_returns_provider_and_terminal_when_configured
+FAILED tests/gateway/test_shutdown_forensics.py::TestSpawnAsyncDiagnostic::test_spawns_subprocess_and_writes_output
+FAILED tests/acp/test_auth.py::TestBuildAuthMethods::test_build_auth_methods_returns_terminal_setup_when_unconfigured
+FAILED tests/hermes_cli/test_gateway_service.py::TestGatewaySystemServiceRouting::test_systemd_restart_gracefully_restarts_running_service_and_waits
+FAILED tests/agent/test_anthropic_adapter.py::TestRunOauthSetupToken::test_returns_token_from_credential_files
+FAILED tests/hermes_cli/test_gateway_service.py::TestGatewaySystemServiceRouting::test_systemd_restart_uses_systemd_main_pid_when_pid_file_is_missing
+FAILED tests/agent/test_anthropic_adapter.py::TestRunOauthSetupToken::test_returns_token_from_env_var
+FAILED tests/hermes_cli/test_gateway_service.py::TestSystemdServiceRefresh::test_systemd_start_refreshes_outdated_unit
+FAILED tests/hermes_cli/test_gateway_service.py::TestGatewaySystemServiceRouting::test_systemd_restart_reports_start_limit_hit
+FAILED tests/agent/test_anthropic_adapter.py::TestRunOauthSetupToken::test_returns_none_when_no_creds_found
+FAILED tests/hermes_cli/test_gateway_service.py::TestSystemdServiceRefresh::test_systemd_restart_refreshes_outdated_unit
+FAILED tests/hermes_cli/test_gateway_service.py::TestGatewaySystemServiceRouting::test_systemd_restart_recovers_failed_planned_restart
+FAILED tests/hermes_cli/test_gateway_wsl.py::TestSupportsSystemdServicesWSL::test_wsl_with_systemd
+FAILED tests/tools/test_file_read_guards.py::TestFileDedup::test_write_rejects_status_text_with_small_framing
+FAILED tests/test_live_system_guard_self_test.py::test_systemctl_unrelated_unit_passes_through
+FAILED tests/test_tui_gateway_server.py::test_browser_manage_connect_default_local_reports_launch_hint
+FAILED tests/tools/test_file_staleness.py::TestPatchStaleness::test_patch_warns_on_stale_file
+FAILED tests/hermes_cli/test_gateway_wsl.py::TestSupportsSystemdServicesWSL::test_native_linux
+FAILED tests/tools/test_file_read_guards.py::TestWriteInvalidatesDedup::test_write_does_not_invalidate_other_tasks
+FAILED tests/gateway/test_slack.py::TestSlashEphemeralAck::test_send_uses_response_url_when_context_exists
+FAILED tests/tools/test_file_read_guards.py::TestWriteInvalidatesDedup::test_write_invalidates_all_offsets
+FAILED tests/tools/test_file_state_registry.py::FileToolsIntegrationTests::test_net_new_file_no_warning
+FAILED tests/test_live_system_guard_self_test.py::test_systemctl_status_passes_through
+FAILED tests/tools/test_file_read_guards.py::TestWriteInvalidatesDedup::test_write_invalidates_dedup_same_second
+FAILED tests/gateway/test_slack.py::TestSlashEphemeralAck::test_send_slash_ephemeral_fallback_on_post_failure
+FAILED tests/hermes_cli/test_web_server.py::TestPtyWebSocket::test_streams_child_stdout_to_client
+FAILED tests/tools/test_file_staleness.py::TestStalenessCheck::test_relative_path_uses_live_cwd_for_staleness_tracking
+FAILED tests/tools/test_file_state_registry.py::FileToolsIntegrationTests::test_sibling_agent_write_surfaces_warning_through_handler
+FAILED tests/test_live_system_guard_self_test.py::test_systemctl_show_passes_through
+FAILED tests/gateway/test_slack.py::TestSlashEphemeralAck::test_send_slash_ephemeral_fallback_on_exception
+FAILED tests/hermes_cli/test_web_server.py::TestPtyWebSocket::test_client_input_reaches_child_stdin
+FAILED tests/tools/test_file_read_guards.py::TestFileDedup::test_write_allows_large_file_that_quotes_status_text
+FAILED tests/tools/test_file_staleness.py::TestStalenessCheck::test_warning_when_file_modified_externally
+FAILED tests/test_live_system_guard_self_test.py::test_systemctl_list_units_passes_through
+FAILED tests/hermes_cli/test_web_server.py::TestPtyWebSocket::test_resize_escape_is_forwarded
+FAILED tests/tools/test_file_read_guards.py::TestFileDedup::test_write_rejects_internal_read_status_text
+ERROR tests/acp/test_entry.py - ImportError while importing test module '/Use...
+ERROR tests/acp/test_events.py - ImportError while importing test module '/Us...
+ERROR tests/acp/test_mcp_e2e.py - ImportError while importing test module '/U...
+ERROR tests/acp/test_permissions.py - ImportError while importing test module...
+ERROR tests/acp/test_ping_suppression.py - ImportError while importing test m...
+ERROR tests/acp/test_server.py - ImportError while importing test module '/Us...
+ERROR tests/acp/test_tools.py - ImportError while importing test module '/Use...
+ERROR tests/acp_adapter/test_acp_commands.py - ImportError while importing te...
+ERROR tests/acp_adapter/test_acp_images.py - ImportError while importing test...
+36 failed, 571 passed, 158 warnings, 9 errors in 68.86s (0:01:08)
+
+rerun_rc=1

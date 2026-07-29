@@ -1,0 +1,13 @@
+{
+  "source_population": "221 FAILED/ERROR nodeids extracted from full-pytest.txt",
+  "interpreter": "final worktree .venv/bin/python for both worktrees",
+  "origin_main": {
+    "failing_or_error_nodeids": 45
+  },
+  "final_stack": {
+    "failing_or_error_nodeids": 45
+  },
+  "final_only": [],
+  "baseline_only": [],
+  "exact_failure_set_parity": true
+}
