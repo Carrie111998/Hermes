@@ -29,6 +29,7 @@ import asyncio
 import time
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -971,6 +972,33 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     # _handle_message_with_agent owns the system-note injection so we don't
     # double it up.
     assert event.text == ""
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_accepts_aware_session_marker():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="aware-resume-chat")
+    aware_now = datetime.now(ZoneInfo("Asia/Singapore"))
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:aware-resume-chat",
+        session_id="sid-aware",
+        created_at=aware_now,
+        updated_at=aware_now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=aware_now,
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio

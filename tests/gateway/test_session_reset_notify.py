@@ -9,6 +9,7 @@ Verifies that:
 
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -46,6 +47,59 @@ def _make_store(policy=None, tmp_path=None):
 # ---------------------------------------------------------------------------
 
 class TestShouldResetReason:
+    def test_legacy_utc_session_survives_timezone_cutover(self, tmp_path, monkeypatch):
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=4),
+            tmp_path,
+        )
+        source = _make_source()
+        monkeypatch.setattr(
+            "gateway.session._hermes_now",
+            lambda: datetime(
+                2026, 7, 29, 10, 0, tzinfo=ZoneInfo("Asia/Singapore")
+            ),
+        )
+        monkeypatch.setattr(
+            "gateway.session._legacy_server_time",
+            lambda value: value.replace(tzinfo=ZoneInfo("UTC")),
+        )
+        legacy_entry = SessionEntry(
+            session_key="test",
+            session_id="legacy",
+            created_at=datetime(2026, 7, 29, 1, 45),
+            updated_at=datetime(2026, 7, 29, 1, 50),
+        )
+
+        assert store._should_reset(legacy_entry, source) is None
+        assert store._is_session_expired(legacy_entry) is False
+
+    def test_daily_boundary_uses_configured_timezone(self, tmp_path, monkeypatch):
+        store = _make_store(
+            SessionResetPolicy(mode="daily", at_hour=4),
+            tmp_path,
+        )
+        source = _make_source()
+        clock = {
+            "now": datetime(
+                2026, 7, 29, 3, 59, 59, tzinfo=ZoneInfo("Asia/Singapore")
+            )
+        }
+        monkeypatch.setattr(
+            "gateway.session._hermes_now",
+            lambda: clock["now"],
+        )
+
+        before = store.get_or_create_session(source)
+        clock["now"] = datetime(
+            2026, 7, 29, 4, 0, 1, tzinfo=ZoneInfo("Asia/Singapore")
+        )
+        assert store._is_session_expired(before) is True
+        after = store.get_or_create_session(source)
+
+        assert after.session_id != before.session_id
+        assert after.auto_reset_reason == "daily"
+        assert after.updated_at.tzinfo == ZoneInfo("Asia/Singapore")
+
     def test_returns_none_when_not_expired(self, tmp_path):
         store = _make_store(
             SessionResetPolicy(mode="both", idle_minutes=60, at_hour=4),
