@@ -259,6 +259,26 @@ class PooledCredential:
                 ):
                     return token.strip()
             return ""
+        # Env-source entries persist with empty access_token; the value
+        # actually lives at the env var named in `source`. Resolve at
+        # request time so borrowed credentials still authenticate.
+        if self.source.startswith("env:") and not self.access_token:
+            env_var = self.source.split(":", 1)[1]
+            if env_var:
+                # Precedence: ~/.hermes/.env → active secret scope → os.environ.
+                # Mirrors _get_env_prefer_dotenv used during seeding.
+                env_file_value = ""
+                try:
+                    env_file_value = load_env().get(env_var, "").strip()
+                except Exception:
+                    pass
+                if not env_file_value:
+                    env_file_value = (
+                        _get_secret(env_var, "") or
+                        os.environ.get(env_var, "")
+                    ).strip()
+                if env_file_value:
+                    return env_file_value
         return str(self.access_token or "")
 
     @property
@@ -1528,7 +1548,23 @@ class CredentialPool:
             # hydrated from their live source on load.  A stale duplicate row
             # can remain unhydrated; never lease or select it as an empty key.
             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
-                continue
+                # Env-source entries are valid even when access_token is empty
+                # on disk: the actual key lives at the env var named in the
+                # source field. The detection layer should respect what's in
+                # auth.json, not require the value to be pre-populated.
+                if not entry.source.startswith("env:"):
+                    continue
+                # If the env var is also unset across ~/.hermes/.env, the
+                # active secret scope, and os.environ, the entry really is
+                # empty and should be filtered.
+                env_var = entry.source.split(":", 1)[1]
+                env_file_value = ""
+                try:
+                    env_file_value = load_env().get(env_var, "").strip()
+                except Exception:
+                    pass
+                if not env_file_value and not _get_secret(env_var, "") and not os.environ.get(env_var):
+                    continue
             # For anthropic claude_code entries, sync from the credentials file
             # before any status/refresh checks. This picks up tokens refreshed
             # by other processes (Claude Code CLI, other Hermes profiles).
@@ -2399,17 +2435,6 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             "CLAUDE_CODE_OAUTH_TOKEN",
             "ANTHROPIC_API_KEY",
         ]
-
-    # Also seed any env-source pool entries already on disk that aren't in
-    # the registry's tuple. A user can put `source: env:OPENCODE_GO_API_KEY2`
-    # in auth.json expecting it to be picked up from the environment; the
-    # registry only declares the primary env var, so this loop fills the
-    # gap and keeps multi-key rotation working without per-provider code.
-    for entry in entries:
-        if entry.source.startswith("env:"):
-            env_name = entry.source.split(":", 1)[1]
-            if env_name and env_name not in env_vars:
-                env_vars.append(env_name)
 
     for env_var in env_vars:
         # Prefer ~/.hermes/.env over os.environ
