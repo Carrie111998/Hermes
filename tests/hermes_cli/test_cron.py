@@ -102,7 +102,8 @@ class TestCronCommandLifecycle:
             Namespace(
                 cron_command="create",
                 schedule="every 1h",
-                prompt="Use both skills",
+                prompt_positional="Use both skills",
+                prompt_flag=None,
                 name="Skill combo",
                 deliver=None,
                 repeat=None,
@@ -120,6 +121,7 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+        assert jobs[0]["prompt"] == "Use both skills"
 
     def test_list_does_not_crash_when_repeat_is_null(self, tmp_cron_dir, capsys):
         """A one-shot job can be persisted with ``"repeat": null``. `cron
@@ -168,7 +170,8 @@ class TestGatewayNotRunningWarning:
             Namespace(
                 cron_command="create",
                 schedule="0 11 * * *",
-                prompt="Daily report",
+                prompt_positional="Daily report",
+                prompt_flag=None,
                 name="Daily 1130",
                 deliver=None,
                 repeat=None,
@@ -189,7 +192,8 @@ class TestGatewayNotRunningWarning:
             Namespace(
                 cron_command="create",
                 schedule="0 11 * * *",
-                prompt="Daily report",
+                prompt_positional="Daily report",
+                prompt_flag=None,
                 name="Daily 1130",
                 deliver=None,
                 repeat=None,
@@ -266,7 +270,8 @@ class TestExternalCronProviderStatus:
             Namespace(
                 cron_command="create",
                 schedule="every 2m",
-                prompt="Ping",
+                prompt_positional="Ping",
+                prompt_flag=None,
                 name="Ping",
                 deliver=None,
                 repeat=None,
@@ -358,7 +363,8 @@ def test_cron_create_success_prints_job_details(monkeypatch, capsys):
 
     args = SimpleNamespace(
         schedule="every day",
-        prompt="refresh docs",
+        prompt_positional="refresh docs",
+        prompt_flag=None,
         name="Nightly docs",
         deliver=None,
         repeat=None,
@@ -381,12 +387,59 @@ def test_cron_create_success_prints_job_details(monkeypatch, capsys):
     assert "Next run: 2026-06-01T00:00:00Z" in out
 
 
+def test_cron_create_resolves_prompt_flag_over_positional(monkeypatch, capsys):
+    # Regression test for the argparse ordering bug fixed 2026-07-29: when
+    # both are set, --prompt (prompt_flag) must win over the positional.
+    captured = {}
+
+    def fake_cron_api(**kwargs):
+        captured.update(kwargs)
+        return {
+            "success": True, "job_id": "job-2", "name": "x", "schedule": "1h",
+            "skills": [], "next_run_at": None, "job": {},
+        }
+
+    monkeypatch.setattr(cron_cli, "_cron_api", fake_cron_api)
+    monkeypatch.setattr(cron_cli, "_warn_if_gateway_not_running", lambda: None)
+
+    args = SimpleNamespace(
+        schedule="1h", prompt_positional="stale positional", prompt_flag="real prompt",
+        name=None, deliver=None, repeat=None, skill=None, skills=None,
+        script=None, workdir=None, no_agent=False,
+    )
+    cron_cli.cron_create(args)
+    assert captured["prompt"] == "real prompt"
+
+
+def test_cron_create_falls_back_to_positional_when_no_flag(monkeypatch, capsys):
+    captured = {}
+
+    def fake_cron_api(**kwargs):
+        captured.update(kwargs)
+        return {
+            "success": True, "job_id": "job-3", "name": "x", "schedule": "1h",
+            "skills": [], "next_run_at": None, "job": {},
+        }
+
+    monkeypatch.setattr(cron_cli, "_cron_api", fake_cron_api)
+    monkeypatch.setattr(cron_cli, "_warn_if_gateway_not_running", lambda: None)
+
+    args = SimpleNamespace(
+        schedule="1h", prompt_positional="the positional prompt", prompt_flag=None,
+        name=None, deliver=None, repeat=None, skill=None, skills=None,
+        script=None, workdir=None, no_agent=False,
+    )
+    cron_cli.cron_create(args)
+    assert captured["prompt"] == "the positional prompt"
+
+
 def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     monkeypatch.setattr(cron_cli, "_cron_api", lambda **kwargs: {"success": False, "error": "boom"})
 
     args = SimpleNamespace(
         schedule="every day",
-        prompt="refresh docs",
+        prompt_positional="refresh docs",
+        prompt_flag=None,
         name=None,
         deliver=None,
         repeat=None,

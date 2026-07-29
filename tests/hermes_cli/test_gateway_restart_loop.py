@@ -102,7 +102,8 @@ class TestCronCreateLifecycleBlock:
         args = Namespace(
             cron_command="create",
             schedule="30m",
-            prompt="Upgrade hermes then run hermes gateway restart",
+            prompt_positional="Upgrade hermes then run hermes gateway restart",
+            prompt_flag=None,
             name=None,
             deliver=None,
             repeat=None,
@@ -123,7 +124,8 @@ class TestCronCreateLifecycleBlock:
         args = Namespace(
             cron_command="create",
             schedule="0 9 * * *",
-            prompt="Run launchctl kickstart -k gui/501/ai.hermes.gateway",
+            prompt_positional="Run launchctl kickstart -k gui/501/ai.hermes.gateway",
+            prompt_flag=None,
             name=None,
             deliver=None,
             repeat=None,
@@ -150,7 +152,8 @@ class TestCronCreateLifecycleBlock:
         args = Namespace(
             cron_command="create",
             schedule="1h",
-            prompt=None,
+            prompt_positional=None,
+            prompt_flag=None,
             name=None,
             deliver=None,
             repeat=None,
@@ -170,7 +173,8 @@ class TestCronCreateLifecycleBlock:
         args = Namespace(
             cron_command="create",
             schedule="30m",
-            prompt="Check server health and report status",
+            prompt_positional="Check server health and report status",
+            prompt_flag=None,
             name=None,
             deliver=None,
             repeat=None,
@@ -193,7 +197,8 @@ class TestCronCreateLifecycleBlock:
         args = Namespace(
             cron_command="create",
             schedule="30m",
-            prompt=None,
+            prompt_positional=None,
+            prompt_flag=None,
             name=None,
             deliver=None,
             repeat=None,

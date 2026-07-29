@@ -57,13 +57,45 @@ def test_cron_create_options():
         "--workdir", "/tmp/x",
     ])
     assert ns.schedule == "0 9 * * *"
-    assert ns.prompt == "daily task prompt"
+    assert ns.prompt_positional == "daily task prompt"
+    assert ns.prompt_flag is None
     assert ns.name == "daily"
     assert ns.deliver == "origin"
     assert ns.repeat == 3
     assert ns.skills == ["a", "b"]
     assert ns.no_agent is True
     assert ns.workdir == "/tmp/x"
+
+
+def test_cron_create_prompt_flag_works_with_flags_before_it():
+    # Regression test: argparse cannot fill an optional positional (prompt)
+    # from a token that appears after an interspersed --flag (a required
+    # positional followed by nargs='?' is a documented argparse limitation
+    # — reproduced directly against bare argparse, not hermes-specific).
+    # Confirmed 2026-07-29: `cron create <schedule> --name X <prompt>` used
+    # to raise "unrecognized arguments" from the TOP-LEVEL parser. --prompt
+    # is the fix: a flag has no ordering dependency on other flags.
+    parser = _build()
+    ns = parser.parse_args([
+        "cron", "create", "0 9 * * *",
+        "--name", "daily", "--prompt", "daily task prompt",
+    ])
+    assert ns.schedule == "0 9 * * *"
+    assert ns.prompt_positional is None
+    assert ns.prompt_flag == "daily task prompt"
+
+
+def test_cron_create_prompt_flag_takes_precedence_over_positional():
+    parser = _build()
+    ns = parser.parse_args([
+        "cron", "create", "0 9 * * *", "positional prompt",
+        "--prompt", "flag prompt",
+    ])
+    assert ns.prompt_positional == "positional prompt"
+    assert ns.prompt_flag == "flag prompt"
+    # cron_create() in hermes_cli/cron.py resolves prompt_flag over
+    # prompt_positional when both are set — this test only confirms the
+    # parser captured both distinctly; see test_cron.py for the resolution.
 
 
 def test_cron_edit_no_agent_tristate():
