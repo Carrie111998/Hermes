@@ -10,6 +10,8 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
     hermes-memory-store:
       db_path: $HERMES_HOME/memory_store.db   # omit to use the default
       auto_extract: false
+      auto_capture: false          # auto-capture tool observations via LLM mid-session
+      capture_interval: 5          # compress every N turns (auto_capture must be true)
       default_trust: 0.5
       min_trust_threshold: 0.3
       temporal_decay_half_life: 0
