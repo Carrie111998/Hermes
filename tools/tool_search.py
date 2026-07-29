@@ -879,6 +879,36 @@ def dispatch_tool_search(args: Dict[str, Any],
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
     _, deferrable = classify_tools(current_tool_defs)
+    # Honor ``mcp_servers.<name>.tools.include`` / ``tools.exclude``
+    # on the deferred bridge path (#72553): the original catalog comes
+    # from raw MCP discovery, but the include/exclude decision lives
+    # only in ``tools.mcp_tool``. Filter defs whose MCP tool name was
+    # excluded there so the model never sees a blocked hit.
+    #
+    # Fail-closed: if the helper cannot be imported for any reason,
+    # we drop every MCP-prefixed def from the catalog rather than
+    # returning them unfiltered. The bridge is unavailable for
+    # discovering MCP tools in that transient state, but the model
+    # can still see non-MCP defs (core tools, plugin tools) and
+    # never sees a blocked name. This matches the security posture
+    # the include/exclude docs promise.
+    try:
+        from tools.mcp_tool import is_mcp_tool_filtered_in_session as _mcp_filtered
+    except Exception:
+        deferrable = [
+            td for td in deferrable
+            if not (td.get("function") or {}).get("name", "").startswith("mcp__")
+        ]
+        _mcp_filtered = None
+    if _mcp_filtered is not None:
+        filtered_deferrable = []
+        for td in deferrable:
+            fn = td.get("function") or {}
+            td_name = fn.get("name", "")
+            if td_name.startswith("mcp__") and _mcp_filtered(td_name):
+                continue
+            filtered_deferrable.append(td)
+        deferrable = filtered_deferrable
     catalog = build_catalog(deferrable)
     hits = search_catalog(catalog, query, limit=limit)
     return json.dumps({
@@ -900,6 +930,22 @@ def dispatch_tool_describe(args: Dict[str, Any],
             f"'{name}' is not a deferrable tool. If you see it in the tools list "
             "already, call it directly; otherwise check the spelling against tool_search."
         )
+    # Belt-and-suspenders for MCP tools: the include/exclude decision in
+    # ``tools.mcp_tool`` must apply here too (#72553). If a blocked name
+    # somehow passes ``is_deferrable_tool_name`` (e.g. during a brief
+    # dynamic-refresh window), this gate still refuses to describe it.
+    if name.startswith("mcp__"):
+        try:
+            from tools.mcp_tool import is_mcp_tool_filtered_in_session as _mcp_filtered
+            if _mcp_filtered(name):
+                return tool_error(
+                    f"'{name}' is filtered by mcp_servers.<name>.tools.include "
+                    "/ tools.exclude and is not available."
+                )
+        except Exception:
+            return tool_error(
+                f"'{name}' is not currently available. Re-run tool_search to refresh."
+            )
     _, deferrable = classify_tools(current_tool_defs)
     for td in deferrable:
         fn = td.get("function") or {}
@@ -926,11 +972,27 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     ``tool_executor`` unwrap so a restricted-toolset session can never invoke
     an out-of-scope tool via the bridge.
     """
+    try:
+        from tools.mcp_tool import is_mcp_tool_filtered_in_session as _mcp_filtered
+    except Exception:
+        # Fail-closed: if the helper cannot be imported, drop every
+        # MCP-prefixed name from the scoped set rather than including
+        # them. The defense-in-depth gate in model_tools.handle_function_call
+        # then refuses to dispatch any MCP tool through ``tool_call``.
+        # Non-MCP plugin tools and core tools are unaffected.
+        _mcp_filtered = None
     names: set[str] = set()
     for td in tool_defs:
         name = (td.get("function") or {}).get("name", "")
-        if name and is_deferrable_tool_name(name):
-            names.add(name)
+        if not name or not is_deferrable_tool_name(name):
+            continue
+        if name.startswith("mcp__"):
+            # Fail-closed on import failure: never admit MCP tools.
+            if _mcp_filtered is None:
+                continue
+            if _mcp_filtered(name):
+                continue
+        names.add(name)
     return frozenset(names)
 
 
@@ -1017,6 +1079,24 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
         )
+    # MCP-shaped names must also clear the ``tools.include`` /
+    # ``tools.exclude`` gate from ``tools.mcp_tool`` (#72553). The
+    # ``is_deferrable_tool_name`` check above consults the registry
+    # directly, but a brief dynamic-refresh window or a session whose
+    # tool-defs come from raw discovery output can present a blocked
+    # name as callable. Fail-closed here, too.
+    if name.startswith("mcp__"):
+        try:
+            from tools.mcp_tool import is_mcp_tool_filtered_in_session as _mcp_filtered
+            if _mcp_filtered(name):
+                return None, {}, (
+                    f"'{name}' is filtered by mcp_servers.<name>.tools.include "
+                    "/ tools.exclude and is not available through tool_call."
+                )
+        except Exception:
+            return None, {}, (
+                f"'{name}' is not currently available. Re-run tool_search to refresh."
+            )
     return name, raw_args, None
 
 

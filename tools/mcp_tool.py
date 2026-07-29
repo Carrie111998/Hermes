@@ -5659,6 +5659,14 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     Returns:
         List of registered prefixed tool names.
+
+    Note on stale-authorization reconciliation:
+        Stale entries from a previous registration of this same server --
+        for example a tool that a stricter ``tools.include`` policy now
+        rejects -- are reconciled by ``MCPServerTask._refresh_tools`` in
+        the reconnect/list_changed path (#68808). We do NOT revoke here
+        because the initial-discovery call path owns its own provenance
+        map and the live reconciliation belongs with the lifecycle owner.
     """
     from tools.registry import registry
 
@@ -5829,6 +5837,67 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         registry.register_toolset_alias(name, toolset_name)
 
     return registered_names
+
+# ---------------------------------------------------------------------------
+# Bridge contract: deferred tool paths must consult the same filter
+# ---------------------------------------------------------------------------
+#
+# tools.tool_search dispatches ``tool_search`` / ``tool_describe`` /
+# ``tool_call`` — the deferral bridge that lets a model discover and invoke
+# MCP tools that were not eagerly registered into the system prompt. The
+# bridge receives a current tool-defs list and decides which tools it may
+# surface or call based on tool name alone.
+#
+# Until #72553, the bridge trusted whatever names appeared in that list
+# without consulting the per-server include/exclude config. The contract
+# here makes the include/exclude decision queryable from the bridge path
+# without having to reload the MCP server config on every dispatch.
+#
+# Definitions of the return value:
+#
+#   True  — ``tool_name`` MUST NOT be surfaced through the deferred bridge.
+#           It is either MCP-shaped but its server's ``tools.include`` /
+#           ``tools.exclude`` decision filtered it out at registration
+#           time, or it is unknown to the registry (which is treated as
+#           "cannot be made available through the bridge").
+#   False — ``tool_name`` is outside the helper's remit (a non-MCP core
+#           tool or a non-MCP plugin tool), or it is an MCP tool whose
+#           server-side include/exclude decision let it through
+#           registration. The bridge may surface it normally.
+def is_mcp_tool_filtered_in_session(tool_name: str) -> bool:
+    """Return True if ``tool_name`` is an MCP tool that ``tools.include``
+    / ``tools.exclude`` blocked, or an unknown name that the deferred
+    bridge must not conjure. See the docstring above for the contract.
+
+    Single source of truth for the include/exclude enforcement on the
+    deferred bridge. ``tools.tool_search`` lazy-imports this helper and
+    uses it inside :func:`dispatch_tool_search`,
+    :func:`dispatch_tool_describe`, :func:`resolve_underlying_call`, and
+    :func:`scoped_deferrable_names`.
+    """
+    if not tool_name:
+        return True  # Empty / None names have no schema — treat as blocked.
+    # Non-MCP tools (core Hermes tools, non-MCP plugin tools) are outside
+    # this helper's remit — they are not subject to MCP include/exclude.
+    if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
+        return False
+    # MCP-shaped name: the only path for it to reach the bridge is to be
+    # currently registered (i.e. `_track_mcp_tool_server` saw it pass
+    # the include/exclude check). A name that was skipped at registration
+    # has no entry in this map and is therefore filtered.
+    try:
+        with _lock:
+            registered_server = _mcp_tool_server_names.get(tool_name)
+    except Exception:
+        # Lock acquisition must never break the bridge's hot path;
+        # fall through to a conservative refusal.
+        return True
+    if registered_server:
+        return False
+    # MCP-shaped but never registered -> filtered out by include/exclude
+    # (or filtered out for some other policy reason at registration).
+    return True
+
 
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     """Connect to a single MCP server, discover tools, and register them.
