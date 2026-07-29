@@ -91,6 +91,88 @@ def _should_emit_turn_failed(reason, last_msg_role, interrupted) -> bool:
     return last_msg_role == "tool" or not normal_text_response
 
 
+def emit_turn_failed(agent, **fields) -> bool:
+    """Fire the ``turn_failed`` hook, at most once per turn.
+
+    Idempotent via ``agent._turn_failed_emitted``, which turn setup resets per
+    turn (``agent/turn_context.py``). The flag is what lets the bypass-exit
+    sweep in :func:`emit_turn_failed_for_unfinalized_exit` run unconditionally
+    without double-firing for turns that did reach :func:`finalize_turn`.
+
+    Returns True if this call emitted. Never raises: a failing observer must
+    not break turn teardown.
+    """
+    if getattr(agent, "_turn_failed_emitted", False):
+        return False
+    agent._turn_failed_emitted = True
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        _invoke_hook("turn_failed", **fields)
+    except Exception as exc:
+        # ``logger`` is imported lazily here for the same reason the rest of
+        # this module does it: importing agent.conversation_loop at module
+        # scope would create a cycle. Kept inside its own guard so a failing
+        # observer cannot be turned into a NameError by a broken import.
+        try:
+            from agent.conversation_loop import logger as _logger
+        except Exception:  # pragma: no cover - defensive
+            import logging
+            _logger = logging.getLogger("agent.conversation_loop")
+        _logger.warning("turn_failed hook failed: %s", exc)
+    return True
+
+
+def emit_turn_failed_for_unfinalized_exit(agent, result, *, turn_id=None) -> bool:
+    """Emit ``turn_failed`` for a turn that never reached :func:`finalize_turn`.
+
+    ``run_conversation`` has ~24 terminal paths that build a result dict and
+    ``return`` it directly — invalid-response exhaustion, context overflow with
+    compaction disabled, payload-too-large, truncated tool arguments, and so
+    on. None of them reach ``finalize_turn``, so the hook fired there cannot
+    see them and the most interesting failures were the ones going unobserved.
+
+    Rather than instrument each site (and require every future site to
+    remember), this reads the terminal contract those paths already satisfy:
+    every one of them sets ``completed: False``. A future 25th path is covered
+    the moment it honours the same contract.
+
+    Deliberately silent when:
+      * ``completed`` is not exactly False — a healthy turn, or a
+        non-dict/None return from a stubbed or partial path;
+      * ``interrupted`` is True — a user ``/stop`` is a clean exit, matching
+        the gate in :func:`_should_emit_turn_failed`;
+      * the turn already emitted via :func:`finalize_turn`.
+
+    Note ``completed`` is used rather than ``failed``: only 13 of those paths
+    set ``failed``, while all of them set ``completed: False``.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("completed") is not False:
+        return False
+    if result.get("interrupted") is True:
+        return False
+
+    _reason = result.get("error") or result.get("final_response") or "unknown"
+    _messages = result.get("messages") or []
+    _last_role = None
+    if _messages and isinstance(_messages[-1], dict):
+        _last_role = _messages[-1].get("role")
+
+    return emit_turn_failed(
+        agent,
+        reason=f"direct_return({_reason})",
+        model=getattr(agent, "model", None),
+        session_id=getattr(agent, "session_id", None),
+        turn_id=turn_id,
+        last_msg_role=_last_role,
+        interrupted=False,
+        api_calls=result.get("api_calls"),
+        tool_turns=None,
+        response_len=len(str(result.get("final_response") or "")),
+    )
+
+
 def finalize_turn(
     agent,
     *,
@@ -443,22 +525,24 @@ def finalize_turn(
     # non-clean exits via the shared classification so healthy turns stay
     # quiet, and wrapped so a failing handler never breaks finalization.
     if _should_emit_turn_failed(_turn_exit_reason, _last_msg_role, interrupted):
-        try:
-            from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _invoke_hook(
-                "turn_failed",
-                reason=str(_turn_exit_reason),
-                model=agent.model,
-                session_id=agent.session_id,
-                turn_id=turn_id,
-                last_msg_role=_last_msg_role,
-                interrupted=interrupted,
-                api_calls=api_call_count,
-                tool_turns=_turn_tool_count,
-                response_len=_resp_len,
-            )
-        except Exception as exc:
-            logger.warning("turn_failed hook failed: %s", exc)
+        emit_turn_failed(
+            agent,
+            reason=str(_turn_exit_reason),
+            model=agent.model,
+            session_id=agent.session_id,
+            turn_id=turn_id,
+            last_msg_role=_last_msg_role,
+            interrupted=interrupted,
+            api_calls=api_call_count,
+            tool_turns=_turn_tool_count,
+            response_len=_resp_len,
+        )
+    else:
+        # A healthy turn still marks itself emitted-or-decided, so the
+        # bypass-exit sweep in the forwarder cannot second-guess a
+        # deliberate silence (e.g. a clean interrupt whose result dict
+        # happens to carry completed: False).
+        agent._turn_failed_emitted = True
 
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this

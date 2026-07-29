@@ -1130,6 +1130,12 @@ def build_turn_context(
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
 
+    # Per-turn ``turn_failed`` emission latch. Reset here so the hook fires at
+    # most once per turn regardless of which exit path the turn takes:
+    # ``finalize_turn`` for normal teardown, or the bypass-exit sweep for the
+    # paths that ``return`` straight out of ``run_conversation``.
+    agent._turn_failed_emitted = False
+
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.
     agent._execution_thread_id = threading.current_thread().ident

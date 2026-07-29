@@ -268,3 +268,184 @@ def test_finalize_does_not_fire_turn_failed_on_healthy_completion():
             _turn_exit_reason="text_response(finish_reason=stop)",
         )
     assert calls == [], "turn_failed must NOT fire on a healthy completed turn"
+
+
+# --------------------------------------------------------------------------- #
+# Bypass exits: paths that return straight out of run_conversation and never
+# reach finalize_turn (the gap the finalizer-only hook could not observe).
+# --------------------------------------------------------------------------- #
+def _unfinalized(result, agent=None, **kw):
+    """Run the sweep with invoke_hook captured; return the recorded calls."""
+    from agent import turn_finalizer
+
+    calls, fake = _capture_turn_failed_calls(None)
+    agent = agent if agent is not None else _make_agent()
+    agent._turn_failed_emitted = False
+    with patch("hermes_cli.plugins.invoke_hook", fake):
+        turn_finalizer.emit_turn_failed_for_unfinalized_exit(agent, result, **kw)
+    return calls
+
+
+def test_bypass_sweep_fires_on_invalid_response_exhaustion():
+    """The reviewer's named path: invalid-response terminal return.
+
+    Dict shape mirrors the real terminal return in
+    ``agent/conversation_loop.py`` for "Invalid API response after N retries",
+    which persists the session and returns directly — never reaching
+    ``finalize_turn``.
+    """
+    msg = "Invalid API response after 5 retries: empty content"
+    calls = _unfinalized(
+        {
+            "final_response": msg,
+            "messages": [{"role": "assistant", "content": ""}],
+            "completed": False,
+            "api_calls": 5,
+            "error": msg,
+            "failed": True,
+        },
+        turn_id="task-abc",
+    )
+    assert len(calls) == 1, "invalid-response exhaustion must emit turn_failed"
+    assert msg in calls[0]["reason"]
+    assert calls[0]["interrupted"] is False
+    assert calls[0]["api_calls"] == 5
+    assert calls[0]["turn_id"] == "task-abc"
+
+
+def test_bypass_sweep_fires_on_context_overflow_without_failed_key():
+    """Second named path, and the reason ``completed`` is the predicate.
+
+    Context-overflow / compaction-disabled returns set ``completed: False`` but
+    NOT ``failed``. Keying on ``failed`` would silently miss them — 11 of the
+    terminal returns have no ``failed`` key at all.
+    """
+    calls = _unfinalized(
+        {
+            "final_response": "Context length exceeded: max compression reached",
+            "messages": [{"role": "tool", "content": "..."}],
+            "completed": False,
+            "api_calls": 2,
+        }
+    )
+    assert len(calls) == 1
+    assert "Context length exceeded" in calls[0]["reason"]
+    assert calls[0]["last_msg_role"] == "tool"
+
+
+def test_bypass_sweep_silent_on_user_interrupt():
+    """A user /stop is a clean exit — matches the _should_emit_turn_failed gate."""
+    assert (
+        _unfinalized(
+            {
+                "final_response": "Interrupted by user",
+                "messages": [],
+                "completed": False,
+                "interrupted": True,
+            }
+        )
+        == []
+    )
+
+
+def test_bypass_sweep_silent_on_healthy_completion():
+    assert (
+        _unfinalized(
+            {
+                "final_response": "here you go",
+                "messages": [{"role": "assistant", "content": "here you go"}],
+                "completed": True,
+                "api_calls": 1,
+            }
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("result", [None, "not-a-dict", {}, {"completed": None}])
+def test_bypass_sweep_silent_on_non_terminal_shapes(result):
+    """Never emit on a shape the sweep cannot positively identify as failed."""
+    assert _unfinalized(result) == []
+
+
+def test_bypass_sweep_does_not_double_fire_after_finalize_turn():
+    """The per-turn latch is what makes the sweep safe to run unconditionally."""
+    from agent import turn_finalizer
+
+    agent = _make_agent()
+    agent._turn_failed_emitted = False
+    calls, fake = _capture_turn_failed_calls(None)
+    with patch("hermes_cli.plugins.invoke_hook", fake):
+        # Stand in for finalize_turn having already emitted this turn.
+        assert turn_finalizer.emit_turn_failed(agent, reason="api_error") is True
+        # The sweep then sees an already-emitted turn and stays quiet.
+        assert (
+            turn_finalizer.emit_turn_failed_for_unfinalized_exit(
+                agent, {"completed": False, "final_response": "x", "messages": []}
+            )
+            is False
+        )
+    assert len(calls) == 1, "hook must fire at most once per turn"
+
+
+def test_emit_turn_failed_survives_a_raising_observer():
+    """A broken plugin must not break turn teardown."""
+    from agent import turn_finalizer
+
+    agent = _make_agent()
+    agent._turn_failed_emitted = False
+
+    def _boom(name, **kwargs):
+        raise RuntimeError("observer exploded")
+
+    with patch("hermes_cli.plugins.invoke_hook", _boom):
+        assert turn_finalizer.emit_turn_failed(agent, reason="api_error") is True
+    # Latch still set, so a later sweep does not retry a broken observer.
+    assert agent._turn_failed_emitted is True
+
+
+def test_every_terminal_return_in_run_conversation_sets_completed():
+    """Source invariant the sweep depends on.
+
+    The sweep identifies a bypass exit by ``completed: False`` rather than by
+    instrumenting each site, so a future terminal return that omits
+    ``completed`` would be invisible. Assert the contract at the source: any
+    ``return {...}`` carrying ``final_response`` also carries ``completed``.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path("agent/conversation_loop.py")
+    if not src.exists():  # pragma: no cover - layout guard
+        pytest.skip("conversation_loop.py not at the expected path")
+
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    fn = next(
+        (
+            n
+            for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "run_conversation"
+        ),
+        None,
+    )
+    assert fn is not None, "run_conversation not found"
+
+    offenders = []
+    checked = 0
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)):
+            continue
+        keys = {k.value for k in node.value.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+        if "final_response" not in keys:
+            continue
+        checked += 1
+        if "completed" not in keys:
+            offenders.append(node.lineno)
+
+    assert checked > 0, "expected to find terminal result returns"
+    assert not offenders, (
+        "terminal return(s) carry final_response without completed, so the "
+        f"turn_failed bypass sweep cannot see them: lines {offenders}"
+    )
