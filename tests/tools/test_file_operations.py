@@ -545,6 +545,57 @@ class TestShellFileOpsHelpers:
         assert "D:/Ivo/ai-costs.json" in captured["cmd"]
         assert "/d/Ivo/ai-costs.json" not in captured["cmd"]
 
+    def test_escape_pattern_arg_preserves_regex_backslashes(self, monkeypatch, file_ops):
+        """Regex patterns must not be MSYS-rewritten even on Windows (#69183 carry)."""
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        # Backslash regex escapes must survive verbatim inside the quotes,
+        # never rewritten to forward slashes the way a drive path would be.
+        assert file_ops._escape_pattern_arg(r"\d+") == r"'\d+'"
+        assert file_ops._escape_pattern_arg(r"foo\w*bar") == r"'foo\w*bar'"
+        assert file_ops._escape_pattern_arg(r"\(group\)") == r"'\(group\)'"
+
+    def test_search_with_rg_preserves_regex_pattern(self, mock_env, monkeypatch):
+        """rg regex patterns keep backslash escapes intact on Windows (#69183 carry)."""
+        import tools.environments.local as local_mod
+        from tools.file_operations import ShellFileOperations, ExecuteResult
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        ops = ShellFileOperations(mock_env)
+        ops._is_local_backend = lambda: True
+        ops._has_command = lambda cmd: cmd == "rg"
+        captured = {}
+
+        def _capture(command, cwd=None, timeout=None, stdin_data=None):
+            captured["cmd"] = command
+            return ExecuteResult(stdout="", exit_code=1)
+
+        ops._exec = _capture
+        ops._search_with_rg(r"\d+", r"D:\Ivo\ai-costs.json", None, 10, 0, "content", 0)
+        assert r"'\d+'" in captured["cmd"]
+        assert "'/d+'" not in captured["cmd"]
+
+    def test_search_with_grep_preserves_regex_pattern(self, mock_env, monkeypatch):
+        """grep fallback regex patterns keep backslash escapes intact (#69183 carry)."""
+        import tools.environments.local as local_mod
+        from tools.file_operations import ShellFileOperations, ExecuteResult
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        ops = ShellFileOperations(mock_env)
+        ops._is_local_backend = lambda: True
+        ops._has_command = lambda cmd: cmd == "grep"
+        captured = {}
+
+        def _capture(command, cwd=None, timeout=None, stdin_data=None):
+            captured["cmd"] = command
+            return ExecuteResult(stdout="", exit_code=1)
+
+        ops._exec = _capture
+        ops._search_with_grep(r"\w+", "/tmp/project", None, 10, 0, "content", 0)
+        assert r"'\w+'" in captured["cmd"]
+        assert "'/w+'" not in captured["cmd"]
+
 
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
         import tools.environments.local as local_mod

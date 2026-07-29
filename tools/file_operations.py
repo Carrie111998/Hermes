@@ -999,6 +999,19 @@ class ShellFileOperations(FileOperations):
             arg = _native_windows_path_for_exe(arg)
         return "'" + arg.replace("'", '\'"\'"\'') + "'"
 
+    def _escape_pattern_arg(self, arg: str) -> str:
+        """Quote a *search pattern* for the shell without path translation.
+
+        Unlike :meth:`_escape_shell_arg`, this must **not** run the value
+        through ``_bash_safe_path``: a regex is not a path, and the MSYS
+        drive rewrite would corrupt regex metacharacters on Windows
+        (e.g. ``\\w`` / ``\\d`` / ``\\(`` getting mangled to ``/w`` / ``/d``
+        / ``/(``). Single-quoting is sufficient to keep backslash escapes
+        intact for both ``rg`` and the ``grep`` fallback (#69183 pattern
+        portion consolidated into #67914 / #63177).
+        """
+        return "'" + arg.replace("'", '\'"\'"\'') + "'"
+
     def _is_local_backend(self) -> bool:
         """Return True iff this FileOperations is wired to the local backend.
 
@@ -2324,8 +2337,9 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")  # Count per file
         
-        # Add pattern and path
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        # Add pattern and path. The pattern is a regex, not a path, so it
+        # must be quoted without the MSYS drive rewrite (#69183 carry).
+        cmd_parts.append(self._escape_pattern_arg(pattern))
         cmd_parts.append(self._escape_native_exe_arg(path))
         
         # Fetch extra rows so we can report the true total before slicing.
@@ -2454,8 +2468,9 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")
         
-        # Add pattern and path
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        # Add pattern and path. The pattern is a regex, not a path, so it
+        # must be quoted without the MSYS drive rewrite (#69183 carry).
+        cmd_parts.append(self._escape_pattern_arg(pattern))
         cmd_parts.append(self._escape_shell_arg(path))
         
         # Fetch generously so we can compute total before slicing
