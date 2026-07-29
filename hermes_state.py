@@ -38,7 +38,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, IO, List, Optional, Tuple, TypeVar, cast
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -346,6 +346,116 @@ _wal_fallback_warned_lock = threading.Lock()
 # Dedup WARNING for the WAL-reset vulnerability fallback (issue #69784).
 _wal_reset_bug_warned_paths: set[str] = set()
 _wal_reset_bug_warned_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Cross-process write lock for state.db
+# ---------------------------------------------------------------------------
+# Prevent concurrent state.db writers from different processes (e.g.
+# ``hermes serve`` + ``hermes gateway run`` on the same profile).  SQLite
+# WAL mode's multi-process checkpoint coordination breaks down when two
+# independent agent runtimes both write to the same database -- this lock
+# enforces single-writer discipline at the opener level.
+#
+# The lock uses ``fcntl.flock`` on a sidecar ``state.db.lock`` file so it
+# never interferes with SQLite's own POSIX record-level locking on the DB
+# file.  Within the same process (where multiple ``SessionDB`` instances
+# may share one ``state.db``), the lock is tracked by refcount -- only one
+# ``flock`` call hits the kernel per db_path, so second-opens in the same
+# process never fail.
+#
+# On process death the OS releases the flock automatically, so stale
+# lock files are harmless.
+_IS_WINDOWS = sys.platform == "win32"
+if _IS_WINDOWS:
+    import msvcrt  # type: ignore[import-untyped]
+
+_state_db_write_lock_handles: dict[str, IO] = {}
+_state_db_write_lock_refcounts: dict[str, int] = {}
+_state_db_write_lock_lock = threading.Lock()
+
+_ACQUIRE_STATE_DB_WRITE_LOCK_WINDOWS_OFFSET = 1024 * 1024
+
+
+def _acquire_state_db_write_lock(
+    db_path: Path,
+) -> Optional[IO]:
+    """Acquire an exclusive, non-blocking advisory lock for *db_path*.
+
+    Only one process machine-wide may open a given ``state.db`` for
+    writing.  Concurrent writers (e.g. ``hermes serve`` + ``hermes
+    gateway run``) can corrupt the database through WAL checkpoint
+    contention and FTS5 shadow-table races (issue #73411).
+
+    Within the same process the lock is reference-counted: the first
+    caller acquires the real file lock; subsequent callers just bump
+    the count.  Returns the lock file handle on success, or ``None``
+    when another process holds the lock.
+    """
+    lock_path = db_path.with_name(f"{db_path.name}.lock")
+
+    with _state_db_write_lock_lock:
+        # Same-process reuse: already locked in this process.
+        if str(db_path) in _state_db_write_lock_handles:
+            _state_db_write_lock_refcounts[str(db_path)] += 1
+            return cast(IO, _state_db_write_lock_handles[str(db_path)])
+
+        # Cross-process: try to acquire the real file lock.
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(str(lock_path), "w")
+        except OSError:
+            return None
+
+        try:
+            if _IS_WINDOWS:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write("\\n")
+                    handle.flush()
+                handle.seek(_ACQUIRE_STATE_DB_WRITE_LOCK_WINDOWS_OFFSET)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            handle.close()
+            return None
+
+        _state_db_write_lock_handles[str(db_path)] = handle
+        _state_db_write_lock_refcounts[str(db_path)] = 1
+        return handle
+
+
+def _release_state_db_write_lock(db_path: Path) -> None:
+    """Release the write lock for *db_path*, decrementing the refcount.
+
+    The kernel-level ``flock`` is only released when the last reference
+    in this process is dropped.
+    """
+    with _state_db_write_lock_lock:
+        key = str(db_path)
+        if key not in _state_db_write_lock_refcounts:
+            return
+        _state_db_write_lock_refcounts[key] -= 1
+        if _state_db_write_lock_refcounts[key] > 0:
+            return
+        handle = _state_db_write_lock_handles.pop(key, None)
+        _state_db_write_lock_refcounts.pop(key, None)
+        if handle is None:
+            return
+        try:
+            if not _IS_WINDOWS:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+
 
 _FTS_TRIGGERS = (
     "messages_fts_insert",
@@ -2022,6 +2132,28 @@ class SessionDB:
                     raise
                 _connect_and_init()
 
+            # Acquire the cross-process write lock for non-read-only
+            # connections.  This prevents two independent Hermes processes
+            # (e.g. ``hermes serve`` and ``hermes gateway run``) from
+            # corrupting ``state.db`` through concurrent WAL checkpoints
+            # (issue #73411).
+            self._state_db_lock_handle: Optional[IO] = None
+            if not read_only:
+                lock_handle = _acquire_state_db_write_lock(self.db_path)
+                if lock_handle is None:
+                    raise sqlite3.OperationalError(
+                        f"state.db write lock is already held by another "
+                        f"Hermes process.  Running both ``hermes serve`` "
+                        f"and ``hermes gateway run`` on the same profile "
+                        f"is not supported -- only one state.db writer is "
+                        f"allowed per profile to prevent database "
+                        f"corruption (issue #73411).  Stop the other "
+                        f"process first, or start this one with a "
+                        f"different profile."
+                    )
+                self._state_db_lock_handle = lock_handle
+
+
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
             # v22 inline FTS untouched here; only the explicit foreground
@@ -2566,6 +2698,12 @@ class SessionDB:
         Attempts a TRUNCATE WAL checkpoint first so that exiting processes
         help shrink the WAL file.
         """
+        # Release the cross-process write lock before closing so the next
+        # awaiting process can take over immediately (issue #73411).
+        try:
+            _release_state_db_write_lock(self.db_path)
+        except Exception:
+            pass
         with self._lock:
             if self._conn:
                 try:
