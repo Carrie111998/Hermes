@@ -3331,26 +3331,28 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
-        # Defensive: if a prior run somehow leaked (invariant violation from
-        # an unknown code path), close it as 'reclaimed' so we don't strand
-        # it when the CAS resets the pointer below. No-op when the invariant
-        # holds (the common case).
-        stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
-            (task_id,),
-        ).fetchone()
-        if stale and stale["current_run_id"]:
-            conn.execute(
-                """
-                UPDATE task_runs
-                   SET status = 'reclaimed', outcome = 'reclaimed',
-                       summary = COALESCE(summary, 'invariant recovery on re-claim'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND ended_at IS NULL
-                """,
-                (now, int(stale["current_run_id"])),
-            )
+        # Defensive sweep: close ANY open run for this task_id, not just the
+        # one referenced by current_run_id. The legacy single-row recovery
+        # could miss orphans left behind by an interrupted writer or by a
+        # DB created before the UNIQUE(task_id) index was added, leading to
+        # the IntegrityError reported in issue #74046. Reaping all open
+        # runs by task_id is the safe invariant — at most one row per
+        # task can ever be 'running'.
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'reclaimed', outcome = 'reclaimed',
+                   summary = COALESCE(summary, 'invariant recovery on re-claim'),
+                   ended_at = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+             WHERE task_id = ? AND ended_at IS NULL
+            """,
+            (now, task_id),
+        )
+        # (Defensive sweep above guarantees at most one open row per
+        # task_id by the time we reach the INSERT OR IGNORE, so an
+        # orphan left behind by an interrupted writer can't crash the
+        # claim. Adopt any pre-existing running row instead of crashing.)
         cur = conn.execute(
             """
             UPDATE tasks
@@ -3373,9 +3375,9 @@ def claim_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        run_cur = conn.execute(
+        conn.execute(
             """
-            INSERT INTO task_runs (
+            INSERT OR IGNORE INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
                 started_at
@@ -3391,11 +3393,31 @@ def claim_task(
                 now,
             ),
         )
-        run_id = run_cur.lastrowid
-        conn.execute(
-            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
-            (run_id, task_id),
-        )
+        run_row = conn.execute(
+            "SELECT id FROM task_runs "
+            "WHERE task_id = ? AND status = 'running' AND claim_lock = ? "
+            "ORDER BY started_at DESC, id DESC LIMIT 1",
+            (task_id, lock),
+        ).fetchone()
+        if run_row is None:
+            # Unreachable: the sweep + INSERT OR IGNORE guarantees at
+            # least one running row exists for this task_id. Fail loud
+            # rather than silently corrupting the task pointer.
+            raise RuntimeError(
+                f"claim_task invariant violated for task_id={task_id!r}: "
+                "no running task_runs row after INSERT OR IGNORE"
+            )
+        run_id = int(run_row["id"])
+        # Update current_run_id only if it changed so we don't churn
+        # task_events with no-op writes.
+        cur_run_id = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if cur_run_id is None or cur_run_id["current_run_id"] != run_id:
+            conn.execute(
+                "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+                (run_id, task_id),
+            )
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
