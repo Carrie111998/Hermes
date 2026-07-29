@@ -454,6 +454,21 @@ def _resolve_runtime_from_pool_entry(
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
+        # OpenRouter serves BOTH wires (``/v1/chat/completions`` and the
+        # Anthropic-compatible ``/v1/messages``), so a user who deliberately
+        # records ``provider: openrouter`` + ``api_mode: anthropic_messages``
+        # means it. Honor that here as the generic branch below already does
+        # for every other pooled provider — without this, the same config
+        # resolves to chat_completions on the pooled path but
+        # anthropic_messages via ``_resolve_openrouter_runtime``, so the wire
+        # silently depended on whether the caller passed explicit credentials.
+        # The provider gate keeps a FOREIGN config's mode from leaking in.
+        _or_configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+        _or_configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+        if _or_configured_mode and _provider_supports_explicit_api_mode(
+            provider, _or_configured_provider
+        ):
+            api_mode = _or_configured_mode
     elif provider == "xai":
         api_mode = "codex_responses"
     elif provider == "nous":
