@@ -24,6 +24,8 @@ from scripts.canary import package_production_cutover_artifacts as package
 from scripts.canary import production_cutover_initial_collector as initial_collector
 from scripts.canary import production_cutover_owner_launcher as owner
 from scripts.canary import production_cutover_public_stager as stager
+from scripts.canary import production_cutover_activation_lock as authority_lock
+from scripts.canary import production_cutover_unit_input_rotation as rotation
 from tests.gateway.test_canonical_writer_production_cutover import (
     MemoryJournal,
     NOW,
@@ -97,6 +99,107 @@ def _operational_identity_inputs() -> tuple[dict, dict]:
             for index, domain in enumerate(domains)
         },
     )
+
+
+def _unit_input_payload(revision: str) -> dict:
+    operational_identities, operational_socket_groups = (
+        _operational_identity_inputs()
+    )
+    return {
+        "schema": package.UNIT_INPUT_PAYLOAD_SCHEMA,
+        "database_ip": "10.20.30.40",
+        "target": {
+            "project": "adventico-ai-platform",
+            "zone": "europe-west3-a",
+            "vm": "ai-platform-runtime-01",
+            "database": "ai_platform_brain",
+            "sql_instance": "production-pg18",
+            "sql_host": "10.20.30.40",
+            "tls_server_name": "production.example.internal",
+            "port": 5432,
+            "writer_login": "muncho_production_writer_login",
+        },
+        "gateway": {
+            "user": "ai-platform-brain",
+            "group": "ai-platform-brain",
+            "uid": 1000,
+            "gid": 1000,
+        },
+        "writer": {
+            "user": "muncho-canonical-writer",
+            "group": "muncho-canonical-writer",
+            "uid": 2000,
+            "gid": 2000,
+        },
+        "projector": {
+            "user": "muncho-projector",
+            "group": "muncho-projector",
+            "uid": 2004,
+            "gid": 2004,
+        },
+        "routeback": {
+            "user": "muncho-discord-egress",
+            "group": "muncho-discord-egress",
+            "uid": 2002,
+            "gid": 2002,
+        },
+        "connector": {
+            "user": "muncho-discord-connector",
+            "group": "muncho-discord-connector",
+            "uid": 2001,
+            "gid": 2001,
+        },
+        "mac_ops": {
+            "user": "muncho-mac-ops-edge",
+            "group": "muncho-mac-ops-edge",
+            "uid": 2003,
+            "gid": 2003,
+        },
+        "browser": {
+            "user": "muncho-capability-browser",
+            "group": "muncho-capability-browser",
+            "uid": 2006,
+            "gid": 2006,
+        },
+        "worker": {
+            "user": "muncho-worker",
+            "group": "muncho-worker",
+            "uid": 2007,
+            "gid": 2007,
+        },
+        "writer_client_group": {
+            "group": "muncho-writer-client",
+            "gid": 2005,
+        },
+        "worker_client_group": {
+            "group": "muncho-worker-clients",
+            "gid": 2008,
+        },
+        "operational_edge_identities": operational_identities,
+        "operational_edge_socket_groups": operational_socket_groups,
+        "writer_capability_public_key_id": "c" * 64,
+        "discord_edge_receipt_public_key_id": "a" * 64,
+        "operational_edge_key_foundation_sha256": "d" * 64,
+        "operational_edge_receipt_public_key_ids": (
+            _operational_receipt_key_ids()
+        ),
+        "discord_reconciliation_intent": {
+            "schema": package.DISCORD_RECONCILIATION_INTENT_SCHEMA,
+            "purpose": package.DISCORD_RECONCILIATION_INTENT_PURPOSE,
+            "release_revision": revision,
+            "legacy_public_policy_sha256": "1" * 64,
+            "target_public_policy_sha256": "2" * 64,
+            "reviewed_reconciliation": True,
+            "secret_material_recorded": False,
+            "secret_digest_recorded": False,
+        },
+        "release_owner_uid": 1000,
+        "release_owner_gid": 1000,
+        "bwrap_sha256": "6" * 64,
+        "shell_sha256": "7" * 64,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
 
 
 def _canonical(value: object) -> bytes:
@@ -211,6 +314,11 @@ def _patch_staged_paths(monkeypatch, staged: Path) -> None:
         package,
         "STAGED_UNIT_INPUT_APPROVAL_PATH",
         staged / "unit-input-approval.json",
+    )
+    monkeypatch.setattr(
+        package,
+        "FIXED_UNIT_INPUTS_PATH",
+        staged / "production-unit-inputs.json",
     )
     monkeypatch.setattr(cutover, "STAGED_FREEZE_PLAN_PATH", staged / "freeze-plan.json")
     monkeypatch.setattr(
@@ -961,6 +1069,1069 @@ def test_owner_accepts_only_freeze_bound_stopped_service_receipt() -> None:
         raise AssertionError("wrong freeze digest unexpectedly accepted")
 
 
+def _unit_input_authority(revision: str, now: int) -> tuple[dict, dict, dict]:
+    return owner.build_unit_input_authority(
+        release_revision=revision,
+        unit_inputs=_unit_input_payload(revision),
+        owner_subject_sha256="a" * 64,
+        private_key=Ed25519PrivateKey.generate(),
+        owner_runtime_attestation=_runtime_attestation(revision),
+        now_unix=now,
+    )
+
+
+def _rotation_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    now: int,
+) -> tuple[Path, tuple[dict, dict, dict], tuple[dict, dict, dict]]:
+    evidence = (tmp_path / "evidence").resolve()
+    evidence.mkdir(mode=0o700)
+    evidence.chmod(0o700)
+    os.chown(evidence, os.geteuid(), os.getegid())
+    staged = evidence / "staged"
+    _patch_staged_paths(monkeypatch, staged)
+    monkeypatch.setattr(cutover, "EVIDENCE_ROOT", evidence)
+    predecessor = _unit_input_authority("a" * 40, now)
+    successor = _unit_input_authority("b" * 40, now)
+    stager.stage_publication(
+        predecessor[2],
+        require_root=False,
+        now_unix=now,
+    )
+    package.bootstrap_fixed_unit_inputs(
+        authority_plan_path=package.STAGED_UNIT_INPUT_PLAN_PATH,
+        authority_approval_path=package.STAGED_UNIT_INPUT_APPROVAL_PATH,
+        unit_inputs_path=package.FIXED_UNIT_INPUTS_PATH,
+        require_root=False,
+        now_unix=now,
+    )
+    return staged, predecessor, successor
+
+
+def test_unit_input_authority_writers_heal_exact_temporary_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+
+    plan_path = staged / "unit-input-plan.json"
+    stage_alias = staged / ".unit-input-plan.json.stage.999999"
+    os.link(plan_path, stage_alias)
+    assert plan_path.stat().st_nlink == 2
+    staged_receipt = stager.stage_publication(
+        predecessor[2],
+        require_root=False,
+        now_unix=now + 1,
+        lock_factory=nullcontext,
+    )
+    assert staged_receipt["files"][0]["created"] is False
+    assert plan_path.stat().st_nlink == 1
+    assert not stage_alias.exists()
+
+    fixed_path = staged / "production-unit-inputs.json"
+    bootstrap_alias = (
+        staged / ".production-unit-inputs.json.bootstrap.999998"
+    )
+    os.link(fixed_path, bootstrap_alias)
+    assert fixed_path.stat().st_nlink == 2
+    bootstrap_receipt = package.bootstrap_fixed_unit_inputs(
+        authority_plan_path=package.STAGED_UNIT_INPUT_PLAN_PATH,
+        authority_approval_path=package.STAGED_UNIT_INPUT_APPROVAL_PATH,
+        unit_inputs_path=package.FIXED_UNIT_INPUTS_PATH,
+        require_root=False,
+        now_unix=now + 1,
+        lock_factory=nullcontext,
+    )
+    assert bootstrap_receipt["created"] is False
+    assert fixed_path.stat().st_nlink == 1
+    assert not bootstrap_alias.exists()
+
+    approval_path = staged / "unit-input-approval.json"
+    plan_bootstrap_alias = (
+        staged / ".unit-input-plan.json.stage.999996"
+    )
+    approval_bootstrap_alias = (
+        staged / ".unit-input-approval.json.rotate.999995"
+    )
+    os.link(plan_path, plan_bootstrap_alias)
+    os.link(approval_path, approval_bootstrap_alias)
+    assert plan_path.stat().st_nlink == 2
+    assert approval_path.stat().st_nlink == 2
+    package.bootstrap_fixed_unit_inputs(
+        authority_plan_path=package.STAGED_UNIT_INPUT_PLAN_PATH,
+        authority_approval_path=package.STAGED_UNIT_INPUT_APPROVAL_PATH,
+        unit_inputs_path=package.FIXED_UNIT_INPUTS_PATH,
+        require_root=False,
+        now_unix=now + 1,
+        lock_factory=nullcontext,
+    )
+    assert plan_path.stat().st_nlink == 1
+    assert approval_path.stat().st_nlink == 1
+    assert not plan_bootstrap_alias.exists()
+    assert not approval_bootstrap_alias.exists()
+
+    rotation_alias = staged / ".unit-input-approval.json.rotate.999997"
+    os.link(approval_path, rotation_alias)
+    assert approval_path.stat().st_nlink == 2
+    rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now + 1,
+        lock_factory=nullcontext,
+    )
+    assert not rotation_alias.exists()
+
+
+def test_unit_input_public_stager_locks_and_rechecks_freshness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_800_000_000
+    evidence = (tmp_path / "evidence").resolve()
+    evidence.mkdir(mode=0o700)
+    evidence.chmod(0o700)
+    os.chown(evidence, os.geteuid(), os.getegid())
+    staged = evidence / "staged"
+    _patch_staged_paths(monkeypatch, staged)
+    publication = _unit_input_authority("a" * 40, now)[2]
+
+    class Busy:
+        def __enter__(self):
+            raise RuntimeError("another writer activation lifecycle is running")
+
+        def __exit__(self, *_args):
+            return False
+
+    with pytest.raises(
+        stager.PublicStagingError,
+        match="public_staging_activation_lock_unavailable",
+    ):
+        stager.stage_publication(
+            publication,
+            require_root=False,
+            now_unix=now,
+            lock_factory=Busy,
+        )
+    assert list(staged.iterdir()) == []
+
+    clock = [now]
+    monkeypatch.setattr(stager.time, "time", lambda: clock[0])
+
+    class ExpireWhileWaiting:
+        def __enter__(self):
+            clock[0] = now + 4_000
+
+        def __exit__(self, *_args):
+            return False
+
+    with pytest.raises(
+        stager.PublicStagingError,
+        match="public_staging_documents_invalid",
+    ):
+        stager.stage_publication(
+            publication,
+            require_root=False,
+            lock_factory=ExpireWhileWaiting,
+        )
+    assert list(staged.iterdir()) == []
+
+
+def test_unit_input_package_bootstrap_shares_activation_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, _predecessor, _successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    before = {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    }
+
+    class Busy:
+        def __enter__(self):
+            raise RuntimeError("another writer activation lifecycle is running")
+
+        def __exit__(self, *_args):
+            return False
+
+    with pytest.raises(
+        package.PackagingError,
+        match="cutover_unit_inputs_activation_lock_unavailable",
+    ):
+        package.bootstrap_fixed_unit_inputs(
+            authority_plan_path=package.STAGED_UNIT_INPUT_PLAN_PATH,
+            authority_approval_path=package.STAGED_UNIT_INPUT_APPROVAL_PATH,
+            unit_inputs_path=package.FIXED_UNIT_INPUTS_PATH,
+            require_root=False,
+            now_unix=now,
+            lock_factory=Busy,
+        )
+    assert {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    } == before
+
+
+def test_authority_lock_reuses_only_a_proven_inherited_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validated: list[int] = []
+    flocked: list[tuple[int, int]] = []
+    inherited: list[tuple[int, bool]] = []
+    monkeypatch.setattr(authority_lock.sys, "platform", "linux")
+    monkeypatch.setenv(authority_lock.INHERITED_LOCK_FD_ENV, "7")
+    monkeypatch.setattr(
+        authority_lock,
+        "_validate_lock_identity",
+        lambda descriptor: validated.append(descriptor),
+    )
+    monkeypatch.setattr(
+        authority_lock.fcntl,
+        "flock",
+        lambda descriptor, operation: flocked.append(
+            (descriptor, operation)
+        ),
+    )
+    monkeypatch.setattr(
+        authority_lock.os,
+        "set_inheritable",
+        lambda descriptor, value: inherited.append((descriptor, value)),
+    )
+
+    with authority_lock.authority_activation_lock(require_root=True):
+        assert validated == [7, 7]
+
+    assert flocked == [(
+        7,
+        authority_lock.fcntl.LOCK_EX | authority_lock.fcntl.LOCK_NB,
+    )]
+    assert inherited == [(7, True)]
+
+    monkeypatch.setenv(authority_lock.INHERITED_LOCK_FD_ENV, "2")
+    with pytest.raises(
+        authority_lock.AuthorityActivationLockError,
+        match="production_authority_activation_lock_invalid",
+    ):
+        with authority_lock.authority_activation_lock(require_root=True):
+            raise AssertionError("invalid inherited descriptor was entered")
+
+
+def test_authority_lock_preserves_errors_from_the_protected_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        authority_lock.INHERITED_LOCK_FD_ENV,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        authority_lock.activation,
+        "_host_activation_lock",
+        nullcontext,
+    )
+    body_error = RuntimeError("protected body failed")
+
+    with pytest.raises(RuntimeError) as caught:
+        with authority_lock.authority_activation_lock(require_root=True):
+            raise body_error
+
+    assert caught.value is body_error
+
+
+def test_unit_input_rotation_archives_triplet_and_exact_replay_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    unrelated = staged / "freeze-plan.json"
+    unrelated.write_bytes(b"unrelated-staged-evidence")
+    unrelated.chmod(0o400)
+    predecessor_raw = {
+        "plan": (staged / "unit-input-plan.json").read_bytes(),
+        "approval": (staged / "unit-input-approval.json").read_bytes(),
+        "fixed": (staged / "production-unit-inputs.json").read_bytes(),
+    }
+
+    receipt = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now,
+        lock_factory=nullcontext,
+    )
+    replay = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now + 4_000,
+        lock_factory=nullcontext,
+    )
+
+    assert replay == receipt
+    assert (staged / "unit-input-plan.json").read_bytes() == _canonical(
+        successor[0]
+    )
+    assert (staged / "unit-input-approval.json").read_bytes() == _canonical(
+        successor[1]
+    )
+    assert (staged / "production-unit-inputs.json").read_bytes() == (
+        _canonical(package._unit_inputs_from_authority(
+            successor[0],
+            successor[1],
+        ))
+        + b"\n"
+    )
+    assert unrelated.read_bytes() == b"unrelated-staged-evidence"
+    transaction = Path(receipt["audit_transaction_path"])
+    archived = transaction / rotation.PREDECESSOR_DIRECTORY_NAME
+    assert (archived / "unit-input-plan.json").read_bytes() == (
+        predecessor_raw["plan"]
+    )
+    assert (archived / "unit-input-approval.json").read_bytes() == (
+        predecessor_raw["approval"]
+    )
+    assert (archived / "production-unit-inputs.json").read_bytes() == (
+        predecessor_raw["fixed"]
+    )
+    assert stat.S_IMODE(transaction.stat().st_mode) == 0o700
+    assert receipt["successor_triplet_complete"] is True
+
+    bootstrapped = package.bootstrap_fixed_unit_inputs(
+        authority_plan_path=package.STAGED_UNIT_INPUT_PLAN_PATH,
+        authority_approval_path=package.STAGED_UNIT_INPUT_APPROVAL_PATH,
+        unit_inputs_path=package.FIXED_UNIT_INPUTS_PATH,
+        require_root=False,
+        now_unix=now,
+    )
+    assert bootstrapped["release_revision"] == successor[0][
+        "release_revision"
+    ]
+    assert bootstrapped["created"] is False
+    assert predecessor[0]["release_revision"] == "a" * 40
+
+
+def test_owner_rotation_launcher_allows_remote_exact_replay_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    _staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    receipt = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now,
+        lock_factory=nullcontext,
+    )
+    calls: list[tuple[str, str, dict]] = []
+
+    class Transport:
+        def invoke(
+            self,
+            revision: str,
+            action: str,
+            *,
+            publication: dict,
+        ) -> dict:
+            calls.append((revision, action, publication))
+            return dict(receipt)
+
+    observed = owner.rotate_unit_input_authority(
+        release_revision=successor[0]["release_revision"],
+        remote_stager_revision="c" * 40,
+        publication=successor[2],
+        transport=Transport(),
+        now_unix=now + 4_000,
+    )
+
+    assert observed == receipt
+    assert calls == [(
+        "c" * 40,
+        "rotate-unit-input-authority",
+        successor[2],
+    )]
+
+
+def test_unit_input_rotation_failure_rolls_back_and_other_successor_conflicts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    before = {
+        path.name: path.read_bytes()
+        for path in (
+            package.STAGED_UNIT_INPUT_PLAN_PATH,
+            package.STAGED_UNIT_INPUT_APPROVAL_PATH,
+            package.FIXED_UNIT_INPUTS_PATH,
+        )
+    }
+
+    def fail_after_successor_plan(stage: str) -> None:
+        if stage == "successor_plan_staged":
+            raise RuntimeError("injected rotation failure")
+
+    monkeypatch.setattr(rotation, "_checkpoint", fail_after_successor_plan)
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_failed",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=nullcontext,
+        )
+
+    assert {
+        path.name: path.read_bytes()
+        for path in (
+            package.STAGED_UNIT_INPUT_PLAN_PATH,
+            package.STAGED_UNIT_INPUT_APPROVAL_PATH,
+            package.FIXED_UNIT_INPUTS_PATH,
+        )
+    } == before
+    different = _unit_input_authority("c" * 40, now)
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_successor_conflict",
+    ):
+        rotation.rotate_unit_input_authority(
+            different[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=nullcontext,
+        )
+
+    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    recovered = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now + 1,
+        lock_factory=nullcontext,
+    )
+    assert recovered["successor_revision"] == "b" * 40
+    assert (staged / "production-unit-inputs.json").exists()
+    assert predecessor[0]["release_revision"] == "a" * 40
+
+
+def test_unit_input_rotation_rejects_a_mixed_predecessor_triplet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    fixed = staged / "production-unit-inputs.json"
+    fixed.chmod(0o600)
+    fixed.write_bytes(
+        _canonical(package._unit_inputs_from_authority(
+            successor[0],
+            successor[1],
+        ))
+        + b"\n"
+    )
+    fixed.chmod(package.FIXED_UNIT_INPUTS_MODE)
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_predecessor_invalid",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=nullcontext,
+        )
+
+    audit_root = cutover.EVIDENCE_ROOT / rotation.AUDIT_DIRECTORY_NAME
+    assert audit_root.exists()
+    assert list(audit_root.iterdir()) == []
+
+
+def test_unit_input_rotation_finishes_receipt_after_complete_successor_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    install_exact = rotation._install_exact
+
+    def fail_receipt(path: Path, payload: bytes, **kwargs) -> bool:
+        if path.name == rotation.RECEIPT_FILE_NAME:
+            raise rotation.UnitInputRotationError(
+                "unit_input_rotation_write_failed"
+            )
+        return install_exact(path, payload, **kwargs)
+
+    monkeypatch.setattr(rotation, "_install_exact", fail_receipt)
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_write_failed",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=nullcontext,
+        )
+
+    assert (staged / "unit-input-plan.json").read_bytes() == _canonical(
+        successor[0]
+    )
+    assert (staged / "unit-input-approval.json").read_bytes() == _canonical(
+        successor[1]
+    )
+    assert (staged / "production-unit-inputs.json").read_bytes() == (
+        _canonical(package._unit_inputs_from_authority(
+            successor[0],
+            successor[1],
+        ))
+        + b"\n"
+    )
+    transactions = list(
+        (cutover.EVIDENCE_ROOT / rotation.AUDIT_DIRECTORY_NAME).iterdir()
+    )
+    assert len(transactions) == 1
+    assert not (transactions[0] / rotation.RECEIPT_FILE_NAME).exists()
+
+    monkeypatch.setattr(rotation, "_install_exact", install_exact)
+    receipt = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now + 4_000,
+        lock_factory=nullcontext,
+    )
+    assert receipt["successor_triplet_complete"] is True
+    assert (transactions[0] / rotation.RECEIPT_FILE_NAME).exists()
+
+
+@pytest.mark.parametrize(
+    "crash_stage",
+    (
+        "audit_prepared",
+        "predecessor_fixed_inputs_removed",
+        "predecessor_approval_removed",
+        "predecessor_plan_removed",
+        "successor_plan_staged",
+        "successor_approval_staged",
+        "successor_fixed_inputs_staged",
+    ),
+)
+def test_unit_input_rotation_resumes_after_each_durable_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    crash_stage: str,
+) -> None:
+    now = int(time.time())
+    staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+
+    def crash(stage: str) -> None:
+        if stage == crash_stage:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(rotation, "_checkpoint", crash)
+    with pytest.raises(KeyboardInterrupt):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=nullcontext,
+        )
+    transactions = list(
+        (cutover.EVIDENCE_ROOT / rotation.AUDIT_DIRECTORY_NAME).iterdir()
+    )
+    assert len(transactions) == 1
+    assert not (transactions[0] / rotation.RECEIPT_FILE_NAME).exists()
+
+    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    receipt = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now + 1,
+        lock_factory=nullcontext,
+    )
+    assert receipt["successor_revision"] == "b" * 40
+    assert (staged / "unit-input-plan.json").read_bytes() == _canonical(
+        successor[0]
+    )
+    assert (staged / "unit-input-approval.json").read_bytes() == _canonical(
+        successor[1]
+    )
+    assert (staged / "production-unit-inputs.json").read_bytes() == (
+        _canonical(package._unit_inputs_from_authority(
+            successor[0],
+            successor[1],
+        ))
+        + b"\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "crash_stage",
+    (
+        "transaction_authorized",
+        "successor_publication_archived",
+        "predecessor_plan_archived",
+        "predecessor_approval_archived",
+        "predecessor_fixed_inputs_archived",
+    ),
+)
+def test_unit_input_rotation_durable_authorization_recovers_after_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    crash_stage: str,
+) -> None:
+    now = int(time.time())
+    _staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+
+    def crash(stage: str) -> None:
+        if stage == crash_stage:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(rotation, "_checkpoint", crash)
+    with pytest.raises(KeyboardInterrupt):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=nullcontext,
+        )
+    transactions = list(
+        (cutover.EVIDENCE_ROOT / rotation.AUDIT_DIRECTORY_NAME).iterdir()
+    )
+    assert len(transactions) == 1
+    transaction = json.loads(
+        (transactions[0] / rotation.TRANSACTION_FILE_NAME).read_bytes()
+    )
+    assert transaction["authorization_checked_at_unix"] == now
+
+    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    if crash_stage == "transaction_authorized":
+        different = _unit_input_authority("c" * 40, now + 4_000)
+        with pytest.raises(
+            rotation.UnitInputRotationError,
+            match="unit_input_rotation_successor_conflict",
+        ):
+            rotation.rotate_unit_input_authority(
+                different[2],
+                require_root=False,
+                now_unix=now + 4_000,
+                lock_factory=nullcontext,
+            )
+    receipt = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now + 4_000,
+        lock_factory=nullcontext,
+    )
+    assert receipt["authorization_checked_at_unix"] == now
+    assert receipt["transaction_sha256"] == transaction[
+        "transaction_sha256"
+    ]
+    assert receipt["successor_triplet_complete"] is True
+
+
+def test_unit_input_rotation_pre_authorization_crash_still_requires_freshness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    before = {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    }
+
+    def crash(stage: str) -> None:
+        if stage == "before_transaction_authorized":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(rotation, "_checkpoint", crash)
+    with pytest.raises(KeyboardInterrupt):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=nullcontext,
+        )
+    transactions = list(
+        (cutover.EVIDENCE_ROOT / rotation.AUDIT_DIRECTORY_NAME).iterdir()
+    )
+    assert len(transactions) == 1
+    assert not (transactions[0] / rotation.TRANSACTION_FILE_NAME).exists()
+
+    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_publication_expired",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now + 4_000,
+            lock_factory=nullcontext,
+        )
+    assert {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    } == before
+
+
+def test_unit_input_rotation_rechecks_lease_at_transaction_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    before = {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    }
+    clock = [now]
+    monkeypatch.setattr(rotation.time, "time", lambda: clock[0])
+
+    def expire_before_authorization(stage: str) -> None:
+        if stage == "before_transaction_authorized":
+            clock[0] = now + 4_000
+
+    monkeypatch.setattr(
+        rotation,
+        "_checkpoint",
+        expire_before_authorization,
+    )
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_publication_expired",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            lock_factory=nullcontext,
+        )
+
+    transactions = list(
+        (cutover.EVIDENCE_ROOT / rotation.AUDIT_DIRECTORY_NAME).iterdir()
+    )
+    assert len(transactions) == 1
+    assert not (transactions[0] / rotation.TRANSACTION_FILE_NAME).exists()
+    assert {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    } == before
+
+
+def test_unit_input_rotation_recovers_expired_persisted_transaction_only_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+
+    def crash(stage: str) -> None:
+        if stage == "successor_plan_staged":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(rotation, "_checkpoint", crash)
+    with pytest.raises(KeyboardInterrupt):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=nullcontext,
+        )
+
+    different = _unit_input_authority("c" * 40, now + 4_000)
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_successor_conflict",
+    ):
+        rotation.rotate_unit_input_authority(
+            different[2],
+            require_root=False,
+            now_unix=now + 4_000,
+            lock_factory=nullcontext,
+        )
+
+    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    receipt = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now + 4_000,
+        lock_factory=nullcontext,
+    )
+    assert receipt["successor_revision"] == "b" * 40
+    assert (staged / "unit-input-plan.json").read_bytes() == _canonical(
+        successor[0]
+    )
+    assert (staged / "unit-input-approval.json").read_bytes() == _canonical(
+        successor[1]
+    )
+    assert (staged / "production-unit-inputs.json").read_bytes() == (
+        _canonical(package._unit_inputs_from_authority(
+            successor[0],
+            successor[1],
+        ))
+        + b"\n"
+    )
+
+
+def test_unit_input_rotation_incomplete_successor_precedes_historical_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    _staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now,
+        lock_factory=nullcontext,
+    )
+    next_successor = _unit_input_authority("c" * 40, now + 1)
+
+    def crash(stage: str) -> None:
+        if stage == "audit_prepared":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(rotation, "_checkpoint", crash)
+    with pytest.raises(KeyboardInterrupt):
+        rotation.rotate_unit_input_authority(
+            next_successor[2],
+            require_root=False,
+            now_unix=now + 1,
+            lock_factory=nullcontext,
+        )
+
+    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_successor_conflict",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now + 2,
+            lock_factory=nullcontext,
+        )
+    recovered = rotation.rotate_unit_input_authority(
+        next_successor[2],
+        require_root=False,
+        now_unix=now + 2,
+        lock_factory=nullcontext,
+    )
+    assert recovered["successor_revision"] == "c" * 40
+
+
+def test_unit_input_rotation_lock_contention_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    before = {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    }
+
+    class Busy:
+        def __enter__(self):
+            raise RuntimeError("another writer activation lifecycle is running")
+
+        def __exit__(self, *_args):
+            return False
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_failed",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now,
+            lock_factory=Busy,
+        )
+
+    assert {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    } == before
+    assert not (
+        cutover.EVIDENCE_ROOT / rotation.AUDIT_DIRECTORY_NAME
+    ).exists()
+
+
+def test_unit_input_rotation_replay_rejects_missing_terminal_triplet_member(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    _staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now,
+        lock_factory=nullcontext,
+    )
+    package.FIXED_UNIT_INPUTS_PATH.unlink()
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_file_unavailable",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now + 4_000,
+            lock_factory=nullcontext,
+        )
+
+
+def test_unit_input_rotation_replay_binds_receipt_to_archived_predecessor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = int(time.time())
+    _staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    receipt = rotation.rotate_unit_input_authority(
+        successor[2],
+        require_root=False,
+        now_unix=now,
+        lock_factory=nullcontext,
+    )
+    receipt_path = (
+        Path(receipt["audit_transaction_path"])
+        / rotation.RECEIPT_FILE_NAME
+    )
+    changed = {**receipt, "predecessor_approval_sha256": "f" * 64}
+    changed["receipt_sha256"] = hashlib.sha256(
+        _canonical({
+            name: item
+            for name, item in changed.items()
+            if name != "receipt_sha256"
+        })
+    ).hexdigest()
+    receipt_path.chmod(0o600)
+    receipt_path.write_bytes(_canonical(changed))
+    receipt_path.chmod(0o400)
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_receipt_invalid",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            now_unix=now + 4_000,
+            lock_factory=nullcontext,
+        )
+
+
+def test_unit_input_rotation_checks_approval_freshness_after_lock_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_800_000_000
+    staged, _predecessor, successor = _rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    before = {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    }
+    clock = [now]
+    monkeypatch.setattr(rotation.time, "time", lambda: clock[0])
+
+    class ExpireWhileWaiting:
+        def __enter__(self):
+            clock[0] = now + 901
+
+        def __exit__(self, *_args):
+            return False
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_publication_expired",
+    ):
+        rotation.rotate_unit_input_authority(
+            successor[2],
+            require_root=False,
+            lock_factory=ExpireWhileWaiting,
+        )
+
+    assert {
+        path.name: path.read_bytes()
+        for path in staged.iterdir()
+    } == before
+    audit_root = cutover.EVIDENCE_ROOT / rotation.AUDIT_DIRECTORY_NAME
+    assert not audit_root.exists() or list(audit_root.iterdir()) == []
+
+
 def test_unit_input_authority_is_signed_locally_and_staged_before_release(
     monkeypatch,
     tmp_path: Path,
@@ -1301,6 +2472,67 @@ def test_owner_cli_stages_successor_unit_inputs_through_installed_runtime(
     assert runtime_calls == [REVISION]
     assert identity_calls == [REVISION]
     assert staged == [{
+        "release_revision": REVISION,
+        "remote_stager_revision": old_revision,
+        "publication": publication,
+        "transport": transport,
+    }]
+    assert json.loads(output.read_bytes()) == receipt
+
+
+def test_owner_cli_rotates_successor_unit_inputs_through_installed_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    old_revision = "b" * 40
+    publication = {"canonical": "successor-unit-input-authority"}
+    publication_path = (tmp_path / "unit-input-publication.json").resolve()
+    publication_path.write_bytes(_canonical(publication))
+    output = (tmp_path / "unit-input-rotation-receipt.json").resolve()
+    runtime_calls: list[str] = []
+    rotated: list[dict] = []
+    transport = object()
+    receipt = {"receipt_sha256": "c" * 64}
+
+    monkeypatch.setattr(
+        owner,
+        "_active_owner_runtime_attestation",
+        lambda revision: (
+            runtime_calls.append(revision)
+            or _runtime_attestation(revision)
+        ),
+    )
+    monkeypatch.setattr(
+        owner,
+        "build_production_cutover_owner_identity",
+        lambda _revision: (object(), object(), object()),
+    )
+    monkeypatch.setattr(
+        owner,
+        "ProductionCutoverTransport",
+        lambda *_args, **_kwargs: transport,
+    )
+
+    def rotate(**kwargs) -> dict:
+        rotated.append(kwargs)
+        return receipt
+
+    monkeypatch.setattr(owner, "rotate_unit_input_authority", rotate)
+
+    assert owner.main([
+        "rotate-unit-inputs",
+        "--revision",
+        REVISION,
+        "--remote-stager-revision",
+        old_revision,
+        "--publication",
+        str(publication_path),
+        "--output",
+        str(output),
+    ]) == 0
+
+    assert runtime_calls == [REVISION]
+    assert rotated == [{
         "release_revision": REVISION,
         "remote_stager_revision": old_revision,
         "publication": publication,
@@ -1978,6 +3210,21 @@ def _production_transport(*, runner=subprocess.run):
         known_hosts=_ProductionKnownHosts(),
         preflight_runner=runner,
     )
+
+
+def test_production_transport_exposes_fixed_unit_input_rotation_edge() -> None:
+    remote = owner.ProductionCutoverTransport._remote_command(
+        REVISION,
+        "rotate-unit-input-authority",
+    )
+
+    assert remote[-4:] == (
+        "-B",
+        "-I",
+        "-m",
+        "scripts.canary.production_cutover_unit_input_rotation",
+    )
+    assert "muncho-canary-v2-01" not in " ".join(remote)
 
 
 def test_production_transport_full_argv_is_sealed_away_from_canary() -> None:

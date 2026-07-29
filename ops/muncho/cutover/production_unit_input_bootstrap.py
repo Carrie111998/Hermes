@@ -9,6 +9,9 @@ on an owner-writable Python import path.
 
 from __future__ import annotations
 
+import ctypes
+import errno
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -19,8 +22,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 
 STAGED_ROOT = Path("/var/lib/muncho-production-legacy-cutover/staged")
@@ -28,6 +32,8 @@ PLAN_PATH = STAGED_ROOT / "unit-input-plan.json"
 APPROVAL_PATH = STAGED_ROOT / "unit-input-approval.json"
 UNIT_INPUTS_PATH = STAGED_ROOT / "production-unit-inputs.json"
 OPENSSL = Path("/usr/bin/openssl")
+ACTIVATION_LOCK_PATH = Path("/run/muncho-writer-activation.lock")
+INHERITED_LOCK_FD_ENV = "MUNCHO_WRITER_ACTIVATION_LOCK_FD"
 
 PLAN_SCHEMA = "muncho-production-cutover-unit-input-plan.v3"
 PAYLOAD_SCHEMA = "muncho-production-cutover-unit-input-payload.v3"
@@ -89,10 +95,127 @@ OPERATIONAL_EDGE_DOMAINS = frozenset({
     "skyvision_db", "skyvision_email", "skyvision_gitlab", "skyvision_panel",
 })
 SPKI_ED25519_PREFIX = bytes.fromhex("302a300506032b6570032100")
+CANONICAL_FD = re.compile(r"^(?:[3-9]|[1-9][0-9]+)$")
+TEMPORARY_SUFFIX = re.compile(r"^[1-9][0-9]*$")
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+MAX_TEMPORARY_ALIASES = 64
 
 
 class BootstrapError(RuntimeError):
     """Stable, secret-free bootstrap failure."""
+
+
+def _xattrs(path: Path) -> tuple[str, ...]:
+    try:
+        return tuple(sorted(os.listxattr(path, follow_symlinks=False)))
+    except AttributeError:
+        return ()
+    except OSError as exc:
+        raise BootstrapError("unit_input_bootstrap_lock_invalid") from exc
+
+
+def _validate_lock_descriptor(descriptor: int) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        reached = ACTIVATION_LOCK_PATH.lstat()
+        if (
+            ACTIVATION_LOCK_PATH.resolve(strict=True)
+            != ACTIVATION_LOCK_PATH
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != 0
+            or opened.st_gid != 0
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino)
+            != (reached.st_dev, reached.st_ino)
+            or _xattrs(ACTIVATION_LOCK_PATH)
+        ):
+            raise BootstrapError("unit_input_bootstrap_lock_invalid")
+    except BootstrapError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise BootstrapError("unit_input_bootstrap_lock_invalid") from exc
+
+
+@contextmanager
+def _activation_lock(*, require_root: bool) -> Iterator[None]:
+    if not require_root:
+        yield
+        return
+    inherited = os.environ.get(INHERITED_LOCK_FD_ENV)
+    if inherited is not None:
+        if CANONICAL_FD.fullmatch(inherited) is None:
+            raise BootstrapError("unit_input_bootstrap_lock_invalid")
+        descriptor = int(inherited)
+        _validate_lock_descriptor(descriptor)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.set_inheritable(descriptor, True)
+        except (OSError, ValueError) as exc:
+            raise BootstrapError("unit_input_bootstrap_lock_unavailable") from exc
+        _validate_lock_descriptor(descriptor)
+        yield
+        return
+
+    descriptor: int | None = None
+    locked = False
+    try:
+        parent = ACTIVATION_LOCK_PATH.parent.lstat()
+        if (
+            ACTIVATION_LOCK_PATH.parent.resolve(strict=True)
+            != ACTIVATION_LOCK_PATH.parent
+            or not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != 0
+            or parent.st_gid != 0
+            or stat.S_IMODE(parent.st_mode) & 0o022
+            or _xattrs(ACTIVATION_LOCK_PATH.parent)
+        ):
+            raise BootstrapError("unit_input_bootstrap_lock_invalid")
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        created = False
+        try:
+            descriptor = os.open(
+                ACTIVATION_LOCK_PATH,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(ACTIVATION_LOCK_PATH, flags)
+        if created:
+            os.fchown(descriptor, 0, 0)
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            parent_descriptor = os.open(
+                ACTIVATION_LOCK_PATH.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
+        _validate_lock_descriptor(descriptor)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BootstrapError(
+                "unit_input_bootstrap_lock_unavailable"
+            ) from exc
+        locked = True
+        yield
+    except BootstrapError:
+        raise
+    except OSError as exc:
+        raise BootstrapError("unit_input_bootstrap_lock_unavailable") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                if locked:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _canonical(value: Any) -> bytes:
@@ -124,6 +247,7 @@ def _read_exact(
     gid: int,
     mode: int,
     maximum: int,
+    allowed_nlinks: frozenset[int] = frozenset({1}),
 ) -> bytes:
     descriptor: int | None = None
     try:
@@ -132,7 +256,7 @@ def _read_exact(
             path.resolve(strict=True) != path
             or stat.S_ISLNK(before.st_mode)
             or not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
+            or before.st_nlink not in allowed_nlinks
             or before.st_uid != uid
             or before.st_gid != gid
             or stat.S_IMODE(before.st_mode) != mode
@@ -446,6 +570,224 @@ def _verify_signature(
         raise BootstrapError("unit_input_bootstrap_signature_invalid")
 
 
+def _bootstrap_temporaries(path: Path) -> list[Path]:
+    prefixes = tuple(
+        f".{path.name}.{tag}."
+        for tag in ("stage", "bootstrap", "rotate")
+    )
+    try:
+        children = list(path.parent.iterdir())
+    except OSError as exc:
+        raise BootstrapError("unit_input_bootstrap_write_failed") from exc
+    result = []
+    for child in children:
+        prefix = next(
+            (
+                candidate
+                for candidate in prefixes
+                if child.name.startswith(candidate)
+            ),
+            None,
+        )
+        if prefix is None:
+            continue
+        if TEMPORARY_SUFFIX.fullmatch(child.name[len(prefix) :]) is None:
+            raise BootstrapError("unit_input_bootstrap_conflict")
+        result.append(child)
+    if len(result) > MAX_TEMPORARY_ALIASES:
+        raise BootstrapError("unit_input_bootstrap_conflict")
+    return sorted(result)
+
+
+def _heal_authority_aliases(
+    path: Path,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+    maximum: int,
+) -> None:
+    candidates = _bootstrap_temporaries(path)
+    if not candidates:
+        return
+    try:
+        target = path.lstat()
+    except OSError as exc:
+        raise BootstrapError("unit_input_bootstrap_conflict") from exc
+    expected_links = len(candidates) + 1
+    if target.st_nlink == 1 or target.st_nlink != expected_links:
+        raise BootstrapError("unit_input_bootstrap_conflict")
+    raw = _read_exact(
+        path,
+        uid=uid,
+        gid=gid,
+        mode=mode,
+        maximum=maximum,
+        allowed_nlinks=frozenset({expected_links}),
+    )
+    for candidate in candidates:
+        item = candidate.lstat()
+        candidate_raw = _read_exact(
+            candidate,
+            uid=uid,
+            gid=gid,
+            mode=mode,
+            maximum=maximum,
+            allowed_nlinks=frozenset({expected_links}),
+        )
+        if (
+            candidate_raw != raw
+            or (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino)
+        ):
+            raise BootstrapError("unit_input_bootstrap_conflict")
+    try:
+        for candidate in candidates:
+            item = candidate.lstat()
+            if (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino):
+                raise BootstrapError("unit_input_bootstrap_conflict")
+            candidate.unlink()
+        parent = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except BootstrapError:
+        raise
+    except OSError as exc:
+        raise BootstrapError("unit_input_bootstrap_write_failed") from exc
+
+
+def _validate_bootstrap_file(
+    path: Path,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+    nlink: int,
+) -> os.stat_result:
+    observed = _read_exact(
+        path,
+        uid=uid,
+        gid=gid,
+        mode=0o444,
+        maximum=max(128 * 1024, len(payload)),
+        allowed_nlinks=frozenset({nlink}),
+    )
+    if observed != payload:
+        raise BootstrapError("unit_input_bootstrap_conflict")
+    return path.lstat()
+
+
+def _recover_bootstrap_temporary(
+    path: Path,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+) -> Path:
+    candidates = _bootstrap_temporaries(path)
+    own_prefix = f".{path.name}.bootstrap."
+    own = [
+        candidate
+        for candidate in candidates
+        if candidate.name.startswith(own_prefix)
+    ]
+    current = path.with_name(f".{path.name}.bootstrap.{os.getpid()}")
+    if not candidates:
+        return current
+    if not os.path.lexists(path):
+        if len(candidates) != 1 or candidates != own:
+            raise BootstrapError("unit_input_bootstrap_conflict")
+        _validate_bootstrap_file(
+            candidates[0],
+            payload,
+            uid=uid,
+            gid=gid,
+            nlink=1,
+        )
+        return candidates[0]
+    target = path.lstat()
+    if target.st_nlink == 1 or target.st_nlink != len(candidates) + 1:
+        raise BootstrapError("unit_input_bootstrap_conflict")
+    target = _validate_bootstrap_file(
+        path,
+        payload,
+        uid=uid,
+        gid=gid,
+        nlink=len(candidates) + 1,
+    )
+    for candidate in candidates:
+        item = _validate_bootstrap_file(
+            candidate,
+            payload,
+            uid=uid,
+            gid=gid,
+            nlink=target.st_nlink,
+        )
+        if (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino):
+            raise BootstrapError("unit_input_bootstrap_conflict")
+    try:
+        for candidate in candidates:
+            item = candidate.lstat()
+            if (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino):
+                raise BootstrapError("unit_input_bootstrap_conflict")
+            candidate.unlink()
+        parent = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except BootstrapError:
+        raise
+    except OSError as exc:
+        raise BootstrapError("unit_input_bootstrap_write_failed") from exc
+    return current
+
+
+def _rename_noreplace(source: Path, destination: Path) -> bool:
+    if sys.platform.startswith("linux"):
+        try:
+            renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+        except (AttributeError, OSError) as exc:
+            raise OSError(
+                errno.ENOSYS,
+                "renameat2(RENAME_NOREPLACE) unavailable",
+            ) from exc
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renameat2(
+            AT_FDCWD,
+            os.fsencode(source),
+            AT_FDCWD,
+            os.fsencode(destination),
+            RENAME_NOREPLACE,
+        )
+        if result == 0:
+            return True
+        number = ctypes.get_errno()
+        if number == errno.EEXIST:
+            return False
+        raise OSError(number, os.strerror(number), destination)
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except FileExistsError:
+        return False
+    return True
+
+
 def _install_exact(
     path: Path,
     payload: bytes,
@@ -454,40 +796,75 @@ def _install_exact(
     gid: int,
 ) -> bool:
     created = False
+    temporary = _recover_bootstrap_temporary(
+        path,
+        payload,
+        uid=uid,
+        gid=gid,
+    )
+    descriptor: int | None = None
+    temporary_identity: tuple[int, int] | None = None
     if not os.path.lexists(path):
-        temporary = path.with_name(f".{path.name}.bootstrap.{os.getpid()}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = None
         try:
-            descriptor = os.open(temporary, flags, 0o600)
-            os.fchown(descriptor, uid, gid)
-            view = memoryview(payload)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("short unit-input bootstrap write")
-                view = view[written:]
-            os.fchmod(descriptor, 0o444)
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
-            os.link(temporary, path, follow_symlinks=False)
-            created = True
-        except FileExistsError:
-            pass
+            if not os.path.lexists(temporary):
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(temporary, flags, 0o600)
+                opened = os.fstat(descriptor)
+                temporary_identity = (opened.st_dev, opened.st_ino)
+                os.fchown(descriptor, uid, gid)
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short unit-input bootstrap write")
+                    view = view[written:]
+                os.fchmod(descriptor, 0o444)
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = None
+            temporary_state = _validate_bootstrap_file(
+                temporary,
+                payload,
+                uid=uid,
+                gid=gid,
+                nlink=1,
+            )
+            temporary_identity = (
+                temporary_state.st_dev,
+                temporary_state.st_ino,
+            )
+            created = _rename_noreplace(temporary, path)
+            if os.path.lexists(temporary):
+                current = temporary.lstat()
+                if (current.st_dev, current.st_ino) != temporary_identity:
+                    raise BootstrapError("unit_input_bootstrap_conflict")
+                temporary.unlink()
+            parent = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+        except BootstrapError:
+            raise
+        except OSError as exc:
+            raise BootstrapError("unit_input_bootstrap_write_failed") from exc
         finally:
             if descriptor is not None:
                 os.close(descriptor)
             try:
-                temporary.unlink()
-            except FileNotFoundError:
+                current = temporary.lstat()
+                if temporary_identity is not None and (
+                    current.st_dev,
+                    current.st_ino,
+                ) == temporary_identity:
+                    temporary.unlink()
+            except (FileNotFoundError, OSError):
                 pass
-        parent = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(parent)
-        finally:
-            os.close(parent)
     observed = _read_exact(
         path,
         uid=uid,
@@ -500,7 +877,7 @@ def _install_exact(
     return created
 
 
-def bootstrap(
+def _bootstrap_locked(
     *,
     plan_path: Path = PLAN_PATH,
     approval_path: Path = APPROVAL_PATH,
@@ -528,6 +905,20 @@ def bootstrap(
         or stat.S_IMODE(parent.st_mode) != 0o700
     ):
         raise BootstrapError("unit_input_bootstrap_directory_invalid")
+    _heal_authority_aliases(
+        plan_path,
+        uid=uid,
+        gid=gid,
+        mode=0o400,
+        maximum=1024 * 1024,
+    )
+    _heal_authority_aliases(
+        approval_path,
+        uid=uid,
+        gid=gid,
+        mode=0o400,
+        maximum=1024 * 1024,
+    )
     plan = _self_hashed(
         _decode(_read_exact(
             plan_path, uid=uid, gid=gid, mode=0o400, maximum=1024 * 1024,
@@ -627,6 +1018,33 @@ def bootstrap(
         "secret_digest_recorded": False,
     }
     return {**unsigned, "receipt_sha256": _sha(_canonical(unsigned))}
+
+
+def bootstrap(
+    *,
+    plan_path: Path = PLAN_PATH,
+    approval_path: Path = APPROVAL_PATH,
+    output_path: Path = UNIT_INPUTS_PATH,
+    openssl: Path = OPENSSL,
+    now_unix: int | None = None,
+    require_root: bool = True,
+) -> Mapping[str, Any]:
+    if require_root and (
+        os.geteuid() != 0
+        or not sys.platform.startswith("linux")
+        or (plan_path, approval_path, output_path, openssl)
+        != (PLAN_PATH, APPROVAL_PATH, UNIT_INPUTS_PATH, OPENSSL)
+    ):
+        raise BootstrapError("unit_input_bootstrap_boundary_invalid")
+    with _activation_lock(require_root=require_root):
+        return _bootstrap_locked(
+            plan_path=plan_path,
+            approval_path=approval_path,
+            output_path=output_path,
+            openssl=openssl,
+            now_unix=now_unix,
+            require_root=require_root,
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -1377,6 +1377,31 @@ def test_standalone_target_bootstrap_verifies_signature_without_repo_imports(
     assert output_path.read_bytes().endswith(b"\n")
     assert stat.S_IMODE(output_path.stat().st_mode) == 0o444
 
+    plan_alias = staged / ".unit-input-plan.json.stage.999997"
+    approval_alias = staged / ".unit-input-approval.json.rotate.999998"
+    output_alias = staged / ".production-unit-inputs.json.bootstrap.999999"
+    os.link(plan_path, plan_alias)
+    os.link(approval_path, approval_alias)
+    os.link(output_path, output_alias)
+    assert plan_path.stat().st_nlink == 2
+    assert approval_path.stat().st_nlink == 2
+    assert output_path.stat().st_nlink == 2
+    replay = bootstrap.bootstrap(
+        plan_path=plan_path,
+        approval_path=approval_path,
+        output_path=output_path,
+        openssl=Path(shutil.which("openssl") or "/usr/bin/openssl"),
+        now_unix=1_800_000_001,
+        require_root=False,
+    )
+    assert replay["created"] is False
+    assert plan_path.stat().st_nlink == 1
+    assert approval_path.stat().st_nlink == 1
+    assert output_path.stat().st_nlink == 1
+    assert not plan_alias.exists()
+    assert not approval_alias.exists()
+    assert not output_alias.exists()
+
 
 def test_packager_binds_gateway_imports_to_its_target_release_under_isolation(
     tmp_path,
@@ -3020,69 +3045,111 @@ def test_host_boundary_embeds_exact_connector_unit_and_gateway_drop_in(
 def test_deploy_packages_and_verifies_before_release_activation():
     source = (ROOT / "ops/muncho/runtime/muncho-auto-deploy-release").read_text()
     run_deploy = source[source.index("run_deploy() {") : source.index("main() {")]
-    copy_venv = run_deploy.index('cp -a "$active/.venv" "$tmp/.venv"')
-    install_wheel = run_deploy.index(
-        'install_target_release_wheel "$tmp" "$active"'
+    marker = run_deploy.index('create_release_build_marker "$new" "$sha"')
+    clone = run_deploy.index(
+        'clone --depth 1 --branch main "$REPO_URL" "$new"',
+        marker,
     )
-    build = run_deploy.index("package_production_cutover_artifacts.py\" build")
-    verify = run_deploy.index("package_production_cutover_artifacts.py\" verify")
-    publish = run_deploy.index('mv "$tmp" "$new"')
-    release_identity = run_deploy.index(
-        'release_identity_matches "$new" "$sha"'
+    source_marker = run_deploy.index(
+        'create_source_commit_marker "$new" "$sha"',
+        clone,
     )
-    attest_venv = run_deploy.index(
-        'attest_target_release_venv "$new" "$new"'
-    )
-    cutover_attest = run_deploy.index('cutover_artifacts_match "$new" "$sha"')
-    activate = run_deploy.index('ln -sfn "$new" "$ACTIVE_LINK.next"')
     bootstrap = run_deploy.index(
-        'bootstrap_cutover_unit_inputs_from_target "$tmp" "$sha"'
+        'bootstrap_cutover_unit_inputs_from_target "$new" "$sha"',
+        source_marker,
     )
     require_inputs = run_deploy.index(
         'require_cutover_unit_inputs "$sha" "$pr"',
         bootstrap,
     )
+    build_venv = run_deploy.index(
+        'build_target_release_venv "$new" "$sha"',
+        require_inputs,
+    )
     dependency_prepare = run_deploy.index(
-        'package_production_runtime_dependencies.py" prepare'
+        'package_production_runtime_dependencies.py" prepare',
+        build_venv,
     )
     config_seal = run_deploy.index(
-        'seal_agent_browser_config "$tmp" "$sha"'
+        'seal_agent_browser_config "$new" "$sha"',
+        dependency_prepare,
+    )
+    dependency_manifest_command = run_deploy.index(
+        'package_production_runtime_dependencies.py"',
+        config_seal,
     )
     dependency_manifest = run_deploy.index(
-        'package_production_runtime_dependencies.py" build-manifest'
+        "build-manifest",
+        dependency_manifest_command,
     )
+    build = run_deploy.index(
+        'package_production_cutover_artifacts.py" build',
+        dependency_manifest,
+    )
+    dependency_verify = run_deploy.index(
+        'package_production_runtime_dependencies.py" verify',
+        build,
+    )
+    verify = run_deploy.index(
+        'package_production_cutover_artifacts.py" verify',
+        dependency_verify,
+    )
+    complete = run_deploy.index(
+        'complete_release_build "$new" "$sha"',
+        verify,
+    )
+    release_identity = run_deploy.index(
+        'release_identity_matches "$new" "$sha"',
+        complete,
+    )
+    attest_venv = run_deploy.index(
+        'attest_target_release_venv "$new" "$new"',
+        release_identity,
+    )
+    cutover_attest = run_deploy.index('cutover_artifacts_match "$new" "$sha"')
+    activate = run_deploy.index('ln -sfn "$new" "$ACTIVE_LINK.next"')
 
     assert (
-        copy_venv
+        marker
+        < clone
+        < source_marker
         < bootstrap
         < require_inputs
-        < install_wheel
+        < build_venv
         < dependency_prepare
         < config_seal
+        < dependency_manifest_command
         < dependency_manifest
         < build
+        < dependency_verify
         < verify
-        < publish
+        < complete
         < release_identity
         < attest_venv
         < cutover_attest
         < activate
     )
+    assert 'cp -a "$active/.venv"' not in run_deploy
+    assert '"$tmp"' not in run_deploy
+    assert 'mv "$tmp" "$new"' not in run_deploy
     assert run_deploy.count('--unit-inputs "$CUTOVER_UNIT_INPUTS_PATH"') >= 2
     assert 'cutover_artifacts_match "$new" "$sha"' in run_deploy
     assert 'blocked_target_cutover_artifacts_invalid' in run_deploy
-    install = source[
-        source.index("install_target_release_wheel() {") : source.index(
-            "release_identity_matches() {"
+    builder = source[
+        source.index("build_target_release_venv() {") : source.index(
+            "attest_target_release_venv() {"
         )
     ]
     for flag in (
-        "--isolated install",
+        "--frozen",
+        "--no-editable",
+        "--no-install-project",
+        "--extra all",
+        "--extra messaging",
+        "--extra voice",
+        "--extra edge-tts",
         "--no-index",
         "--no-deps",
-        "--no-build-isolation",
-        "--no-cache-dir",
-        "--force-reinstall",
+        "--no-build",
     ):
-        assert flag in install
-    assert '"$release" >/dev/null' in install
+        assert flag in builder

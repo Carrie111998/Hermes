@@ -14,6 +14,8 @@ signed cutover plan.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import ipaddress
 import json
@@ -115,6 +117,10 @@ STAGED_UNIT_INPUT_APPROVAL_PATH = (
 )
 FIXED_UNIT_INPUTS_PATH = CUTOVER_STAGED_ROOT / "production-unit-inputs.json"
 FIXED_UNIT_INPUTS_MODE = 0o444
+_TEMPORARY_SUFFIX = re.compile(r"^[1-9][0-9]*$")
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_MAX_TEMPORARY_ALIASES = 64
 UNIT_INPUT_STAGING_SCHEMA = "muncho-production-cutover-unit-input-staging.v3"
 UNIT_INPUT_PAYLOAD_SCHEMA = "muncho-production-cutover-unit-input-payload.v3"
 UNIT_INPUT_PLAN_SCHEMA = "muncho-production-cutover-unit-input-plan.v3"
@@ -721,6 +727,7 @@ def _read_trusted_staged_file(
     expected_gid: int,
     mode: int,
     maximum: int,
+    allowed_nlinks: frozenset[int] = frozenset({1}),
 ) -> bytes:
     """Read one fixed, immutable staging file without following a link."""
 
@@ -733,7 +740,7 @@ def _read_trusted_staged_file(
             or path.resolve(strict=True) != path
             or stat.S_ISLNK(before.st_mode)
             or not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
+            or before.st_nlink not in allowed_nlinks
             or before.st_uid != expected_uid
             or before.st_gid != expected_gid
             or stat.S_IMODE(before.st_mode) != mode
@@ -1025,45 +1032,82 @@ def _unit_inputs_from_authority(
     )
 
 
-def _create_or_validate_fixed_unit_inputs(
+def _bootstrap_temporaries(path: Path) -> list[Path]:
+    prefixes = tuple(
+        f".{path.name}.{tag}."
+        for tag in ("stage", "bootstrap", "rotate")
+    )
+    try:
+        children = list(path.parent.iterdir())
+    except OSError as exc:
+        raise PackagingError("cutover_unit_inputs_staging_failed") from exc
+    result = []
+    for child in children:
+        prefix = next(
+            (
+                candidate
+                for candidate in prefixes
+                if child.name.startswith(candidate)
+            ),
+            None,
+        )
+        if prefix is None:
+            continue
+        if _TEMPORARY_SUFFIX.fullmatch(child.name[len(prefix) :]) is None:
+            raise PackagingError("cutover_unit_inputs_staging_conflict")
+        result.append(child)
+    if len(result) > _MAX_TEMPORARY_ALIASES:
+        raise PackagingError("cutover_unit_inputs_staging_conflict")
+    return sorted(result)
+
+
+def _heal_authority_aliases(
     path: Path,
-    payload: bytes,
     *,
     uid: int,
     gid: int,
-) -> bool:
-    created = False
-    if not os.path.lexists(path):
-        temporary = path.with_name(f".{path.name}.bootstrap.{os.getpid()}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(temporary, flags, 0o600)
-        try:
-            os.fchown(descriptor, uid, gid)
-            view = memoryview(payload)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("short unit-input staging write")
-                view = view[written:]
-            os.fchmod(descriptor, FIXED_UNIT_INPUTS_MODE)
-            os.fsync(descriptor)
-        except BaseException:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
-            raise
-        finally:
-            os.close(descriptor)
-        try:
-            os.link(temporary, path, follow_symlinks=False)
-            created = True
-        except FileExistsError:
-            pass
-        finally:
-            temporary.unlink()
+    mode: int,
+    maximum: int,
+) -> None:
+    candidates = _bootstrap_temporaries(path)
+    if not candidates:
+        return
+    try:
+        target = path.lstat()
+    except OSError as exc:
+        raise PackagingError("cutover_unit_inputs_staging_conflict") from exc
+    expected_links = len(candidates) + 1
+    if target.st_nlink == 1 or target.st_nlink != expected_links:
+        raise PackagingError("cutover_unit_inputs_staging_conflict")
+    raw = _read_trusted_staged_file(
+        path,
+        expected_uid=uid,
+        expected_gid=gid,
+        mode=mode,
+        maximum=maximum,
+        allowed_nlinks=frozenset({expected_links}),
+    )
+    for candidate in candidates:
+        item = candidate.lstat()
+        candidate_raw = _read_trusted_staged_file(
+            candidate,
+            expected_uid=uid,
+            expected_gid=gid,
+            mode=mode,
+            maximum=maximum,
+            allowed_nlinks=frozenset({expected_links}),
+        )
+        if (
+            candidate_raw != raw
+            or (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino)
+        ):
+            raise PackagingError("cutover_unit_inputs_staging_conflict")
+    try:
+        for candidate in candidates:
+            item = candidate.lstat()
+            if (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino):
+                raise PackagingError("cutover_unit_inputs_staging_conflict")
+            candidate.unlink()
         parent = os.open(
             path.parent,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
@@ -1072,6 +1116,219 @@ def _create_or_validate_fixed_unit_inputs(
             os.fsync(parent)
         finally:
             os.close(parent)
+    except PackagingError:
+        raise
+    except OSError as exc:
+        raise PackagingError("cutover_unit_inputs_staging_failed") from exc
+
+
+def _validate_bootstrap_file(
+    path: Path,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+    nlink: int,
+) -> os.stat_result:
+    observed = _read_trusted_staged_file(
+        path,
+        expected_uid=uid,
+        expected_gid=gid,
+        mode=FIXED_UNIT_INPUTS_MODE,
+        maximum=max(128 * 1024, len(payload)),
+        allowed_nlinks=frozenset({nlink}),
+    )
+    if observed != payload:
+        raise PackagingError("cutover_unit_inputs_staging_conflict")
+    return path.lstat()
+
+
+def _recover_bootstrap_temporary(
+    path: Path,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+) -> Path:
+    candidates = _bootstrap_temporaries(path)
+    own_prefix = f".{path.name}.bootstrap."
+    own = [
+        candidate
+        for candidate in candidates
+        if candidate.name.startswith(own_prefix)
+    ]
+    current = path.with_name(f".{path.name}.bootstrap.{os.getpid()}")
+    if not candidates:
+        return current
+    if not os.path.lexists(path):
+        if len(candidates) != 1 or candidates != own:
+            raise PackagingError("cutover_unit_inputs_staging_conflict")
+        _validate_bootstrap_file(
+            candidates[0],
+            payload,
+            uid=uid,
+            gid=gid,
+            nlink=1,
+        )
+        return candidates[0]
+    target = path.lstat()
+    if target.st_nlink == 1 or target.st_nlink != len(candidates) + 1:
+        raise PackagingError("cutover_unit_inputs_staging_conflict")
+    target = _validate_bootstrap_file(
+        path,
+        payload,
+        uid=uid,
+        gid=gid,
+        nlink=len(candidates) + 1,
+    )
+    for candidate in candidates:
+        item = _validate_bootstrap_file(
+            candidate,
+            payload,
+            uid=uid,
+            gid=gid,
+            nlink=target.st_nlink,
+        )
+        if (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino):
+            raise PackagingError("cutover_unit_inputs_staging_conflict")
+    try:
+        for candidate in candidates:
+            item = candidate.lstat()
+            if (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino):
+                raise PackagingError("cutover_unit_inputs_staging_conflict")
+            candidate.unlink()
+        parent = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except PackagingError:
+        raise
+    except OSError as exc:
+        raise PackagingError("cutover_unit_inputs_staging_failed") from exc
+    return current
+
+
+def _rename_noreplace(source: Path, destination: Path) -> bool:
+    if sys.platform.startswith("linux"):
+        try:
+            renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+        except (AttributeError, OSError) as exc:
+            raise OSError(
+                errno.ENOSYS,
+                "renameat2(RENAME_NOREPLACE) unavailable",
+            ) from exc
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renameat2(
+            _AT_FDCWD,
+            os.fsencode(source),
+            _AT_FDCWD,
+            os.fsencode(destination),
+            _RENAME_NOREPLACE,
+        )
+        if result == 0:
+            return True
+        number = ctypes.get_errno()
+        if number == errno.EEXIST:
+            return False
+        raise OSError(number, os.strerror(number), destination)
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except FileExistsError:
+        return False
+    return True
+
+
+def _create_or_validate_fixed_unit_inputs(
+    path: Path,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+) -> bool:
+    created = False
+    temporary = _recover_bootstrap_temporary(
+        path,
+        payload,
+        uid=uid,
+        gid=gid,
+    )
+    descriptor: int | None = None
+    temporary_identity: tuple[int, int] | None = None
+    if not os.path.lexists(path):
+        try:
+            if not os.path.lexists(temporary):
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(temporary, flags, 0o600)
+                opened = os.fstat(descriptor)
+                temporary_identity = (opened.st_dev, opened.st_ino)
+                os.fchown(descriptor, uid, gid)
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short unit-input staging write")
+                    view = view[written:]
+                os.fchmod(descriptor, FIXED_UNIT_INPUTS_MODE)
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = None
+            temporary_state = _validate_bootstrap_file(
+                temporary,
+                payload,
+                uid=uid,
+                gid=gid,
+                nlink=1,
+            )
+            temporary_identity = (
+                temporary_state.st_dev,
+                temporary_state.st_ino,
+            )
+            created = _rename_noreplace(temporary, path)
+            if os.path.lexists(temporary):
+                current = temporary.lstat()
+                if (current.st_dev, current.st_ino) != temporary_identity:
+                    raise PackagingError(
+                        "cutover_unit_inputs_staging_conflict"
+                    )
+                temporary.unlink()
+            parent = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+        except PackagingError:
+            raise
+        except OSError as exc:
+            raise PackagingError("cutover_unit_inputs_staging_failed") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                current = temporary.lstat()
+                if temporary_identity is not None and (
+                    current.st_dev,
+                    current.st_ino,
+                ) == temporary_identity:
+                    temporary.unlink()
+            except (FileNotFoundError, OSError):
+                pass
     observed = _read_trusted_staged_file(
         path,
         expected_uid=uid,
@@ -1084,7 +1341,7 @@ def _create_or_validate_fixed_unit_inputs(
     return created
 
 
-def bootstrap_fixed_unit_inputs(
+def _bootstrap_fixed_unit_inputs_locked(
     *,
     authority_plan_path: Path = STAGED_UNIT_INPUT_PLAN_PATH,
     authority_approval_path: Path = STAGED_UNIT_INPUT_APPROVAL_PATH,
@@ -1126,6 +1383,20 @@ def bootstrap_fixed_unit_inputs(
     ):
         raise PackagingError("cutover_unit_inputs_staging_directory_invalid")
 
+    _heal_authority_aliases(
+        authority_plan_path,
+        uid=uid,
+        gid=gid,
+        mode=0o400,
+        maximum=8 * 1024 * 1024,
+    )
+    _heal_authority_aliases(
+        authority_approval_path,
+        uid=uid,
+        gid=gid,
+        mode=0o400,
+        maximum=1024 * 1024,
+    )
     plan_value = _decode_canonical_json(
         _read_trusted_staged_file(
             authority_plan_path,
@@ -1182,6 +1453,37 @@ def bootstrap_fixed_unit_inputs(
         **unsigned,
         "receipt_sha256": _sha256(_canonical_bytes(unsigned)),
     }
+
+
+def bootstrap_fixed_unit_inputs(
+    *,
+    authority_plan_path: Path = STAGED_UNIT_INPUT_PLAN_PATH,
+    authority_approval_path: Path = STAGED_UNIT_INPUT_APPROVAL_PATH,
+    unit_inputs_path: Path = FIXED_UNIT_INPUTS_PATH,
+    require_root: bool = True,
+    now_unix: int | None = None,
+    lock_factory: Any | None = None,
+) -> Mapping[str, Any]:
+    """Create fixed inputs while holding the shared activation lock."""
+
+    from scripts.canary import production_cutover_activation_lock as authority_lock
+
+    try:
+        with authority_lock.authority_activation_lock(
+            require_root=require_root,
+            lock_factory=lock_factory,
+        ):
+            return _bootstrap_fixed_unit_inputs_locked(
+                authority_plan_path=authority_plan_path,
+                authority_approval_path=authority_approval_path,
+                unit_inputs_path=unit_inputs_path,
+                require_root=require_root,
+                now_unix=now_unix,
+            )
+    except authority_lock.AuthorityActivationLockError as exc:
+        raise PackagingError(
+            "cutover_unit_inputs_activation_lock_unavailable"
+        ) from exc
 
 
 def _production_reconcile(source: str) -> str:
@@ -2105,6 +2407,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    from scripts.canary import production_cutover_activation_lock as authority_lock
+
     try:
         if args.command == "bootstrap-unit-inputs":
             if any(
@@ -2126,23 +2430,28 @@ def main(argv: list[str] | None = None) -> int:
             or args.unit_inputs != FIXED_UNIT_INPUTS_PATH
         ):
             raise PackagingError("cutover_packaging_unit_inputs_path_invalid")
-        unit_inputs = load_fixed_unit_inputs(args.unit_inputs)
-        result = (
-            build_release_artifacts(
-                args.release_root,
-                args.revision,
-                release_address=args.release_address,
-                unit_inputs=unit_inputs,
+        with authority_lock.authority_activation_lock(require_root=True):
+            unit_inputs = load_fixed_unit_inputs(args.unit_inputs)
+            result = (
+                build_release_artifacts(
+                    args.release_root,
+                    args.revision,
+                    release_address=args.release_address,
+                    unit_inputs=unit_inputs,
+                )
+                if args.command == "build"
+                else verify_release_artifacts(
+                    args.release_root,
+                    args.revision,
+                    release_address=args.release_address,
+                    unit_inputs=unit_inputs,
+                )
             )
-            if args.command == "build"
-            else verify_release_artifacts(
-                args.release_root,
-                args.revision,
-                release_address=args.release_address,
-                unit_inputs=unit_inputs,
-            )
-        )
-    except (OSError, PackagingError):
+    except (
+        OSError,
+        PackagingError,
+        authority_lock.AuthorityActivationLockError,
+    ):
         print('{"error_code":"production_cutover_packaging_failed","ok":false}')
         return 2
     print(_canonical_bytes(result).decode("utf-8"))
