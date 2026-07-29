@@ -807,6 +807,34 @@ class TestPrefetch:
         assert result.startswith("Custom header:")
         assert "- memory line" in result
 
+    def test_recall_attribution_defaults_on(self, provider):
+        # Default: the injected recall block carries the visible-attribution
+        # directive so the agent surfaces the 🧠 banner.
+        assert provider._recall_attribution is True
+        provider._prefetch_result = "- some memory"
+        result = provider.prefetch("test")
+        assert "🧠 **Using Hindsight Memories**" in result
+        assert "VISIBLE ATTRIBUTION" in result
+        assert "- some memory" in result
+
+    def test_recall_attribution_can_be_disabled(self, provider_with_config):
+        p = provider_with_config(recall_attribution=False)
+        assert p._recall_attribution is False
+        p._prefetch_result = "- some memory"
+        result = p.prefetch("test")
+        assert "Using Hindsight Memories" not in result   # no banner directive
+        assert "Hindsight Memory" in result               # plain header still present
+        assert "- some memory" in result
+
+    def test_custom_preamble_overrides_attribution(self, provider_with_config):
+        # An explicit preamble wins even with attribution on (the default).
+        p = provider_with_config(recall_prompt_preamble="Custom header:")
+        assert p._recall_attribution is True
+        p._prefetch_result = "- memory line"
+        result = p.prefetch("test")
+        assert result.startswith("Custom header:")
+        assert "Using Hindsight Memories" not in result
+
     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
         p.queue_prefetch("test")

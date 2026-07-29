@@ -56,6 +56,41 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+
+# Header prefixed to injected recall results. The plain variant just tells the
+# agent to use the context; the attribution variant additionally makes the agent
+# visibly surface a "🧠 Using Hindsight Memories" banner when memory informs its
+# answer — so the user can SEE Hindsight working. The attribution wording is
+# ported from the proven hindsight-coding-agents / v1 Claude Code preamble that
+# reliably triggers the header.
+_RECALL_PLAIN_PREAMBLE = (
+    "# Hindsight Memory (persistent cross-session context)\n"
+    "Use this to answer questions about the user and prior sessions. "
+    "Do not call tools to look up information that is already present here."
+)
+_RECALL_ATTRIBUTION_PREAMBLE = (
+    "# Hindsight Memory (persistent cross-session context)\n"
+    "Relevant memories from past conversations (prioritize recent when conflicting). "
+    "Use them to answer questions about the user and prior sessions; do not ask for "
+    "information already present here.\n\n"
+    "VISIBLE ATTRIBUTION — SHOW HINDSIGHT WORKING:\n"
+    "The goal is for the user to SEE Hindsight contributing value. Be generous about when "
+    "to emit it. Whenever recalled memories are RELEVANT to your answer — whether they "
+    "drove your reasoning, supplied background, reinforced a conclusion, or saved you from "
+    "asking a question — surface them with this exact markdown header at the top of the "
+    "relevant section:\n\n"
+    "> 🧠 **Using Hindsight Memories** — {summary naming the specific facts you're drawing on}\n\n"
+    "Rules:\n"
+    "- WHEN IN DOUBT, EMIT. Over-attribution beats invisible value. Early in a conversation "
+    "especially, always show you're leveraging Hindsight.\n"
+    "- Skip the header only when every recalled memory is clearly unrelated to what the user asked.\n"
+    "- Name the specific facts (the actual preference, decision, or detail), not a "
+    'meta-statement like "using memory".\n'
+    "- One header per response, at the top of the section that benefits.\n"
+    "- If a memory is relevant but WRONG or STALE, still surface it and say so "
+    '("memory said X, but now it\'s Y") so the user sees the system self-correct.\n'
+    "- Plain markdown only — no ANSI escape sequences or HTML."
+)
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -717,6 +752,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # recall via the `recall_types` config key.
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
+        self._recall_attribution = True
         self._recall_max_input_chars = 800
 
         # Bank
@@ -1016,6 +1052,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
+            {"key": "recall_attribution", "description": "Have the agent surface a visible '🧠 Using Hindsight Memories' banner when recalled memory informs its answer. Turn off for customer-facing agents. Ignored when recall_prompt_preamble is set.", "default": True},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
             {"key": "port_health_grace_timeout", "description": "Seconds to wait for a slow daemon /health before treating it as stale (raise on busy/low-resource hosts; blank uses the 30s default)", "default": "", "when": {"mode": "local_embedded"}},
@@ -1356,6 +1393,7 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
+        self._recall_attribution = bool(self._config.get("recall_attribution", True))
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
 
@@ -1480,11 +1518,14 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: no results available")
             return ""
         logger.debug("Prefetch: returning %d chars of context", len(result))
-        header = self._recall_prompt_preamble or (
-            "# Hindsight Memory (persistent cross-session context)\n"
-            "Use this to answer questions about the user and prior sessions. "
-            "Do not call tools to look up information that is already present here."
-        )
+        # Explicit custom preamble always wins; otherwise default to the visible
+        # attribution banner (unless turned off for e.g. customer-facing agents).
+        if self._recall_prompt_preamble:
+            header = self._recall_prompt_preamble
+        elif self._recall_attribution:
+            header = _RECALL_ATTRIBUTION_PREAMBLE
+        else:
+            header = _RECALL_PLAIN_PREAMBLE
         return f"{header}\n\n{result}"
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
