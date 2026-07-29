@@ -7679,12 +7679,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
+            delivery_context = row.get("delivery_context")
+            if delivery_context is not None:
+                restore_context = getattr(
+                    adapter,
+                    "restore_delivery_ledger_context",
+                    None,
+                )
+                try:
+                    restored = bool(
+                        callable(restore_context)
+                        and restore_context(row["chat_id"], delivery_context)
+                    )
+                except Exception:
+                    restored = False
+                    logger.debug(
+                        "obligation %s: delivery context restore failed",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
+                if not restored:
+                    try:
+                        mark_failed(
+                            row["obligation_id"],
+                            "delivery context restore failed",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "obligation %s: failed to record context error",
+                            row["obligation_id"],
+                            exc_info=True,
+                        )
+                    continue
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
-            metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            )
+            metadata = {}
+            if row.get("thread_id"):
+                metadata["thread_id"] = row["thread_id"]
+            delivery_metadata = row.get("delivery_metadata")
+            if isinstance(delivery_metadata, dict):
+                metadata.update(delivery_metadata)
+            metadata = metadata or None
             try:
                 result = await adapter.send(
                     chat_id=row["chat_id"],

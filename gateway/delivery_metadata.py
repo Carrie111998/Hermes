@@ -8,18 +8,33 @@ marker, never on message text, timing, or the broader ``notify`` flag.
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any, Mapping
 
 
 TERMINAL_DELIVERY_METADATA_KEY = "hermes_terminal_delivery"
 TERMINAL_DELIVERY_VERSION = 1
 TERMINAL_DELIVERY_OUTCOMES = frozenset({"success", "error"})
+DELIVERY_LEDGER_CONTEXT_VERSION = 1
 _MAX_CORRELATION_ID_BYTES = 256
 _MAX_DELIVERY_ID_BYTES = 256
+_MAX_DELIVER_TYPE_BYTES = 64
+_DELIVERY_LEDGER_ROUTE_FIELDS = frozenset(
+    {"chat_id", "thread_id", "message_thread_id", "repo", "pr_number"}
+)
+
+
+def normalize_delivery_identity(value: Any) -> str:
+    """Normalize an opaque routing identity without stringifying containers."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return ""
 
 
 def _bounded_identity(value: Any, *, prefix: str, max_bytes: int) -> str:
-    raw = str(value or "").strip()
+    raw = normalize_delivery_identity(value)
     if not raw:
         return ""
     encoded = raw.encode("utf-8")
@@ -87,11 +102,9 @@ def project_terminal_delivery(
     if marker.get("outcome") not in TERMINAL_DELIVERY_OUTCOMES:
         return None
 
-    correlation = marker.get("correlation_id")
-    delivery = marker.get("delivery_id")
-    if not isinstance(correlation, str) or not correlation.strip():
-        return None
-    if not isinstance(delivery, str) or not delivery.strip():
+    correlation = normalize_delivery_identity(marker.get("correlation_id"))
+    delivery = normalize_delivery_identity(marker.get("delivery_id"))
+    if not correlation or not delivery:
         return None
     if len(correlation.encode("utf-8")) > _MAX_CORRELATION_ID_BYTES:
         return None
@@ -103,4 +116,60 @@ def project_terminal_delivery(
         "outcome": marker["outcome"],
         "correlation_id": correlation,
         "delivery_id": delivery,
+    }
+
+
+def project_delivery_ledger_context(
+    context: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate the privacy-bounded webhook route persisted for replay.
+
+    Only the rendered destination, optional target thread/repository address,
+    and accepted-turn identity survive. Route secrets, prompts, payloads, tool
+    data, and arbitrary plugin metadata are rejected rather than serialized.
+    """
+    if not isinstance(context, Mapping):
+        return None
+    if set(context) != {"version", "deliver", "deliver_extra", "delivery_id"}:
+        return None
+    if context.get("version") != DELIVERY_LEDGER_CONTEXT_VERSION:
+        return None
+
+    deliver = normalize_delivery_identity(context.get("deliver")).lower()
+    if (
+        not deliver
+        or len(deliver.encode("utf-8")) > _MAX_DELIVER_TYPE_BYTES
+        or re.fullmatch(r"[a-z0-9_-]+", deliver) is None
+    ):
+        return None
+
+    delivery_id = _bounded_identity(
+        context.get("delivery_id"),
+        prefix="sha256",
+        max_bytes=_MAX_DELIVERY_ID_BYTES,
+    )
+    if not delivery_id:
+        return None
+
+    raw_extra = context.get("deliver_extra")
+    if not isinstance(raw_extra, Mapping):
+        return None
+    if not set(raw_extra).issubset(_DELIVERY_LEDGER_ROUTE_FIELDS):
+        return None
+
+    deliver_extra: dict[str, str] = {}
+    for key, value in raw_extra.items():
+        normalized = _bounded_identity(
+            value,
+            prefix="sha256",
+            max_bytes=_MAX_CORRELATION_ID_BYTES,
+        )
+        if normalized:
+            deliver_extra[key] = normalized
+
+    return {
+        "version": DELIVERY_LEDGER_CONTEXT_VERSION,
+        "deliver": deliver,
+        "deliver_extra": deliver_extra,
+        "delivery_id": delivery_id,
     }

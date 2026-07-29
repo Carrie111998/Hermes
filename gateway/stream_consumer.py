@@ -308,6 +308,7 @@ class GatewayStreamConsumer:
         self,
         *,
         final: bool = False,
+        is_turn_final: bool = True,
         expect_edits: bool = False,
     ) -> dict | None:
         """Return per-send metadata for stream-created messages.
@@ -330,7 +331,7 @@ class GatewayStreamConsumer:
             meta["notify"] = True
             platform = getattr(self.adapter, "platform", None)
             platform_name = str(getattr(platform, "value", platform) or "").lower()
-            if platform_name == "webhook":
+            if platform_name == "webhook" and is_turn_final:
                 delivery_identity = self._initial_reply_to_id or self.chat_id
                 meta = mark_terminal_delivery(
                     meta,
@@ -1866,7 +1867,10 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_send(final=True),
+                metadata=self._metadata_for_send(
+                    final=True,
+                    is_turn_final=is_turn_final,
+                ),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -2256,6 +2260,7 @@ class GatewayStreamConsumer:
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
                         final=finalize,
+                        is_turn_final=is_turn_final,
                         expect_edits=True,
                     ),
                 )

@@ -33,8 +33,9 @@ ambiguous sends):
 Poison rows cannot spin: attempts are capped, stale rows expire, and both
 transition to ``abandoned`` (kept briefly for inspection, then pruned).
 
-Everything here is best-effort by design: ledger failures must never block
-or delay an actual send. Callers wrap every call in try/except.
+General messaging callers use the ledger best-effort. Terminal webhook
+callbacks that depend on persisted rendered routing fail closed if their
+pre-egress journal write cannot complete.
 """
 
 from __future__ import annotations
@@ -47,8 +48,13 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Mapping, Optional
 
+from gateway.delivery_metadata import (
+    TERMINAL_DELIVERY_METADATA_KEY,
+    project_delivery_ledger_context,
+    project_terminal_delivery,
+)
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -107,9 +113,32 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT
+            last_error TEXT,
+            delivery_context_json TEXT,
+            delivery_metadata_json TEXT
         )"""
     )
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+    }
+    for column in ("delivery_context_json", "delivery_metadata_json"):
+        if column in columns:
+            continue
+        try:
+            conn.execute(
+                f"ALTER TABLE delivery_obligations ADD COLUMN {column} TEXT"
+            )
+        except sqlite3.OperationalError:
+            # Another gateway process may have completed the additive migration
+            # after our PRAGMA snapshot. Ignore only that confirmed race.
+            current = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(delivery_obligations)"
+                )
+            }
+            if column not in current:
+                raise
 
 
 @contextmanager
@@ -185,6 +214,34 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:24]
 
 
+def _serialize_delivery_context(context: Mapping[str, Any] | None) -> Optional[str]:
+    projected = project_delivery_ledger_context(context)
+    if projected is None:
+        return None
+    return json.dumps(projected, sort_keys=True, separators=(",", ":"))
+
+
+def _serialize_delivery_metadata(metadata: Mapping[str, Any] | None) -> Optional[str]:
+    terminal = project_terminal_delivery(metadata)
+    if terminal is None:
+        return None
+    return json.dumps(
+        {TERMINAL_DELIVERY_METADATA_KEY: terminal},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _deserialize_json_object(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
 def record_obligation(
     *,
     obligation_id: str,
@@ -193,20 +250,38 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
+    delivery_context: Mapping[str, Any] | None = None,
+    delivery_metadata: Mapping[str, Any] | None = None,
+    preserve_existing: bool = False,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     pid, started = _owner_stamp()
+    context_json = _serialize_delivery_context(delivery_context)
+    metadata_json = _serialize_delivery_metadata(delivery_metadata)
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
+        insert = (
+            """INSERT INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, thread_id,
+                content, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at, delivery_context_json,
+                delivery_metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(obligation_id) DO NOTHING"""
+            if preserve_existing
+            else
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, delivery_context_json,
+                delivery_metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)"""
+        )
+        conn.execute(
+            insert,
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, context_json, metadata_json),
         )
     _prune()
 
@@ -261,12 +336,14 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at
+                      owner_pid, owner_started_at, delivery_context_json,
+                      delivery_metadata_json
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, owner_pid, owner_started_at, context_json,
+             metadata_json) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -302,6 +379,21 @@ def sweep_recoverable(
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
+                    "delivery_context": project_delivery_ledger_context(
+                        _deserialize_json_object(context_json)
+                    ),
+                    "delivery_metadata": (
+                        {
+                            TERMINAL_DELIVERY_METADATA_KEY: terminal
+                        }
+                        if (
+                            terminal := project_terminal_delivery(
+                                _deserialize_json_object(metadata_json)
+                            )
+                        )
+                        is not None
+                        else None
+                    ),
                 })
     return claimed
 

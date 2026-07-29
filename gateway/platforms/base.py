@@ -5609,9 +5609,32 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                    _adapter_manages_terminal_ledger = False
+                    _ledger_owner = getattr(
+                        delivery_adapter,
+                        "manages_terminal_delivery_ledger",
+                        None,
+                    )
+                    if callable(_ledger_owner):
+                        try:
+                            _adapter_manages_terminal_ledger = bool(
+                                _ledger_owner(
+                                    event.source.chat_id,
+                                    _final_text_metadata,
+                                )
+                            )
+                        except Exception:
+                            logger.debug(
+                                "adapter delivery-ledger ownership check failed",
+                                exc_info=True,
+                            )
+                    if (
+                        not _adapter_manages_terminal_ledger
+                        and not is_ephemeral_response
+                        and not str(event.text or "").lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,

@@ -41,9 +41,8 @@ import re
 import subprocess
 import sys
 import time
-import uuid
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Mapping, Optional
 
 try:
     from aiohttp import web
@@ -55,8 +54,11 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.delivery_metadata import (
+    DELIVERY_LEDGER_CONTEXT_VERSION,
     TERMINAL_DELIVERY_METADATA_KEY,
     mark_terminal_delivery,
+    normalize_delivery_identity,
+    project_delivery_ledger_context,
     project_terminal_delivery,
 )
 from gateway.platforms.base import (
@@ -137,6 +139,7 @@ DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
+_ACCEPTED_TURN_ID_DOMAIN = b"hermes-webhook-accepted-turn-v1\0"
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
 _LOOPBACK_HOSTS = frozenset({
@@ -146,6 +149,47 @@ _LOOPBACK_HOSTS = frozenset({
     "ip6-localhost",
     "ip6-loopback",
 })
+
+
+def _accepted_turn_delivery_id(
+    route_name: Any,
+    provider_delivery_id: Any,
+    profile: Any = None,
+) -> str:
+    """Return a server-namespaced stable id for one admitted provider event."""
+    route = normalize_delivery_identity(route_name)
+    provider = normalize_delivery_identity(provider_delivery_id)
+    profile_name = normalize_delivery_identity(profile) or "default"
+    material = (
+        _ACCEPTED_TURN_ID_DOMAIN
+        + profile_name.encode("utf-8", "replace")
+        + b"\0"
+        + route.encode("utf-8", "replace")
+        + b"\0"
+        + provider.encode("utf-8", "replace")
+    )
+    return hashlib.sha256(material).hexdigest()
+
+
+def _provider_delivery_key(
+    value: Any,
+) -> str:
+    """Normalize and bound a provider-supplied delivery identifier."""
+    normalized = normalize_delivery_identity(value)
+    if not normalized:
+        normalized = str(int(time.time() * 1000))
+    encoded = normalized.encode("utf-8")
+    if len(encoded) > 256:
+        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    return normalized
+
+
+def _rendered_route_identity(value: Any) -> str:
+    """Normalize a rendered route scalar and reject unresolved templates."""
+    normalized = normalize_delivery_identity(value)
+    if re.fullmatch(r"\{[a-zA-Z0-9_.]+\}", normalized):
+        return ""
+    return normalized
 
 
 def _is_loopback_host(host: Optional[str]) -> bool:
@@ -356,6 +400,233 @@ class WebhookAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("[webhook] Disconnected")
 
+    @staticmethod
+    def _terminal_delivery_for_route(
+        delivery: Mapping[str, Any],
+        source_metadata: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        terminal = project_terminal_delivery(source_metadata)
+        internal_delivery_id = normalize_delivery_identity(
+            delivery.get("_hermes_delivery_id")
+        )
+        if terminal is None or not internal_delivery_id:
+            return None
+
+        extra = delivery.get("deliver_extra")
+        if not isinstance(extra, Mapping):
+            extra = {}
+        correlation_id = (
+            _rendered_route_identity(extra.get("chat_id"))
+            or terminal["correlation_id"]
+        )
+        projected = project_terminal_delivery(
+            mark_terminal_delivery(
+                None,
+                outcome=terminal["outcome"],
+                correlation_id=correlation_id,
+                delivery_id=internal_delivery_id,
+            )
+        )
+        if projected is not None:
+            return projected
+        # A malformed or oversized rendered route must not downgrade a true
+        # final send into an unjournaled interim callback. Fall back to the
+        # already-validated source correlation deterministically.
+        return project_terminal_delivery(
+            mark_terminal_delivery(
+                None,
+                outcome=terminal["outcome"],
+                correlation_id=terminal["correlation_id"],
+                delivery_id=internal_delivery_id,
+            )
+        )
+
+    @staticmethod
+    def _delivery_ledger_context_for_route(
+        delivery: Mapping[str, Any],
+        terminal_delivery: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        raw_extra = delivery.get("deliver_extra")
+        if not isinstance(raw_extra, Mapping):
+            raw_extra = {}
+        safe_extra = {
+            key: value
+            for key, value in raw_extra.items()
+            if key
+            in {"chat_id", "thread_id", "message_thread_id", "repo", "pr_number"}
+        }
+        route_chat_id = _rendered_route_identity(safe_extra.get("chat_id"))
+        safe_extra["chat_id"] = (
+            route_chat_id
+            or normalize_delivery_identity(
+                terminal_delivery.get("correlation_id")
+            )
+        )
+        return project_delivery_ledger_context(
+            {
+                "version": DELIVERY_LEDGER_CONTEXT_VERSION,
+                "deliver": delivery.get("deliver", "log"),
+                "deliver_extra": safe_extra,
+                "delivery_id": delivery.get("_hermes_delivery_id"),
+            }
+        )
+
+    def manages_terminal_delivery_ledger(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        """True when send() owns the terminal obligation before callback egress."""
+        return project_terminal_delivery(metadata) is not None
+
+    def restore_delivery_ledger_context(
+        self,
+        chat_id: str,
+        context: Mapping[str, Any],
+    ) -> bool:
+        """Restore only a validated, privacy-bounded rendered callback route."""
+        projected = project_delivery_ledger_context(context)
+        if projected is None:
+            return False
+        self._delivery_info[str(chat_id)] = {
+            "deliver": projected["deliver"],
+            "deliver_extra": dict(projected["deliver_extra"]),
+            "_hermes_delivery_id": projected["delivery_id"],
+        }
+        now = time.time()
+        self._delivery_info_created[str(chat_id)] = now
+        self._delivery_info_order.append((now, str(chat_id)))
+        return True
+
+    async def _dispatch_delivery(
+        self,
+        content: str,
+        delivery: Mapping[str, Any],
+        *,
+        terminal_delivery: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        deliver_type = normalize_delivery_identity(
+            delivery.get("deliver", "log")
+        ).lower() or "log"
+
+        if deliver_type == "log":
+            logger.info("[webhook] Response: %s", content[:200])
+            return SendResult(success=True)
+
+        if deliver_type == "github_comment":
+            return await self._deliver_github_comment(content, dict(delivery))
+
+        _is_known_platform = deliver_type in _BUILTIN_DELIVER_PLATFORMS
+        if not _is_known_platform:
+            try:
+                from gateway.platform_registry import platform_registry
+
+                _is_known_platform = platform_registry.is_registered(deliver_type)
+            except Exception:
+                pass
+        if self.gateway_runner and _is_known_platform:
+            return await self._deliver_cross_platform(
+                deliver_type,
+                content,
+                dict(delivery),
+                terminal_delivery=terminal_delivery,
+            )
+
+        logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
+        return SendResult(
+            success=False,
+            error=f"Unknown deliver type: {deliver_type}",
+        )
+
+    async def _dispatch_terminal_with_ledger(
+        self,
+        chat_id: str,
+        content: str,
+        delivery: Mapping[str, Any],
+        terminal_delivery: Dict[str, Any],
+    ) -> SendResult:
+        """Journal a terminal callback before crossing the target boundary."""
+        obligation_id = None
+        context = self._delivery_ledger_context_for_route(
+            delivery,
+            terminal_delivery,
+        )
+        metadata = {TERMINAL_DELIVERY_METADATA_KEY: terminal_delivery}
+        if context is None:
+            return SendResult(
+                success=False,
+                error="Terminal webhook delivery route is not replay-safe",
+            )
+
+        from gateway.delivery_ledger import (
+            compute_obligation_id,
+            ledger_enabled,
+            mark_attempting,
+            record_obligation,
+        )
+
+        if ledger_enabled():
+            try:
+                obligation_id = compute_obligation_id(
+                    str(chat_id),
+                    terminal_delivery["delivery_id"],
+                    "",
+                )
+                record_obligation(
+                    obligation_id=obligation_id,
+                    session_key=str(chat_id),
+                    platform=Platform.WEBHOOK.value,
+                    chat_id=str(chat_id),
+                    thread_id=None,
+                    content=content,
+                    delivery_context=context,
+                    delivery_metadata=metadata,
+                    preserve_existing=True,
+                )
+                mark_attempting(obligation_id)
+            except Exception:
+                logger.exception(
+                    "terminal webhook delivery ledger record failed"
+                )
+                return SendResult(
+                    success=False,
+                    error="Terminal webhook delivery could not be journaled",
+                )
+
+        try:
+            result = await self._dispatch_delivery(
+                content,
+                delivery,
+                terminal_delivery=terminal_delivery,
+            )
+        except Exception as exc:
+            if obligation_id is not None:
+                try:
+                    from gateway.delivery_ledger import mark_failed
+
+                    mark_failed(obligation_id, str(exc))
+                except Exception:
+                    logger.debug(
+                        "terminal webhook delivery ledger update failed",
+                        exc_info=True,
+                    )
+            raise
+
+        if obligation_id is not None:
+            try:
+                from gateway.delivery_ledger import mark_delivered, mark_failed
+
+                if result.success:
+                    mark_delivered(obligation_id)
+                else:
+                    mark_failed(obligation_id, str(result.error or ""))
+            except Exception:
+                logger.debug(
+                    "terminal webhook delivery ledger update failed",
+                    exc_info=True,
+                )
+        return result
+
     async def send(
         self,
         chat_id: str,
@@ -378,37 +649,26 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True)
 
-        delivery = self._delivery_info.get(chat_id, {})
-        deliver_type = delivery.get("deliver", "log")
-
-        if deliver_type == "log":
-            logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
-            return SendResult(success=True)
-
-        if deliver_type == "github_comment":
-            return await self._deliver_github_comment(content, delivery)
-
-        # Cross-platform delivery — any platform with a gateway adapter.
-        # Check both built-in names and plugin-registered platforms.
-        _is_known_platform = deliver_type in _BUILTIN_DELIVER_PLATFORMS
-        if not _is_known_platform:
-            try:
-                from gateway.platform_registry import platform_registry
-                _is_known_platform = platform_registry.is_registered(deliver_type)
-            except Exception:
-                pass
-        if self.gateway_runner and _is_known_platform:
-            return await self._deliver_cross_platform(
-                deliver_type,
-                content,
-                delivery,
-                source_metadata=metadata,
+        delivery = self._delivery_info.get(chat_id)
+        if delivery is None:
+            logger.error(
+                "[webhook] Missing delivery route for %s; refusing log fallback",
+                chat_id,
+            )
+            return SendResult(
+                success=False,
+                error="Webhook delivery route is unavailable",
             )
 
-        logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
-        return SendResult(
-            success=False, error=f"Unknown deliver type: {deliver_type}"
-        )
+        terminal_delivery = self._terminal_delivery_for_route(delivery, metadata)
+        if terminal_delivery is not None:
+            return await self._dispatch_terminal_with_ledger(
+                chat_id,
+                content,
+                delivery,
+                terminal_delivery,
+            )
+        return await self._dispatch_delivery(content, delivery)
 
     def _prune_delivery_info(self, now: float) -> None:
         """Drop delivery_info entries older than the idempotency TTL.
@@ -765,11 +1025,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
         # Build a unique delivery ID
-        delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
+        delivery_id = _provider_delivery_key(
             request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                "X-GitHub-Delivery",
+                request.headers.get(
+                    "svix-id",
+                    request.headers.get("X-Request-ID"),
+                ),
             ),
         )
 
@@ -855,10 +1117,14 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": self._render_delivery_extra(
                 route_config.get("deliver_extra", {}), payload
             ),
-            # Internal turn identity is generated after inbound idempotency
-            # admission. It is never selected by request content and remains
-            # stable for every send/retry belonging to this accepted turn.
-            "_hermes_delivery_id": uuid.uuid4().hex,
+            # Server-namespaced identity is minted after inbound idempotency
+            # admission. It is stable across process restart for the same
+            # provider delivery, without persisting any request payload.
+            "_hermes_delivery_id": _accepted_turn_delivery_id(
+                route_name,
+                delivery_id,
+                profile,
+            ),
         }
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
@@ -1221,7 +1487,17 @@ class WebhookAdapter(BasePlatformAdapter):
         rendered: Dict[str, Any] = {}
         for key, value in extra.items():
             if isinstance(value, str):
-                rendered[key] = self._render_prompt(value, payload, "", "")
+                exact = re.fullmatch(r"\{([a-zA-Z0-9_.]+)\}", value)
+                if exact and exact.group(1) not in {"__raw__", "event_type"}:
+                    resolved: Any = payload
+                    for part in exact.group(1).split("."):
+                        if not isinstance(resolved, dict) or part not in resolved:
+                            resolved = None
+                            break
+                        resolved = resolved[part]
+                    rendered[key] = normalize_delivery_identity(resolved)
+                else:
+                    rendered[key] = self._render_prompt(value, payload, "", "")
             else:
                 rendered[key] = value
         return rendered
@@ -1340,6 +1616,7 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery: dict,
         *,
         source_metadata: Optional[Dict[str, Any]] = None,
+        terminal_delivery: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Route response to another platform (telegram, discord, etc.)."""
         if not self.gateway_runner:
@@ -1375,11 +1652,18 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Use home channel if no specific chat_id in deliver_extra
         extra = delivery.get("deliver_extra", {})
-        chat_id = extra.get("chat_id", "")
+        if not isinstance(extra, Mapping):
+            extra = {}
+        if terminal_delivery is not None:
+            chat_id = normalize_delivery_identity(
+                terminal_delivery.get("correlation_id")
+            )
+        else:
+            chat_id = _rendered_route_identity(extra.get("chat_id"))
         if not chat_id:
             home = self.gateway_runner.config.get_home_channel(target_platform)
             if home:
-                chat_id = home.chat_id
+                chat_id = normalize_delivery_identity(home.chat_id)
             else:
                 return SendResult(
                     success=False,
@@ -1388,26 +1672,23 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Pass thread_id from deliver_extra so Telegram forum topics work
         metadata = None
-        thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+        thread_id = (
+            _rendered_route_identity(extra.get("message_thread_id"))
+            or _rendered_route_identity(extra.get("thread_id"))
+        )
         if thread_id:
             metadata = {"thread_id": thread_id}
 
-        terminal_delivery = project_terminal_delivery(source_metadata)
-        internal_delivery_id = delivery.get("_hermes_delivery_id")
-        if terminal_delivery is not None and isinstance(internal_delivery_id, str):
-            correlation_id = extra.get(
-                "correlation_id",
-                terminal_delivery["correlation_id"],
-            ) or terminal_delivery["correlation_id"]
-            terminal_delivery = project_terminal_delivery(
-                mark_terminal_delivery(
-                    None,
-                    outcome=terminal_delivery["outcome"],
-                    correlation_id=correlation_id,
-                    delivery_id=internal_delivery_id,
-                )
+        if terminal_delivery is None:
+            terminal_delivery = self._terminal_delivery_for_route(
+                delivery,
+                source_metadata,
             )
         else:
+            terminal_delivery = project_terminal_delivery(
+                {TERMINAL_DELIVERY_METADATA_KEY: terminal_delivery}
+            )
+        if terminal_delivery is None:
             # A terminal callback without the server-owned accepted-turn
             # identity is not safe to deduplicate. Drop the marker so a
             # final-only target fails closed instead of posting ambiguously.
