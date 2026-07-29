@@ -5491,11 +5491,17 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and channel_id:
             self._remember_channel_team(channel_id, team_id)
 
-        # Determine if this is a DM or channel message
+        # Determine if this is a DM or channel message — classification rules
+        # live in the PURE parse core (slack_parse), shared with the ingress
+        # conformance vector generator.
+        from plugins.platforms.slack.slack_parse import (
+            slack_is_dm,
+            slack_is_one_to_one_dm,
+        )
+
         channel_type = event.get("channel_type", "")
-        if not channel_type and channel_id.startswith("D"):
-            channel_type = "im"
-        is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
+        _cls_event = {**event, "channel": channel_id}
+        is_dm = slack_is_dm(_cls_event)  # Both 1:1 and group DMs
         if is_dm and self._slack_disable_dms():
             logger.info(
                 "[Slack] Ignoring DM because Slack DMs are disabled: channel=%s user=%s",
@@ -5511,7 +5517,7 @@ class SlackAdapter(BasePlatformAdapter):
         # get reaction noise on messages that don't address the bot. Only the 1:1
         # case earns the DM exemptions; session/thread scoping below still treats
         # both as DM-style persistent conversations.
-        is_one_to_one_dm = channel_type == "im"
+        is_one_to_one_dm = slack_is_one_to_one_dm(_cls_event)
 
         # Reject unauthorized users before thread lookups, name resolution,
         # or file downloads.  The final gateway runner auth check happens
@@ -5564,27 +5570,19 @@ class SlackAdapter(BasePlatformAdapter):
             #   (c) top-level, reply_in_thread=false → scope one session
             #       across the whole channel so context accumulates across
             #       messages (#15421 bug 1)
-            event_thread_ts_raw = event.get("thread_ts")
-            # Align with ``is_thread_reply`` below — a ``thread_ts ==
-            # ts`` payload (some thread-root shapes) is not a real reply
-            # and must not prevent the shared-session path from taking
-            # effect.  Matching the same invariant here keeps the two
-            # branches in sync even if Slack introduces new payload
-            # variants (Copilot on #15464).
-            if event_thread_ts_raw and event_thread_ts_raw != ts:
-                thread_ts = event_thread_ts_raw
-            elif self.config.extra.get("reply_in_thread", True):
-                # Legacy default: treat ts as a synthetic thread root so
-                # this top-level message gets its own session.
-                thread_ts = ts
-            else:
-                # reply_in_thread=false: no thread key → session manager
-                # groups by (platform, channel_id, None) and the channel
-                # shares one conversation.  reply_to_message_id at the
-                # outbound side is already gated on ``thread_ts != ts``
-                # so None here produces a non-threaded reply without
-                # further changes.
-                thread_ts = None
+            # Channel-message scoping rules live in the PURE parse core
+            # (slack_parse.slack_session_thread_ts — the #15421/#15464
+            # invariants), shared with the ingress conformance vectors.
+            from plugins.platforms.slack.slack_parse import (
+                slack_session_thread_ts,
+            )
+
+            thread_ts = slack_session_thread_ts(
+                {**_cls_event, "channel_type": channel_type or "channel"},
+                reply_in_thread=bool(
+                    self.config.extra.get("reply_in_thread", True)
+                ),
+            )
 
         # In channels, respond if:
         #   (unless ignore_other_user_mentions is on and the message opens by

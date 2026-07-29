@@ -1,0 +1,303 @@
+{
+  "$comment": "GENERATED — do not hand-edit. Regenerate with hermes-agent scripts/generate_ingress_vectors.py; the native inbound parse cores are the oracle (executable spec).",
+  "oracle": {
+    "repo": "NousResearch/hermes-agent",
+    "commit": "a56c341190b3c0b8e0643f357cf5412511e6cae1",
+    "generator": "scripts/generate_ingress_vectors.py",
+    "generator_version": 1
+  },
+  "platform": "slack",
+  "direction": "ingress",
+  "context": {
+    "bot_user_id": "U0BOT"
+  },
+  "vectors": [
+    {
+      "id": "dm-plain-text",
+      "payload": {
+        "channel": "D111",
+        "channel_type": "im",
+        "ts": "100.1",
+        "user": "U777",
+        "team": "T1",
+        "text": "hello"
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "D111",
+        "is_dm": true,
+        "is_one_to_one_dm": true,
+        "session_thread_ts": "100.1",
+        "user_id": "U777",
+        "team_id": "T1",
+        "message_id": "100.1",
+        "text": "hello",
+        "mentions_bot": false,
+        "user_is_bot": false
+      }
+    },
+    {
+      "id": "dm-prefix-fallback",
+      "payload": {
+        "channel": "D222",
+        "ts": "100.2",
+        "user": "U777",
+        "text": "no channel_type"
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "D222",
+        "is_dm": true,
+        "is_one_to_one_dm": true,
+        "session_thread_ts": "100.2",
+        "user_id": "U777",
+        "team_id": null,
+        "message_id": "100.2",
+        "text": "no channel_type",
+        "mentions_bot": false,
+        "user_is_bot": false
+      }
+    },
+    {
+      "id": "mpim-is-dm-but-not-one-to-one",
+      "payload": {
+        "channel": "G333",
+        "channel_type": "mpim",
+        "ts": "100.3",
+        "user": "U777",
+        "team": "T1",
+        "text": "group dm"
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "G333",
+        "is_dm": true,
+        "is_one_to_one_dm": false,
+        "session_thread_ts": "100.3",
+        "user_id": "U777",
+        "team_id": "T1",
+        "message_id": "100.3",
+        "text": "group dm",
+        "mentions_bot": false,
+        "user_is_bot": false
+      }
+    },
+    {
+      "id": "channel-top-level",
+      "payload": {
+        "channel": "C444",
+        "channel_type": "channel",
+        "ts": "100.4",
+        "user": "U777",
+        "team": "T1",
+        "text": "top level"
+      },
+      "expected": {
+        "chat_type": "channel",
+        "chat_id": "C444",
+        "is_dm": false,
+        "is_one_to_one_dm": false,
+        "session_thread_ts": "100.4",
+        "user_id": "U777",
+        "team_id": "T1",
+        "message_id": "100.4",
+        "text": "top level",
+        "mentions_bot": false,
+        "user_is_bot": false
+      }
+    },
+    {
+      "id": "channel-thread-reply",
+      "payload": {
+        "channel": "C444",
+        "channel_type": "channel",
+        "ts": "100.6",
+        "user": "U777",
+        "team": "T1",
+        "text": "in thread",
+        "thread_ts": "100.4"
+      },
+      "expected": {
+        "chat_type": "thread",
+        "chat_id": "C444",
+        "is_dm": false,
+        "is_one_to_one_dm": false,
+        "session_thread_ts": "100.4",
+        "user_id": "U777",
+        "team_id": "T1",
+        "message_id": "100.6",
+        "text": "in thread",
+        "mentions_bot": false,
+        "user_is_bot": false
+      }
+    },
+    {
+      "id": "thread-root-equals-ts",
+      "payload": {
+        "channel": "C444",
+        "channel_type": "channel",
+        "ts": "100.7",
+        "user": "U777",
+        "team": "T1",
+        "text": "root shape",
+        "thread_ts": "100.7"
+      },
+      "expected": {
+        "chat_type": "channel",
+        "chat_id": "C444",
+        "is_dm": false,
+        "is_one_to_one_dm": false,
+        "session_thread_ts": "100.7",
+        "user_id": "U777",
+        "team_id": "T1",
+        "message_id": "100.7",
+        "text": "root shape",
+        "mentions_bot": false,
+        "user_is_bot": false
+      }
+    },
+    {
+      "id": "channel-mention",
+      "payload": {
+        "channel": "C444",
+        "channel_type": "channel",
+        "ts": "100.8",
+        "user": "U777",
+        "team": "T1",
+        "text": "<@U0BOT> do the thing"
+      },
+      "expected": {
+        "chat_type": "channel",
+        "chat_id": "C444",
+        "is_dm": false,
+        "is_one_to_one_dm": false,
+        "session_thread_ts": "100.8",
+        "user_id": "U777",
+        "team_id": "T1",
+        "message_id": "100.8",
+        "text": "do the thing",
+        "mentions_bot": true,
+        "user_is_bot": false
+      }
+    },
+    {
+      "id": "dm-thread-reply",
+      "payload": {
+        "channel": "D111",
+        "channel_type": "im",
+        "ts": "100.9",
+        "user": "U777",
+        "text": "dm threaded",
+        "thread_ts": "100.1"
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "D111",
+        "is_dm": true,
+        "is_one_to_one_dm": true,
+        "session_thread_ts": "100.1",
+        "user_id": "U777",
+        "team_id": null,
+        "message_id": "100.9",
+        "text": "dm threaded",
+        "mentions_bot": false,
+        "user_is_bot": false
+      }
+    },
+    {
+      "id": "bot-message-subtype",
+      "payload": {
+        "channel": "C444",
+        "channel_type": "channel",
+        "ts": "101.0",
+        "subtype": "bot_message",
+        "bot_id": "B99",
+        "text": "integration says"
+      },
+      "expected": {
+        "chat_type": "channel",
+        "chat_id": "C444",
+        "is_dm": false,
+        "is_one_to_one_dm": false,
+        "session_thread_ts": "101.0",
+        "user_id": null,
+        "team_id": null,
+        "message_id": "101.0",
+        "text": "integration says",
+        "mentions_bot": false,
+        "user_is_bot": true
+      }
+    },
+    {
+      "id": "bot-id-without-subtype",
+      "payload": {
+        "channel": "C444",
+        "channel_type": "channel",
+        "ts": "101.1",
+        "bot_id": "B99",
+        "text": "workflow post"
+      },
+      "expected": {
+        "chat_type": "channel",
+        "chat_id": "C444",
+        "is_dm": false,
+        "is_one_to_one_dm": false,
+        "session_thread_ts": "101.1",
+        "user_id": null,
+        "team_id": null,
+        "message_id": "101.1",
+        "text": "workflow post",
+        "mentions_bot": false,
+        "user_is_bot": true
+      }
+    },
+    {
+      "id": "private-group-channel",
+      "payload": {
+        "channel": "G555",
+        "channel_type": "group",
+        "ts": "101.2",
+        "user": "U777",
+        "team": "T1",
+        "text": "private channel"
+      },
+      "expected": {
+        "chat_type": "channel",
+        "chat_id": "G555",
+        "is_dm": false,
+        "is_one_to_one_dm": false,
+        "session_thread_ts": "101.2",
+        "user_id": "U777",
+        "team_id": "T1",
+        "message_id": "101.2",
+        "text": "private channel",
+        "mentions_bot": false,
+        "user_is_bot": false
+      }
+    },
+    {
+      "id": "cjk-emoji-text",
+      "payload": {
+        "channel": "C444",
+        "channel_type": "channel",
+        "ts": "101.3",
+        "user": "U777",
+        "team": "T1",
+        "text": "中文 — test 🎉 (100%)"
+      },
+      "expected": {
+        "chat_type": "channel",
+        "chat_id": "C444",
+        "is_dm": false,
+        "is_one_to_one_dm": false,
+        "session_thread_ts": "101.3",
+        "user_id": "U777",
+        "team_id": "T1",
+        "message_id": "101.3",
+        "text": "中文 — test 🎉 (100%)",
+        "mentions_bot": false,
+        "user_is_bot": false
+      }
+    }
+  ]
+}

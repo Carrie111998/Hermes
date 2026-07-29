@@ -7863,21 +7863,16 @@ class TelegramAdapter(BasePlatformAdapter):
         plain group/DM replies, but those ids are not topic/session routing
         ids and must not be treated as such.  Gating, skill binding, and
         outbound routing must all agree on the same normalized value.
+
+        Delegates to the PURE parse core (telegram_parse) — the same rules
+        the ingress conformance vector generator exercises, so the relay
+        connector's poller is tested against exactly this logic.
         """
-        chat = getattr(message, "chat", None)
-        chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower() if chat else ""
-        raw = getattr(message, "message_thread_id", None)
-        is_topic_message = bool(getattr(message, "is_topic_message", False))
-        is_forum_group = chat_type in ("group", "supergroup") and getattr(chat, "is_forum", False) is True
-        if raw is not None:
-            if is_forum_group or (chat_type in ("group", "supergroup") and is_topic_message):
-                return str(raw)
-            if chat_type == "private" and is_topic_message:
-                return str(raw)
-            return None
-        if is_forum_group:
-            return cls._GENERAL_TOPIC_THREAD_ID
-        return None
+        from plugins.platforms.telegram.telegram_parse import (
+            effective_message_thread_id,
+        )
+
+        return effective_message_thread_id(message)
 
     # Telegram bot handles historically had to end in "bot", but collectible
     # (Fragment) usernames can be assigned to bots and drop that suffix
@@ -9625,40 +9620,26 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         
         # Extract reply context if this message is a reply.
-        # Prefer Telegram's native partial quote (message.quote, TextQuote)
-        # so a user replying to a single selected substring of a prior
-        # multi-section message doesn't get the whole replied-to message
-        # injected into the agent's context — which can cause the agent
-        # to act on unrelated actionable-looking text the user didn't
-        # quote (#22619). Fall back to the full replied-to message text
-        # / caption when no native quote is present.
-        reply_to_id = None
-        reply_to_text = None
-        if message.reply_to_message:
-            reply_to_id = str(message.reply_to_message.message_id)
-            quote = getattr(message, "quote", None)
-            quote_text = getattr(quote, "text", None) if quote is not None else None
-            if quote_text:
-                reply_to_text = quote_text
-            else:
-                reply_to_text = (
-                    message.reply_to_message.text
-                    or message.reply_to_message.caption
-                    or None
-                )
-                if not reply_to_text:
-                    # Prefer Telegram's native rich-message echo when present;
-                    # keep the local send-time index only as a fallback for
-                    # older/unrecoverable reply payloads.
-                    reply_to_text = self._extract_rich_reply_text(message.reply_to_message)
-                if not reply_to_text:
-                    try:
-                        from gateway import rich_sent_store
-                        reply_to_text = rich_sent_store.lookup(
-                            str(chat.id), reply_to_id
-                        )
-                    except Exception:
-                        reply_to_text = None
+        # Payload-derivable part (native partial quote #22619, text/caption
+        # fallback) lives in the PURE parse core (telegram_parse) — shared
+        # with the ingress conformance vector generator. The two stateful
+        # fallbacks (rich-message echo, rich_sent_store) stay adapter-side.
+        from plugins.platforms.telegram.telegram_parse import extract_reply_context
+
+        reply_to_id, reply_to_text = extract_reply_context(message)
+        if message.reply_to_message and not reply_to_text:
+            # Prefer Telegram's native rich-message echo when present;
+            # keep the local send-time index only as a fallback for
+            # older/unrecoverable reply payloads.
+            reply_to_text = self._extract_rich_reply_text(message.reply_to_message)
+            if not reply_to_text:
+                try:
+                    from gateway import rich_sent_store
+                    reply_to_text = rich_sent_store.lookup(
+                        str(chat.id), reply_to_id
+                    )
+                except Exception:
+                    reply_to_text = None
 
         # Per-channel/topic ephemeral prompt
         from gateway.platforms.base import resolve_channel_prompt

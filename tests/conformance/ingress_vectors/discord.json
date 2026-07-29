@@ -1,0 +1,530 @@
+{
+  "$comment": "GENERATED — do not hand-edit. Regenerate with hermes-agent scripts/generate_ingress_vectors.py; the native inbound parse cores are the oracle (executable spec).",
+  "oracle": {
+    "repo": "NousResearch/hermes-agent",
+    "commit": "a56c341190b3c0b8e0643f357cf5412511e6cae1",
+    "generator": "scripts/generate_ingress_vectors.py",
+    "generator_version": 1
+  },
+  "platform": "discord",
+  "direction": "ingress",
+  "context": {
+    "bot_user_id": "424242"
+  },
+  "vectors": [
+    {
+      "id": "dm-plain-text",
+      "payload": {
+        "id": "1001",
+        "content": "hello",
+        "channel_id": "d1",
+        "channel_kind": "dm",
+        "author": {
+          "id": "777",
+          "username": "ben",
+          "display_name": "Ben"
+        }
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "d1",
+        "chat_name": "ben",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "1001",
+        "text": "hello",
+        "message_type": "text",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "guild-mention-stripped",
+      "payload": {
+        "id": "1002",
+        "content": "<@424242> summarize this",
+        "channel_id": "c1",
+        "channel_name": "general",
+        "channel_kind": "guildText",
+        "guild_id": "g1",
+        "guild_name": "Eng",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "mentions": [
+          {
+            "id": "424242"
+          }
+        ]
+      },
+      "expected": {
+        "chat_type": "group",
+        "chat_id": "c1",
+        "chat_name": "Eng / #general",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": "g1",
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1002",
+        "text": "summarize this",
+        "message_type": "text",
+        "reply_to_message_id": null,
+        "mentions_bot": true
+      }
+    },
+    {
+      "id": "guild-nickname-mention-form",
+      "payload": {
+        "id": "1003",
+        "content": "<@!424242> hi",
+        "channel_id": "c1",
+        "channel_name": "general",
+        "channel_kind": "guildText",
+        "guild_id": "g1",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "mentions": []
+      },
+      "expected": {
+        "chat_type": "group",
+        "chat_id": "c1",
+        "chat_name": "general",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": "g1",
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1003",
+        "text": "hi",
+        "message_type": "text",
+        "reply_to_message_id": null,
+        "mentions_bot": true
+      }
+    },
+    {
+      "id": "addressed-command",
+      "payload": {
+        "id": "1004",
+        "content": "<@424242> /new",
+        "channel_id": "c1",
+        "channel_kind": "guildText",
+        "guild_id": "g1",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "mentions": [
+          {
+            "id": "424242"
+          }
+        ]
+      },
+      "expected": {
+        "chat_type": "group",
+        "chat_id": "c1",
+        "chat_name": "c1",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": "g1",
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1004",
+        "text": "/new",
+        "message_type": "command",
+        "reply_to_message_id": null,
+        "mentions_bot": true
+      }
+    },
+    {
+      "id": "thread-message",
+      "payload": {
+        "id": "1005",
+        "content": "in thread",
+        "channel_id": "t1",
+        "channel_name": "build issue",
+        "channel_kind": "thread",
+        "guild_id": "g1",
+        "guild_name": "Eng",
+        "parent_channel_id": "c1",
+        "parent_channel_name": "general",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        }
+      },
+      "expected": {
+        "chat_type": "thread",
+        "chat_id": "t1",
+        "chat_name": "Eng / #general / build issue",
+        "thread_id": "t1",
+        "parent_chat_id": "c1",
+        "guild_id": "g1",
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1005",
+        "text": "in thread",
+        "message_type": "text",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "forum-thread-naming",
+      "payload": {
+        "id": "1006",
+        "content": "forum post",
+        "channel_id": "t2",
+        "channel_name": "bug report",
+        "channel_kind": "thread",
+        "guild_id": "g1",
+        "guild_name": "Eng",
+        "parent_channel_id": "f1",
+        "parent_channel_name": "reports",
+        "parent_is_forum": true,
+        "author": {
+          "id": "777",
+          "username": "ben"
+        }
+      },
+      "expected": {
+        "chat_type": "thread",
+        "chat_id": "t2",
+        "chat_name": "Eng / reports / bug report",
+        "thread_id": "t2",
+        "parent_chat_id": "f1",
+        "guild_id": "g1",
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1006",
+        "text": "forum post",
+        "message_type": "text",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "image-attachment",
+      "payload": {
+        "id": "1007",
+        "content": "look",
+        "channel_id": "c1",
+        "channel_kind": "guildText",
+        "guild_id": "g1",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "attachments": [
+          {
+            "content_type": "image/png",
+            "filename": "a.png",
+            "url": "https://cdn.discordapp.com/a.png"
+          }
+        ]
+      },
+      "expected": {
+        "chat_type": "group",
+        "chat_id": "c1",
+        "chat_name": "c1",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": "g1",
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1007",
+        "text": "look",
+        "message_type": "photo",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "voice-note-attachment",
+      "payload": {
+        "id": "1008",
+        "content": "",
+        "channel_id": "d1",
+        "channel_kind": "dm",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "attachments": [
+          {
+            "content_type": "audio/ogg",
+            "is_voice_message": true,
+            "duration": 3.2,
+            "waveform": "AAA="
+          }
+        ]
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "d1",
+        "chat_name": "ben",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": null,
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1008",
+        "text": "",
+        "message_type": "voice",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "plain-audio-attachment",
+      "payload": {
+        "id": "1009",
+        "content": "",
+        "channel_id": "d1",
+        "channel_kind": "dm",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "attachments": [
+          {
+            "content_type": "audio/mpeg",
+            "filename": "song.mp3"
+          }
+        ]
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "d1",
+        "chat_name": "ben",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": null,
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1009",
+        "text": "",
+        "message_type": "audio",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "document-attachment-unknown-type",
+      "payload": {
+        "id": "1010",
+        "content": "",
+        "channel_id": "d1",
+        "channel_kind": "dm",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "attachments": [
+          {
+            "filename": "data.bin"
+          }
+        ]
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "d1",
+        "chat_name": "ben",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": null,
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1010",
+        "text": "",
+        "message_type": "document",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "forwarded-snapshot-text",
+      "payload": {
+        "id": "1011",
+        "content": "",
+        "channel_id": "d1",
+        "channel_kind": "dm",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "message_snapshots": [
+          {
+            "content": "forwarded wisdom"
+          }
+        ]
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "d1",
+        "chat_name": "ben",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": null,
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1011",
+        "text": "forwarded wisdom",
+        "message_type": "text",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "reply-with-reference",
+      "payload": {
+        "id": "1012",
+        "content": "re",
+        "channel_id": "c1",
+        "channel_kind": "guildText",
+        "guild_id": "g1",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "referenced_message": {
+          "id": "999",
+          "attachments": []
+        }
+      },
+      "expected": {
+        "chat_type": "group",
+        "chat_id": "c1",
+        "chat_name": "c1",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": "g1",
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1012",
+        "text": "re",
+        "message_type": "text",
+        "reply_to_message_id": "999",
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "reply-inherits-referenced-attachment",
+      "payload": {
+        "id": "1013",
+        "content": "what is this file?",
+        "channel_id": "c1",
+        "channel_kind": "guildText",
+        "guild_id": "g1",
+        "author": {
+          "id": "777",
+          "username": "ben"
+        },
+        "referenced_message": {
+          "id": "999",
+          "attachments": [
+            {
+              "content_type": "application/pdf",
+              "filename": "spec.pdf"
+            }
+          ]
+        }
+      },
+      "expected": {
+        "chat_type": "group",
+        "chat_id": "c1",
+        "chat_name": "c1",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": "g1",
+        "user_id": "777",
+        "user_name": "ben",
+        "user_is_bot": false,
+        "message_id": "1013",
+        "text": "what is this file?",
+        "message_type": "document",
+        "reply_to_message_id": "999",
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "bot-authored",
+      "payload": {
+        "id": "1014",
+        "content": "bot says",
+        "channel_id": "c1",
+        "channel_kind": "guildText",
+        "guild_id": "g1",
+        "author": {
+          "id": "999",
+          "username": "otherbot",
+          "bot": true
+        }
+      },
+      "expected": {
+        "chat_type": "group",
+        "chat_id": "c1",
+        "chat_name": "c1",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": "g1",
+        "user_id": "999",
+        "user_name": "otherbot",
+        "user_is_bot": true,
+        "message_id": "1014",
+        "text": "bot says",
+        "message_type": "text",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    },
+    {
+      "id": "display-name-preference",
+      "payload": {
+        "id": "1015",
+        "content": "hi",
+        "channel_id": "d1",
+        "channel_kind": "dm",
+        "author": {
+          "id": "777",
+          "username": "ben",
+          "display_name": "Benjamin"
+        }
+      },
+      "expected": {
+        "chat_type": "dm",
+        "chat_id": "d1",
+        "chat_name": "ben",
+        "thread_id": null,
+        "parent_chat_id": null,
+        "guild_id": null,
+        "user_id": "777",
+        "user_name": "Benjamin",
+        "user_is_bot": false,
+        "message_id": "1015",
+        "text": "hi",
+        "message_type": "text",
+        "reply_to_message_id": null,
+        "mentions_bot": false
+      }
+    }
+  ]
+}

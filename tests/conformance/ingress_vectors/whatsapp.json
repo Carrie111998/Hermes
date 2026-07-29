@@ -1,0 +1,383 @@
+{
+  "$comment": "GENERATED — do not hand-edit. Regenerate with hermes-agent scripts/generate_ingress_vectors.py; the native inbound parse cores are the oracle (executable spec).",
+  "oracle": {
+    "repo": "NousResearch/hermes-agent",
+    "commit": "a56c341190b3c0b8e0643f357cf5412511e6cae1",
+    "generator": "scripts/generate_ingress_vectors.py",
+    "generator_version": 1
+  },
+  "platform": "whatsapp",
+  "direction": "ingress",
+  "context": {
+    "contacts": {
+      "15551110000": "Ben",
+      "15559998888": "Hermes Biz"
+    },
+    "metadata": {
+      "display_phone_number": "15559998888",
+      "phone_number_id": "PNID1"
+    }
+  },
+  "vectors": [
+    {
+      "id": "text-message",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.t1",
+        "type": "text",
+        "text": {
+          "body": "hello"
+        }
+      },
+      "expected": {
+        "msg_type": "text",
+        "message_type": "text",
+        "body": "hello",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.t1",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": null,
+        "media_mime": null,
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "command-text",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.t2",
+        "type": "text",
+        "text": {
+          "body": "/status"
+        }
+      },
+      "expected": {
+        "msg_type": "text",
+        "message_type": "text",
+        "body": "/status",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.t2",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": null,
+        "media_mime": null,
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "image-with-caption",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.m1",
+        "type": "image",
+        "image": {
+          "id": "MEDIA1",
+          "mime_type": "image/jpeg",
+          "caption": "look"
+        }
+      },
+      "expected": {
+        "msg_type": "image",
+        "message_type": "photo",
+        "body": "look",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.m1",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": "MEDIA1",
+        "media_mime": "image/jpeg",
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "voice-note",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.m2",
+        "type": "audio",
+        "audio": {
+          "id": "MEDIA2",
+          "mime_type": "audio/ogg; codecs=opus",
+          "voice": true
+        }
+      },
+      "expected": {
+        "msg_type": "audio",
+        "message_type": "voice",
+        "body": "",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.m2",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": "MEDIA2",
+        "media_mime": "audio/ogg; codecs=opus",
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "document-with-filename",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.m3",
+        "type": "document",
+        "document": {
+          "id": "MEDIA3",
+          "mime_type": "text/plain",
+          "filename": "notes.txt"
+        }
+      },
+      "expected": {
+        "msg_type": "document",
+        "message_type": "document",
+        "body": "",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.m3",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": "MEDIA3",
+        "media_mime": "text/plain",
+        "document_filename": "notes.txt",
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "sticker",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.m4",
+        "type": "sticker",
+        "sticker": {
+          "id": "MEDIA4",
+          "mime_type": "image/webp"
+        }
+      },
+      "expected": {
+        "msg_type": "sticker",
+        "message_type": "photo",
+        "body": "",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.m4",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": "MEDIA4",
+        "media_mime": "image/webp",
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "reply-to-bot-message",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.r1",
+        "type": "text",
+        "text": {
+          "body": "re"
+        },
+        "context": {
+          "id": "wamid.orig",
+          "from": "15559998888"
+        }
+      },
+      "expected": {
+        "msg_type": "text",
+        "message_type": "text",
+        "body": "re",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.r1",
+        "reply_to_message_id": "wamid.orig",
+        "reply_to_is_own": true,
+        "media_id": null,
+        "media_mime": null,
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "reply-to-own-message",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.r2",
+        "type": "text",
+        "text": {
+          "body": "re self"
+        },
+        "context": {
+          "id": "wamid.mine",
+          "from": "15551110000"
+        }
+      },
+      "expected": {
+        "msg_type": "text",
+        "message_type": "text",
+        "body": "re self",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.r2",
+        "reply_to_message_id": "wamid.mine",
+        "reply_to_is_own": false,
+        "media_id": null,
+        "media_mime": null,
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "button-reply",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.b1",
+        "type": "button",
+        "button": {
+          "text": "Approve",
+          "payload": "approve-1"
+        }
+      },
+      "expected": {
+        "msg_type": "button",
+        "message_type": "text",
+        "body": "Approve",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.b1",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": null,
+        "media_mime": null,
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "list-reply-title",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.b2",
+        "type": "interactive",
+        "interactive": {
+          "type": "list_reply",
+          "list_reply": {
+            "id": "opt-2",
+            "title": "Option Two"
+          }
+        }
+      },
+      "expected": {
+        "msg_type": "interactive",
+        "message_type": "text",
+        "body": "Option Two",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.b2",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": null,
+        "media_mime": null,
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "group-shaped-refused",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.g1",
+        "type": "text",
+        "chat": "1203630xxxx@g.us",
+        "text": {
+          "body": "group msg"
+        }
+      },
+      "expected": {
+        "msg_type": "text",
+        "message_type": "text",
+        "body": "group msg",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.g1",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": null,
+        "media_mime": null,
+        "document_filename": null,
+        "group_shaped": true
+      }
+    },
+    {
+      "id": "unknown-type-defaults-text",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.u1",
+        "type": "reaction",
+        "reaction": {
+          "emoji": "👍",
+          "message_id": "wamid.t1"
+        }
+      },
+      "expected": {
+        "msg_type": "reaction",
+        "message_type": "text",
+        "body": "",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.u1",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": null,
+        "media_mime": null,
+        "document_filename": null,
+        "group_shaped": false
+      }
+    },
+    {
+      "id": "cjk-emoji-body",
+      "payload": {
+        "from": "15551110000",
+        "id": "wamid.c1",
+        "type": "text",
+        "text": {
+          "body": "中文 — test 🎉 (100%)"
+        }
+      },
+      "expected": {
+        "msg_type": "text",
+        "message_type": "text",
+        "body": "中文 — test 🎉 (100%)",
+        "sender_id": "15551110000",
+        "sender_name": "Ben",
+        "chat_id": "15551110000",
+        "message_id": "wamid.c1",
+        "reply_to_message_id": null,
+        "reply_to_is_own": false,
+        "media_id": null,
+        "media_mime": null,
+        "document_filename": null,
+        "group_shaped": false
+      }
+    }
+  ]
+}

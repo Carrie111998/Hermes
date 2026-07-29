@@ -79,6 +79,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
 )
 from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+from gateway.platforms.whatsapp_cloud_parse import parse_cloud_message
 from gateway import rich_sent_store
 from hermes_constants import get_hermes_dir
 
@@ -1896,62 +1897,33 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if handled:
                 return None
 
-        body = ""
-        if msg_type_str == "text":
-            text = raw_message.get("text") or {}
-            body = str(text.get("body") or "")
-        elif msg_type_str in {"button", "interactive"}:
-            # Quick-reply buttons. Treat the button payload as text so the
-            # agent can reason about the user's choice.
-            if msg_type_str == "button":
-                body = str((raw_message.get("button") or {}).get("text") or "")
-            else:
-                inter = raw_message.get("interactive") or {}
-                # button_reply / list_reply both expose ``title``
-                inner = inter.get("button_reply") or inter.get("list_reply") or {}
-                body = str(inner.get("title") or "")
-        elif msg_type_str in {"image", "video", "audio", "voice", "document", "sticker"}:
-            # Captions live on image / video / document. Other media types
-            # don't carry a caption in Meta's spec, but be defensive.
-            inner = raw_message.get(msg_type_str) or {}
-            body = str(inner.get("caption") or "")
+        # Payload-only field derivation lives in the PURE parse core
+        # (whatsapp_cloud_parse.parse_cloud_message) — the same code the
+        # ingress conformance vector generator runs, so the connector's
+        # normalizer is tested against exactly what this adapter does.
+        # Everything below is the adapter-side effectful half: gating,
+        # media download, text injection, quoted-text resolution, caches.
+        parsed = parse_cloud_message(raw_message, contacts_by_waid, metadata)
+        body = parsed.body
+        message_type = parsed.message_type
+        sender_id = parsed.sender_id
+        sender_name = parsed.sender_name
 
-        message_type = {
-            "text": MessageType.TEXT,
-            "image": MessageType.PHOTO,
-            "video": MessageType.VIDEO,
-            "audio": MessageType.VOICE,
-            "voice": MessageType.VOICE,
-            "document": MessageType.DOCUMENT,
-            "sticker": MessageType.PHOTO,
-            "button": MessageType.TEXT,
-            "interactive": MessageType.TEXT,
-            "location": MessageType.TEXT,
-            "contacts": MessageType.TEXT,
-        }.get(msg_type_str, MessageType.TEXT)
-
-        sender_id = str(raw_message.get("from") or "").strip()
-        sender_name = contacts_by_waid.get(sender_id, "")
-
-        # Cloud API doesn't have a separate "chat" entity for DMs — chat_id
-        # equals the sender's wa_id. Group support is deferred to v2.
-        #
         # Defensive guard: if Meta ever delivers a group-shaped payload
         # (group support is capability-tier gated by Meta; some WABAs
         # have it enabled), refuse rather than silently treating it as
         # a DM. Group messages carry a ``chat`` field on the message
         # object identifying the group JID — its absence signals DM.
-        chat_field = raw_message.get("chat")
-        if chat_field:
+        if parsed.group_shaped:
             logger.warning(
                 "[whatsapp_cloud] received group-shaped message (chat=%s, "
                 "wamid=%s) — group support is not yet implemented; dropping. "
                 "Use the Baileys whatsapp adapter for group chats.",
-                chat_field, raw_message.get("id"),
+                raw_message.get("chat"), raw_message.get("id"),
             )
             return None
 
-        chat_id = sender_id
+        chat_id = parsed.chat_id
 
         # Build the data dict the mixin's _should_process_message expects.
         # Cloud API uses different field names from Baileys, so we adapt.

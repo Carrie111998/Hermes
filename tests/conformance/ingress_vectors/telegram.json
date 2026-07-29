@@ -1,0 +1,511 @@
+{
+  "$comment": "GENERATED — do not hand-edit. Regenerate with hermes-agent scripts/generate_ingress_vectors.py; the native inbound parse cores are the oracle (executable spec).",
+  "oracle": {
+    "repo": "NousResearch/hermes-agent",
+    "commit": "a56c341190b3c0b8e0643f357cf5412511e6cae1",
+    "generator": "scripts/generate_ingress_vectors.py",
+    "generator_version": 1
+  },
+  "platform": "telegram",
+  "direction": "ingress",
+  "context": {},
+  "vectors": [
+    {
+      "id": "dm-plain-text",
+      "payload": {
+        "message_id": 1,
+        "chat": {
+          "id": 555,
+          "type": "private",
+          "first_name": "Ben"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "hello"
+      },
+      "expected": {
+        "chat_id": "555",
+        "chat_type": "dm",
+        "chat_name": "Ben",
+        "thread_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "1",
+        "text": "hello",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    },
+    {
+      "id": "group-plain-text",
+      "payload": {
+        "message_id": 2,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "hi group"
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "2",
+        "text": "hi group",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    },
+    {
+      "id": "channel-post",
+      "payload": {
+        "message_id": 3,
+        "chat": {
+          "id": -1009,
+          "type": "channel",
+          "title": "Announce"
+        },
+        "text": "channel news"
+      },
+      "expected": {
+        "chat_id": "-1009",
+        "chat_type": "channel",
+        "chat_name": "Announce",
+        "thread_id": null,
+        "user_id": "-1009",
+        "user_name": "Announce",
+        "user_is_bot": false,
+        "message_id": "3",
+        "text": "channel news",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    },
+    {
+      "id": "forum-topic-message",
+      "payload": {
+        "message_id": 4,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group",
+          "is_forum": true
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "topic chat",
+        "message_thread_id": 55,
+        "is_topic_message": true
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": "55",
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "4",
+        "text": "topic chat",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    },
+    {
+      "id": "forum-general-topic",
+      "payload": {
+        "message_id": 5,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group",
+          "is_forum": true
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "general chat"
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": "1",
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "5",
+        "text": "general chat",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    },
+    {
+      "id": "group-reply-anchor-not-thread",
+      "payload": {
+        "message_id": 6,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "re",
+        "message_thread_id": 42,
+        "reply_to_message": {
+          "message_id": 42,
+          "chat": {
+            "id": -1001234,
+            "type": "supergroup",
+            "title": "Eng Group"
+          },
+          "from": {
+            "id": 888,
+            "is_bot": false,
+            "first_name": "Alice",
+            "username": "ben"
+          },
+          "text": "original"
+        }
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "6",
+        "text": "re",
+        "reply_to_message_id": "42",
+        "reply_to_text": "original"
+      }
+    },
+    {
+      "id": "dm-topic-message",
+      "payload": {
+        "message_id": 7,
+        "chat": {
+          "id": 555,
+          "type": "private",
+          "first_name": "Ben"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "dm topic",
+        "message_thread_id": 9,
+        "is_topic_message": true
+      },
+      "expected": {
+        "chat_id": "555",
+        "chat_type": "dm",
+        "chat_name": "Ben",
+        "thread_id": "9",
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "7",
+        "text": "dm topic",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    },
+    {
+      "id": "reply-with-text",
+      "payload": {
+        "message_id": 8,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "re",
+        "reply_to_message": {
+          "message_id": 7,
+          "chat": {
+            "id": -1001234,
+            "type": "supergroup",
+            "title": "Eng Group"
+          },
+          "from": {
+            "id": 999,
+            "is_bot": true,
+            "first_name": "Hermes",
+            "username": "ben"
+          },
+          "text": "what the bot said"
+        }
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "8",
+        "text": "re",
+        "reply_to_message_id": "7",
+        "reply_to_text": "what the bot said"
+      }
+    },
+    {
+      "id": "reply-partial-quote",
+      "payload": {
+        "message_id": 9,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "re",
+        "quote": {
+          "text": "just this part"
+        },
+        "reply_to_message": {
+          "message_id": 7,
+          "chat": {
+            "id": -1001234,
+            "type": "supergroup",
+            "title": "Eng Group"
+          },
+          "from": {
+            "id": 888,
+            "is_bot": false,
+            "first_name": "Alice",
+            "username": "ben"
+          },
+          "text": "a long message with many parts"
+        }
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "9",
+        "text": "re",
+        "reply_to_message_id": "7",
+        "reply_to_text": "just this part"
+      }
+    },
+    {
+      "id": "reply-to-caption-only",
+      "payload": {
+        "message_id": 10,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "re",
+        "reply_to_message": {
+          "message_id": 7,
+          "chat": {
+            "id": -1001234,
+            "type": "supergroup",
+            "title": "Eng Group"
+          },
+          "from": {
+            "id": 888,
+            "is_bot": false,
+            "first_name": "Alice",
+            "username": "ben"
+          },
+          "caption": "photo caption"
+        }
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "10",
+        "text": "re",
+        "reply_to_message_id": "7",
+        "reply_to_text": "photo caption"
+      }
+    },
+    {
+      "id": "bot-authored-message",
+      "payload": {
+        "message_id": 11,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group"
+        },
+        "from": {
+          "id": 999,
+          "is_bot": true,
+          "first_name": "OtherBot",
+          "username": "ben"
+        },
+        "text": "bot chatter"
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": null,
+        "user_id": "999",
+        "user_name": "OtherBot",
+        "user_is_bot": true,
+        "message_id": "11",
+        "text": "bot chatter",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    },
+    {
+      "id": "command-message",
+      "payload": {
+        "message_id": 12,
+        "chat": {
+          "id": 555,
+          "type": "private",
+          "first_name": "Ben"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "/status"
+      },
+      "expected": {
+        "chat_id": "555",
+        "chat_type": "dm",
+        "chat_name": "Ben",
+        "thread_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "12",
+        "text": "/status",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    },
+    {
+      "id": "cjk-emoji-text",
+      "payload": {
+        "message_id": 13,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        },
+        "text": "中文 — test 🎉 (100%)"
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "13",
+        "text": "中文 — test 🎉 (100%)",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    },
+    {
+      "id": "empty-text-media-placeholder",
+      "payload": {
+        "message_id": 14,
+        "chat": {
+          "id": -1001234,
+          "type": "supergroup",
+          "title": "Eng Group"
+        },
+        "from": {
+          "id": 777,
+          "is_bot": false,
+          "first_name": "Ben",
+          "username": "ben"
+        }
+      },
+      "expected": {
+        "chat_id": "-1001234",
+        "chat_type": "group",
+        "chat_name": "Eng Group",
+        "thread_id": null,
+        "user_id": "777",
+        "user_name": "Ben",
+        "user_is_bot": false,
+        "message_id": "14",
+        "text": "",
+        "reply_to_message_id": null,
+        "reply_to_text": null
+      }
+    }
+  ]
+}

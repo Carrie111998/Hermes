@@ -6012,20 +6012,29 @@ class DiscordAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _is_discord_voice_message_attachment(att: Any) -> bool:
-        """Return True when a Discord audio attachment is a native voice note."""
-        marker = getattr(att, "is_voice_message", None)
-        if marker is not None:
-            if callable(marker):
-                try:
-                    return bool(marker())
-                except Exception as exc:
-                    logger.debug("[Discord] is_voice_message() failed for attachment: %s", exc)
-                    return False
-            return bool(marker)
+        """Return True when a Discord audio attachment is a native voice note.
 
-        return (
-            getattr(att, "duration", None) is not None
-            and getattr(att, "waveform", None) is not None
+        Delegates to the PURE parse core (discord_parse) — the same rule the
+        ingress conformance vector generator exercises.
+        """
+        from plugins.platforms.discord.discord_parse import (
+            AttachmentView,
+            is_voice_message_attachment,
+        )
+
+        marker = getattr(att, "is_voice_message", None)
+        if marker is not None and callable(marker):
+            try:
+                marker = bool(marker())
+            except Exception as exc:
+                logger.debug("[Discord] is_voice_message() failed for attachment: %s", exc)
+                return False
+        return is_voice_message_attachment(
+            AttachmentView(
+                is_voice_message=marker,
+                duration=getattr(att, "duration", None),
+                waveform=getattr(att, "waveform", None),
+            )
         )
 
     def _discord_free_response_channels(self) -> set:
@@ -7239,20 +7248,30 @@ class DiscordAdapter(BasePlatformAdapter):
         return topic
 
     def _format_thread_chat_name(self, thread: Any) -> str:
-        """Build a readable chat name for thread-like Discord channels, including forum context when available."""
-        thread_name = getattr(thread, "name", None) or str(getattr(thread, "id", "thread"))
+        """Build a readable chat name for thread-like Discord channels, including forum context when available.
+
+        Delegates to the PURE parse core (discord_parse.thread_chat_name) —
+        the same naming rules the ingress conformance vectors pin.
+        """
+        from plugins.platforms.discord.discord_parse import (
+            DiscordMessageView,
+            thread_chat_name,
+        )
+
         parent = getattr(thread, "parent", None)
         guild = getattr(thread, "guild", None) or getattr(parent, "guild", None)
-        guild_name = getattr(guild, "name", None)
-        parent_name = getattr(parent, "name", None)
-
-        if self._is_forum_parent(parent) and guild_name and parent_name:
-            return f"{guild_name} / {parent_name} / {thread_name}"
-        if parent_name and guild_name:
-            return f"{guild_name} / #{parent_name} / {thread_name}"
-        if parent_name:
-            return f"{parent_name} / {thread_name}"
-        return thread_name
+        return thread_chat_name(
+            DiscordMessageView(
+                message_id="",
+                content="",
+                channel_id=str(getattr(thread, "id", "thread")),
+                channel_name=getattr(thread, "name", None),
+                channel_kind="thread",
+                guild_name=getattr(guild, "name", None),
+                parent_channel_name=getattr(parent, "name", None),
+                parent_is_forum=self._is_forum_parent(parent),
+            )
+        )
 
     # ------------------------------------------------------------------
     # Attachment download helpers
@@ -7545,34 +7564,39 @@ class DiscordAdapter(BasePlatformAdapter):
 
         all_attachments = list(message.attachments) + snapshot_attachments + referenced_attachments
 
-        # Determine message type
-        msg_type = MessageType.TEXT
-        if normalized_content.startswith("/"):
-            msg_type = MessageType.COMMAND
-        elif all_attachments:
-            # Check attachment types. Any non-media attachment is treated as a
-            # DOCUMENT regardless of extension — authorization to message the
-            # agent is the gate, not the file type.
-            for att in all_attachments:
-                if att.content_type:
-                    if att.content_type.startswith("image/"):
-                        msg_type = MessageType.PHOTO
-                    elif att.content_type.startswith("video/"):
-                        msg_type = MessageType.VIDEO
-                    elif att.content_type.startswith("audio/"):
-                        if self._is_discord_voice_message_attachment(att):
-                            msg_type = MessageType.VOICE
-                        else:
-                            msg_type = MessageType.AUDIO
-                    else:
-                        msg_type = MessageType.DOCUMENT
-                    break
-                else:
-                    # No content_type at all (rare — discord usually fills it
-                    # in). Treat as a document so downstream pipelines surface
-                    # the path to the agent.
-                    msg_type = MessageType.DOCUMENT
-                    break
+        # Determine message type — the classification rules live in the PURE
+        # parse core (discord_parse.classify_message_type), shared with the
+        # ingress conformance vector generator. Wrap the SDK attachments in
+        # the core's view type; command detection runs on the (already
+        # mention-stripped) normalized content.
+        from plugins.platforms.discord.discord_parse import (
+            AttachmentView as _AttView,
+            classify_message_type as _classify,
+            DiscordMessageView as _MsgView,
+        )
+
+        def _att_view(att: Any) -> _AttView:
+            marker = getattr(att, "is_voice_message", None)
+            if marker is not None and callable(marker):
+                try:
+                    marker = bool(marker())
+                except Exception:
+                    marker = False
+            return _AttView(
+                content_type=getattr(att, "content_type", None),
+                is_voice_message=marker,
+                duration=getattr(att, "duration", None),
+                waveform=getattr(att, "waveform", None),
+            )
+
+        msg_type = _classify(
+            _MsgView(
+                message_id=str(message.id),
+                content=normalized_content,
+                channel_id=str(message.channel.id),
+                attachments=[_att_view(a) for a in all_attachments],
+            )
+        )
 
         # When auto-threading kicked in, route responses to the new thread
         effective_channel = auto_threaded_channel or message.channel
