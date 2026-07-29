@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 
@@ -20,6 +21,7 @@ def _configured_defaults(config: dict[str, Any]) -> tuple[str, str, bool, bool]:
 
     cron_model = _text(cron_cfg.get("model"))
     cron_provider = _text(cron_cfg.get("model_provider"))
+    env_model = _text(os.environ.get("HERMES_MODEL"))
 
     model_default = ""
     model_provider = ""
@@ -30,7 +32,7 @@ def _configured_defaults(config: dict[str, Any]) -> tuple[str, str, bool, bool]:
         model_provider = _text(model_cfg.get("provider"))
 
     return (
-        cron_model or model_default,
+        cron_model or model_default or env_model,
         cron_provider or model_provider,
         bool(cron_model),
         bool(cron_provider),
@@ -81,6 +83,9 @@ def audit_cron_models(json_output: bool = False) -> str:
         model = _text(job.get("model"))
         provider = _text(job.get("provider"))
         no_agent = bool(job.get("no_agent", False))
+        enabled = bool(job.get("enabled", True))
+        state = _text(job.get("state")) or "active"
+        active = enabled and state != "paused"
 
         if no_agent:
             status = "script-only"
@@ -133,10 +138,13 @@ def audit_cron_models(json_output: bool = False) -> str:
                 "provider_snapshot": provider_snapshot or None,
                 "status": status,
                 "no_agent": no_agent,
+                "enabled": enabled,
+                "state": state,
+                "active": active,
                 "guarded_axes": guarded_axes,
                 "drifted_axes": drifted_axes,
                 "unprotected_axes": unprotected_axes,
-                "at_risk": bool(drifted_axes),
+                "at_risk": active and bool(drifted_axes),
             }
         )
 
@@ -164,7 +172,11 @@ def audit_cron_models(json_output: bool = False) -> str:
     lines.append("─" * 96)
 
     for result in results:
-        if result["at_risk"]:
+        if not result["active"] and result["drifted_axes"]:
+            risk = "paused; drift on resume: " + ",".join(result["drifted_axes"])
+        elif not result["active"]:
+            risk = "paused"
+        elif result["at_risk"]:
             risk = "SKIP: " + ",".join(result["drifted_axes"])
         elif result["unprotected_axes"]:
             risk = "unguarded: " + ",".join(result["unprotected_axes"])

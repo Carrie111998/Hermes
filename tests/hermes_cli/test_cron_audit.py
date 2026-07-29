@@ -22,8 +22,11 @@ def _job(
     provider_snapshot=None,
     no_agent=False,
     enabled=True,
+    state=None,
 ):
     result = {"id": job_id, "name": f"Job {job_id}", "enabled": enabled}
+    if state is not None:
+        result["state"] = state
     for key, value in (
         ("model", model),
         ("provider", provider),
@@ -37,7 +40,13 @@ def _job(
     return result
 
 
-def _audit(jobs, config, *, resolved_model="global-model", resolved_provider="global-provider"):
+def _audit(
+    jobs,
+    config,
+    *,
+    resolved_model: str | None = "global-model",
+    resolved_provider: str | None = "global-provider",
+):
     with (
         patch("cron.jobs.load_jobs", return_value=jobs),
         patch("hermes_cli.config.load_config", return_value=config),
@@ -85,6 +94,51 @@ def test_drifted_snapshot_is_reported_as_scheduler_skip_risk():
     )
     result = data["jobs"][0]
     assert result["drifted_axes"] == ["model", "provider"]
+    assert result["at_risk"] is True
+
+
+@pytest.mark.parametrize(
+    "job",
+    [
+        _job(
+            "disabled",
+            enabled=False,
+            model_snapshot="old-model",
+            provider_snapshot="old-provider",
+        ),
+        _job(
+            "paused",
+            state="paused",
+            model_snapshot="old-model",
+            provider_snapshot="old-provider",
+        ),
+    ],
+)
+def test_inactive_drift_is_not_counted_as_would_skip_now(job):
+    data = _audit(
+        [job],
+        {"model": {"default": "new-model", "provider": "new-provider"}},
+        resolved_model="new-model",
+        resolved_provider="new-provider",
+    )
+    result = data["jobs"][0]
+    assert result["active"] is False
+    assert result["drifted_axes"] == ["model", "provider"]
+    assert result["at_risk"] is False
+
+
+def test_hermes_model_is_used_when_config_has_no_model_default(monkeypatch):
+    monkeypatch.setenv("HERMES_MODEL", "env-model")
+    data = _audit(
+        [_job(model_snapshot="old-model")],
+        {"model": {"provider": "global-provider"}},
+        resolved_model=None,
+        resolved_provider="global-provider",
+    )
+    result = data["jobs"][0]
+    assert data["effective_default_model"] == "env-model"
+    assert result["effective_model"] == "env-model"
+    assert result["drifted_axes"] == ["model"]
     assert result["at_risk"] is True
 
 
