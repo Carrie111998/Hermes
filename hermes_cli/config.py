@@ -449,7 +449,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
         method = (root / ".install_method").read_text(encoding="utf-8").strip().lower()
         if method in supported_methods:
             return method
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         pass
 
     # 2. Legacy home-scoped stamp — back-compat. Ignore a ``docker`` value
@@ -465,7 +465,7 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
         )
         if method in supported_methods and not (method == "docker" and not _running_in_container()):
             return method
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         pass
 
     managed = get_managed_system()
