@@ -22,7 +22,6 @@ import argparse
 import datetime as _dt
 import json
 import os
-import re
 import shutil
 import sqlite3
 import sys
@@ -39,9 +38,6 @@ RECORDINGS_DIR = Path(
     )
 )
 DB_PATH = RECORDINGS_DIR / "CloudRecordings.db"
-WHISPER_TRANSCRIPTS_DIR = Path(
-    os.path.expanduser("~/.voicememo-whisper/transcripts")
-)
 
 # The binary that needs macOS Full Disk Access for any process reading the
 # (TCC-protected) Voice Memos container — surfaced in error messages so a
@@ -50,7 +46,7 @@ _FDA_HINT = (
     "Voice Memos is a macOS privacy-protected location. The running process "
     "needs Full Disk Access. Grant it to the gateway's Python:\n"
     "  System Settings > Privacy & Security > Full Disk Access > +\n"
-    "  add  ~/.hermes/hermes-agent/venv/bin/python  (Cmd+Shift+G to paste the path)\n"
+    f"  add  {Path(sys.executable).resolve()}  (Cmd+Shift+G to paste the path)\n"
     "then: hermes gateway restart"
 )
 
@@ -74,57 +70,45 @@ def extract_transcript(m4a_path: Path) -> str | None:
         data = m4a_path.read_bytes()
     except OSError:
         return None
-    idx = data.find(b"tsrp")
-    if idx < 4:
-        return None
+
     # QuickTime atom layout: [4-byte big-endian size][4-byte type][payload].
-    # The size and type sit just before the payload, so the 4 bytes preceding
-    # "tsrp" are the atom size (covering header + payload).
-    size = int.from_bytes(data[idx - 4 : idx], "big")
-    payload = data[idx + 4 : idx - 4 + size]
-    try:
-        obj = json.loads(payload.decode("utf-8", "replace"))
-        runs = obj["attributedString"]["runs"]
-    except (ValueError, KeyError, TypeError):
-        # Fall back to a tolerant raw_decode in case of trailing atom padding.
+    # Search every marker because the byte sequence can also occur in audio or
+    # metadata. A malformed candidate must not hide a later valid transcript.
+    offset = 0
+    while True:
+        idx = data.find(b"tsrp", offset)
+        if idx < 0:
+            return None
+        offset = idx + 4
+        if idx < 4:
+            continue
+
+        atom_start = idx - 4
+        size = int.from_bytes(data[atom_start:idx], "big")
+        atom_end = atom_start + size
+        if size < 8 or atom_end > len(data):
+            continue
+
+        payload = data[idx + 4 : atom_end]
         try:
             obj, _ = json.JSONDecoder().raw_decode(
-                payload.decode("utf-8", "replace")
+                payload.decode("utf-8", "replace").lstrip()
             )
             runs = obj["attributedString"]["runs"]
-        except Exception:
-            return None
-    text = "".join(x for x in runs if isinstance(x, str)).strip()
-    return text or None
-
-
-def _safe_cache_key(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "recording"
-
-
-def whisper_transcript_path(rec: dict) -> Path:
-    """Return the cache path for a local Whisper transcript of this recording."""
-    key = rec.get("unique_id") or Path(rec["filename"]).stem
-    return WHISPER_TRANSCRIPTS_DIR / f"{_safe_cache_key(str(key))}.txt"
-
-
-def read_whisper_transcript(rec: dict) -> str | None:
-    """Read a cached local Whisper transcript, if the cron worker made one."""
-    try:
-        text = whisper_transcript_path(rec).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return text or None
+        except (ValueError, KeyError, TypeError):
+            continue
+        if not isinstance(runs, list):
+            continue
+        text = "".join(x for x in runs if isinstance(x, str)).strip()
+        if text:
+            return text
 
 
 def best_transcript(rec: dict) -> tuple[str | None, str | None]:
-    """Return transcript text and source, preferring Apple's embedded text."""
+    """Return Apple's embedded transcript text and source, when available."""
     apple = extract_transcript(Path(rec["path"])) if rec["exists"] else None
     if apple:
         return apple, "apple"
-    whisper = read_whisper_transcript(rec) if rec["exists"] else None
-    if whisper:
-        return whisper, "whisper-medium"
     return None, None
 
 
@@ -208,35 +192,42 @@ def _match(rec: dict, needle: str) -> bool:
 
 
 def cmd_list(args) -> None:
-    recs = load_recordings()
+    recs = list(enumerate(load_recordings()))
     if args.search:
-        recs = [r for r in recs if _match(r, args.search)]
+        recs = [(i, r) for i, r in recs if _match(r, args.search)]
     if args.with_transcript:
-        recs = [r for r in recs if r["exists"] and best_transcript(r)[0]]
+        recs = [(i, r) for i, r in recs if best_transcript(r)[0]]
     if args.limit:
         recs = recs[: args.limit]
 
     if args.json:
-        for r in recs:
+        results = []
+        for i, r in recs:
             _text, source = best_transcript(r)
-            r["has_transcript"] = bool(source)
-            r["transcript_source"] = source
-            r["whisper_transcript_path"] = str(whisper_transcript_path(r))
-        print(json.dumps(recs, indent=2))
+            results.append(
+                {
+                    **r,
+                    "index": i,
+                    "has_transcript": bool(source),
+                    "transcript_source": source,
+                }
+            )
+        print(json.dumps(results, indent=2))
         return
 
     if not recs:
         print("No matching recordings.")
         return
-    for i, r in enumerate(recs):
+    for i, r in recs:
         _text, source = best_transcript(r)
-        has = "A" if source == "apple" else "W" if source == "whisper-medium" else " "
+        has = "A" if source == "apple" else "D" if not r["exists"] else " "
         print(
             f"[{i:>3}] [{has}] {r['date_human']}  "
             f"{_fmt_dur(r['duration_sec']):>6}  {r['title']}"
         )
     print(
-        "\n(A = Apple transcript, W = local Whisper medium transcript. "
+        "\n(A = Apple transcript, D = audio not downloaded locally, "
+        "blank = no embedded Apple transcript. "
         "Use: voicememos.py transcript <index|search>)"
     )
 
@@ -261,11 +252,17 @@ def cmd_transcript(args) -> None:
     print(f"# {rec['title']}")
     print(f"{rec['date_human']}  ({_fmt_dur(rec['duration_sec'])})  {rec['filename']}\n")
     if text:
-        if source == "whisper-medium":
-            print("(local Whisper medium transcript)\n")
         print(text)
+    elif not rec["exists"]:
+        print(
+            "(audio is not downloaded locally; open or download this recording "
+            "in Voice Memos, then retry)"
+        )
     else:
-        print("(no Apple or cached Whisper transcript)")
+        print(
+            "(Apple has not embedded a transcript for this recording; it may "
+            "still be processing or transcription may be unavailable)"
+        )
 
 
 def cmd_dump(args) -> None:

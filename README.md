@@ -186,18 +186,18 @@ All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes
 
 Hermes now ships a bundled `apple-voice-memos` skill for macOS. That skill is the
 standard, read-only **Voice Memos transcript + metadata layer**: it reads Apple's
-embedded transcripts from `.m4a` files, falls back to cached local Whisper text,
-and exposes list/search/dump commands.
+embedded transcripts from locally available `.m4a` files and exposes
+list/search/dump commands.
 
-If you want a fuller workflow — for example, "newly transcribed memo inbox" polling,
-stateful deduping, reminder creation, Apple Notes logging, or cron-driven processing —
-build that as a **custom automation layer on top of the bundled skill** rather than
-forking transcript extraction in a second place.
+Hermes does not automatically transcribe a memo when Apple text is absent. If
+you want external transcription, "new memo" polling, stateful deduping,
+reminder creation, Apple Notes logging, or cron-driven processing, build that
+as a **custom automation layer on top of the bundled skill**.
 
 Typical split:
 
-- **Bundled `apple-voice-memos` skill** → canonical transcript reader
-- **Your custom scripts / cron job** → new-memo detection, logging, reminders, notes, delivery
+- **Bundled `apple-voice-memos` skill** → metadata + Apple transcript reader
+- **Your custom scripts / cron job** → optional transcription, state, logging, reminders, delivery
 
 ---
 
