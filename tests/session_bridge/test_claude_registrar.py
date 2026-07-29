@@ -1338,22 +1338,60 @@ def test_registration_transcript_rejects_any_unrelated_projected_message() -> No
     assert result.status == "failed" and result.error_code == "bridge_conflict"
 
 
-def test_exact_uuid_provider_limit_transcript_reconciles_without_replacement() -> None:
+@pytest.mark.parametrize(
+    "response",
+    [
+        "You've hit your limit · resets Jul 20, 4am "
+        "(America/New_York)\nAPI Error: 429 rate_limit",
+        "You\u2019ve hit your weekly limit · resets Aug 3, 4am "
+        "(America/New_York)",
+        "You've hit your weekly limit \u00c2\u00b7 resets Aug 3, 4am "
+        "(America/New_York)",
+    ],
+)
+def test_exact_uuid_provider_limit_transcript_reconciles_without_replacement(
+    response: str,
+) -> None:
     item = claim(
         lease_kind="reconciliation",
         launch_permitted=False,
         registration_reserved=False,
         requires_exact_id_reconciliation=True,
     )
-    projection = projection_for(
-        item,
-        response="You've hit your limit · resets Jul 20, 4am "
-        "(America/New_York)\nAPI Error: 429 rate_limit",
-    )
+    projection = projection_for(item, response=response)
     factory = FakeFactory()
     result = registrar(FakeSource([projection]), factory).process(item)
 
     assert result.status == "visible"
+    assert factory.spawns == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "You've hit your weekly limit? No; usage resets tomorrow.",
+        'Assistant quoted: "You\u2019ve hit your weekly limit · resets tomorrow."',
+        "You've hit your weekly limits · resets tomorrow.",
+    ],
+)
+def test_exact_uuid_non_limit_text_never_bypasses_registered_response(
+    response: str,
+) -> None:
+    item = claim(
+        lease_kind="reconciliation",
+        launch_permitted=False,
+        registration_reserved=False,
+        requires_exact_id_reconciliation=True,
+    )
+    factory = FakeFactory()
+
+    result = registrar(
+        FakeSource([projection_for(item, response=response)]),
+        factory,
+    ).process(item)
+
+    assert result.status == "failed"
+    assert result.error_code == "bridge_conflict"
     assert factory.spawns == []
 
 
@@ -1375,6 +1413,27 @@ def test_launch_current_session_limit_wording_retries_without_waiting_for_timeou
     item = claim()
     limited = (
         "You've hit your session limit · resets 6:50pm (America/New_York)"
+    )
+    source = FakeSource([None, None])
+    factory = FakeFactory(FakePty(output=limited))
+
+    result = registrar(source, factory).process(item)
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert result.detail == "Claude provider limit interrupted registration"
+    assert len(factory.spawns) == 1
+    assert source.lookups == [item.reserved_claude_uuid, item.reserved_claude_uuid]
+
+
+@pytest.mark.parametrize("apostrophe", ["'", "\u2019"])
+def test_launch_current_weekly_limit_wording_retries_without_waiting_for_timeout(
+    apostrophe: str,
+) -> None:
+    item = claim()
+    limited = (
+        f"You{apostrophe}ve hit your weekly limit · "
+        "resets Aug 3, 4am (America/New_York)"
     )
     source = FakeSource([None, None])
     factory = FakeFactory(FakePty(output=limited))

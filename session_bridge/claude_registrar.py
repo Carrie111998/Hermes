@@ -66,6 +66,10 @@ _CLAUDE_FORCED_ONBOARDING_ENVIRONMENTS = (
 )
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+_CLAUDE_PROVIDER_LIMIT_BANNER_RE = re.compile(
+    r"you've hit your (?:(?:session|weekly) )?limit[ \t]*"
+    r"\u00b7[ \t]*resets[ \t]+\S[^\r\n]{0,159}"
+)
 _CLAUDE_MAIN_REPL_FOOTER_RE = re.compile("\u23f5\u23f5")
 _CLAUDE_2110_RESUME_SCAFFOLD = "No response requested."
 _MAX_AUTH_RECOVERY_ATTEMPTS = 24
@@ -1847,17 +1851,23 @@ def _is_authentication_failure(output: str) -> bool:
 def _is_provider_limit_failure(output: str) -> bool:
     if not isinstance(output, str) or not (1 <= len(output) <= _MAX_RESPONSE_CHARS):
         return False
-    folded = output.casefold()
-    return (
+    folded = (
+        _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", output))
+        .replace("\r", "")
+        .replace("\u00c2\u00b7", "\u00b7")
+        .casefold()
+        .replace("\u2019", "'")
+    )
+    api_limit = (
         ("api error: 429" in folded or '"status":429' in folded)
         and ("rate_limit" in folded or "rate limit" in folded)
-    ) or (
-        (
-            "you've hit your limit" in folded
-            or "you've hit your session limit" in folded
-        )
-        and "resets" in folded
     )
+    banner_limit = any(
+        _CLAUDE_PROVIDER_LIMIT_BANNER_RE.fullmatch(line.strip()) is not None
+        for line in folded.splitlines()
+        if line.strip()
+    )
+    return api_limit or banner_limit
 
 
 def _fileno_closed(resource: object) -> bool:
