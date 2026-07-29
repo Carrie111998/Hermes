@@ -4,7 +4,8 @@ import { persistentAtom } from '@/lib/persisted'
 import { normalize } from '@/lib/text'
 
 import { $rightRailActiveTabId, PREVIEW_PANE_ID, type RightRailTabId, selectRightRailTab } from './layout'
-import { setPaneOpen } from './panes'
+import { $paneOpen, setPaneOpen } from './panes'
+import { requestRightPanelPane } from './right-panel'
 
 /**
  * PREVIEW RAIL — one list of tabs, one way in.
@@ -106,6 +107,8 @@ export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
     )
 })
 
+export const $previewPaneOpen = $paneOpen(PREVIEW_PANE_ID)
+
 if (typeof window !== 'undefined') {
   try {
     window.localStorage.removeItem(LEGACY_SESSION_REGISTRY_KEY)
@@ -176,8 +179,26 @@ export function openPreview(target: PreviewTarget, source: PreviewRecordSource =
 
   $previewTabs.set(index === -1 ? [...current, tab] : current.map((item, i) => (i === index ? tab : item)))
   setPaneOpen(PREVIEW_PANE_ID, true)
+  requestRightPanelPane('preview')
   selectRightRailTab(id)
   $previewOpenRequest.set($previewOpenRequest.get() + 1)
+}
+
+/** Show the Preview function without recreating or mutating any of its child
+ * targets. Used by the top-level right-panel picker/tab lifecycle. */
+export function showPreviewPane(): void {
+  if ($previewTabs.get().length === 0) {
+    return
+  }
+
+  setPaneOpen(PREVIEW_PANE_ID, true)
+  requestRightPanelPane('preview')
+}
+
+/** Hide only the top-level Preview function. Its child tabs stay alive and
+ * return exactly as they were when Preview is selected again. */
+export function hidePreviewPane(): void {
+  setPaneOpen(PREVIEW_PANE_ID, false)
 }
 
 export function closeRightRailTab(tabId: RightRailTabId) {

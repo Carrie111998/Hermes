@@ -16,7 +16,14 @@ import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gatewa
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import { $activeGatewayProfile, requestFreshSession } from '@/store/profile'
-import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, workspaceCwdForNewSession } from '@/store/session'
+import {
+  $currentCwd,
+  $selectedStoredSessionId,
+  $sessions,
+  sessionMatchesStoredId,
+  setCurrentCwd,
+  workspaceCwdForNewSession
+} from '@/store/session'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
 // First-class, per-profile Projects (named, multi-folder workspaces). State is
@@ -157,6 +164,29 @@ export function enterProject(id: string): void {
   }
 }
 
+export function projectWorkspaceCwd(project: SidebarProjectTree): null | string {
+  return (project.path || project.repos.find(repo => repo.path)?.path || '').trim() || null
+}
+
+/** Keep every project-aware Desktop surface on the same workspace context.
+ * Existing PTYs keep their own process cwd; this only updates the workspace
+ * used by Files/Preview/Artifacts and terminals created after the switch. */
+export function syncProjectWorkspaceCwd(project: SidebarProjectTree): void {
+  const cwd = projectWorkspaceCwd(project)
+
+  if (cwd && cwd !== $currentCwd.get()) {
+    setCurrentCwd(cwd)
+  }
+}
+
+/** Entering a project is more than filtering one view: reveal the project
+ * sidebar, align the workspace cwd, then scope all project-aware surfaces. */
+export function enterProjectWorkspace(project: SidebarProjectTree): void {
+  setSidebarAgentsGrouped(true)
+  syncProjectWorkspaceCwd(project)
+  enterProject(project.id)
+}
+
 export function exitProjectScope(): void {
   $projectScope.set(ALL_PROJECTS)
 }
@@ -178,7 +208,7 @@ export function resolveNewSessionCwd(): string {
 
   if (scope !== ALL_PROJECTS) {
     const project = $projectTree.get().find(node => node.id === scope)
-    const cwd = (project?.path || project?.repos.find(repo => repo.path)?.path || '').trim()
+    const cwd = project ? projectWorkspaceCwd(project) : null
 
     if (cwd) {
       return cwd

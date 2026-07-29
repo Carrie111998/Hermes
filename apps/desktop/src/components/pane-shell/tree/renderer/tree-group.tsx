@@ -138,11 +138,15 @@ function ZoneMenu({
 export function TreeGroup({
   node,
   parentAxis,
-  railSide = 'left'
+  railSide = 'left',
+  narrowOverlay = false
 }: {
   node: GroupNode
   parentAxis?: 'column' | 'row'
   railSide?: 'left' | 'right'
+  /** The group is already inside NarrowOverlays, so its collapsible panes are
+   * real content here rather than being filtered out of the docked grid. */
+  narrowOverlay?: boolean
 }) {
   const { t } = useI18n()
   const ref = useRef<HTMLDivElement>(null)
@@ -178,12 +182,15 @@ export function TreeGroup({
   // Edit mode forces toggle-hidden panes visible so they can be rearranged
   // (mirrors tree-split's paneGone) — restores itself on exit.
   const paneShown = (id: string) =>
-    Boolean(paneFor(id)) && (editMode || !hiddenPanes.has(id)) && !(narrow && paneChrome(paneFor(id)).collapsible)
+    Boolean(paneFor(id)) &&
+    (editMode || !hiddenPanes.has(id)) &&
+    !(narrow && !narrowOverlay && paneChrome(paneFor(id)).collapsible)
 
   const shown = node.panes.filter(paneShown)
   const activeId = shown.includes(node.active) ? node.active : (shown[0] ?? node.active)
   const active = paneFor(activeId)
   const isEmpty = node.panes.length === 0
+  const tabBarAction = node.panes.map(id => paneChrome(paneFor(id)).tabBarAction).find(Boolean)
 
   // KEEP-ALIVE: every pane that has been ACTIVE in this zone stays mounted —
   // an inactive tab merely hides (visibility), it does not unmount. Remounting
@@ -316,7 +323,9 @@ export function TreeGroup({
 
   // The zone hosting the uncloseable workspace never minimizes — collapsing
   // MAIN strands the whole app behind a strip.
-  const minimizable = !shown.some(id => paneChrome(paneFor(id)).uncloseable)
+  const minimizable =
+    !shown.some(id => paneChrome(paneFor(id)).uncloseable) &&
+    !node.panes.some(id => paneChrome(paneFor(id)).minimizable === false)
 
   // Tab ✕: a tool panel (terminal/logs) is REMOVED from the layout (comes back
   // via its toggle); everything else routes through its Close (a session tile
@@ -536,6 +545,7 @@ export function TreeGroup({
                 </button>
               )}
             </div>
+            {tabBarAction && !node.minimized ? tabBarAction() : null}
             {minimizable && (
               <button
                 aria-label={node.minimized ? t.zones.restore : t.zones.minimize}

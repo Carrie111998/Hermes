@@ -2,15 +2,11 @@ import { useStore } from '@nanostores/react'
 import { computed } from 'nanostores'
 import type { CSSProperties, ReactElement, PointerEvent as ReactPointerEvent } from 'react'
 
-import {
-  $artifactsPaneOpen,
-  $artifactsPaneRevealRequest,
-  closeArtifactsPane,
-  openArtifactsPane
-} from '@/app/artifacts/pane-state'
+import { $artifactsPaneOpen, closeArtifactsPane, openArtifactsPane } from '@/app/artifacts/pane-state'
 import { PREVIEW_RAIL_MAX_WIDTH, PREVIEW_RAIL_MIN_WIDTH } from '@/app/chat/right-rail'
 import { SessionStatusDot } from '@/app/chat/session-status-dot'
 import { PALETTE_AREA, type PaletteContribution } from '@/app/command-palette/contrib'
+import { RightPanelPicker } from '@/app/right-panel/picker'
 import { type StatusbarItem } from '@/app/shell/statusbar-controls'
 import { IdleMount } from '@/components/idle-mount'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
@@ -18,11 +14,12 @@ import { allPaneIds, group, groupLeafIds, split } from '@/components/pane-shell/
 import { LayoutTreeRoot } from '@/components/pane-shell/tree/renderer'
 import type { DoubleTapContext } from '@/components/pane-shell/tree/renderer/drag-session'
 import {
+  $activePresetId,
   $layoutTree,
+  $userPlacedPanes,
   bindTreeSideVisibility,
   declareDefaultTree,
   dismissTreePane,
-  dockPaneBeside,
   markCollapsePane,
   mirrorLayoutTree,
   paneRootSide,
@@ -33,8 +30,6 @@ import {
   revealTreePane,
   setPaneCollapsed,
   setTreePaneHidden,
-  setTreeSideCollapsed,
-  treeSideOfPane,
   watchContributedPanes
 } from '@/components/pane-shell/tree/store'
 import { SidebarProvider } from '@/components/ui/sidebar'
@@ -60,8 +55,9 @@ import {
   SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_MAX_WIDTH
 } from '@/store/layout'
-import { $previewOpenRequest, $previewTabs, closeRightRail } from '@/store/preview'
-import { $reviewOpen, closeReview, REVIEW_PANE_ID } from '@/store/review'
+import { $previewPaneOpen, $previewTabs, hidePreviewPane } from '@/store/preview'
+import { $reviewOpen, hideReviewPane, REVIEW_PANE_ID } from '@/store/review'
+import { $rightPanelOpen, $rightPanelRevealRequest, setRightPanelOpen } from '@/store/right-panel'
 import { $currentCwd, $selectedStoredSessionId, $sessions, sessionMatchesStoredId } from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
 import { $statusbarVisible, toggleStatusbarVisible } from '@/store/statusbar-prefs'
@@ -75,6 +71,7 @@ import {
   watchSessionTiles,
   WorkspaceTabMenu
 } from '../chat/session-tile'
+import { shouldMigrateLegacyRightPanel } from '../right-panel/layout-migration'
 import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
 import { $workspaceIsPage } from '../routes'
 
@@ -107,6 +104,11 @@ const renderWorkspacePane = () => <WiredPane part="chatRoutes" />
 // Boot-hidden panes mount behind display:none (instant-toggle contract) — defer
 // them to idle so they're off the first-paint path, warm before reveal.
 const idle = (node: ReactElement) => <IdleMount>{node}</IdleMount>
+const renderRightPanelPicker = () => <RightPanelPicker compact />
+// The functional work area is usually paired with the outer Files sidebar.
+// Keep enough room for previews without consuming the composer at laptop
+// widths; large windows still grow it to a comfortable document column.
+const RIGHT_PANEL_WIDTH = 'clamp(20rem, 28vw, 30rem)'
 // The main tab carries the same session context menu as tile tabs (targets
 // the loaded primary session; no menu on a fresh draft).
 const wrapWorkspaceTab = (tab: ReactElement) => <WorkspaceTabMenu>{tab}</WorkspaceTabMenu>
@@ -182,14 +184,30 @@ registry.registerMany([
     // staying collapsed behind the ⌃` toggle. height sizes the fixed track (a
     // single-pane zone declaring a height is a fixed track — the preset weight
     // is moot): a short deck, not a third of the window.
-    data: { placement: 'bottom', height: '20vh', minHeight: '7.5rem', maxHeight: '80vh', revealOnPreset: true },
+    data: {
+      placement: 'right',
+      collapsible: true,
+      dock: { pane: 'preview', pos: 'center' },
+      forceHeader: true,
+      minimizable: false,
+      tabBarAction: renderRightPanelPicker,
+      width: RIGHT_PANEL_WIDTH,
+      minWidth: PREVIEW_RAIL_MIN_WIDTH,
+      maxWidth: PREVIEW_RAIL_MAX_WIDTH,
+      height: '20vh',
+      minHeight: '7.5rem',
+      maxHeight: '80vh',
+      revealOnPreset: true
+    },
     render: () => <WiredPane part="terminal" />
   },
   {
     id: 'files',
     area: 'panes',
     title: 'files',
-    // dock: re-adoption target after a stale dismissal (see sessions).
+    // Files is structural chrome, not a right-tools function tab. It owns the
+    // narrow outermost sidebar while Preview/Review/Artifacts/Terminal share
+    // the wider work area immediately to its inside.
     data: {
       placement: 'right',
       collapsible: true,
@@ -207,13 +225,17 @@ registry.registerMany([
     title: 'preview',
     // The rail brings its OWN tab strip (per-target tabs with close buttons).
     // Exists only while something is previewed — visibility is bound to the
-    // preview targets below, like every other self-managed surface. dock:
-    // adoption seed only — dockPaneBeside re-docks it next to files on every
-    // reveal anyway (position-aware).
+    // preview targets below, like every other self-managed surface. If a stale
+    // persisted tree is missing it, re-adopt it as a new zone left of Files;
+    // the other functions then stack back into this zone.
     data: {
       placement: 'right',
+      collapsible: true,
       dock: { pane: 'files', pos: 'left' },
-      width: 'clamp(18rem, 36vw, 32rem)',
+      forceHeader: true,
+      minimizable: false,
+      tabBarAction: renderRightPanelPicker,
+      width: RIGHT_PANEL_WIDTH,
       minWidth: PREVIEW_RAIL_MIN_WIDTH,
       maxWidth: PREVIEW_RAIL_MAX_WIDTH
     },
@@ -226,10 +248,13 @@ registry.registerMany([
     data: {
       placement: 'right',
       collapsible: true,
-      dock: { pane: 'files', pos: 'left' },
-      width: FILE_BROWSER_DEFAULT_WIDTH,
-      minWidth: FILE_BROWSER_MIN_WIDTH,
-      maxWidth: FILE_BROWSER_MAX_WIDTH
+      dock: { pane: 'preview', pos: 'center' },
+      forceHeader: true,
+      minimizable: false,
+      tabBarAction: renderRightPanelPicker,
+      width: RIGHT_PANEL_WIDTH,
+      minWidth: PREVIEW_RAIL_MIN_WIDTH,
+      maxWidth: PREVIEW_RAIL_MAX_WIDTH
     },
     render: () => idle(<ArtifactsPaneContent />)
   },
@@ -237,15 +262,19 @@ registry.registerMany([
     id: 'review',
     area: 'panes',
     title: 'review',
-    // The second right sidebar: hidden until ⌘G ($reviewOpen) — bound below
-    // like the other chrome toggles; its zone collapses while hidden.
+    // Hidden until ⌘G ($reviewOpen); when present it shares the functional
+    // right-tools group rather than adding another sidebar track.
     data: {
       placement: 'right',
       collapsible: true,
+      dock: { pane: 'preview', pos: 'center' },
+      forceHeader: true,
+      minimizable: false,
+      tabBarAction: renderRightPanelPicker,
       revealAliases: [REVIEW_PANE_ID],
-      width: FILE_BROWSER_DEFAULT_WIDTH,
-      minWidth: FILE_BROWSER_MIN_WIDTH,
-      maxWidth: FILE_BROWSER_MAX_WIDTH
+      width: RIGHT_PANEL_WIDTH,
+      minWidth: PREVIEW_RAIL_MIN_WIDTH,
+      maxWidth: PREVIEW_RAIL_MAX_WIDTH
     },
     render: () => idle(<ReviewPaneContent />)
   },
@@ -353,45 +382,34 @@ registry.registerMany([
 // Layout presets — CHAT (main) always dominates.
 // ---------------------------------------------------------------------------
 
-// The REAL default: sessions left, chat main, and the right sidebars in
-// column order main | … | review | preview | file-browser (files outermost,
-// preview DIRECTLY left of the file tree). Each is its OWN zone — main
-// parity: a file double-click slides the preview open as its own pane beside
-// the tree, never as a tab stacked into the files sidebar. Preview/review
-// zones collapse to nothing while their pane is hidden (no target / ⌘G off).
-// This static spot is just the seed — dockPaneBeside keeps preview adjacent
-// to files WHEREVER files moves (see the target listeners below).
+// The right side has two roles:
+//
+//   Workspace | right-tools | Files
+//
+// Review, Artifacts, Preview and Terminal are mutually exclusive top-level
+// function tabs in one wider work area. Files stays a narrow structural
+// sidebar at the outer edge, so choosing a file opens Preview directly to its
+// left without replacing the tree. This caps the default at two right tracks
+// instead of the former one-track-per-tool squeeze.
 const DEFAULT_TREE = split(
   'row',
   [
     group(['sessions'], { id: 'grp-sessions' }),
     group(['workspace'], { id: 'grp-main' }),
-    split(
-      'column',
-      [
-        split(
-          'row',
-          [
-            group(['review'], { id: 'grp-review' }),
-            group(['preview'], { id: 'grp-preview' }),
-            group(['files'], { id: 'grp-files' })
-          ],
-          [1, 1, 1.2],
-          'spl-rail'
-        ),
-        group(['terminal'], { id: 'grp-terminal' })
-      ],
-      [1.6, 1],
-      'spl-right'
-    )
+    group(['review', 'artifacts-pane', 'preview', 'terminal'], {
+      active: 'preview',
+      headerHidden: false,
+      id: 'grp-right-tools'
+    }),
+    group(['files'], { id: 'grp-files' })
   ],
-  [1, 3.4, 1.25],
+  [1, 3.4, 1.5, 0.8],
   'spl-root'
 )
 
 const FOCUS_TREE = split(
   'row',
-  [group(['sessions']), group(['workspace', 'files', 'preview', 'review', 'terminal'])],
+  [group(['sessions']), group(['workspace', 'files', 'review', 'artifacts-pane', 'preview', 'terminal'])],
   [1, 4.6]
 )
 
@@ -420,7 +438,9 @@ registry.registerMany([
   { id: 'quad', area: 'layouts', title: 'Quad', order: 30, data: QUAD_TREE }
 ])
 
-declareDefaultTree(DEFAULT_TREE)
+declareDefaultTree(DEFAULT_TREE, {
+  migratePersisted: current => shouldMigrateLegacyRightPanel(current, $activePresetId.get(), $userPlacedPanes.get())
+})
 
 // Bundled plugins load AFTER core, so a same-id contribution from a plugin
 // deliberately overrides the core default (last writer wins). Third-party
@@ -568,10 +588,10 @@ $panesFlipped.listen(flipped => {
 })
 
 // POSITIONAL side toggles (titlebar buttons, ⌘B / ⌘J): $sidebarOpen ≙ the
-// LEFT side of the main zone, $fileBrowserOpen ≙ the RIGHT — everything on
+// LEFT side of the main zone, $rightPanelOpen ≙ the RIGHT — everything on
 // that side hides together, whatever panes have been rearranged there.
 bindTreeSideVisibility('left', $sidebarOpen, setSidebarOpen)
-bindTreeSideVisibility('right', $fileBrowserOpen, setFileBrowserOpen)
+bindTreeSideVisibility('right', $rightPanelOpen, setRightPanelOpen)
 
 // Workspace-scoped surfaces: the file tree and git diff only mean something
 // inside a project. A detached chat (no cwd) hides them — their zones
@@ -580,9 +600,8 @@ bindTreeSideVisibility('right', $fileBrowserOpen, setFileBrowserOpen)
 // rode the rail's row and vanished with it), its zone stands on its own.
 const $hasWorkspace = computed($currentCwd, cwd => Boolean(cwd.trim()))
 
-// The tree pane's own presence tracks ⌘J directly, not just the column's
-// collapse — otherwise revealing a preview (which opens that shared column)
-// would drag the tree along with it. See revealPreview.
+// Files owns the independent outer sidebar; the whole right region has a
+// separate visibility flag.
 bindPaneVisibility(
   'files',
   computed([$hasWorkspace, $fileBrowserOpen], (workspace, open) => workspace && open)
@@ -591,11 +610,12 @@ bindPaneVisibility(
 bindPaneVisibility(
   'review',
   computed([$reviewOpen, $hasWorkspace], (open, workspace) => open && workspace),
-  closeReview
+  hideReviewPane
 )
-// ⌃` / statusbar toggle — the terminal COLLAPSES to a rail (tab stays), not
-// hides; PTYs stay alive while collapsed (see PersistentTerminal).
-bindPaneCollapse(
+// The terminal is a normal top-level function tab. Hiding it keeps the
+// persistent xterm host and PTYs alive; reopening only reattaches the visible
+// slot and fits the active inner terminal once.
+bindPaneVisibility(
   'terminal',
   $terminalTakeover,
   () => setTerminalTakeover(false),
@@ -606,21 +626,18 @@ bindPaneCollapse(
 // closing the last preview tab closes the pane; a new target opens + fronts
 // it). Same visibility binding as every other self-managed surface, driven
 // by the open tabs instead of a toggle.
-const $previewVisible = computed($previewTabs, tabs => tabs.length > 0)
+const $previewVisible = computed([$previewTabs, $previewPaneOpen], (tabs, open) => tabs.length > 0 && open)
 
-bindPaneVisibility('preview', $previewVisible, closeRightRail)
+bindPaneVisibility('preview', $previewVisible, hidePreviewPane)
 
 bindPaneVisibility('artifacts-pane', $artifactsPaneOpen, closeArtifactsPane, openArtifactsPane)
 
-$artifactsPaneRevealRequest.listen(() => {
-  dockPaneBeside('artifacts-pane', 'files')
-  const side = treeSideOfPane('artifacts-pane')
-
-  if (side) {
-    setTreeSideCollapsed(side, false)
+$rightPanelRevealRequest.listen(({ paneId, sequence }) => {
+  if (sequence === 0) {
+    return
   }
 
-  revealTreePane('artifacts-pane')
+  revealTreePane(paneId)
 })
 
 // Logs are optional chrome: off by default, toggled from ⌘K, persisted.
@@ -643,44 +660,13 @@ registry.register({
   } satisfies PaletteContribution
 })
 
-// Sessions/files Close = collapse their SIDE (⌘B/⌘J truthful, titlebar button
-// flips back) — but only while the pane actually lives in that root side
-// column. Dragged next to main, a side collapse can't hide it (the collapse
-// skips main-bearing children), so Close falls back to dismissal there —
-// otherwise ⌘W/Close silently no-op.
+// Sessions Close collapses its whole side (⌘B remains truthful). Files has its
+// own visibility owner, so closing only the outer tree leaves right-tools
+// available instead of collapsing Preview/Terminal with it.
 registerPaneCloser('sessions', () =>
   paneRootSide('sessions') === 'left' ? setSidebarOpen(false) : dismissTreePane('sessions')
 )
-registerPaneCloser('files', () =>
-  paneRootSide('files') === 'right' ? setFileBrowserOpen(false) : dismissTreePane('files')
-)
-
-// A preview target lands NEXT TO the file tree — position-aware: wherever
-// files currently lives (default rail, ⌘\-flipped, dragged into a stack), the
-// preview zone docks directly beside it. A user who drags the preview pane
-// somewhere pins it there instead (until a preset/reset). Then reveal: open
-// the side, unhide, front — a NEW target while already visible still fronts.
-const revealPreview = () => {
-  dockPaneBeside('preview', 'files')
-
-  // The preview shares a collapsible column with the file tree, and
-  // revealTreePane un-collapses a column through its bound store — here ⌘J /
-  // $fileBrowserOpen, which IS the tree's toggle. Going through it would open
-  // the tree every time a preview opened. Un-collapse the column directly and
-  // leave the toggle alone, so a preview can appear on its own.
-  const side = treeSideOfPane('preview')
-
-  if (side) {
-    setTreeSideCollapsed(side, false)
-  }
-
-  revealTreePane('preview')
-}
-
-// Keyed on open REQUESTS, not on the tab list: re-opening a tab that already
-// exists must still un-hide and front the pane, and closing one of two tabs
-// must not.
-$previewOpenRequest.listen(() => revealPreview())
+registerPaneCloser('files', () => setFileBrowserOpen(false))
 
 // ---------------------------------------------------------------------------
 

@@ -2113,7 +2113,14 @@ export interface Translations {
   rightSidebar: {
     aria: string
     panelsAria: string
+    choosePanel: string
+    addPanel: string
+    showPanel: string
+    hidePanel: string
     files: string
+    review: string
+    artifacts: string
+    preview: string
     terminal: string
     noFolderSelected: string
     changeCwdTitle: string

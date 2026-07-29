@@ -2,7 +2,8 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useMemo } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
-import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
+import { toggleTerminalPanel } from '@/app/right-panel/actions'
+import { $terminalTakeover } from '@/app/right-sidebar/store'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
@@ -527,7 +528,7 @@ export function useStatusbarItems({
         hidden: !chatOpen,
         icon: <Terminal className="size-3.5" />,
         id: 'terminal',
-        onSelect: () => setTerminalTakeover(!$terminalTakeover.get()),
+        onSelect: toggleTerminalPanel,
         title: terminalTakeover ? copy.hideTerminal : copy.showTerminal,
         toggleLabel: copy.toggleTerminal,
         variant: 'action'

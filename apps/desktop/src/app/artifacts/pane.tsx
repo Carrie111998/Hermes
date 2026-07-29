@@ -6,7 +6,6 @@ import { Button } from '@/components/ui/button'
 import { getSessionMessages } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { FileImage, FileText, Link2, Loader2, RefreshCw } from '@/lib/icons'
-import { downloadGatewayMediaFile, isRemoteGateway } from '@/lib/media'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
 import { $activeProjectId, $projectScope, $projectTree } from '@/store/projects'
@@ -22,6 +21,7 @@ import {
   collectArtifactsForSession,
   preferredArtifactProjectId
 } from './artifact-utils'
+import { openArtifactRecordInPreview } from './open-artifact'
 import { $artifactsPaneOpen } from './pane-state'
 
 const PANE_PROJECT_SESSIONS = 4
@@ -35,20 +35,6 @@ async function collectSessionArtifacts(sessions: readonly SessionInfo[]): Promis
       result.status === 'fulfilled' ? collectArtifactsForSession(sessions[index], result.value.messages) : []
     )
     .sort((left, right) => right.timestamp - left.timestamp)
-}
-
-async function openArtifactHref(href: string): Promise<void> {
-  if (isRemoteGateway() && /^file:/i.test(href)) {
-    await downloadGatewayMediaFile(href)
-
-    return
-  }
-
-  if (window.hermesDesktop?.openExternal) {
-    await window.hermesDesktop.openExternal(href)
-  } else {
-    window.open(href, '_blank', 'noopener,noreferrer')
-  }
 }
 
 export function ArtifactsPane() {
@@ -178,6 +164,7 @@ export function ArtifactsPane() {
                 artifacts={currentArtifacts}
                 empty={t.artifacts.noConversationArtifacts}
                 label={t.artifacts.thisConversation}
+                onOpen={artifact => openArtifactRecordInPreview(artifact, currentCwd)}
               />
             )}
             {project && (
@@ -185,6 +172,7 @@ export function ArtifactsPane() {
                 artifacts={projectArtifacts}
                 empty={t.artifacts.noRecentProjectArtifacts}
                 label={t.artifacts.recentInProject}
+                onOpen={artifact => openArtifactRecordInPreview(artifact, currentCwd)}
               />
             )}
           </div>
@@ -203,11 +191,13 @@ export function ArtifactsPane() {
 function ArtifactPaneSection({
   artifacts,
   empty,
-  label
+  label,
+  onOpen
 }: {
   artifacts: readonly ArtifactRecord[]
   empty: string
   label: string
+  onOpen: (artifact: ArtifactRecord) => Promise<boolean>
 }) {
   const { t } = useI18n()
 
@@ -230,9 +220,7 @@ function ArtifactPaneSection({
                   'hover:bg-(--ui-control-hover-background)'
                 )}
                 key={artifact.id}
-                onClick={() =>
-                  void openArtifactHref(artifact.href).catch(err => notifyError(err, t.artifacts.openFailed))
-                }
+                onClick={() => void onOpen(artifact).catch(err => notifyError(err, t.artifacts.openFailed))}
                 title={artifact.value}
                 type="button"
               >

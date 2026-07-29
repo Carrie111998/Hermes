@@ -35,7 +35,7 @@ export interface PaneSizing {
 }
 
 /** Chrome behavior flags a pane contributes. Read via `paneChrome`. */
-interface PaneChrome extends PaneSizing {
+export interface PaneChrome extends PaneSizing {
   /** Leaves the grid on narrow viewports; revealed as an edge overlay. */
   collapsible?: boolean
   /** Extra ids accepted from PANE_TOGGLE_REVEAL_EVENT (the real app's pane
@@ -66,6 +66,17 @@ interface PaneChrome extends PaneSizing {
    *  (artifacts/skills/plugin pages) are not tab-able surfaces. The flag is
    *  live: the workspace contribution re-registers it on route changes. */
   headerVeto?: boolean
+  /** Keep the group's top-level tab bar visible even when this is its only
+   * shown pane. Used by feature workspaces whose "+" picker must remain
+   * reachable with one open function. */
+  forceHeader?: boolean
+  /** Fixed action rendered after the group's scrollable tab list. Every pane
+   * in a product-owned group may contribute the same action; the renderer
+   * picks the first one without creating another tab-state authority. */
+  tabBarAction?: () => React.ReactNode
+  /** Opt out of the generic group minimize affordance. Whole-side workspaces
+   * are hidden by their own titlebar control instead. */
+  minimizable?: boolean
   /** A lead NODE for this pane's TAB, rendered before the label. A session
    *  pane (main workspace + tiles) passes its live `SessionStatusDot` here so
    *  the tab and the sidebar row render status/color from the ONE primitive

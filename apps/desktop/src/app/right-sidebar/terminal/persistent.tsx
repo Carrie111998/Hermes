@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
+import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { createRendererLoopPauseController } from '@/lib/renderer-loop-pause'
 
 import { $terminalTakeover } from '../store'
@@ -22,11 +23,12 @@ const SLOT_CLASS = 'relative flex min-h-0 min-w-0 flex-1 flex-col'
 
 export function TerminalSlot({ className = SLOT_CLASS }: { className?: string }) {
   const ref = useRef<HTMLDivElement | null>(null)
+  const paneVisible = usePaneVisible()
 
   useEffect(() => {
     const el = ref.current
 
-    if (!el) {
+    if (!el || !paneVisible) {
       return
     }
 
@@ -37,7 +39,7 @@ export function TerminalSlot({ className = SLOT_CLASS }: { className?: string })
         $slot.set(null)
       }
     }
-  }, [])
+  }, [paneVisible])
 
   return <div className={className} ref={ref} />
 }
@@ -215,8 +217,8 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
   // booting xterm/node-pty at 0×0 starts the shell at 80×24 and spawns a visible
   // conhost on Windows. After that `mounted` latches: shells persist while hidden.
   return (
-    <div aria-hidden={!visible} style={style}>
-      {mounted && <TerminalWorkspace onAddSelectionToChat={onAddSelectionToChat} />}
+    <div aria-hidden={!visible} data-persistent-terminal="" style={style}>
+      {mounted && <TerminalWorkspace onAddSelectionToChat={onAddSelectionToChat} surfaceVisible={visible} />}
     </div>
   )
 }

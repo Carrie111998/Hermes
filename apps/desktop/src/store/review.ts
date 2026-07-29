@@ -9,6 +9,7 @@ import { desktopGit } from '@/lib/desktop-git'
 import { isExcludedPath } from '@/lib/excluded-paths'
 import { requestOneShot } from '@/lib/oneshot'
 import { Codecs, persistentAtom } from '@/lib/persisted'
+import { requestRightPanelPane } from '@/store/right-panel'
 
 import { refreshRepoStatus } from './coding-status'
 import { $busy, $currentCwd } from './session'
@@ -248,6 +249,7 @@ function refreshShipInfoIfStale(): void {
 
 export function openReview(): void {
   $reviewOpen.set(true)
+  requestRightPanelPane('review')
   void refreshReview()
   void refreshShipInfo()
 }
@@ -255,6 +257,12 @@ export function openReview(): void {
 export function closeReview(): void {
   $reviewOpen.set(false)
   clearReviewSelection()
+}
+
+/** Hide the top-level Review function without discarding the selected file or
+ * diff. Reopening the right-panel tab resumes the same review context. */
+export function hideReviewPane(): void {
+  $reviewOpen.set(false)
 }
 
 export function toggleReview(): void {

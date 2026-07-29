@@ -31,7 +31,6 @@ import {
   useLinkTitle
 } from '@/lib/external-link'
 import { ChevronDown, ChevronRight, FileImage, FileText, FolderOpen, Link2, Loader2, RefreshCw } from '@/lib/icons'
-import { downloadGatewayMediaFile, isRemoteGateway } from '@/lib/media'
 import { normalize } from '@/lib/text'
 import { fmtDayTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
@@ -57,7 +56,9 @@ import {
   collectArtifactsForSession,
   preferredArtifactProjectId
 } from './artifact-utils'
+import { openArtifactRecordInPreview } from './open-artifact'
 import { openArtifactsPane } from './pane-state'
+import { enterArtifactProject } from './project-context'
 
 function formatArtifactTime(timestamp: number): string {
   return fmtDayTime.format(new Date(timestamp))
@@ -101,7 +102,7 @@ function paginationItems(page: number, pageCount: number): Array<number | 'ellip
 }
 
 type CellCtx = {
-  onOpen: (href: string) => void | Promise<void>
+  onOpen: (artifact: ArtifactRecord) => void | Promise<void>
   onOpenChat: (sessionId: string) => void
 }
 
@@ -284,8 +285,9 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   const setSelectedProject = useCallback(
     (projectId: string) => {
       const params = new URLSearchParams(location.search)
+      const enteredProject = enterArtifactProject(projectId, projectTree)
 
-      if (projectId === preferredProject) {
+      if (enteredProject || projectId === preferredProject) {
         params.delete('project')
       } else {
         params.set('project', projectId)
@@ -300,7 +302,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
         { replace: true }
       )
     },
-    [location.hash, location.pathname, location.search, navigate, preferredProject]
+    [location.hash, location.pathname, location.search, navigate, preferredProject, projectTree]
   )
 
   useRefreshHotkey(projectArtifacts.refresh)
@@ -395,23 +397,9 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   const refreshing = !allProjects && artifacts === null
 
   const openArtifact = useCallback(
-    async (href: string) => {
+    async (artifact: ArtifactRecord) => {
       try {
-        // A gateway-local file resolves to file:// in remote mode (the file
-        // lives on the gateway, not this disk). Opening that locally fails —
-        // and an OAuth remote connection has no query token to build a download
-        // URL. Fetch the bytes over the authenticated fs bridge instead.
-        if (isRemoteGateway() && /^file:/i.test(href)) {
-          await downloadGatewayMediaFile(href)
-
-          return
-        }
-
-        if (window.hermesDesktop?.openExternal) {
-          await window.hermesDesktop.openExternal(href)
-        } else {
-          window.open(href, '_blank', 'noopener,noreferrer')
-        }
+        await openArtifactRecordInPreview(artifact, $currentCwd.get())
       } catch (err) {
         notifyError(err, a.openFailed)
       }
@@ -536,6 +524,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
                         failedImage={failedImageIds.has(artifact.id)}
                         key={artifact.id}
                         onImageError={markImageFailed}
+                        onOpen={() => openArtifact(artifact)}
                         onOpenChat={sessionId => openSession(sessionId, navigate)}
                       />
                     ))}
@@ -590,7 +579,7 @@ function AllProjectsArtifacts({
   query
 }: {
   filter: ArtifactFilter
-  onOpenArtifact: (href: string) => void | Promise<void>
+  onOpenArtifact: (artifact: ArtifactRecord) => void | Promise<void>
   onOpenChat: (sessionId: string) => void
   onOpenProject: (projectId: string) => void
   projects: readonly SidebarProjectTree[]
@@ -638,7 +627,7 @@ function ProjectArtifactGroup({
   query
 }: {
   filter: ArtifactFilter
-  onOpenArtifact: (href: string) => void | Promise<void>
+  onOpenArtifact: (artifact: ArtifactRecord) => void | Promise<void>
   onOpenChat: (sessionId: string) => void
   onOpenProject: (projectId: string) => void
   project: SidebarProjectTree
@@ -706,7 +695,7 @@ function ProjectArtifactGroup({
                   <div className="flex items-center gap-1 hover:bg-(--ui-control-hover-background)" key={artifact.id}>
                     <button
                       className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left"
-                      onClick={() => void onOpenArtifact(artifact.href)}
+                      onClick={() => void onOpenArtifact(artifact)}
                       type="button"
                     >
                       <Icon className="size-3.5 shrink-0 text-(--ui-text-tertiary)" />
@@ -804,10 +793,11 @@ interface ArtifactImageCardProps {
   artifact: ArtifactRecord
   failedImage: boolean
   onImageError: (id: string) => void
+  onOpen: () => void | Promise<void>
   onOpenChat: (sessionId: string) => void
 }
 
-function ArtifactImageCard({ artifact, failedImage, onImageError, onOpenChat }: ArtifactImageCardProps) {
+function ArtifactImageCard({ artifact, failedImage, onImageError, onOpen, onOpenChat }: ArtifactImageCardProps) {
   const { t } = useI18n()
   const a = t.artifacts
   const kindLabel = artifact.kind === 'image' ? a.kindImage : artifact.kind === 'file' ? a.kindFile : a.kindLink
@@ -873,6 +863,10 @@ function ArtifactImageCard({ artifact, failedImage, onImageError, onOpenChat }: 
         </div>
 
         <div className="flex flex-wrap gap-1.5">
+          <Button onClick={() => void onOpen()} size="xs" type="button" variant="textStrong">
+            <ExternalLinkIcon />
+            {t.artifactCard.open}
+          </Button>
           <Button onClick={() => onOpenChat(artifact.sessionId)} size="xs" type="button" variant="textStrong">
             <FolderOpen className="size-3" />
             {a.chat}
@@ -928,11 +922,7 @@ const PrimaryCell = memo(function PrimaryCell({ artifact, ctx }: { artifact: Art
   const label = isLink ? fetchedTitle || urlSlugTitleLabel(artifact.href) : artifact.label
 
   return (
-    <ArtifactCellAction
-      href={isLink ? artifact.href : undefined}
-      onClick={isLink ? undefined : () => void ctx.onOpen(artifact.href)}
-      title={label}
-    >
+    <ArtifactCellAction onClick={() => void ctx.onOpen(artifact)} title={label}>
       <span className="mt-0.5 grid size-6 shrink-0 place-items-center self-start rounded-md bg-(--ui-bg-tertiary) text-(--ui-text-tertiary)">
         <Icon className="size-3.5" />
       </span>

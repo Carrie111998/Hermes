@@ -23,6 +23,7 @@ import {
   closeRightRail,
   closeRightRailTab,
   closeRightRailTabsToRight,
+  hidePreviewPane,
   type PreviewTarget
 } from '@/store/preview'
 import { $dirtyPreviewUrls } from '@/store/preview-edit'
@@ -147,7 +148,7 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
         <button
           aria-label={t.preview.closePane}
           className="mr-1.5 grid size-6 shrink-0 self-center place-items-center rounded-md text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring group-hover/rail-tabs:opacity-100 [-webkit-app-region:no-drag]"
-          onClick={closeRightRail}
+          onClick={hidePreviewPane}
           type="button"
         >
           <Codicon name="close" size="0.75rem" />

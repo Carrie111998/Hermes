@@ -5,6 +5,7 @@ import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { matchesQuery } from '@/hooks/use-media-query'
 import { Codecs, persistentAtom } from '@/lib/persisted'
 import { arraysEqual, insertUniqueId, readKey } from '@/lib/storage'
+import { requestRightPanelPane } from '@/store/right-panel'
 
 import { $paneStates, ensurePaneRegistered, setPaneOpen, setPaneWidthOverride, togglePane } from './panes'
 
@@ -279,6 +280,11 @@ export function toggleFileBrowserOpen() {
 
 export function setFileBrowserOpen(open: boolean) {
   setPaneOpen(FILE_BROWSER_PANE_ID, open)
+
+  if (open) {
+    requestRightPanelPane('files')
+  }
+
   revealNarrowPane(FILE_BROWSER_PANE_ID, open ? 'open' : 'close')
 }
 
