@@ -2583,6 +2583,7 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                agent.session_api_calls += 1
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -3157,7 +3158,6 @@ def run_conversation(
                     agent.session_prompt_tokens += prompt_tokens
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
-                    agent.session_api_calls += 1
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens

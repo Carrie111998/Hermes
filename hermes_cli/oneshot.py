@@ -151,6 +151,7 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
             "session_id": result.get("session_id"),
             "completed": result.get("completed"),
             "failed": bool(result.get("failed")) or failure is not None,
+            "partial": bool(result.get("partial")),
             # Billing-audit field: the service tier this run REQUESTED via
             # request_overrides.extra_body (e.g. OpenAI "flex"). None when
             # unset. Lets batch pipelines verify the tier they think they're
@@ -190,13 +191,6 @@ def run_oneshot(
 
     Returns the exit code.  The caller owns process termination.
     """
-    # Silence every stdlib logger for the duration.  AIAgent, tools, and
-    # provider adapters all log to stderr through the root logger; file
-    # handlers added by setup_logging() keep working (they're attached to
-    # the root logger's handler list, not affected by level), but no
-    # bytes reach the terminal.
-    logging.disable(logging.CRITICAL)
-
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
     # not host it), and silently picking the provider's catalog default hides
@@ -276,6 +270,13 @@ def run_oneshot(
         return 1
 
     _write_usage_file(usage_file, result)
+
+    if result.get("partial"):
+        real_stderr.write(
+            "hermes -z: incomplete model response; treating the run as failed.\n"
+        )
+        real_stderr.flush()
+        return 2
 
     if response:
         real_stdout.write(response)

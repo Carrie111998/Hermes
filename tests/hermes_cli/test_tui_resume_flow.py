@@ -1,4 +1,5 @@
 from argparse import Namespace
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -1411,6 +1412,47 @@ def test_oneshot_prints_nonempty_final_response(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.out == "done\n"
     assert captured.err == ""
+
+
+def test_oneshot_partial_response_fails_closed(monkeypatch, capsys):
+    _stub_plugin_discovery(monkeypatch)
+    import hermes_cli.oneshot as oneshot_mod
+
+    monkeypatch.setattr(
+        oneshot_mod,
+        "_run_agent",
+        lambda *_args, **_kwargs: ("unfinished answer", {"partial": True}),
+    )
+
+    assert oneshot_mod.run_oneshot("hello") == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "incomplete model response" in captured.err
+
+
+def test_oneshot_keeps_file_logging_enabled(monkeypatch, tmp_path):
+    _stub_plugin_discovery(monkeypatch)
+    import hermes_cli.oneshot as oneshot_mod
+
+    log_path = tmp_path / "oneshot.log"
+    logger = logging.getLogger("test.oneshot.file")
+    handler = logging.FileHandler(log_path)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    def fake_run(*_args, **_kwargs):
+        logger.info("provider request sent")
+        return "done", {}
+
+    monkeypatch.setattr(oneshot_mod, "_run_agent", fake_run)
+    try:
+        assert oneshot_mod.run_oneshot("hello") == 0
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+    assert "provider request sent" in log_path.read_text()
 
 
 def test_oneshot_fails_closed_on_agent_exception(monkeypatch, capsys):

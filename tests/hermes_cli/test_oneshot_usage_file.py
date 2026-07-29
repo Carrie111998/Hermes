@@ -22,6 +22,7 @@ def _result(**overrides):
         "session_id": "abc123",
         "completed": True,
         "failed": False,
+        "partial": False,
     }
     base.update(overrides)
     return base
@@ -63,7 +64,9 @@ class TestWriteUsageFile:
         # Root-owned path — the write must be swallowed, not raised.
         _write_usage_file("/proc/definitely/not/writable/usage.json", _result())
 
-    def test_result_failed_flag_carries_through(self, tmp_path):
+    def test_result_status_flags_carry_through(self, tmp_path):
         path = tmp_path / "usage.json"
-        _write_usage_file(str(path), _result(failed=True))
-        assert json.loads(path.read_text())["failed"] is True
+        _write_usage_file(str(path), _result(failed=True, partial=True))
+        report = json.loads(path.read_text())
+        assert report["failed"] is True
+        assert report["partial"] is True
