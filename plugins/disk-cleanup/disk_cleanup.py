@@ -579,23 +579,18 @@ _TEST_PATTERNS = ("test_", "tmp_")
 _TEST_SUFFIXES = (".test.py", ".test.js", ".test.ts", ".test.md")
 
 
-def _is_inside_git_checkout(path: Path, boundary: Path) -> bool:
-    """Return True when *path* belongs to a Git checkout under *boundary*.
+def _is_inside_git_checkout(path: Path) -> bool:
+    """Return True when *path* belongs to a Git checkout.
 
     Ordinary repositories use a ``.git/`` directory; linked worktrees use a
     ``.git`` file. Both are durable source and must never be auto-cleaned.
     """
     current = path if path.is_dir() else path.parent
-    boundary = boundary.resolve()
-    try:
-        current.resolve().relative_to(boundary)
-    except (ValueError, OSError):
-        return False
 
     while True:
         if (current / ".git").exists():
             return True
-        if current == boundary or current.parent == current:
+        if current.parent == current:
             return False
         current = current.parent
 
@@ -606,6 +601,8 @@ def guess_category(path: Path) -> Optional[str]:
     Used by the ``post_tool_call`` hook to auto-track ephemeral files.
     """
     if not is_safe_path(path):
+        return None
+    if _is_inside_git_checkout(path.resolve()):
         return None
 
     # Skip the state dir itself, logs, memory files, sessions, config.
@@ -635,8 +632,6 @@ def guess_category(path: Path) -> Optional[str]:
             return None
         if top == "cache":
             return "temp"
-        if _is_inside_git_checkout(path.resolve(), hermes_home):
-            return None
     except ValueError:
         # Path isn't under HERMES_HOME (e.g. /tmp/hermes-*) — fall through.
         pass
