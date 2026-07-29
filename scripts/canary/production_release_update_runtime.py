@@ -2103,7 +2103,6 @@ def _execute_update_locked(
 
     state = load_state(intent=intent, events=journal.load())
     if state.terminal_phase is not None:
-        _verify_terminal_state(state, actions=actions)
         return state
     if state.next_rollback_phase is not None:
         try:
@@ -2270,7 +2269,6 @@ def _recover_update_locked(
 
     state = load_state(intent=intent, events=journal.load())
     if state.terminal_phase is not None:
-        _verify_terminal_state(state, actions=actions)
         return state
     if state.next_abort_phase is not None:
         try:
@@ -2356,11 +2354,19 @@ def _run_with_lock(
     try:
         with context:
             runner = _recover_update_locked if recover else _execute_update_locked
-            return runner(
+            state = runner(
                 intent=record["intent"],
                 actions=actions,
                 journal=journal,
             )
+            # Every successful public execution/recovery return proves current
+            # terminal host state exactly once.  This includes a transaction
+            # that reached its terminal event during this invocation, not only
+            # a later exact replay.  Recovery coordinators may therefore retire
+            # the active marker immediately after this boundary returns while
+            # retaining the outer activation lock.
+            _verify_terminal_state(state, actions=actions)
+            return state
     except authority_lock.AuthorityActivationLockError as exc:
         raise ProductionReleaseUpdateRuntimeError(
             "release_update_runtime_lock_unavailable"

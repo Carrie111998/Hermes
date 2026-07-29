@@ -7,6 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 HOST_ACTIONS = ROOT / "scripts/canary/production_release_host_actions.py"
 UPDATE_RUNTIME = ROOT / "scripts/canary/production_release_update_runtime.py"
+RECOVERY_COORDINATOR = (
+    ROOT / "scripts/canary/production_release_update_recovery.py"
+)
 UPDATE_ENTRYPOINT = ROOT / "scripts/canary/production_release_update_entrypoint.py"
 BUILDER_ASSET_ROOT = ROOT / "ops/muncho/release-updater"
 BUILDER_UNIT = BUILDER_ASSET_ROOT / "muncho-release-builder@.service"
@@ -104,7 +107,7 @@ def test_builder_assets_have_no_systemd_activation_surface() -> None:
     assert activation_assets == []
 
 
-def test_production_update_has_no_entrypoint_or_runtime_caller() -> None:
+def test_production_update_has_only_the_reviewed_dormant_recovery_caller() -> None:
     assert not UPDATE_ENTRYPOINT.exists()
 
     callers: list[tuple[str, int, str]] = []
@@ -152,4 +155,55 @@ def test_production_update_has_no_entrypoint_or_runtime_caller() -> None:
                 if owner in module_aliases and node.func.attr in UPDATE_CALLS:
                     callers.append((str(relative), node.lineno, node.func.attr))
 
-    assert callers == []
+    assert sorted(
+        (path, name)
+        for path, _line, name in callers
+    ) == [
+        (
+            str(RECOVERY_COORDINATOR.relative_to(ROOT)),
+            "recover_update",
+        )
+    ]
+
+
+def test_recovery_coordinator_has_no_fresh_execution_or_activation_surface() -> None:
+    tree = ast.parse(
+        RECOVERY_COORDINATOR.read_text(encoding="utf-8"),
+        filename=str(RECOVERY_COORDINATOR),
+    )
+    forbidden_imports = {
+        "argparse",
+        "asyncio",
+        "subprocess",
+    }
+    forbidden_calls = {
+        "ReleaseUpdateJournal",
+        "active.create_or_replay_active_transaction",
+        "runtime.execute_update",
+    }
+    forbidden: list[tuple[int, str]] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == "main":
+                forbidden.append((node.lineno, "main"))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".", 1)[0] in forbidden_imports:
+                    forbidden.append((node.lineno, alias.name))
+        elif isinstance(node, ast.ImportFrom):
+            if (
+                node.module is not None
+                and node.module.split(".", 1)[0] in forbidden_imports
+            ):
+                forbidden.append((node.lineno, node.module))
+        elif isinstance(node, ast.Call):
+            target = _dotted_name(node.func)
+            if target in forbidden_calls:
+                forbidden.append((node.lineno, target))
+        elif isinstance(node, ast.If):
+            compared = ast.dump(node.test, include_attributes=False)
+            if "__name__" in compared and "__main__" in compared:
+                forbidden.append((node.lineno, "__main__"))
+
+    assert forbidden == []

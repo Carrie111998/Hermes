@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import lru_cache
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 from unittest.mock import patch
 
 import pytest
@@ -1149,11 +1149,12 @@ def test_precommit_failure_after_fence_rolls_back_exactly() -> None:
         *runtime.ROLLBACK_PHASES,
     ]
     assert runtime.COMMIT_PHASE not in _phases(journal)
-    assert actions.calls[-4:] == [
+    assert actions.calls[-5:] == [
         "target_stopped",
         "host_prestate_restored",
         "predecessor_consumers_restored",
         "rollback_validated",
+        "rolled_back_revalidated",
     ]
 
 
@@ -1241,6 +1242,7 @@ def test_boot_recovery_rolls_back_any_precommit_application_mutation() -> None:
         "host_prestate_restored",
         "predecessor_consumers_restored",
         "rollback_validated",
+        "rolled_back_revalidated",
     ]
 
 
@@ -1263,6 +1265,7 @@ def test_fresh_execute_cannot_resume_a_precommit_mutated_journal_forward() -> No
         "host_prestate_restored",
         "predecessor_consumers_restored",
         "rollback_validated",
+        "rolled_back_revalidated",
     ]
     assert runtime.COMMIT_PHASE not in _phases(journal)
 
@@ -1771,6 +1774,135 @@ def test_terminal_replay_detects_live_state_drift() -> None:
         )
 
 
+def test_new_forward_terminal_is_revalidated_before_successful_return() -> None:
+    journal = MemoryJournal()
+
+    with pytest.raises(
+        runtime.ProductionReleaseUpdateRuntimeError,
+        match="release_update_runtime_terminal_revalidation_failed",
+    ):
+        _execute(
+            actions=FakeActions(fail_always="completed_revalidated"),
+            journal=journal,
+        )
+
+    assert _phases(journal) == list(runtime.FORWARD_PHASES)
+    assert runtime.load_state(
+        intent=_intent(),
+        events=journal.load(),
+    ).terminal_phase == "completed"
+    snapshot = journal.load()
+    replay = FakeActions()
+    state = _recover(
+        actions=replay,
+        journal=journal,
+        now_unix=NOW + 1,
+    )
+    assert state.terminal_phase == "completed"
+    assert replay.calls == ["completed_revalidated"]
+    assert journal.load() == snapshot
+
+
+def test_new_rollback_terminal_is_revalidated_before_successful_return() -> None:
+    journal = _forward_prefix("host_payloads_applied")
+
+    with pytest.raises(
+        runtime.ProductionReleaseUpdateRuntimeError,
+        match="release_update_runtime_terminal_revalidation_failed",
+    ):
+        _recover(
+            actions=FakeActions(fail_always="rolled_back_revalidated"),
+            journal=journal,
+            now_unix=NOW + 1,
+        )
+
+    assert runtime.load_state(
+        intent=_intent(),
+        events=journal.load(),
+    ).terminal_phase == "rolled_back"
+    snapshot = journal.load()
+    replay = FakeActions()
+    state = _recover(
+        actions=replay,
+        journal=journal,
+        now_unix=NOW + 2,
+    )
+    assert state.terminal_phase == "rolled_back"
+    assert replay.calls == ["rolled_back_revalidated"]
+    assert journal.load() == snapshot
+
+
+def test_new_abort_terminal_is_revalidated_before_successful_return() -> None:
+    journal = MemoryJournal()
+
+    with pytest.raises(
+        runtime.ProductionReleaseUpdateRuntimeError,
+        match="release_update_runtime_terminal_revalidation_failed",
+    ):
+        _execute(
+            actions=FakeActions(fail_always="aborted_revalidated"),
+            journal=journal,
+            now_unix=int(_intent()["approval_expires_at_unix"]),
+        )
+
+    assert _phases(journal) == list(runtime.ABORT_PHASES)
+    assert runtime.load_state(
+        intent=_intent(),
+        events=journal.load(),
+    ).terminal_phase == "aborted"
+    snapshot = journal.load()
+    replay = FakeActions()
+    state = _recover(
+        actions=replay,
+        journal=journal,
+        now_unix=int(_intent()["approval_expires_at_unix"]) + 1,
+    )
+    assert state.terminal_phase == "aborted"
+    assert replay.calls == ["aborted_revalidated"]
+    assert journal.load() == snapshot
+
+
+def test_new_terminal_revalidation_occurs_once_inside_runtime_lock() -> None:
+    held = {"value": False}
+
+    @contextmanager
+    def lock() -> Iterator[None]:
+        assert held["value"] is False
+        held["value"] = True
+        try:
+            yield
+        finally:
+            held["value"] = False
+
+    class LockProvingActions(FakeActions):
+        def perform(
+            self,
+            phase: str,
+            *,
+            intent: Mapping[str, Any],
+            receipts: Mapping[str, Mapping[str, Any]],
+        ) -> Mapping[str, Any]:
+            assert held["value"] is True
+            return super().perform(
+                phase,
+                intent=intent,
+                receipts=receipts,
+            )
+
+    actions = LockProvingActions()
+    with patch.object(runtime.time, "time", return_value=NOW):
+        state = runtime._execute_update_for_test(
+            authority_record=_authority_record(),
+            actions=actions,
+            journal=MemoryJournal(),
+            lock_factory=lambda: lock(),
+        )
+
+    assert state.terminal_phase == "completed"
+    assert held["value"] is False
+    assert actions.calls.count("completed_revalidated") == 1
+
+
 def test_self_rehashed_intent_cannot_escape_signed_authority() -> None:
     forged_intent = {
         **_intent(),
@@ -1892,7 +2024,10 @@ def test_expired_before_event_zero_aborts_without_application_mutation() -> None
 
     assert state.terminal_phase == "aborted"
     assert _phases(journal) == list(runtime.ABORT_PHASES)
-    assert actions.calls == ["preapplication_cleanup"]
+    assert actions.calls == [
+        "preapplication_cleanup",
+        "aborted_revalidated",
+    ]
     assert runtime.FIRST_APPLICATION_MUTATION_PHASE not in _phases(journal)
 
 
@@ -1919,7 +2054,10 @@ def test_expiry_after_recovery_gate_cleans_up_and_aborts() -> None:
         ],
         *runtime.ABORT_PHASES,
     ]
-    assert actions.calls[-1] == "preapplication_cleanup"
+    assert actions.calls[-2:] == [
+        "preapplication_cleanup",
+        "aborted_revalidated",
+    ]
     assert runtime.FIRST_APPLICATION_MUTATION_PHASE not in _phases(journal)
 
 
