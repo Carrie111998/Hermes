@@ -1088,6 +1088,55 @@ class TestServerRequestRouting:
         # Fail-closed: deny on callback exception
         assert ("r1", {"decision": "decline"}) in client.responses
 
+    def test_exec_approval_command_missing_does_not_raise(self):
+        """Phase 3E regression: when params omits 'command' key, callback path
+        must still receive a safe empty-string command and not NameError."""
+        client = FakeClient()
+        # Note: no command= argument — params will lack the 'command' key.
+        client.queue_server_request("item/commandExecution/requestApproval",
+                                    request_id="r1", cwd="/")
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        seen = {}
+
+        def cb(command, description, allow_permanent=False):
+            seen["command"] = command
+            seen["description"] = description
+            return "once"
+
+        s = make_session(client, approval_callback=cb)
+        s.run_turn("hi", turn_timeout=1.0)
+        assert ("r1", {"decision": "accept"}) in client.responses
+        # command is normalized to "" when absent
+        assert seen["command"] == ""
+
+    def test_exec_approval_command_non_string_does_not_raise(self):
+        """Phase 3E regression: when params['command'] is not a string
+        (e.g. list, dict, None), callback must still be invoked safely."""
+        client = FakeClient()
+        client.queue_server_request("item/commandExecution/requestApproval",
+                                    request_id="r1",
+                                    command=["ls", "-la"], cwd="/")
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        seen = {}
+
+        def cb(command, description, allow_permanent=False):
+            seen["command"] = command
+            return "once"
+
+        s = make_session(client, approval_callback=cb)
+        s.run_turn("hi", turn_timeout=1.0)
+        assert ("r1", {"decision": "accept"}) in client.responses
+        # Non-string command passed through unchanged to callback
+        assert seen["command"] == ["ls", "-la"]
+
 
 # ---- enriched approval prompts ----
 
