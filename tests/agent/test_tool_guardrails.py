@@ -359,6 +359,101 @@ def test_subagent_cap_counts_batch_task_spawns():
     assert decision.code == "loop_subagent_cap"
 
 
+def test_subagent_cap_blocks_batch_that_crosses_remaining_budget():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_subagents=3))
+    )
+    assert controller.before_call("delegate_task", {"goal": "first"}).action == "allow"
+
+    decision = controller.before_call(
+        "delegate_task",
+        {"tasks": [{"goal": "a"}, {"goal": "b"}, {"goal": "c"}]},
+    )
+
+    assert decision.action == "block"
+    assert decision.code == "loop_subagent_cap"
+    assert controller._turn_subagent_count == 1
+
+
+def test_subagent_cap_counts_json_string_batch_like_native_list():
+    tasks = [{"goal": "a"}, {"goal": "b"}, {"goal": "c"}]
+    decisions = []
+    for tasks_arg in (tasks, json.dumps(tasks)):
+        controller = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_subagents=2))
+        )
+        decisions.append(controller.before_call("delegate_task", {"tasks": tasks_arg}))
+        assert controller._turn_subagent_count == 0
+
+    assert [decision.action for decision in decisions] == ["block", "block"]
+    assert {decision.code for decision in decisions} == {"loop_subagent_cap"}
+
+
+def test_rejected_delegate_batch_releases_reserved_spawn_budget():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_subagents=5))
+    )
+    args = {"tasks": [{"goal": str(i)} for i in range(4)]}
+    assert controller.before_call("delegate_task", args).action == "allow"
+    assert controller._turn_subagent_count == 4
+
+    controller.after_call(
+        "delegate_task",
+        args,
+        json.dumps({"error": "Too many tasks: max_concurrent_children is 3."}),
+        failed=True,
+    )
+
+    assert controller._turn_subagent_count == 0
+    assert controller.before_call("delegate_task", {"goal": "valid"}).action == "allow"
+
+
+def test_invalid_delegate_arguments_do_not_consume_spawn_budget():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_subagents=1))
+    )
+    invalid_calls = (
+        {"tasks": '[{"goal": "broken"}'},
+        {"tasks": ""},
+        {"tasks": [{"context": "missing goal"}]},
+        {},
+    )
+    for args in invalid_calls:
+        assert controller.before_call("delegate_task", args).action == "allow"
+        controller.after_call(
+            "delegate_task",
+            args,
+            json.dumps({"error": "invalid delegation request"}),
+            failed=True,
+        )
+
+    assert controller._turn_subagent_count == 0
+    assert controller.before_call("delegate_task", {"goal": "valid"}).action == "allow"
+
+
+def test_failed_child_result_still_consumes_spawn_budget():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_subagents=1))
+    )
+    args = {"goal": "child fails"}
+    assert controller.before_call("delegate_task", args).action == "allow"
+    controller.after_call(
+        "delegate_task",
+        args,
+        json.dumps(
+            {
+                "results": [
+                    {"task_index": 0, "status": "error", "error": "child failed"}
+                ]
+            }
+        ),
+        failed=True,
+    )
+
+    assert controller._turn_subagent_count == 1
+    assert controller.before_call("delegate_task", {"goal": "next"}).action == "block"
+
+
 def test_subagent_cap_resets_each_turn():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_subagents=1))

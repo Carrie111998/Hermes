@@ -184,6 +184,46 @@ def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
     assert "different tool" in content
 
 
+def test_delegate_cap_releases_rejected_call_but_counts_failed_child_spawn():
+    agent = _make_agent(
+        "delegate_task",
+        config={
+            "tool_loop_guardrails": {
+                "loop_caps": {"max_subagents": 1},
+            }
+        },
+    )
+    messages = []
+
+    def run(args: dict, call_id: str) -> None:
+        msg = SimpleNamespace(
+            content="",
+            tool_calls=[_mock_tool_call("delegate_task", json.dumps(args), call_id)],
+        )
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    def fake_dispatch(args: dict) -> str:
+        if not args.get("goal"):
+            return json.dumps({"error": "Provide either goal or tasks."})
+        return json.dumps(
+            {
+                "results": [
+                    {"task_index": 0, "status": "error", "error": "child failed"}
+                ]
+            }
+        )
+
+    with patch.object(agent, "_dispatch_delegate_task", side_effect=fake_dispatch) as dispatch:
+        run({}, "invalid")
+        run({"goal": "spawned but failed"}, "spawned")
+        run({"goal": "must be blocked"}, "blocked")
+
+    assert dispatch.call_count == 2
+    assert "Provide either goal or tasks" in messages[0]["content"]
+    assert "child failed" in messages[1]["content"]
+    assert "loop_subagent_cap" in messages[2]["content"]
+
+
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
     agent = _make_agent("web_search", config=_hard_stop_config())
     blocked_args = {"query": "blocked"}
