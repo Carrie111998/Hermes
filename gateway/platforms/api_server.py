@@ -90,6 +90,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
@@ -4231,7 +4232,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
-                    agent.interrupt("SSE client disconnected")
+                    request_hard_interrupt(agent, "SSE client disconnected")
                 except Exception:
                     pass
             if not agent_task.done():
@@ -4810,7 +4811,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
-                    agent.interrupt("SSE client disconnected")
+                    request_hard_interrupt(agent, "SSE client disconnected")
                 except Exception:
                     pass
             if not agent_task.done():
@@ -4829,7 +4830,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
-                    agent.interrupt("SSE task cancelled")
+                    request_hard_interrupt(agent, "SSE task cancelled")
                 except Exception:
                     pass
             if not agent_task.done():
@@ -6650,7 +6651,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if agent is not None:
             try:
-                agent.interrupt("Stop requested via API")
+                request_hard_interrupt(agent, "Stop requested via API")
             except Exception:
                 pass
 

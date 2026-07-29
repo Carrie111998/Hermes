@@ -2688,8 +2688,10 @@ def _(rid, params: dict) -> dict:
     run_thread = session.get("_run_thread")
     run_thread_alive = run_thread is not None and run_thread.is_alive()
     should_interrupt = bool(session.get("running"))
-    if should_interrupt and hasattr(session["agent"], "interrupt"):
-        session["agent"].interrupt()
+    if should_interrupt:
+        from agent.interrupt_compat import request_hard_interrupt
+
+        request_hard_interrupt(session["agent"])
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None

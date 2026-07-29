@@ -861,7 +861,6 @@ class TestInvalidateRuntimeClient:
         reset_client_cache()
         assert invalidate_runtime_client("eu-west-1") is False
 
-
 class TestIsStaleConnectionError:
     """Classifier that decides whether an exception warrants client eviction."""
 
