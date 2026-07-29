@@ -2486,6 +2486,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(json.dumps({
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
+            "interrupted": res.interrupted,
             "timed_out": res.timed_out,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
@@ -2507,6 +2508,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
+    if res.interrupted:
+        print(f"Interrupted:  {len(res.interrupted)} (deploy/restart, requeued)")
+        print(f"  {', '.join(res.interrupted)}")
     print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")
@@ -2637,12 +2641,13 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
-            or res.spawned or res.auto_blocked or res.stale
+            or res.spawned or res.auto_blocked or res.stale or res.interrupted
         )
         if did_work:
             print(
                 f"[{_fmt_ts(int(time.time()))}] "
                 f"reclaimed={res.reclaimed} crashed={len(res.crashed)} "
+                f"interrupted={len(res.interrupted)} "
                 f"timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
                 f"auto_blocked={len(res.auto_blocked)}",
