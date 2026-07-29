@@ -7412,6 +7412,20 @@ def test_refresh_cannot_resurrect_a_lock_already_reclaimed(db, monkeypatch):
     assert current == "holder-b"
 
 
+def test_list_cron_job_runs_includes_reused_stable_session(db):
+    db.create_session("cron_job123", "cron")
+    db.append_message("cron_job123", "user", "stable tick")
+    db.create_session("cron_job123_20260707_120000", "cron")
+    db.append_message("cron_job123_20260707_120000", "user", "fresh tick")
+    db.create_session("cron_other", "cron")
+    db.append_message("cron_other", "user", "other tick")
+
+    runs = db.list_cron_job_runs("job123", limit=10)
+
+    ids = {run["id"] for run in runs}
+    assert ids == {"cron_job123", "cron_job123_20260707_120000"}
+
+
 # =========================================================================
 # compact_rows — lightweight column projection (issue #47414)
 # =========================================================================
@@ -7809,9 +7823,6 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
-
-
-
 class TestGatewayRoutingPkHeal:
     """Legacy gateway_routing tables (session_key-only PK) get rebuilt on open.
 
