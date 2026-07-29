@@ -18,6 +18,11 @@ export function sessionMatchesSearch(session: SessionInfo, query: string): boole
     session.preview ?? '',
     session.cwd ?? '',
     session.git_branch ?? '',
+    session.channel_origin?.display_name ?? '',
+    session.channel_origin?.chat_name ?? '',
+    session.channel_origin?.chat_topic ?? '',
+    session.channel_origin?.chat_type ?? '',
+    session.channel_origin?.platform ?? '',
     ...sessionSourceSearchTerms(session.source)
   ].some(value => value.toLowerCase().includes(needle))
 }

@@ -185,3 +185,45 @@ describe('SidebarSessionRow', () => {
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
   })
 })
+
+describe('SidebarSessionRow shared-channel origin', () => {
+  const renderRow = (session: SessionInfo) =>
+    render(
+      <SidebarSessionRow
+        isPinned={false}
+        isSelected={false}
+        isWorking={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={noop}
+        session={session}
+      />
+    )
+
+  it('renders safe shared-channel origin labels below the title', () => {
+    renderRow(
+      makeSession({
+        channel_origin: {
+          chat_name: 'Build Room',
+          chat_topic: 'Release coordination',
+          chat_type: 'channel',
+          display_name: 'Build Room',
+          has_thread: true,
+          platform: 'webhook'
+        },
+        title: 'Shared channel session'
+      })
+    )
+
+    expect(screen.getByText('Shared channel session')).toBeTruthy()
+    expect(screen.getByText('Build Room · Release coordination')).toBeTruthy()
+  })
+
+  it('keeps ordinary sessions to the title-only row', () => {
+    renderRow(makeSession({ channel_origin: null, title: 'Shared channel session' }))
+
+    expect(screen.getByText('Shared channel session')).toBeTruthy()
+    expect(screen.queryByText(/Build Room/)).toBeNull()
+  })
+})

@@ -22,6 +22,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { sessionChannelOriginLabel } from '@/lib/session-channel-origin'
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
@@ -99,7 +100,7 @@ interface ChatHeaderProps {
   selectedSessionId: null | string
 }
 
-function ChatHeader({
+export function ChatHeader({
   activeSessionId,
   isRoutedSessionView,
   onDeleteSelectedSession,
@@ -114,6 +115,7 @@ function ChatHeader({
     (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New session'
+  const channelLabel = activeStoredSession ? sessionChannelOriginLabel(activeStoredSession.channel_origin) : null
 
   // Which agent/persona owns this chat — glanceable in the header once a
   // second profile exists, so the open session's ownership is never ambiguous
@@ -155,7 +157,18 @@ function ChatHeader({
           sideOffset={8}
           title={title}
         >
-          <TitleMenuTrigger>{title}</TitleMenuTrigger>
+          <TitleMenuTrigger className={channelLabel ? 'h-8 items-center' : undefined}>
+            {channelLabel ? (
+              <span className="block whitespace-normal text-left">
+                <span className="block truncate text-[0.75rem] font-medium leading-none">{title}</span>
+                <span className="mt-0.5 block truncate text-[0.625rem] font-normal leading-none text-(--ui-text-tertiary)">
+                  {channelLabel}
+                </span>
+              </span>
+            ) : (
+              title
+            )}
+          </TitleMenuTrigger>
         </SessionActionsMenu>
       </div>
     </header>
