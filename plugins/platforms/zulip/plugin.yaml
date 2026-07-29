@@ -1,0 +1,28 @@
+name: zulip-platform
+label: Zulip
+kind: platform
+version: 1.0.0
+description: Minimal Zulip inbound adapter treating every non-bot stream message in the workspace as a direct instruction (with optional @Hermes mention stripping).
+author: Nous Research
+requires_env:
+  - name: ZULIP_URL
+    description: Zulip organization URL
+    prompt: Zulip URL
+    password: false
+  - name: ZULIP_BOT_EMAIL
+    description: Hermes Zulip bot email
+    prompt: Zulip bot email
+    password: false
+  - name: ZULIP_API_KEY
+    description: Hermes Zulip bot API key
+    prompt: Zulip bot API key
+    password: true
+optional_env:
+  - name: ZULIP_ALLOWED_USERS
+    description: Comma-separated Zulip user IDs authorized to command Hermes
+    prompt: Allowed Zulip user IDs
+    password: false
+  - name: ZULIP_ALLOW_ALL_USERS
+    description: Allow all Zulip users to command Hermes
+    prompt: Allow all Zulip users? (true/false)
+    password: false
