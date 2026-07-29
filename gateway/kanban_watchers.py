@@ -1435,23 +1435,42 @@ class GatewayKanbanWatchersMixin:
                 _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                 if _ad_enabled:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):
+                    missing_exit_signal_count = 0
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
-                        # Quiet by default — only log when something actually
-                        # happened, so an idle gateway stays silent.
+                    if res is not None and getattr(res, "missing_exit_signal", []):
+                        missing_exit_signal_count = len(res.missing_exit_signal)
+                        any_spawned = True
+                    if any_spawned and missing_exit_signal_count:
                         logger.info(
                             "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                            "crashed=%d timed_out=%d promoted=%d "
+                            "auto_blocked=%d missing_exit_signal=%d",
+                            slug,
+                            len(res.spawned) if res is not None else 0,
+                            getattr(res, "reclaimed", 0) if res is not None else 0,
+                            len(getattr(res, "crashed", [])) if res is not None else 0,
+                            len(getattr(res, "timed_out", [])) if res is not None else 0,
+                            getattr(res, "promoted", 0) if res is not None else 0,
+                            len(getattr(res, "auto_blocked", [])) if res is not None else 0,
+                            missing_exit_signal_count,
+                        )
+                    elif any_spawned:
+                        logger.info(
+                            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+                            "crashed=%d timed_out=%d promoted=%d "
+                            "auto_blocked=%d",
                             slug,
                             len(res.spawned),
-                            res.reclaimed,
-                            len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                            len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                            res.promoted,
-                            len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                            getattr(res, "reclaimed", 0),
+                            len(getattr(res, "crashed", [])),
+                            len(getattr(res, "timed_out", [])),
+                            getattr(res, "promoted", 0),
+                            len(getattr(res, "auto_blocked", [])),
                         )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
