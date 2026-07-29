@@ -68,6 +68,17 @@ class TestBuildLocalTranscribeKwargs:
         assert kwargs["language"] == "en"
         assert kwargs["initial_prompt"] == "Hermes glossary"
 
+    def test_thresholds_configurable_in_transcribe(self):
+        cfg = {
+            "local": {
+                "no_speech_prob_threshold": 0.8,
+                "logprob_threshold": -2.0,
+            }
+        }
+        kwargs = build_local_transcribe_kwargs(cfg)
+        assert kwargs["no_speech_threshold"] == 0.8
+        assert kwargs["log_prob_threshold"] == -2.0
+
 
 class TestConfidenceGate:
     def test_high_no_speech_and_low_logprob_dropped(self):
