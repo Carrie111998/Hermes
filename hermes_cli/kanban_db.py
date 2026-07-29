@@ -2669,7 +2669,13 @@ def _canonicalize_product_ai_provenance(
         # runs have recorded the same facts at the metadata root instead, in
         # more than one shape, so canonicalize them here rather than relying
         # on the worker to author the right keys.
-        verdict, reviewed_branch, reviewed_commit = _reviewer_evidence(canonical)
+        pinned_review_head = ""
+        if run is not None and isinstance(run.metadata, dict):
+            pinned_review_head = str(run.metadata.get("review_head_sha") or "").strip()
+        evidence_metadata = dict(canonical)
+        if pinned_review_head:
+            evidence_metadata["review_head_sha"] = pinned_review_head
+        verdict, reviewed_branch, reviewed_commit = _reviewer_evidence(evidence_metadata)
         reviewer_facts = provenance.get("reviewer")
         reviewer_facts = dict(reviewer_facts) if isinstance(reviewer_facts, dict) else {}
         for key, value in (
@@ -2677,7 +2683,10 @@ def _canonicalize_product_ai_provenance(
             ("reviewed_branch", reviewed_branch),
             ("reviewed_commit", reviewed_commit),
         ):
-            if value and not str(reviewer_facts.get(key) or "").strip():
+            if value and (
+                (key == "reviewed_commit" and pinned_review_head)
+                or not str(reviewer_facts.get(key) or "").strip()
+            ):
                 reviewer_facts[key] = value
         if reviewer_facts:
             provenance["reviewer"] = reviewer_facts
@@ -13034,6 +13043,8 @@ def _reviewer_evidence(metadata: dict) -> tuple[str, str, str]:
 
     return (
         _first(reviewer.get("verdict"), metadata.get("verdict"), workflow.get("verdict")),
+        # Branch has no dispatcher-pinned source; release cross-checks this
+        # worker-authored chain against the branch it is actually releasing.
         _first(
             reviewer.get("reviewed_branch"),
             metadata.get("reviewed_branch"),
@@ -13041,9 +13052,9 @@ def _reviewer_evidence(metadata: dict) -> tuple[str, str, str]:
             candidate.get("branch"),
         ),
         _first(
+            metadata.get("review_head_sha"),
             reviewer.get("reviewed_commit"),
             metadata.get("reviewed_commit"),
-            metadata.get("review_head_sha"),
             candidate.get("head_sha"),
         ),
     )

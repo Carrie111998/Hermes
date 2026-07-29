@@ -97,6 +97,27 @@ def test_manifest_declares_only_pre_tool_call():
     assert "post_tool_call" not in manifest
 
 
+def test_worker_profile_uses_root_project_registry(governed_workspace, monkeypatch):
+    mod = _load_plugin()
+    profile_home = governed_workspace["home"] / "profiles" / "developer"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+    target = governed_workspace["repo"] / "README.md"
+
+    governance = mod._governance(target)
+    assert governance is not None
+    assert governance["project_id"] == governed_workspace["project_id"]
+    assert mod._validate_worker(
+        governed_workspace["task_id"],
+        [target],
+        [governance],
+        tool_name="write_file",
+        args={"path": str(target), "content": "changed\n"},
+        ambiguous_targets=False,
+    ) is None
+
+
 def test_reads_are_always_allowed(governed_workspace):
     mod = _load_plugin()
     repo = governed_workspace["repo"]
@@ -1070,6 +1091,105 @@ def test_worker_privileged_git_and_deploy_actions_are_blocked(
         "terminal", {"command": command, "workdir": str(governed_workspace["repo"])}
     )
     assert decision["action"] == "block"
+
+
+def _install_verification_runner_stubs(governed_workspace, monkeypatch) -> None:
+    runner_bin = governed_workspace["home"] / "runner-bin"
+    runner_bin.mkdir()
+    for executable in {"make", "npm", "npx", "pytest", "python3", "vitest"}:
+        stub = runner_bin / executable
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH",
+        f"{runner_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "npm test",
+        "npm run test",
+        "npm run build",
+        "npm run typecheck",
+        "npm run lint",
+        "npx vitest run tests",
+        "vitest run tests",
+        "pytest tests",
+        "python3 -m unittest discover -s tests",
+        "python3 -m pytest tests",
+        "make test",
+    ],
+)
+def test_worker_verification_command_shapes_are_allowed(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    _install_verification_runner_stubs(governed_workspace, monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    assert mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "node --require=/tmp/escape.js --test",
+        "node scripts/escape.js",
+        "python3 scripts/escape.py",
+        "npm run arbitrary",
+        "npx vitest --require=/tmp/escape.js run tests",
+        "vitest --loader /tmp/escape.js run tests",
+        "pytest --import=/tmp/escape.py tests",
+        "python3 -m pytest -p escape tests",
+        "npm --node-options=/tmp/escape.js test",
+    ],
+)
+def test_worker_general_code_execution_shapes_are_blocked(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    _install_verification_runner_stubs(governed_workspace, monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    )
+
+    assert decision is not None and decision["action"] == "block"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "npx vitest run {outside}",
+        "vitest run {outside}",
+        "pytest {outside}",
+        "python3 -m unittest {outside}",
+        "python3 -m pytest {outside}",
+    ],
+)
+def test_worker_verification_target_outside_workspace_is_blocked(
+    governed_workspace, monkeypatch, command
+):
+    mod = _load_plugin()
+    _install_verification_runner_stubs(governed_workspace, monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": command.format(outside=governed_workspace["outside"]),
+            "workdir": str(governed_workspace["repo"]),
+        },
+    )
+
+    assert decision is not None and decision["action"] == "block"
 
 
 @pytest.mark.parametrize("command", [
