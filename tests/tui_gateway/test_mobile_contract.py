@@ -4,8 +4,8 @@ import threading
 
 import pytest
 
-from tui_gateway import mobile_contract
-from tui_gateway import server
+from tui_gateway import mobile_contract, server
+from tui_gateway.mobile_contract import gateway_ready_payload
 
 
 class RecordingTransport:
@@ -19,6 +19,15 @@ class RecordingTransport:
 
     def close(self):
         pass
+
+
+def test_gateway_ready_payload_preserves_change_event_capability():
+    skin = {"name": "default", "colors": {}}
+
+    payload = gateway_ready_payload(skin=skin)
+
+    assert payload["skin"] == skin
+    assert payload["change_events"] is True
 
 
 def _mobile_authorization(*scopes):
