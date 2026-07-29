@@ -355,6 +355,12 @@ def _prompt_plugin_env_vars(manifest: dict, console) -> None:
     if not missing:
         return
 
+    if not sys.stdin.isatty():
+        # Scripted/CI enable: don't block on prompts for secrets.
+        names = ", ".join(s["name"] for s in missing)
+        console.print(f"[dim]Set {names} in {display_hermes_home()}/.env to activate.[/dim]")
+        return
+
     plugin_name = manifest.get("name", "this plugin")
     console.print(f"\n[bold]{plugin_name}[/bold] requires the following environment variables:\n")
 
@@ -955,6 +961,10 @@ def _resolve_tool_override_grant(
     ``allow_tool_override`` tri-state: True grants, False declines, None
     prompts interactively (defaulting to deny on a non-interactive stdin).
     """
+    if allow_tool_override is None and not sys.stdin.isatty():
+        # Scripted/CI enable: never block on a prompt; deny by default (the
+        # decline branch below prints how to grant it later).
+        allow_tool_override = False
     if allow_tool_override is None:
         # Interactive consent. Default to NO so a blind Enter doesn't grant
         # a privileged capability, and a non-interactive stdin denies safely.

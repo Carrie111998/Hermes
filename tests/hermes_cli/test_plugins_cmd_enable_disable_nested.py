@@ -298,7 +298,9 @@ class TestEnableToolOverrideConsent:
         mock_user.return_value = nested_plugin_env
         mock_bundled.return_value = nested_plugin_env / "nonexistent"
 
-        with patch("rich.console.Console.input", return_value="y"):
+        # The consent prompt is TTY-gated; simulate an interactive stdin.
+        with patch("sys.stdin.isatty", return_value=True), \
+                patch("rich.console.Console.input", return_value="y"):
             cmd_enable("disk-cleanup")  # no flag -> prompt
 
         mock_set_flag.assert_called_once_with(
