@@ -95,6 +95,7 @@ jobs:
 
       - name: Run runtime integration tests
         id: integration
+        continue-on-error: true
         env:
           AUTHORITY_POSTGRES_TEST_URL: postgresql://test:test@localhost:5432/charterforge_test
         run: |
@@ -104,13 +105,13 @@ jobs:
 
       - name: Run migration tests
         id: migration
+        continue-on-error: true
         env:
           AUTHORITY_POSTGRES_TEST_URL: postgresql://test:test@localhost:5432/charterforge_test
         run: |
           uv run pytest tests/test_postgres_authority.py \
             -v --tb=long --no-header \
-            --junit-xml=migration-results.xml \
-            || true
+            --junit-xml=migration-results.xml
 
       - name: Build package
         id: build

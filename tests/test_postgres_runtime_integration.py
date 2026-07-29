@@ -45,7 +45,11 @@ def pg_env(monkeypatch):
     conn.commit()
     conn.close()
 
-    modified_url = f"{POSTGRES_URL} options=-csearch_path={schema_name}"
+    if POSTGRES_URL.startswith("postgresql://") or POSTGRES_URL.startswith("postgres://"):
+        sep = "&" if "?" in POSTGRES_URL else "?"
+        modified_url = f"{POSTGRES_URL}{sep}options=-csearch_path%3D{schema_name}"
+    else:
+        modified_url = f"{POSTGRES_URL} options=-csearch_path={schema_name}"
     monkeypatch.setenv("AUTHORITY_POSTGRES_URL", modified_url)
     monkeypatch.delenv("HERMES_TENANT_ID", raising=False)
 
