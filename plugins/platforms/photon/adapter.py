@@ -885,9 +885,9 @@ class PhotonAdapter(BasePlatformAdapter):
             # arrives while that turn is active and the gateway sends a bogus
             # "Interrupting current task" busy ack. Drop placeholder-only text
             # at the platform boundary; the real media event carries the bytes.
-            if raw_text.strip() == "\ufffc":
-                logger.debug("[photon] ignoring iMessage object-placeholder text event")
-                return
+            # Placeholder-only text is handled just below: create a short-lived
+            # pending entry so a following attachment can cancel the timeout.
+            # Do not return here or the timeout/correlation state is skipped.
         if ctype == "reaction":
             # Route only tapbacks on messages WE sent — those are implicitly
             # addressed to the bot (feishu precedent: synthetic text event).
