@@ -26,6 +26,44 @@ from providers.base import ProviderProfile
 class VertexProfile(ProviderProfile):
     """Vertex AI — reuse Gemini's thinking_config translation for extra_body."""
 
+    def prepare_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Sanitize messages for Vertex AI.
+
+        Vertex AI's OpenAPI endpoint (specifically for models like
+        gemini-3.6-flash and gemini-3.5-flash-lite) rejects requests with
+        HTTP 400 INVALID_ARGUMENT if an assistant message in history contains
+        both `tool_calls` and a non-empty `content` string.
+        Clear `content` to "" on any assistant message that carries `tool_calls`.
+        """
+        needs_fix = False
+        for msg in messages:
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and msg.get("content")
+            ):
+                needs_fix = True
+                break
+
+        if not needs_fix:
+            return messages
+
+        sanitized = list(messages)
+        for idx, msg in enumerate(messages):
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+                and msg.get("content")
+            ):
+                copied = dict(msg)
+                copied["content"] = ""
+                sanitized[idx] = copied
+        return sanitized
+
     def build_extra_body(
         self, *, session_id: str | None = None, **context: Any
     ) -> dict[str, Any]:
@@ -47,7 +85,7 @@ class VertexProfile(ProviderProfile):
         thinking_config = _snake_case_gemini_thinking_config(raw_thinking_config)
         if not thinking_config:
             return {}
-        return {"extra_body": {"google": {"thinking_config": thinking_config}}}
+        return {"google": {"thinking_config": thinking_config}}
 
     def fetch_models(
         self,
