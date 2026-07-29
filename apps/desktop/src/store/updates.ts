@@ -142,7 +142,15 @@ function isInstallMethodToastSnoozed(): boolean {
  * doesn't nag on every thread switch.
  */
 export function reportBackendContract(contract: number | undefined): void {
-  if ((contract ?? 0) >= REQUIRED_BACKEND_CONTRACT) {
+  // Runtime-info updates may be partial. Absence of this optional field is not
+  // evidence that a current backend is old; only an explicit numeric contract
+  // can establish skew. Treating `undefined` as version zero created a false
+  // persistent warning after otherwise-valid session payloads.
+  if (contract === undefined) {
+    return
+  }
+
+  if (contract >= REQUIRED_BACKEND_CONTRACT) {
     dismissNotification(SKEW_TOAST_ID)
     // Backend caught up — forget any prior snooze so a future regression warns
     // immediately rather than staying silent for the rest of the window.

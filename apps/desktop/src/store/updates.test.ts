@@ -139,11 +139,14 @@ describe('reportBackendContract', () => {
     expect(notifySpy).not.toHaveBeenCalled()
   })
 
-  it('warns when the backend is behind (or reports no contract)', () => {
+  it('does not infer an old backend from a partial payload with no contract', () => {
     reportBackendContract(undefined)
-    expect(notifySpy).toHaveBeenCalledTimes(1)
+    expect(notifySpy).not.toHaveBeenCalled()
+  })
+
+  it('warns when the backend explicitly reports an older contract', () => {
     reportBackendContract(1)
-    expect(notifySpy).toHaveBeenCalledTimes(2)
+    expect(notifySpy).toHaveBeenCalledTimes(1)
   })
 
   it('stays quiet on later session opens once the user closed it', () => {

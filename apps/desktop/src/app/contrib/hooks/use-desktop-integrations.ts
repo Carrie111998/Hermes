@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
@@ -7,9 +8,11 @@ import { respondToApprovalAction } from '@/store/native-notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import {
   $sessions,
+  $sessionsLoading,
   getRememberedRoute,
   getRememberedSessionId,
   rememberedSessionProfile,
+  sessionMatchesStoredId,
   setRememberedRoute,
   setRememberedSessionId
 } from '@/store/session'
@@ -18,7 +21,7 @@ import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/
 import { isSecondaryWindow } from '@/store/windows'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
-import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
+import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '../../routes'
 
 interface DesktopIntegrationsParams {
   chatOpen: boolean
@@ -46,6 +49,8 @@ export function useDesktopIntegrations({
   routedSessionId,
   runtimeIdByStoredSessionId
 }: DesktopIntegrationsParams): void {
+  const sessionsLoading = useStore($sessionsLoading)
+
   // Update polling — populates $desktopVersion/$updateStatus, which feed the
   // statusbar version pill and the update toasts. Also honors the main
   // process's "open updates" menu request.
@@ -66,11 +71,19 @@ export function useDesktopIntegrations({
     window.hermesDesktop?.setPreviewShortcutActive?.(true)
   }, [])
 
+  const restoredRef = useRef(false)
+
   // Remember the open chat (session id for notifications/resume) AND the last
   // non-overlay route (a page like /skills, or a session route) so a relaunch
   // lands where you were. Overlays (settings/command-center/…) aren't stored —
   // you don't want to boot into a modal.
   useEffect(() => {
+    // The first render always starts at `/`. Do not overwrite the durable route
+    // before the cold-start restore effect below has had a chance to read it.
+    if (!restoredRef.current) {
+      return
+    }
+
     if (routedSessionId) {
       setRememberedSessionId(
         routedSessionId,
@@ -83,34 +96,60 @@ export function useDesktopIntegrations({
     }
   }, [locationPathname, routedSessionId])
 
-  const restoredRef = useRef(false)
-
   // Restore once on cold start — only when the renderer booted at the default
   // route (a hidden-then-shown window keeps its own route). Prefer the full
   // remembered route (covers pages); fall back to the last session id.
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (restoredRef.current || locationPathname !== NEW_CHAT_ROUTE) {
+    if (restoredRef.current) {
+      return
+    }
+
+    if (locationPathname !== NEW_CHAT_ROUTE) {
       restoredRef.current = true
 
       return
     }
 
-    restoredRef.current = true
+    // Archived/deleted sessions are absent from the loaded session list. Wait
+    // for that list before trusting a remembered chat id so stale durable state
+    // cannot resurrect a hidden conversation on every launch.
+    if (sessionsLoading) {
+      return
+    }
+
     const route = getRememberedRoute()
 
     if (route && route !== NEW_CHAT_ROUTE && !isOverlayView(appViewForPath(route))) {
-      navigate(route, { replace: true })
+      const rememberedRouteSessionId = routeSessionId(route)
+
+      if (!rememberedRouteSessionId || $sessions.get().some(session => sessionMatchesStoredId(session, rememberedRouteSessionId))) {
+        restoredRef.current = true
+        navigate(route, { replace: true })
+
+        return
+      }
+
+      setRememberedRoute(NEW_CHAT_ROUTE)
+    }
+
+    const activeProfile = $activeGatewayProfile.get()
+    const last = getRememberedSessionId(activeProfile)
+
+    if (last && $sessions.get().some(session => sessionMatchesStoredId(session, last))) {
+      restoredRef.current = true
+      navigate(sessionRoute(last), { replace: true })
 
       return
     }
 
-    const last = getRememberedSessionId($activeGatewayProfile.get())
-
     if (last) {
-      navigate(sessionRoute(last), { replace: true })
+      setRememberedSessionId(null, activeProfile)
     }
-  }, [locationPathname, navigate])
+
+    restoredRef.current = true
+    setRememberedRoute(NEW_CHAT_ROUTE)
+  }, [locationPathname, navigate, sessionsLoading])
 
   useEffect(() => {
     if (!resumeExhaustedSessionId) {
