@@ -16,6 +16,11 @@ const DATA_URL_READ_MAX_MAX_MB = 4096
 // reader so the payload still fits uvicorn's raised ws_max_size (384 MiB)
 // after base64 + framing. Preview stays on the Settings-configurable path.
 const ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES = 256 * 1024 * 1024
+// Ceiling for a plugin-initiated download buffered in main before it's written
+// to disk. Matches the kanban attachment upload cap (KANBAN_ATTACHMENT_MAX_BYTES
+// in hermes_cli/kanban_db.py) — a blob the backend refused to accept can't come
+// back down — with headroom for other plugins' smaller payloads.
+const PLUGIN_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024
 const TEXT_PREVIEW_SOURCE_MAX_BYTES = 64 * 1024 * 1024
 
 function clampDataUrlReadMaxMb(value) {
@@ -46,6 +51,69 @@ function resolveTimeoutMs(timeoutMs, fallbackMs = DEFAULT_FETCH_TIMEOUT_MS) {
   }
 
   return fallback
+}
+
+// A downloaded filename is attacker-influenced data (it comes from a DB row a
+// worker wrote, or a Content-Disposition header). It must never be able to
+// escape the directory the user picked, so reduce it to a bare basename with
+// no separators, no traversal, and no leading dot.
+function safeDownloadFilename(name, fallback = 'download') {
+  const raw = String(name || '')
+    .replace(/[/\\]/g, '_')
+    .replace(/\0/g, '')
+    .trim()
+
+  // '.' and '..' survive the separator strip; treat them as absent.
+  const cleaned = raw === '.' || raw === '..' ? '' : raw.replace(/^\.+/, '')
+
+  return cleaned || fallback
+}
+
+// RFC 6266 Content-Disposition filename, preferring the RFC 5987 `filename*`
+// form when present (it carries the encoding and survives non-ASCII names).
+function filenameFromContentDisposition(header) {
+  const value = String(header || '')
+
+  const extended = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/.exec(value)
+
+  if (extended) {
+    try {
+      return safeDownloadFilename(decodeURIComponent(extended[1]), '')
+    } catch {
+      // Malformed percent-encoding — fall through to the plain form.
+    }
+  }
+
+  const plain = /filename\s*=\s*(?:"([^"]*)"|([^;]+))/.exec(value)
+
+  return plain ? safeDownloadFilename((plain[1] ?? plain[2] ?? '').trim(), '') : ''
+}
+
+// Pick a path that doesn't clobber an existing file: `notes.txt` becomes
+// `notes (1).txt`, then `notes (2).txt`. The suffix goes before the extension
+// so the file still opens in the right app. `exists` is injected so this stays
+// pure and testable; bounded so a pathological directory can't spin forever.
+function resolveDownloadCollision(targetPath, exists, limit = 1000) {
+  if (!exists(targetPath)) {
+    return targetPath
+  }
+
+  const dir = path.dirname(targetPath)
+  const base = path.basename(targetPath)
+  // Leading-dot files ('.gitignore') are all name, no extension.
+  const dot = base.lastIndexOf('.')
+  const stem = dot > 0 ? base.slice(0, dot) : base
+  const ext = dot > 0 ? base.slice(dot) : ''
+
+  for (let n = 1; n <= limit; n += 1) {
+    const candidate = path.join(dir, `${stem} (${n})${ext}`)
+
+    if (!exists(candidate)) {
+      return candidate
+    }
+  }
+
+  throw new Error(`Could not find a free filename for ${base} after ${limit} attempts.`)
 }
 
 function encryptDesktopSecret(value, safeStorageApi) {
@@ -355,12 +423,16 @@ export {
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret,
+  filenameFromContentDisposition,
+  PLUGIN_DOWNLOAD_MAX_BYTES,
   readFileDataUrlForIpc,
   rejectUnsafePathSyntax,
   resolveDirectoryForIpc,
+  resolveDownloadCollision,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
+  safeDownloadFilename,
   sensitiveFileBlockReason,
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 }

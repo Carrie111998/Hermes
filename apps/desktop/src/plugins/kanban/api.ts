@@ -26,8 +26,15 @@ import type {
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
+type Download = (
+  path: string,
+  opts?: { filename?: string; timeoutMs?: number }
+) => Promise<{ canceled: boolean; filePath?: string }>
+type Reveal = (filePath: string) => Promise<boolean>
 
 let rest: null | Rest = null
+let download: null | Download = null
+let reveal: null | Reveal = null
 
 /** Selected board slug ('' = the server's current board). Persisted. */
 export const $boardSlug = atom<string>('')
@@ -79,8 +86,10 @@ interface Persisted<T> {
  *  runs on unload/disable — so nothing (store sync, socket) survives a toggle
  *  or duplicates on re-enable. The events socket is pinned to a board at
  *  handshake, so a board switch closes + reopens it. */
-export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): () => void {
+export function bindApi(r: Rest, storage: PluginStorage, socket: Socket, d: Download, rv: Reveal): () => void {
   rest = r
+  download = d
+  reveal = rv
   const unsubs: Array<() => void> = []
 
   // Hydrate an atom from storage and keep storage in sync with it.
@@ -108,6 +117,8 @@ export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): () => 
     unsubs.forEach(unsub => unsub())
     close?.()
     rest = null
+    download = null
+    reveal = null
   }
 }
 
@@ -217,6 +228,17 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
+
+/** Save an attachment to disk. Binary, so it takes the `download` door rather
+ *  than `rest` (which would JSON-decode and corrupt it). Board-scoped like
+ *  every other call — the blob is resolved against the selected board's root. */
+export const downloadAttachment = (attachmentId: number | string, filename: string) =>
+  download
+    ? download(withBoard(`/attachments/${encodeURIComponent(String(attachmentId))}`), { filename })
+    : Promise.reject(new Error('kanban api not ready'))
+
+/** Reveal a saved attachment in the OS file manager. */
+export const revealAttachment = (filePath: string) => (reveal ? reveal(filePath) : Promise.resolve(false))
 
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {

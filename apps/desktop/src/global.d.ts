@@ -111,6 +111,13 @@ declare global {
         set: (name: string | null) => Promise<DesktopActiveProfile>
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
+      /** Binary download from a plugin's own API namespace: fetches the bytes,
+       *  prompts for a save location, writes with collision resolution. The
+       *  renderer is a file:// origin and `api` is JSON-only, so this is the
+       *  only path a plugin has to hand the user a file. */
+      pluginDownload?: (request: HermesPluginDownloadRequest) => Promise<HermesPluginDownloadResult>
+      /** Reveal a saved download in Finder/Explorer/Files. */
+      pluginRevealDownload?: (filePath: string) => Promise<boolean>
       notify: (payload: HermesNotification) => Promise<boolean>
       requestMicrophoneAccess: () => Promise<boolean>
       readFileDataUrl: (filePath: string) => Promise<string>
@@ -750,6 +757,27 @@ export interface HermesApiRequest {
   // (window) backend. Read-only cross-profile data is served by the primary, so
   // this is only needed for profile-scoped live/settings calls.
   profile?: string | null
+}
+
+export interface HermesPluginDownloadRequest {
+  /** Plugin id — main rebuilds `/api/plugins/<id><path>` from it, so a caller
+   *  can't reach another namespace by assembling its own URL. */
+  pluginId: string
+  /** Path relative to the plugin's namespace, leading slash ('/attachments/7'). */
+  path: string
+  /** Suggested save name. Sanitized in main; falls back to the response's
+   *  Content-Disposition when empty. */
+  filename?: string
+  timeoutMs?: number
+  profile?: string | null
+}
+
+export interface HermesPluginDownloadResult {
+  /** True when the user dismissed the save dialog — not an error. */
+  canceled: boolean
+  /** Where the file actually landed (may differ from the chosen name when a
+   *  collision was resolved). Absent when canceled. */
+  filePath?: string
 }
 
 export interface HermesNotification {

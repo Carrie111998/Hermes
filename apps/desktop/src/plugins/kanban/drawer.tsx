@@ -33,6 +33,7 @@ import {
   $boardSlug,
   addComment,
   deleteTask,
+  downloadAttachment,
   estimateTask,
   fetchLog,
   fetchProfiles,
@@ -42,6 +43,7 @@ import {
   PROFILES_KEY,
   reassignTask,
   reclaimTask,
+  revealAttachment,
   taskKey,
   uploadAttachment
 } from './api'
@@ -410,10 +412,12 @@ const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\
 
 function AttachmentsSection({
   attachments,
+  onDownload,
   onUpload,
   pending
 }: {
   attachments: KanbanAttachment[]
+  onDownload: (attachment: KanbanAttachment) => void
   onUpload: (file: File) => void
   pending: boolean
 }) {
@@ -454,9 +458,21 @@ function AttachmentsSection({
       {attachments.length > 0 ? (
         <ul className="flex flex-col gap-1">
           {attachments.map(attachment => (
-            <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
-              <Codicon name="file" size="0.75rem" />
-              {attachment.filename}
+            <li key={attachment.id}>
+              <button
+                className="flex w-full items-center gap-1.5 rounded-sm text-left text-[0.75rem] text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)"
+                onClick={() => onDownload(attachment)}
+                title={k.downloadAttachment}
+                type="button"
+              >
+                <Codicon className="shrink-0" name="file" size="0.75rem" />
+                <span className="truncate">{attachment.filename}</span>
+                <Codicon
+                  className="ml-auto shrink-0 text-(--ui-text-quaternary)"
+                  name="cloud-download"
+                  size="0.7rem"
+                />
+              </button>
             </li>
           ))}
         </ul>
@@ -648,6 +664,25 @@ export function TaskDrawer({
       }),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
+  })
+
+  const downloadMut = useMutation({
+    mutationFn: (attachment: KanbanAttachment) => downloadAttachment(attachment.id, attachment.filename),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: result => {
+      // Dismissing the save dialog is a normal outcome — don't toast it.
+      if (result.canceled || !result.filePath) {
+        return
+      }
+
+      const filePath = result.filePath
+
+      host.notify({
+        action: { label: k.reveal, onClick: () => void revealAttachment(filePath) },
+        kind: 'success',
+        message: k.attachmentSaved(filePath.split(/[/\\]/).pop() || '')
+      })
+    }
   })
 
   if (!id) {
@@ -934,6 +969,7 @@ export function TaskDrawer({
 
             <AttachmentsSection
               attachments={detail.attachments}
+              onDownload={attachment => downloadMut.mutate(attachment)}
               onUpload={file => uploadMut.mutate(file)}
               pending={uploadMut.isPending}
             />
