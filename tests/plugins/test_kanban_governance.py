@@ -1135,6 +1135,29 @@ def test_worker_verification_command_shapes_are_allowed(
     ) is None
 
 
+@pytest.mark.parametrize("command", [
+    "npm ci",
+    "npm install",
+    "npm ci --ignore-scripts",
+])
+def test_worker_dependency_install_commands_remain_blocked(
+    governed_workspace, monkeypatch, command
+):
+    """Dependency provisioning must not widen governed worker authority."""
+    mod = _load_plugin()
+    _install_verification_runner_stubs(governed_workspace, monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {"command": command, "workdir": str(governed_workspace["repo"])},
+    )
+
+    assert decision is not None
+    assert decision["action"] == "block"
+    assert "worker mutation targets could not be verified" in decision["message"]
+
+
 @pytest.mark.parametrize(
     "command",
     [

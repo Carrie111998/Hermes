@@ -159,6 +159,32 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_manual_claim_rolls_back_when_workspace_provisioning_fails(
+    kanban_home, monkeypatch, capsys
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="provisioning failure")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        conn.commit()
+
+    monkeypatch.setattr(
+        kb,
+        "resolve_workspace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("unsafe deps")),
+    )
+
+    result = kc._cmd_claim(argparse.Namespace(task_id=task_id, ttl=None))
+
+    assert result == 1
+    assert "workspace provisioning failed" in capsys.readouterr().err
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)

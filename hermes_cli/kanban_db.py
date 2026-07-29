@@ -10504,12 +10504,12 @@ def _is_managed_scratch_path(p: Path) -> bool:
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
-    """Remove a task's scratch workspace dir and kill its stale tmux session.
+    """Clean a task workspace and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
     Best-effort — any error is swallowed so cleanup never blocks task completion.
-    Only ``scratch`` workspaces are removed; ``worktree`` and ``dir`` workspaces
-    are intentionally preserved.
+    Scratch directories are removed; persistent worktrees and dirs are kept,
+    but dispatcher-provisioned Node dependencies are removed from worktrees.
     """
     try:
         row = conn.execute(
@@ -10520,6 +10520,14 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        if kind == "worktree" and path:
+            worktree_path = Path(path)
+            if not _worktree_has_other_running_consumer(
+                conn, task_id, worktree_path
+            ):
+                _cleanup_provisioned_node_dependencies(worktree_path)
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         if kind != "scratch" or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -12101,7 +12109,7 @@ def _is_epic_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def _ensure_git_worktree(
     repo_root: Path, target: Path, branch_name: str, *, base: str = "HEAD"
-) -> None:
+) -> bool:
     """Materialize ``target`` as a linked git worktree under ``repo_root``.
 
     ``base`` is the ref a brand-new ``branch_name`` is created from (default
@@ -12114,7 +12122,7 @@ def _ensure_git_worktree(
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
-            return
+            return False
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -12135,10 +12143,115 @@ def _ensure_git_worktree(
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    return True
+
+
+def _primary_checkout_root(path: Path) -> Path:
+    """Resolve the primary checkout shared by a linked worktree."""
+    common_dir = _git_common_dir(path)
+    if common_dir is not None and common_dir.name == ".git":
+        return common_dir.parent.resolve(strict=False)
+    return (_git_toplevel(path) or path).expanduser().resolve(strict=False)
+
+
+def _provision_node_dependencies(primary_root: Path, worktree_root: Path) -> None:
+    """Provision Node dependencies before a worker can claim the worktree."""
+    from hermes_cli.worktree_dependencies import provision_node_dependencies
+
+    provision_node_dependencies(primary_root, worktree_root)
+
+
+def _cleanup_provisioned_node_dependencies(worktree_root: Path) -> None:
+    """Remove dispatcher-provisioned Node dependencies from a worktree."""
+    from hermes_cli.worktree_dependencies import (
+        cleanup_provisioned_node_dependencies,
+    )
+
+    cleanup_provisioned_node_dependencies(worktree_root)
+
+
+def _worktree_has_other_running_consumer(
+    conn: sqlite3.Connection, task_id: str, worktree_root: Path
+) -> bool:
+    """Return whether another claimed task currently uses this worktree."""
+    target = worktree_root.expanduser().resolve(strict=False)
+    rows = conn.execute(
+        "SELECT id, workspace_path FROM tasks "
+        "WHERE id != ? AND workspace_kind = 'worktree' AND status = 'running' "
+        "AND workspace_path IS NOT NULL",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            other = Path(row["workspace_path"]).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            continue
+        if other == target:
+            return True
+    return False
+
+
+def _assert_worktree_has_no_other_running_consumer(
+    conn: Optional[sqlite3.Connection], task_id: Optional[str], worktree_root: Path
+) -> None:
+    if conn is None or task_id is None:
+        return
+    if _worktree_has_other_running_consumer(conn, task_id, worktree_root):
+        raise RuntimeError(
+            f"worktree dependency provisioning refused for {worktree_root}: "
+            "another running task is using this checkout"
+        )
+
+
+def _materialize_worktree_with_dependencies(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    base: str,
+    conn: Optional[sqlite3.Connection] = None,
+    task_id: Optional[str] = None,
+) -> None:
+    """Create/reuse a linked worktree and provision it before spawning."""
+    created = _ensure_git_worktree(repo_root, target, branch_name, base=base)
+    try:
+        _assert_worktree_has_no_other_running_consumer(conn, task_id, target)
+        _provision_node_dependencies(_primary_checkout_root(repo_root), target)
+    except Exception as provision_exc:
+        if created:
+            try:
+                removed = subprocess.run(
+                    [
+                        "git", "-C", str(repo_root), "worktree", "remove",
+                        "--force", str(target),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=60,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as cleanup_exc:
+                raise RuntimeError(
+                    f"{provision_exc}; failed to remove new worktree {target}: "
+                    f"{cleanup_exc}"
+                ) from provision_exc
+            if removed.returncode != 0:
+                detail = (removed.stderr or removed.stdout or "").strip()
+                raise RuntimeError(
+                    f"{provision_exc}; failed to remove new worktree {target}: "
+                    f"{detail or f'exit {removed.returncode}'}"
+                ) from provision_exc
+        raise
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None, base_branch: Optional[str] = None
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    base_branch: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -12187,7 +12300,14 @@ def _resolve_worktree_workspace(
         target = repo_root / ".worktrees" / task.id
         if base_branch is not None:
             _ensure_epic_branch(repo_root, base_branch)
-        _ensure_git_worktree(repo_root, target, branch_name, base=base)
+        _materialize_worktree_with_dependencies(
+            repo_root,
+            target,
+            branch_name,
+            base=base,
+            conn=conn,
+            task_id=task.id,
+        )
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -12201,6 +12321,10 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            _assert_worktree_has_no_other_running_consumer(
+                conn, task.id, requested
+            )
+            _provision_node_dependencies(_primary_checkout_root(requested), requested)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -12213,7 +12337,14 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _materialize_worktree_with_dependencies(
+                    fallback_root,
+                    fallback,
+                    branch_name,
+                    base="HEAD",
+                    conn=conn,
+                    task_id=task.id,
+                )
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -12225,7 +12356,14 @@ def _resolve_worktree_workspace(
         target = repo_root / ".worktrees" / task.id
         if base_branch is not None:
             _ensure_epic_branch(repo_root, base_branch)
-        _ensure_git_worktree(repo_root, target, branch_name, base=base)
+        _materialize_worktree_with_dependencies(
+            repo_root,
+            target,
+            branch_name,
+            base=base,
+            conn=conn,
+            task_id=task.id,
+        )
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -12236,7 +12374,14 @@ def _resolve_worktree_workspace(
         )
     if base_branch is not None:
         _ensure_epic_branch(repo_root, base_branch)
-    _ensure_git_worktree(repo_root, requested, branch_name, base=base)
+    _materialize_worktree_with_dependencies(
+        repo_root,
+        requested,
+        branch_name,
+        base=base,
+        conn=conn,
+        task_id=task.id,
+    )
     return requested, branch_name
 
 
@@ -12371,9 +12516,19 @@ def _build_verified_merge_candidate(
         _remove_clean_integration_worktree(repo_root, scratch)
         raise IntegrationCandidateError("merge conflict")
 
+    try:
+        _provision_node_dependencies(_primary_checkout_root(repo_root), scratch)
+    except Exception as exc:
+        _cleanup_provisioned_node_dependencies(scratch)
+        _remove_clean_integration_worktree(repo_root, scratch)
+        raise IntegrationCandidateError(
+            f"candidate dependency provisioning failed: {exc}"
+        ) from exc
+
     candidate_result = _integration_git(scratch, ["rev-parse", "HEAD"])
     candidate_sha = (candidate_result.stdout or "").strip()
     if candidate_result.returncode != 0 or not candidate_sha:
+        _cleanup_provisioned_node_dependencies(scratch)
         raise IntegrationCandidateError(
             "could not resolve integration candidate", scratch_worktree=scratch
         )
@@ -12401,8 +12556,11 @@ def _build_verified_merge_candidate(
         except Exception:
             verified = False
     if not verified:
+        _cleanup_provisioned_node_dependencies(scratch)
         _remove_clean_integration_worktree(repo_root, scratch)
         raise IntegrationCandidateError("candidate verification failed")
+
+    _cleanup_provisioned_node_dependencies(scratch)
 
     if expected_source_sha is not None:
         current_source = _integration_git(
@@ -12511,19 +12669,34 @@ def _default_epic_verify(epic_branch: str) -> bool:
             return False
         _ensure_epic_branch(repo_root, epic_branch)
         target = repo_root / ".worktrees" / f"epic-verify-{epic_branch.replace('/', '-')}"
-        _ensure_git_worktree(repo_root, target, epic_branch)
-        script = target / "scripts" / "run_tests.sh"
-        if not script.exists():
-            return False
-        result = subprocess.run(
-            ["bash", "scripts/run_tests.sh"],
-            cwd=target,
-            capture_output=True,
-            text=True,
-            timeout=1800,
-            check=False,
-        )
-        return result.returncode == 0
+        from hermes_cli.worktree_dependencies import _acquire_project_lock
+
+        # Provisioning's per-project locks protect mutation only. This
+        # separate lease serializes the entire deterministic verification
+        # worktree lifetime so concurrent verifiers cannot replace or clean
+        # dependencies while another suite is running.
+        verify_lease = _acquire_project_lock(target / ".hermes-epic-verification")
+        try:
+            _materialize_worktree_with_dependencies(
+                repo_root, target, epic_branch, base="HEAD"
+            )
+            try:
+                script = target / "scripts" / "run_tests.sh"
+                if not script.exists():
+                    return False
+                result = subprocess.run(
+                    ["bash", "scripts/run_tests.sh"],
+                    cwd=target,
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                    check=False,
+                )
+                return result.returncode == 0
+            finally:
+                _cleanup_provisioned_node_dependencies(target)
+        finally:
+            verify_lease.release()
     except Exception:
         return False
 
@@ -13878,7 +14051,12 @@ def deploy_epic(
     )
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
@@ -13935,7 +14113,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
-        p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        p, _branch_name = _resolve_worktree_workspace(
+            task, board=board, conn=conn
+        )
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -14459,10 +14639,10 @@ def _spawn_one_v2(
         if claimed.workspace_kind == "worktree":
             base_branch = _story_base_branch(conn, task_id, board=board)
             workspace, resolved_branch_name = _resolve_worktree_workspace(
-                claimed, board=board, base_branch=base_branch
+                claimed, board=board, base_branch=base_branch, conn=conn
             )
         else:
-            workspace = resolve_workspace(claimed, board=board)
+            workspace = resolve_workspace(claimed, board=board, conn=conn)
     except Exception as exc:
         _record_spawn_failure(
             conn, claimed.id, f"workspace: {exc}",
@@ -16734,9 +16914,9 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board, conn=conn)
             else:
-                workspace = resolve_workspace(claimed, board=board)
+                workspace = resolve_workspace(claimed, board=board, conn=conn)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -16844,9 +17024,9 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board, conn=conn)
             else:
-                workspace = resolve_workspace(claimed, board=board)
+                workspace = resolve_workspace(claimed, board=board, conn=conn)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
