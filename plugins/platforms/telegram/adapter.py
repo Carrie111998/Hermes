@@ -4352,7 +4352,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         # the typing refresh loop; re-arming Telegram's ~5s timer
                         # here would leave the "...typing" bubble lingering after
                         # the answer (no Bot API call cancels it). See #48678.
-                        if not (metadata or {}).get("notify"):
+                        if not ((metadata or {}).get("notify") or (metadata or {}).get("job_id")):
                             try:
                                 await self.send_typing(chat_id, metadata=metadata)
                             except Exception:
@@ -4599,7 +4599,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # send returns, so re-arming Telegram's ~5s timer here would leave
             # the indicator lingering after the answer with nothing to cancel
             # it (Telegram exposes no stop-typing API). See #48678.
-            if not (metadata or {}).get("notify"):
+            if not ((metadata or {}).get("notify") or (metadata or {}).get("job_id")):
                 try:
                     await self.send_typing(chat_id, metadata=metadata)
                 except Exception:
