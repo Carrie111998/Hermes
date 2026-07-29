@@ -278,9 +278,12 @@ ollama serve
 
 ### Model doesn't follow tool calls
 
-Smaller models (3B, 7B) sometimes ignore tool-call instructions and produce plain text instead of structured function calls. Solutions:
+A model without reliable tool support may answer in plain text instead of
+returning the structured function calls Hermes needs. Solutions:
 
-- **Use a bigger model** — `gemma4:31b` or `gemma2:27b` handle tool calls much better than 3B/7B models.
+- **Use a tool-capable model** — of the models listed in this guide,
+  `gemma4:31b` is the supported choice for agentic tasks. `gemma2:27b` is a
+  larger conversational model, but it does not provide native tool calling.
 - **Hermes has auto-repair** — it detects malformed tool calls and attempts to fix them automatically.
 - **Set up a fallback** — if the local model fails 3 times, Hermes falls back to a cloud provider.
 
