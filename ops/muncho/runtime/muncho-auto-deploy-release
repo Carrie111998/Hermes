@@ -2032,6 +2032,67 @@ install_target_release_wheel() {
   attest_target_release_venv "$release" "$inherited_release"
 }
 
+attest_target_release_entrypoints() {
+  local release="$1"
+  sudo -n -u "$OWNER" "$release/.venv/bin/python" -I -P -s - \
+    "$release" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+release = Path(sys.argv[1])
+if not release.is_absolute() or release.resolve(strict=True) != release:
+    raise SystemExit("BLOCKED_RELEASE_ENTRYPOINT_ADDRESS_INVALID")
+
+interpreter = release / ".venv/bin/python"
+expected = f"#!{interpreter}\n".encode("ascii")
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+for name in ("hermes", "hermes-acp", "hermes-agent", "muncho-ops"):
+    path = release / ".venv/bin" / name
+    try:
+        before = path.lstat()
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise SystemExit(
+            f"BLOCKED_RELEASE_ENTRYPOINT_UNAVAILABLE:{name}"
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        first_line = b""
+        while len(first_line) <= len(expected):
+            chunk = os.read(fd, 1)
+            if not chunk:
+                break
+            first_line += chunk
+            if chunk == b"\n":
+                break
+    finally:
+        os.close(fd)
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    after = path.lstat()
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or not (before.st_mode & stat.S_IXUSR)
+        or identity(before) != identity(opened)
+        or identity(before) != identity(after)
+        or first_line != expected
+    ):
+        raise SystemExit(f"BLOCKED_RELEASE_ENTRYPOINT_INVALID:{name}")
+print("target_release_entrypoints=ok")
+PY
+}
+
 release_identity_matches() {
   local release="$1"
   local expected_head="$2"
@@ -2310,6 +2371,23 @@ PY"
   require_cutover_unit_inputs "$sha" "$pr" >/dev/null || return $?
   if ! release_identity_matches "$new" "$sha"; then
     write_status "blocked_target_release_identity_invalid" "$sha" "$pr" "{}"
+    exit 5
+  fi
+  # pip writes console-script shebangs with the interpreter's current absolute
+  # path.  The first wheel install runs in the hidden staging directory, so
+  # those launchers become stale after the atomic rename to ``$new``.  Reinstall
+  # only the target wheel at its final, inactive address and fail closed unless
+  # every shipped entrypoint is bound to that exact release interpreter.
+  if [ "$new" != "$active" ]; then
+    if ! install_target_release_wheel "$new" "$new" >/dev/null; then
+      write_status "blocked_target_release_venv_invalid" "$sha" "$pr" \
+        "{\"stage\": \"final_address_wheel_install\"}"
+      exit 5
+    fi
+  fi
+  if ! attest_target_release_entrypoints "$new" >/dev/null; then
+    write_status "blocked_target_release_entrypoints_invalid" "$sha" "$pr" \
+      "{\"stage\": \"pre_activation\"}"
     exit 5
   fi
   if ! attest_target_release_venv "$new" "$new" >/dev/null; then
