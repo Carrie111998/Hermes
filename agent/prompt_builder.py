@@ -1797,6 +1797,32 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 # Context files (SOUL.md, AGENTS.md, .cursorrules)
 # =========================================================================
 
+def _section_index(content: str, target: str, max_entries: int = 40) -> str:
+    """Build a markdown section index with line numbers for a truncated file.
+
+    When a large context file (AGENTS.md, CLAUDE.md) is truncated, the agent
+    loses the map it needs to fetch a relevant section on demand. Emitting
+    the `##` headers with 1-based line numbers costs ~1KB and turns blind
+    truncation into navigable truncation: the agent can read_file(offset=N)
+    straight into the section it needs instead of paying for the whole file.
+    """
+    entries: list[str] = []
+    for i, line in enumerate(content.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("## ") or (stripped.startswith("# ") and not entries):
+            title = stripped.lstrip("#").strip()
+            entries.append(f"  - line {i}: {title}")
+            if len(entries) >= max_entries:
+                break
+    if len(entries) < 3:
+        return ""
+    listing = "\n".join(entries)
+    return (
+        f"\nSection index for {target} (use read_file with the line number as "
+        f"offset to load a section on demand):\n{listing}\n"
+    )
+
+
 def _truncate_content(
     content: str,
     filename: str,
@@ -1828,11 +1854,13 @@ def _truncate_content(
     tail_chars = int(max_chars * CONTEXT_TRUNCATE_TAIL_RATIO)
     head = content[:head_chars]
     tail = content[-tail_chars:]
+    index = _section_index(content, target)
     marker = (
         f"\n\n[...truncated {filename}: kept {head_chars}+{tail_chars} of "
         f"{len(content)} chars. The middle is omitted — if you need the full "
         f"instructions, read the complete file with the read_file tool: "
-        f"{target}]\n\n"
+        f"{target}]\n"
+        f"{index}\n"
     )
     return head + marker + tail
 

@@ -161,6 +161,76 @@ class TestTruncateContent:
         assert "HEAD_MARKER" in result
         assert "TAIL_MARKER" in result
 
+
+class TestSectionIndex:
+    """Truncated markdown files get a navigable section index.
+
+    A large AGENTS.md used to truncate blind: the agent kept head+tail with no
+    map of the omitted middle, so it could not fetch a relevant section without
+    reading the whole file. The index (## headers + 1-based line numbers)
+    makes truncation navigable via read_file(offset=N).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _drain_warnings(self):
+        """These tests deliberately truncate, which records warnings into the
+        shared queue; drain before AND after so neighbours that assert on
+        queue contents see the same empty queue as before this class ran."""
+        from agent.prompt_builder import drain_truncation_warnings
+
+        drain_truncation_warnings()
+        yield
+        drain_truncation_warnings()
+
+    BIG_MD = (
+        "# Guide\n\nintro\n\n"
+        "## Principles\n\n" + "p " * 3000 + "\n"
+        "## Architecture\n\n" + "a " * 3000 + "\n"
+        "## Testing\n\n" + "t " * 3000 + "\n"
+        "## Pitfalls\n\n" + "z " * 2000
+    )
+
+    def test_index_lists_headers_with_line_numbers(self):
+        from agent.prompt_builder import _section_index
+
+        idx = _section_index(self.BIG_MD, "AGENTS.md")
+        assert "line 1: Guide" in idx
+        assert "line 5: Principles" in idx
+        assert "Testing" in idx
+        assert "Pitfalls" in idx
+
+    def test_index_appears_inside_truncation_marker(self):
+        result = _truncate_content(self.BIG_MD, "AGENTS.md", max_chars=8_000)
+        assert "Section index" in result
+        assert "read_file" in result
+        # index sits between the truncation notice and the tail
+        assert result.index("[...truncated") < result.index("Section index")
+
+    def test_line_numbers_are_real_offsets(self):
+        """Every listed line number must actually start that section."""
+        from agent.prompt_builder import _section_index
+        import re
+
+        lines = self.BIG_MD.splitlines()
+        for m in re.finditer(r"line (\d+): (.+)", _section_index(self.BIG_MD, "x.md")):
+            n, title = int(m.group(1)), m.group(2)
+            assert lines[n - 1].lstrip("#").strip() == title
+
+    def test_few_headers_no_index(self):
+        from agent.prompt_builder import _section_index
+
+        content = "# One\n\nbody\n\n## Two\n\nmore\n"
+        assert _section_index(content, "x.md") == ""
+
+    def test_no_index_when_not_truncated(self):
+        result = _truncate_content("# A\n\nshort", "small.md")
+        assert "Section index" not in result
+
+    def test_head_and_tail_still_present(self):
+        result = _truncate_content(self.BIG_MD, "AGENTS.md", max_chars=8_000)
+        assert "intro" in result          # head kept
+        assert "z z z" in result          # tail kept
+
     def test_exact_limit_unchanged(self):
         content = "x" * CONTEXT_FILE_MAX_CHARS
         result = _truncate_content(content, "exact.md")
