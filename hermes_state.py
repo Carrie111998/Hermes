@@ -2083,10 +2083,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if getattr(self._read_local, "failed", False):
             return None
         try:
+            # check_same_thread=False matches the writer connection and the
+            # cross-profile read_only open. Without it, per-thread read conns
+            # can only be closed from the creating thread — SessionDB.close()
+            # (called from the owner / event-loop thread) hits
+            # sqlite3.ProgrammingError, swallows it, and permanently leaks
+            # the .db/.wal/.shm fds. Gateway + dashboard share one SessionDB
+            # across many worker threads, so this compounds into EMFILE.
             conn = _connect_tracked_db(
                 f"file:{self.db_path}?mode=ro",
                 tracking_path=self.db_path,
                 uri=True,
+                check_same_thread=False,
                 timeout=5.0,
                 isolation_level=None,
             )

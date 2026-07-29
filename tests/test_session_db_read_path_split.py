@@ -129,3 +129,120 @@ def test_anchored_view_and_around_use_read_path(db):
         assert done["view"]["window"]
     finally:
         db._lock.release()
+
+
+def _count_state_db_fds(db_path) -> int:
+    """Count open fds whose path is this DB or its WAL/SHM sidecars."""
+    import psutil
+
+    root = str(db_path)
+    return sum(
+        1
+        for f in psutil.Process().open_files()
+        if f.path == root or f.path.startswith(root + "-")
+    )
+
+
+@pytest.mark.requires_wal
+def test_read_conn_closeable_from_owner_thread(tmp_path):
+    """Per-thread read conns must close from SessionDB.close()'s thread.
+
+    Regression: _get_read_conn omitted check_same_thread=False, so
+    SessionDB.close() on the owner thread raised ProgrammingError for every
+    worker-created read conn, swallowed it, and leaked .db/.wal/.shm fds.
+    Under gateway/dashboard thread pools this accumulated into EMFILE.
+    """
+    d = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        d.create_session(session_id="s1", source="cli", model="m")
+        d.append_message("s1", role="user", content="fd leak probe")
+
+        barriers = []
+        errors = []
+
+        def worker(i):
+            try:
+                assert d.get_session("s1")["id"] == "s1"
+                # Keep the thread alive long enough for close() to run while
+                # the connection objects still exist (registered in _read_conns).
+                barriers[i].wait(timeout=5.0)
+            except Exception as exc:  # pragma: no cover - surface in assert
+                errors.append(exc)
+
+        n_threads = 6
+        barriers = [threading.Barrier(2) for _ in range(n_threads)]
+        threads = [
+            threading.Thread(target=worker, args=(i,)) for i in range(n_threads)
+        ]
+        for t in threads:
+            t.start()
+        # Wait until every worker has opened its read conn.
+        for i in range(n_threads):
+            # Spin until this thread's conn is registered (or worker failed).
+            for _ in range(200):
+                if len(d._read_conns) >= i + 1 or errors:
+                    break
+                threading.Event().wait(0.01)
+        assert not errors
+        assert len(d._read_conns) >= n_threads
+
+        # Cross-thread close of a worker-created read conn must succeed
+        # (would raise ProgrammingError without check_same_thread=False).
+        sample = next(iter(d._read_conns))
+        sample.close()
+
+        fds_before_close = _count_state_db_fds(d.db_path)
+        assert fds_before_close > 0
+
+        d.close()
+        # Release barriers so workers exit cleanly after close.
+        for b in barriers:
+            try:
+                b.wait(timeout=1.0)
+            except threading.BrokenBarrierError:
+                pass
+        for t in threads:
+            t.join(timeout=5.0)
+
+        fds_after = _count_state_db_fds(d.db_path)
+        assert fds_after == 0, (
+            f"SessionDB.close() left {fds_after} state.db fds open "
+            f"(had {fds_before_close} before close); threaded read conns leaked"
+        )
+        assert len(d._read_conns) == 0
+    finally:
+        # Idempotent if already closed above.
+        try:
+            d.close()
+        except Exception:
+            pass
+
+
+@pytest.mark.requires_wal
+def test_close_after_threadpool_reads_reclaims_fds(tmp_path):
+    """Thread-pool style reads (gateway/dashboard) must not leave FDs behind."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    d = SessionDB(db_path=tmp_path / "pool.db")
+    try:
+        d.create_session(session_id="s1", source="cli", model="m")
+        for i in range(5):
+            d.append_message("s1", role="user", content=f"msg {i}")
+
+        def read_once(_):
+            return d.get_session("s1")["id"]
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(read_once, range(32)))
+        assert results == ["s1"] * 32
+        assert len(d._read_conns) >= 1
+
+        d.close()
+        assert _count_state_db_fds(d.db_path) == 0
+        assert d._conn is None
+        assert len(d._read_conns) == 0
+    finally:
+        try:
+            d.close()
+        except Exception:
+            pass
