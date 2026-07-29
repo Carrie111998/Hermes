@@ -47,6 +47,21 @@ def _apply_workspace(task_id: Optional[str], path: Optional[str], name: str) -> 
         except Exception:
             pass
 
+    # --- Sync the project path as the session's terminal cwd ---
+    # Without this, `project_switch` / `project_create` updates the GUI
+    # sidebar but leaves the terminal tool's working directory wherever it
+    # was before — causing `cd` drift: the agent writes files and runs
+    # commands in the wrong directory (the core of the "sessions scattered
+    # across folders" bug).  `record_session_cwd` is the durable cwd store
+    # that the terminal tool reads before every command.
+    if path and task_id:
+        try:
+            from tools.terminal_tool import record_session_cwd
+
+            record_session_cwd(task_id, path)
+        except Exception:
+            pass
+
 
 def _resolve(conn, token: str):
     from hermes_cli import projects_db as pdb
