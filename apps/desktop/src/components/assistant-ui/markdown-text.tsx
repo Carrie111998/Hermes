@@ -411,9 +411,7 @@ const STABLE_MARKDOWN_COMPONENTS = {
   // mirroring the CSS isolate that already keeps it out of the
   // plaintext scan. Fenced code never reaches this override; it goes
   // through the code plugin's CodeCard path.
-  inlineCode: ({ className, ...props }: ComponentProps<'code'>) => (
-    <code className={className} dir="ltr" {...props} />
-  ),
+  inlineCode: ({ className, ...props }: ComponentProps<'code'>) => <code className={className} dir="ltr" {...props} />,
   // `---` as quiet spacing, not a heavy full-width rule.
   hr: (_props: ComponentProps<'hr'>) => <div aria-hidden className="my-3" />,
   // Lists and blockquotes: `dir="auto"` so markers/borders follow content

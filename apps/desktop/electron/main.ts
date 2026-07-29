@@ -8174,11 +8174,7 @@ async function startHermes() {
     })
 
     if (prewarmed) {
-      await advanceBootProgress(
-        'backend.watchdog',
-        `Using watchdog prewarmed backend at ${prewarmed.baseUrl}`,
-        50
-      )
+      await advanceBootProgress('backend.watchdog', `Using watchdog prewarmed backend at ${prewarmed.baseUrl}`, 50)
       rememberLog(`Watchdog prewarmed backend ready at ${prewarmed.baseUrl}`)
       await waitForHermes(prewarmed.baseUrl, prewarmed.token)
       updateBootProgress({

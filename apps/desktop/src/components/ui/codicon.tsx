@@ -12,14 +12,7 @@ export interface CodiconProps extends HTMLAttributes<HTMLElement> {
 // Memo: assistant footers / tooltips re-render on stream commits; the glyph
 // props almost never change, so skipping the host element cuts wasted work
 // measured under render-churn (Codicon showed up on the wasted list).
-export const Codicon = memo(function Codicon({
-  className,
-  name,
-  size,
-  spinning,
-  style,
-  ...props
-}: CodiconProps) {
+export const Codicon = memo(function Codicon({ className, name, size, spinning, style, ...props }: CodiconProps) {
   return (
     <i
       aria-hidden="true"
