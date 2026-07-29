@@ -1,10 +1,13 @@
-"""Tests for the pre_gateway_dispatch plugin hook.
+"""Tests for the gateway plugin dispatch and routing hooks.
 
 The hook allows plugins to intercept incoming messages before auth and
 agent dispatch. It runs in _handle_message and acts on returned action
 dicts: {"action": "skip"|"rewrite"|"allow"}.
 """
 
+import ast
+import inspect
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -209,3 +212,51 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+def test_agent_route_hook_precedes_runtime_resolution_and_gets_turn_context():
+    """Route hooks must see the turn before its session runtime is resolved.
+
+    This deliberately inspects only ``_run_agent_inner``: constructing a full
+    gateway would exercise unrelated platform setup, while this pin protects
+    the dispatch order and the hook's local-plugin context contract.
+    """
+    from gateway.run import GatewayRunner
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(GatewayRunner._run_agent_inner)))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+
+    route_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name)
+        and node.func.id == "_invoke_route_hook"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "pre_gateway_agent_route"
+    ]
+    assert len(route_calls) == 1, "_run_agent_inner must invoke pre_gateway_agent_route once"
+    route_call = route_calls[0]
+
+    assert {
+        keyword.arg: keyword.value.id
+        for keyword in route_call.keywords
+        if keyword.arg is not None and isinstance(keyword.value, ast.Name)
+    } == {
+        "message": "message",
+        "source": "source",
+        "session_key": "session_key",
+        "gateway": "self",
+    }
+
+    resolution_calls = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_resolve_session_agent_runtime"
+    ]
+    assert len(resolution_calls) == 1
+    assert route_call.lineno < resolution_calls[0].lineno, (
+        "pre_gateway_agent_route must run before _resolve_session_agent_runtime "
+        "so local plugins can set session-scoped runtime overrides"
+    )

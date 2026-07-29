@@ -171,6 +171,12 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Gateway per-turn routing hook. Fired synchronously inside _run_agent,
+    # after session reset/queue handling and immediately before model and
+    # reasoning resolution. Observer return values are ignored; trusted local
+    # plugins may update session-scoped runtime overrides on the gateway.
+    # Kwargs: message, source, session_key, gateway.
+    "pre_gateway_agent_route",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.

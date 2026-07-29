@@ -334,6 +334,24 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     try:
         return _dispatch(backend, action, args)
     except Exception as e:
+        # A Gateway process can outlive the per-run cua-driver session. In
+        # that case the cached backend still holds the old session id and every
+        # later turn fails with ``session ... has ended``. Dispose that backend
+        # and retry once so the next call gets a fresh MCP connection/session.
+        # Do not retry arbitrary driver errors or user actions indefinitely.
+        stale = "session" in str(e).lower() and "has ended" in str(e).lower()
+        if stale:
+            logger.warning(
+                "computer_use %s hit an ended cua-driver session; recreating backend",
+                action,
+            )
+            _shutdown_backend_atexit()
+            try:
+                fresh_backend = _get_backend()
+                return _dispatch(fresh_backend, action, args)
+            except Exception as retry_exc:
+                logger.exception("computer_use %s failed after session recovery", action)
+                return json.dumps({"error": f"{action} failed after session recovery: {retry_exc}"})
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
 

@@ -73,3 +73,62 @@ class TestAtexitTeardown:
         finally:
             atexit.unregister(cu_tool._shutdown_backend_atexit)
             atexit.register(cu_tool._shutdown_backend_atexit)
+
+
+class TestEndedSessionRecovery:
+    def test_stale_session_recreates_backend_and_retries_once(self):
+        old_backend = MagicMock(name="old_backend")
+        fresh_backend = MagicMock(name="fresh_backend")
+
+        with (
+            patch.object(cu_tool, "_get_backend", side_effect=[old_backend, fresh_backend]),
+            patch.object(
+                cu_tool,
+                "_dispatch",
+                side_effect=[RuntimeError("session abc has ended"), "recovered"],
+            ) as dispatch,
+            patch.object(cu_tool, "_shutdown_backend_atexit") as shutdown,
+        ):
+            result = cu_tool.handle_computer_use({"action": "capture"})
+
+        assert result == "recovered"
+        shutdown.assert_called_once_with()
+        assert dispatch.call_args_list[0].args[:2] == (old_backend, "capture")
+        assert dispatch.call_args_list[1].args[:2] == (fresh_backend, "capture")
+
+    def test_non_stale_error_does_not_retry(self):
+        backend = MagicMock(name="backend")
+
+        with (
+            patch.object(cu_tool, "_get_backend", return_value=backend) as get_backend,
+            patch.object(cu_tool, "_dispatch", side_effect=RuntimeError("driver unavailable")) as dispatch,
+            patch.object(cu_tool, "_shutdown_backend_atexit") as shutdown,
+        ):
+            result = cu_tool.handle_computer_use({"action": "capture"})
+
+        assert "capture failed: driver unavailable" in result
+        get_backend.assert_called_once_with()
+        dispatch.assert_called_once()
+        shutdown.assert_not_called()
+
+    def test_retry_failure_returns_safe_error(self):
+        old_backend = MagicMock(name="old_backend")
+        fresh_backend = MagicMock(name="fresh_backend")
+
+        with (
+            patch.object(cu_tool, "_get_backend", side_effect=[old_backend, fresh_backend]),
+            patch.object(
+                cu_tool,
+                "_dispatch",
+                side_effect=[
+                    RuntimeError("session abc has ended"),
+                    RuntimeError("fresh backend failed"),
+                ],
+            ) as dispatch,
+            patch.object(cu_tool, "_shutdown_backend_atexit") as shutdown,
+        ):
+            result = cu_tool.handle_computer_use({"action": "capture"})
+
+        assert "capture failed after session recovery: fresh backend failed" in result
+        shutdown.assert_called_once_with()
+        assert dispatch.call_count == 2

@@ -21911,6 +21911,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             max_iterations = _current_max_iterations()
 
+            # Route the turn only after session-reset/queue handling and
+            # immediately before runtime resolution. Recursively drained queued
+            # follow-ups pass through this point too, so each actual message gets
+            # its own route without mutating the cached conversation prefix.
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_route_hook
+                _invoke_route_hook(
+                    "pre_gateway_agent_route",
+                    message=message,
+                    source=source,
+                    session_key=session_key,
+                    gateway=self,
+                )
+            except Exception as _route_hook_exc:
+                logger.warning(
+                    "pre_gateway_agent_route invocation failed: %s",
+                    _route_hook_exc,
+                )
+
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
