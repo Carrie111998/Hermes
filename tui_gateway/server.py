@@ -12,9 +12,12 @@ import queue
 import subprocess
 import sys
 import threading
+import asyncio
 import time
 import uuid
 from datetime import datetime
+from gateway.hooks import HookRegistry
+from hermes_cli.config import get_hermes_home
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
@@ -149,6 +152,20 @@ _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
+
+_tui_hook_registry: Optional[HookRegistry] = None
+_tui_hooks_lock = threading.Lock()
+
+
+def _get_tui_hook_registry() -> HookRegistry:
+    global _tui_hook_registry
+    if _tui_hook_registry is None:
+        with _tui_hooks_lock:
+            if _tui_hook_registry is None:
+                registry = HookRegistry()
+                registry.discover_and_load()
+                _tui_hook_registry = registry
+    return _tui_hook_registry
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
@@ -12299,6 +12316,28 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            # ── message:pre_route — hook-driven session redirect ──────────
+            try:
+                _pre_route_ctx = {
+                    "platform": "desktop",
+                    "user_id": "",
+                    "chat_id": session.get("session_key", sid),
+                    "thread_id": None,
+                    "chat_type": "",
+                    "session_id": session.get("session_key", sid),
+                    "session_key": session.get("session_key", sid),
+                    "message": text if isinstance(text, str) else "",
+                }
+                _registry = _get_tui_hook_registry()
+                _pre_route_results = asyncio.run(_registry.emit_collect("message:pre_route", _pre_route_ctx))
+                for _pr in _pre_route_results:
+                    if not isinstance(_pr, dict):
+                        continue
+                    if _pr.get("decision") == "switch_session" and _pr.get("session_id"):
+                        logger.warning("Session switching is not yet supported in TUI path (switch_session target: %s)", _pr.get("session_id"))
+            except Exception as _hook_err:
+                logger.warning("Failed to fire message:pre_route hook in TUI path: %s", _hook_err)
+
             result = agent.run_conversation(run_message, **run_kwargs)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
