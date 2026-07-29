@@ -6309,6 +6309,30 @@ def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
     class ProtocolCodexClient:
         def __init__(self) -> None:
             self.closed = False
+            self._initialized = False
+
+        def initialize(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs == {
+                "capabilities": {"experimentalApi": True},
+                "timeout": 30.0,
+            }
+            self._initialized = True
+            return {}
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, object],
+            *,
+            timeout: float,
+        ) -> dict[str, object]:
+            assert method == "config/read"
+            assert params == {
+                "cwd": str(Path.cwd()),
+                "includeLayers": False,
+            }
+            assert timeout == 30.0
+            return {"config": {"mcp_servers": {}}}
 
         def close(self) -> None:
             self.closed = True
@@ -6412,6 +6436,34 @@ def test_production_sidebar_executor_uses_a_dedicated_codex_transport(
         def __init__(self, name: str) -> None:
             self.name = name
             self.close_count = 0
+            self._initialized = False
+            self.requests: list[tuple[str, dict[str, object], float]] = []
+
+        def initialize(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs == {
+                "capabilities": {"experimentalApi": True},
+                "timeout": 30.0,
+            }
+            self._initialized = True
+            return {}
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, object],
+            *,
+            timeout: float,
+        ) -> dict[str, object]:
+            self.requests.append((method, dict(params), timeout))
+            assert method == "config/read"
+            return {
+                "config": {
+                    "mcp_servers": {
+                        "session_bridge": {"url": "http://127.0.0.1"},
+                        "gbrain": {"url": "http://127.0.0.1"},
+                    }
+                }
+            }
 
         def close(self) -> None:
             self.close_count += 1
@@ -6448,25 +6500,34 @@ def test_production_sidebar_executor_uses_a_dedicated_codex_transport(
 
     try:
         assert backend.sidebar_run_once()["status"] == "idle"
-        registration_client = created[0][1]
-        assert created[0][0] == {
+        normal_client = created[0][1]
+        registration_client = created[1][1]
+        assert created[0][0] == {"codex_bin": "codex"}
+        assert normal_client.requests == [
+            (
+                "config/read",
+                {"cwd": str(Path.cwd()), "includeLayers": False},
+                30.0,
+            )
+        ]
+        assert created[1][0] == {
             "codex_bin": "codex",
-            "extra_args": sidebar_registration_app_server_args(),
+            "extra_args": sidebar_registration_app_server_args(
+                ("gbrain", "session_bridge")
+            ),
         }
         assert captured["native"]._client is registration_client
         assert captured["verifier"]._source_adapter._client is registration_client
         assert backend._codex_client is provider_client
         assert backend._sidebar_registration_codex_client is registration_client
-        assert backend._sidebar_codex_client is None
+        assert backend._sidebar_codex_client is normal_client
 
         fresh_client = captured["native"]._fresh_client_factory()
-        assert created[1][0] == {"codex_bin": "codex"}
-        assert fresh_client is created[1][1]
+        assert created[2][0] == {"codex_bin": "codex"}
+        assert fresh_client is created[2][1]
         fresh_client.close()
 
         terminal = backend._require_sidebar_terminal_delivery()
-        normal_client = created[2][1]
-        assert created[2][0] == {"codex_bin": "codex"}
         assert terminal._client is normal_client
         assert backend._sidebar_codex_client is normal_client
     finally:

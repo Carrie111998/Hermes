@@ -102,7 +102,10 @@ from .sidebar_executor import (
     SidebarExecutor,
 )
 from .sidebar_hydration_executor import SidebarHydrationExecutor
-from .sidebar_runtime import sidebar_registration_app_server_args
+from .sidebar_runtime import (
+    configured_mcp_server_names,
+    sidebar_registration_app_server_args,
+)
 from .store import (
     HYDRATION_FATAL_ERRORS,
     HYDRATION_RETRYABLE_ERRORS,
@@ -3098,9 +3101,12 @@ class ProductionBackend:
             if len(codex_command) != 1:
                 raise RuntimeError("codex_direct_runtime_required")
             if self._sidebar_registration_codex_client is None:
+                registration_args = self._sidebar_registration_runtime_args(
+                    codex_bin=codex_command[0],
+                )
                 self._sidebar_registration_codex_client = CodexAppServerClient(
                     codex_bin=codex_command[0],
-                    extra_args=sidebar_registration_app_server_args(),
+                    extra_args=registration_args,
                 )
             source = CodexSourceAdapter(
                 self._sidebar_registration_codex_client,
@@ -3133,6 +3139,26 @@ class ProductionBackend:
         except Exception as exc:
             self.close()
             raise ConfigurationFailure("sidebar_executor_unavailable") from exc
+
+    def _sidebar_registration_runtime_args(self, *, codex_bin: str) -> list[str]:
+        """Resolve every configured MCP name before launching the lean runtime."""
+
+        if self._sidebar_codex_client is None:
+            self._sidebar_codex_client = CodexAppServerClient(codex_bin=codex_bin)
+        client = self._sidebar_codex_client
+        if not bool(getattr(client, "_initialized", False)):
+            client.initialize(
+                capabilities={"experimentalApi": True},
+                timeout=30.0,
+            )
+        response = client.request(
+            "config/read",
+            {"cwd": str(Path.cwd()), "includeLayers": False},
+            timeout=30.0,
+        )
+        return sidebar_registration_app_server_args(
+            configured_mcp_server_names(response)
+        )
 
     def _require_sidebar_hydration_executor(self) -> SidebarHydrationExecutor:
         if self._sidebar_hydration_executor is not None:
