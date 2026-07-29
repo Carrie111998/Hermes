@@ -2664,6 +2664,24 @@ def _canonicalize_product_ai_provenance(
     if writer_executor is not None:
         _stamp("writer", writer_executor)
     canonical["ai_provenance"] = provenance
+    if step == "review":
+        # Release evidence is read from ``ai_provenance.reviewer``. Reviewer
+        # runs have recorded the same facts at the metadata root instead, in
+        # more than one shape, so canonicalize them here rather than relying
+        # on the worker to author the right keys.
+        verdict, reviewed_branch, reviewed_commit = _reviewer_evidence(canonical)
+        reviewer_facts = provenance.get("reviewer")
+        reviewer_facts = dict(reviewer_facts) if isinstance(reviewer_facts, dict) else {}
+        for key, value in (
+            ("verdict", verdict),
+            ("reviewed_branch", reviewed_branch),
+            ("reviewed_commit", reviewed_commit),
+        ):
+            if value and not str(reviewer_facts.get(key) or "").strip():
+                reviewer_facts[key] = value
+        if reviewer_facts:
+            provenance["reviewer"] = reviewer_facts
+            canonical["ai_provenance"] = provenance
     return canonical
 
 
@@ -12991,6 +13009,46 @@ def _latest_event_of_kind(
     return events[-1] if events else None
 
 
+def _reviewer_evidence(metadata: dict) -> tuple[str, str, str]:
+    """Return ``(verdict, reviewed_branch, reviewed_commit)`` from a review run.
+
+    The canonical location is ``ai_provenance.reviewer``. Reviewer runs have
+    also recorded the same facts at the metadata root, in more than one shape,
+    so those are accepted as fallbacks. This only widens where the values are
+    *read from* — callers still compare them against the release branch and
+    source SHA, so approval stays bound to the exact candidate.
+    """
+    reviewer = _provenance_payload(metadata).get("reviewer")
+    reviewer = reviewer if isinstance(reviewer, dict) else {}
+    candidate = metadata.get("candidate")
+    candidate = candidate if isinstance(candidate, dict) else {}
+    workflow = metadata.get("workflow_outcome")
+    workflow = workflow if isinstance(workflow, dict) else {}
+
+    def _first(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    return (
+        _first(reviewer.get("verdict"), metadata.get("verdict"), workflow.get("verdict")),
+        _first(
+            reviewer.get("reviewed_branch"),
+            metadata.get("reviewed_branch"),
+            metadata.get("branch"),
+            candidate.get("branch"),
+        ),
+        _first(
+            reviewer.get("reviewed_commit"),
+            metadata.get("reviewed_commit"),
+            metadata.get("review_head_sha"),
+            candidate.get("head_sha"),
+        ),
+    )
+
+
 def _latest_approved_review_candidate(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12999,17 +13057,14 @@ def _latest_approved_review_candidate(
     for run in reversed(list_runs(conn, task_id, include_active=False)):
         metadata = run.metadata if isinstance(run.metadata, dict) else {}
         workflow = metadata.get("workflow_outcome")
-        reviewer = _provenance_payload(metadata).get("reviewer")
+        verdict, branch, commit = _reviewer_evidence(metadata)
         if (
             run.step_key == "review"
             and isinstance(workflow, dict)
             and workflow.get("verdict") == "approved"
-            and isinstance(reviewer, dict)
-            and reviewer.get("verdict") == "approved"
+            and verdict == "approved"
             and _reviewer_agent_from_metadata(metadata)
         ):
-            branch = str(reviewer.get("reviewed_branch") or "").strip()
-            commit = str(reviewer.get("reviewed_commit") or "").strip()
             if branch and commit:
                 return branch, commit
     return None
@@ -13047,18 +13102,17 @@ def _release_run_evidence(
             ):
                 test_run = run
         if run.step_key == "review":
-            reviewer = provenance.get("reviewer")
+            verdict, run_branch, run_commit = _reviewer_evidence(metadata)
             if (
                 isinstance(workflow, dict)
                 and workflow.get("verdict") == "approved"
-                and isinstance(reviewer, dict)
-                and reviewer.get("verdict") == "approved"
+                and verdict == "approved"
                 and _reviewer_agent_from_metadata(metadata)
             ):
                 review_run = run
                 reviewer_agent = _reviewer_agent_from_metadata(metadata)
-                reviewed_branch = str(reviewer.get("reviewed_branch") or "").strip()
-                reviewed_commit = str(reviewer.get("reviewed_commit") or "").strip()
+                reviewed_branch = run_branch
+                reviewed_commit = run_commit
                 reviewed_writer_agent = run_writer or writer_agent
 
     missing: list[str] = []
