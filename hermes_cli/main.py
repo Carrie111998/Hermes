@@ -483,6 +483,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.compression import build_compression_parser
 
 
 def _require_tty(command_name: str) -> None:
@@ -5022,12 +5023,49 @@ def cmd_config(args):
     config_command(args)
 
 
-def cmd_skin(args):
-    """Skin management (list / use / set)."""
-    from hermes_cli.skin_cmd import skin_command
+def cmd_compression(args):
+    """Show context-compressor configuration."""
+    from hermes_cli.config import load_config
+    from hermes_cli.subcommands.compression import format_diagnostics
 
-    skin_command(args)
+    config = load_config()
+    if not isinstance(config, dict):
+        config = {}
 
+    compression_cfg = config.get("compression", {})
+    model_cfg = config.get("model", {})
+    provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
+    model = model_cfg.get("default") or model_cfg.get("model") or model_cfg.get("name") if isinstance(model_cfg, dict) else None
+    base_url = model_cfg.get("base_url") if isinstance(model_cfg, dict) else None
+
+    diagnostics = {
+        "model": model,
+        "provider": provider,
+        "base_url": base_url,
+        "context_length": compression_cfg.get("context_length"),
+        "max_tokens": compression_cfg.get("max_tokens"),
+        "threshold_percent": compression_cfg.get("threshold_percent"),
+        "threshold_tokens": compression_cfg.get("threshold_tokens"),
+        "summary_target_ratio": compression_cfg.get("summary_target_ratio"),
+        "tail_token_budget": compression_cfg.get("tail_token_budget"),
+        "max_summary_tokens": compression_cfg.get("max_summary_tokens"),
+        "compression_count": compression_cfg.get("compression_count"),
+        "last_compression_savings_pct": compression_cfg.get("last_compression_savings_pct"),
+        "ineffective_compression_count": compression_cfg.get("ineffective_compression_count"),
+        "summary_failure_cooldown_remaining_seconds": compression_cfg.get("summary_failure_cooldown_remaining_seconds"),
+        "last_summary_error": compression_cfg.get("last_summary_error"),
+        "last_compress_aborted": compression_cfg.get("last_compress_aborted"),
+        "summary_model": compression_cfg.get("summary_model"),
+        "awaiting_real_usage_after_compression": compression_cfg.get("awaiting_real_usage_after_compression"),
+        "last_prompt_tokens": compression_cfg.get("last_prompt_tokens"),
+        "last_real_prompt_tokens": compression_cfg.get("last_real_prompt_tokens"),
+        "last_compression_rough_tokens": compression_cfg.get("last_compression_rough_tokens"),
+        "abort_on_summary_failure": compression_cfg.get("abort_on_summary_failure"),
+        "quiet_mode": compression_cfg.get("quiet_mode"),
+    }
+
+    raw = bool(getattr(args, "raw", False))
+    print(format_diagnostics(diagnostics, raw=raw))
 
 def cmd_backup(args):
     """Back up Hermes home directory to a zip file."""
@@ -12002,9 +12040,9 @@ def main():
     build_config_parser(subparsers, cmd_config=cmd_config)
 
     # =========================================================================
-    # skin command  (parser built in hermes_cli/subcommands/skin.py)
+    # compression command  (parser built in hermes_cli/subcommands/compression.py)
     # =========================================================================
-    build_skin_parser(subparsers, cmd_skin=cmd_skin)
+    build_compression_parser(subparsers, cmd_compression=cmd_compression)
 
     # =========================================================================
     # console command  (parser built in hermes_cli/subcommands/console.py)
