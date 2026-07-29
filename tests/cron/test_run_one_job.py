@@ -372,3 +372,68 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
     assert ok is False
     assert "deliver" not in order
     assert order == ["save-raise", "agent.close", "cleanup_stale"], order
+
+
+# ---------------------------------------------------------------------------
+# BaseException reconciliation (#73973).
+#
+# claim_dispatch() consumes repeat.completed BEFORE the run, so every exit
+# path out of run_one_job() must reconcile the claim via mark_job_run().
+# CancelledError / KeyboardInterrupt / SystemExit are NOT Exception
+# subclasses, so `except Exception` misses them: a one-shot job is left with
+# completed==times and last_run_at==null, the run_claim blocks re-dispatch
+# until its TTL, and the dispatch-limit guard then removes the job with no
+# output at all.
+# ---------------------------------------------------------------------------
+
+
+import asyncio
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "exc", [asyncio.CancelledError, KeyboardInterrupt, SystemExit]
+)
+def test_run_one_job_base_exception_still_marks_failure(monkeypatch, exc):
+    """A cancelled / interrupted run must not leave the claim unreconciled."""
+    def boom(job, *, defer_agent_teardown=None):
+        raise exc()
+
+    monkeypatch.setattr(s, "run_job", boom)
+    marks = []
+    monkeypatch.setattr(
+        s, "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok)),
+    )
+
+    # The abort still propagates — shutdown/cancel semantics are unchanged.
+    with pytest.raises(exc):
+        s.run_one_job({"id": "j7", "name": "t"})
+
+    assert marks == [("j7", False)], (
+        "claim_dispatch() already consumed repeat.completed; the run must be "
+        "marked failed so the job is not wedged and silently dropped"
+    )
+
+
+def test_run_one_job_base_exception_finishes_the_execution_record(monkeypatch):
+    """The execution ledger entry must be closed out too, not left running."""
+    def boom(job, *, defer_agent_teardown=None):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(s, "run_job", boom)
+    monkeypatch.setattr(
+        s, "mark_job_run",
+        lambda jid, ok, err=None, delivery_error=None: None,
+    )
+    finished = []
+    monkeypatch.setattr(
+        s, "finish_execution",
+        lambda eid, success=None, error=None: finished.append((eid, success)),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        s.run_one_job({"id": "j8", "name": "t", "execution_id": "e8"})
+
+    assert finished == [("e8", False)]

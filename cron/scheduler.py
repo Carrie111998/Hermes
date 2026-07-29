@@ -4035,6 +4035,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         finish_execution(execution_id, success=False, error=str(e))
         return False
 
+    except BaseException as e:
+        # CancelledError / KeyboardInterrupt / SystemExit are NOT Exception
+        # subclasses, so they slipped past the handler above — and the inner
+        # teardown handler re-raises them by design. claim_dispatch() has
+        # already consumed ``repeat.completed`` at this point, so skipping the
+        # reconciliation leaves a one-shot job with completed == times and
+        # last_run_at still null: its run_claim blocks re-dispatch until the
+        # TTL expires, and the dispatch-limit guard then drops the job without
+        # ever producing output (#73973). Record the failed run, then re-raise
+        # — cancellation and shutdown semantics are unchanged.
+        _abort_reason = f"aborted: {type(e).__name__}"
+        logger.error("Job %s aborted: %s", job["id"], type(e).__name__)
+        if not _consume_interrupted_flag(job["id"]):
+            mark_job_run(job["id"], False, _abort_reason)
+        finish_execution(execution_id, success=False, error=_abort_reason)
+        raise
+
 
 def _notify_provider_jobs_changed() -> None:
     """Best-effort: tell the active scheduler provider the job set changed.
