@@ -2,14 +2,13 @@
 Integration tests for the desktop boot handshake fix (PR #50231 / issue #50209).
 
 Simulates a slow hermes_cli.gateway import (15-30 s on a fresh Windows install
-with Defender scanning every new .pyc) by patching the two helpers that touch
-the blocking import and measuring event-loop freedom + response latency.
+with Defender scanning every new .pyc) and measures event-loop freedom +
+response latency.
 
 Three scenarios are covered:
 
-1. _lifespan fire-and-forget: patched _warm_gateway_module sleeps N seconds in
-   a thread; TestClient startup must complete in << N seconds (event loop not
-   blocked, HERMES_DASHBOARD_READY would fire immediately).
+1. _lifespan must not launch a gateway prewarm that can retain the GIL and
+   starve health/WebSocket handling despite running in an executor thread.
 
 2. get_status run_in_executor: patched _resolve_restart_drain_timeout sleeps N
    seconds in a thread; a concurrent fast endpoint (/api/version) must respond
@@ -22,6 +21,7 @@ Three scenarios are covered:
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 import threading
 from unittest.mock import patch
@@ -38,9 +38,16 @@ SLOW_SECONDS = 3  # represents the Defender worst-case (scaled down for CI speed
 # ---------------------------------------------------------------------------
 
 def _make_slow_warm(seconds: float):
-    """Return a _warm_gateway_module replacement that sleeps in the caller thread."""
+    """Return a cold-import stand-in that retains the GIL for ``seconds``."""
     def _slow():
-        time.sleep(seconds)
+        old_interval = sys.getswitchinterval()
+        try:
+            sys.setswitchinterval(seconds * 2)
+            deadline = time.perf_counter() + seconds
+            while time.perf_counter() < deadline:
+                pass
+        finally:
+            sys.setswitchinterval(old_interval)
     return _slow
 
 
@@ -53,30 +60,32 @@ def _make_slow_drain(seconds: float):
 
 
 # ---------------------------------------------------------------------------
-# Test 1 — _lifespan fire-and-forget does not block the event loop
+# Test 1 — lifespan does not start a GIL-holding gateway prewarm
 # ---------------------------------------------------------------------------
 
-def test_lifespan_warmup_is_nonblocking():
+def test_lifespan_does_not_start_gil_holding_gateway_warmup():
     """
-    _warm_gateway_module runs in an executor (fire-and-forget).
-    Even if it sleeps for SLOW_SECONDS, TestClient startup must complete
-    in well under that time — proving the event loop was never blocked and
-    HERMES_DASHBOARD_READY would have fired without delay.
+    A worker thread is not an isolation boundary for GIL-holding imports.
+    Health must respond without waiting for the synthetic cold import.
     """
     from fastapi.testclient import TestClient
 
-    with patch.object(web_server_mod, "_warm_gateway_module", _make_slow_warm(SLOW_SECONDS)):
+    with patch.object(
+        web_server_mod,
+        "_warm_gateway_module",
+        _make_slow_warm(SLOW_SECONDS),
+        create=True,
+    ):
         t0 = time.perf_counter()
-        with TestClient(web_server_mod.app, raise_server_exceptions=False) as _client:
-            startup_ms = (time.perf_counter() - t0) * 1000
+        with TestClient(web_server_mod.app, raise_server_exceptions=False) as client:
+            response = client.get("/api/health")
+        health_ms = (time.perf_counter() - t0) * 1000
 
-    # Startup must complete in under half of SLOW_SECONDS (generous margin).
-    # If the import were synchronous, startup would block for >= SLOW_SECONDS.
+    assert response.status_code == 200
     threshold_ms = (SLOW_SECONDS * 1000) / 2
-    assert startup_ms < threshold_ms, (
-        f"_lifespan blocked the event loop: startup took {startup_ms:.0f} ms "
-        f"but slow import is {SLOW_SECONDS * 1000:.0f} ms — "
-        f"fire-and-forget is not working."
+    assert health_ms < threshold_ms, (
+        f"gateway prewarm starved the health path for {health_ms:.0f} ms; "
+        "executor threads do not isolate GIL-holding imports"
     )
 
 
