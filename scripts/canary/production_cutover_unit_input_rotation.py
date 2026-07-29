@@ -90,12 +90,32 @@ RECEIPT_FILE_NAME = "rotation-receipt.json"
 PREDECESSOR_DIRECTORY_NAME = "predecessor"
 PRODUCTION_STAGED_ROOT = Path("/var/lib/muncho-production-legacy-cutover/staged")
 MAX_FILE = 16 * 1024 * 1024
+_RELEASE_PREPARE_PENDING_NAMES = frozenset({
+    TRANSACTION_FILE_NAME,
+    PUBLICATION_FILE_NAME,
+    RELEASE_UPDATE_PUBLICATION_FILE_NAME,
+    PREDECESSOR_TRUST_FILE_NAME,
+    package.STAGED_UNIT_INPUT_PLAN_PATH.name,
+    package.STAGED_UNIT_INPUT_APPROVAL_PATH.name,
+    package.FIXED_UNIT_INPUTS_PATH.name,
+    PREPARED_RECEIPT_FILE_NAME,
+})
+_RELEASE_PREAUTHORIZE_PENDING_NAMES = frozenset({
+    MUTATION_BEGIN_FILE_NAME,
+})
+_RELEASE_FINALIZE_PENDING_NAMES = frozenset({
+    ACTIVATION_BEGIN_FILE_NAME,
+    RECEIPT_FILE_NAME,
+})
+_RELEASE_ABORT_PENDING_NAMES = frozenset({
+    ABORT_RECEIPT_FILE_NAME,
+})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TRANSACTION_DIRECTORY = re.compile(r"^[0-9a-f]{64}-[0-9a-f]{64}$")
 _TEMPORARY_SUFFIX = re.compile(r"^[1-9][0-9]*$")
-_AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _MAX_TEMPORARY_ALIASES = 64
+_PENDING_TEMPORARY_MODE = 0o600
 _TRANSACTION_FIELDS = frozenset({
     "schema",
     "predecessor_revision",
@@ -598,6 +618,164 @@ def _heal_same_inode_aliases(
         raise UnitInputRotationError("unit_input_rotation_write_failed") from exc
 
 
+def _require_no_temporary_extended_metadata(path: Path) -> None:
+    listxattr = getattr(os, "listxattr", None)
+    if listxattr is None:
+        if sys.platform.startswith("linux"):
+            raise UnitInputRotationError(
+                "unit_input_rotation_conflict"
+            )
+        return
+    try:
+        attributes = listxattr(path, follow_symlinks=False)
+    except OSError as exc:
+        raise UnitInputRotationError("unit_input_rotation_conflict") from exc
+    if attributes:
+        raise UnitInputRotationError("unit_input_rotation_conflict")
+
+
+def _pending_temporary_identity(
+    path: Path,
+    *,
+    uid: int,
+    gid: int,
+    final_mode: int,
+) -> tuple[int, ...] | None:
+    try:
+        item = path.lstat()
+        observed_mode = stat.S_IMODE(item.st_mode)
+        pending_mode = observed_mode == _PENDING_TEMPORARY_MODE
+        if not pending_mode:
+            return None
+        if (
+            path.resolve(strict=True) != path
+            or stat.S_ISLNK(item.st_mode)
+            or not stat.S_ISREG(item.st_mode)
+            or item.st_nlink != 1
+            or item.st_uid != uid
+            or item.st_gid != gid
+            or not 0 <= item.st_size <= MAX_FILE
+        ):
+            raise UnitInputRotationError(
+                "unit_input_rotation_conflict"
+            )
+        _require_no_temporary_extended_metadata(path)
+        return _identity(item)
+    except UnitInputRotationError:
+        raise
+    except OSError as exc:
+        raise UnitInputRotationError(
+            "unit_input_rotation_conflict"
+        ) from exc
+
+
+def _remove_pending_temporary(
+    path: Path,
+    *,
+    uid: int,
+    gid: int,
+    final_mode: int,
+) -> bool:
+    identity = _pending_temporary_identity(
+        path,
+        uid=uid,
+        gid=gid,
+        final_mode=final_mode,
+    )
+    if identity is None:
+        return False
+    try:
+        current = path.lstat()
+        if _identity(current) != identity:
+            raise UnitInputRotationError(
+                "unit_input_rotation_conflict"
+            )
+        path.unlink()
+        cutover.activation._fsync_directory(path.parent)
+    except UnitInputRotationError:
+        raise
+    except OSError as exc:
+        raise UnitInputRotationError(
+            "unit_input_rotation_conflict"
+        ) from exc
+    return True
+
+
+def _prune_unpublished_pending_temporary(
+    path: Path,
+    *,
+    uid: int,
+    gid: int,
+    final_mode: int,
+) -> bool:
+    if os.path.lexists(path):
+        return False
+    candidates = _reserved_temporaries(path)
+    own_prefix = f".{path.name}.rotate."
+    own = [
+        candidate
+        for candidate in candidates
+        if candidate.name.startswith(own_prefix)
+    ]
+    if not candidates:
+        return False
+    if len(candidates) != 1 or candidates != own:
+        raise UnitInputRotationError("unit_input_rotation_conflict")
+    return _remove_pending_temporary(
+        candidates[0],
+        uid=uid,
+        gid=gid,
+        final_mode=final_mode,
+    )
+
+
+def _fsync_exact_temporary(
+    path: Path,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> None:
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            path.resolve(strict=True) != path
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != uid
+            or before.st_gid != gid
+            or stat.S_IMODE(before.st_mode) != mode
+            or _identity(before) != _identity(opened)
+        ):
+            raise UnitInputRotationError(
+                "unit_input_rotation_conflict"
+            )
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        reachable = path.lstat()
+        if (
+            _identity(before) != _identity(after)
+            or _identity(before) != _identity(reachable)
+        ):
+            raise UnitInputRotationError(
+                "unit_input_rotation_conflict"
+            )
+    except UnitInputRotationError:
+        raise
+    except OSError as exc:
+        raise UnitInputRotationError(
+            "unit_input_rotation_write_failed"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _recover_temporary_aliases(
     path: Path,
     payload: bytes,
@@ -606,6 +784,12 @@ def _recover_temporary_aliases(
     gid: int,
     mode: int,
 ) -> Path:
+    _prune_unpublished_pending_temporary(
+        path,
+        uid=uid,
+        gid=gid,
+        final_mode=mode,
+    )
     candidates = _reserved_temporaries(
         path,
         tags=("stage", "bootstrap", "rotate"),
@@ -643,10 +827,32 @@ def _recover_temporary_aliases(
     )
     if observed != payload:
         raise UnitInputRotationError("unit_input_rotation_conflict")
+    _require_no_temporary_extended_metadata(candidates[0])
+    _fsync_exact_temporary(
+        candidates[0],
+        uid=uid,
+        gid=gid,
+        mode=mode,
+    )
     return candidates[0]
 
 
-def _rename_noreplace(source: Path, destination: Path) -> bool:
+def _rename_noreplace(
+    source: Path,
+    destination: Path,
+    *,
+    directory_fd: int,
+    expected_identity: tuple[int, int],
+) -> bool:
+    if source.parent != destination.parent:
+        raise OSError(errno.EXDEV, "unit-input rotation parent mismatch")
+    source_state = os.stat(
+        source.name,
+        dir_fd=directory_fd,
+        follow_symlinks=False,
+    )
+    if (source_state.st_dev, source_state.st_ino) != expected_identity:
+        raise UnitInputRotationError("unit_input_rotation_conflict")
     if sys.platform.startswith("linux"):
         try:
             renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
@@ -665,10 +871,10 @@ def _rename_noreplace(source: Path, destination: Path) -> bool:
         renameat2.restype = ctypes.c_int
         ctypes.set_errno(0)
         result = renameat2(
-            _AT_FDCWD,
-            os.fsencode(source),
-            _AT_FDCWD,
-            os.fsencode(destination),
+            directory_fd,
+            os.fsencode(source.name),
+            directory_fd,
+            os.fsencode(destination.name),
             _RENAME_NOREPLACE,
         )
         if result == 0:
@@ -678,7 +884,13 @@ def _rename_noreplace(source: Path, destination: Path) -> bool:
             return False
         raise OSError(number, os.strerror(number), destination)
     try:
-        os.link(source, destination, follow_symlinks=False)
+        os.link(
+            source.name,
+            destination.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
     except FileExistsError:
         return False
     return True
@@ -702,25 +914,53 @@ def _install_exact(
     )
     created = False
     descriptor: int | None = None
+    directory_descriptor: int | None = None
     temporary_identity: tuple[int, int] | None = None
+    checkpoint_prefix = f"install_exact:{path.name}"
     try:
+        parent_before = path.parent.lstat()
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_descriptor = os.open(path.parent, directory_flags)
+        parent_opened = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(parent_opened.st_mode)
+            or _identity(parent_before) != _identity(parent_opened)
+        ):
+            raise UnitInputRotationError(
+                "unit_input_rotation_directory_invalid"
+            )
         if not os.path.lexists(path):
             if not os.path.lexists(temporary):
                 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                 flags |= getattr(os, "O_CLOEXEC", 0)
                 flags |= getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(temporary, flags, 0o600)
+                descriptor = os.open(
+                    temporary.name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
                 opened = os.fstat(descriptor)
                 temporary_identity = (opened.st_dev, opened.st_ino)
                 os.fchown(descriptor, uid, gid)
+                os.fchmod(descriptor, _PENDING_TEMPORARY_MODE)
+                _checkpoint(f"{checkpoint_prefix}:temporary_created")
                 view = memoryview(payload)
                 while view:
                     written = os.write(descriptor, view)
                     if written <= 0:
                         raise OSError("short unit-input rotation write")
                     view = view[written:]
+                    _checkpoint(
+                        f"{checkpoint_prefix}:temporary_write_progress"
+                    )
+                _checkpoint(f"{checkpoint_prefix}:temporary_written")
                 os.fchmod(descriptor, mode)
+                _checkpoint(f"{checkpoint_prefix}:temporary_chmod")
                 os.fsync(descriptor)
+                _checkpoint(f"{checkpoint_prefix}:temporary_fsynced")
                 os.close(descriptor)
                 descriptor = None
             temporary_payload = _read_exact(
@@ -737,22 +977,100 @@ def _install_exact(
             )
             if temporary_payload != payload:
                 raise UnitInputRotationError("unit_input_rotation_conflict")
-            created = _rename_noreplace(temporary, path)
-            if os.path.lexists(temporary):
-                current = temporary.lstat()
-                if (current.st_dev, current.st_ino) != temporary_identity:
+            if temporary_identity is None:
+                raise UnitInputRotationError(
+                    "unit_input_rotation_conflict"
+                )
+            # The canonical activation lock plus this owner-only 0700
+            # directory is the writer concurrency boundary.  The retained
+            # dirfd anchors both names; bind the source inode immediately
+            # before publication and require the destination to be that same
+            # inode.  A violated boundary is rolled back without accepting the
+            # substituted destination.
+            created = _rename_noreplace(
+                temporary,
+                path,
+                directory_fd=directory_descriptor,
+                expected_identity=temporary_identity,
+            )
+            _checkpoint(f"{checkpoint_prefix}:destination_installed")
+            if created:
+                installed = os.stat(
+                    path.name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    installed.st_dev,
+                    installed.st_ino,
+                ) != temporary_identity:
+                    installed_identity = (
+                        installed.st_dev,
+                        installed.st_ino,
+                    )
+                    current = os.stat(
+                        path.name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        current.st_dev,
+                        current.st_ino,
+                    ) != installed_identity:
+                        raise UnitInputRotationError(
+                            "unit_input_rotation_conflict"
+                        )
+                    os.unlink(
+                        path.name,
+                        dir_fd=directory_descriptor,
+                    )
+                    os.fsync(directory_descriptor)
                     raise UnitInputRotationError("unit_input_rotation_conflict")
-                temporary.unlink()
-            cutover.activation._fsync_directory(path.parent)
-        observed = _read_exact(
-            path,
-            uid=uid,
-            gid=gid,
-            mode=mode,
-            maximum=max(MAX_FILE, len(payload)),
-        )
-        if observed != payload:
-            raise UnitInputRotationError("unit_input_rotation_conflict")
+                os.fsync(directory_descriptor)
+            observed = _read_exact(
+                path,
+                uid=uid,
+                gid=gid,
+                mode=mode,
+                maximum=max(MAX_FILE, len(payload)),
+            )
+            if observed != payload:
+                raise UnitInputRotationError(
+                    "unit_input_rotation_conflict"
+                )
+            try:
+                current = os.stat(
+                    temporary.name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                current = None
+            if current is not None:
+                if (
+                    current.st_dev,
+                    current.st_ino,
+                ) != temporary_identity:
+                    raise UnitInputRotationError(
+                        "unit_input_rotation_conflict"
+                    )
+                os.unlink(
+                    temporary.name,
+                    dir_fd=directory_descriptor,
+                )
+                os.fsync(directory_descriptor)
+        else:
+            observed = _read_exact(
+                path,
+                uid=uid,
+                gid=gid,
+                mode=mode,
+                maximum=max(MAX_FILE, len(payload)),
+            )
+            if observed != payload:
+                raise UnitInputRotationError(
+                    "unit_input_rotation_conflict"
+                )
     except UnitInputRotationError:
         raise
     except OSError as exc:
@@ -760,15 +1078,8 @@ def _install_exact(
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        try:
-            current = temporary.lstat()
-            if temporary_identity is not None and (
-                current.st_dev,
-                current.st_ino,
-            ) == temporary_identity:
-                temporary.unlink()
-        except (FileNotFoundError, OSError):
-            pass
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
     return created
 
 
@@ -3559,11 +3870,222 @@ def _release_validate_inventory_alias_groups(
             )
 
 
+def _release_inventory_observation(
+    child: Path,
+    *,
+    expected_modes: Mapping[str, int],
+    uid: int,
+    gid: int,
+) -> tuple[str, bool]:
+    logical_name = child.name
+    temporary = False
+    if logical_name not in expected_modes:
+        matched: str | None = None
+        for name in expected_modes:
+            prefix = f".{name}.rotate."
+            if not logical_name.startswith(prefix):
+                continue
+            suffix = logical_name[len(prefix) :]
+            if _TEMPORARY_SUFFIX.fullmatch(suffix) is None:
+                break
+            matched = name
+            temporary = True
+            break
+        if matched is None:
+            raise UnitInputRotationError(
+                "unit_input_rotation_audit_invalid"
+            )
+        logical_name = matched
+    try:
+        item = child.lstat()
+    except OSError as exc:
+        raise UnitInputRotationError(
+            "unit_input_rotation_audit_invalid"
+        ) from exc
+    mode = stat.S_IMODE(item.st_mode)
+    pending = (
+        temporary
+        and mode == _PENDING_TEMPORARY_MODE
+        and 0 <= item.st_size <= MAX_FILE
+    )
+    sealed = mode == expected_modes[logical_name] and (
+        0 < item.st_size <= MAX_FILE
+    )
+    if (
+        child.resolve(strict=True) != child
+        or stat.S_ISLNK(item.st_mode)
+        or not stat.S_ISREG(item.st_mode)
+        or item.st_uid != uid
+        or item.st_gid != gid
+        or not (pending or sealed)
+        or (pending and item.st_nlink != 1)
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_audit_invalid"
+        )
+    _release_require_no_extended_metadata(child, uid=uid, gid=gid)
+    return logical_name, pending
+
+
+def _release_prune_valid_pending_leaf(
+    transaction_path: Path,
+    *,
+    file_modes: Mapping[str, int],
+    predecessor_modes: Mapping[str, int],
+    recover_pending_names: frozenset[str],
+    uid: int,
+    gid: int,
+) -> None:
+    predecessor_root = transaction_path / PREDECESSOR_DIRECTORY_NAME
+    try:
+        outer_children = sorted(transaction_path.iterdir())
+    except OSError as exc:
+        raise UnitInputRotationError(
+            "unit_input_rotation_audit_invalid"
+        ) from exc
+    predecessor_present = os.path.lexists(predecessor_root)
+    predecessor_children: list[Path] = []
+    if predecessor_present:
+        _require_directory(predecessor_root, uid=uid, gid=gid)
+        _release_require_no_extended_metadata(
+            predecessor_root,
+            uid=uid,
+            gid=gid,
+        )
+        try:
+            predecessor_children = sorted(predecessor_root.iterdir())
+        except OSError as exc:
+            raise UnitInputRotationError(
+                "unit_input_rotation_audit_invalid"
+            ) from exc
+
+    observed: set[str] = set()
+    pending: list[tuple[str, Path, int]] = []
+    groups: dict[str, list[Path]] = {}
+
+    def observe(
+        child: Path,
+        *,
+        location: str,
+        expected_modes: Mapping[str, int],
+    ) -> None:
+        logical, is_pending = _release_inventory_observation(
+            child,
+            expected_modes=expected_modes,
+            uid=uid,
+            gid=gid,
+        )
+        key = f"{location}:{logical}"
+        observed.add(key)
+        groups.setdefault(key, []).append(child)
+        if is_pending:
+            pending.append((key, child, expected_modes[logical]))
+
+    for child in outer_children:
+        if child.name == PREDECESSOR_DIRECTORY_NAME:
+            continue
+        observe(child, location="outer", expected_modes=file_modes)
+    for child in predecessor_children:
+        observe(
+            child,
+            location="predecessor",
+            expected_modes=predecessor_modes,
+        )
+
+    for key, paths in groups.items():
+        pending_paths = [
+            path
+            for path in paths
+            if any(path == candidate for _, candidate, _ in pending)
+        ]
+        if pending_paths:
+            if len(paths) != 1:
+                raise UnitInputRotationError(
+                    "unit_input_rotation_audit_invalid"
+                )
+            continue
+        logical = key.split(":", 1)[1]
+        _release_validate_inventory_alias_groups({logical: paths})
+
+    if not pending:
+        return
+    if len(pending) != 1:
+        raise UnitInputRotationError(
+            "unit_input_rotation_audit_invalid"
+        )
+
+    base = [
+        f"outer:{TRANSACTION_FILE_NAME}",
+        f"outer:{PUBLICATION_FILE_NAME}",
+        f"outer:{RELEASE_UPDATE_PUBLICATION_FILE_NAME}",
+        f"outer:{PREDECESSOR_TRUST_FILE_NAME}",
+    ]
+    predecessor = [
+        f"predecessor:{name}" for name in predecessor_modes
+    ]
+    prepared = f"outer:{PREPARED_RECEIPT_FILE_NAME}"
+    mutation = f"outer:{MUTATION_BEGIN_FILE_NAME}"
+    activation = f"outer:{ACTIVATION_BEGIN_FILE_NAME}"
+    aborted = f"outer:{ABORT_RECEIPT_FILE_NAME}"
+    final = f"outer:{RECEIPT_FILE_NAME}"
+    next_leaf: dict[frozenset[str], set[str]] = {}
+    for index, name in enumerate(base):
+        next_leaf[frozenset(base[:index])] = {name}
+    complete_base = frozenset(base)
+    for index, name in enumerate(predecessor):
+        next_leaf[
+            frozenset({*complete_base, *predecessor[:index]})
+        ] = {name}
+    complete_predecessor = frozenset({*complete_base, *predecessor})
+    next_leaf[complete_predecessor] = {prepared}
+    prepared_state = frozenset({*complete_predecessor, prepared})
+    next_leaf[prepared_state] = {mutation}
+    mutation_state = frozenset({*prepared_state, mutation})
+    next_leaf[mutation_state] = {activation, aborted}
+    activation_state = frozenset({*mutation_state, activation})
+    next_leaf[activation_state] = {final}
+
+    pending_key, pending_path, final_mode = pending[0]
+    pending_name = pending_key.split(":", 1)[1]
+    durable_state = frozenset(observed - {pending_key})
+    if (
+        pending_name not in recover_pending_names
+        or pending_key not in next_leaf.get(durable_state, set())
+        or (
+            predecessor_present
+            and not complete_base.issubset(durable_state)
+        )
+        or (
+            not predecessor_present
+            and pending_key.startswith("predecessor:")
+        )
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_audit_invalid"
+        )
+    try:
+        removed = _remove_pending_temporary(
+            pending_path,
+            uid=uid,
+            gid=gid,
+            final_mode=final_mode,
+        )
+    except UnitInputRotationError as exc:
+        raise UnitInputRotationError(
+            "unit_input_rotation_audit_invalid"
+        ) from exc
+    if not removed:
+        raise UnitInputRotationError(
+            "unit_input_rotation_audit_invalid"
+        )
+
+
 def _require_release_transaction_inventory(
     path: Path,
     *,
     uid: int,
     gid: int,
+    recover_pending_names: frozenset[str] = frozenset(),
 ) -> None:
     """Validate every allowed crash-state inventory and nothing else."""
 
@@ -3580,6 +4102,19 @@ def _require_release_transaction_inventory(
         ABORT_RECEIPT_FILE_NAME: 0o400,
         RECEIPT_FILE_NAME: 0o400,
     }
+    predecessor_modes = {
+        package.STAGED_UNIT_INPUT_PLAN_PATH.name: 0o400,
+        package.STAGED_UNIT_INPUT_APPROVAL_PATH.name: 0o400,
+        package.FIXED_UNIT_INPUTS_PATH.name: package.FIXED_UNIT_INPUTS_MODE,
+    }
+    _release_prune_valid_pending_leaf(
+        path,
+        file_modes=file_modes,
+        predecessor_modes=predecessor_modes,
+        recover_pending_names=recover_pending_names,
+        uid=uid,
+        gid=gid,
+    )
     try:
         children = sorted(path.iterdir())
     except OSError as exc:
@@ -3623,11 +4158,6 @@ def _require_release_transaction_inventory(
     allowed_outer: list[set[str]] = [
         set(base[:index]) for index in range(len(base) + 1)
     ]
-    predecessor_modes = {
-        package.STAGED_UNIT_INPUT_PLAN_PATH.name: 0o400,
-        package.STAGED_UNIT_INPUT_APPROVAL_PATH.name: 0o400,
-        package.FIXED_UNIT_INPUTS_PATH.name: package.FIXED_UNIT_INPUTS_MODE,
-    }
     predecessor_sequence = list(predecessor_modes)
     predecessor_names: set[str] = set()
     if predecessor_present:
@@ -3712,6 +4242,7 @@ def _release_transaction_directories(
     *,
     uid: int,
     gid: int,
+    recover_pending_names: frozenset[str] = frozenset(),
 ) -> list[Path]:
     _release_require_no_extended_metadata(root, uid=uid, gid=gid)
     directories = _transaction_directories(root, uid=uid, gid=gid)
@@ -3725,6 +4256,7 @@ def _release_transaction_directories(
             directory,
             uid=uid,
             gid=gid,
+            recover_pending_names=recover_pending_names,
         )
     return directories
 
@@ -3734,8 +4266,14 @@ def _load_release_transaction(
     *,
     uid: int,
     gid: int,
+    recover_pending_names: frozenset[str] = frozenset(),
 ) -> Mapping[str, Any] | None:
-    _require_release_transaction_inventory(path, uid=uid, gid=gid)
+    _require_release_transaction_inventory(
+        path,
+        uid=uid,
+        gid=gid,
+        recover_pending_names=recover_pending_names,
+    )
     transaction_path = path / TRANSACTION_FILE_NAME
     if not os.path.lexists(transaction_path):
         return None
@@ -5322,11 +5860,15 @@ def _prepare_release_unit_input_authority_rotation(
                 root,
                 uid=uid,
                 gid=gid,
+                recover_pending_names=_RELEASE_PREPARE_PENDING_NAMES,
             ):
                 transaction = _load_release_transaction(
                     directory,
                     uid=uid,
                     gid=gid,
+                    recover_pending_names=(
+                        _RELEASE_PREPARE_PENDING_NAMES
+                    ),
                 )
                 if (
                     transaction is not None
@@ -5845,10 +6387,20 @@ def _preauthorize_prepared_release_unit_input_authority_rotation(
             )
             transaction_path = Path(supplied["audit_transaction_path"])
             _require_directory(transaction_path, uid=uid, gid=gid)
+            if _release_logical_file_present(
+                transaction_path,
+                ABORT_RECEIPT_FILE_NAME,
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_preauthorization_aborted"
+                )
             transaction = _load_release_transaction(
                 transaction_path,
                 uid=uid,
                 gid=gid,
+                recover_pending_names=(
+                    _RELEASE_PREAUTHORIZE_PENDING_NAMES
+                ),
             )
             if (
                 transaction is None
@@ -6059,10 +6611,18 @@ def _finalize_preauthorized_release_unit_input_authority_rotation(
                 supplied_prepared["audit_transaction_path"]
             )
             _require_directory(transaction_path, uid=uid, gid=gid)
+            if _release_logical_file_present(
+                transaction_path,
+                ABORT_RECEIPT_FILE_NAME,
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_preauthorization_aborted"
+                )
             transaction = _load_release_transaction(
                 transaction_path,
                 uid=uid,
                 gid=gid,
+                recover_pending_names=_RELEASE_FINALIZE_PENDING_NAMES,
             )
             if (
                 transaction is None
@@ -6270,10 +6830,24 @@ def _abort_preauthorized_release_unit_input_authority_rotation(
                 supplied_prepared["audit_transaction_path"]
             )
             _require_directory(transaction_path, uid=uid, gid=gid)
+            if (
+                _release_logical_file_present(
+                    transaction_path,
+                    ACTIVATION_BEGIN_FILE_NAME,
+                )
+                or _release_logical_file_present(
+                    transaction_path,
+                    RECEIPT_FILE_NAME,
+                )
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_abort_authorization_invalid"
+                )
             transaction = _load_release_transaction(
                 transaction_path,
                 uid=uid,
                 gid=gid,
+                recover_pending_names=_RELEASE_ABORT_PENDING_NAMES,
             )
             if (
                 transaction is None

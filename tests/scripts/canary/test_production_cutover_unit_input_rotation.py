@@ -333,6 +333,100 @@ def _downgrade_finalized_release_evidence_to_legacy_v4(
     return legacy
 
 
+class _SimulatedInstallPowerLoss(BaseException):
+    pass
+
+
+def _temporary_aliases(path: Path) -> list[Path]:
+    prefix = f".{path.name}.rotate."
+    return sorted(
+        child
+        for child in path.parent.iterdir()
+        if child.name.startswith(prefix)
+    )
+
+
+def _inject_install_power_loss(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target: Path,
+    boundary: str,
+) -> None:
+    checkpoint = {
+        "create": "temporary_created",
+        "partial_write": "temporary_write_progress",
+        "write": "temporary_written",
+        "chmod": "temporary_chmod",
+        "fsync": "temporary_fsynced",
+        "rename": "destination_installed",
+        "link": "destination_installed",
+    }[boundary]
+    expected = f"install_exact:{target.name}:{checkpoint}"
+
+    def crash(stage: str) -> None:
+        if stage == expected:
+            raise _SimulatedInstallPowerLoss
+
+    monkeypatch.setattr(rotation, "_checkpoint", crash)
+    if boundary == "partial_write":
+        write = rotation.os.write
+
+        def short_write(descriptor: int, value: Any) -> int:
+            view = memoryview(value)
+            return write(
+                descriptor,
+                view[: max(1, len(view) // 2)],
+            )
+
+        monkeypatch.setattr(rotation.os, "write", short_write)
+    if boundary in {"rename", "link"}:
+
+        def install(
+            source: Path,
+            destination: Path,
+            *,
+            directory_fd: int,
+            expected_identity: tuple[int, int],
+        ) -> bool:
+            observed = os.stat(
+                source.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            assert (observed.st_dev, observed.st_ino) == expected_identity
+            if boundary == "rename":
+                try:
+                    os.stat(
+                        destination.name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    return False
+                os.rename(
+                    source.name,
+                    destination.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+            else:
+                try:
+                    os.link(
+                        source.name,
+                        destination.name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    return False
+            return True
+
+        monkeypatch.setattr(rotation, "_rename_noreplace", install)
+
+
 def test_prepare_persists_exact_authorization_without_live_mutation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1141,6 +1235,596 @@ def test_release_v5_ignores_legacy_evidence_but_rejects_mixed_live_state(
     v5_root = cutover.EVIDENCE_ROOT / v5_root_name
     assert not v5_root.exists() or list(v5_root.iterdir()) == []
     assert _tree_snapshot(legacy_root) == legacy_before
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    ("preauthorization", "activation_begin", "abort", "final_receipt"),
+)
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "create",
+        "partial_write",
+        "write",
+        "chmod",
+        "fsync",
+        "rename",
+        "link",
+    ),
+)
+def test_release_marker_install_recovers_every_syscall_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    artifact: str,
+    boundary: str,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    preauthorization: dict[str, Any] | None = None
+    if artifact != "preauthorization":
+        preauthorization = _preauthorize_release(
+            documents,
+            trusted,
+            prepared,
+            now=now,
+        )
+    target_name = {
+        "preauthorization": rotation.MUTATION_BEGIN_FILE_NAME,
+        "activation_begin": rotation.ACTIVATION_BEGIN_FILE_NAME,
+        "abort": rotation.ABORT_RECEIPT_FILE_NAME,
+        "final_receipt": rotation.RECEIPT_FILE_NAME,
+    }[artifact]
+    target = Path(prepared["audit_transaction_path"]) / target_name
+    before = _live_triplet()
+
+    with monkeypatch.context() as crash_patch:
+        _inject_install_power_loss(
+            crash_patch,
+            target=target,
+            boundary=boundary,
+        )
+        with pytest.raises(_SimulatedInstallPowerLoss):
+            if artifact == "preauthorization":
+                _preauthorize_release(
+                    documents,
+                    trusted,
+                    prepared,
+                    now=now,
+                )
+            elif artifact == "abort":
+                assert preauthorization is not None
+                _abort_preauthorized_release(
+                    documents,
+                    trusted,
+                    prepared,
+                    preauthorization,
+                )
+            else:
+                assert preauthorization is not None
+                _finalize_preauthorized_release(
+                    documents,
+                    trusted,
+                    prepared,
+                    preauthorization,
+                )
+
+    if boundary in {"create", "partial_write", "write"}:
+        aliases = _temporary_aliases(target)
+        assert len(aliases) == 1
+        assert stat.S_IMODE(aliases[0].stat().st_mode) == 0o600
+    elif boundary in {"chmod", "fsync"}:
+        aliases = _temporary_aliases(target)
+        assert len(aliases) == 1
+        assert stat.S_IMODE(aliases[0].stat().st_mode) == 0o400
+    elif boundary == "rename":
+        assert target.exists()
+        assert _temporary_aliases(target) == []
+    else:
+        aliases = _temporary_aliases(target)
+        assert target.exists()
+        assert len(aliases) == 1
+        assert target.stat().st_ino == aliases[0].stat().st_ino
+        assert target.stat().st_nlink == 2
+
+    if artifact == "preauthorization":
+        recovered = _preauthorize_release(
+            documents,
+            trusted,
+            prepared,
+            now=now,
+        )
+        assert recovered["schema"] == rotation.RELEASE_MUTATION_BEGIN_SCHEMA
+        assert _live_triplet() == before
+    elif artifact == "abort":
+        assert preauthorization is not None
+        recovered = _abort_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+        assert recovered["schema"] == rotation.RELEASE_ABORTED_RECEIPT_SCHEMA
+        assert _live_triplet() == before
+    else:
+        assert preauthorization is not None
+        recovered = _finalize_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+        assert recovered["schema"] == rotation.RELEASE_FINALIZED_RECEIPT_SCHEMA
+    assert target.exists()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o400
+    assert _temporary_aliases(target) == []
+
+
+def test_release_prepare_cannot_prune_activation_branch_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    preauthorization = _preauthorize_release(
+        documents,
+        trusted,
+        prepared,
+        now=now,
+    )
+    transaction = Path(prepared["audit_transaction_path"])
+    activation = transaction / rotation.ACTIVATION_BEGIN_FILE_NAME
+
+    with monkeypatch.context() as crash_patch:
+        _inject_install_power_loss(
+            crash_patch,
+            target=activation,
+            boundary="create",
+        )
+        with pytest.raises(_SimulatedInstallPowerLoss):
+            _finalize_preauthorized_release(
+                documents,
+                trusted,
+                prepared,
+                preauthorization,
+            )
+
+    pending = _temporary_aliases(activation)
+    assert len(pending) == 1
+    identity = (pending[0].stat().st_dev, pending[0].stat().st_ino)
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_audit_invalid",
+    ):
+        _prepare_release(documents, trusted, now=now)
+    assert (
+        pending[0].stat().st_dev,
+        pending[0].stat().st_ino,
+    ) == identity
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_abort_authorization_invalid",
+    ):
+        _abort_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+    assert (
+        pending[0].stat().st_dev,
+        pending[0].stat().st_ino,
+    ) == identity
+
+    receipt = _finalize_preauthorized_release(
+        documents,
+        trusted,
+        prepared,
+        preauthorization,
+    )
+    assert receipt["schema"] == rotation.RELEASE_FINALIZED_RECEIPT_SCHEMA
+    assert _temporary_aliases(activation) == []
+
+
+def test_release_prepare_cannot_prune_abort_branch_scratch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    preauthorization = _preauthorize_release(
+        documents,
+        trusted,
+        prepared,
+        now=now,
+    )
+    transaction = Path(prepared["audit_transaction_path"])
+    aborted = transaction / rotation.ABORT_RECEIPT_FILE_NAME
+
+    with monkeypatch.context() as crash_patch:
+        _inject_install_power_loss(
+            crash_patch,
+            target=aborted,
+            boundary="create",
+        )
+        with pytest.raises(_SimulatedInstallPowerLoss):
+            _abort_preauthorized_release(
+                documents,
+                trusted,
+                prepared,
+                preauthorization,
+            )
+
+    pending = _temporary_aliases(aborted)
+    assert len(pending) == 1
+    identity = (pending[0].stat().st_dev, pending[0].stat().st_ino)
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_audit_invalid",
+    ):
+        _prepare_release(documents, trusted, now=now)
+    assert (
+        pending[0].stat().st_dev,
+        pending[0].stat().st_ino,
+    ) == identity
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_preauthorization_aborted",
+    ):
+        _finalize_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+    assert (
+        pending[0].stat().st_dev,
+        pending[0].stat().st_ino,
+    ) == identity
+
+    receipt = _abort_preauthorized_release(
+        documents,
+        trusted,
+        prepared,
+        preauthorization,
+    )
+    assert receipt["schema"] == rotation.RELEASE_ABORTED_RECEIPT_SCHEMA
+    assert _temporary_aliases(aborted) == []
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    (
+        rotation.TRANSACTION_FILE_NAME,
+        rotation.PUBLICATION_FILE_NAME,
+        rotation.RELEASE_UPDATE_PUBLICATION_FILE_NAME,
+        rotation.PREDECESSOR_TRUST_FILE_NAME,
+        package.STAGED_UNIT_INPUT_PLAN_PATH.name,
+        package.STAGED_UNIT_INPUT_APPROVAL_PATH.name,
+        package.FIXED_UNIT_INPUTS_PATH.name,
+        rotation.PREPARED_RECEIPT_FILE_NAME,
+    ),
+)
+def test_release_prepare_recovers_pending_temp_for_every_logical_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    target_name: str,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    before = _live_triplet()
+    transaction_name = (
+        f"{trusted['authority_plan_sha256']}-"
+        f"{documents['publication']['publication_sha256']}"
+    )
+    transaction = (
+        cutover.EVIDENCE_ROOT
+        / rotation.RELEASE_AUDIT_DIRECTORY_NAME
+        / transaction_name
+    )
+    predecessor_names = {
+        package.STAGED_UNIT_INPUT_PLAN_PATH.name,
+        package.STAGED_UNIT_INPUT_APPROVAL_PATH.name,
+        package.FIXED_UNIT_INPUTS_PATH.name,
+    }
+    target = (
+        transaction / rotation.PREDECESSOR_DIRECTORY_NAME / target_name
+        if target_name in predecessor_names
+        else transaction / target_name
+    )
+
+    with monkeypatch.context() as crash_patch:
+        _inject_install_power_loss(
+            crash_patch,
+            target=target,
+            boundary="partial_write",
+        )
+        with pytest.raises(_SimulatedInstallPowerLoss):
+            _prepare_release(documents, trusted, now=now)
+
+    aliases = _temporary_aliases(target)
+    assert len(aliases) == 1
+    assert stat.S_IMODE(aliases[0].stat().st_mode) == 0o600
+    recovered = _prepare_release(documents, trusted, now=now)
+
+    assert recovered["schema"] == rotation.RELEASE_PREPARED_RECEIPT_SCHEMA
+    assert target.exists()
+    assert _temporary_aliases(target) == []
+    assert _live_triplet() == before
+
+
+@pytest.mark.parametrize(
+    "adversary",
+    (
+        "hardlink",
+        "symlink",
+        "wrong_mode",
+        "partial_final_mode",
+        "malformed_suffix",
+        "multiple_pending",
+        "extended_metadata",
+    ),
+)
+def test_release_pending_temp_adversarial_state_is_not_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    adversary: str,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    transaction = Path(prepared["audit_transaction_path"])
+    target = transaction / rotation.MUTATION_BEGIN_FILE_NAME
+    temporary = target.with_name(f".{target.name}.rotate.991")
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"sentinel")
+    paths = [temporary]
+
+    if adversary == "symlink":
+        temporary.symlink_to(sentinel)
+    elif adversary == "malformed_suffix":
+        temporary = target.with_name(f".{target.name}.rotate.invalid")
+        temporary.write_bytes(b"attacker")
+        temporary.chmod(0o600)
+        paths = [temporary]
+    else:
+        temporary.write_bytes(
+            b"{" if adversary == "partial_final_mode" else b"attacker"
+        )
+        temporary.chmod(
+            0o400
+            if adversary == "partial_final_mode"
+            else 0o200
+            if adversary == "wrong_mode"
+            else 0o600
+        )
+        if adversary == "hardlink":
+            linked = tmp_path / "external-hardlink"
+            os.link(temporary, linked)
+            paths.append(linked)
+        elif adversary == "multiple_pending":
+            second = target.with_name(f".{target.name}.rotate.992")
+            second.write_bytes(b"attacker-two")
+            second.chmod(0o600)
+            paths.append(second)
+        elif adversary == "extended_metadata":
+
+            def listxattr(path: Any, **_kwargs: Any) -> list[str]:
+                return (
+                    ["user.attacker"]
+                    if Path(path) == temporary
+                    else []
+                )
+
+            monkeypatch.setattr(
+                rotation.os,
+                "listxattr",
+                listxattr,
+                raising=False,
+            )
+
+    before = {path: path.lstat() for path in paths}
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match=r"unit_input_rotation_(audit_invalid|conflict)",
+    ):
+        _preauthorize_release(
+            documents,
+            trusted,
+            prepared,
+            now=now,
+        )
+
+    for path, identity in before.items():
+        current = path.lstat()
+        assert (current.st_dev, current.st_ino) == (
+            identity.st_dev,
+            identity.st_ino,
+        )
+    assert sentinel.read_bytes() == b"sentinel"
+    assert not target.exists()
+
+
+def test_release_out_of_order_pending_temp_is_not_pruned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    transaction = Path(prepared["audit_transaction_path"])
+    activation = transaction / rotation.ACTIVATION_BEGIN_FILE_NAME
+    pending = activation.with_name(f".{activation.name}.rotate.993")
+    pending.write_bytes(b"out-of-order")
+    pending.chmod(0o600)
+    before = pending.lstat()
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_audit_invalid",
+    ):
+        _preauthorize_release(
+            documents,
+            trusted,
+            prepared,
+            now=now,
+        )
+
+    after = pending.lstat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert not (
+        transaction / rotation.MUTATION_BEGIN_FILE_NAME
+    ).exists()
+
+
+def test_install_exact_rolls_back_substituted_destination_inode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    directory = (tmp_path / "secure").resolve()
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o700)
+    target = directory / "receipt.json"
+    payload = b'{"safe":true}'
+
+    def substitute(
+        source: Path,
+        destination: Path,
+        *,
+        directory_fd: int,
+        expected_identity: tuple[int, int],
+    ) -> bool:
+        original = os.stat(
+            source.name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        assert (original.st_dev, original.st_ino) == expected_identity
+        os.unlink(source.name, dir_fd=directory_fd)
+        descriptor = os.open(
+            source.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            os.write(descriptor, b'{"attacker":true}')
+            os.fchmod(descriptor, 0o400)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.rename(
+            source.name,
+            destination.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        return True
+
+    with monkeypatch.context() as swap_patch:
+        swap_patch.setattr(rotation, "_rename_noreplace", substitute)
+        with pytest.raises(
+            rotation.UnitInputRotationError,
+            match="unit_input_rotation_conflict",
+        ):
+            rotation._install_exact(
+                target,
+                payload,
+                uid=os.geteuid(),  # windows-footgun: ok — POSIX-only inode ownership test
+                gid=os.getegid(),  # windows-footgun: ok — POSIX-only inode ownership test
+                mode=0o400,
+            )
+
+    assert not target.exists()
+    assert _temporary_aliases(target) == []
+    assert rotation._install_exact(
+        target,
+        payload,
+        uid=os.geteuid(),  # windows-footgun: ok — POSIX-only inode ownership test
+        gid=os.getegid(),  # windows-footgun: ok — POSIX-only inode ownership test
+        mode=0o400,
+    )
+    assert target.read_bytes() == payload
+
+
+def test_install_exact_resyncs_sealed_temp_before_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    directory = (tmp_path / "secure").resolve()
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o700)
+    target = directory / "receipt.json"
+    temporary = target.with_name(f".{target.name}.rotate.994")
+    payload = b'{"safe":true}'
+    temporary.write_bytes(payload)
+    temporary.chmod(0o400)
+    temporary_identity = (temporary.stat().st_dev, temporary.stat().st_ino)
+    fsync = rotation.os.fsync
+    synced: set[tuple[int, int]] = set()
+
+    def observe_fsync(descriptor: int) -> None:
+        item = os.fstat(descriptor)
+        if stat.S_ISREG(item.st_mode):
+            synced.add((item.st_dev, item.st_ino))
+        fsync(descriptor)
+
+    def install(
+        source: Path,
+        destination: Path,
+        *,
+        directory_fd: int,
+        expected_identity: tuple[int, int],
+    ) -> bool:
+        assert expected_identity == temporary_identity
+        assert expected_identity in synced
+        os.rename(
+            source.name,
+            destination.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        return True
+
+    monkeypatch.setattr(rotation.os, "fsync", observe_fsync)
+    monkeypatch.setattr(rotation, "_rename_noreplace", install)
+
+    assert rotation._install_exact(
+        target,
+        payload,
+        uid=os.geteuid(),  # windows-footgun: ok — POSIX-only inode ownership test
+        gid=os.getegid(),  # windows-footgun: ok — POSIX-only inode ownership test
+        mode=0o400,
+    )
+    assert target.read_bytes() == payload
+    assert temporary_identity in synced
 
 
 @pytest.mark.parametrize(
