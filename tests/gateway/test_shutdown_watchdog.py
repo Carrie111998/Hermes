@@ -24,9 +24,14 @@ from gateway.shutdown_watchdog import (
     resolve_shutdown_watchdog_delay,
     write_loop_heartbeat,
 )
+from gateway.shutdown_timing import resolve_gateway_shutdown_timing
+
 
 def test_resolve_shutdown_watchdog_delay_adds_grace():
-    assert resolve_shutdown_watchdog_delay(180) == 180 + DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
+    assert (
+        resolve_shutdown_watchdog_delay(180)
+        == resolve_gateway_shutdown_timing(180).controlled_exit_deadline_s
+    )
     assert resolve_shutdown_watchdog_delay(0) == DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
     assert resolve_shutdown_watchdog_delay("bad") == DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
     assert resolve_shutdown_watchdog_delay(10, grace_s=5) == 15.0

@@ -2864,6 +2864,26 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+
+@dataclasses.dataclass(slots=True)
+class _GatewayAgentWorker:
+    """Real executor ownership for one gateway agent turn.
+
+    The asyncio wrapper around ``run_in_executor`` can be cancelled while its
+    already-running thread continues. Shutdown therefore tracks the underlying
+    ``concurrent.futures.Future`` so it never closes an agent or its SessionDB
+    while the authoritative transcript writer is still alive.
+    """
+
+    future: concurrent.futures.Future
+    agent_holder: list[Any]
+    run_generation: Optional[int]
+
+    @property
+    def agent(self) -> Any:
+        return self.agent_holder[0] if self.agent_holder else None
+
+
 # Conversation-scoped per-session state registry.  Every GatewayRunner dict
 # keyed by session_key whose entries must NOT survive a conversation boundary
 # (/new, /resume, auto-reset, expiry finalization, compression-exhausted
@@ -4842,6 +4862,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        # Real ThreadPoolExecutor futures for every still-observable turn per
+        # routing key. Kept separate from the asyncio handler task because a
+        # cancelled/timed-out wrapper can release the public running-agent slot
+        # while its thread continues, then a replacement can reuse the same
+        # key. Storing only the newest worker would lose the older SQLite writer
+        # (ABA) and make shutdown close state.db underneath it.
+        self._running_agent_workers: Dict[str, list[_GatewayAgentWorker]] = {}
+        # Complete set of real futures submitted to the gateway executor,
+        # including resource-cleanup workers. SessionDB close checks this set so
+        # a cleanup that timed out before shutdown cannot become an invisible
+        # late user of the shared connection.
+        self._gateway_executor_futures: set[concurrent.futures.Future] = set()
         self._active_session_leases: Dict[str, Any] = {}
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
@@ -5432,7 +5464,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
     async def _bounded_adapter_teardown(
-        self, adapter, platform, *, profile: Optional[str] = None
+        self,
+        adapter,
+        platform,
+        *,
+        profile: Optional[str] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> None:
         """Tear down one adapter on the shutdown path with bounded awaits.
 
@@ -5449,9 +5486,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the loop never hangs even if an adapter swallows cancellation. Never
         raises.
         """
-        timeout = self._adapter_disconnect_timeout_secs()
+        configured_timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
+
+        def _remaining_timeout() -> Optional[float]:
+            if deadline_monotonic is None:
+                return configured_timeout
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                return None
+            if configured_timeout <= 0:
+                return remaining
+            return min(configured_timeout, remaining)
+
+        timeout = _remaining_timeout()
+        if timeout is None:
+            logger.warning(
+                "✗ %s teardown skipped - global shutdown deadline exhausted%s",
+                platform.value,
+                suffix,
+            )
+            return
         try:
             cancelled = await self._await_adapter_cleanup_with_timeout(
                 adapter.cancel_background_tasks(), timeout
@@ -5465,6 +5521,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug(
                 "✗ %s background-task cancel error%s: %s", platform.value, suffix, e
             )
+        timeout = _remaining_timeout()
+        if timeout is None:
+            logger.warning(
+                "✗ %s disconnect skipped - global shutdown deadline exhausted%s",
+                platform.value,
+                suffix,
+            )
+            return
         try:
             disconnected = await self._await_adapter_cleanup_with_timeout(
                 adapter.disconnect(), timeout
@@ -8489,8 +8553,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     e,
                 )
 
-    async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
+    async def _finalize_shutdown_agents(
+        self,
+        active_agents: Dict[str, Any],
+        *,
+        deadline_monotonic: Optional[float] = None,
+    ) -> set[str]:
+        """Finalize stopped workers without racing a still-running writer.
+
+        Returns session keys whose real executor or cleanup worker is still
+        alive.  Callers must not close the shared SessionDB while that set is
+        non-empty; process hard-exit releases its SQLite handles safely.
+        """
+        if deadline_monotonic is None:
+            deadline_monotonic = getattr(
+                self,
+                "_shutdown_deadline_monotonic",
+                None,
+            )
+        unsafe_db_close: set[str] = set()
         for session_key, agent in active_agents.items():
+            live_workers = [
+                worker
+                for worker in self._running_agent_workers_for(session_key, agent)
+                if not worker.future.done()
+            ]
+            if live_workers:
+                unsafe_db_close.add(session_key)
+                logger.warning(
+                    "Shutdown agent finalization deferred: session=%s "
+                    "reason=executor_worker_still_running workers=%d "
+                    "recovery=canonical_resume_pending; "
+                    "shared SessionDB close will be skipped",
+                    getattr(agent, "session_id", None) or session_key,
+                    len(live_workers),
+                )
+                continue
+
             # Persist any in-flight transcript to the SQLite session store
             # before teardown (#13121). Most tool-loop boundaries are persisted
             # incrementally, but a forcibly interrupted worker can still own an
@@ -8572,9 +8671,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
             # Off-loop + bounded: a wedged memory provider here used to hang
             # the whole shutdown so SIGTERM never completed (#53175).
-            await self._cleanup_agent_resources_off_loop(
-                agent, context="shutdown finalize"
+            cleanup_timeout = None
+            if deadline_monotonic is not None:
+                cleanup_timeout = max(
+                    0.0,
+                    min(
+                        self._CLEANUP_TIMEOUT_S,
+                        deadline_monotonic - time.monotonic(),
+                    ),
+                )
+            cleanup_completed = await self._cleanup_agent_resources_off_loop(
+                agent,
+                context="shutdown finalize",
+                timeout_s=cleanup_timeout,
             )
+            if not cleanup_completed:
+                unsafe_db_close.add(session_key)
+        return unsafe_db_close
 
     def _should_emit_long_running_notification(
         self,
@@ -8647,8 +8760,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task.add_done_callback(tasks.discard)
 
     async def _cleanup_agent_resources_off_loop(
-        self, agent: Any, *, context: str = ""
-    ) -> None:
+        self,
+        agent: Any,
+        *,
+        context: str = "",
+        timeout_s: Optional[float] = None,
+    ) -> bool:
         """Run _cleanup_agent_resources in a worker thread with a bounded wait.
 
         Safe to await from coroutines on the gateway event loop: a slow or
@@ -8656,35 +8773,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         block message processing. On timeout the await is cancelled and the
         worker thread is left to finish (or leak) on its own — the caller
         proceeds regardless, exactly as the /new reset path does (#35994).
+
+        Returns True only when the cleanup worker has actually stopped. During
+        shutdown, False tells the caller not to close the shared SessionDB
+        underneath that still-running worker.
         """
         if agent is None:
-            return
+            return True
         if context.startswith("shutdown") or context == "session expiry":
             try:
                 agent._end_session_on_close = False
             except Exception:
                 pass
+        if timeout_s is None and context.startswith("shutdown"):
+            shutdown_deadline = getattr(
+                self,
+                "_shutdown_deadline_monotonic",
+                None,
+            )
+            if shutdown_deadline is not None:
+                timeout_s = max(0.0, shutdown_deadline - time.monotonic())
+        timeout = self._CLEANUP_TIMEOUT_S
+        if timeout_s is not None:
+            timeout = max(0.0, min(timeout, float(timeout_s)))
+        if timeout <= 0:
+            logger.warning(
+                "Agent resource cleanup%s skipped: global shutdown deadline exhausted",
+                f" ({context})" if context else "",
+            )
+            return False
+        cleanup_async_future, cleanup_worker_future = (
+            self._submit_in_executor_with_context(
+                self._cleanup_agent_resources,
+                agent,
+            )
+        )
         try:
             await asyncio.wait_for(
-                self._run_in_executor_with_context(
-                    self._cleanup_agent_resources, agent
-                ),
-                timeout=self._CLEANUP_TIMEOUT_S,
+                cleanup_async_future,
+                timeout=timeout,
             )
+            return True
         except asyncio.TimeoutError:
             logger.warning(
                 "Agent resource cleanup%s exceeded %ss; proceeding without "
                 "blocking the event loop (the worker thread is left to finish "
                 "on its own). (#53175)",
                 f" ({context})" if context else "",
-                self._CLEANUP_TIMEOUT_S,
+                timeout,
             )
+            return cleanup_worker_future.done()
         except Exception as cleanup_exc:
             logger.warning(
                 "Agent resource cleanup%s failed: %s (#53175)",
                 f" ({context})" if context else "",
                 cleanup_exc,
             )
+            return True
 
     def _cleanup_agent_resources(self, agent: Any) -> None:
         """Best-effort cleanup for temporary or cached agent instances."""
@@ -11588,7 +11733,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # delayed hard-exit in the worker.
             _watchdog_done = threading.Event()
             self._shutdown_watchdog_done = _watchdog_done
-            _stop_started_at_box: dict[str, float] = {}
+            _stop_started_at = time.monotonic()
+            _stop_started_at_box: dict[str, float] = {"t": _stop_started_at}
+            _watchdog_delay = resolve_shutdown_watchdog_delay(
+                self._restart_drain_timeout
+            )
+            _shutdown_deadline_monotonic = _stop_started_at + _watchdog_delay
+            self._shutdown_deadline_monotonic = _shutdown_deadline_monotonic
 
             def _shutdown_watchdog_snapshot() -> dict:
                 started = _stop_started_at_box.get("t")
@@ -11600,9 +11751,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "active_cron_jobs": self._active_cron_job_count(),
                     "active_api_runs": self._active_api_run_count(),
                     "restart_drain_timeout": self._restart_drain_timeout,
-                    "watchdog_delay_s": resolve_shutdown_watchdog_delay(
-                        self._restart_drain_timeout
-                    ),
+                    "watchdog_delay_s": _watchdog_delay,
                     "phase_elapsed_s": (
                         time.monotonic() - started if started is not None else None
                     ),
@@ -11610,27 +11759,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if not os.environ.get("PYTEST_CURRENT_TEST"):
                 arm_shutdown_watchdog(
-                    resolve_shutdown_watchdog_delay(self._restart_drain_timeout),
+                    _watchdog_delay,
                     done_event=_watchdog_done,
                     snapshot_fn=_shutdown_watchdog_snapshot,
-                    exit_code=1,
+                    exit_code=(
+                        GATEWAY_SERVICE_RESTART_EXIT_CODE
+                        if self._restart_requested and self._restart_via_service
+                        else 1
+                    ),
                 )
 
             try:
                 await _stop_impl_body(
                     _kill_tool_subprocesses,
                     _stop_started_at_box,
+                    _shutdown_deadline_monotonic,
                 )
             finally:
                 _watchdog_done.set()
 
-        async def _stop_impl_body(_kill_tool_subprocesses, _stop_started_at_box) -> None:
+        async def _stop_impl_body(
+            _kill_tool_subprocesses,
+            _stop_started_at_box,
+            _shutdown_deadline_monotonic,
+        ) -> None:
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
             )
-            _stop_started_at = time.monotonic()
-            _stop_started_at_box["t"] = _stop_started_at
+            _stop_started_at = _stop_started_at_box["t"]
 
             def _phase_elapsed() -> float:
                 return time.monotonic() - _stop_started_at
@@ -11669,12 +11826,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "restart_timeout"
                         if self._restart_requested
                         else "shutdown_timeout",
+                        require_primary=True,
                     )
                     if _marked:
                         _pre_drain_marked_agents[_sk] = _agent
                 except Exception as _e:
-                    logger.debug(
-                        "pre-drain mark_resume_pending failed for %s: %s", _sk, _e
+                    logger.warning(
+                        "Canonical pre-drain resume receipt failed for %s: %s",
+                        _sk,
+                        _e,
                     )
 
             _cron_at_start = self._active_cron_job_count()
@@ -11746,23 +11906,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _resume_reason = (
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
                 )
+                # Include any pending-sentinel agent that finished construction
+                # during the drain. Current identity wins for an ABA-rebound key.
+                active_agents.update(self._snapshot_running_agents())
                 for _sk, _agent in list(self._running_agents.items()):
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue
-                    # A successful pre-drain write is already the durable
-                    # recovery receipt. Repeating it here can spend the
-                    # service manager's remaining shutdown budget waiting on
-                    # the same contended state.db. Retry only failed marks or
-                    # an ABA replacement agent that rebound the same key.
-                    if _pre_drain_marked_agents.get(_sk) is _agent:
-                        continue
+                    # Always refresh the canonical marker immediately before
+                    # interrupt.  The pre-drain receipt protects against a
+                    # supervisor kill during the drain; this second receipt is
+                    # both a retry after transient state.db contention and the
+                    # authoritative interruption timestamp used by startup's
+                    # freshness gate. Agent identity alone cannot prove either.
                     try:
                         await self.async_session_store.mark_resume_pending(
-                            _sk, _resume_reason
+                            _sk,
+                            _resume_reason,
+                            require_primary=True,
                         )
                     except Exception as _e:
-                        logger.debug(
-                            "mark_resume_pending failed for %s: %s",
+                        logger.warning(
+                            "Canonical pre-interrupt resume receipt failed for %s: %s",
                             _sk,
                             _e,
                         )
@@ -11771,22 +11935,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if self._restart_requested
                     else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
-                interrupt_deadline = asyncio.get_running_loop().time() + 5.0
+                interrupt_deadline = min(
+                    time.monotonic() + 5.0,
+                    _shutdown_deadline_monotonic,
+                )
                 while (
                     self._running_agents
-                    and asyncio.get_running_loop().time() < interrupt_deadline
+                    and time.monotonic() < interrupt_deadline
                 ):
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
 
                 # Kill lingering tool subprocesses NOW, before we spend more
                 # budget on adapter disconnect / session DB close.  Under
-                # systemd (TimeoutStopSec bounded by drain_timeout+headroom),
-                # deferring this to the end of stop() risks systemd escalating
-                # to SIGKILL on the cgroup first — at which point bash/sleep
-                # children left behind by an interrupted terminal tool get
-                # killed by systemd instead of us (issue #8202).  The final
-                # catch-all cleanup below still runs for the graceful path.
+                # systemd, deferring this to the end of stop() risks consuming
+                # the shared post-drain cleanup budget before these children
+                # are reclaimed. The generated TimeoutStopSec is later than the
+                # in-process watchdog deadline, so the watchdog retains
+                # authority over the final controlled exit (issue #8202). The
+                # final catch-all cleanup below still runs for the graceful
+                # path.
                 _kill_tool_subprocesses("post-interrupt")
                 logger.info(
                     "Shutdown phase: post-interrupt tool kill done at +%.2fs",
@@ -11799,7 +11967,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart: %s", e)
 
-            await self._finalize_shutdown_agents(active_agents)
+            # Keep the private finalizer call signature compatible with gateway
+            # test doubles and downstream subclasses; the real implementation
+            # reads the deadline published on the runner above.
+            _finalize_result = await self._finalize_shutdown_agents(
+                active_agents,
+            )
+            _unsafe_db_close = set(_finalize_result or ())
 
             # Also shut down memory providers on idle cached agents.
             # _finalize_shutdown_agents only handles agents that were
@@ -11812,23 +11986,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 with _cache_lock:
                     _idle_agents = list(_cache.values())
                     _cache.clear()
-                for _entry in _idle_agents:
+                for _idle_index, _entry in enumerate(_idle_agents):
                     _agent = _entry[0] if isinstance(_entry, tuple) else _entry
                     # Bounded + off-loop so a wedged memory provider on one
                     # idle agent can't hang shutdown indefinitely — that path
                     # is why SIGTERM failed to kill the process (#53175).
-                    await self._cleanup_agent_resources_off_loop(
-                        _agent, context="shutdown idle-cache"
+                    _idle_cleanup_completed = (
+                        await self._cleanup_agent_resources_off_loop(
+                            _agent,
+                            context="shutdown idle-cache",
+                        )
                     )
+                    # Legacy test doubles returned None before this helper grew
+                    # a DB-safety receipt. Only an explicit False means a real
+                    # cleanup worker is still active.
+                    if _idle_cleanup_completed is False:
+                        _unsafe_db_close.add(f"idle-cache:{_idle_index}")
 
             for platform, adapter in list(self.adapters.items()):
-                await self._bounded_adapter_teardown(adapter, platform)
+                await self._bounded_adapter_teardown(
+                    adapter,
+                    platform,
+                    deadline_monotonic=_shutdown_deadline_monotonic,
+                )
 
             # Disconnect secondary-profile adapters (multiplex mode).
             for _prof, _amap in list(getattr(self, "_profile_adapters", {}).items()):
                 for platform, adapter in list(_amap.items()):
                     await self._bounded_adapter_teardown(
-                        adapter, platform, profile=_prof
+                        adapter,
+                        platform,
+                        profile=_prof,
+                        deadline_monotonic=_shutdown_deadline_monotonic,
                     )
                 _amap.clear()
             if hasattr(self, "_profile_adapters"):
@@ -11890,25 +12079,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _e:
                 logger.debug("shutdown_cached_clients error: %s", _e)
 
-            # Close SQLite session DBs so the WAL write lock is released.
-            # Without this, --replace and similar restart flows leave the
-            # old gateway's connection holding the WAL lock until Python
-            # actually exits — causing 'database is locked' errors when
-            # the new gateway tries to open the same file.
-            # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
-            # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
-            _self_db = getattr(self, "_session_db", None)
-            _self_db = getattr(_self_db, "_db", _self_db)
-            for _db in (
-                _self_db,
-                getattr(getattr(self, "session_store", None), "_db", None),
-            ):
-                if _db is None or not hasattr(_db, "close"):
-                    continue
-                try:
-                    _db.close()
-                except Exception as _e:
-                    logger.debug("SessionDB close error: %s", _e)
+            # Close SQLite only after all known transcript/cleanup workers have
+            # stopped. The close itself is off-loop and consumes the remaining
+            # global shutdown budget, so its internal lock can never re-freeze
+            # the event loop behind an interrupted writer.
+            await GatewayRunner._close_shutdown_session_dbs(
+                self,
+                deadline_monotonic=_shutdown_deadline_monotonic,
+                unsafe_reasons=_unsafe_db_close,
+            )
             GatewayRunner._shutdown_executor(self)
             logger.info(
                 "Shutdown phase: SessionDB close done at +%.2fs",
@@ -22431,16 +22610,108 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         clear_session_vars(tokens)
 
-    async def _run_in_executor_with_context(self, func, *args):
-        """Run blocking work in the thread pool while preserving session contextvars."""
+    def _submit_in_executor_with_context(self, func, *args):
+        """Submit work while exposing both async and real worker futures."""
         loop = asyncio.get_running_loop()
         ctx = copy_context()
-        return await loop.run_in_executor(
-            self._get_executor(),
-            ctx.run,
-            func,
-            *args,
+        worker_future = self._get_executor().submit(ctx.run, func, *args)
+        pending = self.__dict__.get("_gateway_executor_futures")
+        if pending is None:
+            pending = set()
+            self._gateway_executor_futures = pending
+        pending.add(worker_future)
+
+        def _worker_done(_future) -> None:
+            def _discard() -> None:
+                current = self.__dict__.get("_gateway_executor_futures")
+                if current is not None:
+                    current.discard(worker_future)
+
+            try:
+                loop.call_soon_threadsafe(_discard)
+            except RuntimeError:
+                pass
+
+        worker_future.add_done_callback(_worker_done)
+        return (
+            asyncio.wrap_future(worker_future, loop=loop),
+            worker_future,
         )
+
+    async def _run_in_executor_with_context(self, func, *args):
+        """Run blocking work in the thread pool while preserving contextvars."""
+        async_future, _worker_future = self._submit_in_executor_with_context(
+            func, *args
+        )
+        return await async_future
+
+    def _register_running_agent_worker(
+        self,
+        session_key: str,
+        record: _GatewayAgentWorker,
+    ) -> None:
+        """Publish one real worker future until that thread actually exits."""
+        if not session_key:
+            return
+        workers = self.__dict__.get("_running_agent_workers")
+        if workers is None:
+            workers = {}
+            self._running_agent_workers = workers
+        records = workers.setdefault(session_key, [])
+        # Compatibility for bare runners/tests constructed against the first
+        # revision of this tracker, which stored one record directly.
+        if isinstance(records, _GatewayAgentWorker):
+            records = [records]
+            workers[session_key] = records
+        records.append(record)
+        loop = asyncio.get_running_loop()
+
+        def _worker_done(_future) -> None:
+            def _discard_if_current() -> None:
+                current = self.__dict__.get("_running_agent_workers")
+                if current is None:
+                    return
+                current_records = current.get(session_key)
+                if isinstance(current_records, _GatewayAgentWorker):
+                    if current_records is record:
+                        current.pop(session_key, None)
+                    return
+                if not isinstance(current_records, list):
+                    return
+                current[session_key] = [
+                    candidate
+                    for candidate in current_records
+                    if candidate is not record
+                ]
+                if not current[session_key]:
+                    current.pop(session_key, None)
+
+            try:
+                loop.call_soon_threadsafe(_discard_if_current)
+            except RuntimeError:
+                # The owning event loop is already gone. Process teardown will
+                # reclaim the map together with the runner.
+                pass
+
+        record.future.add_done_callback(_worker_done)
+
+    def _running_agent_workers_for(
+        self,
+        session_key: str,
+        agent: Any = None,
+    ) -> list[_GatewayAgentWorker]:
+        """Return all tracked real workers for one key/agent identity."""
+        workers = self.__dict__.get("_running_agent_workers") or {}
+        records = workers.get(session_key)
+        if records is None:
+            return []
+        if isinstance(records, _GatewayAgentWorker):
+            records = [records]
+        if not isinstance(records, list):
+            return []
+        if agent is None:
+            return list(records)
+        return [record for record in records if record.agent is agent]
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""
@@ -22479,6 +22750,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
             executor.shutdown(wait=False)
+
+    async def _close_shutdown_session_dbs(
+        self,
+        *,
+        deadline_monotonic: float,
+        unsafe_reasons: set[str],
+    ) -> bool:
+        """Close shared SessionDB handles only when no live worker can use them.
+
+        ``SessionDB.close()`` takes the same internal lock as transcript and
+        routing writes. Run it off-loop under the one global shutdown deadline;
+        if a writer or cleanup worker is still alive, skip close entirely and
+        let the imminent process hard-exit release SQLite's OS handles.
+        """
+        unsafe = set(unsafe_reasons)
+        # Inspect the complete worker registry independently of the public
+        # _running_agents snapshot.  A cancelled/timed-out outer coroutine can
+        # release that slot while its real executor thread remains alive, and a
+        # newer turn can reuse the same routing key.  Either worker can still be
+        # inside SessionDB, so closing is safe only after every tracked future
+        # has actually stopped.
+        for session_key, records in (
+            self.__dict__.get("_running_agent_workers") or {}
+        ).items():
+            if isinstance(records, _GatewayAgentWorker):
+                records = [records]
+            if not isinstance(records, list):
+                continue
+            if any(not record.future.done() for record in records):
+                unsafe.add(f"executor:{session_key}")
+        if any(
+            not future.done()
+            for future in (
+                self.__dict__.get("_gateway_executor_futures") or set()
+            )
+        ):
+            unsafe.add("executor:unscoped")
+
+        if unsafe:
+            logger.warning(
+                "Skipping SessionDB close: %d shutdown worker(s) still active "
+                "(%s); process exit will release SQLite handles",
+                len(unsafe),
+                ", ".join(sorted(unsafe)[:8]),
+            )
+            return False
+
+        self_db = getattr(self, "_session_db", None)
+        self_db = getattr(self_db, "_db", self_db)
+        dbs: list[Any] = []
+        seen: set[int] = set()
+        for db in (
+            self_db,
+            getattr(getattr(self, "session_store", None), "_db", None),
+        ):
+            if db is None or not hasattr(db, "close") or id(db) in seen:
+                continue
+            seen.add(id(db))
+            dbs.append(db)
+
+        for db in dbs:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "Skipping SessionDB close: global shutdown deadline exhausted"
+                )
+                return False
+            close_async_future, close_worker_future = (
+                self._submit_in_executor_with_context(db.close)
+            )
+            try:
+                await asyncio.wait_for(close_async_future, timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "SessionDB close exceeded the global shutdown deadline; "
+                    "continuing to controlled process exit"
+                )
+                return close_worker_future.done()
+            except Exception as exc:
+                logger.debug("SessionDB close error: %s", exc)
+        return True
 
     def _decide_image_input_mode(
         self,
@@ -30120,9 +30472,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900)
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
             _warning_fired = False
-            _executor_task = asyncio.ensure_future(
-                self._run_in_executor_with_context(run_sync)
+            _executor_task, _executor_worker_future = (
+                self._submit_in_executor_with_context(run_sync)
             )
+            if session_key:
+                self._register_running_agent_worker(
+                    session_key,
+                    _GatewayAgentWorker(
+                        future=_executor_worker_future,
+                        agent_holder=agent_holder,
+                        run_generation=run_generation,
+                    ),
+                )
 
             _inactivity_timeout = False
             _POLL_INTERVAL = 5.0

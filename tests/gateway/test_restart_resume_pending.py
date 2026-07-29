@@ -445,6 +445,123 @@ class TestMarkResumePending:
         assert reloaded.resume_pending is True
         assert reloaded.resume_reason == "restart_timeout"
 
+    def test_default_call_keeps_legacy_json_fallback_on_primary_failure(
+        self,
+        tmp_path,
+    ):
+        """Existing callers still accept the historical JSON-only fallback."""
+        sessions_dir = tmp_path / "sessions"
+        store = SessionStore(
+            sessions_dir=sessions_dir,
+            config=GatewayConfig(),
+            db_path=tmp_path / "state.db",
+        )
+        entry = store.get_or_create_session(_make_source())
+
+        with patch.object(
+            store._db,
+            "replace_gateway_routing_entries",
+            side_effect=RuntimeError("synthetic state.db failure"),
+        ):
+            assert store.mark_resume_pending(entry.session_key) is True
+
+        mirrored = json.loads(
+            (sessions_dir / "sessions.json").read_text(encoding="utf-8")
+        )
+        assert mirrored[entry.session_key]["resume_pending"] is True
+        assert store._entries[entry.session_key].resume_pending is True
+
+        primary = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        assert json.loads(primary[entry.session_key])["resume_pending"] is False
+
+    def test_required_primary_failure_is_surfaced_and_retry_succeeds(
+        self,
+        tmp_path,
+    ):
+        """A JSON backup is not a shutdown durability receipt for state.db."""
+        sessions_dir = tmp_path / "sessions"
+        db_path = tmp_path / "state.db"
+        store = SessionStore(
+            sessions_dir=sessions_dir,
+            config=GatewayConfig(),
+            db_path=db_path,
+        )
+        entry = store.get_or_create_session(_make_source())
+        real_primary_writer = store._db.replace_gateway_routing_entries
+        primary_attempts = 0
+
+        def fail_primary_once(entries, *, scope):
+            nonlocal primary_attempts
+            primary_attempts += 1
+            if primary_attempts == 1:
+                raise RuntimeError("synthetic state.db failure")
+            return real_primary_writer(entries, scope=scope)
+
+        with patch.object(
+            store._db,
+            "replace_gateway_routing_entries",
+            side_effect=fail_primary_once,
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="gateway routing primary save failed",
+            ):
+                store.mark_resume_pending(
+                    entry.session_key,
+                    reason="shutdown_timeout",
+                    require_primary=True,
+                )
+
+            # The best-effort recovery mirror is allowed to be ahead, but it
+            # cannot turn the failed canonical write into a success receipt.
+            mirrored = json.loads(
+                (sessions_dir / "sessions.json").read_text(encoding="utf-8")
+            )
+            assert mirrored[entry.session_key]["resume_pending"] is True
+            assert (
+                mirrored[entry.session_key]["resume_reason"]
+                == "shutdown_timeout"
+            )
+            assert store._entries[entry.session_key].resume_pending is False
+            assert store._entries[entry.session_key].resume_reason is None
+            assert store._entries[entry.session_key].last_resume_marked_at is None
+
+            primary_after_failure = store._db.load_gateway_routing_entries(
+                scope=store._routing_scope()
+            )
+            assert (
+                json.loads(primary_after_failure[entry.session_key])[
+                    "resume_pending"
+                ]
+                is False
+            )
+
+            assert store.mark_resume_pending(
+                entry.session_key,
+                reason="shutdown_timeout",
+                require_primary=True,
+            ) is True
+
+        primary_after_retry = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        persisted = json.loads(primary_after_retry[entry.session_key])
+        assert persisted["resume_pending"] is True
+        assert persisted["resume_reason"] == "shutdown_timeout"
+        assert primary_attempts == 2
+
+        restarted = SessionStore(
+            sessions_dir=sessions_dir,
+            config=GatewayConfig(),
+            db_path=db_path,
+        )
+        restarted._ensure_loaded()
+        reloaded = restarted._entries[entry.session_key]
+        assert reloaded.resume_pending is True
+        assert reloaded.resume_reason == "shutdown_timeout"
+
 
 class TestClearResumePending:
     def test_clears_flag(self, tmp_path):
@@ -1305,15 +1422,19 @@ async def test_drain_timeout_marks_resume_pending():
     ):
         await runner.stop()
 
-    # Both active sessions were marked with the shutdown_timeout reason.
+    # Each active session receives an early canonical receipt before drain and
+    # a second canonical receipt immediately before the actual interrupt.  The
+    # latter refreshes the freshness timestamp and retries transient primary
+    # writer failures; agent identity is not a durability receipt.
     calls = session_store.mark_resume_pending.call_args_list
-    # A successful pre-drain marker is already the durable recovery receipt;
-    # do not repeat the same potentially-contended state.db write at timeout.
-    assert len(calls) == 2
-    marked = {args[0][0] for args in calls}
-    assert marked == {session_key_one, session_key_two}
+    assert len(calls) == 4
+    marked = [args[0][0] for args in calls]
+    assert set(marked) == {session_key_one, session_key_two}
+    assert marked.count(session_key_one) == 2
+    assert marked.count(session_key_two) == 2
     for args in calls:
         assert args[0][1] == "shutdown_timeout"
+        assert args.kwargs == {"require_primary": True}
 
 
 @pytest.mark.asyncio
@@ -1337,8 +1458,8 @@ async def test_drain_timeout_retries_failed_pre_drain_resume_mark():
         await runner.stop()
 
     assert session_store.mark_resume_pending.call_args_list == [
-        ((session_key, "shutdown_timeout"),),
-        ((session_key, "shutdown_timeout"),),
+        ((session_key, "shutdown_timeout"), {"require_primary": True}),
+        ((session_key, "shutdown_timeout"), {"require_primary": True}),
     ]
 
 
@@ -1374,6 +1495,8 @@ async def test_drain_timeout_marks_replacement_agent_on_same_session_key():
     await replacement_task
 
     assert session_store.mark_resume_pending.call_count == 2
+    for mark_call in session_store.mark_resume_pending.call_args_list:
+        assert mark_call.kwargs == {"require_primary": True}
     replacement_agent.interrupt.assert_called_once()
 
 
@@ -1400,6 +1523,7 @@ async def test_drain_timeout_uses_restart_reason_when_restarting():
     assert calls, "expected at least one mark_resume_pending call"
     for args in calls:
         assert args[0][1] == "restart_timeout"
+        assert args.kwargs == {"require_primary": True}
 
 
 @pytest.mark.asyncio
@@ -1434,6 +1558,9 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
     calls = session_store.mark_resume_pending.call_args_list
     marked = {args[0][0] for args in calls}
     assert marked == {session_key_real}
+    assert len(calls) == 2
+    for mark_call in calls:
+        assert mark_call.kwargs == {"require_primary": True}
 
 
 # ---------------------------------------------------------------------------

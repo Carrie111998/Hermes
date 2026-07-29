@@ -1,19 +1,22 @@
 import asyncio
+import concurrent.futures
 import json
 import os
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import HomeChannel, Platform
+from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
-from gateway.session import build_session_key
+from gateway.session import SessionStore, build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -184,25 +187,35 @@ async def test_gateway_stop_systemd_service_restart_uses_tempfail(tmp_path, monk
     assert (tmp_path / ".restart_pending.json").exists()
 
 
-def test_service_restart_process_exits_75_when_worker_owns_persist_lock(tmp_path):
+def test_service_restart_process_exits_75_with_live_worker_and_session_db_lock(
+    tmp_path,
+):
     """Process-level regression for the production SIGTERM hang.
 
-    The worker deliberately keeps the real agent persistence RLock for the
-    lifetime of the child. The complete ``GatewayRunner.stop`` path must still
-    tear down, publish its shutdown receipt, and exit with the service-restart
-    status rather than waiting for systemd to SIGKILL it.
+    A real ThreadPoolExecutor worker keeps both the agent persistence RLock and
+    the real SessionDB lock after the canonical pre-interrupt recovery receipt
+    is durable. ``GatewayRunner.stop`` must not close the agent or state.db
+    underneath that worker; it must finish bounded teardown and hard-exit 75.
     """
     repo_root = Path(__file__).resolve().parents[2]
     child_code = textwrap.dedent(
         """
         import asyncio
+        import concurrent.futures
         import json
         import logging
+        import os
         import threading
+        from pathlib import Path
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
-        from tests.gateway.restart_test_helpers import make_restart_runner
+        from gateway.run import _GatewayAgentWorker, _exit_after_graceful_shutdown
+        from gateway.session import SessionStore
+        from tests.gateway.restart_test_helpers import (
+            make_restart_runner,
+            make_restart_source,
+        )
 
         logging.basicConfig(level=logging.WARNING)
 
@@ -210,6 +223,17 @@ def test_service_restart_process_exits_75_when_worker_owns_persist_lock(tmp_path
         adapter.disconnect = AsyncMock()
         runner._restart_drain_timeout = 0.0
         runner._launch_systemd_restart_shortcut = MagicMock()
+        home = Path(os.environ["HERMES_HOME"])
+        store = SessionStore(
+            sessions_dir=home / "sessions",
+            config=runner.config,
+            db_path=home / "state.db",
+        )
+        entry = store.get_or_create_session(
+            make_restart_source(chat_id="production-lock-e2e")
+        )
+        session_key = entry.session_key
+        runner.session_store = store
 
         class BusyPersistAgent:
             def __init__(self):
@@ -239,26 +263,47 @@ def test_service_restart_process_exits_75_when_worker_owns_persist_lock(tmp_path
                 self.closed = True
 
         agent = BusyPersistAgent()
-        runner._running_agents = {
-            "agent:main:discord:channel:production": agent
-        }
-        runner.session_store.mark_resume_pending = MagicMock(return_value=True)
+        runner._running_agents = {session_key: agent}
 
-        lock_held = threading.Event()
+        allow_db_lock = threading.Event()
+        db_lock_held = threading.Event()
 
-        def hold_persist_lock_forever():
+        def run_real_agent_worker():
             with agent._session_persist_lock:
-                lock_held.set()
-                threading.Event().wait()
+                if not allow_db_lock.wait(timeout=5):
+                    raise RuntimeError("canonical receipt never released DB lock")
+                with store._db._lock:
+                    db_lock_held.set()
+                    threading.Event().wait()
 
-        holder = threading.Thread(
-            target=hold_persist_lock_forever,
-            name="active-persist-writer",
-            daemon=True,
-        )
-        holder.start()
-        if not lock_held.wait(timeout=2):
-            raise SystemExit("worker failed to acquire persistence lock")
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        worker_future = executor.submit(run_real_agent_worker)
+        runner._running_agent_workers = {
+            session_key: [
+                _GatewayAgentWorker(
+                    future=worker_future,
+                    agent_holder=[agent],
+                    run_generation=None,
+                )
+            ]
+        }
+
+        real_mark_resume_pending = store.mark_resume_pending
+        mark_calls = []
+
+        def mark_then_let_worker_take_db(*args, **kwargs):
+            result = real_mark_resume_pending(*args, **kwargs)
+            mark_calls.append((args, kwargs))
+            if len(mark_calls) == 2:
+                # The second canonical write is the authoritative timestamp at
+                # actual interrupt. Let the worker take SessionDB only after it
+                # is durable, then prove teardown never waits for/close-races it.
+                allow_db_lock.set()
+                if not db_lock_held.wait(timeout=2):
+                    raise RuntimeError("worker failed to acquire SessionDB lock")
+            return result
+
+        store.mark_resume_pending = mark_then_let_worker_take_db
 
         async def stop_for_service_restart():
             with (
@@ -273,24 +318,35 @@ def test_service_restart_process_exits_75_when_worker_owns_persist_lock(tmp_path
                 )
 
         asyncio.run(stop_for_service_restart())
-        print(json.dumps({
-            "closed": agent.closed,
+        receipt = {
+            "agent_closed": agent.closed,
+            "db_connection_open": store._db._conn is not None,
             "exit_code": runner._exit_code,
             "flush_calls": agent.flush_calls,
-            "resume_mark_calls": (
-                runner.session_store.mark_resume_pending.call_count
-            ),
+            "resume_mark_calls": len(mark_calls),
+            "session_key": session_key,
             "shutdown_event": runner._shutdown_event.is_set(),
-        }))
+            "worker_done": worker_future.done(),
+        }
+        receipt_path = Path(os.environ["SHUTDOWN_RECEIPT_PATH"])
+        with receipt_path.open("w", encoding="utf-8") as handle:
+            json.dump(receipt, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+
         if runner._exit_code != GATEWAY_SERVICE_RESTART_EXIT_CODE:
             raise SystemExit(1)
-        raise SystemExit(runner._exit_code)
+        # The production entry point uses the same bounded hard-exit so Python
+        # never waits for the intentionally wedged non-daemon executor worker.
+        _exit_after_graceful_shutdown(runner._exit_code)
         """
     )
     hermes_home = tmp_path / "hermes-home"
+    receipt_path = tmp_path / "shutdown-receipt.json"
     env = os.environ.copy()
     env["HERMES_HOME"] = str(hermes_home)
     env["INVOCATION_ID"] = "shutdown-persist-lock-process-e2e"
+    env["SHUTDOWN_RECEIPT_PATH"] = str(receipt_path)
 
     completed = subprocess.run(
         [sys.executable, "-c", child_code],
@@ -305,19 +361,105 @@ def test_service_restart_process_exits_75_when_worker_owns_persist_lock(tmp_path
     assert completed.returncode == GATEWAY_SERVICE_RESTART_EXIT_CODE, (
         f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
     )
-    output_lines = [line for line in completed.stdout.splitlines() if line.strip()]
-    assert output_lines, completed.stderr
-    receipt = json.loads(output_lines[-1])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt == {
-        "closed": True,
+        "agent_closed": False,
+        "db_connection_open": True,
         "exit_code": GATEWAY_SERVICE_RESTART_EXIT_CODE,
         "flush_calls": 0,
-        "resume_mark_calls": 1,
+        "resume_mark_calls": 2,
+        "session_key": receipt["session_key"],
         "shutdown_event": True,
+        "worker_done": False,
     }
-    assert "reason=persist_lock_busy writer=active_worker" in completed.stderr
+    assert "reason=executor_worker_still_running" in completed.stderr
+    assert "Skipping SessionDB close" in completed.stderr
     assert (hermes_home / ".restart_pending.json").exists()
     assert not (hermes_home / ".clean_shutdown").exists()
+
+    # The child hard-exit released the OS lock. Reload from the canonical
+    # state.db (not sessions.json) and prove the pre-interrupt receipt survived.
+    reloaded = SessionStore(
+        sessions_dir=hermes_home / "sessions",
+        config=GatewayConfig(),
+        db_path=hermes_home / "state.db",
+    )
+    try:
+        reloaded._ensure_loaded()
+        recovered = reloaded._entries[receipt["session_key"]]
+        assert recovered.resume_pending is True
+        assert recovered.resume_reason == "restart_timeout"
+    finally:
+        reloaded._db.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cleanup_uses_one_global_deadline_across_agents():
+    runner, _adapter = make_restart_runner()
+    release_cleanup = threading.Event()
+
+    first_agent = MagicMock()
+    first_agent._session_messages = []
+    first_agent.shutdown_memory_provider.side_effect = (
+        lambda *_args: release_cleanup.wait(timeout=5)
+    )
+    second_agent = MagicMock()
+    second_agent._session_messages = []
+
+    started = time.monotonic()
+    try:
+        unsafe = await runner._finalize_shutdown_agents(
+            {"first": first_agent, "second": second_agent},
+            deadline_monotonic=started + 0.05,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        release_cleanup.set()
+        await asyncio.sleep(0.05)
+        runner._shutdown_executor()
+
+    assert elapsed < 0.5
+    assert unsafe == {"first", "second"}
+    first_agent.shutdown_memory_provider.assert_called_once()
+    second_agent.shutdown_memory_provider.assert_not_called()
+    second_agent.close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_db_close_sees_stale_real_worker_after_public_slot_release():
+    """The complete executor registry, not _running_agents, owns DB safety."""
+    runner, _adapter = make_restart_runner()
+    worker_future: concurrent.futures.Future = concurrent.futures.Future()
+    agent = MagicMock()
+    runner._running_agents = {}
+    runner._running_agent_workers = {
+        "same-key": [
+            gateway_run._GatewayAgentWorker(
+                future=worker_future,
+                agent_holder=[agent],
+                run_generation=1,
+            )
+        ]
+    }
+    session_db = MagicMock()
+    runner.session_store._db = session_db
+
+    skipped = await runner._close_shutdown_session_dbs(
+        deadline_monotonic=time.monotonic() + 1,
+        unsafe_reasons=set(),
+    )
+    assert skipped is False
+    session_db.close.assert_not_called()
+
+    worker_future.set_result(None)
+    closed = await runner._close_shutdown_session_dbs(
+        deadline_monotonic=time.monotonic() + 1,
+        unsafe_reasons=set(),
+    )
+    runner._shutdown_executor()
+
+    assert closed is True
+    session_db.close.assert_called_once()
 
 
 @pytest.mark.asyncio

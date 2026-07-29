@@ -39,6 +39,7 @@ from gateway.restart import (
     is_gateway_supervisor_process,
     parse_restart_drain_timeout,
 )
+from gateway.shutdown_timing import resolve_gateway_shutdown_timing
 from hermes_cli.config import (
     get_env_value,
     get_hermes_home,
@@ -2779,12 +2780,13 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         "/sbin",
         "/bin",
     ]
-    # Preserve 30s for post-drain cleanup before systemd escalates, with a
-    # 60s minimum for installs that use the default immediate drain. Positive
-    # drain values extend the deadline directly instead of inheriting a second
-    # 60s floor, so a configured 45s drain yields 75s rather than 90s.
-    _drain_timeout = int(_get_restart_drain_timeout() or 0)
-    restart_timeout = max(60, _drain_timeout + 30)
+    # Resolve the same global shutdown deadline used by the in-process
+    # watchdog, then leave a supervisor-only margin so its diagnostic dump and
+    # controlled exit always precede systemd's SIGKILL escalation.
+    _shutdown_timing = resolve_gateway_shutdown_timing(
+        _get_restart_drain_timeout()
+    )
+    restart_timeout = _shutdown_timing.systemd_timeout_stop_sec
 
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)

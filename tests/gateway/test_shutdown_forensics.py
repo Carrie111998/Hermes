@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import signal
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -271,3 +273,45 @@ class TestCheckSystemdTimingAlignment:
         # for whatever unit pytest IS in.  Both are valid; we just ensure
         # the function doesn't raise.
         assert result is None or isinstance(result, dict)
+
+    @staticmethod
+    def _install_systemd_probe(monkeypatch, timeout_stop_sec):
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        monkeypatch.setattr(
+            sf,
+            "open",
+            lambda *_args, **_kwargs: io.StringIO(
+                "0::/user.slice/hermes-gateway.service\n"
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            sf.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0,
+                stdout=f"TimeoutStopUSec={int(timeout_stop_sec * 1_000_000)}\n",
+            ),
+        )
+
+    def test_reports_unit_that_would_kill_before_controlled_watchdog(self, monkeypatch):
+        self._install_systemd_probe(monkeypatch, timeout_stop_sec=240)
+
+        result = sf.check_systemd_timing_alignment(180)
+
+        assert result is not None
+        assert result["controlled_exit_deadline"] == 240
+        assert result["expected_min"] == 255
+        assert result["mismatch"] is True
+
+    def test_accepts_unit_with_required_post_watchdog_margin(self, monkeypatch):
+        self._install_systemd_probe(monkeypatch, timeout_stop_sec=255)
+
+        result = sf.check_systemd_timing_alignment(180)
+
+        assert result is not None
+        assert (
+            result["timeout_stop_sec"] - result["controlled_exit_deadline"]
+            >= result["systemd_kill_margin"]
+        )
+        assert result["mismatch"] is False
