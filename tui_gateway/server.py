@@ -1271,6 +1271,9 @@ def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> di
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
+        # `[]` must cross the process boundary as `[]`, never as "unset": the
+        # host builds the session's first agent itself.
+        "enabled_toolsets": session.get("create_enabled_toolsets"),
         "source": _session_source(session),
         "attached_images": attached_images,
     }
@@ -1627,6 +1630,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                # Outside the if/else on purpose: a cold resume restoring its
+                # persisted runtime identity must carry the scope too.
+                if (toolsets := current.get("create_enabled_toolsets")) is not None:
+                    kw["enabled_toolsets_override"] = toolsets
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2958,6 +2965,59 @@ def _load_tool_progress_mode() -> str:
         return "all"
     mode = str(raw or "all").strip().lower()
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
+
+
+class _ToolsetSelectionError(ValueError):
+    """``enabled_toolsets`` was sent with a shape the contract doesn't accept."""
+
+
+def _requested_enabled_toolsets(params: dict) -> list[str] | None:
+    """The caller's explicit toolset selection, or ``None`` when absent.
+
+    Only ABSENCE inherits the global resolution. ``null`` is rejected rather
+    than treated as absent: a client asking for a scope must never be handed a
+    fully tooled session because its field serialized to null.
+    """
+    if not isinstance(params, dict) or "enabled_toolsets" not in params:
+        return None
+    raw = params.get("enabled_toolsets")
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise _ToolsetSelectionError(
+            "enabled_toolsets must be a list of toolset names; "
+            "omit the field to inherit the configured toolsets"
+        )
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _session_toolset_selection(session: dict) -> list[str] | None:
+    agent = session.get("agent")
+    if agent is not None:
+        selection = getattr(agent, "enabled_toolsets", None)
+        return list(selection) if selection is not None else None
+    stored = session.get("create_enabled_toolsets")
+    return list(stored) if stored is not None else None
+
+
+def _toolset_selection_conflict(session: dict, requested: list[str] | None) -> bool:
+    """Would reusing ``session`` silently ignore ``requested``?
+
+    Toolsets are snapshotted once at agent build and never re-read (rebuilding
+    them mid-conversation would break prompt caching), so a live session cannot
+    be re-scoped by a resume. Fail closed instead of handing a tooled agent to
+    a caller that asked for none.
+    """
+    if requested is None:
+        return False
+    current = _session_toolset_selection(session)
+    if current is None:
+        return True
+    return set(current) != set(requested)
+
+
+_TOOLSET_CONFLICT_MESSAGE = (
+    "session is already live with a different toolset selection; "
+    "close it before resuming with enabled_toolsets"
+)
 
 
 def _load_enabled_toolsets() -> list[str] | None:
@@ -4645,8 +4705,13 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "acp_args": getattr(agent, "acp_args", None) or None,
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
-        "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
-        or _load_enabled_toolsets(),
+        # `is not None`, not `or`: an agent scoped to no toolsets must not have
+        # the global selection injected back into its clone.
+        "enabled_toolsets": (
+            list(_agent_toolsets)
+            if (_agent_toolsets := getattr(agent, "enabled_toolsets", None)) is not None
+            else _load_enabled_toolsets()
+        ),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -4812,11 +4877,14 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        # Deliberately NOT cleared with the runtime pins above: /new must not
+        # hand back a tooled agent to a session opened without tools.
         new_agent = _make_agent(
             sid,
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            enabled_toolsets_override=session.get("create_enabled_toolsets"),
         )
     finally:
         _clear_session_context(tokens)
@@ -4984,6 +5052,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    enabled_toolsets_override: list | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5136,7 +5205,13 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        # `is not None`, not truthiness: `[]` is a real selection (no tools at
+        # all) and must not fall through to the global resolution.
+        enabled_toolsets=(
+            list(enabled_toolsets_override)
+            if enabled_toolsets_override is not None
+            else _load_enabled_toolsets()
+        ),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -5820,6 +5895,10 @@ def _(rid, params: dict) -> dict:
         create_service_tier_override = (
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
+    try:
+        create_enabled_toolsets = _requested_enabled_toolsets(params)
+    except _ToolsetSelectionError as exc:
+        return _err(rid, 4045, str(exc))
 
     ready = threading.Event()
     now = time.time()
@@ -5851,6 +5930,7 @@ def _(rid, params: dict) -> dict:
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
+            "create_enabled_toolsets": create_enabled_toolsets,
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
@@ -6079,6 +6159,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    enabled_toolsets: list[str] | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -6092,6 +6173,7 @@ def _deferred_session_record(
         "active_session_lease": lease,
         "cols": cols,
         "created_at": now,
+        "create_enabled_toolsets": enabled_toolsets,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {},
@@ -6156,6 +6238,10 @@ def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
+    try:
+        requested_toolsets = _requested_enabled_toolsets(params)
+    except _ToolsetSelectionError as exc:
+        return _err(rid, 4045, str(exc))
     try:
         cols = int(params.get("cols", 80))
     except (TypeError, ValueError):
@@ -6242,6 +6328,8 @@ def _(rid, params: dict) -> dict:
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
         if live is not None:
+            if _toolset_selection_conflict(live[1], requested_toolsets):
+                return _err(rid, 4045, _TOOLSET_CONFLICT_MESSAGE)
             return _ok(rid, _reuse_live_payload(*live))
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
@@ -6283,8 +6371,11 @@ def _(rid, params: dict) -> dict:
             close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
             profile_home=profile_home,
             lazy=True,
+            enabled_toolsets=requested_toolsets,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
+            if _toolset_selection_conflict(live[1], requested_toolsets):
+                return _err(rid, 4045, _TOOLSET_CONFLICT_MESSAGE)
             return _ok(rid, _reuse_live_payload(*live))
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
@@ -6365,8 +6456,11 @@ def _(rid, params: dict) -> dict:
             profile_home=profile_home,
             model_override=overrides.get("model_override"),
             resume_runtime_overrides=overrides or None,
+            enabled_toolsets=requested_toolsets,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
+            if _toolset_selection_conflict(live[1], requested_toolsets):
+                return _err(rid, 4045, _TOOLSET_CONFLICT_MESSAGE)
             return _ok(rid, _reuse_live_payload(*live))
 
         _schedule_agent_build(sid)
@@ -6438,6 +6532,7 @@ def _(rid, params: dict) -> dict:
                 session_id=target,
                 session_db=db,
                 platform_override=source,
+                enabled_toolsets_override=requested_toolsets,
                 **stored_runtime_overrides,
             )
         finally:
@@ -6464,6 +6559,8 @@ def _(rid, params: dict) -> dict:
             if lease is not None:
                 lease.release()
             other_sid, other_session = live
+            if _toolset_selection_conflict(other_session, requested_toolsets):
+                return _err(rid, 4045, _TOOLSET_CONFLICT_MESSAGE)
             payload = _live_session_payload(
                 other_sid,
                 other_session,
@@ -6499,6 +6596,10 @@ def _(rid, params: dict) -> dict:
                         "model_override"
                     ]
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
+                # On the record, not just on the built agent, so every later
+                # rebuild of this session re-applies the scope.
+                if requested_toolsets is not None:
+                    _sessions[sid]["create_enabled_toolsets"] = requested_toolsets
                 # Remember the profile home so each turn re-binds HERMES_HOME (the
                 # agent persists to its own db, but mid-turn home reads — memory,
                 # skills — must resolve to the resumed profile too).
@@ -12722,10 +12823,17 @@ def _(rid, params: dict) -> dict:
                 from tools.mcp_tool import refresh_agent_mcp_tools
 
                 # Explicit reload: re-resolve enabled toolsets so a server the
-                # user just enabled in config this session is picked up.
+                # user just enabled in config this session is picked up. An
+                # explicitly scoped session keeps its own list instead, or the
+                # reload would re-tool a session opened without tools.
+                _agent_toolsets = getattr(agent, "enabled_toolsets", None)
                 refresh_agent_mcp_tools(
                     agent,
-                    enabled_override=_load_enabled_toolsets(),
+                    enabled_override=(
+                        list(_agent_toolsets)
+                        if _agent_toolsets is not None
+                        else _load_enabled_toolsets()
+                    ),
                     quiet_mode=True,
                 )
             except Exception as _exc:

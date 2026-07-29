@@ -426,6 +426,8 @@ class ComputeHost:
                 session["cwd"] = str(frame.get("cwd"))
             if frame.get("profile_home"):
                 session["profile_home"] = str(frame.get("profile_home"))
+            if frame.get("enabled_toolsets") is not None:
+                session["create_enabled_toolsets"] = frame.get("enabled_toolsets")
             if isinstance(frame.get("attached_images"), list):
                 session["attached_images"] = list(frame.get("attached_images") or [])
             return session
@@ -449,6 +451,7 @@ class ComputeHost:
                 reasoning_config_override=frame.get("reasoning_config_override"),
                 service_tier_override=frame.get("service_tier_override"),
                 platform_override=frame.get("source"),
+                enabled_toolsets_override=frame.get("enabled_toolsets"),
                 session_db=session_db,
             )
         finally:
@@ -500,6 +503,7 @@ class ComputeHost:
                 "edit_snapshots": {},
                 "tool_started_at": {},
                 "model_override": frame.get("model_override"),
+                "create_enabled_toolsets": frame.get("enabled_toolsets"),
                 "source": server._sanitize_client_source(frame.get("source")),
                 "transport": self._transport,
             }
@@ -510,6 +514,8 @@ class ComputeHost:
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        if frame.get("enabled_toolsets") is not None:
+            session["create_enabled_toolsets"] = frame.get("enabled_toolsets")
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:
