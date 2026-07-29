@@ -376,6 +376,7 @@ def _release_site(
     short: str = REVISION[:12],
 ) -> tuple[Path, Path]:
     release = (paths["releases"] / f"hermes-agent-{short}").resolve()
+    (release / ".venv/bin").mkdir(parents=True)
     site = release / ".venv/lib/python3.11/site-packages"
     site.mkdir(parents=True)
     return release, site

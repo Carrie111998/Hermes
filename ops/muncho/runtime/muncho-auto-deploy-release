@@ -22,6 +22,8 @@ SYSTEMCTL="/usr/bin/systemctl"
 SYSTEM_PYTHON="/usr/bin/python3"
 SYSTEM_GIT="/usr/bin/git"
 SYSTEM_ID="/usr/bin/id"
+SYSTEM_FLOCK="/usr/bin/flock"
+DEPLOY_LOCK_PATH="/run/muncho-auto-deploy-release.lock"
 CUTOVER_BOOTSTRAP_RUNTIME_DIR="/run"
 CUTOVER_BOOTSTRAP_REPOSITORY_PATH="ops/muncho/cutover/production_unit_input_bootstrap.py"
 AGENT_BROWSER_CONFIG_RELATIVE_PATH="ops/muncho/runtime/dependencies/agent-browser.json"
@@ -230,6 +232,147 @@ validate_args() {
     echo "BLOCKED: deploy health wait must be an integer from 0 through 300 seconds." >&2
     exit 2
   fi
+}
+
+acquire_deploy_lock_at() {
+  local sha="$1"
+  local pr="$2"
+  local lock_path="$3"
+  local lock_parent="$4"
+  local trusted_uid="$5"
+  local trusted_gid="$6"
+  if [ ! -x "$SYSTEM_FLOCK" ]; then
+    write_status "blocked_deploy_lock_unavailable" "$sha" "$pr" "{}"
+    return 12
+  fi
+  if ! "$SYSTEM_PYTHON" -I -S - \
+    "$lock_path" "$lock_parent" "$trusted_uid" "$trusted_gid" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+parent = Path(sys.argv[2])
+trusted_uid = int(sys.argv[3])
+trusted_gid = int(sys.argv[4])
+if (
+    not path.is_absolute()
+    or not parent.is_absolute()
+    or path.parent != parent
+    or parent.resolve(strict=True) != parent
+):
+    raise SystemExit("BLOCKED_DEPLOY_LOCK_PATH_INVALID")
+directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+directory_flags |= getattr(os, "O_DIRECTORY", 0)
+directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+directory = os.open(parent, directory_flags)
+try:
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+    )
+    parent_opened = os.fstat(directory)
+    parent_reachable = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_opened.st_mode)
+        or parent_opened.st_uid != trusted_uid
+        or parent_opened.st_gid != trusted_gid
+        or stat.S_IMODE(parent_opened.st_mode) & 0o022
+        or identity(parent_opened) != identity(parent_reachable)
+    ):
+        raise SystemExit("BLOCKED_DEPLOY_LOCK_PARENT_INVALID")
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(
+            path.name,
+            flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory,
+        )
+    except FileExistsError:
+        descriptor = os.open(path.name, flags, dir_fd=directory)
+    try:
+        opened = os.fstat(descriptor)
+        reachable = os.stat(
+            path.name,
+            dir_fd=directory,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != trusted_uid
+            or opened.st_gid != trusted_gid
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or identity(opened) != identity(reachable)
+        ):
+            raise SystemExit("BLOCKED_DEPLOY_LOCK_IDENTITY_INVALID")
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(directory)
+PY
+  then
+    write_status "blocked_deploy_lock_invalid" "$sha" "$pr" "{}"
+    return 12
+  fi
+  if ! exec 9<>"$lock_path"; then
+    write_status "blocked_deploy_lock_open_failed" "$sha" "$pr" "{}"
+    return 12
+  fi
+  if ! "$SYSTEM_PYTHON" -I -S - \
+    "$lock_path" "$trusted_uid" "$trusted_gid" 9 <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+trusted_uid = int(sys.argv[2])
+trusted_gid = int(sys.argv[3])
+descriptor = int(sys.argv[4])
+opened = os.fstat(descriptor)
+reachable = path.lstat()
+identity = lambda value: (
+    value.st_dev,
+    value.st_ino,
+    value.st_mode,
+    value.st_nlink,
+    value.st_uid,
+    value.st_gid,
+)
+if (
+    stat.S_ISLNK(reachable.st_mode)
+    or not stat.S_ISREG(opened.st_mode)
+    or opened.st_nlink != 1
+    or opened.st_uid != trusted_uid
+    or opened.st_gid != trusted_gid
+    or stat.S_IMODE(opened.st_mode) != 0o600
+    or identity(opened) != identity(reachable)
+):
+    raise SystemExit("BLOCKED_DEPLOY_LOCK_OPEN_IDENTITY_INVALID")
+PY
+  then
+    exec 9>&-
+    write_status "blocked_deploy_lock_open_identity_invalid" "$sha" "$pr" "{}"
+    return 12
+  fi
+  if ! "$SYSTEM_FLOCK" --exclusive --nonblock 9; then
+    write_status "blocked_concurrent_deploy" "$sha" "$pr" "{}"
+    exec 9>&-
+    return 12
+  fi
+  return 0
+}
+
+acquire_deploy_lock() {
+  acquire_deploy_lock_at "$1" "$2" "$DEPLOY_LOCK_PATH" "/run" 0 0
 }
 
 gateway_deploy_topology_json() {
@@ -1544,6 +1687,20 @@ def checked_directory(path, code):
         or stat.S_IMODE(before.st_mode) & 0o022
     ):
         fail(code)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        fail(code)
+    try:
+        opened = os.fstat(descriptor)
+        reachable = path.lstat()
+    finally:
+        os.close(descriptor)
+    if identity(before) != identity(opened) or identity(before) != identity(reachable):
+        fail(code)
     return before
 
 
@@ -1901,6 +2058,7 @@ def run():
     checked_directory(inherited_release, "inherited_release_identity_invalid")
     for path, code in (
         (release / ".venv", "venv_identity_invalid"),
+        (release / ".venv" / "bin", "venv_bin_identity_invalid"),
         (release / ".venv" / "lib", "venv_lib_identity_invalid"),
     ):
         checked_directory(path, code)
@@ -1993,7 +2151,7 @@ attest_target_release_venv() {
   )"; then
     return 1
   fi
-  sudo -n -u "$OWNER" "$release/.venv/bin/python" -I -P -s - \
+  sudo -n -u "$OWNER" "$release/.venv/bin/python" -I -B -P -s - \
     "$site" <<'PY'
 import importlib
 import sys
@@ -2034,61 +2192,111 @@ install_target_release_wheel() {
 
 attest_target_release_entrypoints() {
   local release="$1"
-  sudo -n -u "$OWNER" "$release/.venv/bin/python" -I -P -s - \
-    "$release" <<'PY'
+  local owner_uid=""
+  local owner_gid=""
+  owner_uid="$("$SYSTEM_ID" -u "$OWNER")"
+  owner_gid="$("$SYSTEM_ID" -g "$OWNER")"
+  "$SYSTEM_PYTHON" -I -S - "$release" "$owner_uid" "$owner_gid" <<'PY'
 import os
 import stat
 import sys
 from pathlib import Path
 
 release = Path(sys.argv[1])
+owner_uid = int(sys.argv[2])
+owner_gid = int(sys.argv[3])
 if not release.is_absolute() or release.resolve(strict=True) != release:
     raise SystemExit("BLOCKED_RELEASE_ENTRYPOINT_ADDRESS_INVALID")
 
-interpreter = release / ".venv/bin/python"
+bin_path = release / ".venv/bin"
+try:
+    bin_before = bin_path.lstat()
+except OSError as exc:
+    raise SystemExit("BLOCKED_RELEASE_ENTRYPOINT_BIN_UNAVAILABLE") from exc
+if (
+    bin_path.resolve(strict=True) != bin_path
+    or stat.S_ISLNK(bin_before.st_mode)
+    or not stat.S_ISDIR(bin_before.st_mode)
+    or bin_before.st_uid != owner_uid
+    or bin_before.st_gid != owner_gid
+    or stat.S_IMODE(bin_before.st_mode) & 0o022
+):
+    raise SystemExit("BLOCKED_RELEASE_ENTRYPOINT_BIN_INVALID")
+dir_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+dir_flags |= getattr(os, "O_DIRECTORY", 0)
+dir_flags |= getattr(os, "O_NOFOLLOW", 0)
+try:
+    bin_descriptor = os.open(bin_path, dir_flags)
+except OSError as exc:
+    raise SystemExit("BLOCKED_RELEASE_ENTRYPOINT_BIN_UNAVAILABLE") from exc
+
+interpreter = bin_path / "python"
 expected = f"#!{interpreter}\n".encode("ascii")
 flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-for name in ("hermes", "hermes-acp", "hermes-agent", "muncho-ops"):
-    path = release / ".venv/bin" / name
-    try:
-        before = path.lstat()
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise SystemExit(
-            f"BLOCKED_RELEASE_ENTRYPOINT_UNAVAILABLE:{name}"
-        ) from exc
-    try:
-        opened = os.fstat(fd)
-        first_line = b""
-        while len(first_line) <= len(expected):
-            chunk = os.read(fd, 1)
-            if not chunk:
-                break
-            first_line += chunk
-            if chunk == b"\n":
-                break
-    finally:
-        os.close(fd)
-    identity = lambda value: (
-        value.st_dev,
-        value.st_ino,
-        value.st_mode,
-        value.st_nlink,
-        value.st_size,
-        value.st_mtime_ns,
-        value.st_ctime_ns,
-    )
-    after = path.lstat()
+identity = lambda value: (
+    value.st_dev,
+    value.st_ino,
+    value.st_mode,
+    value.st_nlink,
+    value.st_uid,
+    value.st_gid,
+    value.st_size,
+    value.st_mtime_ns,
+    value.st_ctime_ns,
+)
+try:
+    bin_opened = os.fstat(bin_descriptor)
+    if identity(bin_before) != identity(bin_opened):
+        raise SystemExit("BLOCKED_RELEASE_ENTRYPOINT_BIN_CHANGED")
+    for name in ("hermes", "hermes-acp", "hermes-agent", "muncho-ops"):
+        try:
+            before = os.stat(name, dir_fd=bin_descriptor, follow_symlinks=False)
+            fd = os.open(name, flags, dir_fd=bin_descriptor)
+        except OSError as exc:
+            raise SystemExit(
+                f"BLOCKED_RELEASE_ENTRYPOINT_UNAVAILABLE:{name}"
+            ) from exc
+        try:
+            opened_before = os.fstat(fd)
+            first_line = b""
+            while len(first_line) <= len(expected):
+                chunk = os.read(fd, 1)
+                if not chunk:
+                    break
+                first_line += chunk
+                if chunk == b"\n":
+                    break
+            opened_after = os.fstat(fd)
+            anchored_after = os.stat(
+                name,
+                dir_fd=bin_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != owner_uid
+                or before.st_gid != owner_gid
+                or stat.S_IMODE(before.st_mode) & 0o022
+                or not (before.st_mode & stat.S_IXUSR)
+                or identity(before) != identity(opened_before)
+                or identity(before) != identity(opened_after)
+                or identity(before) != identity(anchored_after)
+                or first_line != expected
+            ):
+                raise SystemExit(f"BLOCKED_RELEASE_ENTRYPOINT_INVALID:{name}")
+        finally:
+            os.close(fd)
+    bin_after = os.fstat(bin_descriptor)
+    bin_reachable = bin_path.lstat()
     if (
-        stat.S_ISLNK(before.st_mode)
-        or not stat.S_ISREG(before.st_mode)
-        or before.st_nlink != 1
-        or not (before.st_mode & stat.S_IXUSR)
-        or identity(before) != identity(opened)
-        or identity(before) != identity(after)
-        or first_line != expected
+        identity(bin_before) != identity(bin_after)
+        or identity(bin_before) != identity(bin_reachable)
     ):
-        raise SystemExit(f"BLOCKED_RELEASE_ENTRYPOINT_INVALID:{name}")
+        raise SystemExit("BLOCKED_RELEASE_ENTRYPOINT_BIN_CHANGED")
+finally:
+    os.close(bin_descriptor)
 print("target_release_entrypoints=ok")
 PY
 }
@@ -2114,6 +2322,27 @@ release_identity_matches() {
     && [ "$observed_source" = "$expected_head" ]
 }
 
+require_inactive_target_with_unchanged_active() {
+  local sha="$1"
+  local pr="$2"
+  local expected_active="$3"
+  local target="$4"
+  local stage="$5"
+  local current_active=""
+  local active_unchanged="false"
+  local target_inactive="false"
+  local stage_json=""
+  current_active="$(readlink -f "$ACTIVE_LINK" 2>/dev/null || true)"
+  [ "$current_active" = "$expected_active" ] && active_unchanged="true"
+  [ "$current_active" != "$target" ] && target_inactive="true"
+  if [ "$current_active" != "$expected_active" ] || [ "$current_active" = "$target" ]; then
+    stage_json="$(printf '%s' "$stage" | json_escape)"
+    write_status "blocked_active_release_changed_during_deploy" "$sha" "$pr" \
+      "{\"stage\": $stage_json, \"active_unchanged\": $active_unchanged, \"target_inactive\": $target_inactive}"
+    return 13
+  fi
+}
+
 cutover_artifacts_match() {
   local release="$1"
   local expected_head="$2"
@@ -2122,11 +2351,11 @@ cutover_artifacts_match() {
     return 1
   fi
   validate_cutover_unit_inputs "$expected_head" >/dev/null \
-    && sudo -n -u "$OWNER" "$release/.venv/bin/python" -I \
+    && sudo -n -u "$OWNER" "$release/.venv/bin/python" -I -B \
     "$release/scripts/canary/package_production_runtime_dependencies.py" verify \
     --release-root "$release" \
     --revision "$expected_head" >/dev/null \
-    && sudo -n -u "$OWNER" "$release/.venv/bin/python" -I \
+    && sudo -n -u "$OWNER" "$release/.venv/bin/python" -I -B \
     "$release/scripts/canary/package_production_cutover_artifacts.py" verify \
     --release-root "$release" \
     --revision "$expected_head" \
@@ -2265,6 +2494,8 @@ run_deploy() {
   local pr="$2"
   validate_args "$sha" "$pr"
   require_legacy_deploy_topology "$sha" "$pr" "pre_deploy" || return $?
+  acquire_deploy_lock "$sha" "$pr" || return $?
+  require_legacy_deploy_topology "$sha" "$pr" "post_deploy_lock" || return $?
   local short="${sha:0:12}"
   local new="$RELEASES/hermes-agent-$short"
   local tmp="$RELEASES/.hermes-agent-$short.tmp.$$"
@@ -2273,6 +2504,8 @@ run_deploy() {
   local active_source
   local remote_main
   local rollback_rc
+  local publish_rc
+  local activation_rc
 
   write_status "deploy_running" "$sha" "$pr" "{}"
   active="$(readlink -f "$ACTIVE_LINK" 2>/dev/null || true)"
@@ -2288,6 +2521,20 @@ run_deploy() {
   if [ "$remote_main" != "$sha" ]; then
     write_status "blocked_target_not_current_fork_main" "$sha" "$pr" "{\"remote_main\": \"$remote_main\"}"
     exit 3
+  fi
+  if [ "$active" = "$new" ]; then
+    if [ "$active_head" != "$sha" ] \
+      || [ "$active_source" != "$sha" ] \
+      || ! systemctl is-active --quiet "$SERVICE" \
+      || ! attest_target_release_entrypoints "$active" >/dev/null \
+      || ! attest_target_release_venv "$active" "$active" >/dev/null \
+      || ! cutover_artifacts_match "$active" "$sha"; then
+      write_status "blocked_target_already_active_unhealthy" "$sha" "$pr" "{}"
+      exit 4
+    fi
+    write_status "deploy_pass" "$sha" "$pr" \
+      "{\"deployed_release\": \"$new\", \"deployed_head\": \"$active_head\", \"service_active\": \"active\", \"already_active\": true}"
+    return 0
   fi
   require_no_active_voice_call "$sha" "$pr" "pre_release"
 
@@ -2359,7 +2606,17 @@ ctx = RouteBackCaseContext(case_id='case:auto-sync-deploy-smoke', source_thread_
 assert 'concrete next-action artifact' in build_routeback_context_prompt([ctx])
 print('routeback_context_import_smoke=ok')
 PY"
-    sudo -n -u "$OWNER" mv "$tmp" "$new"
+    require_inactive_target_with_unchanged_active \
+      "$sha" "$pr" "$active" "$new" "pre_release_publish" || {
+      publish_rc=$?
+      rm -rf "$tmp"
+      return "$publish_rc"
+    }
+    if [ -e "$new" ] || ! sudo -n -u "$OWNER" mv -T "$tmp" "$new"; then
+      rm -rf "$tmp"
+      write_status "blocked_target_release_publish_failed" "$sha" "$pr" "{}"
+      exit 5
+    fi
   fi
   if ! validate_cutover_unit_inputs "$sha" >/dev/null 2>&1; then
     bootstrap_cutover_unit_inputs_from_target "$new" "$sha" >/dev/null || {
@@ -2375,15 +2632,16 @@ PY"
   fi
   # pip writes console-script shebangs with the interpreter's current absolute
   # path.  The first wheel install runs in the hidden staging directory, so
-  # those launchers become stale after the atomic rename to ``$new``.  Reinstall
-  # only the target wheel at its final, inactive address and fail closed unless
-  # every shipped entrypoint is bound to that exact release interpreter.
-  if [ "$new" != "$active" ]; then
-    if ! install_target_release_wheel "$new" "$new" >/dev/null; then
-      write_status "blocked_target_release_venv_invalid" "$sha" "$pr" \
-        "{\"stage\": \"final_address_wheel_install\"}"
-      exit 5
-    fi
+  # those launchers become stale after the atomic rename to ``$new``. Re-resolve
+  # the active link while holding the process-global deploy lock, then reinstall
+  # only the target wheel at its final, still-inactive address.
+  require_inactive_target_with_unchanged_active \
+    "$sha" "$pr" "$active" "$new" "pre_final_address_wheel_install" \
+    || return $?
+  if ! install_target_release_wheel "$new" "$new" >/dev/null; then
+    write_status "blocked_target_release_venv_invalid" "$sha" "$pr" \
+      "{\"stage\": \"final_address_wheel_install\"}"
+    exit 5
   fi
   if ! attest_target_release_entrypoints "$new" >/dev/null; then
     write_status "blocked_target_release_entrypoints_invalid" "$sha" "$pr" \
@@ -2401,6 +2659,8 @@ PY"
   fi
 
   require_no_active_voice_call "$sha" "$pr" "pre_restart"
+  require_inactive_target_with_unchanged_active \
+    "$sha" "$pr" "$active" "$new" "pre_restart_marker" || return $?
   local marker_output
   if [ ! -x "$PLANNED_RESTART_HELPER" ]; then
     write_status "blocked_planned_restart_helper_missing" "$sha" "$pr" "{}"
@@ -2412,11 +2672,24 @@ PY"
     write_status "blocked_planned_stop_marker_failed" "$sha" "$pr" "{}"
     exit 7
   fi
+  require_inactive_target_with_unchanged_active \
+    "$sha" "$pr" "$active" "$new" "pre_link_activation" || {
+    activation_rc=$?
+    rm -f "$HERMES_HOME/.gateway-planned-stop.json"
+    return "$activation_rc"
+  }
   if ! ln -sfn "$new" "$ACTIVE_LINK.next"; then
     rm -f "$HERMES_HOME/.gateway-planned-stop.json"
     write_status "blocked_target_link_stage_failed" "$sha" "$pr" "{}"
     exit 7
   fi
+  require_inactive_target_with_unchanged_active \
+    "$sha" "$pr" "$active" "$new" "pre_link_swap" || {
+    activation_rc=$?
+    rm -f "$ACTIVE_LINK.next"
+    rm -f "$HERMES_HOME/.gateway-planned-stop.json"
+    return "$activation_rc"
+  }
   if ! mv -Tf "$ACTIVE_LINK.next" "$ACTIVE_LINK"; then
     rm -f "$ACTIVE_LINK.next"
     if [ "$(readlink -f "$ACTIVE_LINK" 2>/dev/null || true)" = "$active" ]; then

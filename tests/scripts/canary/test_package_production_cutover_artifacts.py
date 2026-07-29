@@ -3051,7 +3051,7 @@ def test_deploy_packages_and_verifies_before_release_activation():
     )
     build = run_deploy.index("package_production_cutover_artifacts.py\" build")
     verify = run_deploy.index("package_production_cutover_artifacts.py\" verify")
-    publish = run_deploy.index('mv "$tmp" "$new"')
+    publish = run_deploy.index('mv -T "$tmp" "$new"')
     release_identity = run_deploy.index(
         'release_identity_matches "$new" "$sha"'
     )
