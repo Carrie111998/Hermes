@@ -38,6 +38,8 @@ Hermes on Discord is not a webhook that replies statelessly. It runs through the
 
 That matters because behavior in a busy server depends on both Discord routing and Hermes session policy.
 
+For the authoritative user-visible start, progress, and terminal-state behavior of an agent run, see the [Discord Run Lifecycle](../../product/discord-run-lifecycle.md) product contract.
+
 ### Session Model in Discord
 
 By default:

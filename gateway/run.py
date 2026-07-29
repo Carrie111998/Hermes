@@ -10992,6 +10992,146 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return switched
 
+    @staticmethod
+    def _event_for_pending_text(
+        pending_event: Optional[MessageEvent],
+        pending_text: Optional[str],
+        source: SessionSource,
+    ) -> Optional[MessageEvent]:
+        """Give string-only interrupt/steer turns normal lifecycle identity."""
+        if pending_event is not None or not pending_text:
+            return pending_event
+        return MessageEvent(
+            text=pending_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            metadata={"_synthetic_pending_followup": True},
+        )
+
+    @staticmethod
+    def _run_lifecycle_outcome_from_result(result: Any) -> str:
+        if isinstance(result, dict):
+            if result.get("timed_out"):
+                return "timeout"
+            if result.get("interrupted"):
+                return "stopped"
+            if result.get("failed"):
+                return "failed"
+        return "success"
+
+    async def _begin_recursive_discord_run_lifecycle(
+        self,
+        event: Optional[MessageEvent],
+        *,
+        session_key: str,
+        generation: Optional[int],
+    ) -> Any:
+        """Start lifecycle state for an in-band queued Discord event."""
+        if event is None:
+            return None
+        source = getattr(event, "source", None)
+        if (
+            source is None
+            or source.platform != Platform.DISCORD
+            or not getattr(source, "thread_id", None)
+        ):
+            return None
+        adapter = self._adapter_for_source(source)
+        begin = getattr(adapter, "begin_run_lifecycle", None)
+        if not callable(begin):
+            return None
+        try:
+            await asyncio.wait_for(
+                begin(event, session_key=session_key, generation=generation),
+                timeout=5.0,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "Recursive Discord run lifecycle start failed for %s",
+                session_key,
+                exc_info=True,
+            )
+        return adapter
+
+    async def _finish_recursive_discord_run_lifecycle(
+        self,
+        event: Optional[MessageEvent],
+        *,
+        session_key: str,
+        generation: Optional[int],
+        outcome: str,
+        adapter: Any = None,
+    ) -> None:
+        """Flush deferred output and one terminal marker before the next turn."""
+        if event is None:
+            return
+        source = getattr(event, "source", None)
+        if (
+            source is None
+            or source.platform != Platform.DISCORD
+            or not getattr(source, "thread_id", None)
+        ):
+            return
+        try:
+            adapter = adapter or self._adapter_for_source(source)
+        except Exception:
+            logger.debug(
+                "Recursive Discord lifecycle adapter lookup failed for %s",
+                session_key,
+                exc_info=True,
+            )
+            return
+
+        try:
+            setter = getattr(adapter, "set_run_lifecycle_outcome", None)
+            if callable(setter):
+                setter(event, outcome)
+        except Exception:
+            logger.debug(
+                "Recursive Discord lifecycle outcome update failed for %s",
+                session_key,
+                exc_info=True,
+            )
+
+        try:
+            register = getattr(adapter, "register_run_lifecycle_terminal", None)
+            if callable(register):
+                register(event)
+        except Exception:
+            logger.debug(
+                "Recursive Discord lifecycle terminal registration failed for %s",
+                session_key,
+                exc_info=True,
+            )
+
+        callback = None
+        try:
+            pop_callback = getattr(adapter, "pop_post_delivery_callback", None)
+            if callable(pop_callback):
+                callback = pop_callback(session_key, generation=generation)
+        except Exception:
+            logger.debug(
+                "Recursive Discord lifecycle callback pop failed for %s",
+                session_key,
+                exc_info=True,
+            )
+        if not callable(callback):
+            return
+        try:
+            callback_result = callback()
+            if inspect.isawaitable(callback_result):
+                await asyncio.wait_for(callback_result, timeout=30.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "Recursive Discord run lifecycle finalization failed for %s",
+                session_key,
+                exc_info=True,
+            )
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -12567,8 +12707,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        # Discord's typing indicator and parent-message reaction are both
+        # transient/easy to miss once an auto-thread opens. Start the durable
+        # in-thread lifecycle only after this request has passed command,
+        # authorization, drain, and concurrency gates and has claimed a real
+        # agent slot. Adapters without the explicit lifecycle capability are
+        # untouched.
+        _run_lifecycle_adapter = None
+        if source.platform == Platform.DISCORD and getattr(source, "thread_id", None):
+            _run_lifecycle_adapter = self._adapter_for_source(source)
+
+        def _set_run_lifecycle_outcome(outcome: str) -> None:
+            setter = getattr(
+                _run_lifecycle_adapter, "set_run_lifecycle_outcome", None
+            )
+            if not callable(setter):
+                return
+            try:
+                setter(event, outcome)
+            except Exception:
+                logger.debug(
+                    "Discord run lifecycle outcome update failed for %s",
+                    _quick_key,
+                    exc_info=True,
+                )
+
         try:
+            # Keep startup inside the cleanup-owning try: cancellation while
+            # Discord is posting the durable marker must still classify the
+            # turn as stopped and release its sentinel/lease.
+            if _run_lifecycle_adapter is not None:
+                _begin_run_lifecycle = getattr(
+                    _run_lifecycle_adapter, "begin_run_lifecycle", None
+                )
+                if callable(_begin_run_lifecycle):
+                    try:
+                        await asyncio.wait_for(
+                            _begin_run_lifecycle(
+                                event,
+                                session_key=_quick_key,
+                                generation=_run_generation,
+                            ),
+                            timeout=5.0,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as _lifecycle_exc:
+                        logger.debug(
+                            "Discord run lifecycle start failed for %s: %s",
+                            _quick_key,
+                            _lifecycle_exc,
+                        )
+
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            if isinstance(_agent_result, dict):
+                if _agent_result.get("timed_out"):
+                    _set_run_lifecycle_outcome("timeout")
+                elif _agent_result.get("interrupted"):
+                    _set_run_lifecycle_outcome("stopped")
+                elif _agent_result.get("failed"):
+                    _set_run_lifecycle_outcome("failed")
+                else:
+                    _set_run_lifecycle_outcome("success")
+            else:
+                _set_run_lifecycle_outcome("success")
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -12598,6 +12800,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
+        except asyncio.CancelledError:
+            _set_run_lifecycle_outcome("stopped")
+            raise
+        except Exception:
+            _set_run_lifecycle_outcome("failed")
+            raise
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -14325,6 +14533,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                lifecycle_event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -14996,6 +15205,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception:
                 logger.debug("Failed to persist inbound user message after agent exception", exc_info=True)
+            # The user-facing error below is intentionally returned as a
+            # normal string so BasePlatformAdapter can deliver it. Preserve
+            # the semantic run failure on the event before that string reaches
+            # the outer classifier, which otherwise sees a successful return.
+            try:
+                _lifecycle_adapter = self._adapter_for_source(source)
+                _set_lifecycle_outcome = getattr(
+                    _lifecycle_adapter, "set_run_lifecycle_outcome", None
+                )
+                if callable(_set_lifecycle_outcome):
+                    _set_lifecycle_outcome(event, "failed")
+            except Exception:
+                logger.debug(
+                    "Failed to classify caught agent exception for Discord lifecycle",
+                    exc_info=True,
+                )
             # Log full details server-side only; never expose raw exception
             # types or messages to end users (info-leakage risk).
             status_hint = ""
@@ -20483,6 +20708,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        lifecycle_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -20501,6 +20727,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                lifecycle_event=lifecycle_event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -20512,6 +20739,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                lifecycle_event=lifecycle_event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -20633,6 +20861,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        lifecycle_event: Optional[MessageEvent] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23007,6 +23236,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
                 "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
+                "failed": result_holder[0].get("failed", False) if result_holder[0] else False,
+                "timed_out": result_holder[0].get("timed_out", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
                 # Soft lock-contention defer (#69870 consumer): distinct from
@@ -23485,6 +23716,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "tools": tools_holder[0] or [],
                     "history_offset": 0,
                     "failed": True,
+                    "timed_out": True,
                 }
 
             # Track fallback model state: if the agent switched to a
@@ -23616,6 +23848,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pending_event = None
                 pending = None
 
+            pending_event = self._event_for_pending_text(
+                pending_event,
+                pending,
+                source,
+            )
+
             if pending_event or pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])
 
@@ -23703,34 +23941,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
                             session_key or "?",
                         )
-                    # Release deferred bg-review notifications now that the
-                    # first response has been delivered.  Pop from the
-                    # adapter's callback dict (prevents double-fire in
-                    # base.py's finally block) and call it.
-                    if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
-                        _bg_cb = adapter.pop_post_delivery_callback(
-                            session_key,
-                            generation=run_generation,
-                        )
-                        if callable(_bg_cb):
-                            try:
-                                _bg_result = _bg_cb()
-                                if inspect.isawaitable(_bg_result):
-                                    await _bg_result
-                            except Exception:
-                                pass
-                    elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
-                        _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
-                        if callable(_bg_cb):
-                            try:
-                                _bg_result = _bg_cb()
-                                if inspect.isawaitable(_bg_result):
-                                    await _bg_result
-                            except Exception:
-                                pass
                 # else: interrupted — discard the interrupted response ("Operation
                 # interrupted." is just noise; the user already knows they sent a
                 # new message).
+
+                _has_discord_lifecycle = bool(
+                    lifecycle_event is not None
+                    and getattr(lifecycle_event, "source", None) is not None
+                    and lifecycle_event.source.platform == Platform.DISCORD
+                    and getattr(lifecycle_event.source, "thread_id", None)
+                )
+                if _has_discord_lifecycle:
+                    await self._finish_recursive_discord_run_lifecycle(
+                        lifecycle_event,
+                        session_key=session_key,
+                        generation=run_generation,
+                        outcome=self._run_lifecycle_outcome_from_result(result),
+                        adapter=adapter,
+                    )
+                # Preserve the existing cross-platform deferred-callback drain
+                # when this turn has no Discord lifecycle marker.
+                elif getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
+                    _bg_cb = adapter.pop_post_delivery_callback(
+                        session_key,
+                        generation=run_generation,
+                    )
+                    if callable(_bg_cb):
+                        try:
+                            _bg_result = _bg_cb()
+                            if inspect.isawaitable(_bg_result):
+                                await _bg_result
+                        except Exception:
+                            pass
+                elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
+                    _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
+                    if callable(_bg_cb):
+                        try:
+                            _bg_result = _bg_cb()
+                            if inspect.isawaitable(_bg_result):
+                                await _bg_result
+                        except Exception:
+                            pass
 
                 updated_history = result.get("messages", history)
                 next_source = source
@@ -23770,6 +24021,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
 
+                _next_lifecycle_adapter = None
+                try:
+                    _next_lifecycle_adapter = await self._begin_recursive_discord_run_lifecycle(
+                        pending_event,
+                        session_key=next_session_key,
+                        generation=run_generation,
+                    )
+                except asyncio.CancelledError:
+                    # begin_run_lifecycle stores its state before awaiting the
+                    # Discord send, so a cancellation can still produce a
+                    # truthful stopped marker without leaking into the next run.
+                    await asyncio.shield(
+                        self._finish_recursive_discord_run_lifecycle(
+                            pending_event,
+                            session_key=next_session_key,
+                            generation=run_generation,
+                            outcome="stopped",
+                        )
+                    )
+                    raise
+
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
                 # typing task is still alive but may be stale.
@@ -23799,18 +24071,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                )
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        lifecycle_event=pending_event,
+                    )
+                except asyncio.CancelledError:
+                    await asyncio.shield(
+                        self._finish_recursive_discord_run_lifecycle(
+                            pending_event,
+                            session_key=next_session_key,
+                            generation=run_generation,
+                            outcome="stopped",
+                            adapter=_next_lifecycle_adapter,
+                        )
+                    )
+                    raise
+                except Exception:
+                    await self._finish_recursive_discord_run_lifecycle(
+                        pending_event,
+                        session_key=next_session_key,
+                        generation=run_generation,
+                        outcome="failed",
+                        adapter=_next_lifecycle_adapter,
+                    )
+                    raise
+                else:
+                    await self._finish_recursive_discord_run_lifecycle(
+                        pending_event,
+                        session_key=next_session_key,
+                        generation=run_generation,
+                        outcome=self._run_lifecycle_outcome_from_result(followup_result),
+                        adapter=_next_lifecycle_adapter,
+                    )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
