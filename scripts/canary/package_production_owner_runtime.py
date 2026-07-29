@@ -16,6 +16,7 @@ this local packaging operation.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -25,9 +26,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from gateway import production_owner_runtime as runtime
 
@@ -44,6 +47,7 @@ _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_WHEEL = re.compile(r"^[A-Za-z0-9_.+-]+\.whl$")
 _MAX_OUTPUT = 64 * 1024 * 1024
 _COMMAND_TIMEOUT = 1800
+_RECOVERABLE_ROOT_MODES = frozenset({0o555, 0o700, 0o755})
 _PUBLICATION_FIELDS = frozenset({
     "schema",
     "release_revision",
@@ -139,7 +143,18 @@ class OwnerRuntimeBuildSpec:
 
     @property
     def incomplete_marker(self) -> Path:
+        return (
+            self.release_base
+            / f".{self.revision}.owner-runtime-build-incomplete"
+        )
+
+    @property
+    def legacy_incomplete_marker(self) -> Path:
         return self.release_root / ".owner-runtime-build-incomplete"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.release_base / f".{self.revision}.owner-runtime-build.lock"
 
     def validate(self) -> None:
         paths = (
@@ -281,6 +296,380 @@ def _verify_clean_source(spec: OwnerRuntimeBuildSpec) -> None:
         raise ProductionOwnerRuntimePackagingError(
             "production_owner_runtime_package_source_not_exact"
         )
+
+
+def _lexists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _validate_release_base(spec: OwnerRuntimeBuildSpec) -> None:
+    try:
+        item = os.lstat(spec.release_base)
+    except OSError as exc:
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_release_base_invalid"
+        ) from exc
+    if (
+        not stat.S_ISDIR(item.st_mode)
+        or stat.S_ISLNK(item.st_mode)
+        or item.st_uid != os.getuid()
+        or stat.S_IMODE(item.st_mode) & 0o022
+    ):
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_release_base_invalid"
+        )
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    descriptor: int | None = None
+    try:
+        before = os.lstat(path)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or (before.st_dev, before.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise ProductionOwnerRuntimePackagingError(
+                "production_owner_runtime_package_durability_failed"
+            )
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+    except ProductionOwnerRuntimePackagingError:
+        raise
+    except OSError as exc:
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_durability_failed"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_mode,
+        opened.st_uid,
+        opened.st_gid,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_uid,
+        after.st_gid,
+    ):
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_durability_failed"
+        )
+
+
+@contextmanager
+def _revision_lock(spec: OwnerRuntimeBuildSpec) -> Iterator[None]:
+    """Serialize publication and recovery for one immutable revision."""
+
+    try:
+        import fcntl
+    except ImportError as exc:  # pragma: no cover - production boundary is macOS/Linux
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_lock_unavailable"
+        ) from exc
+
+    spec.release_base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _validate_release_base(spec)
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        if _lexists(spec.lock_path):
+            existing = os.lstat(spec.lock_path)
+            if (
+                not stat.S_ISREG(existing.st_mode)
+                or stat.S_ISLNK(existing.st_mode)
+                or existing.st_nlink != 1
+                or existing.st_uid != os.getuid()
+                or stat.S_IMODE(existing.st_mode) != 0o600
+                or existing.st_size != 0
+            ):
+                raise ProductionOwnerRuntimePackagingError(
+                    "production_owner_runtime_package_lock_invalid"
+                )
+        descriptor = os.open(spec.lock_path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        path_state = os.lstat(spec.lock_path)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(path_state.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size != 0
+            or (opened.st_dev, opened.st_ino)
+            != (path_state.st_dev, path_state.st_ino)
+        ):
+            raise ProductionOwnerRuntimePackagingError(
+                "production_owner_runtime_package_lock_invalid"
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise ProductionOwnerRuntimePackagingError(
+                    "production_owner_runtime_package_build_in_progress"
+                ) from exc
+            raise ProductionOwnerRuntimePackagingError(
+                "production_owner_runtime_package_lock_unavailable"
+            ) from exc
+        current = os.lstat(spec.lock_path)
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or (current.st_dev, current.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise ProductionOwnerRuntimePackagingError(
+                "production_owner_runtime_package_lock_invalid"
+            )
+    except ProductionOwnerRuntimePackagingError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_lock_unavailable"
+        ) from exc
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(descriptor)
+
+
+def _marker_payload(spec: OwnerRuntimeBuildSpec) -> bytes:
+    return (spec.revision + "\n").encode("ascii", errors="strict")
+
+
+def _validate_incomplete_marker(
+    path: Path,
+    *,
+    spec: OwnerRuntimeBuildSpec,
+) -> None:
+    payload = _marker_payload(spec)
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        before = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_size != len(payload)
+            or stat.S_IMODE(before.st_mode) & 0o022
+        ):
+            raise ProductionOwnerRuntimePackagingError(
+                "production_owner_runtime_package_recovery_invalid"
+            )
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        raw = os.read(descriptor, len(payload) + 1)
+        after = os.fstat(descriptor)
+    except ProductionOwnerRuntimePackagingError:
+        raise
+    except OSError as exc:
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_recovery_invalid"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_uid,
+        item.st_gid,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    if (
+        identity(before) != identity(opened)
+        or identity(before) != identity(after)
+        or raw != payload
+    ):
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_recovery_invalid"
+        )
+
+
+def _create_incomplete_marker(spec: OwnerRuntimeBuildSpec) -> None:
+    payload = _marker_payload(spec)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(spec.incomplete_marker, flags, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short incomplete marker write")
+            view = view[written:]
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_recovery_invalid"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    _validate_incomplete_marker(spec.incomplete_marker, spec=spec)
+    _fsync_directory(spec.release_base)
+
+
+def _remove_incomplete_marker(spec: OwnerRuntimeBuildSpec) -> None:
+    _validate_incomplete_marker(spec.incomplete_marker, spec=spec)
+    _fsync_directory(spec.release_root)
+    try:
+        spec.incomplete_marker.unlink()
+    except OSError as exc:
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_recovery_invalid"
+        ) from exc
+    _fsync_directory(spec.release_base)
+
+
+def _validate_release_root(spec: OwnerRuntimeBuildSpec) -> os.stat_result:
+    try:
+        item = os.lstat(spec.release_root)
+    except OSError as exc:
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_recovery_invalid"
+        ) from exc
+    if (
+        not stat.S_ISDIR(item.st_mode)
+        or stat.S_ISLNK(item.st_mode)
+        or item.st_uid != os.getuid()
+        or stat.S_IMODE(item.st_mode) & 0o022
+        or stat.S_IMODE(item.st_mode) not in _RECOVERABLE_ROOT_MODES
+    ):
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_recovery_invalid"
+        )
+    return item
+
+
+def _rename_release_root(
+    spec: OwnerRuntimeBuildSpec,
+    destination: Path,
+    *,
+    root_state: os.stat_result,
+) -> None:
+    """Rename the exact root inode while restoring its sealed mode on all exits."""
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    descriptor: int | None = None
+    original_mode = stat.S_IMODE(root_state.st_mode)
+    widened = not original_mode & stat.S_IWUSR
+    try:
+        descriptor = os.open(spec.release_root, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or (opened.st_dev, opened.st_ino)
+            != (root_state.st_dev, root_state.st_ino)
+            or stat.S_IMODE(opened.st_mode) != original_mode
+        ):
+            raise ProductionOwnerRuntimePackagingError(
+                "production_owner_runtime_package_recovery_invalid"
+            )
+        if widened:
+            os.fchmod(descriptor, original_mode | stat.S_IWUSR)
+        try:
+            os.rename(spec.release_root, destination)
+        finally:
+            if widened:
+                try:
+                    os.fchmod(descriptor, original_mode)
+                    os.fsync(descriptor)
+                except OSError as exc:
+                    raise ProductionOwnerRuntimePackagingError(
+                        "production_owner_runtime_package_recovery_failed"
+                    ) from exc
+    except ProductionOwnerRuntimePackagingError:
+        raise
+    except OSError as exc:
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_recovery_failed"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _quarantine_incomplete_release(spec: OwnerRuntimeBuildSpec) -> Path:
+    """Atomically preserve one marked unpublished tree outside its live address."""
+
+    root_state = _validate_release_root(spec)
+    markers = tuple(
+        path
+        for path in (spec.incomplete_marker, spec.legacy_incomplete_marker)
+        if _lexists(path)
+    )
+    if not markers:
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_recovery_invalid"
+        )
+    for marker in markers:
+        _validate_incomplete_marker(marker, spec=spec)
+    quarantine: Path | None = None
+    destination: Path | None = None
+    renamed = False
+    try:
+        quarantine = Path(
+            tempfile.mkdtemp(
+                prefix=f".{spec.revision}.owner-runtime-quarantine-",
+                dir=spec.release_base,
+            )
+        )
+        destination = quarantine / "release"
+        _rename_release_root(spec, destination, root_state=root_state)
+        renamed = True
+        _fsync_directory(destination)
+        _fsync_directory(quarantine)
+        _fsync_directory(spec.release_base)
+    except BaseException as exc:
+        if quarantine is not None and not renamed:
+            try:
+                quarantine.rmdir()
+            except OSError:
+                pass
+        if isinstance(exc, OSError):
+            raise ProductionOwnerRuntimePackagingError(
+                "production_owner_runtime_package_recovery_failed"
+            ) from exc
+        raise
+    if _lexists(spec.release_root) or not _lexists(destination):
+        raise ProductionOwnerRuntimePackagingError(
+            "production_owner_runtime_package_recovery_failed"
+        )
+    return destination
 
 
 def build_commands(
@@ -590,14 +979,32 @@ def _existing_release(spec: OwnerRuntimeBuildSpec) -> Mapping[str, Any]:
     )
 
 
-def build_owner_runtime(spec: OwnerRuntimeBuildSpec) -> Mapping[str, Any]:
-    spec.validate()
-    _verify_clean_source(spec)
-    if spec.release_root.exists():
+def _prepare_release(spec: OwnerRuntimeBuildSpec) -> Mapping[str, Any] | None:
+    state_present = _lexists(spec.incomplete_marker)
+    root_present = _lexists(spec.release_root)
+    legacy_present = root_present and _lexists(spec.legacy_incomplete_marker)
+    if state_present:
+        _validate_incomplete_marker(spec.incomplete_marker, spec=spec)
+    if not root_present:
+        return None
+    _validate_release_root(spec)
+    if legacy_present:
+        _validate_incomplete_marker(spec.legacy_incomplete_marker, spec=spec)
+        _quarantine_incomplete_release(spec)
+        return None
+    if not state_present:
         return _existing_release(spec)
-    spec.release_base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        reused = _existing_release(spec)
+    except ProductionOwnerRuntimePackagingError:
+        _quarantine_incomplete_release(spec)
+        return None
+    _remove_incomplete_marker(spec)
+    return reused
+
+
+def _build_new_release(spec: OwnerRuntimeBuildSpec) -> Mapping[str, Any]:
     spec.release_root.mkdir(mode=0o700)
-    spec.incomplete_marker.write_text(spec.revision + "\n", encoding="ascii")
     spec.scratch_root.mkdir(mode=0o700)
     spec.snapshot_root.mkdir(mode=0o700)
     spec.wheel_root.mkdir(mode=0o700)
@@ -656,7 +1063,13 @@ def build_owner_runtime(spec: OwnerRuntimeBuildSpec) -> Mapping[str, Any]:
         spec=spec,
         extra_environment={"UV_PROJECT_ENVIRONMENT": str(spec.venv_root)},
     )
-    _run(commands[2], spec=spec)
+    _run(
+        commands[2],
+        spec=spec,
+        extra_environment={
+            "HERMES_SEALED_RELEASE_BUILD": "owner-runtime-v1",
+        },
+    )
     wheels = sorted(spec.wheel_root.iterdir())
     if (
         len(wheels) != 1
@@ -695,7 +1108,6 @@ def build_owner_runtime(spec: OwnerRuntimeBuildSpec) -> Mapping[str, Any]:
             "production_owner_runtime_package_cleanup_unsafe"
         )
     shutil.rmtree(spec.scratch_root)
-    spec.incomplete_marker.unlink()
     _seal_tree(spec.release_root)
     manifest = _decode_line(
         _run(runtime_command(spec, "manifest"), spec=spec, timeout=300)
@@ -727,9 +1139,27 @@ def build_owner_runtime(spec: OwnerRuntimeBuildSpec) -> Mapping[str, Any]:
     )
 
 
+def build_owner_runtime(spec: OwnerRuntimeBuildSpec) -> Mapping[str, Any]:
+    spec.validate()
+    _verify_clean_source(spec)
+    with _revision_lock(spec):
+        reused = _prepare_release(spec)
+        if reused is not None:
+            return reused
+        if not _lexists(spec.incomplete_marker):
+            _create_incomplete_marker(spec)
+        result = _build_new_release(spec)
+        _remove_incomplete_marker(spec)
+        return result
+
+
 def verify_owner_runtime(spec: OwnerRuntimeBuildSpec) -> Mapping[str, Any]:
     spec.validate()
-    if not spec.release_root.exists() or spec.incomplete_marker.exists():
+    if (
+        not _lexists(spec.release_root)
+        or _lexists(spec.incomplete_marker)
+        or _lexists(spec.legacy_incomplete_marker)
+    ):
         raise ProductionOwnerRuntimePackagingError(
             "production_owner_runtime_package_release_unavailable"
         )
