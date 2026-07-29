@@ -6008,12 +6008,18 @@ def _normalize_vision_provider(provider: Optional[str]) -> str:
 def _resolve_strict_vision_backend(
     provider: str,
     model: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     provider = _normalize_vision_provider(provider)
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
     if provider == "openrouter":
-        return _try_openrouter(model=model)
+        if explicit_api_key:
+            logger.debug(
+                "Strict vision: forwarding resolved key to OpenRouter (len=%d)",
+                len(explicit_api_key),
+            )
+        return _try_openrouter(model=model, explicit_api_key=explicit_api_key)
     if provider == "nous":
         # Must go through resolve_provider_client so anthropic/* vision
         # recommendations wrap onto /v1/messages — _try_nous alone returns
@@ -6043,6 +6049,7 @@ def _resolve_strict_vision_backend(
         return resolve_provider_client("deepinfra", vision_model, is_vision=True)
     if provider == "custom":
         return _try_custom_endpoint()
+    logger.debug("Strict vision: no backend for provider %r", provider)
     return None, None
 
 
@@ -6171,7 +6178,7 @@ def resolve_vision_provider_client(
             vision_model = _resolve_provider_vision_default(main_provider) or main_model
             if main_provider == "nous":
                 sync_client, default_model = _resolve_strict_vision_backend(
-                    main_provider, vision_model
+                    main_provider, vision_model, explicit_api_key=resolved_api_key
                 )
                 if sync_client is not None:
                     logger.info(
@@ -6259,7 +6266,9 @@ def resolve_vision_provider_client(
         for candidate in _VISION_AUTO_PROVIDER_ORDER:
             if candidate == main_provider:
                 continue  # already tried above
-            sync_client, default_model = _resolve_strict_vision_backend(candidate)
+            sync_client, default_model = _resolve_strict_vision_backend(
+                candidate, explicit_api_key=resolved_api_key
+            )
             if sync_client is not None:
                 return _finalize(candidate, sync_client, default_model)
 
@@ -6268,7 +6277,7 @@ def resolve_vision_provider_client(
 
     if requested in _VISION_AUTO_PROVIDER_ORDER:
         sync_client, default_model = _resolve_strict_vision_backend(
-            requested, resolved_model
+            requested, resolved_model, explicit_api_key=resolved_api_key
         )
         return _finalize(requested, sync_client, default_model)
 
