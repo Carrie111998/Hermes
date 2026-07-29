@@ -2750,6 +2750,16 @@ def _systemd_watchdog_service_fields(
     return "notify", f"NotifyAccess=main\nWatchdogSec={seconds}s\n"
 
 
+def _collect_systemd_proxy_env() -> list[str]:
+    """Add HTTP_PROXY / HTTPS_PROXY to the systemd unit if available."""
+    result: list[str] = []
+    for var in ("HTTP_PROXY", "HTTPS_PROXY"):
+        val = os.environ.get(var, "")
+        if val:
+            result.append(f'Environment="{var}={val}"')
+    return result
+
+
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = _stable_service_working_dir()
@@ -2793,6 +2803,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
             hermes_home
         )
         profile_arg = _profile_arg_for_target_user(hermes_home, home_dir)
+        proxy_env = _collect_systemd_proxy_env()
         # Remap all paths that may resolve under the calling user's home
         # (e.g. /root/) to the target user's home so the service can
         # actually access them.
@@ -2825,6 +2836,7 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+""" + "\n".join(proxy_env) + f"""
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -2846,6 +2858,7 @@ WantedBy=multi-user.target
         hermes_home
     )
     profile_arg = _profile_arg(hermes_home)
+    proxy_env = _collect_systemd_proxy_env()
     path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
     path_entries.extend(common_bin_paths)
@@ -2863,6 +2876,7 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
+""" + "\n".join(proxy_env) + f"""
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}

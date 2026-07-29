@@ -5,6 +5,7 @@
   "version": "0.17.0",
   "description": "Native desktop shell for Hermes Agent.",
   "author": "Nous Research",
+  "homepage": "https://github.com/NousResearch/hermes-agent",
   "type": "module",
   "main": "dist/electron-main.mjs",
   "engines": {
@@ -266,8 +267,7 @@
       "synopsis": "Native desktop shell for Hermes Agent.",
       "target": [
         "AppImage",
-        "deb",
-        "rpm"
+        "deb"
       ]
     },
     "nsis": {
