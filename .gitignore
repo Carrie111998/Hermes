@@ -190,3 +190,7 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
+
+# Eval run artifacts (regenerated)
+evals/reports/*.json
+evals/rubrics/__pycache__/
