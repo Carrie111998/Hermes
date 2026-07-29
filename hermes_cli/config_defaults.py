@@ -2847,6 +2847,10 @@ DEFAULT_CONFIG = {
 
     # Computer Use (cua-driver) toolset settings.
     "computer_use": {
+        # Optional executable override. A Docker/VM transport can provide a
+        # cua-driver-compatible stdio wrapper without replacing the built-in
+        # computer_use policy and approval layer.
+        "driver_command": "",
         # cua-driver ships with anonymous usage telemetry (PostHog) ENABLED
         # by default upstream. Hermes disables it for our users unless they
         # explicitly opt in here. When false (default), Hermes sets

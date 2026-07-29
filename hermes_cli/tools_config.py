@@ -737,8 +737,26 @@ TOOLSET_ENV_REQUIREMENTS = {
 
 
 def _cua_driver_cmd() -> str:
-    """Return the configured cua-driver override, or the bare default name."""
-    return os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip() or "cua-driver"
+    """Return the cua-driver command selected by env or config.yaml."""
+    from tools.computer_use.cua_backend import resolve_cua_driver_cmd
+
+    resolved = resolve_cua_driver_cmd()
+    if resolved:
+        return resolved
+    configured = os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip()
+    if not configured:
+        try:
+            from hermes_cli.config import load_config
+
+            configured = str(
+                ((load_config() or {}).get("computer_use") or {}).get(
+                    "driver_command"
+                )
+                or ""
+            ).strip()
+        except Exception:
+            configured = ""
+    return configured or "cua-driver"
 
 
 def _resolved_cua_driver_cmd() -> Optional[str]:

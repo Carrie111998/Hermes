@@ -37,6 +37,16 @@ test_durations.json
 tmp/
 temp_vision_images/
 hermes-*/*
+
+# Track hermes-desktop module but ignore runtime artifacts
+!hermes-desktop/
+!hermes-desktop/**
+hermes-desktop/screenshots/
+hermes-desktop/sessions/
+hermes-desktop/profile/
+hermes-desktop/.env
+hermes-desktop/compose.override.yml
+hermes-desktop/logs/
 examples/
 tests/quick_test_dataset.jsonl
 tests/sample_dataset.jsonl

@@ -534,8 +534,9 @@ def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
     """Return candidate cua-driver commands in resolution order.
 
     ``override`` is authoritative when supplied. Otherwise a non-empty
-    ``HERMES_CUA_DRIVER_CMD`` is authoritative; only when neither is set do we
-    use PATH and canonical install locations.
+    ``HERMES_CUA_DRIVER_CMD`` wins, followed by
+    ``computer_use.driver_command`` in config.yaml. Only when none is set do
+    we use PATH and canonical install locations.
 
     Desktop apps launched from Finder/Dock often inherit a narrow PATH that
     omits user-local install directories. The upstream cua-driver installer
@@ -543,7 +544,12 @@ def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
     Hermes Desktop/TUI session can otherwise filter out the `computer_use`
     tool even though `hermes computer-use doctor` succeeds from a login shell.
     """
-    configured = (override if override is not None else os.environ.get(_CUA_DRIVER_CMD_ENV, "")).strip()
+    if override is not None:
+        configured = override.strip()
+    else:
+        configured = os.environ.get(_CUA_DRIVER_CMD_ENV, "").strip()
+        if not configured:
+            configured = str(_computer_use_cfg().get("driver_command") or "").strip()
     if configured:
         # An explicit override is authoritative: if it is wrong, report the
         # driver missing instead of silently picking a different binary.
@@ -569,9 +575,10 @@ def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
 def resolve_cua_driver_cmd(override: Optional[str] = None) -> Optional[str]:
     """Resolve the cua-driver executable for every runtime/status surface.
 
-    A supplied override (or ``HERMES_CUA_DRIVER_CMD``) is never silently
-    replaced by another binary. Otherwise resolve PATH first, then canonical
-    user-local installation locations used by the official installer.
+    A supplied override, ``HERMES_CUA_DRIVER_CMD``, or configured
+    ``computer_use.driver_command`` is never silently replaced by another
+    binary. Otherwise resolve PATH first, then canonical user-local install
+    locations used by the official installer.
     """
     for candidate in _candidate_cua_driver_commands(override):
         expanded = os.path.expanduser(candidate)
@@ -2972,4 +2979,3 @@ class CuaDriverBackend(ComputerUseBackend):
             meta.update(structured)
         return _action_result_from(name, ok, message, meta, structured,
                                    requested_delivery=args.get("delivery_mode"))
-

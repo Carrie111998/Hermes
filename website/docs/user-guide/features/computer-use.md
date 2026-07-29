@@ -75,6 +75,24 @@ hermes -t computer_use chat
 
 or add `computer_use` to your enabled toolsets in `~/.hermes/config.yaml`.
 
+### Optional headless Linux desktop
+
+For a persistent Xfce/Chrome desktop on a Linux host, the repository includes
+an optional noVNC stack under `hermes-desktop/`:
+
+```bash
+cd hermes-desktop
+./setup.sh
+hermes -t computer_use chat
+```
+
+This installs `cua-driver` inside the container and saves its stdio wrapper as
+`computer_use.driver_command` in `config.yaml`. The wrapper is only a
+transport: clicks, typing, and other state-changing actions still pass through
+Hermes's built-in approval and hard-block policy. noVNC and raw VNC bind to
+`127.0.0.1` by default; open <http://localhost:6080/vnc.html> for manual
+takeover.
+
 ## `hermes computer-use doctor` — your first triage stop
 
 `hermes computer-use doctor` runs cua-driver's structured
