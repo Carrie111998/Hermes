@@ -2971,6 +2971,57 @@ class _ToolsetSelectionError(ValueError):
     """``enabled_toolsets`` was sent with a shape the contract doesn't accept."""
 
 
+def _is_known_toolset(name: str) -> bool:
+    """Would ``name`` resolve to something the resolver understands?
+
+    Mirrors the resolver's own vocabulary: built-in and plugin toolsets, the
+    ``all``/``*`` aliases, registry aliases, the legacy ``*_tools`` names, and
+    configured MCP server names.
+    """
+    try:
+        from toolsets import validate_toolset
+    except Exception:
+        return True  # Cannot check: do not invent a rejection.
+    if validate_toolset(name):
+        return True
+    try:
+        from model_tools import _LEGACY_TOOLSET_MAP
+
+        if name in _LEGACY_TOOLSET_MAP:
+            return True
+    except Exception:
+        pass
+    # Plugin toolsets only exist once discovery ran (it is idempotent).
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+        if validate_toolset(name):
+            return True
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import read_raw_config
+
+        raw_cfg = read_raw_config()
+        servers = raw_cfg.get("mcp_servers") if isinstance(raw_cfg, dict) else None
+        if isinstance(servers, dict) and name in servers:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _reject_unknown_toolsets(names: list[str]) -> None:
+    unknown = [name for name in names if not _is_known_toolset(name)]
+    if unknown:
+        # A name the resolver drops would otherwise turn into a silent
+        # zero-tool session, so a typo must surface as an error instead.
+        raise _ToolsetSelectionError(
+            "unknown toolset(s): " + ", ".join(unknown)
+        )
+
+
 def _requested_enabled_toolsets(params: dict) -> list[str] | None:
     """The caller's explicit toolset selection, or ``None`` when absent.
 
@@ -2995,7 +3046,9 @@ def _requested_enabled_toolsets(params: dict) -> list[str] | None:
                 "enabled_toolsets entries must be strings; "
                 f"got {type(item).__name__}"
             )
-    return [item.strip() for item in raw if item.strip()]
+    names = [item.strip() for item in raw if item.strip()]
+    _reject_unknown_toolsets(names)
+    return names
 
 
 def _session_toolset_selection(session: dict) -> list[str] | None:

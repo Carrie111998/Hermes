@@ -1301,3 +1301,95 @@ class TestPrebuildInspection:
         result = _show_tools(server, self._session([]))
         assert result["total"] == 0
         assert result["sections"] == []
+
+
+def _known_toolset_name() -> str:
+    from toolsets import get_all_toolsets
+
+    return sorted(get_all_toolsets())[0]
+
+
+class TestUnknownToolsetNames:
+    """A typo must not resolve to "no tools" behind the client's back.
+
+    An unknown name is dropped by the resolver, so ["fiel"] silently became a
+    zero-tool session instead of an error.
+    """
+
+    TARGET = "20260409_030303_ghi789"
+
+    def test_create_rejects_an_unknown_name(self, server, monkeypatch) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        calls = _capture_builds(server, monkeypatch)
+
+        resp = _create(server, {"cols": 80, "enabled_toolsets": ["fiel"]})
+        assert "error" in resp
+        assert "result" not in resp
+        assert "fiel" in resp["error"]["message"]
+        assert "unknown toolset" in resp["error"]["message"].lower()
+        assert not calls
+        assert not server._sessions
+
+    def test_resume_rejects_an_unknown_name(self, server, monkeypatch) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_get_db", lambda: _DB(self.TARGET))
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        monkeypatch.setattr(server, "sanitize_replay_history", lambda h: h)
+        calls = _capture_builds(server, monkeypatch)
+
+        resp = _resume(
+            server, {"session_id": self.TARGET, "enabled_toolsets": ["fiel"]}
+        )
+        assert "error" in resp
+        assert "result" not in resp
+        assert "fiel" in resp["error"]["message"]
+        assert not calls
+        assert not server._sessions
+
+    def test_unknown_name_next_to_a_valid_one_is_rejected(
+        self, server, monkeypatch
+    ) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        calls = _capture_builds(server, monkeypatch)
+
+        resp = _create(
+            server,
+            {"cols": 80, "enabled_toolsets": [_known_toolset_name(), "fiel"]},
+        )
+        assert "error" in resp
+        assert not calls
+        assert not server._sessions
+
+    def test_known_toolset_is_accepted(self, server, monkeypatch) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        calls = _capture_builds(server, monkeypatch)
+        name = _known_toolset_name()
+
+        resp = _create(server, {"cols": 80, "enabled_toolsets": [name]})
+        assert "error" not in resp
+        _run_deferred_build(server, monkeypatch, resp["result"]["session_id"])
+        assert calls[-1]["enabled_toolsets_override"] == [name]
+
+    @pytest.mark.parametrize("alias", ["all", "*", "web_tools"])
+    def test_supported_aliases_are_accepted(self, server, monkeypatch, alias) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        calls = _capture_builds(server, monkeypatch)
+
+        resp = _create(server, {"cols": 80, "enabled_toolsets": [alias]})
+        assert "error" not in resp, resp
+        _run_deferred_build(server, monkeypatch, resp["result"]["session_id"])
+        assert calls[-1]["enabled_toolsets_override"] == [alias]
+
+    def test_empty_selection_is_still_accepted(self, server, monkeypatch) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        calls = _capture_builds(server, monkeypatch)
+
+        resp = _create(server, {"cols": 80, "enabled_toolsets": []})
+        assert "error" not in resp
+        _run_deferred_build(server, monkeypatch, resp["result"]["session_id"])
+        assert calls[-1]["enabled_toolsets_override"] == []
