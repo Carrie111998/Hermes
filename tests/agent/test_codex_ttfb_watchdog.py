@@ -17,6 +17,7 @@ stall.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -55,6 +56,109 @@ def _make_codex_agent(tmp_path, monkeypatch):
         agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 60.0
     )
     return agent
+
+
+def _install_watchdog_abort_transport_race(agent, monkeypatch, *, first_event: bool):
+    """Make the worker publish its abort-caused transport error before main resumes."""
+    abort_called = threading.Event()
+    worker_closed = threading.Event()
+    closes: list[str | None] = []
+    dummy_client = SimpleNamespace()
+
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+
+    def abort_client(_client, reason=None):
+        closes.append(reason)
+        abort_called.set()
+        assert worker_closed.wait(5), "worker did not unwind after watchdog abort"
+
+    def close_client(_client, reason=None):
+        closes.append(reason)
+        if reason == "request_complete":
+            worker_closed.set()
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        if first_event:
+            agent._codex_stream_last_event_ts = time.time()
+        assert abort_called.wait(10), "watchdog did not abort the request"
+        raise RuntimeError("transport closed by watchdog abort")
+
+    monkeypatch.setattr(agent, "_abort_request_openai_client", abort_client)
+    monkeypatch.setattr(agent, "_close_request_openai_client", close_client)
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+    return closes
+
+
+class ProviderStatusError(RuntimeError):
+    status_code = 429
+
+
+def test_ttfb_watchdog_abort_transport_error_stays_timeout(tmp_path, monkeypatch):
+    """The transport error caused by the TTFB watchdog abort is not the result."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+    closes = _install_watchdog_abort_transport_race(
+        agent, monkeypatch, first_event=False
+    )
+
+    with pytest.raises(TimeoutError) as excinfo:
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+
+    assert "TTFB" in str(excinfo.value)
+    assert "codex_ttfb_kill" in closes
+
+
+def test_event_idle_watchdog_abort_transport_error_stays_timeout(tmp_path, monkeypatch):
+    """The transport error caused by the idle watchdog abort is not the result."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "1")
+    closes = _install_watchdog_abort_transport_race(
+        agent, monkeypatch, first_event=True
+    )
+
+    with pytest.raises(TimeoutError) as excinfo:
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+
+    assert "after first byte" in str(excinfo.value)
+    assert "codex_stream_idle_kill" in closes
+    assert "codex_ttfb_kill" not in closes
+
+
+def test_published_status_error_wins_over_later_ttfb_deadline(tmp_path, monkeypatch):
+    """Do not overwrite a provider/status error already published by the worker."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+    provider_error = ProviderStatusError("rate limited")
+    release_close = threading.Event()
+    close_started = threading.Event()
+    dummy_client = SimpleNamespace()
+
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_run_codex_stream", lambda *a, **k: (_ for _ in ()).throw(provider_error))
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **k: release_close.set())
+
+    def close_client(_client, reason=None):
+        if reason == "request_complete":
+            close_started.set()
+            assert release_close.wait(5), "test did not release worker close"
+
+    monkeypatch.setattr(agent, "_close_request_openai_client", close_client)
+
+    try:
+        with pytest.raises(ProviderStatusError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    finally:
+        release_close.set()
+
+    assert excinfo.value is provider_error
+    assert close_started.is_set()
 
 
 def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
