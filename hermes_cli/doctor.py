@@ -18,6 +18,7 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.path_env import ensure_common_tool_paths
 from hermes_constants import display_hermes_home
 from hermes_constants import agent_browser_runnable
 
@@ -1683,6 +1684,12 @@ def run_doctor(args):
                         manual_issues.append(f"Add {_cmd_link_display} to your PATH")
                 else:
                     issues.append(f"Missing {_cmd_link_display}/hermes symlink — run 'hermes doctor --fix'")
+
+    # Non-interactive launchers often miss shell-initialized tool directories
+    # (for example mise/asdf/nvm shims or Homebrew). Add conservative fallbacks
+    # before checking external tools so doctor matches what users can run from
+    # an interactive shell without requiring a wrapper script around Hermes.
+    ensure_common_tool_paths()
 
     _section("External Tools")
     # Git
