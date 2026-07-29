@@ -1347,6 +1347,7 @@ _CORRUPT_BACKUP_RETENTION = 10
 # lock (the in-process _INIT_LOCK + idempotent init remain the backstop).
 _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
+_WRITE_LOCK_LOCAL = threading.local()
 
 
 def _resolve_busy_timeout_ms() -> int:
@@ -1539,11 +1540,18 @@ def _dispatch_tick_lock(db_path: Path):
         acquired = True
         handle = None
     try:
+        if acquired:
+            held = getattr(_WRITE_LOCK_LOCAL, "held", set())
+            held.add(str(db_path.resolve()))
+            _WRITE_LOCK_LOCAL.held = held
         yield acquired
     finally:
         if handle is not None:
             try:
                 if acquired:
+                    held = getattr(_WRITE_LOCK_LOCAL, "held", set())
+                    held.discard(str(db_path.resolve()))
+                    _WRITE_LOCK_LOCAL.held = held
                     if _IS_WINDOWS:
                         import msvcrt
 
@@ -2737,6 +2745,38 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
 
 
 @contextlib.contextmanager
+def _common_write_lock(conn: sqlite3.Connection):
+    """Serialize every board write with the dispatcher's cross-process lock."""
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+    if str(db_path) in getattr(_WRITE_LOCK_LOCAL, "held", set()):
+        yield
+        return
+    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if _IS_WINDOWS:
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+@contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection):
     """Context manager for an IMMEDIATE write transaction.
 
@@ -2749,32 +2789,26 @@ def write_txn(conn: sqlite3.Connection):
     shadow the original exception with a spurious rollback error.
     """
     _assert_not_delegated_child_mutation()
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
-    try:
-        yield conn
-    except Exception:
+    with _common_write_lock(conn):
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            # SQLite has already auto-rolled-back the transaction (typical
-            # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
-            pass
-        raise
-    else:
-        try:
-            _execute_boundary_with_retry(conn, "COMMIT")
+            yield conn
         except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        else:
+            try:
+                _execute_boundary_with_retry(conn, "COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+            _check_file_length_invariant(conn)
 
 
 # ---------------------------------------------------------------------------
