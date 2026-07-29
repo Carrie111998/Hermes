@@ -909,6 +909,78 @@ class TestPrefetch:
 
 
 # ---------------------------------------------------------------------------
+# recall_status (deterministic recall indicator) tests
+# ---------------------------------------------------------------------------
+
+
+class TestRecallStatus:
+    def test_none_before_any_prefetch(self, provider):
+        # Nothing recalled yet → no indicator.
+        assert provider.recall_status() is None
+
+    def test_reports_count_after_recall(self, provider):
+        # Mock client returns 2 memories; prefetch consumes the block.
+        provider.queue_prefetch("test")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        provider.prefetch("test")
+
+        status = provider.recall_status()
+        assert status is not None
+        assert status.provider_label == "Hindsight"
+        assert status.count == 2
+
+    def test_none_when_recall_returned_nothing(self, provider):
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(results=[])
+        )
+        provider.queue_prefetch("test")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        assert provider.prefetch("test") == ""
+        assert provider.recall_status() is None
+
+    def test_stale_count_cleared_on_empty_turn(self, provider):
+        # First turn recalls 2 memories.
+        provider.queue_prefetch("test")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        provider.prefetch("test")
+        assert provider.recall_status().count == 2
+
+        # Next turn recalls nothing — the prior count must not linger.
+        provider._client.arecall = AsyncMock(
+            return_value=SimpleNamespace(results=[])
+        )
+        provider.queue_prefetch("test2")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        provider.prefetch("test2")
+        assert provider.recall_status() is None
+
+    def test_suppressed_when_indicator_off(self, provider_with_config):
+        p = provider_with_config(recall_indicator=False)
+        p.queue_prefetch("test")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+        p.prefetch("test")
+        # Memory was injected, but the indicator is turned off.
+        assert p._last_recall_returned is True
+        assert p.recall_status() is None
+
+    def test_reflect_mode_reports_generic_count(self, provider_with_config):
+        p = provider_with_config(recall_prefetch_method="reflect")
+        p.queue_prefetch("test")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+        p.prefetch("test")
+        status = p.recall_status()
+        assert status is not None
+        # Reflect synthesizes across memories → no discrete count (0).
+        assert status.count == 0
+
+
+# ---------------------------------------------------------------------------
 # sync_turn tests
 # ---------------------------------------------------------------------------
 

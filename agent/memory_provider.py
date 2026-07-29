@@ -35,9 +35,26 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RecallStatus:
+    """Summary of what a provider's most recent prefetch injected this turn.
+
+    Returned by :meth:`MemoryProvider.recall_status` so the agent can emit a
+    deterministic, model-independent "memory was used" indicator (see
+    ``MemoryManager.describe_recall``). ``count`` is the number of discrete
+    memories injected; ``0`` means content was injected but has no discrete
+    count (e.g. a synthesized reflect answer), which the indicator renders
+    generically rather than as "0 memories".
+    """
+
+    provider_label: str
+    count: int
 
 
 class MemoryProvider(ABC):
@@ -112,6 +129,19 @@ class MemoryProvider(ABC):
         by prefetch() on the next turn. Default is no-op — providers
         that do background prefetching should override this.
         """
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        """Describe what the most recent :meth:`prefetch` injected, for the UI.
+
+        Called by the agent right after prefetch, on the same (single) turn
+        thread, so it can surface a deterministic "🧠 recalled N memories"
+        status line that does not depend on the model choosing to mention it.
+
+        Return ``None`` (the default) when this provider injected nothing this
+        turn or does not want a visible indicator. Providers that override it
+        must reflect only the LAST prefetch — never a stale prior count.
+        """
+        return None
 
     def sync_turn(
         self,

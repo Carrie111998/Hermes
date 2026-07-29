@@ -40,15 +40,30 @@ import queue
 import sys
 import threading
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, RecallStatus
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _RecallResult:
+    """Text + memory count from one recall.
+
+    Carrying the count alongside the text lets the deterministic recall
+    indicator report "recalled N memories" accurately without re-parsing the
+    formatted bullet list. ``count`` is 0 for a reflect synthesis (no discrete
+    memories) or on error.
+    """
+
+    text: str
+    count: int
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
@@ -699,8 +714,18 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
+        # Number of memories in the pending prefetch block, captured alongside
+        # _prefetch_result so the deterministic recall indicator can report an
+        # accurate count without re-parsing the formatted text.
+        self._prefetch_count = 0
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
+        # State for the model-independent recall indicator (see recall_status()).
+        # _last_recall_returned tracks whether the most recent prefetch() handed
+        # any memory to the agent this turn; _last_recall_count is how many.
+        self._last_recall_returned = False
+        self._last_recall_count = 0
+        self._recall_indicator = True
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -1064,6 +1089,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
+            {"key": "recall_indicator", "description": "Show a '🧠 Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
@@ -1413,6 +1439,11 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
+        # On-by-default deterministic indicator: when auto-recall injects memory,
+        # Hermes emits a "🧠 Hindsight — recalled N memories" status line so the
+        # user SEES memory working, independent of whether the model mentions it.
+        # Off switch for customer-facing agents that shouldn't surface internals.
+        self._recall_indicator = bool(self._config.get("recall_indicator", True))
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
 
@@ -1539,12 +1570,14 @@ class HindsightMemoryProvider(MemoryProvider):
             return True
         return False
 
-    def _do_recall(self, query: str) -> str:
-        """Run one recall/reflect for *query* and return the formatted memory
-        text (empty on error or no results).
+    def _do_recall(self, query: str) -> _RecallResult:
+        """Run one recall/reflect for *query*.
 
-        Shared by the background prefetch worker (``queue_prefetch``) and the
-        opt-in synchronous path (``prefetch`` when ``recall_sync`` is enabled).
+        Returns the formatted memory text plus the number of discrete memories
+        recalled (0 for a reflect synthesis or on error), so the deterministic
+        recall indicator can report an accurate count without re-parsing the
+        text. Shared by the background prefetch worker (``queue_prefetch``) and
+        the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
         """
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
@@ -1553,7 +1586,8 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
                 resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-                return resp.text or ""
+                # Reflect synthesizes across many memories -> no discrete count.
+                return _RecallResult(resp.text or "", 0)
             recall_kwargs: dict = {
                 "bank_id": self._bank_id, "query": query,
                 "budget": self._budget, "max_tokens": self._recall_max_tokens,
@@ -1568,10 +1602,11 @@ class HindsightMemoryProvider(MemoryProvider):
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
             num_results = len(resp.results) if resp.results else 0
             logger.debug("Recall: returned %d results", num_results)
-            return "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+            return _RecallResult(text, num_results)
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
-            return ""
+            return _RecallResult("", 0)
 
     def _format_recall(self, result: str) -> str:
         if not result:
@@ -1585,14 +1620,26 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
+    def _record_recall_indicator(self, *, returned: bool, count: int) -> None:
+        """Track what the last prefetch injected, for recall_status().
+
+        Cleared to "nothing" on empty turns so the indicator never reports a
+        stale prior count.
+        """
+        self._last_recall_returned = returned
+        self._last_recall_count = count if returned else 0
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         # Opt-in: recall synchronously against the *current* message so the
         # injected memories match this turn's query rather than the previous
         # turn's queued recall. See NousResearch/hermes-agent#5820.
         if self._recall_sync:
             if self._recall_disabled():
+                self._record_recall_indicator(returned=False, count=0)
                 return ""
-            return self._format_recall(self._do_recall(query))
+            recalled = self._do_recall(query)
+            self._record_recall_indicator(returned=bool(recalled.text), count=recalled.count)
+            return self._format_recall(recalled.text)
 
         # Default: return the result the background worker prefetched for the
         # previous turn (cheap buffer read, capped join).
@@ -1601,8 +1648,22 @@ class HindsightMemoryProvider(MemoryProvider):
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             result = self._prefetch_result
+            count = self._prefetch_count
             self._prefetch_result = ""
+            self._prefetch_count = 0
+        self._record_recall_indicator(returned=bool(result), count=count)
         return self._format_recall(result)
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        """Report the count injected by the last prefetch (for the UI indicator).
+
+        Returns ``None`` when nothing was injected this turn or the indicator
+        is turned off (``recall_indicator=false``), so customer-facing agents
+        can suppress the "recalled N memories" status line.
+        """
+        if not self._recall_indicator or not self._last_recall_returned:
+            return None
+        return RecallStatus(provider_label="Hindsight", count=self._last_recall_count)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # In synchronous mode prefetch() does a live recall each turn, so
@@ -1613,10 +1674,11 @@ class HindsightMemoryProvider(MemoryProvider):
             return
 
         def _run():
-            text = self._do_recall(query)
-            if text:
+            recalled = self._do_recall(query)
+            if recalled.text:
                 with self._prefetch_lock:
-                    self._prefetch_result = text
+                    self._prefetch_result = recalled.text
+                    self._prefetch_count = recalled.count
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()
