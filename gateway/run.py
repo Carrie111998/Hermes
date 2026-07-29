@@ -11676,6 +11676,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return ("Agent is running — wait or /stop first, then "
                         "change runtime.")
 
+            # Explicit plugin control-plane commands can resolve an external
+            # wait without interrupting the active agent. They are opt-in,
+            # remain behind the normal gateway authorization gate, and never
+            # enter the model/agent loop.
+            if _evt_cmd:
+                try:
+                    from hermes_cli.plugins import (
+                        get_plugin_command_handler,
+                        invoke_plugin_command,
+                        is_plugin_control_plane_command,
+                    )
+                    plugin_name = _evt_cmd.replace("_", "-")
+                    if is_plugin_control_plane_command(plugin_name):
+                        _denied = self._check_slash_access(source, plugin_name)
+                        if _denied is not None:
+                            return _denied
+                    if (
+                        is_plugin_control_plane_command(plugin_name)
+                        and get_plugin_command_handler(plugin_name)
+                    ):
+                        platform = getattr(getattr(source, "platform", None), "value", None)
+                        context = {
+                            "surface": "gateway",
+                            "platform": str(platform or ""),
+                            "user_id": str(getattr(source, "user_id", "") or ""),
+                            "chat_id": str(getattr(source, "chat_id", "") or ""),
+                        }
+                        result = invoke_plugin_command(
+                            plugin_name,
+                            event.get_command_args().strip(),
+                            context=context,
+                        )
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                        return str(result) if result else None
+                except Exception as exc:
+                    logger.warning("Plugin control-plane command failed: %s", exc)
+                    return "Plugin control-plane command failed safely."
+
             # /approve and /deny must bypass the running-agent interrupt path.
             # The agent thread is blocked on a threading.Event inside
             # tools/approval.py — sending an interrupt won't unblock it.
@@ -12442,17 +12481,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     return f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias')."
 
-        # Plugin-registered slash commands
+        # Plugin-registered slash commands. Gateway authorization has already
+        # passed at this point; contextual handlers receive only the trusted
+        # metadata needed for their own fine-grained policy checks.
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    get_plugin_command_handler,
+                    invoke_plugin_command,
+                )
                 # Normalize underscores to hyphens so Telegram's underscored
                 # autocomplete form matches plugin commands registered with
                 # hyphens. See hermes_cli/commands.py:_build_telegram_menu.
-                plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
-                if plugin_handler:
+                plugin_name = command.replace("_", "-")
+                if get_plugin_command_handler(plugin_name):
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    platform = getattr(getattr(source, "platform", None), "value", None)
+                    context = {
+                        "surface": "gateway",
+                        "platform": str(platform or ""),
+                        "user_id": str(getattr(source, "user_id", "") or ""),
+                        "chat_id": str(getattr(source, "chat_id", "") or ""),
+                    }
+                    result = invoke_plugin_command(plugin_name, user_args, context=context)
                     if asyncio.iscoroutine(result):
                         result = await result
                     return str(result) if result else None

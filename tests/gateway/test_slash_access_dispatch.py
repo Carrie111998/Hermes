@@ -316,6 +316,37 @@ async def test_plugin_registered_command_is_gated(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_gateway_contextual_plugin_command_receives_trusted_source(monkeypatch):
+    """A context-opted plugin gets platform/user/chat metadata after gateway auth."""
+    runner = _make_runner()
+    source = _make_source(user_id="111", chat_id="222")
+    received = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_command_handler",
+        lambda name: object() if name == "contextual" else None,
+    )
+
+    def _invoke(name, raw_args, *, context):
+        received.update(name=name, raw_args=raw_args, context=context)
+        return "context-ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_plugin_command", _invoke)
+
+    result = await runner._handle_message(_make_event("/contextual approve 1234", source))
+
+    assert result == "context-ok"
+    assert received["name"] == "contextual"
+    assert received["raw_args"] == "approve 1234"
+    assert received["context"] == {
+        "surface": "gateway",
+        "platform": source.platform.value,
+        "user_id": "111",
+        "chat_id": "222",
+    }
+
+
+@pytest.mark.asyncio
 async def test_non_admin_denied_for_unlisted_quick_command_exec():
     """A non-admin must not reach the quick_commands exec sink for a command
     that isn't in user_allowed_commands. Regression for #44727 — quick
@@ -381,6 +412,60 @@ async def test_admin_runs_quick_command_when_gating_enabled():
     )
 
     assert result == "quick-command-admin"
+
+
+@pytest.mark.asyncio
+async def test_control_plane_plugin_command_bypasses_running_agent_guard(monkeypatch):
+    """An opted-in plugin control command resolves an external wait mid-run."""
+    runner = _make_runner()
+    source = _make_source(user_id="111", chat_id="222")
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = MagicMock()
+    runner._running_agents_ts[session_key] = 0
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.is_plugin_control_plane_command",
+        lambda name: name == "control",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_command_handler",
+        lambda name: object() if name == "control" else None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_plugin_command",
+        lambda name, raw_args, *, context: "control-ok",
+    )
+
+    result = await runner._handle_message(_make_event("/control deny 1234", source))
+
+    assert result == "control-ok"
+
+
+@pytest.mark.asyncio
+async def test_control_plane_plugin_command_still_requires_gateway_authorization(monkeypatch):
+    runner = _make_runner(
+        platform_extra={"allow_admin_from": ["111"], "user_allowed_commands": []}
+    )
+    source = _make_source(user_id="999", chat_id="222")
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = MagicMock()
+    runner._running_agents_ts[session_key] = 0
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.is_plugin_control_plane_command",
+        lambda name: name == "control",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_plugin_command_handler",
+        lambda name: object() if name == "control" else None,
+    )
+    invoked = MagicMock(return_value="must-not-run")
+    monkeypatch.setattr("hermes_cli.plugins.invoke_plugin_command", invoked)
+
+    result = await runner._handle_message(_make_event("/control deny 1234", source))
+
+    assert "⛔" in result
+    invoked.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

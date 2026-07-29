@@ -551,24 +551,22 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        *,
+        accepts_context: bool = False,
+        control_plane: bool = False,
     ) -> None:
-        """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
+        """Register an in-session slash command for CLI and gateway sessions.
 
-        The handler signature is ``fn(raw_args: str) -> str | None``.
-        It may also be an async callable — the gateway dispatch handles both.
+        ``handler`` normally receives ``fn(raw_args: str)``. Set
+        ``accepts_context=True`` to opt into ``fn(raw_args, context)``. The
+        context is supplied only by the dispatch surface and contains trusted
+        local metadata such as the gateway platform and authenticated user ID;
+        legacy handlers are never called with an unexpected second argument.
 
-        Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
-        terminal commands), this registers in-session slash commands that users
-        invoke during a conversation.
-
-        ``args_hint`` is an optional short string (e.g. ``"<file>"`` or
-        ``"dias:7 formato:json"``) used by gateway adapters to surface the
-        command with an argument field — for example Discord's native slash
-        command picker. Plugin commands without ``args_hint`` register as
-        parameterless in Discord and still accept trailing text when invoked
-        as free-form chat.
-
-        Names conflicting with built-in commands are rejected with a warning.
+        ``control_plane=True`` opts the command into gateway dispatch while an
+        agent is running. It remains subject to normal gateway authorization
+        and cannot override a built-in command; use it only for bounded,
+        non-agent control actions such as resolving an external wait.
         """
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
@@ -596,6 +594,8 @@ class PluginContext:
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "accepts_context": bool(accepts_context),
+            "control_plane": bool(control_plane),
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
@@ -629,6 +629,35 @@ class PluginContext:
                 kwargs["parent_agent"] = agent
 
         return registry.dispatch(tool_name, args, **kwargs)
+
+    # -- human intervention provider registration --------------------------
+
+    def register_human_intervention_provider(self, provider) -> None:
+        """Register one optional fail-closed external wait controller.
+
+        The provider can notify or offer constrained remote signals, but the
+        core CLI retains local queues and final authorization. First valid
+        provider wins so separate plugins cannot race the same modal prompt.
+        """
+        from hermes_cli.human_intervention import HumanInterventionProvider
+
+        if not isinstance(provider, HumanInterventionProvider):
+            logger.warning(
+                "Plugin '%s' tried to register an invalid human-intervention provider.",
+                self.manifest.name,
+            )
+            return
+        if self._manager._human_intervention_provider is not None:
+            logger.warning(
+                "Plugin '%s' tried to register a human-intervention provider, "
+                "but one is already active. Ignoring.",
+                self.manifest.name,
+            )
+            return
+        self._manager._human_intervention_provider = provider
+        logger.info(
+            "Plugin '%s' registered a human-intervention provider.", self.manifest.name
+        )
 
     # -- context engine registration -----------------------------------------
 
@@ -1275,6 +1304,7 @@ class PluginManager:
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
+        self._human_intervention_provider = None  # Optional exclusive plugin provider
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
@@ -1320,6 +1350,7 @@ class PluginManager:
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
+            self._human_intervention_provider = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
         # raises so a failed scan is NOT cached as "discovered with an empty
@@ -2359,6 +2390,40 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
 def get_plugin_context_engine():
     """Return the plugin-registered context engine, or None."""
     return _ensure_plugins_discovered()._context_engine
+
+
+def get_human_intervention_provider():
+    """Return the one optional plugin-backed human-intervention provider."""
+    return _ensure_plugins_discovered()._human_intervention_provider
+
+
+def is_plugin_control_plane_command(name: str) -> bool:
+    """Return whether a plugin command explicitly opts into busy-time dispatch."""
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    return bool(entry and entry.get("control_plane", False))
+
+
+def invoke_plugin_command(
+    name: str,
+    raw_args: str,
+    *,
+    context: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Invoke a registered command with optional trusted dispatch context.
+
+    A plugin must explicitly opt in through ``register_command(...,
+    accepts_context=True)`` before receiving the second argument. This keeps
+    every existing ``handler(raw_args)`` plugin API-compatible.
+    """
+    entry = _ensure_plugins_discovered()._plugin_commands.get(name)
+    if entry is None:
+        return None
+    handler = entry.get("handler")
+    if not callable(handler):
+        return None
+    if entry.get("accepts_context", False):
+        return handler(raw_args, dict(context or {}))
+    return handler(raw_args)
 
 
 def get_plugin_command_handler(name: str) -> Optional[Callable]:
