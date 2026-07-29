@@ -1238,7 +1238,8 @@ def recover_session_database(
         output_path=output_path,
         work_dir=work_dir,
     )
-    assert output is not None
+    if output is None:
+        raise SessionRecoverySourceError("output path could not be resolved")
     disk_space = _disk_space_preflight(source, work_root, output.parent)
 
     temp_dir, snapshot_source, inspection = _snapshot_and_inspect(source, work_root)

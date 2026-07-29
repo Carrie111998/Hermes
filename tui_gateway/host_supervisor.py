@@ -394,7 +394,8 @@ class HostSupervisor:
             proc.stdin.flush()
 
     def _drain_stdout(self, proc: subprocess.Popen[str]) -> None:
-        assert proc.stdout is not None
+        if proc.stdout is None:
+            return
         for raw in proc.stdout:
             try:
                 frame = json.loads(raw)
@@ -405,7 +406,8 @@ class HostSupervisor:
                 self._handle_host_frame(frame)
 
     def _drain_stderr(self, proc: subprocess.Popen[str]) -> None:
-        assert proc.stderr is not None
+        if proc.stderr is None:
+            return
         for raw in proc.stderr:
             text = raw.rstrip("\n")
             if text:
