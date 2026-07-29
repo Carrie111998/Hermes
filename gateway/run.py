@@ -2218,6 +2218,7 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
+    is_gateway_session_ipc_task,
     merge_pending_message_event,
     utf16_len,
 )
@@ -2656,6 +2657,28 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     to a placeholder string.
     """
     return adapter.get_pending_message(session_key)
+
+
+def _pending_slash_is_command_leak(
+    pending: str | None, pending_event: MessageEvent | None
+) -> bool:
+    """Whether pending text is a user command that must not reach the agent.
+
+    Trusted session-IPC tasks may intentionally have slash-leading text, so
+    retain those events even when the textual fallback resembles a command.
+    """
+    text = str(pending or "").strip()
+    if not text.startswith("/") or is_gateway_session_ipc_task(pending_event):
+        return False
+    command_word = text.split(None, 1)[0][1:].lower()
+    if not command_word:
+        return False
+    try:
+        from hermes_cli.commands import resolve_command
+
+        return resolve_command(command_word) is not None
+    except Exception:
+        return False
 
 
 _INTERRUPT_REASON_STOP = "Stop requested"
@@ -7326,17 +7349,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Append a /queue event to the FIFO chain for a session."""
-        if adapter is None:
-            return
-        pending_slot = getattr(adapter, "_pending_messages", None)
-        if pending_slot is None:
-            return
-        if session_key in pending_slot:
-            self._session_state(session_key).conversation.queued_events.append(
-                queued_event
-            )
-        else:
-            pending_slot[session_key] = queued_event
+        with self._busy_queue_guard():
+            if adapter is None:
+                return
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            if pending_slot is None:
+                return
+            if session_key in pending_slot:
+                self._session_state(session_key).conversation.queued_events.append(queued_event)
+            else:
+                pending_slot[session_key] = queued_event
 
     def _promote_queued_event(
         self,
@@ -7355,27 +7377,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             the slot so the NEXT recursion picks it up.
         Returns the (possibly updated) pending_event for drain to use.
         """
-        _q_state = self._peek_session_state(session_key)
-        overflow = _q_state.conversation.queued_events if _q_state else None
-        if not overflow:
+        with self._busy_queue_guard():
+            _q_state = self._peek_session_state(session_key)
+            overflow = _q_state.conversation.queued_events if _q_state else None
+            if not overflow:
+                return pending_event
+            next_queued = overflow.pop(0)
+            if pending_event is None:
+                return next_queued
+            if adapter is not None and hasattr(adapter, "_pending_messages"):
+                adapter._pending_messages[session_key] = next_queued
+            else:
+                # No adapter — push back so we don't silently drop the item.
+                overflow.insert(0, next_queued)
             return pending_event
-        next_queued = overflow.pop(0)
-        if pending_event is None:
-            return next_queued
-        if adapter is not None and hasattr(adapter, "_pending_messages"):
-            adapter._pending_messages[session_key] = next_queued
-        else:
-            # No adapter — push back so we don't silently drop the item.
-            overflow.insert(0, next_queued)
-        return pending_event
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
-        _q_state = self._peek_session_state(session_key)
-        depth = len(_q_state.conversation.queued_events) if _q_state else 0
-        if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
-            depth += 1
-        return depth
+        with self._busy_queue_guard():
+            _q_state = self._peek_session_state(session_key)
+            depth = len(_q_state.conversation.queued_events) if _q_state else 0
+            if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
+                depth += 1
+            return depth
+
+    def _dequeue_and_promote_queued_event(
+        self, session_key: str, adapter: Any
+    ) -> Optional["MessageEvent"]:
+        """Atomically consume the queue head and promote its successor."""
+        with self._busy_queue_guard():
+            pending_event = _dequeue_pending_event(adapter, session_key)
+            return self._promote_queued_event(session_key, adapter, pending_event)
 
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
@@ -7395,6 +7427,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         queued by the judge.  Remove only synthetic goal continuations while
         preserving normal /queue and user follow-up events.
         """
+        with self._busy_queue_guard():
+            return self._clear_goal_pending_continuations_locked(session_key, adapter)
+
+    def _clear_goal_pending_continuations_locked(self, session_key: str, adapter: Any) -> int:
         removed = 0
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
@@ -8276,7 +8312,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    def _busy_queue_guard(self):
+        """Return the re-entrant lock protecting one gateway's busy queues."""
+        guard = getattr(self, "_busy_queue_lock", None)
+        if guard is None:
+            guard = threading.RLock()
+            self._busy_queue_lock = guard
+        return guard
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+        with self._busy_queue_guard():
+            self._queue_or_replace_pending_event_locked(session_key, event)
+
+    def _queue_or_replace_pending_event_locked(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return
@@ -8359,6 +8407,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter: Any,
     ) -> bool:
         """Admit one internal IPC task without touching user media merge state."""
+        with self._busy_queue_guard():
+            return self._enqueue_internal_fifo_event_locked(session_key, event, adapter)
+
+    def _enqueue_internal_fifo_event_locked(
+        self, session_key: str, event: MessageEvent, adapter: Any
+    ) -> bool:
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             return False
         before = self._queue_depth(session_key, adapter=adapter)
@@ -22153,20 +22207,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return
-        # Structural clear: every conversation-scoped field resets in one
-        # call — no per-attribute pop-list to drift.
-        state = self._peek_session_state(session_key)
-        if state is not None:
-            state.conversation.clear()
-        # Legacy plain-dict stores still registered in
-        # _CONVERSATION_SCOPED_STATE (not yet folded into SessionState),
-        # e.g. _pending_model_notes.  SessionState-backed names resolve to
-        # MutableMapping views (not dict), so the isinstance(dict) guard
-        # skips them — already handled above.
-        for attr in _CONVERSATION_SCOPED_STATE:
-            store = getattr(self, attr, None)
-            if isinstance(store, dict):
-                store.pop(session_key, None)
+        with self._busy_queue_guard():
+            # Structural clear: every conversation-scoped field resets in one
+            # call — no per-attribute pop-list to drift.
+            state = self._peek_session_state(session_key)
+            if state is not None:
+                state.conversation.clear()
+            # Legacy plain-dict stores still registered in
+            # _CONVERSATION_SCOPED_STATE (not yet folded into SessionState),
+            # e.g. _pending_model_notes.  SessionState-backed names resolve to
+            # MutableMapping views (not dict), so the isinstance(dict) guard
+            # skips them — already handled above.
+            for attr in _CONVERSATION_SCOPED_STATE:
+                store = getattr(self, attr, None)
+                if isinstance(store, dict):
+                    store.pop(session_key, None)
         self._clear_session_boundary_security_state(session_key)
         logger.debug(
             "Cleared conversation scope for %s (%s)", session_key, reason
@@ -24497,14 +24552,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending_event = None
             pending = None
             if result and adapter and session_key:
-                pending_event = _dequeue_pending_event(adapter, session_key)
+                pending_event = self._dequeue_and_promote_queued_event(session_key, adapter)
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
                 # recursive run's drain will see it.  This keeps the slot
                 # occupied for the full FIFO chain, which (a) preserves
                 # order, and (b) causes any mid-chain /queue to correctly
                 # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
@@ -24555,22 +24609,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # as user input.  The primary fix is in base.py (commands bypass the
             # active-session guard), but this catches edge cases where command
             # text leaks through the interrupt_message fallback.
-            if pending and pending.strip().startswith("/"):
+            if _pending_slash_is_command_leak(pending, pending_event):
                 _pending_parts = pending.strip().split(None, 1)
                 _pending_cmd_word = _pending_parts[0][1:].lower() if _pending_parts else ""
-                if _pending_cmd_word:
-                    try:
-                        from hermes_cli.commands import resolve_command as _rc_pending
-                        if _rc_pending(_pending_cmd_word):
-                            logger.info(
-                                "Discarding command '/%s' from pending queue — "
-                                "commands must not be passed as agent input",
-                                _pending_cmd_word,
-                            )
-                            pending_event = None
-                            pending = None
-                    except Exception:
-                        pass
+                logger.info(
+                    "Discarding command '/%s' from pending queue — "
+                    "commands must not be passed as agent input",
+                    _pending_cmd_word,
+                )
+                pending_event = None
+                pending = None
 
             if self._draining and (pending_event or pending):
                 logger.info(
