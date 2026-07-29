@@ -544,6 +544,17 @@ def _print_setup_summary(config: dict, hermes_home):
             tool_status.append(("Text-to-Speech (KittenTTS local)", True, None))
         else:
             tool_status.append(("Text-to-Speech (KittenTTS — not installed)", False, "run 'hermes setup tts'"))
+    elif tts_provider == "voicevox":
+        from tools.tts_tool import _check_voicevox_available
+
+        if _check_voicevox_available(config.get("tts")):
+            tool_status.append(("Text-to-Speech (VOICEVOX local)", True, None))
+        else:
+            tool_status.append((
+                "Text-to-Speech (VOICEVOX — engine offline)",
+                False,
+                "start the configured VOICEVOX-compatible engine",
+            ))
     else:
         tool_status.append(("Text-to-Speech (Edge TTS)", True, None))
 
@@ -936,6 +947,54 @@ def _run_xai_oauth_login_from_setup() -> bool:
         return False
 
 
+def _configure_voicevox_settings(config: dict) -> None:
+    """Configure the engine URL and speaker/style for VOICEVOX setup."""
+    from tools.tts_tool import (
+        DEFAULT_VOICEVOX_BASE_URL,
+        DEFAULT_VOICEVOX_SPEAKER,
+        list_voices,
+    )
+
+    tts_config = config.setdefault("tts", {})
+    voicevox_config = tts_config.setdefault("voicevox", {})
+    current_base_url = str(
+        voicevox_config.get("base_url") or DEFAULT_VOICEVOX_BASE_URL
+    ).rstrip("/")
+    base_url = prompt("VOICEVOX engine URL", current_base_url).strip().rstrip("/")
+    voicevox_config["base_url"] = base_url or DEFAULT_VOICEVOX_BASE_URL
+    voicevox_config.setdefault("speaker", DEFAULT_VOICEVOX_SPEAKER)
+
+    try:
+        voices = list_voices("voicevox", tts_config)
+    except RuntimeError as exc:
+        print_warning(f"Could not load VOICEVOX speakers: {exc}")
+        print_info("Start the engine and rerun 'hermes setup tts' to choose a speaker.")
+        return
+    if not voices:
+        print_warning("VOICEVOX returned no talk-compatible speaker styles.")
+        return
+
+    choices = [str(voice.get("display") or voice.get("id")) for voice in voices]
+    current_speaker = str(voicevox_config.get("speaker", DEFAULT_VOICEVOX_SPEAKER))
+    keep_current_index = len(voices)
+    default_index = next(
+        (
+            index
+            for index, voice in enumerate(voices)
+            if str(voice.get("id")) == current_speaker
+        ),
+        keep_current_index,
+    )
+    choices.append(f"Keep current (ID {current_speaker})")
+    selected_index = prompt_choice(
+        "Select VOICEVOX speaker/style:", choices, default_index
+    )
+    if selected_index == keep_current_index:
+        return
+    voicevox_config["speaker"] = int(voices[selected_index]["id"])
+    print_success(f"VOICEVOX speaker set to: {voices[selected_index]['display']}")
+
+
 def _setup_tts_provider(config: dict):
     """Interactive TTS provider selection with install flow for NeuTTS."""
     tts_config = config.get("tts", {})
@@ -952,6 +1011,7 @@ def _setup_tts_provider(config: dict):
         "gemini": "Google Gemini TTS",
         "neutts": "NeuTTS",
         "kittentts": "KittenTTS",
+        "voicevox": "VOICEVOX",
     }
     current_label = provider_labels.get(current_provider, current_provider)
 
@@ -976,9 +1036,13 @@ def _setup_tts_provider(config: dict):
             "Google Gemini TTS (30 prebuilt voices, prompt-controllable, needs API key)",
             "NeuTTS (local on-device, free, ~300MB model download)",
             "KittenTTS (local on-device, free, lightweight ~25-80MB ONNX)",
+            "VOICEVOX (local Japanese TTS, compatible engine required)",
         ]
     )
-    providers.extend(["edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts"])
+    providers.extend([
+        "edge", "elevenlabs", "openai", "xai", "minimax", "mistral",
+        "gemini", "neutts", "kittentts", "voicevox",
+    ])
     choices.append(f"Keep current ({current_label})")
     keep_current_idx = len(choices) - 1
     idx = prompt_choice("Select TTS provider:", choices, keep_current_idx)
@@ -1163,6 +1227,9 @@ def _setup_tts_provider(config: dict):
             else:
                 print_info("Skipping install. Set tts.provider to 'kittentts' after installing manually.")
                 selected = "edge"
+
+    elif selected == "voicevox":
+        _configure_voicevox_settings(config)
 
     # Save the selection
     if "tts" not in config:

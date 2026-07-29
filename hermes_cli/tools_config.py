@@ -374,6 +374,13 @@ TOOL_CATEGORIES = {
                 "post_setup": "piper",
             },
             {
+                "name": "VOICEVOX (local, Japanese)",
+                "badge": "free",
+                "tag": "Japanese TTS — VOICEVOX-compatible engines",
+                "tts_provider": "voicevox",
+                "readiness_check": "voicevox",
+            },
+            {
                 "name": "DeepInfra TTS",
                 "badge": "paid",
                 "tag": "Chatterbox, Qwen3-TTS, … — live catalog from api.deepinfra.com",
@@ -2945,6 +2952,12 @@ def provider_readiness_status(
             return "ready"
         return "needs_keys"
 
+    if provider.get("readiness_check") == "voicevox":
+        from tools.tts_tool import _check_voicevox_available
+
+        tts_config = config.get("tts") if isinstance(config, dict) else None
+        return "ready" if _check_voicevox_available(tts_config) else "needs_setup"
+
     managed_feature = provider.get("managed_nous_feature")
     if provider.get("requires_nous_auth") or managed_feature:
         if features is None:
@@ -3607,6 +3620,54 @@ def _select_plugin_video_gen_provider(plugin_name: str, config: dict, *, use_gat
         _configure_xai_imagine_storage("video_gen", config)
 
 
+def _configure_voicevox_settings(config: dict) -> None:
+    """Prompt for the VOICEVOX engine URL and a catalog speaker/style."""
+    from tools.tts_tool import (
+        DEFAULT_VOICEVOX_BASE_URL,
+        DEFAULT_VOICEVOX_SPEAKER,
+        list_voices,
+    )
+
+    tts_config = config.setdefault("tts", {})
+    voicevox_config = tts_config.setdefault("voicevox", {})
+    current_base_url = str(
+        voicevox_config.get("base_url") or DEFAULT_VOICEVOX_BASE_URL
+    ).rstrip("/")
+    base_url = _prompt("  VOICEVOX engine URL", current_base_url).strip().rstrip("/")
+    voicevox_config["base_url"] = base_url or DEFAULT_VOICEVOX_BASE_URL
+    voicevox_config.setdefault("speaker", DEFAULT_VOICEVOX_SPEAKER)
+
+    try:
+        voices = list_voices("voicevox", tts_config)
+    except RuntimeError as exc:
+        _print_warning(f"  Could not load VOICEVOX speakers: {exc}")
+        _print_info("  Start the engine and reconfigure VOICEVOX to choose a speaker.")
+        return
+    if not voices:
+        _print_warning("  VOICEVOX returned no talk-compatible speaker styles.")
+        return
+
+    choices = [str(voice.get("display") or voice.get("id")) for voice in voices]
+    current_speaker = str(voicevox_config.get("speaker", DEFAULT_VOICEVOX_SPEAKER))
+    keep_current_index = len(voices)
+    default_index = next(
+        (
+            index
+            for index, voice in enumerate(voices)
+            if str(voice.get("id")) == current_speaker
+        ),
+        keep_current_index,
+    )
+    choices.append(f"Keep current (ID {current_speaker})")
+    selected_index = _prompt_choice(
+        "Select VOICEVOX speaker/style:", choices, default_index
+    )
+    if selected_index == keep_current_index:
+        return
+    voicevox_config["speaker"] = int(voices[selected_index]["id"])
+    _print_success(f"  VOICEVOX speaker set to: {voices[selected_index]['display']}")
+
+
 def _write_provider_config(provider: dict, config: dict, *, managed_feature) -> None:
     """Persist the provider/backend config keys for a selected provider.
 
@@ -3782,7 +3843,11 @@ def _configure_provider(
     if not env_vars:
         if provider.get("post_setup"):
             _run_post_setup(provider["post_setup"])
-        _print_success(f"  {provider['name']} - no configuration needed!")
+        if provider.get("tts_provider") == "voicevox":
+            _configure_voicevox_settings(config)
+            _print_success("  VOICEVOX configuration saved")
+        else:
+            _print_success(f"  {provider['name']} - no configuration needed!")
         if managed_feature:
             _print_info("  Requests for this tool will be billed to your Nous subscription.")
         # Plugin-registered image_gen provider: write image_gen.provider
