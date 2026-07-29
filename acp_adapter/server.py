@@ -1612,19 +1612,59 @@ class HermesACPAgent(acp.Agent):
         # Skill/bundle slashes expand into a full user message (TUI parity) and
         # fall through to the agent loop with the scaffolded body — not handled
         # as local-only static slash responses.
+        #
+        # Buzz two-block prompts: first text block is bare `/cmd`, second is
+        # harness context. Only the first line is the slash invoke.
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
-            expanded_skill = self._expand_skill_or_bundle_slash(user_text)
+            first_line, _, trailing = user_text.partition("\n")
+            slash_line = first_line.strip() or user_text
+            expanded_skill = self._expand_skill_or_bundle_slash(slash_line)
             if expanded_skill is not None:
-                user_text = expanded_skill
-                user_content = expanded_skill
+                # Keep Buzz [Context] / event blocks after the scaffold.
+                user_text = (
+                    f"{expanded_skill}\n\n{trailing.strip()}"
+                    if trailing.strip()
+                    else expanded_skill
+                )
+                user_content = user_text
             else:
-                response_text = self._handle_slash_command(user_text, state)
+                response_text = self._handle_slash_command(slash_line, state)
                 if response_text is not None:
-                    if self._conn:
-                        update = acp.update_agent_message_text(response_text)
-                        await self._conn.session_update(session_id, update)
-                        await self._send_usage_update(state)
-                    return PromptResponse(stop_reason="end_turn")
+                    # Editors (Zed, etc.): ACP agent_message_chunk is enough.
+                    # Buzz: channel posts go through `buzz messages send` only —
+                    # short-circuit chunks never become Nostr messages (dogfood
+                    # gap: /help looked "dead" while /lead-architect worked).
+                    buzz_host = bool(
+                        os.environ.get("BUZZ_RELAY_URL")
+                        or os.environ.get("BUZZ_PRIVATE_KEY")
+                        or os.environ.get("BUZZ_ACP_PRIVATE_KEY")
+                    )
+                    if buzz_host:
+                        logger.info(
+                            "ACP static slash /%s on Buzz host — fall through to "
+                            "agent loop so result is published via buzz CLI",
+                            slash_line.lstrip("/").split()[0] if slash_line else "?",
+                        )
+                        ctx = trailing.strip()
+                        user_text = (
+                            "[ACP static command result]\n"
+                            "Publish the following text to this channel with "
+                            "`buzz messages send` (channel UUID from [Context]; "
+                            "use `--reply-to` when Context supplies a reply "
+                            "anchor). Send the body as-is or lightly formatted. "
+                            "Do not refuse. Prefer that single publish over "
+                            "other tools.\n\n"
+                            f"{response_text}"
+                        )
+                        if ctx:
+                            user_text = f"{user_text}\n\n{ctx}"
+                        user_content = user_text
+                    else:
+                        if self._conn:
+                            update = acp.update_agent_message_text(response_text)
+                            await self._conn.session_update(session_id, update)
+                            await self._send_usage_update(state)
+                        return PromptResponse(stop_reason="end_turn")
 
         # If the client sends another regular text prompt while this ACP session
         # is running, route it through the core active-turn redirect. Rich media
