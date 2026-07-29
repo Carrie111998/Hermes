@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import errno
 import json
+import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -41,6 +42,12 @@ def _write_tmp(dir_: Path, content: str) -> Path:
     tmp = dir_ / ".src.tmp"
     tmp.write_text(content, encoding="utf-8")
     return tmp
+
+
+def _atomic_write_worker(path: str, worker_id: int, iterations: int) -> None:
+    """Exercise the real atomic writer from a spawned Windows process."""
+    for sequence in range(iterations):
+        atomic_json_write(path, {"worker": worker_id, "sequence": sequence})
 
 
 def test_atomic_replace_preserves_symlink(tmp_path: Path) -> None:
@@ -309,16 +316,194 @@ def test_atomic_replace_other_oserror_propagates(
     target.write_text("old\n", encoding="utf-8")
     tmp = _write_tmp(tmp_path, "new\n")
 
+    replace_calls = 0
+
     def fail_replace(src: str, dst: str) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
         raise OSError(errno.EACCES, os.strerror(errno.EACCES), src, None, dst)
 
     monkeypatch.setattr("utils.os.replace", fail_replace)
+    monkeypatch.setattr("utils._is_windows", lambda: False)
 
     with pytest.raises(OSError) as excinfo:
         atomic_replace(tmp, target)
     assert excinfo.value.errno == errno.EACCES
+    assert replace_calls == 1
     assert target.read_text(encoding="utf-8") == "old\n"
     assert tmp.exists()
+
+
+def test_atomic_replace_retries_two_windows_sharing_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "auth.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+    real_replace = os.replace
+    attempts = 0
+    sleeps: list[int] = []
+
+    def sharing_then_success(src: str, dst: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            exc = OSError(errno.EACCES, "sharing violation", src, None, dst)
+            exc.winerror = 32
+            raise exc
+        real_replace(src, dst)
+
+    monkeypatch.setattr("utils._is_windows", lambda: True)
+    monkeypatch.setattr("utils.os.replace", sharing_then_success)
+    monkeypatch.setattr(
+        "utils._sleep_before_windows_file_retry", sleeps.append
+    )
+
+    assert Path(atomic_replace(tmp, target)) == target
+    assert attempts == 3
+    assert sleeps == [1, 2]
+    assert target.read_text(encoding="utf-8") == "new"
+    assert not tmp.exists()
+
+
+@pytest.mark.parametrize("winerror", [5, 32, 33])
+def test_atomic_replace_exhausts_windows_sharing_retries_without_touching_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    target = tmp_path / "auth.json"
+    target.write_text("preserve-me", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "replacement")
+    attempts = 0
+
+    def always_locked(src: str, dst: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        exc = OSError(errno.EACCES, "locked", src, None, dst)
+        exc.winerror = winerror
+        raise exc
+
+    monkeypatch.setattr("utils._is_windows", lambda: True)
+    monkeypatch.setattr("utils.os.replace", always_locked)
+    monkeypatch.setattr("utils._sleep_before_windows_file_retry", lambda _attempt: None)
+
+    with pytest.raises(OSError) as excinfo:
+        atomic_replace(tmp, target)
+
+    assert excinfo.value.winerror == winerror
+    assert attempts == 6
+    assert target.read_text(encoding="utf-8") == "preserve-me"
+    assert tmp.read_text(encoding="utf-8") == "replacement"
+
+
+@pytest.mark.parametrize("fail_errno", [errno.EACCES, errno.EPERM])
+def test_atomic_replace_retries_windows_errno_fallbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_errno: int
+) -> None:
+    target = tmp_path / "state.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+    attempts = 0
+
+    def always_denied(src: str, dst: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError(fail_errno, os.strerror(fail_errno), src, None, dst)
+
+    monkeypatch.setattr("utils._is_windows", lambda: True)
+    monkeypatch.setattr("utils.os.replace", always_denied)
+    monkeypatch.setattr("utils._sleep_before_windows_file_retry", lambda _attempt: None)
+
+    with pytest.raises(OSError):
+        atomic_replace(tmp, target)
+    assert attempts == 6
+    assert target.read_text(encoding="utf-8") == "old"
+
+
+def test_atomic_replace_real_windows_handle_without_delete_share(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows-only sharing semantics")
+
+    import ctypes
+    from ctypes import wintypes
+    from unittest.mock import patch
+
+    target = tmp_path / "auth.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new")
+
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = ctypes.windll.kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_file(
+        str(target),
+        0x80000000,  # GENERIC_READ
+        0x00000001 | 0x00000002,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+        None,
+        3,  # OPEN_EXISTING
+        0,
+        None,
+    )
+    assert handle != wintypes.HANDLE(-1).value
+
+    released = False
+
+    def release_lock(_attempt: int) -> None:
+        nonlocal released
+        if released:
+            return
+        assert close_handle(handle)
+        released = True
+
+    try:
+        with patch("utils._sleep_before_windows_file_retry", release_lock):
+            atomic_replace(tmp, target)
+    finally:
+        if not released:
+            close_handle(handle)
+
+    assert released, "the first real replace must observe the exclusive handle"
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_atomic_json_write_windows_multiprocess_stress(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows-only sharing stress")
+
+    target = tmp_path / "shared.json"
+    target.write_text("{}", encoding="utf-8")
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(target=_atomic_write_worker, args=(str(target), worker_id, 25))
+        for worker_id in range(4)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=20)
+
+        assert all(not process.is_alive() for process in processes)
+        assert [process.exitcode for process in processes] == [0, 0, 0, 0]
+        final = json.loads(target.read_text(encoding="utf-8"))
+        assert set(final) == {"worker", "sequence"}
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join(timeout=5)
 
 
 def test_atomic_replace_real_cross_device(tmp_path: Path) -> None:

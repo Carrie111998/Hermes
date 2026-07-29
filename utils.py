@@ -4,9 +4,11 @@ import errno
 import json
 import logging
 import os
+import random
 import shutil
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
@@ -17,6 +19,44 @@ logger = logging.getLogger(__name__)
 
 
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+
+_WINDOWS_FILE_RETRY_ATTEMPTS = 6
+_WINDOWS_FILE_RETRY_BASE_DELAY_SECONDS = 0.025
+_WINDOWS_FILE_RETRY_MAX_DELAY_SECONDS = 0.4
+_WINDOWS_SHARING_WINERRORS = frozenset({5, 32, 33})
+_WINDOWS_SHARING_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
+
+
+def _is_windows() -> bool:
+    """Return whether Windows file-sharing semantics apply."""
+    return os.name == "nt"
+
+
+def _is_windows_sharing_error(exc: OSError) -> bool:
+    """Identify transient Windows access and sharing violations.
+
+    CPython exposes native Windows failures through ``winerror`` when
+    available, while some filesystems and wrappers only populate ``errno``.
+    Restricting the errno fallback to Windows avoids retrying ordinary POSIX
+    permission failures. WinError 5 is included for real-world filter-driver
+    behavior, but callers bound it to six attempts because access denial can
+    also be permanent.
+    """
+    if not _is_windows():
+        return False
+    return (
+        getattr(exc, "winerror", None) in _WINDOWS_SHARING_WINERRORS
+        or exc.errno in _WINDOWS_SHARING_ERRNOS
+    )
+
+
+def _sleep_before_windows_file_retry(failed_attempt: int) -> None:
+    """Apply bounded exponential backoff with a small collision jitter."""
+    delay = min(
+        _WINDOWS_FILE_RETRY_BASE_DELAY_SECONDS * (2 ** (failed_attempt - 1)),
+        _WINDOWS_FILE_RETRY_MAX_DELAY_SECONDS,
+    )
+    time.sleep(delay + random.uniform(0.0, delay * 0.25))
 
 
 def is_truthy_value(value: Any, default: bool = False) -> bool:
@@ -101,9 +141,10 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     This helper resolves the symlink first so ``os.replace`` writes to
     the real file in-place while the symlink survives.  For non-symlink
     and non-existent paths the behavior is identical to a plain
-    ``os.replace`` call unless the rename fails with ``EXDEV`` or ``EBUSY``;
-    those cases fall back to copy/fsync/unlink for cross-device, bind-mount,
-    and busy-file deployments.
+    ``os.replace`` call. On Windows, transient access/sharing violations are
+    retried with bounded backoff. ``EXDEV`` and ``EBUSY`` retain their existing
+    copy/fsync/unlink fallback for cross-device, bind-mount, and busy-file
+    deployments.
 
     Returns the resolved real path used for the replace, so callers that
     need to re-apply permissions can target it instead of the symlink.
@@ -111,16 +152,35 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     target_str = str(target)
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
     tmp_str = str(tmp_path)
-    try:
-        os.replace(tmp_str, real_path)
-    except OSError as exc:
-        if exc.errno not in (errno.EXDEV, errno.EBUSY):
-            raise
+    fallback_exc: OSError | None = None
+    for attempt in range(1, _WINDOWS_FILE_RETRY_ATTEMPTS + 1):
+        try:
+            os.replace(tmp_str, real_path)
+            return real_path
+        except OSError as exc:
+            # Preserve the established cross-device/busy-file fallback. EBUSY
+            # is intentionally not part of the Windows sharing retry class.
+            if exc.errno in (errno.EXDEV, errno.EBUSY):
+                fallback_exc = exc
+                break
+            if not _is_windows_sharing_error(exc) or attempt == _WINDOWS_FILE_RETRY_ATTEMPTS:
+                raise
+            logger.debug(
+                "atomic_replace: transient Windows file-sharing failure "
+                "for %s -> %s (attempt %d/%d); retrying",
+                tmp_str,
+                real_path,
+                attempt,
+                _WINDOWS_FILE_RETRY_ATTEMPTS,
+            )
+            _sleep_before_windows_file_retry(attempt)
+
+    if fallback_exc is not None:
         logger.debug(
             "atomic_replace: %s -> %s failed with %s; falling back to copy",
             tmp_str,
             real_path,
-            errno.errorcode.get(exc.errno, exc.errno),
+            errno.errorcode.get(fallback_exc.errno, fallback_exc.errno),
         )
         shutil.copyfile(tmp_str, real_path)
         try:

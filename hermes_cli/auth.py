@@ -51,7 +51,15 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import (
+    _WINDOWS_FILE_RETRY_ATTEMPTS,
+    _is_windows_sharing_error,
+    _sleep_before_windows_file_retry,
+    atomic_replace,
+    atomic_yaml_write,
+    env_float,
+    is_truthy_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +78,12 @@ except Exception:
 
 AUTH_STORE_VERSION = 1
 AUTH_LOCK_TIMEOUT_SECONDS = 15.0
+_AUTH_STORE_LOAD_FAILED_KEY = "_auth_store_load_failed"
+_AUTH_STORE_CORRUPT_COPY_KEY = "_auth_store_corrupt_copy"
+_AUTH_STORE_METADATA_KEYS = frozenset({"version", "updated_at", "active_provider"})
+_AUTH_STORE_TOP_LEVEL_KEYS = _AUTH_STORE_METADATA_KEYS | frozenset(
+    {"providers", "credential_pool", "suppressed_sources", "systems"}
+)
 
 # Nous Portal defaults
 DEFAULT_NOUS_PORTAL_URL = "https://portal.nousresearch.com"
@@ -1109,38 +1123,228 @@ def _auth_store_lock(
         yield
 
 
+def _read_auth_store_bytes(auth_file: Path) -> Optional[bytes]:
+    """Read an auth store without misclassifying Windows sharing races.
+
+    ``None`` means the store does not exist. Persistent I/O failures propagate
+    so callers cannot silently overwrite an inaccessible credential store with
+    an empty one.
+    """
+    for attempt in range(1, _WINDOWS_FILE_RETRY_ATTEMPTS + 1):
+        try:
+            return auth_file.read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if (
+                not _is_windows_sharing_error(exc)
+                or attempt == _WINDOWS_FILE_RETRY_ATTEMPTS
+            ):
+                raise
+            logger.debug(
+                "auth: transient Windows file-sharing failure while reading %s "
+                "(attempt %d/%d); retrying",
+                auth_file,
+                attempt,
+                _WINDOWS_FILE_RETRY_ATTEMPTS,
+            )
+            _sleep_before_windows_file_retry(attempt)
+    raise AssertionError("auth store retry loop exhausted without returning or raising")
+
+
+def _windows_corrupt_sidecar_security_attributes():
+    """Build a protected current-user + SYSTEM DACL for a forensic sidecar."""
+    import ntsecuritycon
+    import win32api
+    import win32con
+    import win32security
+
+    token = win32security.OpenProcessToken(
+        win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
+    )
+    try:
+        current_sid = win32security.GetTokenInformation(
+            token, win32security.TokenUser
+        )[0]
+    finally:
+        token.Close()
+    system_sid = win32security.ConvertStringSidToSid("S-1-5-18")
+    acl = win32security.ACL()
+    for sid in (current_sid, system_sid):
+        acl.AddAccessAllowedAceEx(
+            win32security.ACL_REVISION,
+            0,
+            ntsecuritycon.FILE_ALL_ACCESS,
+            sid,
+        )
+    descriptor = win32security.SECURITY_DESCRIPTOR()
+    descriptor.SetSecurityDescriptorOwner(current_sid, False)
+    descriptor.SetSecurityDescriptorDacl(True, acl, False)
+    descriptor.SetSecurityDescriptorControl(
+        win32security.SE_DACL_PROTECTED,
+        win32security.SE_DACL_PROTECTED,
+    )
+    attributes = win32security.SECURITY_ATTRIBUTES()
+    attributes.SECURITY_DESCRIPTOR = descriptor
+    return attributes
+
+
+def _write_new_corrupt_sidecar_windows(corrupt_path: Path, payload: bytes) -> None:
+    """Create a Windows sidecar with its restrictive DACL applied atomically."""
+    import ntsecuritycon
+    import pywintypes
+    import win32file
+
+    try:
+        handle = win32file.CreateFile(
+            str(corrupt_path),
+            ntsecuritycon.GENERIC_WRITE,
+            0,
+            _windows_corrupt_sidecar_security_attributes(),
+            win32file.CREATE_NEW,
+            win32file.FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    except pywintypes.error as exc:
+        if getattr(exc, "winerror", None) in {80, 183}:
+            raise FileExistsError(str(corrupt_path)) from exc
+        raise
+    try:
+        _error, written = win32file.WriteFile(handle, payload)
+        if written != len(payload):
+            raise OSError(f"short write preserving corrupt auth store: {written}/{len(payload)}")
+        win32file.FlushFileBuffers(handle)
+    except Exception:
+        win32file.CloseHandle(handle)
+        handle = None
+        try:
+            corrupt_path.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        if handle is not None:
+            win32file.CloseHandle(handle)
+
+
+def _write_new_corrupt_sidecar(corrupt_path: Path, payload: bytes) -> None:
+    """Create one protected forensic sidecar without exposing its payload."""
+    if os.name == "nt":
+        _write_new_corrupt_sidecar_windows(corrupt_path, payload)
+        return
+
+    fd = os.open(
+        str(corrupt_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            corrupt_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _preserve_corrupt_auth_payload(auth_file: Path, payload: bytes) -> Path:
+    """Preserve exact invalid bytes once, keyed by their SHA-256 digest."""
+    digest = hashlib.sha256(payload).hexdigest()
+    corrupt_path = auth_file.with_name(f"{auth_file.name}.corrupt.sha256.{digest}")
+    try:
+        _write_new_corrupt_sidecar(corrupt_path, payload)
+        return corrupt_path
+    except FileExistsError:
+        existing = _read_auth_store_bytes(corrupt_path)
+        if existing == payload:
+            return corrupt_path
+        raise OSError(
+            f"corrupt auth sidecar digest collision or incomplete write: {corrupt_path}"
+        )
+
+
+def _auth_store_load_failure(
+    auth_file: Path,
+    payload: bytes,
+    exc: Exception,
+) -> Dict[str, Any]:
+    """Return a fail-closed sentinel after preserving invalid auth bytes."""
+    corrupt_path: Optional[Path] = None
+    try:
+        corrupt_path = _preserve_corrupt_auth_payload(auth_file, payload)
+        preservation_status = f"Corrupt file preserved at {corrupt_path}"
+    except Exception as preserve_exc:
+        logger.debug(
+            "auth: could not preserve invalid store %s: %s",
+            auth_file,
+            preserve_exc,
+        )
+        preservation_status = "Could not safely preserve corrupt file"
+    logger.warning(
+        "auth: invalid store %s (%s) — bounded recovery refused to overwrite it. %s",
+        auth_file,
+        exc,
+        preservation_status,
+    )
+    return {
+        "version": AUTH_STORE_VERSION,
+        "providers": {},
+        _AUTH_STORE_LOAD_FAILED_KEY: str(exc),
+        _AUTH_STORE_CORRUPT_COPY_KEY: str(corrupt_path) if corrupt_path else None,
+    }
+
+
+def _auth_store_structure_error(raw: Any) -> Optional[ValueError]:
+    """Return why parsed JSON is not a recognized auth-store structure."""
+    if not isinstance(raw, dict):
+        return ValueError("auth store top level must be an object")
+    unknown_keys = set(raw) - _AUTH_STORE_TOP_LEVEL_KEYS
+    if unknown_keys:
+        return ValueError(
+            "auth store has unrecognized top-level fields: "
+            + ", ".join(sorted(str(key) for key in unknown_keys))
+        )
+    for key in ("providers", "credential_pool", "suppressed_sources", "systems"):
+        if key in raw and not isinstance(raw[key], dict):
+            return ValueError(f"auth store field {key!r} must be an object")
+    if set(raw) <= _AUTH_STORE_METADATA_KEYS:
+        return None
+    if "systems" in raw:
+        nous_portal = raw["systems"].get("nous_portal")
+        if nous_portal is not None and not isinstance(nous_portal, dict):
+            return ValueError("auth store systems.nous_portal must be an object")
+    return None
+
+
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
-    if not auth_file.exists():
+    payload = _read_auth_store_bytes(auth_file)
+    if payload is None:
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text(encoding="utf-8"))
-    except Exception as exc:
-        corrupt_path = auth_file.with_suffix(".json.corrupt")
-        try:
-            import shutil
-            shutil.copy2(auth_file, corrupt_path)
-        except Exception:
-            pass
-        logger.warning(
-            "auth: failed to parse %s (%s) — starting with empty store. "
-            "Corrupt file preserved at %s",
-            auth_file, exc, corrupt_path,
-        )
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+        raw = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _auth_store_load_failure(auth_file, payload, exc)
 
-    if isinstance(raw, dict) and (
-        isinstance(raw.get("providers"), dict)
-        or isinstance(raw.get("credential_pool"), dict)
-    ):
+    structure_error = _auth_store_structure_error(raw)
+    if structure_error is not None:
+        return _auth_store_load_failure(auth_file, payload, structure_error)
+
+    if "providers" in raw or "credential_pool" in raw or "systems" not in raw:
         raw.setdefault("providers", {})
-        if isinstance(raw.get("providers"), dict):
-            _migrate_stale_nous_portal_url(raw["providers"])
+        _migrate_stale_nous_portal_url(raw["providers"])
         return raw
 
     # Migrate from PR's "systems" format if present
-    if isinstance(raw, dict) and isinstance(raw.get("systems"), dict):
+    if "systems" in raw:
         systems = raw["systems"]
         providers = {}
         if "nous_portal" in systems:
@@ -1148,10 +1352,19 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         return {"version": AUTH_STORE_VERSION, "providers": providers,
                 "active_provider": "nous" if providers else None}
 
-    return {"version": AUTH_STORE_VERSION, "providers": {}}
+    raise AssertionError("recognized auth store was not handled")
 
 
 def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
+    if auth_store.get(_AUTH_STORE_LOAD_FAILED_KEY):
+        corrupt_copy = auth_store.get(_AUTH_STORE_CORRUPT_COPY_KEY)
+        raise RuntimeError(
+            "Refusing to overwrite auth.json because it was loaded after a parse "
+            "or structure validation failure. "
+            "Recover or remove the existing auth.json first. "
+            f"Preserved copy: {corrupt_copy}"
+        )
+
     # target_path=None preserves the existing contract (write the active
     # store at _auth_file_path()). An explicit path lets callers persist a
     # specific store — e.g. the global-root write-through for rotating xAI
