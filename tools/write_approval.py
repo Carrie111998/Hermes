@@ -71,22 +71,32 @@ CONFIG_KEY = "write_approval"
 # Config resolution
 # ---------------------------------------------------------------------------
 
+def _read_write_approval_enabled(subsystem: str) -> bool:
+    """Resolve the gate from config, propagating read failures to the caller."""
+    if subsystem not in _SUBSYSTEMS:
+        return False
+    from hermes_cli.config import load_config, cfg_get
+
+    cfg = load_config()
+    raw = cfg_get(cfg, subsystem, CONFIG_KEY, default=False)
+    return _normalize_enabled(raw)
+
+
 def write_approval_enabled(subsystem: str) -> bool:
     """Return whether the approval gate is enabled for ``subsystem``.
 
     Reads ``<subsystem>.write_approval`` from config.yaml. Defaults to
-    ``False`` (gate off — writes flow freely) for any unset / invalid value so
-    existing installs keep their current behaviour until the user opts in.
+    ``False`` for an unset value. If config cannot be read, fail closed by
+    reporting the gate as enabled; mutation paths use the stricter resolver
+    in :func:`evaluate_gate` and block rather than staging.
     """
     if subsystem not in _SUBSYSTEMS:
         return False
     try:
-        from hermes_cli.config import load_config, cfg_get
-        cfg = load_config()
-        raw = cfg_get(cfg, subsystem, CONFIG_KEY, default=False)
-    except Exception:
-        return False
-    return _normalize_enabled(raw)
+        return _read_write_approval_enabled(subsystem)
+    except Exception as exc:
+        logger.error("Could not resolve %s write approval; failing closed: %s", subsystem, exc)
+        return True
 
 
 def _normalize_enabled(value: Any) -> bool:
@@ -267,11 +277,24 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
         gate on, memory + gateway/script/bg   → stage
         gate on, skills (any origin)          → stage (too big to review inline)
 
-    Note: there is no config-driven "blocked" outcome — the gate only ever
-    delays a write for approval, never silently refuses it. ``blocked`` is
-    still produced when the user *actively denies* an inline prompt.
+    With a valid configuration there is no config-driven ``blocked`` outcome:
+    the gate delays writes for approval, and an explicit inline denial blocks.
+    If approval configuration cannot be resolved, the safe fallback is also a
+    blocked decision so a control-plane failure cannot silently enable writes.
     """
-    if not write_approval_enabled(subsystem):
+    try:
+        gate_enabled = _read_write_approval_enabled(subsystem)
+    except Exception as exc:
+        logger.error("Could not resolve %s write approval; blocking mutation: %s", subsystem, exc)
+        return GateDecision(
+            blocked=True,
+            message=(
+                f"{subsystem.capitalize()} write blocked: approval configuration "
+                "could not be read. No change was staged or saved."
+            ),
+        )
+
+    if not gate_enabled:
         return GateDecision(allow=True)
 
     background = is_background()

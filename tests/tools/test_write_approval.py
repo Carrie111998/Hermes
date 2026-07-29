@@ -48,6 +48,23 @@ def test_invalid_subsystem_is_off(hermes_home):
     assert wa.write_approval_enabled("bogus") is False
 
 
+def test_config_read_failure_blocks_mutation(hermes_home, monkeypatch):
+    """An unreadable approval config must never be interpreted as gate-off."""
+    from tools import write_approval as wa
+
+    def fail_load():
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", fail_load)
+
+    decision = wa.evaluate_gate(wa.MEMORY)
+
+    assert decision.blocked is True
+    assert decision.allow is False
+    assert decision.stage is False
+    assert "approval configuration" in decision.message.lower()
+
+
 def test_normalize_enabled_coerces_values():
     from tools import write_approval as wa
     # Real bools pass through.
@@ -76,6 +93,52 @@ def test_memory_gate_off_allows_write(hermes_home):
     assert r["success"] is True
     assert r["entry_count"] == 1
     assert wa.pending_count("memory") == 0
+
+
+def test_memory_gate_import_failure_blocks(hermes_home, monkeypatch):
+    """A broken approval subsystem must not silently permit memory writes."""
+    import builtins
+    import tools.memory_tool as memory_mod
+
+    real_import = builtins.__import__
+
+    def fail_gate_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tools" and "write_approval" in fromlist:
+            raise ImportError("approval module unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_gate_import)
+
+    raw_result = memory_mod._apply_write_gate("add", "memory", "x", None)
+    assert raw_result is not None
+    result = json.loads(raw_result)
+
+    assert result["success"] is False
+    assert "approval" in result["error"].lower()
+
+
+def test_batch_memory_gate_import_failure_blocks(hermes_home, monkeypatch):
+    """A broken approval subsystem must not silently permit batch memory writes."""
+    import builtins
+    import tools.memory_tool as memory_mod
+
+    real_import = builtins.__import__
+
+    def fail_gate_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tools" and "write_approval" in fromlist:
+            raise ImportError("approval module unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_gate_import)
+
+    raw_result = memory_mod._apply_batch_write_gate(
+        "memory", [{"action": "add", "content": "x"}]
+    )
+    assert raw_result is not None
+    result = json.loads(raw_result)
+
+    assert result["success"] is False
+    assert "approval" in result["error"].lower()
 
 
 def test_memory_gate_on_no_interactive_stages(hermes_home):
@@ -183,6 +246,30 @@ def test_skill_gate_off_allows_create(hermes_home):
     r = json.loads(smt.skill_manage("create", "free-skill", content=_SKILL))
     assert r.get("success") is True
     assert wa.pending_count("skills") == 0
+
+
+def test_skill_gate_import_failure_blocks(hermes_home, monkeypatch):
+    """A broken approval subsystem must not silently permit skill writes."""
+    import builtins
+    import tools.skill_manager_tool as skill_mod
+
+    real_import = builtins.__import__
+
+    def fail_gate_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tools" and "write_approval" in fromlist:
+            raise ImportError("approval module unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_gate_import)
+
+    raw_result = skill_mod._apply_skill_write_gate(
+        "create", "blocked-skill", content=_SKILL
+    )
+    assert raw_result is not None
+    result = json.loads(raw_result)
+
+    assert result["success"] is False
+    assert "approval" in result["error"].lower()
 
 
 def test_skill_gate_on_always_stages(hermes_home):

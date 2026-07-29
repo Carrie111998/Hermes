@@ -7,6 +7,13 @@ from unittest.mock import patch
 from agent.subdirectory_hints import SubdirectoryHintTracker
 
 
+@pytest.fixture(autouse=True)
+def clear_context_suppression_env(monkeypatch):
+    """Each test opts into safe/ignore mode explicitly when needed."""
+    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
+    monkeypatch.delenv("HERMES_IGNORE_RULES", raising=False)
+
+
 @pytest.fixture
 def project(tmp_path):
     """Create a mock project tree with hint files in subdirectories."""
@@ -41,6 +48,28 @@ def project(tmp_path):
 
 class TestSubdirectoryHintTracker:
     """Unit tests for SubdirectoryHintTracker."""
+
+    def test_safe_mode_disables_progressive_discovery(self, project, monkeypatch):
+        """Safe mode must never inject newly discovered governance files."""
+        monkeypatch.setenv("HERMES_SAFE_MODE", "1")
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(project / "backend" / "src" / "main.py")}
+        )
+
+        assert result is None
+
+    def test_ignore_rules_disables_progressive_discovery(self, project, monkeypatch):
+        """The explicit ignore-rules contract also covers lazy discovery."""
+        monkeypatch.setenv("HERMES_IGNORE_RULES", "1")
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(project / "backend" / "src" / "main.py")}
+        )
+
+        assert result is None
 
     def test_working_dir_not_loaded(self, project):
         """Working dir is pre-marked as loaded (startup handles it)."""
