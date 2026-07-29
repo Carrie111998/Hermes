@@ -817,3 +817,37 @@ class TestProfilesToServe:
 
 
 
+    def test_on_no_named_profiles_returns_just_default(self, profile_env):
+        serve = profiles_to_serve(multiplex=True)
+        assert [n for n, _ in serve] == ["default"]
+
+def test_extract_config_model_provider_without_yaml_parser():
+    text = """
+model:
+  default: gpt-5.5
+  provider: openai-codex
+"""
+    assert profiles._extract_config_model_provider(text) == ('gpt-5.5', 'openai-codex')
+    assert profiles._extract_config_model_provider('model: simple-model\n') == ('simple-model', None)
+
+
+def test_read_config_model_uses_mtime_cache(tmp_path, monkeypatch):
+    profile_dir = tmp_path / 'profile'
+    profile_dir.mkdir()
+    config = profile_dir / 'config.yaml'
+    config.write_text('model:\n  default: first-model\n  provider: first-provider\n', encoding='utf-8')
+    profiles._CONFIG_MODEL_CACHE.clear()
+    monkeypatch.setattr(profiles, '_CONFIG_MODEL_CACHE_TTL_SECONDS', 300.0)
+
+    first = profiles._read_config_model(profile_dir)
+    assert first == ('first-model', 'first-provider')
+
+    original_mtime = config.stat().st_mtime
+    config.write_text('model:\n  default: second-model\n  provider: second-provider\n', encoding='utf-8')
+    os.utime(config, (original_mtime, original_mtime))
+    assert profiles._read_config_model(profile_dir) == first
+
+    bumped = original_mtime + 10
+    os.utime(config, (bumped, bumped))
+    assert profiles._read_config_model(profile_dir) == ('second-model', 'second-provider')
+

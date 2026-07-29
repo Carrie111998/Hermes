@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -677,24 +678,78 @@ def _read_distribution_meta(profile_dir: Path) -> tuple:
         return None, None, None
 
 
+# Dashboard/profile list endpoints can call list_profiles() concurrently. Keep
+# inventory reads serialized and avoid YAML parser churn for the lightweight
+# model/provider summary: repeated pure-Python yaml.safe_load has shown native
+# SIGSEGVs in WSL long-lived dashboard processes even with libyaml disabled.
+_CONFIG_MODEL_CACHE: dict[str, tuple[float, float, tuple]] = {}
+_CONFIG_MODEL_CACHE_LOCK = threading.RLock()
+_CONFIG_MODEL_CACHE_TTL_SECONDS = 30.0
+_LIST_PROFILES_LOCK = threading.RLock()
+
+
+def _extract_config_model_provider(text: str) -> tuple:
+    """Best-effort model/provider extraction without parsing YAML.
+
+    list_profiles() only needs a display summary. Avoid invoking yaml.safe_load
+    on every dashboard sidebar/cron refresh; full config readers still parse YAML
+    where exact semantics matter.
+    """
+    model = None
+    provider = None
+    in_model = False
+    model_indent: int | None = None
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if re.match(r"^model\s*:\s*[^#]+$", stripped):
+            value = stripped.split(":", 1)[1].strip().strip('"\'')
+            if value:
+                return value, None
+        if re.match(r"^model\s*:\s*(#.*)?$", stripped):
+            in_model = True
+            model_indent = indent
+            continue
+        if in_model:
+            if model_indent is not None and indent <= model_indent and not raw.startswith(" "):
+                in_model = False
+            else:
+                m = re.match(r"^(default|model|provider)\s*:\s*(.*?)\s*(?:#.*)?$", stripped)
+                if m:
+                    key, value = m.groups()
+                    value = value.strip().strip('"\'')
+                    if key in {"default", "model"} and not model:
+                        model = value or None
+                    elif key == "provider":
+                        provider = value or None
+    return model, provider
+
+
 def _read_config_model(profile_dir: Path) -> tuple:
     """Read model/provider from a profile's config.yaml. Returns (model, provider)."""
     config_path = profile_dir / "config.yaml"
     if not config_path.exists():
         return None, None
+    cache_key = str(config_path)
     try:
-        # Multi-profile display read: load_config() targets the ACTIVE
-        # profile's home, so read THIS profile's file via the raw primitive.
-        from hermes_cli.config import read_user_config_raw
-        cfg = read_user_config_raw(config_path)
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, str):
-            return model_cfg, None
-        if isinstance(model_cfg, dict):
-            return model_cfg.get("default") or model_cfg.get("model"), model_cfg.get("provider")
+        mtime = config_path.stat().st_mtime
+    except OSError:
         return None, None
+    now = time.time()
+    with _CONFIG_MODEL_CACHE_LOCK:
+        cached = _CONFIG_MODEL_CACHE.get(cache_key)
+        if cached and cached[0] == mtime and (now - cached[1]) < _CONFIG_MODEL_CACHE_TTL_SECONDS:
+            return cached[2]
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        result = _extract_config_model_provider(text)
     except Exception:
-        return None, None
+        result = (None, None)
+    with _CONFIG_MODEL_CACHE_LOCK:
+        _CONFIG_MODEL_CACHE[cache_key] = (mtime, time.time(), result)
+    return result
 
 
 def _check_gateway_running(profile_dir: Path) -> bool:
@@ -875,7 +930,7 @@ def write_profile_meta(
 # CRUD operations
 # ---------------------------------------------------------------------------
 
-def list_profiles() -> List[ProfileInfo]:
+def _list_profiles_impl() -> List[ProfileInfo]:
     """Return info for all profiles, including the default."""
     profiles = []
     wrapper_dir = _get_wrapper_dir()
@@ -945,6 +1000,12 @@ def list_profiles() -> List[ProfileInfo]:
             ))
 
     return profiles
+
+
+def list_profiles() -> List[ProfileInfo]:
+    """Return info for all profiles, serialized for dashboard/API safety."""
+    with _LIST_PROFILES_LOCK:
+        return _list_profiles_impl()
 
 
 def profiles_to_serve(multiplex: bool) -> List[Tuple[str, Path]]:
