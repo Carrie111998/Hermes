@@ -1725,7 +1725,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         _rid, method, _params = normalized
         from tui_gateway.mobile_contract import mobile_method_denial
 
-        denial = mobile_method_denial(method, getattr(t, "authorization", None))
+        denial = mobile_method_denial(
+            method,
+            getattr(t, "authorization", None),
+            _params,
+        )
         if denial is not None:
             return _err(
                 _rid,
@@ -7095,7 +7099,14 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    queued: bool = False,
+    allow_control: bool = True,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7116,6 +7127,18 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
+    # A scoped writer may enqueue the next user turn, but must not inherit the
+    # dashboard's interrupt/steer preference unless its connection also holds
+    # conversation.control. Re-check running under the queue-drain lock so a
+    # just-finished turn cannot strand work after teardown already drained it.
+    if not allow_control:
+        with session["history_lock"]:
+            if not session.get("running"):
+                return None
+            _enqueue_prompt(session, text, transport)
+            session["last_active"] = time.time()
+        return _ok(rid, {"status": "queued"})
+
     mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:

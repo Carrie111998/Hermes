@@ -123,25 +123,39 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
-    # Re-bind to the current client transport for this request. This keeps
-    # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+    # Re-bind accepted idle work to the current client. A busy scoped writer
+    # without conversation.control may queue its next turn on this transport,
+    # but must not seize the in-flight turn from the attached controller.
+    t = current_transport()
     while True:
         busy_transport = None
+        allow_control = True
         with session["history_lock"]:
             if session.get("running"):
-                # Don't reject a mid-turn prompt — queue it (and, by default,
-                # interrupt the live turn) so it runs as the next turn. The
-                # provider interrupt itself must happen after this lock is
-                # released: a non-interruptible tool may keep it waiting.
                 busy_transport = t or session.get("transport")
+                from tui_gateway.mobile_contract import (
+                    CONVERSATION_CONTROL_SCOPE,
+                    authorization_allows_scope,
+                )
+
+                allow_control = authorization_allows_scope(
+                    getattr(busy_transport, "authorization", None),
+                    CONVERSATION_CONTROL_SCOPE,
+                )
+                if t is not None and allow_control:
+                    session["transport"] = t
             else:
+                if t is not None:
+                    session["transport"] = t
                 break
         busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport,
+            rid,
+            sid,
+            session,
+            text,
+            busy_transport,
             queued=bool(params.get("queued")),
+            allow_control=allow_control,
         )
         if busy_response is not None:
             return busy_response
@@ -157,6 +171,8 @@ def _(rid, params: dict) -> dict:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
+        if t is not None:
+            session["transport"] = t
         if truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
