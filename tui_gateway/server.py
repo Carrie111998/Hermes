@@ -5110,14 +5110,20 @@ def _get_usage(agent) -> dict:
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''.
 
-    ``no-key-required`` is a valid sentinel for keyless custom providers; only
-    warn when the key is genuinely missing.
+    Only warns when a key is genuinely absent. The placeholder
+    ``no-key-required`` is the *intentional* signal for keyless-by-design
+    providers (local servers, the Nous free tier, Ollama, …) — those work
+    without a key, so flagging them produces a false-positive notification
+    ("First message will fail") even though chat succeeds via the keyless
+    backend. Treat ``no-key-required`` as configured.
     """
     try:
         key = getattr(agent, "api_key", "") or ""
         provider = getattr(agent, "provider", "") or ""
+        if key == "no-key-required":
+            return ""
         if not key:
-            return f"No API key configured for provider '{provider}'. First message will fail."
+            return f"No API key configured for provider '{provider}'. Set one in config or via env."
     except Exception:
         pass
     return ""
