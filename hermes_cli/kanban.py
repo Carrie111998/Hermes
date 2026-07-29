@@ -2266,7 +2266,19 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task)
+        try:
+            workspace = kb.resolve_workspace(task, conn=conn)
+        except Exception as exc:
+            kb.reclaim_task(
+                conn,
+                task.id,
+                reason=f"workspace provisioning failed: {exc}",
+            )
+            print(
+                f"cannot claim {task.id}: workspace provisioning failed: {exc}",
+                file=sys.stderr,
+            )
+            return 1
         kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
