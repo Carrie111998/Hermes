@@ -1186,6 +1186,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     try:
         from telegram import Bot
         from telegram.constants import ParseMode
+        # ponytail: reuse the adapter's visually-empty predicate so the
+        # standalone/cron sender rejects zero-width-only content too (#60848
+        # bug class). Same module the gateway path already imports from.
+        from plugins.platforms.telegram.adapter import _is_visually_empty
 
         # Auto-detect HTML tags — if present, skip MarkdownV2 and send as HTML.
         # Inspired by github.com/ashaney — PR #1568.
@@ -1287,7 +1291,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             _tg_caption = formatted
             formatted = ""  # suppress the separate text send below
 
-        if formatted.strip():
+        if formatted and not _is_visually_empty(formatted):
             # Chunk *after* formatting: MarkdownV2/HTML escaping inflates the
             # text (each escaped char like `!`/`.`/`-` becomes `\!`/`\.`/`\-`),
             # so a message that fit under 4096 UTF-16 units raw can exceed the
