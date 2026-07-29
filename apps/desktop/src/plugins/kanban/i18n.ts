@@ -149,6 +149,9 @@ type KanbanMessages = {
     attachments: (n: number) => string
     noAttachments: string
     uploadAttachment: string
+    downloadAttachment: string
+    attachmentSaved: (name: string) => string
+    reveal: string
     taskActions: string
     copyTaskId: string
     copyTitle: string
@@ -336,6 +339,9 @@ const en: KanbanMessages = {
     attachments: n => `Attachments · ${n}`,
     noAttachments: 'No attachments yet.',
     uploadAttachment: 'Upload attachment',
+    downloadAttachment: 'Download',
+    attachmentSaved: name => `Saved ${name}`,
+    reveal: 'Reveal',
     taskActions: 'Task actions',
     copyTaskId: 'Copy task id',
     copyTitle: 'Copy title',
@@ -523,6 +529,9 @@ const ja: KanbanMessages = {
     attachments: n => `添付・${n}`,
     noAttachments: 'まだ添付はありません。',
     uploadAttachment: '添付をアップロード',
+    downloadAttachment: 'ダウンロード',
+    attachmentSaved: name => `${name} を保存しました`,
+    reveal: '表示',
     taskActions: 'タスクの操作',
     copyTaskId: 'タスク ID をコピー',
     copyTitle: 'タイトルをコピー',
@@ -709,6 +718,9 @@ const zh: KanbanMessages = {
     attachments: n => `附件・${n}`,
     noAttachments: '暂无附件。',
     uploadAttachment: '上传附件',
+    downloadAttachment: '下载',
+    attachmentSaved: name => `已保存 ${name}`,
+    reveal: '在文件夹中显示',
     taskActions: '任务操作',
     copyTaskId: '复制任务 ID',
     copyTitle: '复制标题',
@@ -893,6 +905,9 @@ const zhHant: KanbanMessages = {
     attachments: n => `附件・${n}`,
     noAttachments: '尚無附件。',
     uploadAttachment: '上傳附件',
+    downloadAttachment: '下載',
+    attachmentSaved: name => `已儲存 ${name}`,
+    reveal: '在資料夾中顯示',
     taskActions: '任務操作',
     copyTaskId: '複製任務 ID',
     copyTitle: '複製標題',
