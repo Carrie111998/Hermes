@@ -104,18 +104,6 @@ function pinnedAliasesFor(session: SessionInfo | null | undefined, fallbackId: s
   return aliases
 }
 
-function pinnedAliasesFor(session: SessionInfo | null | undefined, fallbackId: string): Set<string> {
-  const aliases = new Set<string>([fallbackId])
-
-  if (session) {
-    for (const id of sessionAliasIds(session)) {
-      aliases.add(id)
-    }
-  }
-
-  return aliases
-}
-
 interface SessionActionsOptions {
   activeSessionId: string | null
   activeSessionIdRef: MutableRefObject<string | null>
