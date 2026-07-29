@@ -497,6 +497,66 @@ def _validate_teams_service_url(raw: str) -> Optional[str]:
     return normalized
 
 
+# ``<a href="URL" ...>LABEL</a>`` in the HTML body Teams mirrors alongside a
+# message. ``<a\b`` deliberately does not match Teams' ``<at id="0">`` mention
+# tags, which carry no href and are stripped separately.
+_TEAMS_ANCHOR_RE = _re_teams.compile(
+    r"""<a\b(?:[^>]*?\s)?href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""",
+    _re_teams.IGNORECASE | _re_teams.DOTALL,
+)
+_TEAMS_HTML_TAG_RE = _re_teams.compile(r"<[^>]+>")
+
+
+def _extract_teams_html_links(html_body: str) -> list:
+    """Return ``[(label, url), ...]`` for the http(s) anchors in a Teams body."""
+    if not html_body or "<a" not in html_body.lower():
+        return []
+
+    links = []
+    seen = set()
+    for raw_url, raw_label in _TEAMS_ANCHOR_RE.findall(html_body):
+        url = html.unescape(raw_url).strip()
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        label = html.unescape(_TEAMS_HTML_TAG_RE.sub("", raw_label)).strip()
+        links.append((label, url))
+    return links
+
+
+def _merge_teams_link_urls(text: str, html_body: str) -> str:
+    """Restore hyperlink targets that Teams strips out of ``activity.text``.
+
+    Teams flattens ``<a href="URL">LABEL</a>`` down to a bare ``LABEL`` in the
+    plain text a bot receives, and its composer turns a pasted URL into exactly
+    that shape whenever the page has a title. The agent then sees a message
+    that visibly contains a link but carries no URL, and answers "paste the
+    URL" — for a message that already has one. The href survives only in the
+    ``text/html`` body Teams mirrors as an attachment, so recover it from
+    there and put it back next to the label the user actually sees.
+    """
+    links = _extract_teams_html_links(html_body)
+    if not links:
+        return text
+
+    merged = text
+    appended = []
+    for label, url in links:
+        if url in merged:
+            continue
+        if label and label in merged:
+            merged = merged.replace(label, f"{label} ({url})", 1)
+        else:
+            appended.append(f"{label} ({url})" if label else url)
+
+    if appended:
+        joined = "\n".join(appended)
+        merged = f"{merged}\n{joined}" if merged.strip() else joined
+    return merged
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -888,6 +948,9 @@ class TeamsAdapter(BasePlatformAdapter):
         media_urls = []
         media_types = []
         media_kinds = []
+        # The mirrored ``text/html`` body, kept so hyperlink targets that
+        # ``activity.text`` drops can be merged back in after this loop.
+        html_body_mirror = ""
         for att in getattr(activity, "attachments", None) or []:
             content_url = getattr(att, "content_url", None)
             content_type = (getattr(att, "content_type", None) or "").lower()
@@ -897,6 +960,10 @@ class TeamsAdapter(BasePlatformAdapter):
             # text/html attachment on every message, and adaptive/hero cards
             # arrive as application/vnd.microsoft.card.* attachments.
             if content_type in ("text/html", "text/plain") and not content_url:
+                if content_type == "text/html" and not html_body_mirror:
+                    raw_html = getattr(att, "content", None)
+                    if isinstance(raw_html, str):
+                        html_body_mirror = raw_html
                 continue
             if content_type.startswith("application/vnd.microsoft.card"):
                 continue
@@ -955,6 +1022,19 @@ class TeamsAdapter(BasePlatformAdapter):
                         "[teams] Failed to cache attachment '%s' (%s): %s",
                         att_name or content_url, content_type, e,
                     )
+
+        # Put hyperlink targets back into the text. Skipped for slash commands
+        # so a command's arguments are never rewritten.
+        if html_body_mirror and not text.lstrip().startswith("/"):
+            merged_text = _merge_teams_link_urls(text, html_body_mirror)
+            if merged_text != text:
+                logger.debug(
+                    "[teams] recovered hyperlink target(s) from the HTML body "
+                    "(text %d -> %d chars)",
+                    len(text),
+                    len(merged_text),
+                )
+                text = merged_text
 
         # Classification: DOCUMENT wins over PHOTO/VIDEO/AUDIO for mixed
         # attachments — run.py's image handling keys off the per-path image/*

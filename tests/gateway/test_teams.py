@@ -1125,3 +1125,139 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", "/no/such/file.pdf")
         assert not result.success
         adapter._app.send.assert_not_awaited()
+
+
+class TestTeamsHyperlinkRecovery:
+    """Teams flattens ``<a href>`` down to its label in ``activity.text``.
+
+    A link pasted into the composer keeps its URL only in the mirrored
+    ``text/html`` body, so without recovery the agent reads a message that
+    visibly contains a link but carries no URL, and asks the user to paste
+    the URL they just pasted.
+    """
+
+    # The shape Teams actually produces for a pasted link that resolves to a
+    # page title: the visible label is the title, the URL lives in the href.
+    PASTED_LINK_HTML = (
+        '<p><at id="0">Hermes</at>&nbsp;'
+        '<a href="https://example.com/start-program" '
+        'itemtype="http://schema.skype.com/HyperLink" rel="noreferrer noopener" '
+        'title="https://example.com/start-program" target="_blank" '
+        'itemid="ab79dfae-3fb9-433e-9f4f-0ef05249a163">'
+        "4ヶ月完全スタートプログラム丨example studio</a>"
+        " 読める？？</p>"
+    )
+    PASTED_LINK_TEXT = "4ヶ月完全スタートプログラム丨example studio 読める？？"
+
+    def test_url_lands_next_to_its_label(self):
+        merged = _teams_mod._merge_teams_link_urls(
+            self.PASTED_LINK_TEXT, self.PASTED_LINK_HTML
+        )
+        assert merged == (
+            "4ヶ月完全スタートプログラム丨example studio "
+            "(https://example.com/start-program) 読める？？"
+        )
+
+    def test_mention_tag_is_not_read_as_a_link(self):
+        links = _teams_mod._extract_teams_html_links(self.PASTED_LINK_HTML)
+        assert links == [
+            ("4ヶ月完全スタートプログラム丨example studio", "https://example.com/start-program")
+        ]
+
+    def test_bare_url_is_not_duplicated(self):
+        text = "have a look https://example.com/a"
+        html_body = (
+            '<p>have a look <a href="https://example.com/a">https://example.com/a</a></p>'
+        )
+        assert _teams_mod._merge_teams_link_urls(text, html_body) == text
+
+    def test_label_absent_from_text_is_appended(self):
+        # Teams drops the label from activity.text for some rich shapes; the
+        # URL still has to reach the agent.
+        text = "have a look"
+        html_body = '<p>have a look<a href="https://example.com/b">the report</a></p>'
+        assert (
+            _teams_mod._merge_teams_link_urls(text, html_body)
+            == "have a look\nthe report (https://example.com/b)"
+        )
+
+    def test_html_entities_in_href_are_decoded(self):
+        text = "the thread"
+        html_body = '<a href="https://example.com/x?a=1&amp;b=2">the thread</a>'
+        assert (
+            _teams_mod._merge_teams_link_urls(text, html_body)
+            == "the thread (https://example.com/x?a=1&b=2)"
+        )
+
+    def test_data_href_attribute_is_not_mistaken_for_a_link(self):
+        text = "click"
+        html_body = '<a data-href="https://example.com/no">click</a>'
+        assert _teams_mod._merge_teams_link_urls(text, html_body) == text
+
+    def test_non_http_schemes_are_ignored(self):
+        text = "contact"
+        html_body = '<a href="mailto:someone@example.com">contact</a>'
+        assert _teams_mod._merge_teams_link_urls(text, html_body) == text
+
+    def test_body_without_anchors_is_left_alone(self):
+        text = "just text"
+        assert _teams_mod._merge_teams_link_urls(text, "<p>just text</p>") == text
+
+    def _make_adapter(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+        return adapter
+
+    def _make_ctx(self, text, html_body):
+        html_att = MagicMock()
+        html_att.content_type = "text/html"
+        html_att.content_url = None
+        html_att.name = ""
+        html_att.content = html_body
+
+        activity = MagicMock()
+        activity.text = text
+        activity.id = "activity-link-001"
+        activity.from_ = MagicMock()
+        activity.from_.id = "user-123"
+        activity.from_.aad_object_id = "aad-456"
+        activity.from_.name = "Test User"
+        activity.conversation = MagicMock()
+        activity.conversation.id = "19:abc@thread.tacv2"
+        activity.conversation.conversation_type = "channel"
+        activity.conversation.name = "Test Channel"
+        activity.conversation.tenant_id = "tenant-789"
+        activity.attachments = [html_att]
+
+        ctx = MagicMock()
+        ctx.activity = activity
+        return ctx
+
+    @pytest.mark.anyio
+    async def test_on_message_recovers_the_url_end_to_end(self):
+        adapter = self._make_adapter()
+        ctx = self._make_ctx(
+            f"<at>Hermes</at> {self.PASTED_LINK_TEXT}", self.PASTED_LINK_HTML
+        )
+
+        await adapter._on_message(ctx)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert "https://example.com/start-program" in event.text
+
+    @pytest.mark.anyio
+    async def test_slash_command_arguments_are_not_rewritten(self):
+        adapter = self._make_adapter()
+        ctx = self._make_ctx(
+            "/model opus",
+            '<p>/model <a href="https://example.com/m">opus</a></p>',
+        )
+
+        await adapter._on_message(ctx)
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text == "/model opus"
