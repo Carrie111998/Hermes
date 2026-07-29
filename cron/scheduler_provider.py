@@ -20,8 +20,16 @@ selected via the `cron.provider` config key (empty = built-in).
 from __future__ import annotations
 
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Any
+
+
+def _seconds_until_next_tick(interval: float) -> float:
+    """Return the delay to the next wall-clock interval boundary."""
+    if interval <= 0:
+        return 0
+    return interval - (time.time() % interval)
 
 
 class CronScheduler(ABC):
@@ -258,7 +266,7 @@ class InProcessCronScheduler(CronScheduler):
             record_ticker_heartbeat(success=ok)
             if ok:
                 clear_ticker_error()
-            stop_event.wait(interval)
+            stop_event.wait(_seconds_until_next_tick(interval))
 
     def _start_multiplex(
         self,
@@ -354,4 +362,4 @@ class InProcessCronScheduler(CronScheduler):
                             record_ticker_error(_tick_error)
                 finally:
                     reset_hermes_home_override(home_token)
-            stop_event.wait(interval)
+            stop_event.wait(_seconds_until_next_tick(interval))
