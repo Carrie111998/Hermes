@@ -3045,111 +3045,69 @@ def test_host_boundary_embeds_exact_connector_unit_and_gateway_drop_in(
 def test_deploy_packages_and_verifies_before_release_activation():
     source = (ROOT / "ops/muncho/runtime/muncho-auto-deploy-release").read_text()
     run_deploy = source[source.index("run_deploy() {") : source.index("main() {")]
-    marker = run_deploy.index('create_release_build_marker "$new" "$sha"')
-    clone = run_deploy.index(
-        'clone --depth 1 --branch main "$REPO_URL" "$new"',
-        marker,
+    copy_venv = run_deploy.index('cp -a "$active/.venv" "$tmp/.venv"')
+    install_wheel = run_deploy.index(
+        'install_target_release_wheel "$tmp" "$active"'
     )
-    source_marker = run_deploy.index(
-        'create_source_commit_marker "$new" "$sha"',
-        clone,
+    build = run_deploy.index("package_production_cutover_artifacts.py\" build")
+    verify = run_deploy.index("package_production_cutover_artifacts.py\" verify")
+    publish = run_deploy.index('mv "$tmp" "$new"')
+    release_identity = run_deploy.index(
+        'release_identity_matches "$new" "$sha"'
     )
+    attest_venv = run_deploy.index(
+        'attest_target_release_venv "$new" "$new"'
+    )
+    cutover_attest = run_deploy.index('cutover_artifacts_match "$new" "$sha"')
+    activate = run_deploy.index('ln -sfn "$new" "$ACTIVE_LINK.next"')
     bootstrap = run_deploy.index(
-        'bootstrap_cutover_unit_inputs_from_target "$new" "$sha"',
-        source_marker,
+        'bootstrap_cutover_unit_inputs_from_target "$tmp" "$sha"'
     )
     require_inputs = run_deploy.index(
         'require_cutover_unit_inputs "$sha" "$pr"',
         bootstrap,
     )
-    build_venv = run_deploy.index(
-        'build_target_release_venv "$new" "$sha"',
-        require_inputs,
-    )
     dependency_prepare = run_deploy.index(
-        'package_production_runtime_dependencies.py" prepare',
-        build_venv,
+        'package_production_runtime_dependencies.py" prepare'
     )
     config_seal = run_deploy.index(
-        'seal_agent_browser_config "$new" "$sha"',
-        dependency_prepare,
-    )
-    dependency_manifest_command = run_deploy.index(
-        'package_production_runtime_dependencies.py"',
-        config_seal,
+        'seal_agent_browser_config "$tmp" "$sha"'
     )
     dependency_manifest = run_deploy.index(
-        "build-manifest",
-        dependency_manifest_command,
+        'package_production_runtime_dependencies.py" build-manifest'
     )
-    build = run_deploy.index(
-        'package_production_cutover_artifacts.py" build',
-        dependency_manifest,
-    )
-    dependency_verify = run_deploy.index(
-        'package_production_runtime_dependencies.py" verify',
-        build,
-    )
-    verify = run_deploy.index(
-        'package_production_cutover_artifacts.py" verify',
-        dependency_verify,
-    )
-    complete = run_deploy.index(
-        'complete_release_build "$new" "$sha"',
-        verify,
-    )
-    release_identity = run_deploy.index(
-        'release_identity_matches "$new" "$sha"',
-        complete,
-    )
-    attest_venv = run_deploy.index(
-        'attest_target_release_venv "$new" "$new"',
-        release_identity,
-    )
-    cutover_attest = run_deploy.index('cutover_artifacts_match "$new" "$sha"')
-    activate = run_deploy.index('ln -sfn "$new" "$ACTIVE_LINK.next"')
 
     assert (
-        marker
-        < clone
-        < source_marker
+        copy_venv
         < bootstrap
         < require_inputs
-        < build_venv
+        < install_wheel
         < dependency_prepare
         < config_seal
-        < dependency_manifest_command
         < dependency_manifest
         < build
-        < dependency_verify
         < verify
-        < complete
+        < publish
         < release_identity
         < attest_venv
         < cutover_attest
         < activate
     )
-    assert 'cp -a "$active/.venv"' not in run_deploy
-    assert '"$tmp"' not in run_deploy
-    assert 'mv "$tmp" "$new"' not in run_deploy
     assert run_deploy.count('--unit-inputs "$CUTOVER_UNIT_INPUTS_PATH"') >= 2
     assert 'cutover_artifacts_match "$new" "$sha"' in run_deploy
     assert 'blocked_target_cutover_artifacts_invalid' in run_deploy
-    builder = source[
-        source.index("build_target_release_venv() {") : source.index(
-            "attest_target_release_venv() {"
+    install = source[
+        source.index("install_target_release_wheel() {") : source.index(
+            "release_identity_matches() {"
         )
     ]
     for flag in (
-        "--frozen",
-        "--no-editable",
-        "--no-install-project",
-        "--extra all",
-        "--extra messaging",
-        "--extra voice",
-        "--extra edge-tts",
+        "--isolated install",
         "--no-index",
         "--no-deps",
-        "--no-build",
+        "--no-build-isolation",
+        "--no-cache-dir",
+        "--force-reinstall",
     ):
-        assert flag in builder
+        assert flag in install
+    assert '"$release" >/dev/null' in install
