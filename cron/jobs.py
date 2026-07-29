@@ -758,11 +758,12 @@ def _compute_grace_seconds(schedule: dict) -> int:
 def _log_missed_job(job: dict, scheduled_at: str, grace: int, new_next: str) -> None:
     """Append a missed-job event to the audit log for trend analysis.
 
-    Writes one JSON line to ``missed_jobs.jsonl`` in the cron directory.
+    Writes one JSON line to ``missed_jobs.jsonl`` in the active store's
+    cron directory (resolved via ``_current_cron_store()``).
     Used by the daily health report to surface patterns of scheduler gaps.
     """
     try:
-        log_dir = CRON_DIR
+        log_dir = _current_cron_store().cron_dir
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "missed_jobs.jsonl"
 
