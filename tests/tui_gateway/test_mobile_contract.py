@@ -359,6 +359,26 @@ def test_mobile_write_without_control_queues_a_busy_prompt_without_interrupting(
     assert session["queued_prompt"]["transport"] is transport
 
 
+def test_mobile_write_without_control_rechecks_busy_state_before_queueing():
+    session = {
+        "history_lock": threading.Lock(),
+        "queued_prompt": None,
+        "running": False,
+    }
+
+    response = server._handle_busy_submit(
+        "busy-write-race",
+        "busy",
+        session,
+        "next",
+        RecordingTransport(),
+        allow_control=False,
+    )
+
+    assert response is None
+    assert session["queued_prompt"] is None
+
+
 def test_mobile_scope_grants_require_read_access():
     with pytest.raises(
         ValueError,
