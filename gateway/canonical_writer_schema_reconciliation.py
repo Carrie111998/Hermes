@@ -1903,8 +1903,12 @@ def collect_schema_contract(
             "routine.oid, 'EXECUTE') FROM pg_catalog.pg_proc AS routine "
             "JOIN pg_catalog.pg_language AS language ON language.oid = "
             "routine.prolang JOIN pg_catalog.pg_roles AS owner ON owner.oid = "
-            "routine.proowner WHERE routine.oid = pg_catalog.to_regprocedure("
-            "'canonical_brain._discord_guild_routeback_target_valid(jsonb)')",
+            "routine.proowner JOIN pg_catalog.pg_namespace AS namespace ON "
+            "namespace.oid = routine.pronamespace WHERE namespace.nspname = "
+            "'canonical_brain' AND routine.proname = "
+            "'_discord_guild_routeback_target_valid' AND routine.prokind = 'f' "
+            "AND routine.pronargs = 1 AND pg_catalog.oidvectortypes("
+            "routine.proargtypes) = 'jsonb'",
             maximum_rows=1,
         )
         if not helper_result.rows and allow_missing_helper:
