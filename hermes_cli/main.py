@@ -333,6 +333,11 @@ def _wants_tui_early(argv: "list[str] | None" = None) -> bool:
 def _suppress_mouse_residue_early() -> None:
     if os.environ.get("HERMES_TUI_NO_EARLY_DISABLE") == "1":
         return
+    # ``health --json`` promises a clean machine-readable stdout stream. This
+    # helper runs before normal parser setup, so exclude health with the same
+    # dependency-light argv grammar used by the other early startup gates.
+    if _early_recovery_mod.early_cli_subcommand(sys.argv[1:]) == "health":
+        return
     if not _wants_tui_early():
         return
     try:

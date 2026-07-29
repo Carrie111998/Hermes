@@ -616,6 +616,20 @@ def test_health_main_skips_mutating_startup_maintenance(monkeypatch):
     main_mod.main()
 
 
+def test_health_json_skips_early_tui_mouse_output(monkeypatch):
+    import hermes_cli.main as main_mod
+
+    writes = []
+    monkeypatch.setattr(sys, "argv", ["hermes", "--tui", "health", "--json"])
+    monkeypatch.setenv("HERMES_TUI", "1")
+    monkeypatch.setattr(main_mod.os, "isatty", lambda _fd: True)
+    monkeypatch.setattr(main_mod.os, "write", lambda fd, data: writes.append((fd, data)))
+
+    main_mod._suppress_mouse_residue_early()
+
+    assert writes == []
+
+
 def test_cron_reader_accepts_utf8_bom_without_mutation(tmp_path):
     home = tmp_path / "profile"
     jobs_path = home / "cron" / "jobs.json"
