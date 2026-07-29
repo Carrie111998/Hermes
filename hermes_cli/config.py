@@ -3383,12 +3383,17 @@ DEFAULT_CONFIG = {
         # no consumer outside their own overwrite guard and accumulated
         # GBs of disk on heavy users.  Opt in only if you have an external
         # tool that consumes the JSON files directly.
-        # Note: one snapshot per session_id, not per conversation — context
-        # compression starts a new session_id, so a long conversation shows
-        # up as several separate (and individually shorter-looking) JSON
-        # files rather than one continuous transcript (issue #2229). The
-        # JSONL/state.db transcript spans every split and is the source of
-        # truth for full-conversation tooling.
+        # Note: one snapshot per physical session_id, not per logical
+        # conversation. Default in-place compression (compression.in_place:
+        # true) keeps the same session_id, so the snapshot keeps growing
+        # under one file; only rotation mode (in_place: false) or /branch
+        # forks a new session_id (and /branch copies existing history into
+        # it, so that new file isn't "empty, then new messages only"). The
+        # legacy JSONL fallback was removed in spec 002 -- state.db is
+        # canonical, but a full cross-split conversation view needs the
+        # lineage-aware SessionDB readers (get_compression_lineage /
+        # export_session_lineage), not this snapshot or a single-session_id
+        # DB read (issue #2229).
         "write_json_snapshots": False,
         # Search-index (FTS) storage optimization — the compact v23 layout
         # that drops duplicate content copies and stops trigram-indexing tool
