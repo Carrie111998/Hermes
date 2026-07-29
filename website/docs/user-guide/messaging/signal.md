@@ -219,9 +219,9 @@ Just send a message to yourself from your phone — signal-cli picks it up and H
 
 ### Health Monitoring
 
-The adapter monitors the WebSocket connection and automatically reconnects if:
-- The connection drops (with exponential backoff: 2s → 60s)
-- No activity is detected for 120 seconds (pings signal-cli to verify)
+Transport recovery is handled by the WebSocket protocol itself: the adapter sends a WS ping every 30 seconds, and a missed pong tears down the connection and triggers a reconnect (with exponential backoff: 2s → 60s).
+
+Separately, a liveness monitor observes the receive path every 30 seconds and logs when no application-level activity has been seen for 300 seconds. Application idleness alone does **not** trigger a reconnect — a quiet chat is legitimately silent, and the heartbeat already detects a dead transport. The monitor also tracks the timestamp of the last dispatched inbound message (exposed as `last_inbound_message_at` in `gateway_state.json`) so external watchdogs can detect a daemon that is connected but silently not delivering.
 
 ---
 
