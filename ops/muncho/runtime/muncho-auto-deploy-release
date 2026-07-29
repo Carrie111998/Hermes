@@ -9,6 +9,7 @@ SERVICE="hermes-cloud-gateway.service"
 GATEWAY_FRAGMENT="/etc/systemd/system/hermes-cloud-gateway.service"
 GATEWAY_CONNECTOR_DROP_IN="/etc/systemd/system/hermes-cloud-gateway.service.d/20-discord-connector.conf"
 GATEWAY_CANONICAL_GCLOUD_DROP_IN="/etc/systemd/system/hermes-cloud-gateway.service.d/20-canonical-gcloud-config.conf"
+GATEWAY_SHUTDOWN_TIMING_DROP_IN="/etc/systemd/system/hermes-cloud-gateway.service.d/30-shutdown-timing.conf"
 CUTOVER_PLAN_PATH="/var/lib/muncho-production-legacy-cutover/staged/cutover-plan.json"
 CUTOVER_UNIT_INPUT_PLAN_PATH="/var/lib/muncho-production-legacy-cutover/staged/unit-input-plan.json"
 CUTOVER_UNIT_INPUT_APPROVAL_PATH="/var/lib/muncho-production-legacy-cutover/staged/unit-input-approval.json"
@@ -240,6 +241,7 @@ gateway_deploy_topology_json() {
     "$GATEWAY_FRAGMENT" \
     "$GATEWAY_CONNECTOR_DROP_IN" \
     "$GATEWAY_CANONICAL_GCLOUD_DROP_IN" \
+    "$GATEWAY_SHUTDOWN_TIMING_DROP_IN" \
     "$CUTOVER_PLAN_PATH" \
     "$ACTIVE_LINK" \
     "$RELEASES" \
@@ -271,17 +273,22 @@ CANONICAL_GCLOUD_DROP_IN_BYTES = (
     b"RuntimeDirectoryMode=0700\n"
     b"Environment=CLOUDSDK_CONFIG=/run/hermes-canonical-gcloud\n"
 )
+SHUTDOWN_TIMING_DROP_IN_BYTES = (
+    b"[Service]\n"
+    b"TimeoutStopSec=255s\n"
+)
 
 fragment = Path(sys.argv[1])
 drop_in = Path(sys.argv[2])
 canonical_gcloud_drop_in = Path(sys.argv[3])
-plan_path = Path(sys.argv[4])
-active_link = Path(sys.argv[5])
-releases = Path(sys.argv[6])
-service = sys.argv[7]
-trusted_uid = int(sys.argv[8])
-trusted_gid = int(sys.argv[9])
-systemd_raw = sys.argv[10]
+shutdown_timing_drop_in = Path(sys.argv[4])
+plan_path = Path(sys.argv[5])
+active_link = Path(sys.argv[6])
+releases = Path(sys.argv[7])
+service = sys.argv[8]
+trusted_uid = int(sys.argv[9])
+trusted_gid = int(sys.argv[10])
+systemd_raw = sys.argv[11]
 
 
 class GateError(RuntimeError):
@@ -468,20 +475,52 @@ try:
     except UnicodeError as exc:
         raise GateError("gateway_fragment_not_utf8") from exc
     lines = fragment_text.splitlines()
-    legacy_ancillary_sha256 = None
-    if systemd["drop_in_paths"] == [str(canonical_gcloud_drop_in)]:
-        canonical_gcloud_raw = read_exact(
-            canonical_gcloud_drop_in,
-            modes={0o644},
-            owners={trusted_uid},
-            groups={trusted_gid},
-            maximum=MAX_UNIT_BYTES,
-        )
-        if canonical_gcloud_raw != CANONICAL_GCLOUD_DROP_IN_BYTES:
-            raise GateError("legacy_ancillary_drop_in_drifted")
-        legacy_ancillary_sha256 = hashlib.sha256(
-            canonical_gcloud_raw
-        ).hexdigest()
+    loaded_drop_ins = systemd["drop_in_paths"]
+    trusted_legacy_drop_in_sets = {
+        (str(canonical_gcloud_drop_in),),
+        (
+            str(canonical_gcloud_drop_in),
+            str(shutdown_timing_drop_in),
+        ),
+    }
+    legacy_ancillary_identity = {}
+    if tuple(loaded_drop_ins) in trusted_legacy_drop_in_sets:
+        expected_drop_ins = {
+            str(canonical_gcloud_drop_in): (
+                canonical_gcloud_drop_in,
+                CANONICAL_GCLOUD_DROP_IN_BYTES,
+                "canonical_gcloud",
+            ),
+            str(shutdown_timing_drop_in): (
+                shutdown_timing_drop_in,
+                SHUTDOWN_TIMING_DROP_IN_BYTES,
+                "shutdown_timing",
+            ),
+        }
+        for loaded_path in loaded_drop_ins:
+            ancillary_path, expected_raw, identity_prefix = expected_drop_ins[
+                loaded_path
+            ]
+            ancillary_raw = read_exact(
+                ancillary_path,
+                modes={0o644},
+                owners={trusted_uid},
+                groups={trusted_gid},
+                maximum=MAX_UNIT_BYTES,
+            )
+            if ancillary_raw != expected_raw:
+                raise GateError("legacy_ancillary_drop_in_drifted")
+            legacy_ancillary_identity.update(
+                {
+                    f"{identity_prefix}_drop_in_path": str(ancillary_path),
+                    f"{identity_prefix}_drop_in_sha256": hashlib.sha256(
+                        ancillary_raw
+                    ).hexdigest(),
+                }
+            )
+    trusted_legacy_drop_ins = (
+        not loaded_drop_ins or bool(legacy_ancillary_identity)
+    )
     pinned_signal = (
         os.path.lexists(plan_path)
         or PINNED_HEADER in lines
@@ -489,8 +528,8 @@ try:
         or STARTUP_FLAG in fragment_text
         or str(releases) + "/hermes-agent-" in fragment_text
         or (
-            bool(systemd["drop_in_paths"])
-            and legacy_ancillary_sha256 is None
+            bool(loaded_drop_ins)
+            and not trusted_legacy_drop_ins
         )
     )
     if not pinned_signal:
@@ -511,17 +550,7 @@ try:
         legacy_identity = {
             "fragment_sha256": hashlib.sha256(fragment_raw).hexdigest(),
         }
-        if legacy_ancillary_sha256 is not None:
-            legacy_identity.update(
-                {
-                    "canonical_gcloud_drop_in_path": str(
-                        canonical_gcloud_drop_in
-                    ),
-                    "canonical_gcloud_drop_in_sha256": (
-                        legacy_ancillary_sha256
-                    ),
-                }
-            )
+        legacy_identity.update(legacy_ancillary_identity)
         emit(
             "legacy",
             "trusted_legacy_symlink_topology",
