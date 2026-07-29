@@ -1052,6 +1052,74 @@ async def test_runtime_checkpoint_filters_local_activity_sibling_call():
 
 
 @pytest.mark.asyncio
+async def test_runtime_checkpoint_redacts_private_skill_reasoning_without_blocking_safe_tool():
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_private_reasoning_checkpoint",
+        asyncio.get_running_loop(),
+        queue,
+        [{
+            "name": "media.model_catalog",
+            "input_schema": {"type": "object"},
+            "allowed_skills": ["product-photoshoot"],
+        }],
+        10_000,
+        "agent_private_reasoning_checkpoint",
+    )
+    private_body = (
+        "Inspect every supplied reference before composing the shot. Preserve "
+        "exact packaging geometry, material finish, label hierarchy, and brand "
+        "colors. Verify every output against the private acceptance checklist."
+    )
+    session.record_loaded_skill(
+        {"name": "product-photoshoot"},
+        {"success": True, "content": private_body},
+    )
+    safe_args = {
+        "action": "recommend",
+        "query": "lifestyle product photography from a reference image",
+        "media_type": "image",
+    }
+    session.agent_ref[0] = SimpleNamespace(
+        _runtime_checkpoint_message={
+            "role": "assistant",
+            "content": None,
+            "reasoning": f"Apply the loaded workflow: {private_body}",
+            "reasoning_content": f"Apply the loaded workflow: {private_body}",
+            "tool_calls": [{
+                "id": "call_catalog",
+                "function": {
+                    "name": "media.model_catalog",
+                    "arguments": json.dumps(safe_args),
+                },
+            }],
+        },
+    )
+
+    call = asyncio.create_task(asyncio.to_thread(
+        session.invoke_platform_tool,
+        "media.model_catalog",
+        safe_args,
+        "call_catalog",
+    ))
+    checkpoint = await queue.get()
+    assert checkpoint["type"] == "checkpoint"
+    checkpoint_message = checkpoint["payload"]["message"]
+    assert "reasoning" not in checkpoint_message
+    assert checkpoint_message["reasoning_content"] == " "
+    assert private_body not in json.dumps(checkpoint, ensure_ascii=False)
+    request = await queue.get()
+    assert request["type"] == "tool_request"
+    assert request["payload"]["arguments"] == safe_args
+    assert session.submit_result({
+        "call_id": "call_catalog",
+        "ok": True,
+        "result": {"models": []},
+    })
+    assert json.loads(await call) == {"models": []}
+
+
+@pytest.mark.asyncio
 async def test_runtime_bridge_preserves_safe_failed_result_with_typed_error():
     queue = asyncio.Queue()
     session = RuntimeBridgeSession(

@@ -842,6 +842,15 @@ class RuntimeBridgeSession:
         # platform call belongs in the restart checkpoint: local activity is
         # already complete and is not a resumable side effect.
         candidate = {**candidate, "tool_calls": active_calls}
+        # Checkpoints cross the Runtime boundary and are persisted by the
+        # Orchestrator. Plaintext model reasoning is not part of the resumable
+        # tool-call contract and may contain private Skill instructions that
+        # were legitimately used to form safe tool arguments. Keep only the
+        # empty reasoning_content sentinel expected by thinking-mode replay;
+        # agent_runtime_helpers will retain or strip it for the active provider.
+        candidate.pop("reasoning", None)
+        if "reasoning_content" in candidate:
+            candidate["reasoning_content"] = " "
         checkpoint = _resume_runtime_history(
             [],
             {"message": candidate},
