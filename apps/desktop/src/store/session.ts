@@ -169,7 +169,6 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
 export const sessionPinId = (session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string =>
   session._lineage_root_id ?? session.id
 
-<<<<<<< HEAD
 /** True when a stored/lineage id resolves to this session — it matches either
  *  the live id or the stable lineage root (see sessionPinId). The one place the
  *  "same conversation across compression" test lives. */
@@ -197,7 +196,8 @@ export function resolveComposerSessionKey(
   const row = sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))
 
   return row ? sessionPinId(row) : selectedSessionId
-=======
+}
+
 export const sessionAliasIds = (session: Pick<SessionInfo, '_lineage_ids' | '_lineage_root_id' | 'id'>): string[] => {
   const aliases = [session.id, session._lineage_root_id, ...(session._lineage_ids ?? [])].filter(
     (id): id is string => typeof id === 'string' && id.length > 0
@@ -235,7 +235,6 @@ function dedupeSessionsByAlias(sessions: SessionInfo[]): SessionInfo[] {
   }
 
   return deduped.length === sessions.length ? sessions : deduped
->>>>>>> 6c95fe27d (Refresh on upstream/main: resolve conflicts (no behavior change))
 }
 
 /** Merge a fresh server session page into the in-memory list, keeping any
