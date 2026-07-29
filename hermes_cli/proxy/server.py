@@ -135,8 +135,12 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         # Adapters that don't implement map_path() / transform_request_body()
         # will fall back to a lambda no-op. This keeps Nous + other
         # adapters working without modification.
+        # transform_request_body must accept (path, body) — same arity as the
+        # real adapter hook — otherwise adapters without the method TypeError.
         rel_path = getattr(adapter, "map_path", lambda p: p)(rel_path)
-        body = getattr(adapter, "transform_request_body", lambda b: b)(rel_path, body)
+        body = getattr(adapter, "transform_request_body", lambda _path, b: b)(
+            rel_path, body
+        )
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
