@@ -161,6 +161,9 @@ Notes:
   (color mode, tool-call display, usage period). Replaces radio piles and
   pill rows.
 - **`Switch`** (`size="xs"`) — bare, with `aria-label`. No bordered text wrapper.
+- **`Checkbox`** — unchecked, checked, and indeterminate states use the shared
+  primitive. Glyph visibility follows the primitive's own indicator state, not
+  ancestor group state.
 
 ## Layout
 
