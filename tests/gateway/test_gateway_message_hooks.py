@@ -191,6 +191,14 @@ def test_route_snapshot_fills_resolved_active_profile_when_source_is_unset(monke
         ),
         (
             SendResult(success=False, error="rejected with credential-shaped detail"),
+            GatewayDeliveryReceipt(status="unknown"),
+        ),
+        (
+            SendResult(
+                success=False,
+                error="rejected before native submit",
+                native_delivery_non_occurrence_attested=True,
+            ),
             GatewayDeliveryReceipt(status="failed"),
         ),
         (
@@ -226,6 +234,56 @@ async def test_route_delivery_returns_truthful_normalized_receipts(native_result
     assert not hasattr(delivery, "credentials")
     assert not hasattr(delivery, "event")
     assert not hasattr(delivery, "_send_callback")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "native_result",
+    [
+        SendResult(success=False, error="request timed out after submit"),
+        SendResult(
+            success=True,
+            message_id="chunk-1",
+            raw_response={
+                "partial_overflow": True,
+                "delivered_chunks": 1,
+                "total_chunks": 2,
+            },
+            native_delivery_ack=NativeDeliveryAck(
+                platform="discord",
+                room_id="room-1",
+                self_actor_id="bot-9",
+                effect_kind="send",
+                submitted_content="host delivery",
+                message_id="chunk-1",
+                effect_id="chunk-1",
+            ),
+        ),
+    ],
+)
+async def test_route_delivery_normalizes_timeout_and_partial_send_to_unknown(
+    native_result,
+):
+    async def send_native(_content: str):
+        return native_result
+
+    receipt = await GatewayDelivery(
+        send_native,
+        platform="discord",
+        room_id="room-1",
+        profile="work",
+        self_actor_id="bot-9",
+        source_message_id="source-1",
+    ).send("host delivery")
+
+    assert receipt == GatewayDeliveryReceipt(status="unknown")
+
+
+def test_send_result_fifth_positional_argument_remains_retryable():
+    result = SendResult(False, None, "retry", None, True)
+
+    assert result.retryable is True
+    assert result.native_delivery_ack is None
 
 
 @pytest.mark.asyncio
@@ -445,8 +503,7 @@ async def test_terminal_hook_handling_suppresses_cold_agent_dispatch(
     async def hook(name, **kwargs):
         captured["name"] = name
         captured["kwargs"] = kwargs
-        receipt = await kwargs["delivery"].send("plugin reply")
-        assert receipt == GatewayDeliveryReceipt(status="sent", message_id="out-1")
+        captured["receipt"] = await kwargs["delivery"].send("plugin reply")
         return [{"decision": decision}]
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
@@ -470,9 +527,36 @@ async def test_terminal_hook_handling_suppresses_cold_agent_dispatch(
     assert captured["kwargs"]["stop_when"]({"decision": "pass"}) is False
     assert not isinstance(captured["kwargs"]["event"], MessageEvent)
     assert captured["kwargs"]["route"].session_key == build_session_key(_source())
+    assert captured["receipt"].status == "sent"
+    assert captured["receipt"].message_id == "out-1"
     adapter.send.assert_awaited_once_with(
         "channel-1", "plugin reply", metadata={"thread_id": "thread-1"}
     )
+
+
+@pytest.mark.asyncio
+async def test_delivery_ttl_starts_after_participant_hook_finishes(monkeypatch):
+    import gateway.message_hooks as message_hooks
+
+    runner, _adapter = _runner_for_dispatch()
+    receipts = []
+
+    async def hook(_name, **kwargs):
+        await asyncio.sleep(0.03)
+        receipts.append(await kwargs["delivery"].send("still live"))
+        return [{"decision": "handled"}]
+
+    monkeypatch.setattr(
+        message_hooks,
+        "GATEWAY_DELIVERY_CAPABILITY_TTL_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+
+    await runner._handle_message(_event())
+
+    assert receipts[0].status == "sent"
 
 
 @pytest.mark.asyncio
@@ -801,6 +885,65 @@ async def test_discord_text_batch_invokes_hook_once_per_native_event(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_mixed_native_batch_dispatches_only_passed_subset_in_order(monkeypatch):
+    runner, _adapter = _runner_for_dispatch()
+    first = _event()
+    first.message_id = "m1"
+    first.text = "handled-first"
+    first.media_urls = ["/tmp/handled.png"]
+    first.media_types = ["image/png"]
+    first.metadata["handled_only"] = "must-not-dispatch"
+    second = _event()
+    second.message_id = "m2"
+    second.text = "pass-second"
+    second.source.user_id = "pass-user"
+    second.source.user_name = "Passed User"
+    second.media_urls = ["/tmp/pass-2.png"]
+    second.media_types = ["image/png"]
+    third = _event()
+    third.message_id = "m3"
+    third.text = "pass-third"
+    third.media_urls = ["/tmp/pass-3.png"]
+    third.media_types = ["image/png"]
+    merged = _event()
+    merged.text = "handled-first\npass-second\npass-third"
+    merged.media_urls = [
+        "/tmp/handled.png",
+        "/tmp/pass-2.png",
+        "/tmp/pass-3.png",
+    ]
+    merged.media_types = ["image/png", "image/png", "image/png"]
+    merged.metadata["handled_only"] = "must-not-dispatch"
+    merged.metadata["_gateway_native_events"] = (first, second, third)
+
+    async def hook(_name, **kwargs):
+        decision = (
+            "handled"
+            if kwargs["event"].message_id == "m1"
+            else "pass"
+        )
+        return [{"decision": decision}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook_async", hook, raising=False)
+
+    await runner._handle_message(merged)
+
+    runner._handle_message_with_agent.assert_awaited_once()
+    dispatched = runner._handle_message_with_agent.await_args.args[0]
+    dispatched_source = runner._handle_message_with_agent.await_args.args[1]
+    assert dispatched.text == "pass-second\npass-third"
+    assert dispatched.message_id == "m2"
+    assert dispatched_source is second.source
+    assert dispatched.media_urls == ["/tmp/pass-2.png", "/tmp/pass-3.png"]
+    assert "handled_only" not in dispatched.metadata
+    assert tuple(
+        item.message_id
+        for item in dispatched.metadata["_gateway_native_events"]
+    ) == ("m2", "m3")
+
+
+@pytest.mark.asyncio
 async def test_busy_legacy_predispatch_conflict_fails_closed_before_any_hook(monkeypatch):
     runner, _adapter = _runner_for_dispatch()
     event = _event()
@@ -1015,6 +1158,137 @@ async def test_telegram_strict_topic_effect_never_falls_back_to_root_chat():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "returned_message",
+    [
+        SimpleNamespace(
+            message_id=701,
+            chat=SimpleNamespace(id=-200),
+            message_thread_id=42,
+            text="participant effect",
+            from_user=SimpleNamespace(id=9),
+            reply_to_message=None,
+        ),
+        SimpleNamespace(
+            message_id=702,
+            chat=SimpleNamespace(id=-100),
+            message_thread_id=99,
+            text="participant effect",
+            from_user=SimpleNamespace(id=9),
+            reply_to_message=None,
+        ),
+        SimpleNamespace(
+            message_id=703,
+            chat=SimpleNamespace(id=-100),
+            message_thread_id=42,
+            text="different content",
+            from_user=SimpleNamespace(id=9),
+            reply_to_message=None,
+        ),
+        SimpleNamespace(message_id=704),
+    ],
+)
+async def test_telegram_native_ack_rejects_wrong_route_or_partial_message(
+    returned_message,
+):
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = object.__new__(TelegramAdapter)
+    config = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra={"rich_messages": False},
+    )
+    adapter.config = config
+    adapter._config = config
+    adapter._platform = Platform.TELEGRAM
+    adapter.platform = Platform.TELEGRAM
+    adapter._connected = True
+    adapter._dm_topics = {}
+    adapter._dm_topics_config = []
+    adapter._reply_to_mode = "first"
+    adapter._fallback_ips = []
+    adapter._polling_conflict_count = 0
+    adapter._polling_network_error_count = 0
+    adapter._polling_error_callback_ref = None
+    adapter._bot = SimpleNamespace(
+        id=9,
+        send_message=AsyncMock(return_value=returned_message),
+    )
+
+    result = await adapter.send(
+        chat_id="-100",
+        content="participant effect",
+        metadata={
+            "thread_id": "42",
+            "_hermes_require_topic_route": True,
+            "notify": True,
+        },
+    )
+
+    assert result.success is True
+    assert result.native_delivery_ack is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_native_ack_uses_returned_message_facts():
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    returned = SimpleNamespace(
+        message_id=705,
+        chat=SimpleNamespace(id=-100),
+        message_thread_id=42,
+        text="participant effect",
+        from_user=SimpleNamespace(id=9),
+        reply_to_message=SimpleNamespace(message_id=600),
+    )
+    adapter = object.__new__(TelegramAdapter)
+    config = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra={"rich_messages": False},
+    )
+    adapter.config = config
+    adapter._config = config
+    adapter._platform = Platform.TELEGRAM
+    adapter.platform = Platform.TELEGRAM
+    adapter._connected = True
+    adapter._dm_topics = {}
+    adapter._dm_topics_config = []
+    adapter._reply_to_mode = "first"
+    adapter._fallback_ips = []
+    adapter._polling_conflict_count = 0
+    adapter._polling_network_error_count = 0
+    adapter._polling_error_callback_ref = None
+    adapter._bot = SimpleNamespace(
+        id=9,
+        send_message=AsyncMock(return_value=returned),
+    )
+
+    result = await adapter.send(
+        chat_id="-100",
+        content="participant effect",
+        reply_to="600",
+        metadata={
+            "thread_id": "42",
+            "_hermes_require_topic_route": True,
+            "notify": True,
+        },
+    )
+
+    assert result.native_delivery_ack == NativeDeliveryAck(
+        platform="telegram",
+        room_id="-100:topic:42",
+        self_actor_id="9",
+        effect_kind="reply",
+        submitted_content="participant effect",
+        reply_to_message_id="600",
+        message_id="705",
+        effect_id="705",
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["send", "reply", "react"])
 async def test_telegram_topic_delivery_uses_canonical_room_identity(
     monkeypatch, operation
@@ -1071,10 +1345,10 @@ async def test_telegram_topic_delivery_uses_canonical_room_identity(
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._profile_adapters = {"work": {Platform.TELEGRAM: adapter}}
     receipts = []
+    routes = []
 
     async def hook(_name, **kwargs):
-        assert kwargs["route"].chat_id == "-100"
-        assert kwargs["route"].thread_id == "42"
+        routes.append(kwargs["route"])
         if operation == "send":
             receipts.append(await kwargs["delivery"].send("topic message"))
         elif operation == "reply":
@@ -1088,6 +1362,9 @@ async def test_telegram_topic_delivery_uses_canonical_room_identity(
 
     await runner._handle_message(event)
 
+    assert [(route.chat_id, route.thread_id) for route in routes] == [
+        ("-100", "42")
+    ]
     assert len(receipts) == 1
     receipt = receipts[0]
     assert receipt.status == "sent"
@@ -1391,10 +1668,10 @@ async def test_route_delivery_binds_relay_to_ingress_logical_platform(monkeypatc
     runner.adapters = {Platform.RELAY: relay}
     event = _event()
     event.source.delivered_via_upstream_relay = True
+    receipts = []
 
     async def hook(_name, **kwargs):
-        receipt = await kwargs["delivery"].send("relay reply")
-        assert receipt == GatewayDeliveryReceipt(status="sent", message_id="relay-out")
+        receipts.append(await kwargs["delivery"].send("relay reply"))
         return [{"decision": "handled"}]
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
@@ -1402,6 +1679,7 @@ async def test_route_delivery_binds_relay_to_ingress_logical_platform(monkeypatc
 
     await runner._handle_message(event)
 
+    assert receipts == [GatewayDeliveryReceipt(status="unknown")]
     relay.send_for_platform.assert_awaited_once_with(
         Platform.DISCORD,
         "channel-1",
@@ -1726,6 +2004,179 @@ async def test_gateway_session_cancel_timeout_survives_cancel_suppressing_async_
 
 
 @pytest.mark.asyncio
+async def test_gateway_session_cancel_timeout_requests_cancel_and_deduplicates_detached_work(
+    monkeypatch,
+):
+    from gateway import run as run_module
+    from hermes_cli.plugins import get_plugin_manager
+
+    runner, _adapter = _runner_for_dispatch()
+    manager = get_plugin_manager()
+    original = list(manager._hooks.get("gateway_session_cancel", []))
+    entered = asyncio.Event()
+    cancel_requested = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def cancellation_suppressing_observer(**_kwargs):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_requested.set()
+            await release.wait()
+
+    manager._hooks["gateway_session_cancel"] = [cancellation_suppressing_observer]
+    monkeypatch.setattr(run_module, "GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS", 0.01)
+    source = _source()
+    session_key = build_session_key(source)
+    try:
+        await runner._notify_gateway_session_cancel(
+            session_key,
+            source,
+            reason="stop",
+        )
+        await asyncio.wait_for(cancel_requested.wait(), timeout=0.1)
+        assert len(runner._gateway_cancel_observer_tasks) == 1
+
+        await runner._notify_gateway_session_cancel(
+            session_key,
+            source,
+            reason="reset",
+        )
+
+        assert calls == 1
+        assert len(runner._gateway_cancel_observer_tasks) == 1
+    finally:
+        release.set()
+        manager._hooks["gateway_session_cancel"] = original
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_inactivity_boundary_notifies_plugin_before_participant_state_is_destroyed():
+    runner, _adapter = _runner_for_dispatch()
+    source = _source()
+    session_key = build_session_key(source)
+    participant_state = {session_key: "live"}
+    observed = []
+
+    async def notify(key, routed_source, *, reason):
+        observed.append((key, routed_source, reason, participant_state.get(key)))
+        participant_state.pop(key, None)
+
+    runner._notify_gateway_session_cancel = notify
+
+    await runner._handle_gateway_inactivity_boundary(session_key, source)
+
+    assert observed == [
+        (session_key, source, "inactivity_timeout", "live")
+    ]
+    assert session_key not in participant_state
+
+
+@pytest.mark.asyncio
+async def test_stale_running_agent_eviction_notifies_before_host_state_release(
+    monkeypatch,
+):
+    runner, _adapter = _runner_for_dispatch()
+    source = _source()
+    session_key = build_session_key(source)
+    stale_agent = MagicMock()
+    stale_agent.get_activity_summary.return_value = {
+        "seconds_since_activity": 10,
+        "last_activity_desc": "stuck",
+        "api_call_count": 1,
+        "max_iterations": 10,
+    }
+    runner._running_agents[session_key] = stale_agent
+    runner._running_agents_ts[session_key] = 1
+    participant_state = {session_key: "live"}
+    observed = []
+    lifecycle_order = []
+
+    def release_host_state(key):
+        lifecycle_order.append("release")
+        runner._running_agents.pop(key, None)
+
+    runner._release_running_agent_state.side_effect = release_host_state
+
+    async def notify(key, routed_source, *, reason):
+        lifecycle_order.append("notify")
+        observed.append(
+            (
+                key,
+                routed_source,
+                reason,
+                runner._running_agents.get(key),
+                participant_state.get(key),
+            )
+        )
+        participant_state.pop(key, None)
+
+    runner._notify_gateway_session_cancel = notify
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "1")
+    monkeypatch.setattr("gateway.run.time.time", lambda: 10_000)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook_async",
+        AsyncMock(return_value=[{"decision": "handled"}]),
+    )
+
+    await runner._handle_message(_event())
+
+    assert observed == [
+        (
+            session_key,
+            source,
+            "stale_running_agent_eviction",
+            stale_agent,
+            "live",
+        )
+    ]
+    assert session_key not in participant_state
+    assert lifecycle_order[:2] == ["notify", "release"]
+    assert all(
+        call.args == (session_key,)
+        for call in runner._release_running_agent_state.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_ordinary_busy_interrupt_is_not_participant_session_cancel(monkeypatch):
+    runner, _adapter = _runner_for_dispatch()
+    source = _source()
+    session_key = build_session_key(source)
+    running_agent = MagicMock()
+    runner._running_agents[session_key] = running_agent
+    participant_state = {session_key: "live"}
+    runner._busy_input_mode = "interrupt"
+    runner._agent_has_active_subagents = lambda _agent: False
+    runner._session_has_compression_in_flight = AsyncMock(return_value=False)
+    runner._notify_gateway_session_cancel = AsyncMock()
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook_async",
+        AsyncMock(return_value=[{"decision": "pass"}]),
+    )
+
+    handled = await runner._handle_active_session_busy_message(
+        _event(),
+        session_key,
+    )
+
+    assert handled is True
+    running_agent.interrupt.assert_called_once()
+    runner._notify_gateway_session_cancel.assert_not_awaited()
+    assert session_key in runner._running_agents
+    assert participant_state[session_key] == "live"
+    queued_event = runner._queue_or_replace_pending_event.call_args.args[1]
+    assert queued_event.text == "hello"
+
+
+@pytest.mark.asyncio
 async def test_gateway_session_cancel_timeout_bounds_blocking_sync_observer(monkeypatch):
     from gateway import run as run_module
     from hermes_cli.plugins import get_plugin_manager
@@ -1750,6 +2201,44 @@ async def test_gateway_session_cancel_timeout_bounds_blocking_sync_observer(monk
         elapsed = asyncio.get_running_loop().time() - started
         assert entered.is_set()
         assert elapsed < 0.1
+        assert len(runner._gateway_cancel_observer_tasks) == 1
     finally:
         release.set()
+        manager._hooks["gateway_session_cancel"] = original
+        for _ in range(100):
+            if not runner._gateway_cancel_observer_tasks:
+                break
+            await asyncio.sleep(0.001)
+
+
+@pytest.mark.asyncio
+async def test_gateway_session_cancel_detached_observer_registry_is_bounded(
+    monkeypatch,
+):
+    from gateway import run as run_module
+    from hermes_cli.plugins import get_plugin_manager
+
+    runner, _adapter = _runner_for_dispatch()
+    manager = get_plugin_manager()
+    original = list(manager._hooks.get("gateway_session_cancel", []))
+    observer = AsyncMock()
+    manager._hooks["gateway_session_cancel"] = [observer]
+    monkeypatch.setattr(run_module, "GATEWAY_SESSION_CANCEL_DETACHED_LIMIT", 1)
+    blocker = asyncio.create_task(asyncio.Event().wait())
+    runner._gateway_cancel_observer_tasks = {"other-session": blocker}
+    source = _source()
+    try:
+        await runner._notify_gateway_session_cancel(
+            build_session_key(source),
+            source,
+            reason="stop",
+        )
+        observer.assert_not_awaited()
+        assert runner._gateway_cancel_observer_tasks == {
+            "other-session": blocker
+        }
+    finally:
+        blocker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await blocker
         manager._hooks["gateway_session_cancel"] = original

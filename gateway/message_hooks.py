@@ -14,6 +14,7 @@ from hermes_constants import GATEWAY_MESSAGE_HOOK_API_VERSION
 
 
 DeliveryStatus = Literal["sent", "failed", "unknown"]
+GATEWAY_DELIVERY_CAPABILITY_TTL_SECONDS = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,8 +250,11 @@ class _DeliveryRequest:
 @dataclass(slots=True)
 class _DeliveryChannel:
     queue: asyncio.Queue[_DeliveryRequest]
+    wake: asyncio.Event
+    participant_settled: asyncio.Event
     binding: _DeliveryBinding
     worker: Optional[asyncio.Task[None]] = None
+    terminal_callback: Optional[Callable[[Any], None]] = None
     revoked: bool = False
     consumed: bool = False
     invocation_started: bool = False
@@ -286,11 +290,15 @@ class GatewayDelivery:
         profile: str,
         self_actor_id: Optional[str],
         source_message_id: Optional[str],
+        on_terminal: Callable[[Any], None] | None = None,
+        hold_until_participant_settled: bool = False,
     ) -> None:
         if not callable(send_callback):
             raise TypeError("send_callback must be callable")
         channel = _DeliveryChannel(
             queue=asyncio.Queue(maxsize=1),
+            wake=asyncio.Event(),
+            participant_settled=asyncio.Event(),
             binding=_DeliveryBinding(
                 platform=str(platform),
                 room_id=str(room_id),
@@ -298,7 +306,10 @@ class GatewayDelivery:
                 self_actor_id=_optional_text(self_actor_id),
                 source_message_id=_optional_text(source_message_id),
             ),
+            terminal_callback=on_terminal,
         )
+        if not hold_until_participant_settled:
+            channel.participant_settled.set()
         _DELIVERY_CHANNELS[self] = channel
         worker = asyncio.create_task(
             _delivery_worker(
@@ -309,7 +320,11 @@ class GatewayDelivery:
             )
         )
         channel.worker = worker
-        worker.add_done_callback(_consume_delivery_worker_result)
+        worker.add_done_callback(
+            lambda task, delivery_ref=weakref.ref(self), worker_channel=channel: (
+                _finalize_delivery_worker(task, delivery_ref, worker_channel)
+            )
+        )
 
     async def send(self, content: str) -> GatewayDeliveryReceipt:
         """Send text to the bound source and normalize the native acknowledgement."""
@@ -350,9 +365,27 @@ class GatewayDelivery:
                     future=future,
                 )
             )
+            channel.wake.set()
         except asyncio.QueueFull:
             return GatewayDeliveryReceipt(status="failed")
         return await future
+
+    def _set_terminal_callback(
+        self,
+        callback: Callable[[Any], None],
+    ) -> None:
+        """Bind host cleanup after registration, including terminal races."""
+        channel = _DELIVERY_CHANNELS.get(self)
+        if channel is None:
+            callback(self)
+            return
+        channel.terminal_callback = callback
+
+    def _release_participant_hold(self) -> None:
+        """Start the unused-capability TTL after participant handling."""
+        channel = _DELIVERY_CHANNELS.get(self)
+        if channel is not None:
+            channel.participant_settled.set()
 
     def _revoke(self) -> None:
         """Begin invalidation synchronously; async boundaries must await settle."""
@@ -403,6 +436,7 @@ class GatewayDelivery:
                         future=future,
                     )
                 )
+                channel.wake.set()
             except (RuntimeError, asyncio.QueueFull):
                 pass
         return worker
@@ -469,16 +503,39 @@ async def _delivery_worker(
     reply_callback: Callable[[str], Awaitable[Any] | Any] | None,
     react_callback: Callable[[str, str], Awaitable[Any] | Any] | None,
 ) -> None:
-    request: _DeliveryRequest | None = None
-    while request is None:
+    if not channel.participant_settled.is_set():
+        wake_waiter = asyncio.create_task(channel.wake.wait())
+        settled_waiter = asyncio.create_task(channel.participant_settled.wait())
+        waiters = {wake_waiter, settled_waiter}
+        done: set[asyncio.Task[bool]] = set()
         try:
-            request = channel.queue.get_nowait()
-        except asyncio.QueueEmpty:
-            if channel.revoked:
-                return
-            # Polling deliberately leaves no queue waiter that can be traversed
-            # from the public capability into this host task's callback frame.
-            await asyncio.sleep(0.01)
+            done, _pending = await asyncio.wait(
+                waiters,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+        for waiter in done:
+            waiter.result()
+    try:
+        if not channel.wake.is_set():
+            await asyncio.wait_for(
+                channel.wake.wait(),
+                timeout=GATEWAY_DELIVERY_CAPABILITY_TTL_SECONDS,
+            )
+    except TimeoutError:
+        channel.revoked = True
+        channel.consumed = True
+        return
+    try:
+        request = channel.queue.get_nowait()
+    except asyncio.QueueEmpty:
+        channel.revoked = True
+        channel.consumed = True
+        return
     if channel.revoked:
         if not request.future.done():
             request.future.set_result(GatewayDeliveryReceipt(status="failed"))
@@ -491,12 +548,18 @@ async def _delivery_worker(
         channel.invocation_started = True
         if request.kind == "reply":
             if not callable(reply_callback):
-                native_result = SendResult(success=False)
+                native_result = SendResult(
+                    success=False,
+                    native_delivery_non_occurrence_attested=True,
+                )
             else:
                 native_result = reply_callback(request.content)
         elif request.kind == "react":
             if not callable(react_callback):
-                native_result = SendResult(success=False)
+                native_result = SendResult(
+                    success=False,
+                    native_delivery_non_occurrence_attested=True,
+                )
             else:
                 native_result = react_callback(request.content, request.operation)
         else:
@@ -539,9 +602,25 @@ def _normalize_delivery_receipt(
     if not isinstance(native_result, SendResult):
         return GatewayDeliveryReceipt(status="unknown")
     if native_result.success is False:
-        return GatewayDeliveryReceipt(status="failed")
+        return GatewayDeliveryReceipt(
+            status=(
+                "failed"
+                if native_result.native_delivery_non_occurrence_attested is True
+                else "unknown"
+            )
+        )
     if native_result.success is not True or binding.self_actor_id is None:
         return GatewayDeliveryReceipt(status="unknown")
+    raw_response = native_result.raw_response
+    if isinstance(raw_response, dict):
+        delivered_chunks = raw_response.get("delivered_chunks")
+        total_chunks = raw_response.get("total_chunks")
+        if raw_response.get("partial_overflow") is True or (
+            isinstance(delivered_chunks, int)
+            and isinstance(total_chunks, int)
+            and delivered_chunks < total_chunks
+        ):
+            return GatewayDeliveryReceipt(status="unknown")
     ack = native_result.native_delivery_ack
     if not isinstance(ack, NativeDeliveryAck):
         return GatewayDeliveryReceipt(status="unknown")
@@ -603,6 +682,28 @@ def _consume_delivery_worker_result(task: asyncio.Task[None]) -> None:
         task.exception()
     except Exception:
         pass
+
+
+def _finalize_delivery_worker(
+    task: asyncio.Task[None],
+    delivery_ref: "weakref.ReferenceType[GatewayDelivery]",
+    channel: _DeliveryChannel,
+) -> None:
+    """Close one terminal capability and release every host registry edge."""
+    _consume_delivery_worker_result(task)
+    channel.revoked = True
+    channel.consumed = True
+    delivery = delivery_ref()
+    if delivery is None:
+        return
+    _DELIVERY_CHANNELS.pop(delivery, None)
+    callback = channel.terminal_callback
+    channel.terminal_callback = None
+    if callback is not None:
+        try:
+            callback(delivery)
+        except Exception:
+            pass
 
 
 def _optional_text(value: Any) -> Optional[str]:

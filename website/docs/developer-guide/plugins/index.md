@@ -327,6 +327,18 @@ Plugins (1):
   ✓ calculator v1.0.0 (2 tools, 1 hooks)
 ```
 
+For machine-readable activation health, use:
+
+```bash
+hermes plugins list --json
+```
+
+An enabled plugin is healthy only when its entry also has `"active": true`.
+Registration failures appear as `"status": "enabled"`,
+`"runtime_status": "error"`, `"active": false`, plus an `error` string.
+Hermes rolls back that plugin's partial registrations and continues loading
+unrelated plugins.
+
 ### Debugging plugin discovery
 
 If your plugin doesn't show up — or shows up but isn't loading — set `HERMES_PLUGINS_DEBUG=1` to get verbose discovery logs on stderr:
@@ -595,6 +607,15 @@ def register(ctx):
 
 ### Hook reference
 
+Participant plugins should gate on `ctx.participant_host_api_version == 2`,
+not a Hermes package release. This independently versioned umbrella contract
+includes the three gateway participant hooks, immutable profile/session
+routing, route-bound delivery receipts, `ctx.llm.complete_structured`,
+`ctx.dispatch_tool`, `ctx.register_command`, and plugin activation/failure
+semantics. Compatible additions retain major 2; breaking changes increment the
+major. `ctx.gateway_message_hook_api_version` remains available for older
+gateway-message-only integrations.
+
 Each hook is documented in full on the **[Event Hooks reference](/user-guide/features/hooks#plugin-hooks)** — callback signatures, parameter tables, exactly when each fires, and examples. Here's the summary:
 
 | Hook | Fires when | Callback signature | Returns |
@@ -608,7 +629,7 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway tears down an active session | `session_id: str \| None, platform: str` | ignored |
 | [`on_session_reset`](/user-guide/features/hooks#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`) | `session_id: str, platform: str` | ignored |
 | [`gateway_message`](/user-guide/features/hooks#gateway_message) | Authorized, routed ordinary gateway message after control interception and before normal agent dispatch | `event: GatewayMessageEvent, route: GatewayMessageRoute, delivery: GatewayDelivery` | `{"decision": "handled" \| "suppress" \| "continue" \| "pass"}` or `None` when unmatched |
-| [`gateway_session_cancel`](/user-guide/features/hooks#gateway_session_cancel) | Confirmed gateway `/stop` or `/new`/reset boundary | `route: GatewayMessageRoute, reason: str` | ignored |
+| [`gateway_session_cancel`](/user-guide/features/hooks#gateway_session_cancel) | Participant session ends via stop/reset, inactivity timeout, or stale-agent eviction | `route: GatewayMessageRoute, reason: str` | ignored |
 | [`gateway_shutdown`](/user-guide/features/hooks#gateway_shutdown) | Stop/restart after delivery revocation, before adapter teardown | `reason: "stop" \| "restart"` | ignored |
 | `kanban_task_claimed` | A kanban task is claimed (dispatcher process, before the worker spawns) | `task_id: str, board: str \| None, assignee: str \| None, run_id: int \| None, profile_name: str` | ignored |
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |

@@ -1135,6 +1135,73 @@ class TelegramAdapter(BasePlatformAdapter):
         return str(chat_id)
 
     @classmethod
+    def _native_delivery_ack_from_message(
+        cls,
+        message: object,
+        *,
+        expected_chat_id: str,
+        expected_thread_id: Optional[object],
+        expected_content: str,
+        expected_reply_to_message_id: Optional[object],
+        expected_actor_id: Optional[str],
+    ) -> Optional[NativeDeliveryAck]:
+        """Attest a send only from complete, route-matching Telegram output."""
+        if isinstance(message, dict) or expected_actor_id is None:
+            return None
+        try:
+            message_id = getattr(message, "message_id")
+            chat_id = getattr(getattr(message, "chat"), "id")
+            actor_id = getattr(getattr(message, "from_user"), "id")
+            thread_id = getattr(message, "message_thread_id", None)
+            returned_content = getattr(message, "text")
+            reply_message = getattr(message, "reply_to_message", None)
+            reply_to_message_id = (
+                getattr(reply_message, "message_id")
+                if reply_message is not None
+                else None
+            )
+        except (AttributeError, TypeError):
+            return None
+
+        expected_chat = str(normalize_telegram_chat_id(expected_chat_id))
+        expected_thread = (
+            str(expected_thread_id) if expected_thread_id is not None else None
+        )
+        expected_reply = (
+            str(expected_reply_to_message_id)
+            if expected_reply_to_message_id is not None
+            else None
+        )
+        actual_thread = str(thread_id) if thread_id is not None else None
+        actual_reply = (
+            str(reply_to_message_id) if reply_to_message_id is not None else None
+        )
+        if (
+            message_id is None
+            or str(chat_id) != expected_chat
+            or actual_thread != expected_thread
+            or str(actor_id) != str(expected_actor_id)
+            or returned_content != expected_content
+            or actual_reply != expected_reply
+        ):
+            return None
+
+        native_message_id = str(message_id)
+        actual_room_id = str(chat_id)
+        if actual_thread is not None:
+            actual_room_id = f"{actual_room_id}:topic:{actual_thread}"
+        return NativeDeliveryAck(
+            platform="telegram",
+            room_id=actual_room_id,
+            self_actor_id=str(actor_id),
+            effect_kind="reply" if actual_reply is not None else "send",
+            submitted_content=returned_content,
+            reply_to_message_id=actual_reply,
+            message_id=native_message_id,
+            effect_id=native_message_id,
+        )
+
+    @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
             return None
@@ -1902,20 +1969,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 rich_sent_store.record(str(chat_id), str(message_id), content)
             except Exception:
                 pass
-        actor_id = self.authenticated_actor_id()
         native_message_id = str(message_id) if message_id is not None else None
-        native_ack = None
-        if native_message_id is not None and actor_id is not None:
-            native_ack = NativeDeliveryAck(
-                platform="telegram",
-                room_id=self._native_delivery_room_id(str(chat_id), metadata),
-                self_actor_id=actor_id,
-                effect_kind="reply" if reply_to_id is not None else "send",
-                submitted_content=content,
-                reply_to_message_id=str(reply_to_id) if reply_to_id is not None else None,
-                message_id=native_message_id,
-                effect_id=native_message_id,
-            )
+        native_ack = self._native_delivery_ack_from_message(
+            msg,
+            expected_chat_id=str(chat_id),
+            expected_thread_id=thread_kwargs.get("message_thread_id"),
+            expected_content=content,
+            expected_reply_to_message_id=reply_to_id,
+            expected_actor_id=self.authenticated_actor_id(),
+        )
         return SendResult(
             success=True,
             message_id=native_message_id,
@@ -4409,6 +4471,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
             
             message_ids = []
+            native_messages = []
             reply_attested_id = None
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
@@ -4637,6 +4700,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if i == 0 and reply_to_id is not None:
                     reply_attested_id = str(reply_to_id)
                 message_ids.append(str(msg.message_id))
+                native_messages.append(msg)
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -4654,19 +4718,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception:
                     pass  # Typing failures are non-fatal
 
-            actor_id = self.authenticated_actor_id()
             native_message_id = message_ids[0] if message_ids else None
             native_ack = None
-            if native_message_id is not None and actor_id is not None:
-                native_ack = NativeDeliveryAck(
-                    platform="telegram",
-                    room_id=self._native_delivery_room_id(str(chat_id), metadata),
-                    self_actor_id=actor_id,
-                    effect_kind="reply" if reply_attested_id is not None else "send",
-                    submitted_content=content,
-                    reply_to_message_id=reply_attested_id,
-                    message_id=native_message_id,
-                    effect_id=native_message_id,
+            if len(native_messages) == 1:
+                native_ack = self._native_delivery_ack_from_message(
+                    native_messages[0],
+                    expected_chat_id=str(chat_id),
+                    expected_thread_id=effective_thread_id,
+                    expected_content=content,
+                    expected_reply_to_message_id=reply_attested_id,
+                    expected_actor_id=self.authenticated_actor_id(),
                 )
             return SendResult(
                 success=True,

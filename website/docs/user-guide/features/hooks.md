@@ -393,7 +393,7 @@ def register(ctx):
 | [`subagent_stop`](#subagent_stop) | A `delegate_task` child has exited | ignored |
 | [`pre_gateway_dispatch`](#pre_gateway_dispatch) | Gateway received a user message, before auth + dispatch | `{"action": "skip" \| "rewrite" \| "allow", ...}` to influence flow |
 | [`gateway_message`](#gateway_message) | Authorized, routed ordinary user message after control interception, before normal agent dispatch | terminal handled/continue decision |
-| [`gateway_session_cancel`](#gateway_session_cancel) | Confirmed `/stop` or `/new`/reset gateway boundary | ignored |
+| [`gateway_session_cancel`](#gateway_session_cancel) | Participant session ends via stop/reset, inactivity timeout, or stale-agent eviction | ignored |
 | [`gateway_shutdown`](#gateway_shutdown) | Gateway stop/restart after route revocation, before adapter teardown | ignored |
 | [`pre_approval_request`](#pre_approval_request) | An approval decision is requested, including smart-mode auto decisions | ignored |
 | [`post_approval_response`](#post_approval_response) | An approval decision is made (or a prompt times out) | ignored |
@@ -1006,13 +1006,18 @@ With heavy delegation (e.g. orchestrator roles × 5 leaves × nested depth), `su
 
 Fires for an ordinary user message only after Hermes has admitted and authorized the native source, resolved its profile/session route, and intercepted slash commands and other gateway controls. It runs on both cold and active/busy session paths before normal agent dispatch.
 
-The host contract is capability-versioned independently of the Hermes package
-version. Plugins can inspect `ctx.gateway_message_hook_api_version` during
-`register(ctx)` and refuse activation with an actionable update message when
-the capability is absent or has an unsupported major version. Version 2 is the
-contract documented in this section. Backward-compatible additions retain the
-same major version; a future incompatible contract uses a new major version so
-plugins can fail visibly instead of relying on an exact Hermes release pin.
+The public participant host contract is capability-versioned independently of
+the Hermes package version. Plugins can inspect
+`ctx.participant_host_api_version` during `register(ctx)` and refuse activation
+with an actionable update message when the capability is absent or has an
+unsupported major version. Major version 2 covers the complete participant
+surface: `gateway_message`, `gateway_session_cancel`, and `gateway_shutdown`;
+immutable profile/session routing; route-bound delivery and receipts;
+`ctx.llm.complete_structured`; `ctx.dispatch_tool`; `ctx.register_command`; and
+plugin loading, failure isolation, and activation-status semantics.
+Backward-compatible additions retain major 2; a breaking change increments the
+major. `ctx.gateway_message_hook_api_version` remains available as the
+gateway-message-specific compatibility marker.
 
 The callback receives public immutable snapshots and a one-shot, route-bound
 delivery facade. Hermes plugins are trusted in-process Python code: this API
@@ -1046,7 +1051,24 @@ This hook is not invoked for unauthorized, internal, slash-command, or already-i
 
 ### `gateway_session_cancel`
 
-Fires after Hermes confirms an explicit `/stop` or `/new`/reset boundary. The callback receives the immutable `route` and a `reason` (`"stop"` or `"reset"`) so plugin-owned schedulers can invalidate active and pending work. It is a bounded best-effort observer notification: returns are ignored, callback failures are logged, and Hermes proceeds with the host interruption/reset if callbacks do not finish within two seconds. Caller task cancellation still propagates.
+Fires before Hermes destroys participant-scoped host state at `/stop`,
+`/new`/reset, an agent inactivity timeout, or stale running-agent eviction. The
+callback receives the immutable `route` and one of the explicit reasons
+`"stop"`, `"reset"`, `"inactivity_timeout"`, or
+`"stale_running_agent_eviction"` so plugin-owned schedulers can invalidate
+active and pending work.
+
+It is a bounded best-effort observer notification: returns are ignored,
+callback failures are logged, and Hermes proceeds with the host boundary if
+callbacks do not finish within two seconds. Timed-out callbacks receive a
+cancellation request. Work that suppresses cancellation remains visible in a
+bounded, per-session registry; duplicate notifications for that session are
+suppressed until it settles.
+
+An ordinary message interrupting a busy turn is not a participant session
+boundary: the same route, session key, and participant-owned state continue
+into the queued next turn. Hermes therefore does not emit this hook for that
+case.
 
 ```python
 async def cancel_plugin_work(route, reason, **kwargs):

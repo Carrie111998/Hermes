@@ -13,7 +13,10 @@ from hermes_cli.plugins import (
     PluginManager,
     PluginManifest,
 )
-from hermes_constants import GATEWAY_MESSAGE_HOOK_API_VERSION
+from hermes_constants import (
+    GATEWAY_MESSAGE_HOOK_API_VERSION,
+    PARTICIPANT_HOST_API_VERSION,
+)
 
 
 def test_plugin_context_exposes_gateway_message_capability_version():
@@ -23,6 +26,15 @@ def test_plugin_context_exposes_gateway_message_capability_version():
     )
 
     assert context.gateway_message_hook_api_version == GATEWAY_MESSAGE_HOOK_API_VERSION
+
+
+def test_plugin_context_exposes_umbrella_participant_host_api_version():
+    context = PluginContext(
+        PluginManifest(name="participant-capability-probe", source="entrypoint"),
+        PluginManager(),
+    )
+
+    assert context.participant_host_api_version == PARTICIPANT_HOST_API_VERSION == 2
 
 
 @pytest.mark.asyncio

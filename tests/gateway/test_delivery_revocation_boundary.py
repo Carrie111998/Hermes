@@ -331,6 +331,90 @@ async def test_shutdown_fences_inflight_native_send():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_sync_revoke_retains_inflight_worker_for_later_settlement():
+    """The eager shutdown revoke must not discard its settlement handle."""
+    runner, entered, release = _runner_for_inflight()
+    delivery, _source = _retained_delivery(runner)
+
+    submit = asyncio.create_task(delivery.send("payload"))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    runner._revoke_all_gateway_deliveries()
+    boundary = asyncio.create_task(
+        runner._revoke_all_gateway_deliveries_and_settle()
+    )
+    await asyncio.sleep(0.05)
+
+    assert not boundary.done()
+    release.set()
+    await asyncio.wait_for(boundary, timeout=1)
+    assert (await asyncio.wait_for(submit, timeout=1)).status == "unknown"
+    assert runner._gateway_deliveries_by_session == {}
+
+
+@pytest.mark.asyncio
+async def test_consumed_deliveries_unregister_and_leave_no_worker_registry():
+    import gateway.message_hooks as message_hooks
+
+    runner, _entered, _release = _runner_for_inflight()
+    created = []
+
+    async def send_native(_chat_id, content):
+        return SendResult(
+            success=True,
+            message_id=f"out-{content}",
+            native_delivery_ack=_ack(
+                "send",
+                self_actor_id="9",
+                submitted_content=content,
+                message_id=f"out-{content}",
+                effect_id=f"out-{content}",
+            ),
+        )
+
+    runner.adapters[next(iter(runner.adapters))].send = send_native
+    for index in range(300):
+        delivery, _source = _retained_delivery(
+            runner,
+            session_key=f"session-{index}",
+        )
+        created.append(delivery)
+        receipt = await delivery.send(str(index))
+        assert receipt.status == "sent"
+
+    await asyncio.sleep(0)
+    assert runner._gateway_deliveries_by_session == {}
+    assert getattr(runner, "_gateway_delivery_settlement_workers", {}) == {}
+    assert all(
+        delivery not in message_hooks._DELIVERY_CHANNELS
+        for delivery in created
+    )
+
+
+@pytest.mark.asyncio
+async def test_unused_delivery_has_bounded_nonpolling_lifetime(monkeypatch):
+    """An unused one-shot capability expires without a polling task leak."""
+    import gateway.message_hooks as message_hooks
+
+    monkeypatch.setattr(
+        message_hooks,
+        "GATEWAY_DELIVERY_CAPABILITY_TTL_SECONDS",
+        0.01,
+        raising=False,
+    )
+    delivery = _make_delivery(
+        lambda _content: SendResult(
+            success=False,
+            native_delivery_non_occurrence_attested=True,
+        )
+    )
+
+    await asyncio.sleep(0.03)
+
+    assert await delivery.send("too late") == GatewayDeliveryReceipt(status="failed")
+    assert delivery not in message_hooks._DELIVERY_CHANNELS
+
+@pytest.mark.asyncio
 async def test_timeout_boundary_revokes_session_deliveries():
     """The inactivity-timeout path invalidates retained route capabilities."""
     runner, entered, release = _runner_for_inflight()

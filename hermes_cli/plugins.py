@@ -47,7 +47,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
-from hermes_constants import GATEWAY_MESSAGE_HOOK_API_VERSION, get_hermes_home
+from hermes_constants import (
+    GATEWAY_MESSAGE_HOOK_API_VERSION,
+    PARTICIPANT_HOST_API_VERSION,
+    get_hermes_home,
+)
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
@@ -342,6 +346,7 @@ class LoadedPlugin:
     middleware_registered: List[str] = field(default_factory=list)
     commands_registered: List[str] = field(default_factory=list)
     enabled: bool = False
+    active: bool = False
     error: Optional[str] = None
     # True for a bundled platform plugin recorded as a deferred (not-yet-
     # imported) loader. The module loads on first real use via the
@@ -426,6 +431,11 @@ class PluginContext:
     def gateway_message_hook_api_version(self) -> int:
         """Return the semantic version of the immutable gateway-message hook API."""
         return GATEWAY_MESSAGE_HOOK_API_VERSION
+
+    @property
+    def participant_host_api_version(self) -> int:
+        """Return the independent major version of the participant host API."""
+        return PARTICIPANT_HOST_API_VERSION
 
     # -- tool registration --------------------------------------------------
 
@@ -1283,7 +1293,10 @@ class PluginContext:
 
 
 async def _invoke_hook_off_thread(
-    callback: Callable[..., Any], kwargs: Dict[str, Any]
+    callback: Callable[..., Any],
+    kwargs: Dict[str, Any],
+    *,
+    settle_after_cancel: bool = False,
 ) -> Any:
     """Invoke a synchronous hook in a disposable daemon thread.
 
@@ -1326,7 +1339,30 @@ async def _invoke_hook_off_thread(
         name="hermes-plugin-hook",
         daemon=True,
     ).start()
-    return await result_future
+    if not settle_after_cancel:
+        return await result_future
+
+    try:
+        return await asyncio.shield(result_future)
+    except asyncio.CancelledError:
+        # A gateway cancellation observer may be synchronous third-party code.
+        # Cancelling its asyncio wrapper cannot stop the daemon thread, so keep
+        # the wrapper pending until that work really exits. The gateway tracks
+        # these pending wrappers in a bounded registry and deduplicates future
+        # lifecycle events for the same participant session.
+        while not result_future.done():
+            try:
+                await asyncio.shield(result_future)
+            except asyncio.CancelledError:
+                continue
+        try:
+            detached_result = result_future.result()
+        except BaseException:
+            pass
+        else:
+            if inspect.iscoroutine(detached_result):
+                detached_result.close()
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1850,13 +1886,42 @@ class PluginManager:
 
     def _load_plugin(self, manifest: PluginManifest) -> None:
         """Import a plugin module and call its ``register(ctx)`` function."""
-        loaded = LoadedPlugin(manifest=manifest)
+        loaded = LoadedPlugin(manifest=manifest, enabled=True)
         logger.debug(
             "Loading plugin '%s' (source=%s, kind=%s, path=%s)",
             manifest.key or manifest.name, manifest.source, manifest.kind, manifest.path,
         )
 
+        from gateway.platform_registry import platform_registry as _platform_registry
         from tools.registry import registry as _registry
+
+        manager_snapshot = {
+            "hooks": {key: list(value) for key, value in self._hooks.items()},
+            "middleware": {
+                key: list(value) for key, value in self._middleware.items()
+            },
+            "plugin_tool_names": set(self._plugin_tool_names),
+            "plugin_platform_names": set(self._plugin_platform_names),
+            "cli_commands": dict(self._cli_commands),
+            "context_engine": self._context_engine,
+            "plugin_commands": dict(self._plugin_commands),
+            "plugin_skills": dict(self._plugin_skills),
+            "aux_tasks": dict(self._aux_tasks),
+            "slack_action_handlers": list(self._slack_action_handlers),
+        }
+        with _registry._lock:
+            tool_snapshot = {
+                "tools": dict(_registry._tools),
+                "toolset_checks": dict(_registry._toolset_checks),
+                "toolset_aliases": dict(_registry._toolset_aliases),
+                "plugin_override_policy": dict(
+                    _registry._plugin_override_policy
+                ),
+            }
+        platform_snapshot = {
+            "entries": dict(_platform_registry._entries),
+            "deferred": dict(_platform_registry._deferred),
+        }
         _plugin_id = manifest.key or manifest.name
         _slug = _plugin_id.replace("/", "__").replace("-", "_")
         _registry.register_plugin_override_policy(
@@ -1874,8 +1939,7 @@ class PluginManager:
             # Call register()
             register_fn = getattr(module, "register", None)
             if register_fn is None:
-                loaded.error = "no register() function"
-                logger.warning("Plugin '%s' has no register() function", manifest.name)
+                raise AttributeError("no register() function")
             else:
                 ctx = PluginContext(manifest, self)
                 # Snapshot registry state BEFORE register() so each registry's
@@ -1912,6 +1976,7 @@ class PluginManager:
                     if self._plugin_commands[c].get("plugin") == manifest.name
                 ]
                 loaded.enabled = True
+                loaded.active = True
                 logger.debug(
                     "  registered: %d tool(s), %d hook(s), %d middleware, %d slash command(s), %d CLI command(s)",
                     len(loaded.tools_registered),
@@ -1925,6 +1990,30 @@ class PluginManager:
                 )
 
         except Exception as exc:
+            self._hooks = manager_snapshot["hooks"]
+            self._middleware = manager_snapshot["middleware"]
+            self._plugin_tool_names = manager_snapshot["plugin_tool_names"]
+            self._plugin_platform_names = manager_snapshot[
+                "plugin_platform_names"
+            ]
+            self._cli_commands = manager_snapshot["cli_commands"]
+            self._context_engine = manager_snapshot["context_engine"]
+            self._plugin_commands = manager_snapshot["plugin_commands"]
+            self._plugin_skills = manager_snapshot["plugin_skills"]
+            self._aux_tasks = manager_snapshot["aux_tasks"]
+            self._slack_action_handlers = manager_snapshot[
+                "slack_action_handlers"
+            ]
+            with _registry._lock:
+                _registry._tools = tool_snapshot["tools"]
+                _registry._toolset_checks = tool_snapshot["toolset_checks"]
+                _registry._toolset_aliases = tool_snapshot["toolset_aliases"]
+                _registry._plugin_override_policy = tool_snapshot[
+                    "plugin_override_policy"
+                ]
+                _registry._generation += 1
+            _platform_registry._entries = platform_snapshot["entries"]
+            _platform_registry._deferred = platform_snapshot["deferred"]
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
@@ -2054,7 +2143,11 @@ class PluginManager:
         for cb in callbacks:
             try:
                 ret = (
-                    await _invoke_hook_off_thread(cb, kwargs)
+                    await _invoke_hook_off_thread(
+                        cb,
+                        kwargs,
+                        settle_after_cancel=offload_callbacks,
+                    )
                     if (offload_callbacks or offload_sync)
                     and not inspect.iscoroutinefunction(cb)
                     else cb(**kwargs)
@@ -2142,6 +2235,18 @@ class PluginManager:
                     "description": loaded.manifest.description,
                     "source": loaded.manifest.source,
                     "enabled": loaded.enabled,
+                    "active": loaded.active,
+                    "status": (
+                        "error"
+                        if loaded.enabled and loaded.error
+                        else "active"
+                        if loaded.active
+                        else "deferred"
+                        if loaded.enabled and loaded.deferred
+                        else "inactive"
+                        if loaded.enabled
+                        else "disabled"
+                    ),
                     "tools": len(loaded.tools_registered),
                     "hooks": len(loaded.hooks_registered),
                     "middleware": len(loaded.middleware_registered),

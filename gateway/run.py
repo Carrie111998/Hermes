@@ -2652,6 +2652,7 @@ _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 GATEWAY_SESSION_CANCEL_TIMEOUT_SECONDS = 2.0
+GATEWAY_SESSION_CANCEL_DETACHED_LIMIT = 64
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
@@ -11517,6 +11518,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _quick_key, _stale_age, _stale_idle,
                     _raw_stale_timeout, _stale_detail,
                 )
+                await self._notify_gateway_session_cancel(
+                    _quick_key,
+                    source,
+                    reason="stale_running_agent_eviction",
+                )
                 self._invalidate_session_run_generation(
                     _quick_key,
                     reason="stale_running_agent_eviction",
@@ -11820,12 +11826,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if self._queue_during_drain_enabled()
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
-            if (
-                not is_internal
-                and not event.is_command()
-                and await self._run_gateway_message_hook(event, source, _quick_key)
-            ):
-                return None
+            if not is_internal and not event.is_command():
+                if await self._run_gateway_message_hook(
+                    event, source, _quick_key
+                ):
+                    return None
+                # Mixed native batches may retain only a passed subset. Its
+                # first native event is now the authoritative dispatch source.
+                source = event.source
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
@@ -12712,12 +12720,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # This is the cold-session counterpart to the active-session seam.
             # Claim before awaiting a plugin so a pass-through hook cannot
             # reopen the duplicate-agent race protected by the sentinel.
-            if (
-                not is_internal
-                and not event.is_command()
-                and await self._run_gateway_message_hook(event, source, _quick_key)
-            ):
-                return None
+            if not is_internal and not event.is_command():
+                if await self._run_gateway_message_hook(
+                    event, source, _quick_key
+                ):
+                    return None
+                # Mixed native batches may retain only a passed subset. Its
+                # first native event is now the authoritative dispatch source.
+                source = event.source
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -13356,19 +13366,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "invalid native-event batch metadata; suppressing normal dispatch"
                     )
                     return True
-                suppressed = False
+                passed_events: list[MessageEvent] = []
                 for native_event in native_events:
                     # Continue through the entire batch even after one terminal
                     # result so no authorized native identity disappears.
-                    suppressed = (
-                        await self._run_gateway_message_hook_scoped(
-                            native_event,
-                            native_event.source,
-                            session_key,
-                        )
-                        or suppressed
+                    suppressed = await self._run_gateway_message_hook_scoped(
+                        native_event,
+                        native_event.source,
+                        session_key,
                     )
-                return suppressed
+                    if not suppressed:
+                        passed_events.append(native_event)
+                if not passed_events:
+                    return True
+                if len(passed_events) != len(native_events):
+                    self._replace_gateway_native_batch_for_dispatch(
+                        event,
+                        passed_events,
+                    )
+                return False
             return await self._run_gateway_message_hook_scoped(
                 event,
                 source,
@@ -13380,6 +13396,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             with _profile_runtime_scope(profile_home):
                 return await _run_scoped()
         return await _run_scoped()
+
+    @staticmethod
+    def _replace_gateway_native_batch_for_dispatch(
+        event: MessageEvent,
+        passed_events: "list[MessageEvent]",
+    ) -> None:
+        """Rewrite a host batch to the exact passed native subset, in order."""
+        first = passed_events[0]
+        event.text = "\n".join(
+            str(native.text or "")
+            for native in passed_events
+            if native.text
+        )
+        event.message_type = first.message_type
+        event.source = first.source
+        event.raw_message = first.raw_message
+        event.message_id = first.message_id
+        event.platform_update_id = first.platform_update_id
+        event.media_urls = [
+            item for native in passed_events for item in native.media_urls
+        ]
+        event.media_types = [
+            item for native in passed_events for item in native.media_types
+        ]
+        event.reply_to_message_id = first.reply_to_message_id
+        event.reply_to_text = first.reply_to_text
+        event.reply_to_author_id = first.reply_to_author_id
+        event.reply_to_author_name = first.reply_to_author_name
+        event.reply_to_is_own_message = first.reply_to_is_own_message
+        event.prompt_response = first.prompt_response
+        event.auto_skill = first.auto_skill
+        event.channel_prompt = first.channel_prompt
+        event.channel_context = first.channel_context
+        event.internal = first.internal
+        event.timestamp = first.timestamp
+
+        # Rebuild metadata from the passed subset. Starting from the aggregate
+        # batch would preserve fields contributed only by a handled event.
+        metadata = dict(first.metadata)
+        metadata["_gateway_native_events"] = tuple(passed_events)
+        mentioned_ids: list[str] = []
+        seen_mentions: set[str] = set()
+        mentions_attested = True
+        mentions_room: Optional[bool] = False
+        for native in passed_events:
+            native_mentions = native.metadata.get("mentioned_user_ids")
+            if not isinstance(native_mentions, (list, tuple)):
+                mentions_attested = False
+            else:
+                for mentioned_id in native_mentions:
+                    value = str(mentioned_id)
+                    if value not in seen_mentions:
+                        seen_mentions.add(value)
+                        mentioned_ids.append(value)
+            native_mentions_room = native.metadata.get("mentions_room")
+            if not isinstance(native_mentions_room, bool):
+                mentions_room = None
+            elif mentions_room is not None:
+                mentions_room = mentions_room or native_mentions_room
+        metadata["mentioned_user_ids"] = (
+            tuple(mentioned_ids) if mentions_attested else None
+        )
+        metadata["mentions_room"] = mentions_room
+        event.metadata = metadata
 
     async def _run_gateway_message_hook_scoped(
         self,
@@ -13400,6 +13480,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
 
         def _finish(suppress: bool) -> bool:
+            delivery._release_participant_hold()
             setattr(event, result_marker, "suppress" if suppress else "continue")
             return suppress
 
@@ -13448,12 +13529,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _send_to_source(content: str):
             if adapter is None:
-                return SendResult(success=False)
+                return SendResult(
+                    success=False,
+                    native_delivery_non_occurrence_attested=True,
+                )
             metadata = dict(delivery_metadata) if delivery_metadata else None
             if delivery_via_relay:
                 send_for_platform: Any = getattr(adapter, "send_for_platform", None)
                 if not callable(send_for_platform):
-                    return SendResult(success=False)
+                    return SendResult(
+                        success=False,
+                        native_delivery_non_occurrence_attested=True,
+                    )
                 return await send_for_platform(
                     delivery_platform,
                     delivery_chat_id,
@@ -13468,12 +13555,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _reply_to_source(content: str):
             if adapter is None or not delivery_message_id:
-                return SendResult(success=False)
+                return SendResult(
+                    success=False,
+                    native_delivery_non_occurrence_attested=True,
+                )
             metadata = dict(delivery_metadata) if delivery_metadata else None
             if delivery_via_relay:
                 send_for_platform: Any = getattr(adapter, "send_for_platform", None)
                 if not callable(send_for_platform):
-                    return SendResult(success=False)
+                    return SendResult(
+                        success=False,
+                        native_delivery_non_occurrence_attested=True,
+                    )
                 return await send_for_platform(
                     delivery_platform,
                     delivery_chat_id,
@@ -13490,10 +13583,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _react_to_source(reaction: str, operation: str):
             if adapter is None or delivery_via_relay or not delivery_message_id:
-                return SendResult(success=False)
+                return SendResult(
+                    success=False,
+                    native_delivery_non_occurrence_attested=True,
+                )
             react: Any = getattr(adapter, "react", None)
             if not callable(react):
-                return SendResult(success=False)
+                return SendResult(
+                    success=False,
+                    native_delivery_non_occurrence_attested=True,
+                )
             if delivery_platform == Platform.TELEGRAM:
                 metadata = dict(delivery_metadata) if delivery_metadata else None
                 return await react(
@@ -13529,6 +13628,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=delivery_profile,
             self_actor_id=authenticated_actor,
             source_message_id=delivery_message_id or None,
+            on_terminal=lambda terminal_delivery: (
+                self._unregister_gateway_delivery(
+                    session_key,
+                    terminal_delivery,
+                )
+            ),
+            hold_until_participant_settled=True,
         )
         self._register_gateway_delivery(session_key, delivery)
         setattr(event, result_marker, "pending")
@@ -13585,17 +13691,102 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if deliveries is None:
             deliveries = {}
             self._gateway_deliveries_by_session = deliveries
-        deliveries.setdefault(str(session_key), set()).add(delivery)
+        key = str(session_key)
+        deliveries.setdefault(key, set()).add(delivery)
+        set_terminal_callback = getattr(
+            delivery,
+            "_set_terminal_callback",
+            None,
+        )
+        if callable(set_terminal_callback):
+            set_terminal_callback(
+                lambda terminal_delivery: self._unregister_gateway_delivery(
+                    key,
+                    terminal_delivery,
+                )
+            )
 
-    def _revoke_gateway_deliveries(self, session_key: str) -> None:
+    def _unregister_gateway_delivery(
+        self,
+        session_key: str,
+        delivery: Any,
+    ) -> None:
         deliveries = getattr(self, "_gateway_deliveries_by_session", None)
         if not deliveries:
             return
-        for delivery in deliveries.pop(str(session_key), ()):
-            try:
-                delivery._revoke()
-            except Exception:
-                logger.debug("gateway delivery revocation failed", exc_info=True)
+        key = str(session_key)
+        retained = deliveries.get(key)
+        if retained is None:
+            return
+        retained.discard(delivery)
+        if not retained:
+            deliveries.pop(key, None)
+
+    def _retain_gateway_delivery_workers(
+        self,
+        session_key: str,
+        workers: "list[asyncio.Task[None]]",
+    ) -> None:
+        if not workers:
+            return
+        retained_by_session = getattr(
+            self,
+            "_gateway_delivery_settlement_workers",
+            None,
+        )
+        if retained_by_session is None:
+            retained_by_session = {}
+            self._gateway_delivery_settlement_workers = retained_by_session
+        retained = retained_by_session.setdefault(str(session_key), set())
+        for worker in workers:
+            retained.add(worker)
+            worker.add_done_callback(
+                lambda done, key=str(session_key): (
+                    self._discard_gateway_delivery_worker(key, done)
+                )
+            )
+
+    def _discard_gateway_delivery_worker(
+        self,
+        session_key: str,
+        worker: "asyncio.Task[None]",
+    ) -> None:
+        retained_by_session = getattr(
+            self,
+            "_gateway_delivery_settlement_workers",
+            None,
+        )
+        if not retained_by_session:
+            return
+        retained = retained_by_session.get(str(session_key))
+        if retained is None:
+            return
+        retained.discard(worker)
+        if not retained:
+            retained_by_session.pop(str(session_key), None)
+
+    def _retained_gateway_delivery_workers(
+        self,
+        session_key: Optional[str] = None,
+    ) -> "list[asyncio.Task[None]]":
+        retained_by_session = getattr(
+            self,
+            "_gateway_delivery_settlement_workers",
+            None,
+        )
+        if not retained_by_session:
+            return []
+        if session_key is not None:
+            return list(retained_by_session.get(str(session_key), ()))
+        return [
+            worker
+            for retained in retained_by_session.values()
+            for worker in retained
+        ]
+
+    def _revoke_gateway_deliveries(self, session_key: str) -> None:
+        workers = self._begin_revoking_gateway_deliveries(session_key)
+        self._retain_gateway_delivery_workers(session_key, workers)
 
     def _begin_revoking_gateway_deliveries(
         self, session_key: str
@@ -13675,15 +13866,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         shutdown acceptance returns, so no revoked effect can remain live
         past the boundary.
         """
-        workers = self._begin_revoking_all_gateway_deliveries()
+        workers = self._retained_gateway_delivery_workers()
+        workers.extend(self._begin_revoking_all_gateway_deliveries())
         await self._await_gateway_delivery_settlement(workers)
 
     async def _revoke_gateway_deliveries_and_settle(
         self, session_key: str
     ) -> None:
         """Invalidate one session's deliveries, then await in-flight effects."""
-        workers = self._begin_revoking_gateway_deliveries(session_key)
+        workers = self._retained_gateway_delivery_workers(session_key)
+        workers.extend(self._begin_revoking_gateway_deliveries(session_key))
         await self._await_gateway_delivery_settlement(workers)
+
+    async def _handle_gateway_inactivity_boundary(
+        self,
+        session_key: str,
+        source: SessionSource,
+    ) -> None:
+        """Notify participant plugins before an inactive host session ends."""
+        await self._notify_gateway_session_cancel(
+            session_key,
+            source,
+            reason="inactivity_timeout",
+        )
 
     async def _notify_gateway_session_cancel(
         self,
@@ -13704,10 +13909,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.message_hooks import GatewayMessageRoute
         from hermes_cli.plugins import invoke_hook_async
 
-        workers = self._begin_revoking_gateway_deliveries(session_key)
-        await self._await_gateway_delivery_settlement(workers)
+        await self._revoke_gateway_deliveries_and_settle(session_key)
 
         async def _invoke_cancel_observer() -> None:
+            observer_tasks = getattr(
+                self, "_gateway_cancel_observer_tasks", None
+            )
+            if observer_tasks is None:
+                observer_tasks = {}
+                self._gateway_cancel_observer_tasks = observer_tasks
+
+            for tracked_key, tracked_task in tuple(observer_tasks.items()):
+                if tracked_task.done():
+                    observer_tasks.pop(tracked_key, None)
+                    consume_detached_task_result(tracked_task)
+
+            existing = observer_tasks.get(session_key)
+            if existing is not None and not existing.done():
+                logger.warning(
+                    "gateway_session_cancel observer is still running for %s; "
+                    "suppressing duplicate lifecycle notification",
+                    session_key,
+                )
+                return
+            if len(observer_tasks) >= GATEWAY_SESSION_CANCEL_DETACHED_LIMIT:
+                logger.warning(
+                    "gateway_session_cancel detached observer limit (%d) "
+                    "reached; suppressing notification for %s",
+                    GATEWAY_SESSION_CANCEL_DETACHED_LIMIT,
+                    session_key,
+                )
+                return
+
             observer_task = asyncio.create_task(
                 invoke_hook_async(
                     "gateway_session_cancel",
@@ -13719,6 +13952,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     offload_callbacks=True,
                 )
             )
+            observer_tasks[session_key] = observer_task
+
+            def _forget_observer(task: asyncio.Task) -> None:
+                current = observer_tasks.get(session_key)
+                if current is task:
+                    observer_tasks.pop(session_key, None)
+                consume_detached_task_result(task)
+
+            observer_task.add_done_callback(_forget_observer)
             try:
                 done, _pending = await asyncio.wait(
                     {observer_task},
@@ -13726,15 +13968,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except asyncio.CancelledError:
                 observer_task.cancel()
-                observer_task.add_done_callback(consume_detached_task_result)
                 raise
             if not done:
-                # asyncio.wait_for() cannot enforce a hard boundary when a
-                # third-party coroutine suppresses cancellation: it waits for
-                # cancellation cleanup forever. Leave the same-loop observer
-                # detached instead; delivery revocation above is already the
-                # authoritative stale-effect fence.
-                observer_task.add_done_callback(consume_detached_task_result)
+                # Request cancellation, then retain any callback that refuses
+                # to settle. The bounded registry above prevents repeated
+                # participant boundaries from leaking unbounded detached work.
+                observer_task.cancel()
                 raise TimeoutError
             await observer_task
 
@@ -24026,11 +24265,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # native invocation that already won the race is awaited so
                 # its effect cannot remain live past this boundary.
                 if session_key:
-                    _timeout_workers = self._begin_revoking_gateway_deliveries(
-                        session_key
-                    )
-                    await self._await_gateway_delivery_settlement(
-                        _timeout_workers
+                    await self._handle_gateway_inactivity_boundary(
+                        session_key,
+                        source,
                     )
                 # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]

@@ -535,7 +535,8 @@ class TestPluginLoading:
         mgr.discover_and_load()
 
         assert "bad_plugin" in mgr._plugins
-        assert not mgr._plugins["bad_plugin"].enabled
+        assert mgr._plugins["bad_plugin"].enabled
+        assert not mgr._plugins["bad_plugin"].active
         assert mgr._plugins["bad_plugin"].error is not None
         # Should be the missing-init error, not "not enabled".
         assert "not enabled" not in mgr._plugins["bad_plugin"].error
@@ -558,7 +559,8 @@ class TestPluginLoading:
         mgr.discover_and_load()
 
         assert "no_reg" in mgr._plugins
-        assert not mgr._plugins["no_reg"].enabled
+        assert mgr._plugins["no_reg"].enabled
+        assert not mgr._plugins["no_reg"].active
         assert "no register()" in mgr._plugins["no_reg"].error
 
     def test_load_registers_namespace_module(self, tmp_path, monkeypatch):
@@ -1672,6 +1674,43 @@ class TestPluginManagerList:
             assert "enabled" in p
             assert "tools" in p
             assert "hooks" in p
+
+    def test_registration_failure_is_enabled_but_inactive_and_machine_readable(
+        self, tmp_path, monkeypatch
+    ):
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        _make_plugin_dir(
+            plugins_dir,
+            "broken_participant",
+            register_body=(
+                "ctx.register_hook('gateway_message', lambda **kw: "
+                "{'decision': 'handled'})\n"
+                "    raise RuntimeError('registration exploded')"
+            ),
+        )
+        _make_plugin_dir(
+            plugins_dir,
+            "healthy_participant",
+            register_body=(
+                "ctx.register_hook('post_tool_call', lambda **kw: None)"
+            ),
+        )
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        by_name = {p["name"]: p for p in mgr.list_plugins()}
+        broken = by_name["broken_participant"]
+        healthy = by_name["healthy_participant"]
+        assert broken["enabled"] is True
+        assert broken["active"] is False
+        assert broken["status"] == "error"
+        assert "registration exploded" in broken["error"]
+        assert healthy["enabled"] is True
+        assert healthy["active"] is True
+        assert healthy["status"] == "active"
+        assert mgr._hooks.get("gateway_message", []) == []
 
     def test_shared_hook_name_credited_to_every_plugin(self, tmp_path, monkeypatch):
         """Two plugins registering the SAME hook name are each credited.

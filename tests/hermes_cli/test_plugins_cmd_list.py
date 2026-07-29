@@ -59,6 +59,7 @@ def test_cmd_list_plain_compact_output(monkeypatch, capsys):
     monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: entries)
     monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"web-search-plus"})
     monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_runtime_plugin_states", lambda: {})
 
     plugins_cmd.cmd_list(_args(plain=True, no_bundled=True))
 
@@ -74,6 +75,7 @@ def test_cmd_list_json_output(monkeypatch, capsys):
     monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: entries)
     monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"web-search-plus"})
     monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_runtime_plugin_states", lambda: {})
 
     plugins_cmd.cmd_list(_args(json=True))
 
@@ -82,11 +84,112 @@ def test_cmd_list_json_output(monkeypatch, capsys):
         {
             "name": "web-search-plus",
             "status": "enabled",
+            "active": False,
+            "runtime_status": "inactive",
+            "error": None,
             "version": "2.2.0",
             "description": "Search",
             "source": "git",
         }
     ]
+
+
+def test_cmd_list_json_exposes_enabled_plugin_registration_error(
+    monkeypatch, capsys
+):
+    entries = [
+        (
+            "broken-participant",
+            "2.0.0",
+            "Participant",
+            "user",
+            None,
+            "broken-participant",
+        )
+    ]
+    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: entries)
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_get_enabled_set",
+        lambda: {"broken-participant"},
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_get_runtime_plugin_states",
+        lambda: {
+            "broken-participant": {
+                "enabled": True,
+                "active": False,
+                "status": "error",
+                "error": "registration exploded",
+            }
+        },
+        raising=False,
+    )
+
+    plugins_cmd.cmd_list(_args(json=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["status"] == "enabled"
+    assert payload[0]["active"] is False
+    assert payload[0]["runtime_status"] == "error"
+    assert payload[0]["error"] == "registration exploded"
+
+
+def test_cmd_list_json_reports_real_registration_failure_end_to_end(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    import hermes_cli.plugins as plugins_module
+
+    hermes_home = tmp_path / "hermes"
+    plugin_dir = hermes_home / "plugins" / "broken-e2e"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: broken-e2e\nversion: 2.0.0\n"
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "def register(ctx):\n"
+        "    ctx.register_hook('gateway_message', lambda **kwargs: None)\n"
+        "    raise RuntimeError('e2e registration exploded')\n"
+    )
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - broken-e2e\n"
+    )
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        plugins_module,
+        "get_bundled_plugins_dir",
+        lambda: bundled,
+    )
+    monkeypatch.setattr(
+        plugins_cmd.importlib.metadata,
+        "entry_points",
+        lambda: [],
+    )
+    manager = plugins_module.PluginManager()
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+
+    plugins_cmd.cmd_list(_args(json=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [
+        {
+            "name": "broken-e2e",
+            "status": "enabled",
+            "active": False,
+            "runtime_status": "error",
+            "error": "e2e registration exploded",
+            "version": "2.0.0",
+            "description": "",
+            "source": "user",
+        }
+    ]
+    assert manager._hooks.get("gateway_message", []) == []
 
 
 def test_discover_all_plugins_includes_entrypoint_plugins(monkeypatch, tmp_path):
@@ -145,6 +248,7 @@ def test_cmd_list_json_output_includes_entrypoint_source(monkeypatch, capsys):
     monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: entries)
     monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"wiki"})
     monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_runtime_plugin_states", lambda: {})
 
     plugins_cmd.cmd_list(_args(json=True))
 
@@ -153,6 +257,9 @@ def test_cmd_list_json_output_includes_entrypoint_source(monkeypatch, capsys):
         {
             "name": "wiki",
             "status": "enabled",
+            "active": False,
+            "runtime_status": "inactive",
+            "error": None,
             "version": "0.1.0",
             "description": "Karpathy-style LLM Wikis for Hermes",
             "source": "entrypoint",

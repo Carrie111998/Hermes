@@ -1130,6 +1130,44 @@ def _filter_plugin_entries(entries: list, args: Any, enabled: set, disabled: set
     return filtered
 
 
+def _get_runtime_plugin_states() -> dict[str, dict[str, Any]]:
+    """Load enabled plugins and return installer-facing activation state."""
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    try:
+        manager.discover_and_load()
+    except Exception:
+        # Individual registration failures are isolated by PluginManager.
+        # Keep the status command usable even if a broader discovery/config
+        # error occurs, and expose every state the manager did collect.
+        logger.warning("Plugin runtime discovery failed during status", exc_info=True)
+
+    states: dict[str, dict[str, Any]] = {}
+    for state in manager.list_plugins():
+        states[str(state["key"])] = state
+        states.setdefault(str(state["name"]), state)
+    return states
+
+
+def _plugin_runtime_fields(
+    name: str,
+    key: str,
+    configured_status: str,
+    runtime_states: dict[str, dict[str, Any]],
+) -> tuple[bool, str, Optional[str]]:
+    if configured_status != "enabled":
+        return False, "disabled", None
+    state = runtime_states.get(key) or runtime_states.get(name)
+    if state is None:
+        return False, "inactive", None
+    return (
+        bool(state.get("active")),
+        str(state.get("status") or "inactive"),
+        str(state["error"]) if state.get("error") else None,
+    )
+
+
 def cmd_list(args: Any | None = None) -> None:
     """List all plugins (bundled + user) with enabled/disabled state."""
     from rich.console import Console
@@ -1145,25 +1183,40 @@ def cmd_list(args: Any | None = None) -> None:
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
     entries = _filter_plugin_entries(entries, args, enabled, disabled)
+    runtime_states = _get_runtime_plugin_states()
 
     if getattr(args, "json", False):
-        payload = [
-            {
-                "name": name,
-                "status": _plugin_status(name, enabled, disabled, key=key),
-                "version": str(version),
-                "description": description,
-                "source": source,
-            }
-            for name, version, description, source, _dir, key in entries
-        ]
+        payload = []
+        for name, version, description, source, _dir, key in entries:
+            status = _plugin_status(name, enabled, disabled, key=key)
+            active, runtime_status, error = _plugin_runtime_fields(
+                name, key, status, runtime_states
+            )
+            payload.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "active": active,
+                    "runtime_status": runtime_status,
+                    "error": error,
+                    "version": str(version),
+                    "description": description,
+                    "source": source,
+                }
+            )
         print(json.dumps(payload, indent=2))
         return
 
     if getattr(args, "plain", False):
         for name, version, _description, source, _dir, key in entries:
             status = _plugin_status(name, enabled, disabled, key=key)
-            print(f"{status:12} {source:8} {str(version):8} {name}")
+            _active, runtime_status, _error = _plugin_runtime_fields(
+                name, key, status, runtime_states
+            )
+            display_status = (
+                f"{status}/{runtime_status}" if status == "enabled" else status
+            )
+            print(f"{display_status:18} {source:8} {str(version):8} {name}")
         return
 
     if not entries:
@@ -1179,10 +1232,14 @@ def cmd_list(args: Any | None = None) -> None:
 
     for name, version, description, source, _dir, key in entries:
         status_name = _plugin_status(name, enabled, disabled, key=key)
+        _active, runtime_status, _error = _plugin_runtime_fields(
+            name, key, status_name, runtime_states
+        )
         if status_name == "disabled":
             status = "[red]disabled[/red]"
         elif status_name == "enabled":
-            status = "[green]enabled[/green]"
+            color = "green" if runtime_status == "active" else "red"
+            status = f"[{color}]enabled/{runtime_status}[/{color}]"
         else:
             status = "[yellow]not enabled[/yellow]"
         table.add_row(name, status, str(version), description, source)

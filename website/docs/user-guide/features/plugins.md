@@ -264,7 +264,8 @@ Declarative plugins are symlinked with a `nix-managed-` prefix — they coexist 
 
 ```bash
 hermes plugins                               # unified interactive UI
-hermes plugins list                          # table: enabled / disabled / not enabled
+hermes plugins list                          # configured + runtime activation state
+hermes plugins list --json                   # machine-readable installer health status
 hermes plugins install user/repo             # install from Git, then prompt Enable? [y/N]
 hermes plugins install user/repo --enable    # install AND enable (no prompt)
 hermes plugins install user/repo --no-enable # install but leave disabled (no prompt)
@@ -306,7 +307,7 @@ context:
   engine: "compressor"    # default built-in compressor
 ```
 
-### Enabled vs. disabled vs. neither
+### Configuration and runtime activation
 
 Plugins occupy one of three states:
 
@@ -316,7 +317,18 @@ Plugins occupy one of three states:
 | `disabled` | Explicitly off — won't load even if also in `enabled` | (irrelevant) | Yes |
 | `not enabled` | Discovered but never opted in | No | No |
 
-The default for a newly-installed or bundled plugin is `not enabled`. `hermes plugins list` shows all three distinct states so you can tell what's been explicitly turned off vs. what's just waiting to be enabled.
+The default for a newly-installed or bundled plugin is `not enabled`.
+`hermes plugins list` preserves these configuration states and also reports
+the runtime state for enabled plugins as `enabled/active`,
+`enabled/inactive`, or `enabled/error`. An exception from one plugin's
+`register(ctx)` is isolated: its partial registrations are rolled back, it is
+reported as enabled but inactive with the error text, and unrelated plugins
+continue loading.
+
+Installers and health checks should use `hermes plugins list --json` and
+require both `"status": "enabled"` and `"active": true`. The
+`runtime_status` and `error` fields distinguish a successful activation from
+an enabled plugin that failed registration.
 
 In a running session, `/plugins` shows which plugins are currently loaded.
 

@@ -2153,7 +2153,6 @@ class SendResult:
     message_id: Optional[str] = None
     error: Optional[str] = None
     raw_response: Any = None
-    native_delivery_ack: Optional[NativeDeliveryAck] = None
     # Adapter-specific metadata.  Cross-layer contracts that affect delivery
     # semantics must be documented at the producer and consumer sites.  Current
     # known contract: Telegram edit overflow partials set
@@ -2179,6 +2178,12 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # Participant-host extensions are appended so legacy positional
+    # construction keeps binding the fifth argument to ``retryable``.
+    native_delivery_ack: Optional[NativeDeliveryAck] = None
+    # Positive adapter attestation that no native effect occurred. A bare
+    # ``success=False`` is ambiguous after transport submission.
+    native_delivery_non_occurrence_attested: bool = False
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every

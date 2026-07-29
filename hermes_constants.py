@@ -15,6 +15,10 @@ from pathlib import Path
 # Public, versioned contract for terminal gateway-message hooks and their
 # immutable route-bound delivery capabilities.
 GATEWAY_MESSAGE_HOOK_API_VERSION = 2
+# Public umbrella contract for participant plugins. This major is independent
+# of Hermes package releases; compatible additions stay on 2 and breaking
+# host-contract changes require a new major.
+PARTICIPANT_HOST_API_VERSION = 2
 
 
 _profile_fallback_warned: bool = False
