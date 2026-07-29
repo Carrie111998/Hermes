@@ -42,6 +42,41 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
+def _sync_final_response_to_last_assistant(messages, final_response) -> bool:
+    """Write the hook-transformed ``final_response`` back into the turn's last
+    assistant text message so persisted history matches what the user was
+    shown (#44239).
+
+    Walks backwards only within the current turn (stops at the user message
+    that started it, mirroring the reasoning extraction in
+    :func:`finalize_turn`). Only a plain-text assistant row is updated — a
+    tool-call row or multimodal (list) content is never rewritten, because
+    reconciling a transformed string against those structures is ambiguous.
+
+    The row may already have been flushed to SQLite by the incremental
+    tool-call persist, which stamps ``_DB_PERSISTED_MARKER`` so later flushes
+    skip it (``run_agent._persist_session``). Editing content in place without
+    clearing that marker would leave the transform invisible in the durable
+    store — the same resume-replays-raw-text bug this fix exists to close, just
+    relocated. Pop the marker so the next ``_persist_session`` re-writes the
+    row, exactly as the #43849/#44100 tail-fill block does.
+
+    Returns True if a message was updated.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "user":
+            break  # turn boundary — never rewrite a prior turn
+        if msg.get("role") == "assistant":
+            if msg.get("tool_calls") or not isinstance(msg.get("content"), str):
+                break
+            msg["content"] = final_response
+            msg.pop("_db_persisted", None)
+            return True
+    return False
+
+
 # Verification continuation scaffolding flags: verify-on-stop / pre_verify
 # inject a synthetic user nudge to keep the agent going one more turn.
 # These nudges must be stripped from returned/live history to avoid
@@ -259,10 +294,17 @@ def finalize_turn(
         _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
         logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
-    # Persist session to both JSON log and SQLite only after private retry
-    # scaffolding has been removed. Otherwise a later user "continue" turn
-    # can replay assistant("(empty)") / recovery nudges and fall into the
-    # same empty-response loop again.
+    # Prepare the durable transcript before it is read or persisted. Private
+    # retry scaffolding is dropped first: otherwise a later user "continue"
+    # turn can replay assistant("(empty)") / recovery nudges and fall into the
+    # same empty-response loop again. Then close any interrupted tool tail and
+    # enforce the "delivered final_response ⇒ assistant row" invariant.
+    #
+    # The actual ``_persist_session`` call is deferred until AFTER the
+    # transform_llm_output hook below, so a plugin-transformed response is what
+    # lands in the session history (#44239). Everything in this block only
+    # mutates the in-memory transcript, so deferring the write does not change
+    # what any of these steps compute.
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -349,54 +391,64 @@ def finalize_turn(
         _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
         if callable(_apply_override):
             _apply_override(messages)
-        agent._persist_session(messages, conversation_history)
-    except Exception as _persist_err:
-        _cleanup_errors.append(f"persist_session: {_persist_err}")
-        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+    except Exception as _prep_err:
+        _cleanup_errors.append(f"finalize_prep: {_prep_err}")
+        logger.error("finalize_turn: transcript prep failed: %s", _prep_err, exc_info=True)
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
     # When the last message is a tool result (agent was mid-work), log
     # at WARNING — this is the "just stops" scenario users report.
-    _last_msg_role = messages[-1].get("role") if messages else None
-    _last_tool_name = None
-    if _last_msg_role == "tool":
-        # Walk back to find the assistant message with the tool call
-        for _m in reversed(messages):
-            if _m.get("role") == "assistant" and _m.get("tool_calls"):
-                _tcs = _m["tool_calls"]
-                if _tcs and isinstance(_tcs[0], dict):
-                    _last_tool_name = _tcs[-1].get("function", {}).get("name")
-                break
+    #
+    # Guarded: this block sits between the transcript prep above and the
+    # deferred _persist_session below (#44239), so an exception raised while
+    # merely BUILDING a log line would skip the session write and lose the
+    # turn — the #8049 failure mode. It walks message dicts without an
+    # isinstance guard on every access (``messages[-1].get`` /
+    # ``_m.get(...)``), which raises on a malformed non-dict entry. Diagnostics
+    # must never gate persistence, so a failure here is logged and dropped.
+    try:
+        _last_msg_role = messages[-1].get("role") if messages else None
+        _last_tool_name = None
+        if _last_msg_role == "tool":
+            # Walk back to find the assistant message with the tool call
+            for _m in reversed(messages):
+                if _m.get("role") == "assistant" and _m.get("tool_calls"):
+                    _tcs = _m["tool_calls"]
+                    if _tcs and isinstance(_tcs[0], dict):
+                        _last_tool_name = _tcs[-1].get("function", {}).get("name")
+                    break
 
-    _turn_tool_count = sum(
-        1 for m in messages
-        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
-    )
-    _resp_len = len(final_response) if final_response else 0
-    _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
-    _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
-
-    _diag_msg = (
-        "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
-        "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
-    )
-    _diag_args = (
-        _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
-        _budget_used, _budget_max,
-        _turn_tool_count, _last_msg_role, _resp_len,
-        agent.session_id or "none",
-    )
-
-    if _last_msg_role == "tool" and not interrupted:
-        # Agent was mid-work — this is the "just stops" case.
-        logger.warning(
-            "Turn ended with pending tool result (agent may appear stuck). "
-            + _diag_msg + " last_tool=%s",
-            *_diag_args, _last_tool_name,
+        _turn_tool_count = sum(
+            1 for m in messages
+            if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
         )
-    else:
-        logger.info(_diag_msg, *_diag_args)
+        _resp_len = len(final_response) if final_response else 0
+        _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
+        _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
+
+        _diag_msg = (
+            "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
+            "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
+        )
+        _diag_args = (
+            _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
+            _budget_used, _budget_max,
+            _turn_tool_count, _last_msg_role, _resp_len,
+            agent.session_id or "none",
+        )
+
+        if _last_msg_role == "tool" and not interrupted:
+            # Agent was mid-work — this is the "just stops" case.
+            logger.warning(
+                "Turn ended with pending tool result (agent may appear stuck). "
+                + _diag_msg + " last_tool=%s",
+                *_diag_args, _last_tool_name,
+            )
+        else:
+            logger.info(_diag_msg, *_diag_args)
+    except Exception as _diag_err:
+        logger.warning("finalize_turn: turn-exit diagnostic log failed: %s", _diag_err)
 
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this
@@ -503,6 +555,30 @@ def finalize_turn(
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
+
+    # Persist session to both JSON log and SQLite. This runs AFTER the
+    # transform_llm_output hook so a plugin-transformed response is what lands
+    # in the session history (#44239). Without it the user sees the transformed
+    # text this turn, but the raw model output is what gets replayed on the
+    # next turn and after /resume. The transformed text is synced into the
+    # turn's last assistant row first, so result["messages"], the JSON log and
+    # SQLite all agree with final_response.
+    #
+    # Persistence stays BEFORE post_llm_call: that hook is observability-only
+    # per docs/observability/README.md (its return value is discarded — there
+    # is no override path), and its plugins may read the session store
+    # expecting the completed turn to already be present.
+    #
+    # Guarded like the other post-loop cleanup surfaces so an SQLite write
+    # failure surfaces on ``cleanup_errors`` instead of killing the turn
+    # (#8049); the transcript-prep steps above already ran regardless.
+    try:
+        if _response_transformed:
+            _sync_final_response_to_last_assistant(messages, final_response)
+        agent._persist_session(messages, conversation_history)
+    except Exception as _persist_err:
+        _cleanup_errors.append(f"persist_session: {_persist_err}")
+        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
