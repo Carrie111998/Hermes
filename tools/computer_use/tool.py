@@ -164,6 +164,9 @@ def _get_backend() -> ComputerUseBackend:
                 _backend = CuaDriverBackend()
             elif backend_name == "noop":  # pragma: no cover
                 _backend = _NoopBackend()
+            elif backend_name == "win32":
+                from tools.computer_use.win32_backend import Win32NativeBackend
+                _backend = Win32NativeBackend()
             else:
                 raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
             try:
@@ -1038,6 +1041,10 @@ def check_computer_use_requirements() -> bool:
     """
     if sys.platform not in ("darwin", "win32", "linux"):
         return False
+    backend_name = os.environ.get("HERMES_COMPUTER_USE_BACKEND", "cua").lower()
+    if backend_name == "win32":
+        # win32 backend — always available on Windows
+        return sys.platform == "win32"
     from tools.computer_use.cua_backend import cua_driver_binary_available
     return cua_driver_binary_available()
 
