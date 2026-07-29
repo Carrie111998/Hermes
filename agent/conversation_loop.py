@@ -117,6 +117,41 @@ def _context_admission_input_limit(
     )
     return max(1, limit - max(estimator_margin, output_reserve))
 
+
+def _compression_made_progress(compressor: Any) -> bool:
+    """Read an optional engine progress verdict without trusting duck-typed mocks."""
+    probe = getattr(compressor, "compression_made_progress", None)
+    if not callable(probe):
+        return False
+    try:
+        return probe() is True
+    except Exception as exc:
+        logger.debug("Context engine progress probe failed: %s", exc)
+        return False
+
+
+def _context_admission_pressure(compressor: Any, rough_tokens: int) -> int:
+    """Remove only provider-proven fixed over-count from a rough estimate.
+
+    The full rough growth since the fitting baseline is retained. Missing or
+    inconsistent calibration falls back to the unmodified estimate.
+    """
+    rough = max(0, int(rough_tokens or 0))
+    baseline_rough = int(
+        getattr(compressor, "last_rough_tokens_when_real_prompt_fit", 0) or 0
+    )
+    baseline_real = int(getattr(compressor, "last_real_prompt_tokens", 0) or 0)
+    threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
+    if (
+        baseline_rough <= 0
+        or baseline_real <= 0
+        or baseline_real >= baseline_rough
+        or (threshold > 0 and baseline_real >= threshold)
+        or rough < baseline_rough
+    ):
+        return rough
+    return baseline_real + (rough - baseline_rough)
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -1230,6 +1265,11 @@ def run_conversation(
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
+    # ``compression_attempts`` is a consecutive no-progress streak, not a
+    # lifetime budget for a long tool turn. Arm this latch only when the engine
+    # reports real context reduction; clear the streak after the next successful
+    # model response.
+    _last_compression_effective = False
     # One resolved per-turn compression attempt cap, shared by every site that
     # consumes ``compression_attempts``: the pre-API pressure gate, the
     # overflow/413 retry handlers, and the post-tool compaction gate.
@@ -1832,9 +1872,12 @@ def run_conversation(
             _configured_context_limit,
             reserved_output_tokens=getattr(agent, "max_tokens", 0),
         )
+        _admission_pressure_tokens = _context_admission_pressure(
+            _compressor, request_pressure_tokens
+        )
         _request_over_safe_limit = (
             _safe_input_limit > 0
-            and request_pressure_tokens >= _safe_input_limit
+            and _admission_pressure_tokens >= _safe_input_limit
         )
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
@@ -1951,6 +1994,8 @@ def run_conversation(
                 if pending_moa_prepared_request is _moa_prepared_request:
                     pending_moa_prepared_request = None
             else:
+                if _compression_made_progress(agent.context_compressor):
+                    _last_compression_effective = True
                 # Reset retry/empty-response state so the compacted request
                 # gets a fresh chance instead of inheriting stale recovery
                 # counters from the pre-compaction history.
@@ -2014,8 +2059,9 @@ def run_conversation(
                 pass
             logger.error(
                 "Blocking provider call above safe input limit: "
-                "estimated_input=%s safe_input_limit=%s configured_context=%s "
-                "compression_attempts=%s/%s model=%s session=%s",
+                "admission_input=%s rough_input=%s safe_input_limit=%s "
+                "configured_context=%s compression_attempts=%s/%s model=%s session=%s",
+                _admission_pressure_tokens,
                 request_pressure_tokens,
                 _safe_input_limit,
                 _configured_context_limit,
@@ -2033,7 +2079,8 @@ def run_conversation(
                 "completed": False,
                 "api_calls": api_call_count,
                 "provider_call_blocked": True,
-                "estimated_input_tokens": request_pressure_tokens,
+                "estimated_input_tokens": _admission_pressure_tokens,
+                "rough_input_tokens": request_pressure_tokens,
                 "safe_input_limit": _safe_input_limit,
                 "configured_context_limit": _configured_context_limit,
             }
@@ -2674,6 +2721,9 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                if _last_compression_effective:
+                    compression_attempts = 0
+                    _last_compression_effective = False
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -4318,6 +4368,7 @@ def run_conversation(
                                 )
                             )
                             time.sleep(2)
+                            _last_compression_effective = True
                             _retry.restart_with_compressed_messages = True
                             break
                     # Fall through to normal error handling if compression
@@ -4593,6 +4644,7 @@ def run_conversation(
                         else:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
                         time.sleep(2)  # Brief pause between compression retries
+                        _last_compression_effective = True
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -4847,6 +4899,7 @@ def run_conversation(
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
                         time.sleep(2)  # Brief pause between compression retries
+                        _last_compression_effective = True
                         _retry.restart_with_compressed_messages = True
                         break
                     else:
@@ -6300,6 +6353,8 @@ def run_conversation(
                         # compression_exhausted (#9893/#35809).
                         compression_attempts -= 1
                     else:
+                        if _compression_made_progress(agent.context_compressor):
+                            _last_compression_effective = True
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )

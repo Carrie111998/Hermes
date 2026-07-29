@@ -21,11 +21,15 @@ import contextlib
 import io
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.conversation_loop import _context_admission_input_limit
+from agent.conversation_loop import (
+    _context_admission_input_limit,
+    _context_admission_pressure,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -166,6 +170,26 @@ def test_context_admission_limit(context_limit, output_reserve, expected):
     ) == expected
 
 
+def test_context_admission_pressure_removes_only_proven_fixed_overcount():
+    compressor = SimpleNamespace(
+        last_rough_tokens_when_real_prompt_fit=200_000,
+        last_real_prompt_tokens=160_000,
+        threshold_tokens=204_000,
+    )
+
+    assert _context_admission_pressure(compressor, 270_000) == 230_000
+
+
+def test_context_admission_pressure_fails_closed_without_valid_calibration():
+    compressor = SimpleNamespace(
+        last_rough_tokens_when_real_prompt_fit=200_000,
+        last_real_prompt_tokens=210_000,
+        threshold_tokens=204_000,
+    )
+
+    assert _context_admission_pressure(compressor, 270_000) == 270_000
+
+
 def test_pre_provider_admission_blocks_uncompressible_request(monkeypatch, tmp_path):
     agent = _make_agent(monkeypatch, tmp_path, max_attempts=3)
     agent.context_compressor.context_length = 200_000
@@ -258,5 +282,36 @@ def test_request_below_safe_boundary_reaches_provider(monkeypatch, tmp_path):
     ):
         result = agent.run_conversation("hello")
 
+    assert result["completed"] is True
+    provider_call.assert_called_once()
+
+
+def test_provider_proven_calibration_avoids_false_local_block(monkeypatch, tmp_path):
+    agent: Any = _make_agent(monkeypatch, tmp_path, max_attempts=3)
+    compressor = agent.context_compressor
+    compressor.context_length = 200_000
+    compressor.threshold_tokens = 150_000
+    compressor.last_rough_tokens_when_real_prompt_fit = 180_000
+    compressor.last_real_prompt_tokens = 100_000
+    agent.compression_enabled = False
+    agent.max_tokens = 0
+
+    with (
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=270_000,
+        ),
+        patch.object(
+            agent,
+            "_interruptible_api_call",
+            return_value=_stop_response(),
+        ) as provider_call,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert _context_admission_pressure(compressor, 270_000) == 190_000
     assert result["completed"] is True
     provider_call.assert_called_once()
