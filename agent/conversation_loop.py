@@ -4323,6 +4323,14 @@ def run_conversation(
                 # + provider-specific troubleshooting guidance unchanged.
                 if (
                     classified.is_auth
+                    # Defensive: every auth-classified reason currently sets
+                    # ``should_fallback=True`` in ``error_classifier.py``, so
+                    # this guard is a no-op today. It codifies the principle
+                    # that any future auth reason the classifier marks as
+                    # non-recoverable-by-fallback must not burn a fallback
+                    # slot — see #16022 for the matching guard inside
+                    # ``is_client_error``.
+                    and classified.should_fallback
                     and not _retry.auth_failover_attempted
                     and agent._fallback_index < len(agent._fallback_chain)
                 ):
@@ -4855,14 +4863,25 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    #
+                    # Honor the classifier's explicit `should_fallback`
+                    # signal: when it is False, the error is deterministic
+                    # for this model/output (e.g., malformed tool-call
+                    # arguments that any provider will reproduce, or a
+                    # provider-side account policy block). Skipping the
+                    # fallback cascade in those cases prevents burning a
+                    # fallback slot on a guaranteed re-failure. See #16022
+                    # and the existing `should_fallback=False` paths in
+                    # `error_classifier.py` (provider_policy_blocked,
+                    # invalid_encrypted_content).
+                    if classified.should_fallback and agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if classified.should_fallback and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5082,7 +5101,16 @@ def run_conversation(
                         agent._fallback_index = 0
                         agent._fallback_activated = False
                         continue
-                    # Try fallback before giving up entirely
+                    # Try fallback before giving up entirely. NOTE: this path
+                    # is reached only by retryable errors whose retry budget
+                    # is spent (malformed-args and other non-retryable
+                    # client errors abort earlier via the `is_client_error`
+                    # branch above, which carries the `should_fallback`
+                    # guard). For overloaded / timeout / rate_limit at
+                    # retries-exhausted, switching providers is a legitimate
+                    # recovery so the call stays unconditional — see #16022
+                    # for the semantic analysis of why `should_fallback` is
+                    # not a uniform signal here.
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                     if agent._try_activate_fallback():

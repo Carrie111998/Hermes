@@ -451,6 +451,30 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
     "new_sensitive",
 ]
 
+# Provider-side tool-call argument validation errors are request format
+# problems, even when the session is large. Keep them above the generic
+# 400 + large-session heuristic so malformed tool-call JSON does not trigger
+# context compression retries.
+#
+# Cover both `tool_call` and `function_call` spellings — providers/aggregators
+# are inconsistent about which they emit. #58233 documents the
+# `function_call arguments` variant; without it, OpenRouter-wrapped responses
+# that name the function-call form slip past this guard and reach the generic
+# 400 + large-session heuristic, re-classifying as context_overflow and
+# burning a compression retry on a deterministic format error.
+_INVALID_TOOL_CALL_ARGUMENT_PATTERNS = [
+    "invalid tool call arguments",
+    "invalid tool_call arguments",
+    "invalid tool_calls arguments",
+    "invalid function call arguments",
+    "invalid function_call arguments",
+    "tool call arguments are invalid",
+    "tool_call arguments are invalid",
+    "tool calls arguments are invalid",
+    "function call arguments are invalid",
+    "function_call arguments are invalid",
+]
+
 # Auth patterns (non-status-code signals)
 _AUTH_PATTERNS = [
     "invalid api key",
@@ -1388,6 +1412,25 @@ def _classify_400(
             retryable=False,
             should_rotate_credential=True,
             should_fallback=True,
+        )
+
+    # Provider-side malformed tool-call arguments are descriptive format
+    # errors. Classify them before the generic 400 + large-session heuristic
+    # so a bad tool call does not waste a retry on context compression.
+    #
+    # `should_fallback=False` is deliberate: the malformed arguments were
+    # produced by THIS model run, so any fallback provider that re-runs the
+    # same model will produce the same arguments and the same 400. Activating
+    # fallback would just shift the same failure to a different provider
+    # instead of recovering. The conversation-loop fallback gate reads this
+    # flag and skips `_try_activate_fallback()` when it is False — see
+    # #16022 (this PR) and the matching regression in
+    # `tests/run_agent/test_16022_invalid_tool_args_no_fallback.py`.
+    if any(p in error_msg for p in _INVALID_TOOL_CALL_ARGUMENT_PATTERNS):
+        return result_fn(
+            FailoverReason.format_error,
+            retryable=False,
+            should_fallback=False,
         )
 
     # Generic 400 + large session → probable context overflow
