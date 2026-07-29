@@ -297,6 +297,64 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     assert not any(t["id"] == task["id"] for t in columns["todo"])
 
 
+def test_completed_pending_review_has_dashboard_column_and_dist_display(client):
+    """Dashboard display bundle must expose the missing-exit review status."""
+
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "no terminal signal", "assignee": "worker"},
+    ).json()["task"]
+
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'completed_pending_review' WHERE id = ?",
+                (task["id"],),
+            )
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
+    assert any(t["id"] == task["id"] for t in columns["completed_pending_review"])
+    assert not any(t["id"] == task["id"] for t in columns["todo"])
+
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    assert '"completed_pending_review"' in bundle
+    assert "Pending Review" in bundle
+    assert "hermes-kanban-dot-completed-pending-review" in bundle
+    assert "completed_pending_review: { amber:" in bundle
+
+
+def test_dashboard_dist_surfaces_missing_exit_signal_stats_metric():
+    """The shipped bundle must render the backend missing-exit-signal metric."""
+
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    assert "function BoardStatsStrip(props)" in bundle
+    assert '`${API}/stats`' in bundle
+    assert "missing_exit_signal_24h" in bundle
+    assert "missing_exit_signal_rate_24h" in bundle
+    assert "Missing-exit-signal 24h" in bundle
+
+
 def test_tenant_filter(client):
     client.post("/api/plugins/kanban/tasks", json={"title": "A", "tenant": "t1"})
     client.post("/api/plugins/kanban/tasks", json={"title": "B", "tenant": "t2"})
