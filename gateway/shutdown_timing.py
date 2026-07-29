@@ -24,6 +24,16 @@ DEFAULT_SHUTDOWN_POST_DRAIN_CLEANUP_BUDGET_S = 60.0
 # is allowed to send SIGKILL to the cgroup.
 DEFAULT_SYSTEMD_SHUTDOWN_KILL_MARGIN_S = 15.0
 
+# A year is already far beyond a meaningful interactive/service shutdown.
+# Bounding every timing component keeps monotonic deadlines finite, makes the
+# generated systemd duration portable, and prevents float precision from
+# collapsing the supervisor-only margin for absurd custom values.
+MAX_GATEWAY_SHUTDOWN_TIMING_COMPONENT_S = 365.0 * 24.0 * 60.0 * 60.0
+
+# The service manager must always be strictly later than the in-process
+# watchdog, even if a caller explicitly supplies a zero custom margin.
+MIN_SYSTEMD_SHUTDOWN_KILL_MARGIN_S = 1.0
+
 
 @dataclass(frozen=True)
 class GatewayShutdownTiming:
@@ -43,7 +53,10 @@ def _nonnegative_finite(value: Any, *, fallback: float) -> float:
         return fallback
     if not math.isfinite(resolved):
         return fallback
-    return max(resolved, 0.0)
+    return min(
+        max(resolved, 0.0),
+        MAX_GATEWAY_SHUTDOWN_TIMING_COMPONENT_S,
+    )
 
 
 def resolve_gateway_shutdown_timing(
@@ -66,12 +79,20 @@ def resolve_gateway_shutdown_timing(
         post_drain_cleanup_budget_s,
         fallback=DEFAULT_SHUTDOWN_POST_DRAIN_CLEANUP_BUDGET_S,
     )
-    kill_margin = _nonnegative_finite(
-        systemd_kill_margin_s,
-        fallback=DEFAULT_SYSTEMD_SHUTDOWN_KILL_MARGIN_S,
+    kill_margin = max(
+        _nonnegative_finite(
+            systemd_kill_margin_s,
+            fallback=DEFAULT_SYSTEMD_SHUTDOWN_KILL_MARGIN_S,
+        ),
+        MIN_SYSTEMD_SHUTDOWN_KILL_MARGIN_S,
     )
-    controlled_exit_deadline = drain + cleanup_budget
-    timeout_stop_sec = math.ceil(controlled_exit_deadline + kill_margin)
+    controlled_exit_deadline = math.fsum((drain, cleanup_budget))
+    # Add independently rounded terms. Summing as floats first can erase a
+    # small margin next to a huge custom drain value; integer arithmetic keeps
+    # TimeoutStopSec provably and strictly later than the watchdog deadline.
+    timeout_stop_sec = math.ceil(controlled_exit_deadline) + math.ceil(kill_margin)
+    if timeout_stop_sec <= controlled_exit_deadline:
+        timeout_stop_sec = math.floor(controlled_exit_deadline) + 1
     return GatewayShutdownTiming(
         drain_timeout_s=drain,
         post_drain_cleanup_budget_s=cleanup_budget,

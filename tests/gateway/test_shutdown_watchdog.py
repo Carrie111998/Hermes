@@ -153,3 +153,31 @@ def test_gateway_runner_exposes_shutdown_watchdog_state():
     runner._shutdown_watchdog_done.set()
     assert runner._shutdown_watchdog_done.is_set()
     assert runner._loop_heartbeat_task is None
+
+
+def test_post_run_tail_waits_share_the_runner_absolute_deadline():
+    from gateway.run import (
+        GatewayRunner,
+        _remaining_shutdown_tail_budget,
+    )
+
+    runner = object.__new__(GatewayRunner)
+    runner._shutdown_deadline_monotonic = time.monotonic() + 0.2
+
+    first = _remaining_shutdown_tail_budget(runner, 65.0)
+    time.sleep(0.05)
+    second = _remaining_shutdown_tail_budget(runner, 35.0)
+
+    assert 0 < second < first <= 0.2
+
+
+def test_runner_watchdog_disarm_is_explicit_and_idempotent():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._shutdown_watchdog_done = threading.Event()
+
+    runner._disarm_shutdown_watchdog()
+    runner._disarm_shutdown_watchdog()
+
+    assert runner._shutdown_watchdog_done.is_set()

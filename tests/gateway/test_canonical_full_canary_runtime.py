@@ -1989,7 +1989,10 @@ def test_gateway_main_accepts_config_and_writer_readiness_flags(
         ],
     )
     run.main()
-    assert captured["kwargs"] == {"require_canonical_writer": True}
+    assert captured["kwargs"] == {
+        "_process_lifecycle_owned": True,
+        "require_canonical_writer": True,
+    }
     assert captured["exit_code"] == 0
 
 

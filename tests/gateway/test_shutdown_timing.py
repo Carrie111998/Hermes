@@ -1,8 +1,12 @@
 """Behavior contracts for the shared supervised-shutdown timing policy."""
 
+import math
+
 from gateway.shutdown_timing import (
     DEFAULT_SHUTDOWN_POST_DRAIN_CLEANUP_BUDGET_S,
     DEFAULT_SYSTEMD_SHUTDOWN_KILL_MARGIN_S,
+    MAX_GATEWAY_SHUTDOWN_TIMING_COMPONENT_S,
+    MIN_SYSTEMD_SHUTDOWN_KILL_MARGIN_S,
     resolve_gateway_shutdown_timing,
 )
 
@@ -74,3 +78,23 @@ def test_explicit_nonnegative_overrides_remain_supported():
     assert timing.drain_timeout_s == 0
     assert timing.controlled_exit_deadline_s == 10
     assert timing.systemd_timeout_stop_sec == 12
+
+
+def test_extreme_values_stay_finite_and_preserve_strict_supervisor_ordering():
+    timing = resolve_gateway_shutdown_timing(
+        1e18,
+        post_drain_cleanup_budget_s=1e18,
+        systemd_kill_margin_s=0,
+    )
+
+    assert timing.drain_timeout_s == MAX_GATEWAY_SHUTDOWN_TIMING_COMPONENT_S
+    assert (
+        timing.post_drain_cleanup_budget_s
+        == MAX_GATEWAY_SHUTDOWN_TIMING_COMPONENT_S
+    )
+    assert math.isfinite(timing.controlled_exit_deadline_s)
+    assert (
+        timing.systemd_kill_margin_s
+        == MIN_SYSTEMD_SHUTDOWN_KILL_MARGIN_S
+    )
+    assert timing.systemd_timeout_stop_sec > timing.controlled_exit_deadline_s

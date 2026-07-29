@@ -32,6 +32,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -2793,6 +2794,29 @@ from gateway.whatsapp_identity import (
 
 logger = logging.getLogger(__name__)
 
+# A start_gateway-owned shutdown watchdog must outlive the event loop itself.
+# asyncio.run() performs task cancellation, async-generator finalization, and
+# default-executor shutdown only after start_gateway returns. Any of those
+# phases can wedge, so the event is published here and disarmed only at the
+# final process hard-exit boundary.
+_PROCESS_SHUTDOWN_WATCHDOG_LOCK = threading.Lock()
+_PROCESS_SHUTDOWN_WATCHDOG_DONE: Optional[threading.Event] = None
+
+
+def _publish_process_shutdown_watchdog(done: threading.Event) -> None:
+    global _PROCESS_SHUTDOWN_WATCHDOG_DONE
+    with _PROCESS_SHUTDOWN_WATCHDOG_LOCK:
+        _PROCESS_SHUTDOWN_WATCHDOG_DONE = done
+
+
+def _disarm_process_shutdown_watchdog() -> None:
+    global _PROCESS_SHUTDOWN_WATCHDOG_DONE
+    with _PROCESS_SHUTDOWN_WATCHDOG_LOCK:
+        done = _PROCESS_SHUTDOWN_WATCHDOG_DONE
+        _PROCESS_SHUTDOWN_WATCHDOG_DONE = None
+    if done is not None:
+        done.set()
+
 
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
@@ -4309,6 +4333,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_task: Optional[asyncio.Task] = None
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
+    _defer_shutdown_watchdog_disarm: bool = False
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _pending_one_turn_model_restores: Dict[str, Dict[str, Any]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
@@ -4803,7 +4828,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
-        self._async_session_store = AsyncSessionStore(self.session_store)
+        self._async_session_store = AsyncSessionStore(
+            self.session_store,
+            offload=self._run_in_executor_with_context,
+        )
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -4815,6 +4843,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._draining = False
         self._profile_failed_platforms: Dict[str, Dict[Platform, asyncio.Task]] = {}
         self._systemd_watchdog = None
+        self._defer_shutdown_watchdog_disarm = False
         # External (NAS-driven) drain state — distinct from the shutdown
         # ``_draining`` flag above. Set by ``_drain_control_watcher`` when the
         # ``.drain_request.json`` marker is present: the gateway flips
@@ -5058,7 +5087,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_state import AsyncSessionDB, SessionDB
 
             self._session_db = AsyncSessionDB(
-                SessionDB(self._gateway_state_db_path)
+                SessionDB(self._gateway_state_db_path),
+                offload=self._run_in_executor_with_context,
             )
         except Exception as e:
             # WARNING (not DEBUG) so the failure appears in errors.log — matches
@@ -5694,7 +5724,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return False
-        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
+        # Runs off-loop through the gateway's tracked executor; use the sync handle.
         session_db = getattr(session_db, "_db", session_db)
         try:
             raw = session_db.is_telegram_topic_mode_enabled(
@@ -5794,7 +5824,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None or not source.chat_id or not source.thread_id:
             return
-        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
+        # Runs off-loop through the gateway's tracked executor; use the sync handle.
         session_db = getattr(session_db, "_db", session_db)
         session_db.bind_telegram_topic(
             chat_id=str(source.chat_id),
@@ -5866,7 +5896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return None
-        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
+        # Runs off-loop through the gateway's tracked executor; use the sync handle.
         session_db = getattr(session_db, "_db", session_db)
         try:
             bindings = session_db.list_telegram_topic_bindings_for_chat(
@@ -7481,12 +7511,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _load_restart_drain_timeout() -> float:
         """Load graceful gateway restart/stop drain timeout in seconds."""
-        raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
-        if not raw:
+        raw = ""
+        try:
             cfg = _load_gateway_runtime_config()
-            raw = str(
-                cfg_get(cfg, "agent", "restart_drain_timeout", default="") or ""
-            ).strip()
+            configured = cfg_get(
+                cfg,
+                "agent",
+                "restart_drain_timeout",
+                default=None,
+            )
+            if configured is not None:
+                raw = str(configured).strip()
+        except Exception:
+            logger.debug(
+                "Could not resolve restart_drain_timeout from config",
+                exc_info=True,
+            )
         value = parse_restart_drain_timeout(raw)
         if raw and value == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT:
             try:
@@ -7736,7 +7776,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key or session_store is None:
             return False
         try:
-            session_id = await asyncio.to_thread(
+            session_id = await self._run_in_executor_with_context(
                 self._lookup_session_id_under_store_lock, session_store, session_key
             )
         except (AttributeError, TypeError):
@@ -7757,7 +7797,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         raw_db = getattr(session_db, "_db", session_db)
         try:
-            holder = await asyncio.to_thread(
+            holder = await self._run_in_executor_with_context(
                 raw_db.get_compression_lock_holder, str(session_id)
             )
             return bool(holder)
@@ -10253,6 +10293,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             # Set up message + fatal error handlers
+            adapter.gateway_runner = self
             adapter.set_message_handler(self._handle_message)
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
@@ -11424,6 +11465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
+                    adapter.gateway_runner = self
                     adapter.set_message_handler(self._handle_message)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
@@ -11733,6 +11775,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # delayed hard-exit in the worker.
             _watchdog_done = threading.Event()
             self._shutdown_watchdog_done = _watchdog_done
+            if getattr(self, "_defer_shutdown_watchdog_disarm", False):
+                _publish_process_shutdown_watchdog(_watchdog_done)
             _stop_started_at = time.monotonic()
             _stop_started_at_box: dict[str, float] = {"t": _stop_started_at}
             _watchdog_delay = resolve_shutdown_watchdog_delay(
@@ -11776,7 +11820,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _shutdown_deadline_monotonic,
                 )
             finally:
-                _watchdog_done.set()
+                # ``start_gateway`` owns cron/housekeeping/MCP teardown after
+                # runner.stop(). Keep the same out-of-loop watchdog armed
+                # through that tail; direct GatewayRunner users disarm here.
+                self._shutdown_event.set()
+                if not getattr(
+                    self,
+                    "_defer_shutdown_watchdog_disarm",
+                    False,
+                ):
+                    _watchdog_done.set()
 
         async def _stop_impl_body(
             _kill_tool_subprocesses,
@@ -12050,8 +12103,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._pending_approvals.clear()
             if hasattr(self, "_busy_ack_ts"):
                 self._busy_ack_ts.clear()
-            self._shutdown_event.set()
-
             # Global cleanup: kill any remaining tool subprocesses not tied
             # to a specific agent (catch-all for zombie prevention). On the
             # drain-timeout path we already did this earlier after agent
@@ -12204,6 +12255,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._stop_task = asyncio.create_task(_stop_impl())
         await self._stop_task
+
+    def _disarm_shutdown_watchdog(self) -> None:
+        """Disarm the process shutdown backstop after every teardown owner exits."""
+        done = getattr(self, "_shutdown_watchdog_done", None)
+        if done is not None:
+            done.set()
 
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
@@ -12529,6 +12586,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        adapter.gateway_runner = self
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -14244,7 +14302,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
 
         if canonical == "new":
-            if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+            if await self._run_in_executor_with_context(
+                self._is_telegram_topic_root_lobby, source
+            ):
                 return self._telegram_topic_root_new_message()
 
             async def _do_reset():
@@ -14862,7 +14922,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
-        if not is_internal and await asyncio.to_thread(
+        if not is_internal and await self._run_in_executor_with_context(
             self._is_telegram_topic_root_lobby, source
         ):
             # Debounce the lobby reminder so a user who forgets about
@@ -15088,7 +15148,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # ``/api/show`` capability probe for local servers — whose
                 # request timeout would otherwise stall the whole gateway event
                 # loop (every session) while a single image is routed.
-                _img_mode = await asyncio.to_thread(
+                _img_mode = await self._run_in_executor_with_context(
                     self._decide_image_input_mode,
                     source=source,
                     session_key=session_key,
@@ -15483,7 +15543,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return the single async facade for this runner's SessionStore."""
         facade = getattr(self, "_async_session_store", None)
         if facade is None or facade._store is not self.session_store:
-            facade = AsyncSessionStore(self.session_store)
+            facade = AsyncSessionStore(
+                self.session_store,
+                offload=self._run_in_executor_with_context,
+            )
             self._async_session_store = facade
         return facade
 
@@ -15531,7 +15594,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
         # last-active topic so a cross-topic Reply or stripped plain reply
         # doesn't fragment the conversation across sessions.
-        recovered = await asyncio.to_thread(
+        recovered = await self._run_in_executor_with_context(
             self._recover_telegram_topic_thread_id, source
         )
         if recovered is not None:
@@ -15562,7 +15625,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+        if await self._run_in_executor_with_context(
+            self._is_telegram_topic_lane, source
+        ):
             try:
                 binding = (
                     (
@@ -15621,7 +15686,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if bound_session_id and bound_session_id != str(
                     binding.get("session_id") or ""
                 ):
-                    await asyncio.to_thread(
+                    await self._run_in_executor_with_context(
                         self._sync_telegram_topic_binding,
                         source,
                         session_entry,
@@ -15629,7 +15694,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             else:
                 try:
-                    await asyncio.to_thread(
+                    await self._run_in_executor_with_context(
                         self._record_telegram_topic_binding, source, session_entry
                     )
                 except Exception:
@@ -15821,7 +15886,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = await asyncio.to_thread(
+                            session_info = await self._run_in_executor_with_context(
                                 self._reset_notice_session_info, source
                             )
                             if session_info:
@@ -16288,16 +16353,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_agent._owns_runtime_resources = False
                                     _hyg_agent._print_fn = lambda *a, **kw: None
 
-                                    loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
-                                    _hyg_future = loop.run_in_executor(
-                                        None,
-                                        lambda: _hyg_agent._compress_context(
-                                            _hyg_msgs,
-                                            "",
-                                            approx_tokens=_approx_tokens,
-                                            commit_fence=_hyg_commit_fence,
-                                        ),
+                                    _hyg_future, _hyg_worker_future = (
+                                        self._submit_in_executor_with_context(
+                                            lambda: _hyg_agent._compress_context(
+                                                _hyg_msgs,
+                                                "",
+                                                approx_tokens=_approx_tokens,
+                                                commit_fence=_hyg_commit_fence,
+                                            ),
+                                        )
                                     )
                                     try:
                                         # Progress-aware wait: the timeout is an
@@ -16395,8 +16460,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     "Failed to deliver compression-timeout "
                                                     "warning to user: %s",
                                                     _werr,
-                                                )
+                                            )
                                             raise
+                                    except asyncio.CancelledError:
+                                        # Shutdown/task cancellation must fence a
+                                        # not-yet-committed compaction and must
+                                        # never hide the real worker from the
+                                        # shared-DB close boundary.
+                                        _cancelled = None
+                                        while _cancelled is None:
+                                            _cancelled = (
+                                                _hyg_commit_fence.try_cancel_before_commit()
+                                            )
+                                            if _cancelled is None:
+                                                await asyncio.shield(
+                                                    asyncio.sleep(0.001)
+                                                )
+                                        self._defer_agent_cleanup_until_future_done(
+                                            _hyg_future,
+                                            _hyg_agent,
+                                            context="session hygiene cancellation",
+                                        )
+                                        _hyg_cleanup_deferred = True
+                                        # Keep the real concurrent future named:
+                                        # _gateway_executor_futures, not this
+                                        # cancelled coroutine, is authoritative
+                                        # for SessionDB close safety.
+                                        assert _hyg_worker_future is not None
+                                        raise
 
                                     # _compress_context ends the old session and creates
                                     # a new session_id.  Write compressed messages into
@@ -16423,7 +16514,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _quick_key, run_generation, _hyg_new_sid
                                         )
                                         await self.async_session_store._save()
-                                        await asyncio.to_thread(
+                                        await self._run_in_executor_with_context(
                                             self._sync_telegram_topic_binding,
                                             source,
                                             session_entry,
@@ -17014,7 +17105,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         session_key,
                         source,
                     )
-                    await asyncio.to_thread(
+                    await self._run_in_executor_with_context(
                         self._sync_telegram_topic_binding,
                         source,
                         session_entry,
@@ -17255,7 +17346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # forever (#35809 — regression of the #9893/#10063 auto-reset).
                     # No-op on non-topic lanes.
                     session_entry = new_entry
-                    await asyncio.to_thread(
+                    await self._run_in_executor_with_context(
                         self._sync_telegram_topic_binding,
                         source,
                         session_entry,
@@ -18276,8 +18367,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _write_capability_goal_meta(self, key: str, value: str) -> None:
         db = self._capability_goal_state_db()
-        await asyncio.to_thread(db.set_meta, key, value)
-        observed = await asyncio.to_thread(db.get_meta, key)
+        await self._run_in_executor_with_context(db.set_meta, key, value)
+        observed = await self._run_in_executor_with_context(db.get_meta, key)
         if observed != value:
             raise RuntimeError("capability goal durable meta readback drifted")
 
@@ -18310,8 +18401,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return False
 
-        replayed = bool(await asyncio.to_thread(execute_write, _write_once))
-        observed = await asyncio.to_thread(db.get_meta, key)
+        replayed = bool(
+            await self._run_in_executor_with_context(execute_write, _write_once)
+        )
+        observed = await self._run_in_executor_with_context(db.get_meta, key)
         if observed != value:
             raise RuntimeError("capability goal append-only readback drifted")
         return replayed
@@ -18332,7 +18425,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _CAPABILITY_GOAL_SAFE_ID_RE.fullmatch(str(session_id or "")) is None:
             raise RuntimeError("capability goal terminal clear session is invalid")
         db = self._capability_goal_state_db()
-        raw = await asyncio.to_thread(
+        raw = await self._run_in_executor_with_context(
             db.get_meta,
             _capability_goal_lineage_meta_key(session_id),
         )
@@ -18385,7 +18478,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.goals import GoalState
 
-        runtime_binding = await asyncio.to_thread(
+        runtime_binding = await self._run_in_executor_with_context(
             self._load_capability_goal_runtime_binding
         )
         now_unix_ms = int(time.time() * 1_000)
@@ -18446,7 +18539,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True
 
-        return bool(await asyncio.to_thread(execute_write, _clear_exact))
+        return bool(
+            await self._run_in_executor_with_context(execute_write, _clear_exact)
+        )
 
     @staticmethod
     def _capability_goal_gateway_process_binding() -> dict[str, Any]:
@@ -18502,12 +18597,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if state is None or state.status != "active":
             await self._clear_capability_goal_current_terminal_lineage(session_id)
             return {}
-        runtime_binding = await asyncio.to_thread(
+        runtime_binding = await self._run_in_executor_with_context(
             self._load_capability_goal_runtime_binding
         )
         recorded_at = int(time.time() * 1_000)
         db = self._capability_goal_state_db()
-        existing_raw = await asyncio.to_thread(
+        existing_raw = await self._run_in_executor_with_context(
             db.get_meta,
             _capability_goal_lineage_meta_key(session_id),
         )
@@ -18677,7 +18772,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             != session_key
         ):
             raise RuntimeError("queued capability goal route binding drifted")
-        bound_session_id = await asyncio.to_thread(
+        bound_session_id = await self._run_in_executor_with_context(
             self.session_store.peek_session_id,
             session_key,
         )
@@ -18685,7 +18780,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise RuntimeError("queued capability goal session binding drifted")
 
         db = self._capability_goal_state_db()
-        raw_record = await asyncio.to_thread(
+        raw_record = await self._run_in_executor_with_context(
             db.get_meta,
             _capability_goal_lineage_meta_key(session_id),
         )
@@ -18700,7 +18795,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             sort_keys=True,
         ):
             raise RuntimeError("capability goal lineage record is not canonical")
-        runtime_binding = await asyncio.to_thread(
+        runtime_binding = await self._run_in_executor_with_context(
             self._load_capability_goal_runtime_binding
         )
         observed_at = int(time.time() * 1_000)
@@ -18827,7 +18922,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or not session_key
         ):
             raise RuntimeError("capability goal finalization authority drifted")
-        bound_session_id = await asyncio.to_thread(
+        bound_session_id = await self._run_in_executor_with_context(
             self.session_store.peek_session_id,
             session_key,
         )
@@ -18835,14 +18930,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise RuntimeError("capability goal finalization session drifted")
 
         db = self._capability_goal_state_db()
-        raw_record = await asyncio.to_thread(
+        raw_record = await self._run_in_executor_with_context(
             db.get_meta,
             _capability_goal_lineage_meta_key(session_id),
         )
         if not isinstance(raw_record, str) or not raw_record:
             raise RuntimeError("capability goal lineage record is unavailable")
         parsed_record = json.loads(raw_record)
-        runtime_binding = await asyncio.to_thread(
+        runtime_binding = await self._run_in_executor_with_context(
             self._load_capability_goal_runtime_binding
         )
         observed_at = int(time.time() * 1_000)
@@ -19059,11 +19154,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not isinstance(transport, DiscordConnectorRelayTransport):
                 raise RuntimeError("capability goal connector transport is unavailable")
 
-            session_id = await asyncio.to_thread(
+            session_id = await self._run_in_executor_with_context(
                 self.session_store.peek_session_id,
                 session_key,
             )
-            entry = await asyncio.to_thread(
+            entry = await self._run_in_executor_with_context(
                 self.session_store.lookup_by_session_id,
                 str(session_id or ""),
             )
@@ -19082,7 +19177,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 raise RuntimeError("capability goal routing entry drifted")
 
             db = self._capability_goal_state_db()
-            raw_record = await asyncio.to_thread(
+            raw_record = await self._run_in_executor_with_context(
                 db.get_meta,
                 _capability_goal_lineage_meta_key(session_id),
             )
@@ -19097,7 +19192,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 sort_keys=True,
             ):
                 raise RuntimeError("capability goal lineage record is not canonical")
-            runtime_binding = await asyncio.to_thread(
+            runtime_binding = await self._run_in_executor_with_context(
                 self._load_capability_goal_runtime_binding
             )
             now_unix_ms = int(time.time() * 1_000)
@@ -19126,7 +19221,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 raise RuntimeError("capability goal restored source drifted")
 
-            session_row = await asyncio.to_thread(db.get_session, session_id)
+            session_row = await self._run_in_executor_with_context(
+                db.get_session, session_id
+            )
             if (
                 not isinstance(session_row, Mapping)
                 or session_row.get("id") != session_id
@@ -21154,7 +21251,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if (
-            not await asyncio.to_thread(self._is_telegram_topic_lane, source)
+            not await self._run_in_executor_with_context(
+                self._is_telegram_topic_lane, source
+            )
             or not source.chat_id
             or not source.thread_id
         ):
@@ -22610,16 +22709,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         clear_session_vars(tokens)
 
-    def _submit_in_executor_with_context(self, func, *args):
+    def _submit_in_executor_with_context(self, func, *args, **kwargs):
         """Submit work while exposing both async and real worker futures."""
         loop = asyncio.get_running_loop()
         ctx = copy_context()
-        worker_future = self._get_executor().submit(ctx.run, func, *args)
-        pending = self.__dict__.get("_gateway_executor_futures")
-        if pending is None:
-            pending = set()
-            self._gateway_executor_futures = pending
-        pending.add(worker_future)
+        if kwargs:
+            from functools import partial
+
+            func = partial(func, *args, **kwargs)
+            args = ()
+        lock = getattr(self, "_executor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._executor_lock = lock
+        # Admission, submit, and publication are one atomic region with the
+        # DB-close seal. A caller can never obtain the executor before the seal
+        # and publish its real future only after close safety was snapshotted.
+        with lock:
+            if getattr(self, "_executor_closing", False):
+                raise RuntimeError("Gateway is shutting down; executor unavailable")
+            executor = getattr(self, "_executor", None)
+            if executor is None or getattr(executor, "_shutdown", False):
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=10,
+                    thread_name_prefix="hermes-gateway",
+                )
+                self._executor = executor
+            worker_future = executor.submit(ctx.run, func, *args)
+            pending = self.__dict__.get("_gateway_executor_futures")
+            if pending is None:
+                pending = set()
+                self._gateway_executor_futures = pending
+            pending.add(worker_future)
+
+        return (
+            self._wrap_tracked_gateway_future(worker_future, loop=loop),
+            worker_future,
+        )
+
+    def _wrap_tracked_gateway_future(
+        self,
+        worker_future: concurrent.futures.Future,
+        *,
+        loop: asyncio.AbstractEventLoop,
+    ) -> asyncio.Future:
+        """Wrap one already-published real worker and retire its receipt."""
 
         def _worker_done(_future) -> None:
             def _discard() -> None:
@@ -22633,17 +22767,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         worker_future.add_done_callback(_worker_done)
-        return (
-            asyncio.wrap_future(worker_future, loop=loop),
-            worker_future,
-        )
+        return asyncio.wrap_future(worker_future, loop=loop)
 
-    async def _run_in_executor_with_context(self, func, *args):
+    async def _run_in_executor_with_context(self, func, *args, **kwargs):
         """Run blocking work in the thread pool while preserving contextvars."""
         async_future, _worker_future = self._submit_in_executor_with_context(
-            func, *args
+            func, *args, **kwargs
         )
         return await async_future
+
+    async def _wait_for_gateway_executor_idle(self) -> None:
+        """Wait until every real gateway worker has exited.
+
+        Adapter-owned stores use this as a close barrier. Poll the underlying
+        concurrent futures rather than awaiting cancellation-propagating
+        asyncio wrappers: cancellation of an HTTP/task wrapper cannot make a
+        still-running worker disappear from the close-safety boundary.
+        """
+        while any(
+            not future.done()
+            for future in (
+                self.__dict__.get("_gateway_executor_futures") or set()
+            )
+        ):
+            await asyncio.sleep(0.01)
 
     def _register_running_agent_worker(
         self,
@@ -22732,6 +22879,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._executor = executor
             return executor
 
+    def _seal_executor_for_db_close(
+        self,
+    ) -> concurrent.futures.ThreadPoolExecutor:
+        """Atomically reject new work while retaining one DB-close executor."""
+        lock = getattr(self, "_executor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._executor_lock = lock
+        with lock:
+            self._executor_closing = True
+            executor = getattr(self, "_executor", None)
+            if executor is None or getattr(executor, "_shutdown", False):
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="hermes-gateway-close",
+                )
+                self._executor = executor
+            return executor
+
     def _shutdown_executor(self) -> None:
         """Stop the gateway-owned executor without touching the loop default."""
         lock = getattr(self, "_executor_lock", None)
@@ -22764,6 +22930,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if a writer or cleanup worker is still alive, skip close entirely and
         let the imminent process hard-exit release SQLite's OS handles.
         """
+        close_executor = self._seal_executor_for_db_close()
         unsafe = set(unsafe_reasons)
         # Inspect the complete worker registry independently of the public
         # _running_agents snapshot.  A cancelled/timed-out outer coroutine can
@@ -22817,8 +22984,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Skipping SessionDB close: global shutdown deadline exhausted"
                 )
                 return False
-            close_async_future, close_worker_future = (
-                self._submit_in_executor_with_context(db.close)
+            loop = asyncio.get_running_loop()
+            close_worker_future = close_executor.submit(copy_context().run, db.close)
+            pending = self.__dict__.get("_gateway_executor_futures")
+            if pending is None:
+                pending = set()
+                self._gateway_executor_futures = pending
+            pending.add(close_worker_future)
+            close_async_future = self._wrap_tracked_gateway_future(
+                close_worker_future,
+                loop=loop,
             )
             try:
                 await asyncio.wait_for(close_async_future, timeout=remaining)
@@ -24142,7 +24317,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         Path(profile_home) / "state.db",
                         read_only=True,
                     )
-                    session_db = AsyncSessionDB(dedicated_db)
+                    session_db = AsyncSessionDB(
+                        dedicated_db,
+                        offload=self._run_in_executor_with_context,
+                    )
                 except Exception:
                     logger.debug(
                         "Async-completion profile SessionDB open failed for %s",
@@ -24151,7 +24329,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if dedicated_db is not None:
                         try:
-                            await asyncio.to_thread(dedicated_db.close)
+                            await self._run_in_executor_with_context(
+                                dedicated_db.close
+                            )
                         except Exception:
                             logger.debug(
                                 "Partially opened async-completion SessionDB "
@@ -24206,7 +24386,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             if dedicated_db is not None:
                 try:
-                    await asyncio.to_thread(dedicated_db.close)
+                    await self._run_in_executor_with_context(dedicated_db.close)
                 except Exception:
                     logger.debug(
                         "Async-completion profile SessionDB close failed",
@@ -31721,6 +31901,18 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+def _remaining_shutdown_tail_budget(
+    runner: GatewayRunner,
+    requested_timeout: float,
+) -> float:
+    """Clamp one post-run wait to the runner's global shutdown deadline."""
+    requested = max(float(requested_timeout), 0.0)
+    deadline = getattr(runner, "_shutdown_deadline_monotonic", None)
+    if not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+        return requested
+    return min(requested, max(0.0, float(deadline) - time.monotonic()))
+
+
 def _capability_canary_adapters_are_ready(
     adapters: Dict[Platform, BasePlatformAdapter],
 ) -> bool:
@@ -32002,6 +32194,7 @@ async def start_gateway(
     require_production_model_sovereignty: bool = False,
     production_release_revision: Optional[str] = None,
     production_config_sha256: Optional[str] = None,
+    _process_lifecycle_owned: bool = False,
 ) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -32025,6 +32218,10 @@ async def start_gateway(
         production_release_revision: Full release commit for the production
                  import and prerequisite attestation.
         production_config_sha256: Exact production config digest.
+        _process_lifecycle_owned: Internal flag set only by ``main``. It
+                 transfers shutdown-watchdog ownership past this coroutine to
+                 ``asyncio.run`` finalization and the final hard-exit boundary.
+                 Direct/library callers retain coroutine-local ownership.
     """
     if type(require_canonical_writer) is not bool:
         raise TypeError("require_canonical_writer must be boolean")
@@ -32032,6 +32229,8 @@ async def start_gateway(
         raise TypeError("require_capability_canary must be boolean")
     if type(require_production_model_sovereignty) is not bool:
         raise TypeError("require_production_model_sovereignty must be boolean")
+    if type(_process_lifecycle_owned) is not bool:
+        raise TypeError("_process_lifecycle_owned must be boolean")
     startup_contract_count = sum(
         (
             require_canonical_writer,
@@ -32404,6 +32603,11 @@ async def start_gateway(
     if require_capability_canary:
         _runner_contract_kwargs["require_capability_canary"] = True
     runner = GatewayRunner(config, **_runner_contract_kwargs)
+    # start_gateway owns a *process* lifecycle, not merely this coroutine.
+    # Keep runner.stop's OS-thread watchdog armed across every early-return
+    # path and through asyncio.run's later task/asyncgen/executor finalization.
+    # _exit_after_graceful_shutdown disarms it only immediately before os._exit.
+    runner._defer_shutdown_watchdog_disarm = _process_lifecycle_owned
     isolated_runtime = bool(getattr(runner, "_isolated_runtime", isolated_runtime))
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
@@ -33014,22 +33218,33 @@ async def start_gateway(
         except Exception as e:
             logger.debug("Cron provider stop() error: %s", e)
     if cron_thread is not None:
+        _cron_tail_timeout = _remaining_shutdown_tail_budget(
+            runner,
+            _CRON_SHUTDOWN_DRAIN_TIMEOUT,
+        )
         if not await _await_thread_exit(
             cron_thread,
-            timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT,
+            timeout=_cron_tail_timeout,
         ):
             logger.warning(
-                "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
+                "Cron ticker did not exit within %.1fs of shutdown — an in-flight "
                 "delivery may have been dropped.",
-                _CRON_SHUTDOWN_DRAIN_TIMEOUT,
+                _cron_tail_timeout,
             )
     await _await_thread_exit(
-        housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT
+        housekeeping_thread,
+        timeout=_remaining_shutdown_tail_budget(
+            runner,
+            _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT,
+        ),
     )
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
-    _planned_stop_watcher_thread.join(timeout=2)
+    await _await_thread_exit(
+        _planned_stop_watcher_thread,
+        timeout=_remaining_shutdown_tail_budget(runner, 2.0),
+    )
 
     # Close MCP server connections only when discovery was allowed.
     if external_extension_runtime_allowed:
@@ -33417,6 +33632,7 @@ def main():
         success = asyncio.run(
             start_gateway(
                 config,
+                _process_lifecycle_owned=True,
                 **startup_kwargs,
             )
         )
@@ -33492,6 +33708,11 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         drain_log_queue(timeout=1.0)
     except Exception:
         pass
+    # The OS-thread watchdog intentionally remained armed through
+    # asyncio.run's pending-task cancellation, async-generator finalization,
+    # default-executor drain, and this bounded final cleanup. There is no
+    # remaining Python lifecycle after the next instruction.
+    _disarm_process_shutdown_watchdog()
     os._exit(exit_code)
 
 

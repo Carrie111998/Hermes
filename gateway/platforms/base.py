@@ -2603,6 +2603,21 @@ class BasePlatformAdapter(ABC):
     # routing is platform-generic instead of Discord-only.
     gateway_runner = None  # type: ignore[assignment]  # set by gateway/run.py
 
+    async def _offload_blocking(self, func, *args, **kwargs):
+        """Run blocking adapter work under the gateway's real-worker tracker.
+
+        ``asyncio.to_thread`` hides its concurrent future when the awaiting
+        task is cancelled. When ``func`` can touch a SessionDB, that would let
+        adapter/runner teardown close SQLite underneath the still-running
+        worker. Normal gateway adapters have ``gateway_runner`` injected; bare
+        test/plugin adapters retain the standard fallback.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        offload = getattr(runner, "_run_in_executor_with_context", None)
+        if callable(offload):
+            return await offload(func, *args, **kwargs)
+        return await asyncio.to_thread(func, *args, **kwargs)
+
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
@@ -5219,7 +5234,7 @@ class BasePlatformAdapter(ABC):
         # (Telegram DM topic mode) so the session key, guard checks, and
         # downstream delivery all agree on the same lane.
         # Offloaded: the sync hook must not block the loop.
-        await asyncio.to_thread(self._apply_topic_recovery, event)
+        await self._offload_blocking(self._apply_topic_recovery, event)
 
         session_key = build_session_key(
             event.source,

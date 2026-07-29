@@ -39,7 +39,17 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    TypeVar,
+)
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -11402,10 +11412,22 @@ class SessionDB:
 
 
 class AsyncSessionDB:
-    """Async door onto SessionDB: offloads each call via asyncio.to_thread so a blocking SQLite call never freezes the event loop. Generic forwarder — the audit confirms no method returns a live cursor/generator."""
+    """Async door onto SessionDB without blocking the event loop.
 
-    def __init__(self, db: "SessionDB") -> None:
+    Generic callers default to ``asyncio.to_thread``. Long-lived owners can
+    inject an offloader whose real worker futures participate in their
+    shutdown barrier, preventing a cancelled coroutine from hiding a live
+    SQLite worker.
+    """
+
+    def __init__(
+        self,
+        db: "SessionDB",
+        *,
+        offload: Callable[..., Awaitable[Any]] | None = None,
+    ) -> None:
         self._db = db
+        self._offload = offload
 
     def __getattr__(self, name: str):
         attr = getattr(self._db, name)
@@ -11413,6 +11435,12 @@ class AsyncSessionDB:
             return attr
 
         async def _offloaded(*args, **kwargs):
+            if self._offload is not None:
+                if kwargs:
+                    from functools import partial
+
+                    return await self._offload(partial(attr, *args, **kwargs))
+                return await self._offload(attr, *args)
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _offloaded

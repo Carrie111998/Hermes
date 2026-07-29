@@ -17,6 +17,7 @@ import json
 import os
 import stat
 import sys
+import threading
 import time
 import types
 import uuid
@@ -6361,6 +6362,116 @@ class TestSessionDbOffEventLoop:
             hermes_state.SessionDB = original_class
             auth_adapter._session_db = None
             auth_adapter._session_db_lock = None
+
+    @pytest.mark.asyncio
+    async def test_session_db_seal_rejects_cached_sync_and_async_handles(
+        self,
+        auth_adapter,
+    ):
+        """Disconnect's seal covers cached/explicit handles, not only opens."""
+        cached = MagicMock()
+        auth_adapter._session_db = cached
+        assert auth_adapter._ensure_session_db() is cached
+
+        auth_adapter._seal_session_db_offload_admission()
+
+        assert auth_adapter._ensure_session_db() is None
+        assert await auth_adapter._ensure_session_db_async() is None
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await auth_adapter._offload_session_db(lambda: None)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_api_db_worker_blocks_pool_close_until_real_exit(
+        self,
+        auth_adapter,
+    ):
+        """Request cancellation cannot hide an admitted adapter DB worker."""
+        worker_entered = threading.Event()
+        release_worker = threading.Event()
+
+        class BlockingDB:
+            def __init__(self):
+                self.closed = False
+
+            def read(self):
+                worker_entered.set()
+                if not release_worker.wait(timeout=5):
+                    raise RuntimeError("test worker release timed out")
+                assert not self.closed
+                return "ok"
+
+            def close(self):
+                self.closed = True
+
+        db = BlockingDB()
+        auth_adapter._session_db = db
+        auth_adapter._owned_session_db_ids.add(id(db))
+        read_task = asyncio.create_task(
+            auth_adapter._offload_session_db(db.read)
+        )
+        try:
+            for _ in range(100):
+                if worker_entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert worker_entered.is_set()
+
+            read_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read_task
+
+            disconnect_task = asyncio.create_task(auth_adapter.disconnect())
+            await asyncio.sleep(0.05)
+            assert not disconnect_task.done()
+            assert db.closed is False
+            assert auth_adapter._ensure_session_db() is None
+        finally:
+            release_worker.set()
+
+        await asyncio.wait_for(disconnect_task, timeout=3)
+        assert db.closed is True
+
+    @pytest.mark.asyncio
+    async def test_disconnect_redrains_owner_published_by_aiohttp_cleanup(
+        self,
+        auth_adapter,
+    ):
+        """A late handler owner is drained before the SessionDB pool closes."""
+        release_owner = asyncio.Event()
+        owner_entered = asyncio.Event()
+
+        class OwnedDB:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        db = OwnedDB()
+        auth_adapter._session_db = db
+        auth_adapter._owned_session_db_ids.add(id(db))
+
+        async def late_owner():
+            owner_entered.set()
+            await release_owner.wait()
+
+        class LatePublishingRunner:
+            async def cleanup(self):
+                task = asyncio.create_task(late_owner())
+                auth_adapter._active_run_tasks["late-owner"] = task
+                await owner_entered.wait()
+
+        auth_adapter._runner = LatePublishingRunner()
+        disconnect_task = asyncio.create_task(auth_adapter.disconnect())
+        await owner_entered.wait()
+        await asyncio.sleep(0)
+
+        assert not disconnect_task.done()
+        assert db.closed is False
+
+        release_owner.set()
+        await asyncio.wait_for(disconnect_task, timeout=3)
+        assert db.closed is True
 
 
 # ---------------------------------------------------------------------------

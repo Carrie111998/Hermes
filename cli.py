@@ -17399,10 +17399,25 @@ def main(
     # Handle gateway mode (messaging + cron)
     if gateway:
         import asyncio
-        from gateway.run import start_gateway
+        from gateway.run import (
+            _exit_after_graceful_shutdown,
+            start_gateway,
+        )
         print("Starting Hermes Gateway (messaging platforms)...")
-        asyncio.run(start_gateway())
-        return
+        try:
+            _gateway_success = asyncio.run(
+                start_gateway(_process_lifecycle_owned=True)
+            )
+            _gateway_exit_code = 0 if _gateway_success else 1
+        except SystemExit as _gateway_exit:
+            if _gateway_exit.code is None:
+                _gateway_exit_code = 0
+            elif isinstance(_gateway_exit.code, int):
+                _gateway_exit_code = _gateway_exit.code
+            else:
+                _gateway_exit_code = 1
+        _exit_after_graceful_shutdown(_gateway_exit_code)
+        return  # unreachable after the process-owned hard-exit boundary
 
     # Skip worktree for list commands (they exit immediately)
     if not list_tools and not list_toolsets:

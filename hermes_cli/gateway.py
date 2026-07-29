@@ -2780,17 +2780,15 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         "/sbin",
         "/bin",
     ]
-    # Resolve the same global shutdown deadline used by the in-process
-    # watchdog, then leave a supervisor-only margin so its diagnostic dump and
-    # controlled exit always precede systemd's SIGKILL escalation.
-    _shutdown_timing = resolve_gateway_shutdown_timing(
-        _get_restart_drain_timeout()
-    )
-    restart_timeout = _shutdown_timing.systemd_timeout_stop_sec
-
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
         hermes_home = _hermes_home_for_target_user(home_dir)
+        # Resolve under the exact home that this unit exports. Config is
+        # authoritative; a stale installer-shell environment must never
+        # generate a shorter TimeoutStopSec than the gateway will use.
+        restart_timeout = resolve_gateway_shutdown_timing(
+            _get_restart_drain_timeout_for_home(hermes_home)
+        ).systemd_timeout_stop_sec
         systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
             hermes_home
         )
@@ -2844,6 +2842,9 @@ WantedBy=multi-user.target
 """
 
     hermes_home = str(get_hermes_home().resolve())
+    restart_timeout = resolve_gateway_shutdown_timing(
+        _get_restart_drain_timeout_for_home(hermes_home)
+    ).systemd_timeout_stop_sec
     systemd_type, systemd_watchdog_directives = _systemd_watchdog_service_fields(
         hermes_home
     )
@@ -3183,16 +3184,59 @@ def _print_system_scope_remediation(action: str) -> None:
 
 
 def _get_restart_drain_timeout() -> float:
-    """Return the configured gateway restart drain timeout in seconds."""
-    raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
-    if not raw:
-        cfg = read_raw_config()
-        agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
-        raw = str(
-            agent_cfg.get(
-                "restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
-            )
+    """Return the config-authoritative gateway drain timeout."""
+    return _get_restart_drain_timeout_for_home(get_hermes_home())
+
+
+def _get_restart_drain_timeout_for_home(
+    hermes_home: str | Path,
+) -> float:
+    """Read the runtime setting from an exact home without mutating it.
+
+    Unit rendering is a read-only operation and may target a not-yet-created
+    user home. ``load_config()`` calls ``ensure_hermes_home()`` and therefore
+    cannot be used here: previewing/installing a unit must never mkdir or write
+    the target. Read only the one explicit file, expand the same environment
+    references as runtime config, then apply the process' managed overlay.
+    """
+    config_path = Path(hermes_home).expanduser() / "config.yaml"
+    cfg: dict = {}
+    try:
+        from utils import fast_safe_load
+
+        with config_path.open(encoding="utf-8") as handle:
+            loaded = fast_safe_load(handle) or {}
+        if isinstance(loaded, dict):
+            cfg = loaded
+    except (FileNotFoundError, OSError):
+        cfg = {}
+    except Exception:
+        logger.warning(
+            "Could not parse drain-timeout config at %s; using default",
+            config_path,
+            exc_info=True,
         )
+        cfg = {}
+
+    try:
+        from hermes_cli import managed_scope
+        from hermes_cli.config import _expand_env_vars
+
+        cfg = _expand_env_vars(cfg)
+        cfg = managed_scope.apply_managed_overlay(cfg)
+    except Exception:
+        logger.debug(
+            "Could not resolve managed drain-timeout configuration",
+            exc_info=True,
+        )
+
+    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+    raw = str(
+        agent_cfg.get(
+            "restart_drain_timeout",
+            DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+        )
+    )
     return parse_restart_drain_timeout(raw)
 
 
@@ -5023,7 +5067,13 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+        success = asyncio.run(
+            start_gateway(
+                replace=replace,
+                verbosity=verbosity,
+                _process_lifecycle_owned=True,
+            )
+        )
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # On Windows-detached runs this shouldn't fire (we absorb SIGINT above),

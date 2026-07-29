@@ -16,7 +16,7 @@ import gateway.run as gateway_run
 from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
-from gateway.session import SessionStore, build_session_key
+from gateway.session import AsyncSessionStore, SessionStore, build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -460,6 +460,433 @@ async def test_session_db_close_sees_stale_real_worker_after_public_slot_release
 
     assert closed is True
     session_db.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_async_store_call_remains_visible_to_db_close(tmp_path):
+    """A cancelled await cannot hide its still-running SQLite worker."""
+    runner, _adapter = make_restart_runner()
+    runner._executor_lock = threading.Lock()
+    runner._executor = None
+    runner._executor_closing = False
+    runner._gateway_executor_futures = set()
+    runner._running_agent_workers = {}
+    runner._session_db = None
+
+    store = SessionStore(
+        sessions_dir=tmp_path / "sessions",
+        config=runner.config,
+        db_path=tmp_path / "state.db",
+    )
+    store._db.set_meta("shutdown-race", "intact")
+    runner.session_store = store
+    facade = AsyncSessionStore(
+        store,
+        offload=runner._run_in_executor_with_context,
+    )
+
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+
+    def delayed_db_read():
+        worker_entered.set()
+        if not release_worker.wait(timeout=5):
+            raise RuntimeError("test worker release timed out")
+        return store._db.get_meta("shutdown-race")
+
+    store.delayed_db_read = delayed_db_read  # type: ignore[attr-defined]
+    call_task = asyncio.create_task(facade.delayed_db_read())
+    try:
+        for _ in range(100):
+            if worker_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert worker_entered.is_set()
+
+        call_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call_task
+
+        assert any(
+            not future.done() for future in runner._gateway_executor_futures
+        )
+        skipped = await runner._close_shutdown_session_dbs(
+            deadline_monotonic=time.monotonic() + 1,
+            unsafe_reasons=set(),
+        )
+        assert skipped is False
+        assert store._db._conn is not None
+
+        release_worker.set()
+        for _ in range(100):
+            if not any(
+                not future.done()
+                for future in runner._gateway_executor_futures
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+        assert not any(
+            not future.done() for future in runner._gateway_executor_futures
+        )
+        closed = await runner._close_shutdown_session_dbs(
+            deadline_monotonic=time.monotonic() + 1,
+            unsafe_reasons=set(),
+        )
+        assert closed is True
+        assert store._db._conn is None
+    finally:
+        release_worker.set()
+        runner._shutdown_executor()
+        if store._db._conn is not None:
+            store._db.close()
+
+
+@pytest.mark.asyncio
+async def test_db_close_seal_atomically_rejects_late_executor_admission():
+    """No worker can slip in after DB-close safety was snapshotted."""
+    runner, _adapter = make_restart_runner()
+    runner._session_db = None
+    close_entered = threading.Event()
+    release_close = threading.Event()
+
+    class BlockingCloseDB:
+        def close(self):
+            close_entered.set()
+            if not release_close.wait(timeout=5):
+                raise RuntimeError("test DB close release timed out")
+
+    runner.session_store._db = BlockingCloseDB()
+    close_task = asyncio.create_task(
+        runner._close_shutdown_session_dbs(
+            deadline_monotonic=time.monotonic() + 5,
+            unsafe_reasons=set(),
+        )
+    )
+    try:
+        for _ in range(100):
+            if close_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert close_entered.is_set()
+
+        with pytest.raises(RuntimeError, match="shutting down"):
+            runner._submit_in_executor_with_context(lambda: None)
+    finally:
+        release_close.set()
+
+    assert await close_task is True
+    runner._shutdown_executor()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_topic_recovery_worker_remains_visible_to_db_close(
+    tmp_path,
+):
+    """Base-adapter offloads inherit the runner's real-worker close barrier."""
+    runner, adapter = make_restart_runner()
+    adapter.gateway_runner = runner
+    store = SessionStore(
+        sessions_dir=tmp_path / "sessions",
+        config=runner.config,
+        db_path=tmp_path / "state.db",
+    )
+    store._db.set_meta("topic-recovery", "intact")
+    runner._session_db = None
+    runner.session_store = store
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    worker_errors = []
+
+    def recover_topic(_source):
+        worker_entered.set()
+        if not release_worker.wait(timeout=5):
+            raise RuntimeError("test topic recovery release timed out")
+        try:
+            store._db.get_meta("topic-recovery")
+        except Exception as exc:
+            worker_errors.append(exc)
+            raise
+        return None
+
+    adapter.set_topic_recovery_fn(recover_topic)
+    adapter.set_message_handler(AsyncMock(return_value=None))
+    event = MessageEvent(
+        text="topic recovery",
+        source=make_restart_source(),
+        message_id="topic-recovery-1",
+    )
+    call_task = asyncio.create_task(adapter.handle_message(event))
+    try:
+        for _ in range(100):
+            if worker_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert worker_entered.is_set()
+
+        call_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call_task
+
+        assert any(
+            not future.done() for future in runner._gateway_executor_futures
+        )
+        assert await runner._close_shutdown_session_dbs(
+            deadline_monotonic=time.monotonic() + 1,
+            unsafe_reasons=set(),
+        ) is False
+        assert store._db._conn is not None
+    finally:
+        release_worker.set()
+
+    for _ in range(100):
+        if not any(
+            not future.done() for future in runner._gateway_executor_futures
+        ):
+            break
+        await asyncio.sleep(0.01)
+    assert worker_errors == []
+    assert await runner._close_shutdown_session_dbs(
+        deadline_monotonic=time.monotonic() + 1,
+        unsafe_reasons=set(),
+    ) is True
+    runner._shutdown_executor()
+
+
+def test_start_gateway_owned_watchdog_remains_armed_through_post_run_tail(
+    tmp_path,
+):
+    """Process proof: runner.stop cannot disarm start_gateway's tail watchdog."""
+    repo_root = Path(__file__).resolve().parents[2]
+    receipt_path = tmp_path / "tail-watchdog-receipt.json"
+    child_code = textwrap.dedent(
+        """
+        import asyncio
+        import json
+        import os
+        import time
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from tests.gateway.restart_test_helpers import make_restart_runner
+
+        runner, _adapter = make_restart_runner()
+        runner._defer_shutdown_watchdog_disarm = True
+        runner._restart_drain_timeout = 0.0
+
+        async def stop_runner():
+            with (
+                patch("gateway.run.resolve_shutdown_watchdog_delay", return_value=1.0),
+                patch("gateway.status.remove_pid_file"),
+                patch("gateway.status.release_gateway_runtime_lock"),
+                patch("gateway.status.write_runtime_status"),
+            ):
+                await runner.stop()
+
+        asyncio.run(stop_runner())
+        receipt = {
+            "done_is_set": runner._shutdown_watchdog_done.is_set(),
+            "shutdown_event": runner._shutdown_event.is_set(),
+        }
+        path = Path(os.environ["TAIL_WATCHDOG_RECEIPT"])
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(receipt, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        # Simulate a wedged cron/housekeeping/MCP post-run tail. The still-armed
+        # OS-thread watchdog must terminate the process.
+        time.sleep(3)
+        raise SystemExit(99)
+        """
+    )
+    env = os.environ.copy()
+    env.pop("PYTEST_CURRENT_TEST", None)
+    env["HERMES_HOME"] = str(tmp_path / "hermes-home")
+    env["TAIL_WATCHDOG_RECEIPT"] = str(receipt_path)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child_code],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=7,
+        check=False,
+    )
+
+    assert completed.returncode == 1, (
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == {
+        "done_is_set": False,
+        "shutdown_event": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "finalization_phase",
+    ("pending_task", "async_generator", "default_executor"),
+)
+def test_start_gateway_watchdog_covers_asyncio_run_finalization(
+    tmp_path,
+    finalization_phase,
+):
+    """The process watchdog covers every blocking ``asyncio.run`` tail."""
+    repo_root = Path(__file__).resolve().parents[2]
+    receipt_path = tmp_path / f"{finalization_phase}-watchdog-receipt.json"
+    phase_marker_path = tmp_path / f"{finalization_phase}-entered"
+    child_code = textwrap.dedent(
+        """
+        import asyncio
+        import json
+        import os
+        import threading
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from tests.gateway.restart_test_helpers import make_restart_runner
+
+        runner, _adapter = make_restart_runner()
+        runner._defer_shutdown_watchdog_disarm = True
+        runner._restart_drain_timeout = 0.0
+        phase = os.environ["WATCHDOG_FINALIZATION_PHASE"]
+        marker_path = Path(os.environ["WATCHDOG_PHASE_MARKER"])
+
+        def wedged_worker():
+            marker_path.write_text("entered", encoding="utf-8")
+            threading.Event().wait()
+
+        async def exercise_start_gateway_return_boundary():
+            with (
+                patch("gateway.run.resolve_shutdown_watchdog_delay", return_value=1.0),
+                patch("gateway.status.remove_pid_file"),
+                patch("gateway.status.release_gateway_runtime_lock"),
+                patch("gateway.status.write_runtime_status"),
+            ):
+                await runner.stop()
+
+            if phase == "pending_task":
+                async def cancellation_resistant_task():
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if current is not None:
+                            current.uncancel()
+                        marker_path.write_text("entered", encoding="utf-8")
+                        await asyncio.Future()
+
+                asyncio.create_task(cancellation_resistant_task())
+                await asyncio.sleep(0)
+            elif phase == "async_generator":
+                async def generator_with_wedged_finalizer():
+                    try:
+                        yield "ready"
+                    finally:
+                        marker_path.write_text("entered", encoding="utf-8")
+                        await asyncio.Future()
+
+                generator = generator_with_wedged_finalizer()
+                await anext(generator)
+            elif phase == "default_executor":
+                worker_task = asyncio.create_task(asyncio.to_thread(wedged_worker))
+                while not marker_path.exists():
+                    await asyncio.sleep(0.01)
+                worker_task.cancel()
+                try:
+                    await worker_task
+                except asyncio.CancelledError:
+                    pass
+            else:
+                raise RuntimeError(f"unknown phase: {phase}")
+
+            receipt = {
+                "done_is_set": runner._shutdown_watchdog_done.is_set(),
+                "phase": phase,
+            }
+            path = Path(os.environ["WATCHDOG_FINALIZATION_RECEIPT"])
+            with path.open("w", encoding="utf-8") as handle:
+                json.dump(receipt, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            # Returning is the exact end-of-start_gateway boundary.
+            # asyncio.run() next cancels pending tasks, finalizes async
+            # generators, and drains its default executor. Whichever selected
+            # phase wedges must remain covered by the already-armed watchdog.
+        asyncio.run(exercise_start_gateway_return_boundary())
+        raise SystemExit(99)
+        """
+    )
+    env = os.environ.copy()
+    env.pop("PYTEST_CURRENT_TEST", None)
+    env["HERMES_HOME"] = str(tmp_path / "hermes-home")
+    env["WATCHDOG_FINALIZATION_PHASE"] = finalization_phase
+    env["WATCHDOG_FINALIZATION_RECEIPT"] = str(receipt_path)
+    env["WATCHDOG_PHASE_MARKER"] = str(phase_marker_path)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child_code],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=7,
+        check=False,
+    )
+
+    assert completed.returncode == 1, (
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == {
+        "done_is_set": False,
+        "phase": finalization_phase,
+    }
+    assert phase_marker_path.read_text(encoding="utf-8") == "entered"
+
+
+@pytest.mark.asyncio
+async def test_direct_or_startup_failure_stop_disarms_its_watchdog():
+    """Before tail ownership transfers, runner.stop owns the full lifecycle."""
+    runner, _adapter = make_restart_runner()
+    assert runner._defer_shutdown_watchdog_disarm is False
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.release_gateway_runtime_lock"),
+        patch("gateway.status.write_runtime_status"),
+    ):
+        await runner.stop()
+
+    assert runner._shutdown_event.is_set()
+    assert runner._shutdown_watchdog_done.is_set()
+
+
+def test_hard_exit_disarms_process_watchdog_only_at_exit_boundary():
+    done = threading.Event()
+    observed = {}
+
+    def fake_exit(code):
+        observed["code"] = code
+        observed["done"] = done.is_set()
+        observed["published"] = gateway_run._PROCESS_SHUTDOWN_WATCHDOG_DONE
+        raise RuntimeError("exit sentinel")
+
+    gateway_run._publish_process_shutdown_watchdog(done)
+    try:
+        with (
+            patch("gateway.status.remove_pid_file"),
+            patch("gateway.status.release_gateway_runtime_lock"),
+            patch("hermes_logging.drain_log_queue"),
+            patch("gateway.run.os._exit", side_effect=fake_exit),
+            pytest.raises(RuntimeError, match="exit sentinel"),
+        ):
+            gateway_run._exit_after_graceful_shutdown(17)
+    finally:
+        gateway_run._disarm_process_shutdown_watchdog()
+
+    assert observed == {"code": 17, "done": True, "published": None}
 
 
 @pytest.mark.asyncio

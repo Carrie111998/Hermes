@@ -20,7 +20,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from dataclasses import field as dataclass_field, replace as dataclass_replace
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1287,8 +1287,14 @@ class ConsumedResetMarkers:
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
-    def __init__(self, store: "SessionStore") -> None:
+    def __init__(
+        self,
+        store: "SessionStore",
+        *,
+        offload: Callable[..., Awaitable[Any]] | None = None,
+    ) -> None:
         self._store = store
+        self._offload = offload
 
     def __getattr__(self, name: str):
         attr = getattr(self._store, name)
@@ -1296,6 +1302,12 @@ class AsyncSessionStore:
             return attr
 
         async def _offloaded(*args, **kwargs) -> Any:
+            if self._offload is not None:
+                if kwargs:
+                    from functools import partial
+
+                    return await self._offload(partial(attr, *args, **kwargs))
+                return await self._offload(attr, *args)
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _offloaded

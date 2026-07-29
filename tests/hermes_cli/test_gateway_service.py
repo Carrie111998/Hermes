@@ -234,16 +234,33 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
-        # Prevent run_gateway from actually starting the gateway
+        # Prevent run_gateway from actually starting/exiting the gateway while
+        # proving this process-owning CLI transfers watchdog ownership through
+        # asyncio.run() to the hard-exit boundary.
+        captured = {}
+
         async def fake_start_gateway(**kwargs):
+            captured["start_kwargs"] = kwargs
             return True
 
         monkeypatch.setattr("gateway.run.start_gateway", fake_start_gateway)
+        monkeypatch.setattr(
+            "gateway.run._exit_after_graceful_shutdown",
+            lambda code: captured.update(exit_code=code),
+        )
 
         gateway_cli.run_gateway()
 
         assert unit_path.read_text(encoding="utf-8") == "new unit\n"
         assert ["systemctl", "--user", "daemon-reload"] in calls
+        assert captured == {
+            "start_kwargs": {
+                "_process_lifecycle_owned": True,
+                "replace": False,
+                "verbosity": 0,
+            },
+            "exit_code": 0,
+        }
 
     def test_refresh_refuses_to_bake_pytest_tmpdir_into_real_user_unit(
         self, tmp_path, monkeypatch
@@ -430,8 +447,8 @@ class TestGeneratedSystemdUnits:
     def test_user_unit_avoids_recursive_execstop_and_uses_extended_stop_timeout(self, monkeypatch):
         monkeypatch.setattr(
             gateway_cli,
-            "_get_restart_drain_timeout",
-            lambda: DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+            "_get_restart_drain_timeout_for_home",
+            lambda _home: DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
         )
         unit = gateway_cli.generate_systemd_unit(system=False)
 
@@ -453,11 +470,34 @@ class TestGeneratedSystemdUnits:
         assert "KillMode=mixed" in unit
 
     def test_user_unit_adds_cleanup_headroom_to_positive_drain_timeout(self, monkeypatch):
-        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 45)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_get_restart_drain_timeout_for_home",
+            lambda _home: 45,
+        )
 
         unit = gateway_cli.generate_systemd_unit(system=False)
 
         expected = resolve_gateway_shutdown_timing(45).systemd_timeout_stop_sec
+        assert f"TimeoutStopSec={expected}" in unit
+
+    def test_user_unit_ignores_stale_shell_drain_when_config_is_present(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "agent:\n  restart_drain_timeout: 180\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "0")
+
+        unit = gateway_cli.generate_systemd_unit(system=False)
+
+        expected = resolve_gateway_shutdown_timing(180).systemd_timeout_stop_sec
         assert f"TimeoutStopSec={expected}" in unit
 
     def test_user_unit_includes_resolved_node_directory_in_path(self, monkeypatch):
@@ -628,26 +668,40 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
-    def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
-        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
-        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
+    def test_get_restart_drain_timeout_is_config_authoritative(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        hermes_home = tmp_path / "exact-hermes-home"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_hermes_home",
+            lambda: hermes_home,
+        )
 
         assert (
             gateway_cli._get_restart_drain_timeout()
             == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
         )
 
-        monkeypatch.setattr(
-            gateway_cli,
-            "read_raw_config",
-            lambda: {"agent": {"restart_drain_timeout": 14}},
+        config_path.write_text(
+            "agent:\n  restart_drain_timeout: 14\n",
+            encoding="utf-8",
         )
         assert gateway_cli._get_restart_drain_timeout() == 14.0
 
+        # A stale installer-shell bridge cannot shorten the unit below the
+        # value the runtime loads from config.yaml.
         monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "9")
-        assert gateway_cli._get_restart_drain_timeout() == 9.0
+        assert gateway_cli._get_restart_drain_timeout() == 14.0
 
-        monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "invalid")
+        config_path.write_text(
+            "agent:\n  restart_drain_timeout: invalid\n",
+            encoding="utf-8",
+        )
         assert (
             gateway_cli._get_restart_drain_timeout()
             == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT

@@ -33,6 +33,25 @@ async def test_async_session_store_offloads_calls() -> None:
     assert facade._store is store
 
 
+@pytest.mark.asyncio
+async def test_async_session_store_uses_injected_tracked_offloader() -> None:
+    store = _SpyStore()
+    seen: list[tuple[object, tuple[object, ...]]] = []
+
+    async def tracked_offload(func, *args):
+        seen.append((func, args))
+        return func(*args)
+
+    facade = AsyncSessionStore(  # type: ignore[arg-type]
+        store,
+        offload=tracked_offload,
+    )
+
+    assert await facade.read("tracked") == "tracked"
+    assert seen and seen[0][1] == ("tracked",)
+    assert store.calls[0][0] == "tracked"
+
+
 def _nearest_function(node: ast.AST, parents: dict[ast.AST, ast.AST]):
     current = node
     while current in parents:

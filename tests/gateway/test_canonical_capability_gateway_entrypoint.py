@@ -141,7 +141,10 @@ def test_gateway_main_uses_distinct_capability_contract(
     run.main()
     assert captured == {
         "config": expected,
-        "kwargs": {"require_capability_canary": True},
+        "kwargs": {
+            "_process_lifecycle_owned": True,
+            "require_capability_canary": True,
+        },
         "exit_code": 0,
     }
 

@@ -17,7 +17,10 @@ def _raise_exit(code: int) -> None:
 
 
 def test_main_force_exits_zero_after_clean_shutdown(monkeypatch):
-    async def fake_start_gateway(config=None):
+    captured = {}
+
+    async def fake_start_gateway(config=None, **kwargs):
+        captured.update(kwargs)
         return True
 
     stdout = SimpleNamespace(flush=Mock())
@@ -33,12 +36,13 @@ def test_main_force_exits_zero_after_clean_shutdown(monkeypatch):
         gateway_run.main()
 
     assert exc_info.value.code == 0
+    assert captured == {"_process_lifecycle_owned": True}
     stdout.flush.assert_called_once_with()
     stderr.flush.assert_called_once_with()
 
 
 def test_main_force_exits_one_after_failed_shutdown(monkeypatch):
-    async def fake_start_gateway(config=None):
+    async def fake_start_gateway(config=None, **_kwargs):
         return False
 
     stdout = SimpleNamespace(flush=Mock())
@@ -65,7 +69,7 @@ def test_main_terminates_via_os_exit_not_systemexit(monkeypatch):
     propagate instead of our os._exit sentinel and this test would fail.
 
     Test contributed by @AgenticSpark (PR #53122, duplicate of #53121)."""
-    async def fake_start_gateway(config=None):
+    async def fake_start_gateway(config=None, **_kwargs):
         return False
 
     stdout = SimpleNamespace(flush=Mock())
@@ -89,7 +93,7 @@ def test_main_routes_systemexit_through_os_exit(monkeypatch):
     (#53107) — a SystemExit propagating to interpreter finalization would join a
     stuck non-daemon worker and hang. Verifies the explicit code (e.g. 78) is
     preserved through the os._exit backstop."""
-    async def fake_start_gateway(config=None):
+    async def fake_start_gateway(config=None, **_kwargs):
         raise SystemExit(78)
 
     stdout = SimpleNamespace(flush=Mock())
@@ -112,7 +116,7 @@ def test_main_routes_systemexit_through_os_exit(monkeypatch):
 
 def test_main_systemexit_none_code_maps_to_zero(monkeypatch):
     """SystemExit() with no code (or None) is a clean exit → os._exit(0)."""
-    async def fake_start_gateway(config=None):
+    async def fake_start_gateway(config=None, **_kwargs):
         raise SystemExit()
 
     monkeypatch.setattr(gateway_run, "start_gateway", fake_start_gateway)
@@ -131,7 +135,7 @@ def test_main_systemexit_str_code_maps_to_one(monkeypatch):
     """SystemExit with a str code (CPython prints it to stderr then exits 1).
     We can't print during os._exit, but the code must still map to 1 — matching
     CPython's handle_system_exit semantics for a non-int, non-None code."""
-    async def fake_start_gateway(config=None):
+    async def fake_start_gateway(config=None, **_kwargs):
         raise SystemExit("fatal: something went wrong")
 
     monkeypatch.setattr(gateway_run, "start_gateway", fake_start_gateway)
@@ -144,6 +148,30 @@ def test_main_systemexit_str_code_maps_to_one(monkeypatch):
         gateway_run.main()
 
     assert exc_info.value.code == 1
+
+
+def test_legacy_cli_gateway_mode_owns_process_watchdog_boundary(monkeypatch):
+    import cli as legacy_cli
+
+    captured = {}
+
+    async def fake_start_gateway(**kwargs):
+        captured["start_kwargs"] = kwargs
+        return False
+
+    monkeypatch.setattr(gateway_run, "start_gateway", fake_start_gateway)
+    monkeypatch.setattr(
+        gateway_run,
+        "_exit_after_graceful_shutdown",
+        lambda code: captured.update(exit_code=code),
+    )
+
+    legacy_cli.main(gateway=True)
+
+    assert captured == {
+        "start_kwargs": {"_process_lifecycle_owned": True},
+        "exit_code": 1,
+    }
 
 
 def test_exit_backstop_releases_pid_file_and_runtime_lock(monkeypatch):
