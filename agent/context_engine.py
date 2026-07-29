@@ -402,11 +402,29 @@ class ContextEngine(ABC):
         """Called on /new or /reset. Reset per-session state.
 
         Default resets compression_count and token tracking.
+        Engines with per-session caches (DAG nodes, summary stores,
+        etc.) should clear them here OR in ``clear_session_cache()``.
         """
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.compression_count = 0
+
+    def clear_session_cache(self) -> None:
+        """Called after ``on_session_reset()`` on /new to force full cache
+        clearing — independent of any retention policy the engine maintains.
+
+        Engines with DAG-based caches (e.g. LCM) that implement their own
+        retention depth in ``on_session_reset()`` should override this to
+        delete ALL per-session cached data so a user requesting /new gets
+        a truly clean session.
+
+        Default is a no-op for backward compatibility — engines that only
+        need token-counter reset (the built-in ContextCompressor) are
+        unaffected.  Engines that already clear everything in
+        ``on_session_reset()`` are also unaffected.
+        """
+        return None
 
     # -- Optional: tools ---------------------------------------------------
 
