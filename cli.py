@@ -4287,6 +4287,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # through MoA instead of hitting the real provider with an unknown
         # model (#56828). A ``moa:`` prefix wins over an explicit ``--provider``.
         _moa_provider_override, self.model = _normalize_moa_model(self.model)
+        # A provider-qualified model string has to select that provider too —
+        # the same reason the ``moa:`` prefix is decoded here (#56828).
+        # ``custom:<name>:<model>`` is the documented way to pick an entry out
+        # of the ``providers:`` block; when only the model half survives, the
+        # request is built for the DEFAULT provider with the unsplit string as
+        # the model name, so the whole prompt is transmitted to that provider's
+        # endpoint before it 404s — even when the user selected a local server
+        # (#73943). An explicit ``--provider`` still wins, but the model is
+        # split either way so the wire never carries the qualified form. A
+        # plain model name parses to no provider and is left untouched.
+        _model_provider_override = ""
+        if self.model:
+            from hermes_cli.models import parse_model_input as _parse_model_input
+
+            _parsed_provider, _parsed_model = _parse_model_input(self.model, "")
+            if _parsed_provider and _parsed_model:
+                _model_provider_override = _parsed_provider
+                self.model = _parsed_model
         # Read max_tokens from config (env var override: HERMES_MAX_TOKENS)
         _env_mt = os.environ.get("HERMES_MAX_TOKENS")
         if _env_mt:
@@ -4324,6 +4342,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.requested_provider = (
             _moa_provider_override
             or provider
+            or _model_provider_override
             or CLI_CONFIG["model"].get("provider")
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or "auto"

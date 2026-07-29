@@ -822,3 +822,36 @@ class TestProviderResolution:
         cli = _make_cli()
         assert isinstance(cli.model, str)
         assert isinstance(cli.model, str) and '/' in cli.model
+
+
+class TestProviderQualifiedModelString:
+    """A provider-qualified ``-m`` value must set the provider, not just the model.
+
+    ``custom:<name>:<model>`` is the documented way to select a provider from
+    the ``providers:`` block. Leaving ``requested_provider`` on the configured
+    default means the request is built for the DEFAULT endpoint with the
+    unsplit string as the model name — the whole prompt is transmitted to the
+    default cloud provider before it 404s (#73943). The ``moa:`` prefix right
+    above is decoded here for exactly this reason (#56828).
+    """
+
+    def test_custom_triple_sets_provider_and_model(self):
+        cli = _make_cli(model="custom:jetson-vllm:nemotron-nano-30b")
+        assert cli.requested_provider == "custom:jetson-vllm"
+        assert cli.model == "nemotron-nano-30b"
+
+    def test_known_provider_prefix_sets_provider_and_model(self):
+        cli = _make_cli(model="nous:hermes-3")
+        assert cli.requested_provider == "nous"
+        assert cli.model == "hermes-3"
+
+    def test_explicit_provider_flag_still_wins(self):
+        """--provider is the user's explicit choice; only the model is split."""
+        cli = _make_cli(model="custom:jetson-vllm:nemotron-nano-30b",
+                        provider="anthropic")
+        assert cli.requested_provider == "anthropic"
+        assert cli.model == "nemotron-nano-30b"
+
+    def test_plain_model_string_is_untouched(self):
+        cli = _make_cli(model="anthropic/claude-sonnet-4.5")
+        assert cli.model == "anthropic/claude-sonnet-4.5"
