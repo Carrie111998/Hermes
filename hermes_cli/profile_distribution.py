@@ -557,8 +557,19 @@ def _copy_dist_payload(
     ``preserve_config`` is False (fresh install or ``--force-config`` update).
     ``.env.template`` is renamed to ``.env.EXAMPLE`` in the target to avoid
     shadowing a real ``.env``.
+
+    Only top-level staged entries listed in ``manifest.owned_paths()`` are
+    installed/updated -- an explicit ``distribution_owned`` manifest is an
+    allowlist boundary, not just documentation. A staged entry outside that
+    list is skipped even if present in the source tree, and (per issue
+    #74373) an owned DIRECTORY is merge-copied rather than replaced
+    wholesale: ``shutil.copytree(..., dirs_exist_ok=True)`` overwrites/adds
+    the staged files but does not delete a target-only child the staged
+    directory doesn't mention, so a user's own file placed inside an
+    owned directory (e.g. ``skills/local-only/``) survives an update.
     """
     target.mkdir(parents=True, exist_ok=True)
+    owned = set(manifest.owned_paths())
 
     for entry in staged.iterdir():
         name = entry.name
@@ -566,7 +577,12 @@ def _copy_dist_payload(
         if name in USER_OWNED_EXCLUDE:
             continue
         if name == ENV_TEMPLATE_FILENAME:
+            # .env.template ships alongside the payload to document required
+            # variables; it is not itself a content path subject to the
+            # owned_paths() allowlist.
             shutil.copy2(entry, target / ENV_EXAMPLE_FILENAME)
+            continue
+        if name not in owned:
             continue
         if name == "config.yaml" and preserve_config and (target / "config.yaml").exists():
             # Leave user's config.yaml alone on update
@@ -574,12 +590,11 @@ def _copy_dist_payload(
 
         dest = target / name
         if entry.is_dir():
-            if dest.exists():
-                shutil.rmtree(dest)
             staged_resolved = staged.resolve()
             shutil.copytree(
                 entry,
                 dest,
+                dirs_exist_ok=True,
                 ignore=lambda d, names: (
                     [n for n in names if n in USER_OWNED_EXCLUDE]
                     if Path(d).resolve() == staged_resolved

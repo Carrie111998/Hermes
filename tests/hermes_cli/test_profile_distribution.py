@@ -505,9 +505,17 @@ class TestSecurity:
 class TestNestedUserOwnedExcludeNotFiltered:
 
     def test_nested_bin_dir_is_preserved(self, profile_env):
-        """"A distribution shipping tools/bin/ must not have tools/bin/ dropped
-        during install even though 'bin' is in USER_OWNED_EXCLUDE."""
-        staged = _make_staging_dir(profile_env, "src")
+        """A distribution shipping tools/bin/ must not have tools/bin/ dropped
+        during install even though 'bin' is in USER_OWNED_EXCLUDE -- that
+        exclusion only applies to TOP-LEVEL entries, not nested ones that
+        happen to share a name. (tools/ itself must be explicitly
+        opted into distribution_owned per #74373's allowlist enforcement.)
+        """
+        mf = DistributionManifest(
+            name="nested_bin", version="0.1.0",
+            distribution_owned=list(DEFAULT_DIST_OWNED) + ["tools"],
+        )
+        staged = _make_staging_dir(profile_env, "src", manifest=mf)
         (staged / "tools" / "bin").mkdir(parents=True)
         (staged / "tools" / "bin" / "tool.py").write_text("# tool\n")
 
@@ -516,7 +524,11 @@ class TestNestedUserOwnedExcludeNotFiltered:
         assert (plan.target_dir / "tools" / "bin" / "tool.py").exists()
 
     def test_nested_logs_dir_is_preserved(self, profile_env):
-        staged = _make_staging_dir(profile_env, "src")
+        mf = DistributionManifest(
+            name="nested_logs", version="0.1.0",
+            distribution_owned=list(DEFAULT_DIST_OWNED) + ["scripts"],
+        )
+        staged = _make_staging_dir(profile_env, "src", manifest=mf)
         (staged / "scripts" / "logs").mkdir(parents=True)
         (staged / "scripts" / "logs" / "run.log").write_text("ok\n")
 
@@ -525,7 +537,11 @@ class TestNestedUserOwnedExcludeNotFiltered:
         assert (plan.target_dir / "scripts" / "logs" / "run.log").read_text() == "ok\n"
 
     def test_nested_cache_dir_is_preserved(self, profile_env):
-        staged = _make_staging_dir(profile_env, "src")
+        mf = DistributionManifest(
+            name="nested_cache", version="0.1.0",
+            distribution_owned=list(DEFAULT_DIST_OWNED) + ["control-plane"],
+        )
+        staged = _make_staging_dir(profile_env, "src", manifest=mf)
         (staged / "control-plane" / "cache").mkdir(parents=True)
         (staged / "control-plane" / "cache" / "data.json").write_text("{}\n")
 
@@ -539,7 +555,8 @@ class TestNestedUserOwnedExcludeNotFiltered:
 
         Note: _bootstrap_user_dirs creates some of these (logs/, sessions/,
         memories/) in every fresh profile, so we check that the *staged content*
-        did not leak through rather than asserting the directory doesn't exist."""
+        did not leak through rather than asserting the directory doesn't exist.
+        """
         staged = _make_staging_dir(profile_env, "src")
         # Add top-level excluded entries alongside the legit ones
         (staged / "bin").mkdir(exist_ok=True)
@@ -556,8 +573,13 @@ class TestNestedUserOwnedExcludeNotFiltered:
             "staged logs/ content should not leak into target"
 
     def test_both_nested_and_top_level_coexist(self, profile_env):
-        """Top-level bin/ filtered, but tools/bin/ kept."""
-        staged = _make_staging_dir(profile_env, "src")
+        """Top-level bin/ filtered, but tools/bin/ kept (tools/ opted into
+        distribution_owned, matching #74373's allowlist enforcement)."""
+        mf = DistributionManifest(
+            name="coexist", version="0.1.0",
+            distribution_owned=list(DEFAULT_DIST_OWNED) + ["tools"],
+        )
+        staged = _make_staging_dir(profile_env, "src", manifest=mf)
         (staged / "bin").mkdir(exist_ok=True)
         (staged / "bin" / "top.sh").write_text("# top\n")
         (staged / "tools" / "bin").mkdir(parents=True)
@@ -675,3 +697,133 @@ class TestErrorSurfaces:
         staged = _make_staging_dir(profile_env, "bad", manifest=mf)
         with pytest.raises((ValueError, DistributionError)):
             plan_install(str(staged), tmp_path / "work")
+
+
+# ===========================================================================
+# distribution_owned enforcement (issue #74373)
+# ===========================================================================
+
+
+class TestOwnedPathsEnforcement:
+    """_copy_dist_payload() must actually consult manifest.owned_paths()
+    as an allowlist, not just parse and persist distribution_owned as
+    documentation. Also: an owned directory must be merge-copied on
+    update, not replaced wholesale (which silently deleted target-only
+    children).
+    """
+
+    def test_listed_entry_is_installed(self, profile_env):
+        mf = DistributionManifest(
+            name="repro", version="1.0.0", distribution_owned=["SOUL.md"],
+        )
+        staged = _make_staging_dir(profile_env, "repro", manifest=mf)
+        plan = install_distribution(str(staged), name="repro")
+        assert (plan.target_dir / "SOUL.md").is_file()
+
+    def test_unlisted_entry_is_excluded(self, profile_env):
+        """The core regression: an explicit distribution_owned allowlist
+        must actually constrain what gets installed."""
+        mf = DistributionManifest(
+            name="repro", version="1.0.0", distribution_owned=["SOUL.md"],
+        )
+        staged = _make_staging_dir(profile_env, "repro", manifest=mf)
+        (staged / "unlisted.txt").write_text("not part of the manifest\n")
+
+        plan = install_distribution(str(staged), name="repro")
+
+        assert not (plan.target_dir / "unlisted.txt").exists(), (
+            "An entry absent from distribution_owned must not be installed"
+        )
+        # mcp.json and cron/ are in the staged tree (from _make_staging_dir)
+        # but not in this manifest's explicit allowlist -- must also be excluded.
+        assert not (plan.target_dir / "mcp.json").exists()
+        # cron/ itself is unconditionally created empty by
+        # _bootstrap_user_dirs() as a user scaffold directory (independent
+        # of the manifest) -- the correct check is that the STAGED cron
+        # content wasn't copied into it, not that the directory is absent.
+        assert not (plan.target_dir / "cron" / "daily.json").exists()
+
+    def test_top_level_hard_exclusions_preserved_regardless_of_manifest(self, profile_env):
+        """USER_OWNED_EXCLUDE (credentials, runtime state) must never be
+        installed even if a manifest somehow lists it in distribution_owned
+        -- the allowlist can only ADD restriction, never remove this floor."""
+        mf = DistributionManifest(
+            name="repro", version="1.0.0",
+            distribution_owned=["SOUL.md", "auth.json", "state.db"],
+        )
+        staged = _make_staging_dir(profile_env, "repro", manifest=mf)
+        (staged / "auth.json").write_text('{"fake": "creds"}\n')
+        (staged / "state.db").write_text("not a real db\n")
+
+        plan = install_distribution(str(staged), name="repro")
+
+        assert not (plan.target_dir / "auth.json").exists()
+        assert not (plan.target_dir / "state.db").exists()
+
+    def test_target_only_child_survives_update_in_owned_directory(self, profile_env):
+        """Regression: an owned directory (e.g. skills/) used to be
+        wholesale-replaced on update (rmtree + fresh copytree), silently
+        deleting anything the user added inside it that the new staged
+        version doesn't mention. Must now merge instead."""
+        mf = DistributionManifest(
+            name="repro", version="1.0.0", distribution_owned=["skills"],
+        )
+        staged = _make_staging_dir(profile_env, "repro", manifest=mf)
+        plan = install_distribution(str(staged), name="repro")
+
+        # User adds their own skill directly inside the owned skills/ dir.
+        local_skill = plan.target_dir / "skills" / "local-only" / "SKILL.md"
+        local_skill.parent.mkdir(parents=True)
+        local_skill.write_text("---\nname: local-only\n---\n# mine\n")
+
+        # New version of the distribution updates the shipped skill but
+        # doesn't know about the user's local-only one. Bump the SAME
+        # staging dir in place, matching update_distribution()'s re-pull
+        # from the recorded source: path (it takes a profile name, not
+        # source/target paths directly).
+        (staged / "skills" / "demo" / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: updated\n---\n# Updated demo skill\n"
+        )
+
+        update_distribution("repro", force_config=False)
+
+        assert local_skill.is_file(), (
+            "A user file inside an owned directory must survive an update "
+            "-- the directory must be merge-copied, not replaced wholesale"
+        )
+        assert "updated" in (
+            plan.target_dir / "skills" / "demo" / "SKILL.md"
+        ).read_text()
+
+    def test_config_yaml_preservation_and_force_config_still_work(self, profile_env):
+        """Sanity: this fix must not regress the existing config.yaml
+        preserve-by-default / --force-config-overwrites behavior, since
+        config.yaml stays in DEFAULT_DIST_OWNED."""
+        staged = _make_staging_dir(profile_env, "cfgtest")
+        plan = install_distribution(str(staged), name="cfgtest")
+        (plan.target_dir / "config.yaml").write_text("model:\n  model: user-edited\n")
+
+        (staged / "config.yaml").write_text("model:\n  model: gpt-5\n")
+
+        update_distribution("cfgtest", force_config=False)
+        assert "user-edited" in (plan.target_dir / "config.yaml").read_text(), (
+            "config.yaml must be preserved on a normal update"
+        )
+
+        update_distribution("cfgtest", force_config=True)
+        assert "gpt-5" in (plan.target_dir / "config.yaml").read_text(), (
+            "--force-config must still overwrite config.yaml"
+        )
+
+    def test_default_manifest_without_explicit_owned_list_unchanged(self, profile_env):
+        """A manifest with no explicit distribution_owned must fall back to
+        DEFAULT_DIST_OWNED exactly as before -- this fix must not regress
+        the common (implicit-allowlist) install path."""
+        staged = _make_staging_dir(profile_env, "defaults")
+        plan = install_distribution(str(staged), name="defaults")
+
+        assert (plan.target_dir / "SOUL.md").is_file()
+        assert (plan.target_dir / "config.yaml").is_file()
+        assert (plan.target_dir / "mcp.json").is_file()
+        assert (plan.target_dir / "skills" / "demo" / "SKILL.md").is_file()
+        assert (plan.target_dir / "cron" / "daily.json").is_file()
