@@ -2,7 +2,10 @@
 
 Security hardened (cap-drop ALL, no-new-privileges, PID limits),
 configurable resource limits (CPU, memory, disk), and optional filesystem
-persistence via bind mounts.
+persistence via bind mounts. Optional further hardening on top of the
+namespace/cgroup boundary: an alternate Docker runtime (e.g. gVisor's
+``runsc``) and a read-only root filesystem — see ``DockerEnvironment``'s
+``runtime``/``read_only`` params.
 """
 
 import hashlib
@@ -607,19 +610,31 @@ def _extra_args_egress_collisions(
     return sorted(set(collisions))
 
 
-def _build_security_args(run_as_host_user: bool, run_exec: bool = False) -> list[str]:
+def _build_security_args(
+    run_as_host_user: bool, run_exec: bool = False, read_only: bool = False,
+) -> list[str]:
     """Return the security/cap/tmpfs args tailored to the privilege mode.
 
     ``run_exec`` mounts ``/run`` with ``exec`` instead of the hardened
     ``noexec`` default. This is required for s6-overlay images whose ``/init``
     entrypoint execs ``/run/s6/basedir/bin/init`` during startup; see
     ``_image_uses_init_entrypoint``.
+
+    ``read_only`` adds ``--read-only``, making the image's own root layer
+    immutable. This is additive with the existing tmpfs/bind mounts (they are
+    separate mounts, not part of the root layer, so ``/tmp``, ``/workspace``,
+    etc. stay writable) — but package installs that write outside those
+    mounted paths (e.g. ``apt install`` touching ``/usr``) will fail with
+    "Read-only file system" unless the operator also declares an extra tmpfs
+    or volume for that path via ``docker_extra_args``/``docker_volumes``.
     """
     run_tmpfs = list(_RUN_TMPFS_EXEC if run_exec else _RUN_TMPFS_NOEXEC)
     args = list(_BASE_SECURITY_ARGS) + run_tmpfs
-    if run_as_host_user:
-        return args
-    return args + list(_PRIVDROP_CAP_ARGS)
+    if not run_as_host_user:
+        args = args + list(_PRIVDROP_CAP_ARGS)
+    if read_only:
+        args = args + ["--read-only"]
+    return args
 
 
 def _image_uses_init_entrypoint(docker_exe: str, image: str) -> bool:
@@ -741,6 +756,39 @@ def _cgroup_limits_available(image: str) -> bool:
     return _cgroup_limits_ok
 
 
+_runtime_availability_cache: dict[str, bool] = {}
+
+
+def _docker_runtime_available(docker_exe: str, runtime: str) -> bool:
+    """Return True if *runtime* (e.g. ``"runsc"`` for gVisor) is registered
+    with the Docker daemon.
+
+    Probes ``docker info`` once per runtime name per process and caches the
+    result — the daemon's registered runtimes don't change without a daemon
+    restart/reconfigure, which a running Hermes process wouldn't see anyway.
+    """
+    if runtime in _runtime_availability_cache:
+        return _runtime_availability_cache[runtime]
+
+    available = False
+    try:
+        result = subprocess.run(
+            [docker_exe, "info", "--format", "{{json .Runtimes}}"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            runtimes = json.loads(result.stdout.strip())
+            available = isinstance(runtimes, dict) and runtime in runtimes
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        logger.debug("Docker: could not probe registered runtimes: %s", e)
+
+    _runtime_availability_cache[runtime] = available
+    return available
+
+
 def _ensure_docker_available() -> None:
     """Best-effort check that the docker CLI is available before use.
 
@@ -816,6 +864,19 @@ class DockerEnvironment(BaseEnvironment):
     boundary — the filesystem inside is writable so agents can install packages
     (pip, npm, apt) as needed. Writable workspace via tmpfs or bind mounts.
 
+    Two opt-in knobs are available for operators who already have the
+    underlying tooling in place (see SECURITY.md):
+
+    - ``runtime`` — a Docker runtime name (e.g. ``"runsc"`` for gVisor)
+      already registered with the operator's Docker daemon. Fails loud at
+      construction time if the requested runtime isn't registered, rather
+      than silently running under the default ``runc``.
+    - ``read_only`` — makes the image's root filesystem immutable
+      (``--read-only``), on top of the existing tmpfs/bind mounts for
+      ``/tmp``, ``/workspace``, etc. Package installs that write outside
+      those mounted paths will fail unless the operator declares an extra
+      writable mount.
+
     Persistence: when enabled, bind mounts preserve /workspace and /root
     across container restarts.
     """
@@ -839,6 +900,8 @@ class DockerEnvironment(BaseEnvironment):
         run_as_host_user: bool = False,
         extra_args: list = None,
         persist_across_processes: bool = True,
+        runtime: str = "",
+        read_only: bool = False,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -848,6 +911,8 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        self._runtime = (runtime or "").strip()
+        self._read_only = bool(read_only)
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
@@ -1258,7 +1323,27 @@ class DockerEnvironment(BaseEnvironment):
         security_args = _build_security_args(
             run_as_host_user and bool(user_args),
             run_exec=image_uses_s6_init,
+            read_only=self._read_only,
         )
+
+        # gVisor (or another alternate Docker runtime): fail loud rather than
+        # silently falling back to the default runc if the requested runtime
+        # isn't registered with the daemon — this is a deliberate security
+        # choice by the operator, and silently downgrading it would leave
+        # them believing they have a stronger boundary than they actually do.
+        runtime_args: list[str] = []
+        if self._runtime:
+            if not _docker_runtime_available(self._docker_exe, self._runtime):
+                raise RuntimeError(
+                    f"terminal.docker_runtime={self._runtime!r} is set but the "
+                    f"Docker daemon does not have a '{self._runtime}' runtime "
+                    "registered. Install it (e.g. gVisor's runsc: "
+                    "https://gvisor.dev/docs/user_guide/install/), register it "
+                    "in the daemon's /etc/docker/daemon.json runtimes config, "
+                    "and restart the daemon — or unset docker_runtime to use "
+                    "the default runc runtime."
+                )
+            runtime_args = ["--runtime", self._runtime]
 
         logger.info(f"Docker volume_args: {volume_args}")
         # User-supplied extra docker run flags (docker_extra_args in config.yaml).
@@ -1290,6 +1375,7 @@ class DockerEnvironment(BaseEnvironment):
 
         all_run_args = (
             security_args
+            + runtime_args
             + user_args
             + writable_args
             + resource_args
@@ -1371,6 +1457,44 @@ class DockerEnvironment(BaseEnvironment):
                         "container — removing it and starting fresh "
                         "(task=%s, profile=%s).",
                         container_id[:12], actual_mode or "unknown",
+                        task_label, profile_name,
+                    )
+                    try:
+                        subprocess.run(
+                            [self._docker_exe, "rm", "-f", container_id],
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                            timeout=30,
+                            check=False,
+                            stdin=subprocess.DEVNULL,
+                        )
+                    except (subprocess.TimeoutExpired, OSError) as e:
+                        logger.warning("Failed to remove mismatched container %s: %s", container_id[:12], e)
+                    existing = None
+            if existing is not None:
+                container_id, state = existing
+                # Hardening guard: same class of bug as the network-mode
+                # guard above.  A container created before the operator set
+                # ``docker_runtime``/``docker_readonly`` keeps its original
+                # runtime/rootfs mode forever — label-only reuse would hand
+                # the agent a container that looks hardened in config but
+                # isn't. Only the stronger-than-existing direction is
+                # guarded (same asymmetry as network): a container that's
+                # already stricter than requested is left alone.
+                runtime_mismatch = False
+                readonly_mismatch = False
+                if self._runtime or self._read_only:
+                    actual_runtime, actual_readonly = self._container_runtime_and_readonly(container_id)
+                    if self._runtime:
+                        runtime_mismatch = actual_runtime != self._runtime
+                    if self._read_only:
+                        readonly_mismatch = actual_readonly is not True
+                if runtime_mismatch or readonly_mismatch:
+                    logger.warning(
+                        "Existing container %s does not match the requested "
+                        "hardening (runtime=%r read_only=%r) — removing it "
+                        "and starting fresh (task=%s, profile=%s).",
+                        container_id[:12], self._runtime, self._read_only,
                         task_label, profile_name,
                     )
                     try:
@@ -1717,6 +1841,47 @@ class DockerEnvironment(BaseEnvironment):
             return None
         mode = result.stdout.strip()
         return mode or None
+
+    def _container_runtime_and_readonly(
+        self, container_id: str,
+    ) -> tuple[Optional[str], Optional[bool]]:
+        """Return ``(HostConfig.Runtime, HostConfig.ReadonlyRootfs)`` for
+        *container_id*, or ``(None, None)`` when inspection fails.
+
+        Used by the reuse path so a persisted container's actual runtime and
+        rootfs mode still matches the operator's ``docker_runtime`` /
+        ``docker_readonly`` settings. ``None`` is treated as a mismatch by
+        the caller when hardening was requested, so a failed inspect fails
+        closed rather than open — same posture as ``_container_network_mode``.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    self._docker_exe, "inspect",
+                    "--format", "{{.HostConfig.Runtime}}\t{{.HostConfig.ReadonlyRootfs}}",
+                    container_id,
+                ],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=10,
+                check=False,
+                stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            logger.debug("docker inspect Runtime/ReadonlyRootfs failed: %s", e)
+            return (None, None)
+        if result.returncode != 0:
+            logger.debug(
+                "docker inspect Runtime/ReadonlyRootfs returned %d: %s",
+                result.returncode, result.stderr.strip(),
+            )
+            return (None, None)
+        parts = result.stdout.strip().split("\t", 1)
+        if len(parts) != 2:
+            return (None, None)
+        runtime = parts[0].strip() or None
+        readonly = parts[1].strip().lower() == "true"
+        return (runtime, readonly)
 
     def _find_reusable_container(
         self,

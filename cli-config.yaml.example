@@ -268,6 +268,17 @@ terminal:
 #   # docker_extra_args:
 #   #   - "--cap-add"
 #   #   - "SETUID"
+#   # Optional: run the container under an alternate Docker runtime you've already
+#   # installed and registered with your Docker daemon (e.g. gVisor's "runsc").
+#   # Fails loud at startup if the named runtime isn't registered, rather than
+#   # silently falling back to the default runc runtime. Requires installing
+#   # gVisor separately: https://gvisor.dev/docs/user_guide/install/
+#   # docker_runtime: "runsc"
+#   # Optional: make the container's root filesystem read-only. Additive with the
+#   # existing tmpfs mounts for /tmp, /workspace, etc. — but package installs that
+#   # write outside those paths (e.g. "apt install") will fail unless you also add
+#   # an extra writable mount via docker_extra_args or docker_volumes.
+#   # docker_readonly: true
 
 # -----------------------------------------------------------------------------
 # OPTION 4: Singularity/Apptainer container

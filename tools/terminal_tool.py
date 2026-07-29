@@ -1453,6 +1453,12 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
         "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
         "docker_extra_args": docker_extra_args,
+        # Opt-in alternate Docker runtime (e.g. "runsc" for gVisor, if already
+        # installed and registered) and read-only root filesystem. Empty/false
+        # by default; DockerEnvironment fails loud at construction if a
+        # requested runtime isn't registered with the daemon.
+        "docker_runtime": os.getenv("TERMINAL_DOCKER_RUNTIME", ""),
+        "docker_readonly": os.getenv("TERMINAL_DOCKER_READONLY", "false").lower() in {"true", "1", "yes"},
         # Cross-process container reuse (issue #20561).  The docs claim
         # "ONE long-lived container shared across sessions" — this toggle
         # makes that real by probing for a labeled container at startup and
@@ -1513,6 +1519,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     docker_env = cc.get("docker_env", {})
     docker_extra_args = cc.get("docker_extra_args", [])
     docker_network = cc.get("docker_network", True)
+    docker_runtime = cc.get("docker_runtime", "")
+    docker_readonly = cc.get("docker_readonly", False)
 
     if env_type == "local":
         return _LocalEnvironment(cwd=cwd, timeout=timeout)
@@ -1538,6 +1546,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
+            runtime=docker_runtime,
+            read_only=docker_readonly,
         )
     
     elif env_type == "singularity":

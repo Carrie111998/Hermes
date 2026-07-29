@@ -1241,6 +1241,18 @@ DEFAULT_CONFIG = {
         # When on, SETUID/SETGID caps are omitted from the container since
         # no privilege drop is needed.
         "docker_run_as_host_user": False,
+        # Opt-in alternate Docker runtime (e.g. "runsc" for gVisor), for
+        # operators who already have it installed and registered with their
+        # Docker daemon. DockerEnvironment fails loud at construction if the
+        # named runtime isn't registered, rather than silently falling back
+        # to the default runc. Empty string = default runc runtime.
+        "docker_runtime": "",
+        # Opt-in read-only root filesystem (--read-only). Additive with the
+        # existing tmpfs/bind mounts for /tmp, /workspace, etc. — but package
+        # installs that write outside those mounted paths (e.g. `apt install`
+        # touching /usr) will fail unless you also declare an extra writable
+        # mount via docker_extra_args/docker_volumes.
+        "docker_readonly": False,
         # Persistent shell — keep a long-lived bash shell across execute() calls
         # so cwd/env vars/shell variables survive between commands.
         # Enabled by default for non-local backends (SSH); local is always opt-in
@@ -7675,6 +7687,8 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
     "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
+    "docker_runtime": "TERMINAL_DOCKER_RUNTIME",
+    "docker_readonly": "TERMINAL_DOCKER_READONLY",
     "sandbox_dir": "TERMINAL_SANDBOX_DIR",
     "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
 }

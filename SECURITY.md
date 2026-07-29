@@ -87,6 +87,18 @@ Terminal-backend isolation is the right posture when the concern is
 LLM-emitted destructive shell or unwanted file-tool writes, and the
 operator is otherwise trusted.
 
+Two additional opt-in `config.yaml` knobs are available for operators who
+already run an alternate container runtime or want a stricter rootfs, without
+adopting the whole-process wrapper below: `terminal.docker_runtime` (points
+the sandbox at an already-installed alternate Docker runtime, e.g. gVisor's
+`"runsc"` — fails loud at startup if the named runtime isn't registered with
+the daemon, rather than silently falling back to `runc`) and
+`terminal.docker_readonly` (makes the image's root filesystem immutable on
+top of the existing tmpfs mounts). These are configuration options for
+operators who already have the underlying tooling, not a recommended
+default, and they don't change the guidance below for untrusted-input
+operators — that guidance still points at NVIDIA OpenShell.
+
 #### Whole-process wrapping
 
 Whole-process wrapping runs the entire agent process tree inside a
