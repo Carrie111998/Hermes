@@ -566,7 +566,8 @@ class TestDeleteProfile:
         profile_dir = create_profile("coder", no_alias=True)
         assert profile_dir.is_dir()
         # Mock gateway import to avoid real systemd/launchd interaction
-        with patch("hermes_cli.profiles._cleanup_gateway_service"):
+        with patch("hermes_cli.profiles._cleanup_gateway_service"), \
+             patch("hermes_cli.profiles._profile_bound_backend_pids", return_value=[]):
             delete_profile("coder", yes=True)
         assert not profile_dir.is_dir()
 
@@ -583,6 +584,7 @@ class TestDeleteProfile:
         set_active_profile("coder")
 
         with patch("hermes_cli.profiles._cleanup_gateway_service"), \
+             patch("hermes_cli.profiles._profile_bound_backend_pids", return_value=[]), \
              patch("hermes_cli.profiles.time.sleep"), \
              patch("hermes_cli.profiles.shutil.rmtree", side_effect=PermissionError("locked")):
             with pytest.raises(RuntimeError, match="Could not remove profile directory"):
@@ -1847,7 +1849,8 @@ class TestEdgeCases:
         set_active_profile("coder")
         assert get_active_profile() == "coder"
 
-        with patch("hermes_cli.profiles._cleanup_gateway_service"):
+        with patch("hermes_cli.profiles._cleanup_gateway_service"), \
+             patch("hermes_cli.profiles._profile_bound_backend_pids", return_value=[]):
             delete_profile("coder", yes=True)
 
         assert get_active_profile() == "default"

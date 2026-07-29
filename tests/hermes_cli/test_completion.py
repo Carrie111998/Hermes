@@ -178,10 +178,18 @@ class TestGenerateZsh:
                 [
                     "zsh",
                     "-fc",
-                    f"autoload -Uz compinit && compinit -D; source {path}; [[ ${{_comps[hermes]}} == _hermes ]]",
+                    "for dir in $fpath; do "
+                    "[[ -r $dir/compinit ]] && { fpath=($dir); break; }; "
+                    "done; autoload -Uz compinit && compinit -D; "
+                    f"source {path}; [[ ${{_comps[hermes]}} == _hermes ]]",
                 ],
                 capture_output=True,
                 text=True,
+                env={
+                    **os.environ,
+                    "HOME": os.path.dirname(path),
+                    "ZDOTDIR": os.path.dirname(path),
+                },
             )
             assert result.returncode == 0, result.stderr
             assert result.stderr == ""
