@@ -257,6 +257,8 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
     ]
 
 
+
+
 @pytest.mark.asyncio
 async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db):
     session_id = session_db.create_session("image-session", "api_server")
