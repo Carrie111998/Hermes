@@ -439,16 +439,22 @@ class GatewaySlashCommandsMixin:
         # profile serving this source so a multiplexed /reset //new banner
         # reports the profile's model, not the base config's (#59003).
         try:
-            session_info = await asyncio.to_thread(
+            session_info = await self._run_in_executor_with_context(
                 self._reset_notice_session_info, source
             )
         except Exception:
             session_info = ""
 
         if old_entry is not None:
-            header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_default")
+            header = await self._run_in_executor_with_context(
+                self._telegram_topic_new_header,
+                source,
+            ) or t("gateway.reset.header_default")
         else:
-            header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_new")
+            header = await self._run_in_executor_with_context(
+                self._telegram_topic_new_header,
+                source,
+            ) or t("gateway.reset.header_new")
 
         # Set session title if provided with /new <title>
         _title_arg = event.get_command_args().strip()
@@ -478,9 +484,19 @@ class GatewaySlashCommandsMixin:
         # uses the freshly-created session. Without this, the binding
         # still points at the old session and the binding-lookup at the
         # top of _handle_message_with_agent would switch right back.
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source) and new_entry is not None:
+        if (
+            await self._run_in_executor_with_context(
+                self._is_telegram_topic_lane,
+                source,
+            )
+            and new_entry is not None
+        ):
             try:
-                await asyncio.to_thread(self._record_telegram_topic_binding, source, new_entry)
+                await self._run_in_executor_with_context(
+                    self._record_telegram_topic_binding,
+                    source,
+                    new_entry,
+                )
             except Exception:
                 logger.debug("Failed to rebind Telegram topic after /new", exc_info=True)
 
@@ -1077,7 +1093,7 @@ class GatewaySlashCommandsMixin:
             # text (no glyph grid — monospace isn't guaranteed on messaging
             # platforms). Fail-open: rendering errors never break /context.
             if has_agent:
-                breakdown = await asyncio.to_thread(
+                breakdown = await self._run_in_executor_with_context(
                     self._context_breakdown_block, agent, source, expanded
                 )
                 if breakdown:
@@ -2005,7 +2021,10 @@ class GatewaySlashCommandsMixin:
         # (Telegram DM topic recovery) before deriving the override key, so
         # the override is stored under the key the next message turn reads
         # (#30479).
-        source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
+        source = await self._run_in_executor_with_context(
+            self._normalize_source_for_session_key,
+            source,
+        )
         session_key = self._session_key_for_source(source)
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
@@ -3642,7 +3661,10 @@ class GatewaySlashCommandsMixin:
         # Normalize the source (Telegram DM topic recovery) before deriving
         # the override key so storage matches the key the next message turn
         # reads — same fix as /model (#30479).
-        _reasoning_source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        _reasoning_source = await self._run_in_executor_with_context(
+            self._normalize_source_for_session_key,
+            event.source,
+        )
         session_key = self._session_key_for_source(_reasoning_source)
         show_reasoning = self._load_show_reasoning()
         # Use the session's effective model (session /model override wins over
@@ -4268,6 +4290,7 @@ class GatewaySlashCommandsMixin:
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),
             )
+            _compress_cleanup_deferred = False
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
                 # Prevent close() from ending the newly rotated session —
@@ -4292,18 +4315,29 @@ class GatewaySlashCommandsMixin:
                 if not compressor.has_content_to_compress(head):
                     return t("gateway.compress.nothing_to_do")
 
-                loop = asyncio.get_running_loop()
-                compressed, _ = await loop.run_in_executor(
-                    None,
-                    lambda: tmp_agent._compress_context(
-                        head,
-                        "",
-                        approx_tokens=approx_tokens,
-                        focus_topic=focus_topic,
-                        force=True,
-                        defer_context_engine_notification=True,
+                _compress_future, _compress_worker_future = (
+                    self._submit_in_executor_with_context(
+                        lambda: tmp_agent._compress_context(
+                            head,
+                            "",
+                            approx_tokens=approx_tokens,
+                            focus_topic=focus_topic,
+                            force=True,
+                            defer_context_engine_notification=True,
+                        ),
                     )
                 )
+                try:
+                    compressed, _ = await asyncio.shield(_compress_future)
+                except asyncio.CancelledError:
+                    self._defer_agent_cleanup_until_future_done(
+                        _compress_future,
+                        tmp_agent,
+                        context="manual compression cancellation",
+                    )
+                    _compress_cleanup_deferred = True
+                    assert _compress_worker_future is not None
+                    raise
 
                 # If _compress_context returned unchanged because a
                 # concurrent compression lock is held, tell the user
@@ -4370,7 +4404,7 @@ class GatewaySlashCommandsMixin:
                         )
                     session_entry.session_id = new_session_id
                     await self.async_session_store._save()
-                    await asyncio.to_thread(
+                    await self._run_in_executor_with_context(
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compress-command",
                     )
@@ -4430,7 +4464,11 @@ class GatewaySlashCommandsMixin:
                 # Evict cached agent so next turn rebuilds system prompt
                 # from current files (SOUL.md, memory, etc.).
                 self._evict_cached_agent(session_key)
-                self._cleanup_agent_resources(tmp_agent)
+                if not _compress_cleanup_deferred:
+                    await self._cleanup_agent_resources_off_loop(
+                        tmp_agent,
+                        context="manual compression",
+                    )
             lines = [f"🗜️ {summary['headline']}"]
             if focus_topic:
                 lines.append(t("gateway.compress.focus_line", topic=focus_topic))
@@ -4599,7 +4637,12 @@ class GatewaySlashCommandsMixin:
                     )
                     if callable(schedule_rename):
                         try:
-                            await asyncio.to_thread(schedule_rename, source, session_id, sanitized)
+                            await self._run_in_executor_with_context(
+                                schedule_rename,
+                                source,
+                                session_id,
+                                sanitized,
+                            )
                         except Exception:
                             logger.debug(
                                 "Failed to rename Telegram topic from /title",
@@ -4863,7 +4906,7 @@ class GatewaySlashCommandsMixin:
         # previews / sources — the enumeration half of the /resume IDOR.
         cross_origin = include_all and self._resume_caller_is_admin(source)
         current_entry = await self.async_session_store.get_or_create_session(source)
-        rows = await asyncio.to_thread(
+        rows = await self._run_in_executor_with_context(
             query_session_listing,
             getattr(self._session_db, "_db", self._session_db),
             source=source.platform.value if source.platform else None,
@@ -5307,7 +5350,7 @@ class GatewaySlashCommandsMixin:
             # Same engine the desktop popover uses (PR #54907). The system
             # prompt / tools / skills / memory slices read off the live agent;
             # the conversation slice is estimated from the session transcript.
-            breakdown_lines = await asyncio.to_thread(
+            breakdown_lines = await self._run_in_executor_with_context(
                 self._context_breakdown_lines, agent, source
             )
             if breakdown_lines:
@@ -5722,7 +5765,7 @@ class GatewaySlashCommandsMixin:
             )
         )
         if not count and production_boundary and approval_id:
-            count = await asyncio.to_thread(
+            count = await self._run_in_executor_with_context(
                 resolve_gateway_owner_escalation_by_id,
                 approval_id,
                 choice,
@@ -5821,7 +5864,7 @@ class GatewaySlashCommandsMixin:
             )
         )
         if not count and production_boundary and approval_id:
-            count = await asyncio.to_thread(
+            count = await self._run_in_executor_with_context(
                 resolve_gateway_owner_escalation_by_id,
                 approval_id,
                 "deny",

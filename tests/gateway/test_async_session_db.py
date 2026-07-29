@@ -88,6 +88,21 @@ async def test_offload_goes_through_to_thread(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_offload_can_join_an_owner_tracked_executor():
+    db = _SpyDB()
+    seen = []
+
+    async def tracked_offload(func, *args):
+        seen.append((func, args))
+        return func(*args)
+
+    facade = AsyncSessionDB(db, offload=tracked_offload)
+
+    assert await facade.returns_str() == "title"
+    assert seen and seen[0][0].__name__ == "returns_str"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "method,expected",
     [
@@ -131,7 +146,7 @@ _GATEWAY_FILES = ("gateway/run.py", "gateway/slash_commands.py")
 _ALLOWED_SYNC_DB_ESCAPES = 4
 
 # Sync helpers that touch SessionDB but are NEVER invoked bare on the loop:
-# every loop-side call wraps them in ``asyncio.to_thread(...)`` and the only
+# every loop-side call routes them through the gateway's tracked executor and the only
 # bare calls live in the run_sync thread-pool closure. Their DB calls therefore
 # run off-loop. The guard exempts their bodies AND enforces the contract — see
 # test_offloaded_helpers_never_called_bare_on_loop. Adding a helper here without
@@ -178,7 +193,7 @@ class _RawCallVisitor:
         self.alias_calls = []  # (method, lineno) — via a _session_db-bound local, on-loop
         self.db_escapes = []  # self._session_db._db.<x> sites (lineno)
         # BARE self.<helper>(...) call sites of offloaded helpers — i.e. the
-        # helper is actually *called*, not passed to asyncio.to_thread (which
+        # helper is actually *called*, not passed to the tracked offloader (which
         # references it as an attribute, producing no Call node here). Each is
         # (helper, lineno, enclosing_fn) for the contract test.
         self.bare_helper_calls = []
@@ -200,7 +215,7 @@ class _RawCallVisitor:
                 continue
             encl_fn = enclosing.get(id(node))
             in_offloaded_helper = encl_fn in _OFFLOADED_SYNC_HELPERS
-            # Bare call of an offloaded helper (self._helper(...)). A to_thread
+            # Bare call of an offloaded helper (self._helper(...)). An offloader
             # offload passes the helper as an attribute arg, not a Call, so it
             # never lands here — exactly the distinction the contract test needs.
             if (
@@ -354,7 +369,7 @@ def test_offloaded_helpers_never_called_bare_on_loop():
 
     They touch SessionDB synchronously, so a bare ``self._helper(...)`` on the
     loop would freeze it. The contract: loop-side callers wrap them in
-    ``await asyncio.to_thread(self._helper, ...)`` (which references the helper
+    ``await self._run_in_executor_with_context(self._helper, ...)`` (which references the helper
     as an attribute — no Call node — so it never appears here). A bare call is
     only legitimate when it runs off-loop: inside the ``run_sync`` thread-pool
     closure, or inside another offloaded helper (sync->sync, same thread). Any
@@ -370,7 +385,8 @@ def test_offloaded_helpers_never_called_bare_on_loop():
                 violations.append(f"{rel}:{ln} bare self.{helper}( on the loop")
     assert not violations, (
         "Offloaded sync helper called bare on the gateway loop — wrap in "
-        "await asyncio.to_thread(self.<helper>, ...):\n  " + "\n  ".join(violations)
+        "await self._run_in_executor_with_context(self.<helper>, ...):\n  "
+        + "\n  ".join(violations)
     )
 
 

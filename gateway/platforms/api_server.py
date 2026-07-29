@@ -2307,6 +2307,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._session_dbs: Dict[str, Any] = {}
         self._owned_session_db_ids: set[int] = set()
         self._session_dbs_lock = threading.RLock()
+        self._session_db_offload_lock = threading.RLock()
+        self._session_db_offloads_closing = False
+        self._session_db_offload_futures: set[asyncio.Future] = set()
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
         # server requests; "*" is the process-wide fallback), mirroring
@@ -4158,6 +4161,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 owned.add(id(db))
             return db
 
+    def _ensure_session_db_for_authority(
+        self,
+        authority: APIRequestScope,
+    ):
+        """Return/open one DB after its caller has acquired admission."""
+        if self._session_db is not None and not self._api_multiplex_enabled():
+            return self._session_db
+        return self._open_and_cache_session_db(
+            Path(authority.canonical_home),
+            request_authority=authority,
+        )
+
     def _ensure_session_db(self):
         """Lazily initialise and return the SessionDB for the active profile home.
 
@@ -4170,20 +4185,27 @@ class APIServerAdapter(BasePlatformAdapter):
         contexts). Request handlers use ``_ensure_session_db_async`` to keep
         the SQLite open off the event loop.
         """
-        # Explicit override (tests / manual wiring) is safe only when one
-        # profile owns the listener.  A shared override must never leak into a
-        # named multiplex profile.
-        if self._session_db is not None and not self._api_multiplex_enabled():
-            return self._session_db
         try:
             authority = (
                 _api_request_authority.get()
                 or self._api_request_scope("request")
             )
-            return self._open_and_cache_session_db(
-                Path(authority.canonical_home),
-                request_authority=authority,
+            admission_lock = getattr(
+                self,
+                "_session_db_offload_lock",
+                None,
             )
+            if admission_lock is None:
+                admission_lock = threading.RLock()
+                self._session_db_offload_lock = admission_lock
+            # Sync callers (notably worker-side agent creation/coherence) must
+            # not obtain even a cached handle after disconnect sealed the
+            # adapter pool. The check and handle acquisition are one atomic
+            # region with the seal.
+            with admission_lock:
+                if getattr(self, "_session_db_offloads_closing", False):
+                    return None
+                return self._ensure_session_db_for_authority(authority)
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
@@ -4197,35 +4219,93 @@ class APIServerAdapter(BasePlatformAdapter):
         construction runs in the worker. A single-flight lock prevents duplicate
         concurrent construction for the same home.
         """
-        if self._session_db is not None and not self._api_multiplex_enabled():
-            return self._session_db
         try:
             authority = (
                 _api_request_authority.get()
                 or self._api_request_scope("request")
             )
-            home = Path(authority.canonical_home)
-            pool_key, _ = self._session_db_pool_key(
-                home,
-                request_authority=authority,
-            )
-            lock = getattr(self, "_session_dbs_lock", None)
-            cache = getattr(self, "_session_dbs", None)
-            if lock is not None and cache is not None:
-                with lock:
-                    cached = cache.get(pool_key)
-                if cached is not None:
-                    return cached
-            # The same thread lock used by synchronous callers is the
-            # single-flight authority inside this worker call.
-            return await asyncio.to_thread(
-                self._open_and_cache_session_db,
-                home,
-                request_authority=authority,
+            # Cached handles follow the same admitted offload path as first
+            # open. Returning one directly would bypass the disconnect seal
+            # and let a cancellation-resistant request resume against a pool
+            # already selected for close.
+            return await self._offload_session_db(
+                self._ensure_session_db_for_authority,
+                authority,
             )
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
+
+    async def _offload_session_db(self, func, *args, **kwargs):
+        """Submit one adapter-pool DB operation under an atomic close seal."""
+        lock = getattr(self, "_session_db_offload_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._session_db_offload_lock = lock
+        with lock:
+            if getattr(self, "_session_db_offloads_closing", False):
+                raise RuntimeError("API SessionDB pool is shutting down")
+            runner = getattr(self, "gateway_runner", None)
+            submit = getattr(runner, "_submit_in_executor_with_context", None)
+            if callable(submit):
+                future, _worker_future = submit(func, *args, **kwargs)
+            else:
+                future = asyncio.create_task(
+                    asyncio.to_thread(func, *args, **kwargs)
+                )
+            pending = getattr(self, "_session_db_offload_futures", None)
+            if pending is None:
+                pending = set()
+                self._session_db_offload_futures = pending
+            pending.add(future)
+
+        def _discard(_future) -> None:
+            with lock:
+                current = getattr(self, "_session_db_offload_futures", None)
+                if current is not None:
+                    current.discard(future)
+
+        future.add_done_callback(_discard)
+        # Cancellation belongs to the request wrapper, not the real DB worker.
+        # Keep the inner future alive and visible to disconnect's close barrier.
+        return await asyncio.shield(future)
+
+    async def _seal_and_wait_session_db_offloads(
+        self,
+        *,
+        timeout: float = 5.0,
+    ) -> bool:
+        """Reject new pool operations, then await every admitted real worker."""
+        self._seal_session_db_offload_admission()
+        lock = getattr(self, "_session_db_offload_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._session_db_offload_lock = lock
+
+        deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+        while True:
+            with lock:
+                pending = [
+                    future
+                    for future in (
+                        getattr(self, "_session_db_offload_futures", None) or set()
+                    )
+                    if not future.done()
+                ]
+            if not pending:
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.01)
+
+    def _seal_session_db_offload_admission(self) -> None:
+        """Atomically forbid new operations against this adapter's DB pool."""
+        lock = getattr(self, "_session_db_offload_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._session_db_offload_lock = lock
+        with lock:
+            self._session_db_offloads_closing = True
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -4699,7 +4779,11 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
-    def _persist_session_runtime_lock(self, session_id: str, runtime_request: Dict[str, Any]) -> bool:
+    async def _persist_session_runtime_lock(
+        self,
+        session_id: str,
+        runtime_request: Dict[str, Any],
+    ) -> bool:
         # Persist only a newly confirmed lock. Reusing a stored lock should not
         # rewrite its timestamp/prompt state on every turn, and an ordinary
         # one-off request override must not erase a previously confirmed lock.
@@ -4710,14 +4794,15 @@ class APIServerAdapter(BasePlatformAdapter):
         provider = self._clean_runtime_id(requested.get("provider"), max_len=80)
         if not model and not provider:
             return False
-        db = self._ensure_session_db()
+        db = await self._ensure_session_db_async()
         if db is None:
             return False
         try:
             safe_model_options = _normalize_persisted_api_model_options(
                 runtime_request.get("model_options")
             )
-            db.update_session_runtime_lock(
+            await self._offload_session_db(
+                db.update_session_runtime_lock,
                 session_id,
                 model=model or None,
                 provider=provider or None,
@@ -6414,7 +6499,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # API server is single-threaded aiohttp; a sync SessionDB call here
         # freezes every in-flight request, see PR discussion on event-loop
         # blocking SQLite in the gateway surface).
-        session = await asyncio.to_thread(db.get_session, session_id)
+        session = await self._offload_session_db(db.get_session, session_id)
         if not session:
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
@@ -6424,7 +6509,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return []
         try:
-            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            return await self._offload_session_db(
+                db.get_messages_as_conversation,
+                session_id,
+            )
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
@@ -6616,7 +6704,8 @@ class APIServerAdapter(BasePlatformAdapter):
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
-        sessions = await asyncio.to_thread(db.list_sessions_rich,
+        sessions = await self._offload_session_db(
+            db.list_sessions_rich,
             source=source,
             limit=limit,
             offset=offset,
@@ -6763,7 +6852,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 }), None
             return db._execute_write(_atomic)
 
-        session, err = await asyncio.to_thread(_do_create)
+        session, err = await self._offload_session_db(_do_create)
         if err == "exists":
             return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
         if err and err.startswith("title:"):
@@ -6804,16 +6893,24 @@ class APIServerAdapter(BasePlatformAdapter):
         db = await self._ensure_session_db_async()
         if "title" in body:
             try:
-                await asyncio.to_thread(db.set_session_title, session_id, "" if body["title"] is None else str(body["title"]))
+                await self._offload_session_db(
+                    db.set_session_title,
+                    session_id,
+                    "" if body["title"] is None else str(body["title"]),
+                )
             except ValueError as exc:
                 return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         if body.get("end_reason"):
-            await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
+            await self._offload_session_db(
+                db.end_session,
+                session_id,
+                str(body["end_reason"]),
+            )
             self._retire_api_session_agents(
                 session_id,
                 reason="API session ended",
             )
-        session = await asyncio.to_thread(db.get_session, session_id) or session
+        session = await self._offload_session_db(db.get_session, session_id) or session
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
@@ -6828,7 +6925,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        deleted = await asyncio.to_thread(db.delete_session, session_id)
+        deleted = await self._offload_session_db(db.delete_session, session_id)
         if deleted:
             self._retire_api_session_agents(
                 session_id,
@@ -6848,8 +6945,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
-        messages = await asyncio.to_thread(db.get_messages, resolved_id)
+        resolved_id = await self._offload_session_db(
+            db.resolve_resume_session_id,
+            session_id,
+        )
+        messages = await self._offload_session_db(db.get_messages, resolved_id)
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
@@ -6888,35 +6988,46 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if id_err is not None:
                 return id_err
-        if await asyncio.to_thread(db.get_session, fork_id):
+        if await self._offload_session_db(db.get_session, fork_id):
             return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
 
         # Match the CLI /branch semantics: mark the original as branched, then
         # create a child session that carries the transcript forward. This uses
         # SessionDB's native parent_session_id/end_reason visibility model rather
         # than inventing a parallel fork store.
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        await asyncio.to_thread(db.create_session,
+        await self._offload_session_db(db.end_session, source_id, "branched")
+        await self._offload_session_db(
+            db.create_session,
             fork_id,
             "api_server",
             model=source.get("model"),
             system_prompt=source.get("system_prompt"),
             parent_session_id=source_id,
         )
-        messages = await asyncio.to_thread(db.get_messages, source_id)
-        await asyncio.to_thread(db.replace_messages, fork_id, messages)
+        messages = await self._offload_session_db(db.get_messages, source_id)
+        await self._offload_session_db(db.replace_messages, fork_id, messages)
         title = body.get("title")
         if title is None:
             base = source.get("title") or "fork"
             try:
-                title = await asyncio.to_thread(db.get_next_title_in_lineage, base)
+                title = await self._offload_session_db(
+                    db.get_next_title_in_lineage,
+                    base,
+                )
             except Exception:
                 title = f"{base} fork"
         try:
-            await asyncio.to_thread(db.set_session_title, fork_id, str(title))
+            await self._offload_session_db(
+                db.set_session_title,
+                fork_id,
+                str(title),
+            )
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
-        fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
+        fork = await self._offload_session_db(db.get_session, fork_id) or {
+            "id": fork_id,
+            "parent_session_id": source_id,
+        }
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
     @_admit_api_agent_request
@@ -6959,7 +7070,10 @@ class APIServerAdapter(BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
-        if not self._persist_session_runtime_lock(session_id, runtime_request):
+        if not await self._persist_session_runtime_lock(
+            session_id,
+            runtime_request,
+        ):
             return web.json_response(
                 _openai_error(
                     "Could not persist the requested session model lock",
@@ -7128,7 +7242,10 @@ class APIServerAdapter(BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
-        if not self._persist_session_runtime_lock(session_id, runtime_request):
+        if not await self._persist_session_runtime_lock(
+            session_id,
+            runtime_request,
+        ):
             return web.json_response(
                 _openai_error(
                     "Could not persist the requested session model lock",
@@ -7498,7 +7615,10 @@ class APIServerAdapter(BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
-        if not self._persist_session_runtime_lock(session_id, runtime_request):
+        if not await self._persist_session_runtime_lock(
+            session_id,
+            runtime_request,
+        ):
             return web.json_response(
                 _openai_error(
                     "Could not persist the requested session model lock",
@@ -7625,7 +7745,10 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = await self._ensure_session_db_async()
                 if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+                    history = await self._offload_session_db(
+                        db.get_messages_as_conversation,
+                        session_id,
+                    )
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -9568,10 +9691,11 @@ class APIServerAdapter(BasePlatformAdapter):
             and not previous_response_id
         ):
             try:
-                db = self._ensure_session_db()
+                db = await self._ensure_session_db_async()
                 if db is not None:
-                    conversation_history = db.get_messages_as_conversation(
-                        provided_session_id
+                    conversation_history = await self._offload_session_db(
+                        db.get_messages_as_conversation,
+                        provided_session_id,
                     )
             except Exception:
                 logger.debug(
@@ -13139,6 +13263,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._site:
             await self._site.stop()
             self._site = None
+        # Close the adapter-specific SessionDB admission gate before any
+        # cancellation-resistant aiohttp handler can enqueue another DB worker.
+        self._seal_session_db_offload_admission()
 
         # Reconnect cleanup may receive an adapter whose construction failed
         # before the run/cleanup registries were initialized.  Treat absent
@@ -13178,56 +13305,68 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
             )
 
-        # Graceful shutdown is itself an authority boundary.  Keep retrying
-        # every retained exact binding and do not report a clean disconnect
-        # merely because a short timeout elapsed.  systemd's hard-kill path is
-        # separately reconciled by the privileged writer's stop/start hooks.
-        while True:
-            for handle in list(api_cleanup_handles.values()):
-                self._ensure_api_cleanup_retry(
-                    handle,
-                    cleanup_ref=None,
-                    cleanup_state_callback=None,
-                )
-            cleanup_tasks = {
-                task
-                for task in (
-                    list(active_run_tasks.values())
-                    + list(api_cleanup_tasks)
-                )
-                if task is not None and not task.done()
-            }
-            if not cleanup_tasks and not api_cleanup_handles:
-                break
-            try:
-                _done, pending = await asyncio.wait(
-                    cleanup_tasks,
-                    timeout=30.0,
-                )
-                for task in _done:
-                    try:
-                        task.exception()
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                if pending or api_cleanup_handles:
-                    logger.warning(
-                        "[%s] Waiting for exact API cleanup: %d task(s), "
-                        "%d handle(s)",
-                        self.name,
-                        len(pending),
-                        len(api_cleanup_handles),
+        async def _await_exact_api_cleanup() -> None:
+            # Graceful shutdown is itself an authority boundary. Keep retrying
+            # every retained exact binding and do not report a clean disconnect
+            # merely because a short timeout elapsed. systemd's hard-kill path
+            # is separately reconciled by the privileged writer's stop/start
+            # hooks.
+            while True:
+                for handle in list(api_cleanup_handles.values()):
+                    self._ensure_api_cleanup_retry(
+                        handle,
+                        cleanup_ref=None,
+                        cleanup_state_callback=None,
                     )
-            except asyncio.CancelledError:
-                logger.error(
-                    "[%s] Graceful shutdown cancellation deferred until "
-                    "exact API cleanup confirms",
-                    self.name,
-                )
-                current = asyncio.current_task()
-                if current is not None and hasattr(current, "uncancel"):
-                    current.uncancel()
+                cleanup_tasks = {
+                    task
+                    for task in (
+                        list(active_run_tasks.values())
+                        + list(api_cleanup_tasks)
+                    )
+                    if task is not None and not task.done()
+                }
+                if not cleanup_tasks and not api_cleanup_handles:
+                    return
+                try:
+                    _done, pending = await asyncio.wait(
+                        cleanup_tasks,
+                        timeout=30.0,
+                    )
+                    for task in _done:
+                        try:
+                            task.exception()
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    if pending or api_cleanup_handles:
+                        logger.warning(
+                            "[%s] Waiting for exact API cleanup: %d task(s), "
+                            "%d handle(s)",
+                            self.name,
+                            len(pending),
+                            len(api_cleanup_handles),
+                        )
+                except asyncio.CancelledError:
+                    logger.error(
+                        "[%s] Graceful shutdown cancellation deferred until "
+                        "exact API cleanup confirms",
+                        self.name,
+                    )
+                    current = asyncio.current_task()
+                    if current is not None and hasattr(current, "uncancel"):
+                        current.uncancel()
 
-        # No worker owns these conversation agents now.  Release every cached
+        await _await_exact_api_cleanup()
+
+        if self._runner:
+            await self._runner.cleanup()
+            self._runner = None
+        # aiohttp cleanup may let an already-admitted, cancellation-resistant
+        # handler publish its run/cleanup owner after the first snapshot. Drain
+        # the live registries again before releasing agents or closing DBs.
+        await _await_exact_api_cleanup()
+
+        # No worker owns these conversation agents now. Release every cached
         # provider client and cancel any clarification that raced shutdown.
         api_agent_cache = getattr(self, "_api_agent_cache", {})
         cache_lock = getattr(self, "_api_agent_cache_lock", threading.RLock())
@@ -13242,7 +13381,11 @@ class APIServerAdapter(BasePlatformAdapter):
             deferred_releases.clear()
         for agent in cached_agents.values():
             self._release_api_cached_agent(agent)
-        clarifications_lock = getattr(self, "_api_clarifications_lock", threading.RLock())
+        clarifications_lock = getattr(
+            self,
+            "_api_clarifications_lock",
+            threading.RLock(),
+        )
         pending_clarifications = getattr(self, "_api_pending_clarifications", {})
         with clarifications_lock:
             clarify_scopes = {
@@ -13251,7 +13394,11 @@ class APIServerAdapter(BasePlatformAdapter):
             }
         for scope in clarify_scopes:
             self._clear_api_clarify_scope(scope)
-        approvals_lock = getattr(self, "_api_approvals_lock", threading.RLock())
+        approvals_lock = getattr(
+            self,
+            "_api_approvals_lock",
+            threading.RLock(),
+        )
         pending_approvals = getattr(self, "_api_pending_approvals", {})
         with approvals_lock:
             approval_scopes = {
@@ -13274,36 +13421,49 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
             )
 
-        if self._runner:
-            await self._runner.cleanup()
-            self._runner = None
-        session_dbs_lock = getattr(
-            self,
-            "_session_dbs_lock",
-            threading.RLock(),
+        # Request-task cancellation can release an awaiting coroutine while its
+        # real SQLite worker continues. Do not close the pool until every
+        # operation admitted before the seal has exited. This wait is bounded
+        # for non-process reconnect/disposal paths; timeout leaves handles open
+        # rather than closing underneath a live worker.
+        session_db_workers_idle = await self._seal_and_wait_session_db_offloads(
+            timeout=5.0,
         )
-        with session_dbs_lock:
-            session_dbs = getattr(self, "_session_dbs", {})
-            owned_session_db_ids = set(
-                getattr(self, "_owned_session_db_ids", set())
+        owned_session_dbs = {}
+        if session_db_workers_idle:
+            session_dbs_lock = getattr(
+                self,
+                "_session_dbs_lock",
+                threading.RLock(),
             )
-            owned_session_dbs = {
-                id(db): db
-                for db in session_dbs.values()
-                if db is not None and id(db) in owned_session_db_ids
-            }
-            injected_session_db = getattr(self, "_session_db", None)
-            if (
-                injected_session_db is not None
-                and id(injected_session_db) in owned_session_db_ids
-            ):
-                owned_session_dbs[id(injected_session_db)] = (
-                    injected_session_db
+            with session_dbs_lock:
+                session_dbs = getattr(self, "_session_dbs", {})
+                owned_session_db_ids = set(
+                    getattr(self, "_owned_session_db_ids", set())
                 )
-            session_dbs.clear()
-            owned_ids = getattr(self, "_owned_session_db_ids", None)
-            if owned_ids is not None:
-                owned_ids.clear()
+                owned_session_dbs = {
+                    id(db): db
+                    for db in session_dbs.values()
+                    if db is not None and id(db) in owned_session_db_ids
+                }
+                injected_session_db = getattr(self, "_session_db", None)
+                if (
+                    injected_session_db is not None
+                    and id(injected_session_db) in owned_session_db_ids
+                ):
+                    owned_session_dbs[id(injected_session_db)] = (
+                        injected_session_db
+                    )
+                session_dbs.clear()
+                owned_ids = getattr(self, "_owned_session_db_ids", None)
+                if owned_ids is not None:
+                    owned_ids.clear()
+        else:
+            logger.warning(
+                "[%s] Leaving SessionDB pool open: admitted worker did not "
+                "exit before the close barrier timeout",
+                self.name,
+            )
         for session_db in owned_session_dbs.values():
             try:
                 session_db.close()

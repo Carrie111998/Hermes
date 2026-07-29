@@ -16,7 +16,12 @@ import hermes_cli.gateway as gateway
 
 def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
-    module.start_gateway = start_gateway
+
+    def process_owned_start_gateway(**kwargs):
+        assert kwargs.pop("_process_lifecycle_owned") is True
+        return start_gateway(**kwargs)
+
+    module.start_gateway = process_owned_start_gateway
 
     def _exit_after_graceful_shutdown(code):
         if code:
@@ -122,7 +127,13 @@ def test_gateway_run_subprocess_preserves_daemon_exit_codes(
 
         outcome = os.environ["HERMES_TEST_GATEWAY_OUTCOME"]
 
-        async def start_gateway(*, replace, verbosity):
+        async def start_gateway(
+            *,
+            replace,
+            verbosity,
+            _process_lifecycle_owned,
+        ):
+            assert _process_lifecycle_owned is True
             if outcome == "failure":
                 return False
             raise SystemExit(int(outcome.split(":", 1)[1]))

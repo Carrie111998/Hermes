@@ -376,6 +376,7 @@ def test_gateway_main_passes_exact_production_bindings(
         ),
         "config": expected,
         "kwargs": {
+            "_process_lifecycle_owned": True,
             "require_production_model_sovereignty": True,
             "production_release_revision": _REVISION,
             "production_config_sha256": digest,

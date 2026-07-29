@@ -1759,3 +1759,110 @@ async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
     ]
     assert len(timeout_warnings) == 1
     assert runner._hygiene_compression_failure_cooldowns["sess-progress"] > time.time()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_hygiene_worker_remains_visible_to_session_db_close(
+    monkeypatch,
+    tmp_path,
+):
+    """Cancelling the turn cannot hide its real compression DB worker."""
+    from hermes_state import SessionDB
+
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    worker_errors = []
+    shared_db = SessionDB(db_path=tmp_path / "state.db")
+    shared_db.set_meta("hygiene-close-race", "intact")
+
+    class BlockingCompressAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self.session_db = kwargs.get("session_db")
+            self._print_fn = None
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(
+            self,
+            messages,
+            *_args,
+            commit_fence=None,
+            **_kwargs,
+        ):
+            worker_entered.set()
+            if not release_worker.wait(timeout=5):
+                raise RuntimeError("test hygiene worker release timed out")
+            try:
+                self.session_db.get_meta("hygiene-close-race")
+            except Exception as exc:
+                worker_errors.append(exc)
+                raise
+            if commit_fence is not None and not commit_fence.begin_commit():
+                return (messages, None)
+            try:
+                return (messages, None)
+            finally:
+                if commit_fence is not None:
+                    commit_fence.finish_commit()
+
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        BlockingCompressAgent,
+        "compression:\n"
+        "  enabled: true\n"
+        "  hygiene_timeout_seconds: 10\n"
+        "  hygiene_total_ceiling_seconds: 20\n",
+    )
+    runner._hygiene_compression_failure_cooldowns = {}
+    runner._session_db = SimpleNamespace(_db=shared_db)
+    runner.session_store._db = shared_db
+
+    turn_task = asyncio.create_task(runner._handle_message(event))
+    try:
+        for _ in range(100):
+            if worker_entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert worker_entered.is_set()
+
+        turn_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn_task
+
+        assert any(
+            not future.done()
+            for future in runner._gateway_executor_futures
+        )
+        assert await runner._close_shutdown_session_dbs(
+            deadline_monotonic=time.monotonic() + 1,
+            unsafe_reasons=set(),
+        ) is False
+        assert shared_db._conn is not None
+    finally:
+        release_worker.set()
+
+    for _ in range(100):
+        if not any(
+            not future.done()
+            for future in runner._gateway_executor_futures
+        ):
+            break
+        await asyncio.sleep(0.01)
+    assert worker_errors == []
+    assert shared_db._conn is not None
+
+    deferred = list(
+        getattr(runner, "_deferred_agent_cleanup_tasks", set())
+    )
+    if deferred:
+        await asyncio.gather(*deferred, return_exceptions=True)
+    runner._shutdown_executor()
+    shared_db.close()

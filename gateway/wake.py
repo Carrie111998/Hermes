@@ -758,8 +758,13 @@ async def _resolve_wake_session_id(
     db = await adapter._ensure_session_db_async()
     if db is None:
         raise RuntimeError("wake self-post session database is unavailable")
+    offload = getattr(
+        adapter,
+        "_offload_session_db",
+        getattr(adapter, "_offload_blocking", asyncio.to_thread),
+    )
     current_id = str(session_id or "").strip()
-    row = await asyncio.to_thread(db.get_session, current_id)
+    row = await offload(db.get_session, current_id)
     if row is None:
         raise RuntimeError(
             f"wake self-post target session does not exist: {current_id}"
@@ -770,7 +775,7 @@ async def _resolve_wake_session_id(
                 "wake self-post target ended at an explicit conversation "
                 "boundary"
             )
-        tip_id = await asyncio.to_thread(
+        tip_id = await offload(
             db.get_compression_tip,
             current_id,
         )
@@ -778,7 +783,7 @@ async def _resolve_wake_session_id(
             raise RuntimeError(
                 "wake self-post compression continuation is not available"
             )
-        tip = await asyncio.to_thread(db.get_session, str(tip_id))
+        tip = await offload(db.get_session, str(tip_id))
         if tip is None or tip.get("ended_at"):
             raise RuntimeError(
                 "wake self-post compression continuation is not live"
@@ -786,7 +791,7 @@ async def _resolve_wake_session_id(
         current_id = str(tip_id)
 
     if runtime_effect is not None:
-        authority = await asyncio.to_thread(
+        authority = await offload(
             db.get_conversation_root,
             current_id,
         )

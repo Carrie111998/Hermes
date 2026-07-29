@@ -9,7 +9,7 @@ SIGKILL.
 This module provides:
 
 1. A plain OS-thread shutdown watchdog armed at ``stop()``. If shutdown has not
-   completed within ``restart_drain_timeout + grace``, it dumps all-thread
+   completed within ``restart_drain_timeout + cleanup budget``, it dumps all-thread
    stacks via ``faulthandler`` plus a metadata snapshot, then ``os._exit`` so
    the service manager can revive the process.
 2. An event-loop heartbeat file at ``<HERMES_HOME>/state/gateway.heartbeat`` so
@@ -36,14 +36,20 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+from gateway.shutdown_timing import (
+    DEFAULT_SHUTDOWN_POST_DRAIN_CLEANUP_BUDGET_S,
+    resolve_gateway_shutdown_timing,
+)
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
-# Extra leash beyond ``agent.restart_drain_timeout`` so a slow-but-progressing
-# drain is not cut short. Matches the issue #66892 suggested hardening.
-DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S = 60.0
+# Backward-compatible name for the shared globally bounded post-drain cleanup
+# budget.  New timing consumers should import from gateway.shutdown_timing.
+DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S = (
+    DEFAULT_SHUTDOWN_POST_DRAIN_CLEANUP_BUDGET_S
+)
 DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
 DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S = 5.0
 DEFAULT_LOOP_WATCHDOG_INTERVAL_S = 30.0
@@ -255,16 +261,11 @@ def resolve_shutdown_watchdog_delay(
     *,
     grace_s: float = DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S,
 ) -> float:
-    """Return the wall-clock leash for the shutdown watchdog thread."""
-    try:
-        drain = max(float(drain_timeout), 0.0)
-    except (TypeError, ValueError):
-        drain = 0.0
-    try:
-        grace = max(float(grace_s), 0.0)
-    except (TypeError, ValueError):
-        grace = DEFAULT_SHUTDOWN_WATCHDOG_GRACE_S
-    return drain + grace
+    """Return the shared global controlled-exit deadline for shutdown."""
+    return resolve_gateway_shutdown_timing(
+        drain_timeout,
+        post_drain_cleanup_budget_s=grace_s,
+    ).controlled_exit_deadline_s
 
 
 def _write_watchdog_dump(

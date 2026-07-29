@@ -149,12 +149,21 @@ def test_load_busy_text_mode_follows_input_mode_and_honors_legacy(tmp_path, monk
     assert gateway_run.GatewayRunner._load_busy_text_mode() == "interrupt"
 
 
-def test_load_restart_drain_timeout_prefers_env_then_config_then_default(
+def test_load_restart_drain_timeout_is_config_authoritative(
     tmp_path, monkeypatch, caplog
 ):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+    monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "180")
 
+    # A stale installer-shell bridge cannot lengthen the runtime watchdog when
+    # the exact home has no config at all.
+    assert (
+        gateway_run.GatewayRunner._load_restart_drain_timeout()
+        == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+    )
+
+    # Nor can it become authoritative merely because config.yaml omits the key.
+    (tmp_path / "config.yaml").write_text("agent: {}\n", encoding="utf-8")
     assert (
         gateway_run.GatewayRunner._load_restart_drain_timeout()
         == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -166,9 +175,11 @@ def test_load_restart_drain_timeout_prefers_env_then_config_then_default(
     assert gateway_run.GatewayRunner._load_restart_drain_timeout() == 12.0
 
     monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "7")
-    assert gateway_run.GatewayRunner._load_restart_drain_timeout() == 7.0
+    assert gateway_run.GatewayRunner._load_restart_drain_timeout() == 12.0
 
-    monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "invalid")
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  restart_drain_timeout: invalid\n", encoding="utf-8"
+    )
     assert (
         gateway_run.GatewayRunner._load_restart_drain_timeout()
         == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT

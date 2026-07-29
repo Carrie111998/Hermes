@@ -176,6 +176,17 @@ def _warm_gateway_module() -> None:
 
 
 def _resolve_restart_drain_timeout() -> float:
+    # ``/api/status`` has historically exposed the process-local compatibility
+    # override first so external lifecycle controllers can size their polling
+    # deadline without reading config.yaml.  Keep that API contract local to
+    # the status hint: the actual gateway runtime and generated service units
+    # use their config-authoritative resolvers, so a stale installer-shell
+    # environment cannot lengthen or shorten the real shutdown boundary.
+    raw_override = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
+    if raw_override:
+        from gateway.restart import parse_restart_drain_timeout
+
+        return parse_restart_drain_timeout(raw_override)
     try:
         from hermes_cli.gateway import _get_restart_drain_timeout
         return _get_restart_drain_timeout()

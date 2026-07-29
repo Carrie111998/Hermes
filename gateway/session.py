@@ -20,7 +20,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from dataclasses import field as dataclass_field, replace as dataclass_replace
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1287,8 +1287,14 @@ class ConsumedResetMarkers:
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
-    def __init__(self, store: "SessionStore") -> None:
+    def __init__(
+        self,
+        store: "SessionStore",
+        *,
+        offload: Callable[..., Awaitable[Any]] | None = None,
+    ) -> None:
         self._store = store
+        self._offload = offload
 
     def __getattr__(self, name: str):
         attr = getattr(self._store, name)
@@ -1296,6 +1302,12 @@ class AsyncSessionStore:
             return attr
 
         async def _offloaded(*args, **kwargs) -> Any:
+            if self._offload is not None:
+                if kwargs:
+                    from functools import partial
+
+                    return await self._offload(partial(attr, *args, **kwargs))
+                return await self._offload(attr, *args)
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _offloaded
@@ -3024,6 +3036,8 @@ class SessionStore:
         self,
         session_key: str,
         reason: str = "restart_timeout",
+        *,
+        require_primary: bool = False,
     ) -> bool:
         """Mark a session as resumable after a restart interruption.
 
@@ -3031,6 +3045,12 @@ class SessionStore:
         ``session_id`` and the transcript.  The next call to
         ``get_or_create_session()`` for this key returns the same entry
         so the user auto-resumes on the same conversation lane.
+
+        When ``require_primary`` is true, success means the canonical
+        ``state.db`` routing writer durably accepted the marker.  A failed
+        primary write is surfaced even when the legacy ``sessions.json``
+        recovery mirror succeeds, allowing shutdown callers to retry instead
+        of treating JSON-only persistence as an authoritative receipt.
 
         Returns True if the session existed and was marked.
         """
@@ -3042,10 +3062,53 @@ class SessionStore:
                 # forced-wipe signal (from /stop or stuck-loop escalation).
                 if entry.suspended:
                     return False
+                previous_marker = (
+                    entry.resume_pending,
+                    entry.resume_reason,
+                    entry.last_resume_marked_at,
+                )
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
-                self._save()
+                if not require_primary:
+                    self._save()
+                    return True
+
+                routing_data, routing_generation = self._snapshot_routing_locked()
+                try:
+                    db = getattr(self, "_db", None)
+                    primary_writer = getattr(
+                        db,
+                        "replace_gateway_routing_entries",
+                        None,
+                    )
+                    if not callable(primary_writer):
+                        raise RuntimeError(
+                            "gateway routing primary save unavailable"
+                        )
+                    self._persist_routing_data(
+                        routing_data,
+                        routing_generation,
+                        require_primary=True,
+                    )
+                except Exception:
+                    # Keep a conservative emergency mirror even though it is
+                    # not an authoritative shutdown receipt.  state.db wins
+                    # when both copies are available on restart.
+                    try:
+                        self._save_sessions_json(routing_data)
+                    except Exception as mirror_exc:
+                        logger.warning(
+                            "gateway.session: sessions.json recovery mirror "
+                            "save failed after resume marker primary failure: %s",
+                            mirror_exc,
+                        )
+                    (
+                        entry.resume_pending,
+                        entry.resume_reason,
+                        entry.last_resume_marked_at,
+                    ) = previous_marker
+                    raise
                 return True
         return False
 

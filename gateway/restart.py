@@ -1,9 +1,11 @@
 """Shared gateway restart constants and supervisor detection helpers."""
 
+import math
 import os
 from collections.abc import Mapping
 
 from hermes_cli.config import DEFAULT_CONFIG
+from gateway.shutdown_timing import MAX_GATEWAY_SHUTDOWN_TIMING_COMPONENT_S
 
 # EX_TEMPFAIL from sysexits.h — used to ask the service manager to restart
 # the gateway after a graceful drain/reload path completes.
@@ -51,4 +53,9 @@ def parse_restart_drain_timeout(raw: object) -> float:
         value = float(raw) if str(raw or "").strip() else DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     except (TypeError, ValueError):
         return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
-    return max(0.0, value)
+    if not math.isfinite(value):
+        return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+    return min(
+        max(0.0, value),
+        MAX_GATEWAY_SHUTDOWN_TIMING_COMPONENT_S,
+    )
