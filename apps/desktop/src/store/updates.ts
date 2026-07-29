@@ -199,7 +199,7 @@ export function reportInstallMethodWarning(message: string | undefined): void {
  * (re)starts the cooldown, so a busy upstream branch doesn't re-spam the user
  * on every new commit. The snooze is persisted, so it survives relaunches too.
  */
-export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
+export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null, target: UpdateTarget) {
   if (!status || status.supported === false || status.error || !status.targetSha) {
     return
   }
@@ -208,11 +208,22 @@ export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
     return
   }
 
+  // The previous attempt at THIS upstream sha never landed. Re-firing the
+  // cheerful "update ready" toast just walks the user back into the identical
+  // failure — and the snooze below never engages, because it only starts when a
+  // toast is DISMISSED, not when an apply fails. Stay quiet until upstream
+  // advances past the sha we failed on; the next commit may well be the fix.
+  if (status.lastUpdateFailure && status.lastUpdateFailure.targetSha === status.targetSha) {
+    return
+  }
+
   if (isUpdateToastSnoozed()) {
     return
   }
 
-  if ($updateApply.get().applying) {
+  const applyState = target === 'backend' ? $backendUpdateApply.get() : $updateApply.get()
+
+  if (applyState.applying) {
     return
   }
 
@@ -223,7 +234,7 @@ export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
       label: translateNow('notifications.seeWhatsNew'),
       onClick: () => {
         snoozeUpdateToast()
-        openUpdatesWindow()
+        openUpdatesWindow(target)
       }
     },
     durationMs: 0,
@@ -236,8 +247,8 @@ export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
   })
 }
 
-export function openUpdatesWindow(): void {
-  openUpdateOverlayFor(isRemoteMode() ? 'backend' : 'client')
+export function openUpdatesWindow(target: UpdateTarget): void {
+  openUpdateOverlayFor(target)
 }
 
 /**
@@ -247,8 +258,7 @@ export function openUpdatesWindow(): void {
  * Used by the "Update now" affordance on the About panel, which would otherwise
  * only be able to open the changelog overlay.
  */
-export function startActiveUpdate(): void {
-  const target: UpdateTarget = isRemoteMode() ? 'backend' : 'client'
+export function startActiveUpdate(target: UpdateTarget): void {
   $updateOverlayTarget.set(target)
   $updateOverlayOpen.set(true)
   void (target === 'backend' ? applyBackendUpdate() : applyUpdates())
@@ -310,7 +320,7 @@ export async function checkBackendUpdates(): Promise<DesktopUpdateStatus | null>
   try {
     const status = mapBackendCheck(await checkHermesUpdate(true))
     $backendUpdateStatus.set(status)
-    maybeNotifyUpdateAvailable(status)
+    maybeNotifyUpdateAvailable(status, 'backend')
 
     return status
   } catch (error) {
@@ -341,7 +351,24 @@ export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
   try {
     const status = await bridge.check()
     $updateStatus.set(status)
-    maybeNotifyUpdateAvailable(status)
+
+    // Surface an attempt that never landed. Without this the failure is
+    // invisible in the desktop app entirely — it happens after we've quit, so
+    // only the separate installer window ever saw it. Reuses the existing
+    // 'error' stage, which updates-overlay.tsx already renders as a retryable
+    // card, so there's no new component or store to maintain.
+    if (status?.lastUpdateFailure && !$updateApply.get().applying) {
+      // Empty message on purpose: ErrorView already falls back to its own
+      // localized copy, so this adds no new i18n keys to keep in sync.
+      $updateApply.set({
+        ...IDLE,
+        stage: 'error',
+        error: 'last-update-failed',
+        message: ''
+      })
+    }
+
+    maybeNotifyUpdateAvailable(status, 'client')
     void refreshDesktopVersion()
 
     return status
