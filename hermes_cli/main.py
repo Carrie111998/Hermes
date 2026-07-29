@@ -7997,6 +7997,73 @@ def _atomic_replace_dir(src: str, dst: str) -> None:
         shutil.rmtree(backup, ignore_errors=True)
 
 
+def _looks_like_hermes_checkout(path: Path) -> bool:
+    """True when ``path`` is a hermes-agent source tree we can reinstall from."""
+    try:
+        return (path / "pyproject.toml").is_file() and (
+            path / "hermes_cli" / "main.py"
+        ).is_file()
+    except OSError:
+        return False
+
+
+def _resolve_managed_install_root() -> Path:
+    """Return the hermes-agent checkout this install actually manages.
+
+    ``PROJECT_ROOT`` is derived from the *running* ``hermes_cli`` package, so it
+    is the install root only when the ``hermes`` entry point on PATH belongs to
+    the managed install. The two diverge when the entry point lives elsewhere —
+    e.g. a ``hermes`` shim in a conda env while the agent itself sits under
+    ``%LOCALAPPDATA%\\hermes\\hermes-agent`` (#59850). Updating relative to
+    ``PROJECT_ROOT`` then copies the new tree into the shim's site-packages and
+    runs ``pip install -e .`` in a directory with no ``pyproject.toml``, which
+    exits 2 on every run while the real install stays stale.
+
+    Candidates are probed in order; the first that looks like a hermes-agent
+    checkout wins. ``PROJECT_ROOT`` is probed first so nothing changes for the
+    normal case where both roots already agree, and it is also the final
+    fallback so an unrecognized layout keeps today's behavior rather than
+    updating some unrelated directory.
+    """
+    candidates: list[Path] = [PROJECT_ROOT]
+
+    # Explicit installer override (``scripts/install.sh --install-dir``).
+    env_dir = os.environ.get("HERMES_INSTALL_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+
+    # The managed venv lives at ``<install root>/venv``, so when hermes runs out
+    # of that venv the parent of sys.prefix / $VIRTUAL_ENV is the install root.
+    for venv_dir in (sys.prefix, os.environ.get("VIRTUAL_ENV")):
+        if venv_dir:
+            candidates.append(Path(venv_dir).parent)
+
+    # Installer defaults: ``$HERMES_HOME/hermes-agent`` (where the Windows
+    # platform default home is ``%LOCALAPPDATA%\\hermes``), then the
+    # system-wide location used for Linux root installs.
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        candidates.append(get_default_hermes_root() / "hermes-agent")
+    except Exception as exc:
+        logger.debug("Could not derive the default Hermes root: %s", exc)
+    candidates.append(Path("/usr/local/lib/hermes-agent"))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if _looks_like_hermes_checkout(resolved):
+            return resolved
+
+    return PROJECT_ROOT
+
+
 def _update_via_zip(args):
     """Update Hermes Agent by downloading a ZIP archive.
 
@@ -8029,6 +8096,13 @@ def _update_via_zip(args):
     zip_url = (
         f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip"
     )
+
+    # Everything below writes to the managed install, which is NOT always the
+    # directory the running hermes_cli was imported from (#59850).
+    install_root = _resolve_managed_install_root()
+    if install_root != PROJECT_ROOT:
+        print(f"→ Updating managed install at {install_root}")
+        print(f"  (running `hermes` is loaded from {PROJECT_ROOT})")
 
     print("→ Downloading latest version...")
     tmp_dir = tempfile.mkdtemp(prefix="hermes-update-")
@@ -8080,7 +8154,7 @@ def _update_via_zip(args):
             if item in preserve:
                 continue
             src = os.path.join(extracted, item)
-            dst = os.path.join(str(PROJECT_ROOT), item)
+            dst = os.path.join(str(install_root), item)
             if os.path.isdir(src):
                 # Atomic-ish replace: never leave dst half-deleted if the copy
                 # fails partway (the failure mode behind #49145 on Windows).
@@ -8098,7 +8172,7 @@ def _update_via_zip(args):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Clear stale bytecode after ZIP extraction
-    removed = _clear_bytecode_cache(PROJECT_ROOT)
+    removed = _clear_bytecode_cache(install_root)
     if removed:
         print(
             f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
@@ -8121,11 +8195,13 @@ def _update_via_zip(args):
     if not uv_bin:
         uv_bin = _ensure_uv_for_termux(pip_cmd)
     if uv_bin:
-        uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+        uv_env = {**os.environ, "VIRTUAL_ENV": str(install_root / "venv")}
         if _is_termux_env(uv_env):
             uv_env.pop("PYTHONPATH", None)
             uv_env.pop("PYTHONHOME", None)
-        _install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
+        _install_python_dependencies_with_optional_fallback(
+            [uv_bin, "pip"], env=uv_env, cwd=install_root
+        )
     else:
         # Use sys.executable to explicitly call the venv's pip module,
         # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
@@ -8134,17 +8210,17 @@ def _update_via_zip(args):
         try:
             subprocess.run(
                 pip_cmd + ["--version"],
-                cwd=PROJECT_ROOT,
+                cwd=install_root,
                 check=True,
                 capture_output=True,
             )
         except subprocess.CalledProcessError:
             subprocess.run(
                 [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                cwd=PROJECT_ROOT,
+                cwd=install_root,
                 check=True,
             )
-        _install_python_dependencies_with_optional_fallback(pip_cmd)
+        _install_python_dependencies_with_optional_fallback(pip_cmd, cwd=install_root)
 
     # ZIP path parity: heal the active memory provider's bridge packages
     # after the dependency reinstall, same as the git-pull path (#53272,
@@ -8152,7 +8228,7 @@ def _update_via_zip(args):
     _refresh_active_memory_provider_dependencies()
 
     node_failures = _update_node_dependencies()
-    _build_web_ui(PROJECT_ROOT / "web")
+    _build_web_ui(install_root / "web")
 
     # Sync skills
     try:
@@ -8189,7 +8265,7 @@ def _update_via_zip(args):
     try:
         from hermes_cli.model_catalog import seed_cache_from_checkout
 
-        if seed_cache_from_checkout(PROJECT_ROOT):
+        if seed_cache_from_checkout(install_root):
             print("  ✓ Model catalog cache refreshed from checkout")
     except Exception as e:
         logger.debug("Model catalog seed during zip update failed: %s", e)
@@ -9226,12 +9302,17 @@ def _run_install_with_heartbeat(
     *,
     env: dict[str, str] | None = None,
     heartbeat_interval_seconds: int = 30,
+    cwd: Path | None = None,
 ) -> None:
     """Run dependency install command with periodic heartbeat output.
 
     Some resolvers/build backends (especially when compiling Rust/C extensions)
     can stay quiet for minutes. Emit a simple elapsed-time heartbeat so users
     know ``hermes update`` is still progressing even if pip/uv itself is silent.
+
+    ``cwd`` is the directory the editable install resolves ``.`` against and
+    defaults to ``PROJECT_ROOT``; the update path passes the managed install
+    root, which is not always the same directory (#59850).
     """
     done = threading.Event()
     start = _time.time()
@@ -9251,7 +9332,7 @@ def _run_install_with_heartbeat(
     try:
         subprocess.run(
             cmd,
-            cwd=PROJECT_ROOT,
+            cwd=cwd or PROJECT_ROOT,
             check=True,
             env=env,
         )
@@ -9264,9 +9345,13 @@ def _is_windows() -> bool:
     return sys.platform == "win32"
 
 
-def _venv_scripts_dir() -> Path | None:
-    """Return the venv Scripts directory if we're running inside the project venv."""
-    venv_dir = PROJECT_ROOT / "venv"
+def _venv_scripts_dir(root: Path | None = None) -> Path | None:
+    """Return the venv Scripts directory for ``root`` (default ``PROJECT_ROOT``).
+
+    Callers that install into a specific checkout pass its root so the shims
+    they quarantine belong to the venv being written to (#59850).
+    """
+    venv_dir = (root or PROJECT_ROOT) / "venv"
     if not venv_dir.is_dir():
         return None
     scripts = venv_dir / ("Scripts" if _is_windows() else "bin")
@@ -9586,6 +9671,7 @@ def _run_quarantined_install(
     *,
     env: dict[str, str] | None = None,
     scripts_dir: Path | None = None,
+    cwd: Path | None = None,
 ) -> None:
     """Run an editable install, quarantining the running ``hermes.exe`` first.
 
@@ -9606,7 +9692,7 @@ def _run_quarantined_install(
     if scripts_dir is not None:
         moved = _quarantine_running_hermes_exe(scripts_dir)
     try:
-        _run_install_with_heartbeat(cmd, env=env)
+        _run_install_with_heartbeat(cmd, env=env, cwd=cwd)
     except BaseException:
         # Restore shims if pip/uv didn't write replacements (e.g. install
         # failed before the entry-points step). Don't swallow the error.
@@ -10033,6 +10119,7 @@ def _install_python_dependencies_with_optional_fallback(
     *,
     env: dict[str, str] | None = None,
     group: str = "all",
+    cwd: Path | None = None,
 ) -> None:
     """Install base deps plus as many optional extras as the environment supports.
 
@@ -10043,12 +10130,15 @@ def _install_python_dependencies_with_optional_fallback(
     in the venv Scripts dir before each install attempt so uv can write fresh
     copies (Windows blocks REPLACE on a running .exe but allows RENAME). See
     ``_quarantine_running_hermes_exe`` for the rationale.
+
+    ``cwd`` selects the checkout ``.`` resolves against — and therefore the venv
+    whose shims get quarantined — defaulting to ``PROJECT_ROOT`` (#59850).
     """
-    scripts_dir = _venv_scripts_dir() if _is_windows() else None
+    scripts_dir = _venv_scripts_dir(cwd) if _is_windows() else None
 
     def _install(args: list[str]) -> None:
         _run_quarantined_install(
-            install_cmd_prefix + args, env=env, scripts_dir=scripts_dir
+            install_cmd_prefix + args, env=env, scripts_dir=scripts_dir, cwd=cwd
         )
 
     try:
