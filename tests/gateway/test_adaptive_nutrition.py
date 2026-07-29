@@ -2015,12 +2015,36 @@ def test_publish_pending_card_recovers_once(tmp_path):
         registry=SimpleNamespace(model_dump=lambda **_kwargs: {"version": 1}),
         _by_key={"client_001": SimpleNamespace(customer=customer)},
     )
+    preview = (
+        "오늘 상태: 안정적입니다.\n"
+        "이전 흐름과 비교: 유지 중입니다.\n"
+        "오늘 판단: 현재 계획을 유지합니다.\n"
+        "판단 이유: 승인된 근거 범위입니다.\n"
+        "오늘 할 일: 승인 식단 실행\n"
+        "다음 확인: 내일 체크인"
+    )
+    proposal = SimpleNamespace(digest="d" * 64, revision=1)
+    adaptive = SimpleNamespace(
+        _latest_production_proposal=lambda: proposal,
+        preview_registered_daily_projection=lambda _proposal: preview,
+    )
+    coordinator.adaptive_nutrition_coordinator = lambda _key: adaptive
+    service_state = "proposed"
+    card_text = (
+        "고객: Client · 날짜: 2026-07-14\n"
+        "이전 기록과 이번 입력을 함께 반영했습니다.\n"
+        "판단: 현재 근거 범위에서만 잠금 · 승인 전 고객에게 전송되지 않습니다.\n\n"
+        "실행 제안\n1. 승인 식단 실행\n\n"
+        f"고객 전달 미리보기\n{preview}\n\n"
+        "안전·과장 점검: 확인된 기록 범위를 넘는 단정이나 전송은 하지 않습니다."
+    )
     service = AdaptiveOperatorService(
         coordinator,
         review_operator=review,
         session_path=tmp_path / "sessions.jsonl",
         now_provider=lambda: datetime(2026, 7, 14, 9, 0, tzinfo=ZoneInfo("Asia/Seoul")),
     )
+    service._proposal_card_state = lambda _adaptive, _proposal: service_state
     callback = service.issue_session(
         action="select",
         customer_key="client_001",
@@ -2030,15 +2054,14 @@ def test_publish_pending_card_recovers_once(tmp_path):
     )
     card = {
         "status": "card",
-        "text": "테스트 전용 · 고객: Client · KST day: 2026-07-14 · revision: 1 · state: proposed",
+        "customer_key": "client_001",
+        "text": card_text,
         "envelope": {
-            "marker": "테스트 전용",
             "customer_label": "Client",
             "kst_day": "2026-07-14",
-            "revision": 1,
-            "state": "proposed",
         },
         "buttons": [],
+        **service._card_hidden_pins(proposal, service_state, preview),
     }
     service._consume(service._latest_session(callback), state="consumed")
     pending = service.mark_publish_pending(
@@ -2049,6 +2072,7 @@ def test_publish_pending_card_recovers_once(tmp_path):
     assert pending["state"] == "publish_pending"
     calls = []
 
+
     def publisher(payload):
         calls.append(payload)
         return {"ok": True, "message_id": "card-1"}
@@ -2056,11 +2080,9 @@ def test_publish_pending_card_recovers_once(tmp_path):
     recovered = service.recover_pending_cards(publisher)
     assert len(recovered["recovered"]) == 1
     recovered_text = recovered["recovered"][0]["card_payload"]["text"]
-    assert "테스트 전용" in recovered_text
-    assert "고객: Client" in recovered_text
-    assert "KST day: 2026-07-14" in recovered_text
-    assert "revision: 1" in recovered_text
-    assert "state: proposed" in recovered_text
+    assert recovered_text == card_text
+    assert "revision:" not in recovered_text
+    assert "state:" not in recovered_text
     assert recovered["pending"] == ()
     assert calls == [card]
     assert service._latest_session(callback)["state"] == "published"
@@ -4490,3 +4512,45 @@ def test_current_coaching_facts_binding_match_and_mismatch_are_read_only(
     assert coordinator.store.read() == before_rows
     assert service._read_rows() == before_sessions
     assert provider_calls == []
+
+def test_publication_unknown_outcome_is_not_retried(tmp_path):
+    review = AdaptiveReviewOperator("review-user", "review-chat", 59, 1)
+    customer = SimpleNamespace(spec=SimpleNamespace(enabled=True))
+    coordinator = SimpleNamespace(
+        owner=SimpleNamespace(key=("owner-user", "owner-chat", "7")),
+        registry=SimpleNamespace(model_dump=lambda **_kwargs: {"version": 1}),
+        _by_key={"client_001": SimpleNamespace(customer=customer)},
+    )
+    service = AdaptiveOperatorService(
+        coordinator,
+        review_operator=review,
+        session_path=tmp_path / "sessions.jsonl",
+    )
+    callback = service.issue_session(
+        action="select",
+        customer_key="client_001",
+        originating_message_id="review-card",
+        originating_chat_id="review-chat",
+        originating_topic_id=59,
+    )
+    service._consume(service._latest_session(callback), state="consumed")
+    card = {"status": "menu", "text": "검토 메뉴", "buttons": []}
+    service.mark_publish_pending(
+        callback,
+        card_payload=card,
+        origin_message_id="review-card",
+    )
+    calls = []
+
+    def uncertain(payload):
+        calls.append(payload)
+        raise TimeoutError("accepted response was lost")
+
+    first = service.recover_pending_cards(uncertain)
+    second = service.recover_pending_cards(uncertain)
+
+    assert len(calls) == 1
+    assert first["recovered"] == ()
+    assert first["pending"][0]["state"] == "publish_claimed"
+    assert second == {"recovered": (), "pending": ()}
+    assert service._latest_session(callback)["state"] == "publish_claimed"

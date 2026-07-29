@@ -547,6 +547,7 @@ class PhysiqueCheckinBridge:
         }
         branch_state = self._snapshot_branch_state(session)
         return {
+            "session_id": str(getattr(session, "session_id", "")),
             "flow": str(getattr(session, "flow", "")),
             "kst_day": str(getattr(session, "kst_day", "")),
             "answers": answers,

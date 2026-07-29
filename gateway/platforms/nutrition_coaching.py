@@ -1525,11 +1525,12 @@ class NutritionCoachingCoordinator:
         try:
             self._save_request(token, resolved.customer.spec.customer_key, callback.session_id)
         except DraftLedgerError as exc:
+            logger.warning("customer nutrition request persistence failed: %s", exc.detail)
             return CustomerTransition(
                 WizardReply(
                     True,
                     False,
-                    f"고객 요청 기록이 손상되었습니다. 관리자에게 drafts ledger 복구를 요청해 주세요 ({exc.detail}).",
+                    "현재 서비스를 이용할 수 없습니다. 잠시 후 다시 시도해 주세요.",
                     None,
                     None,
                 )
@@ -1639,7 +1640,80 @@ class NutritionCoachingCoordinator:
         except (TypeError, ValueError):
             return None
         return None if self._selection_eligibility_error(selection) else selection
-    def create_draft(self, token: str, owner: IncomingAddress, text: str) -> DraftAction:
+    def create_weekly_review_draft(
+        self,
+        customer_key: str,
+        owner: IncomingAddress,
+        source: object,
+    ) -> DraftAction:
+        """Persist one typed weekly source in the existing human-review lifecycle."""
+
+        if not self._ensure_live_registry() or owner.key != self._registry.owner.key:
+            return DraftAction(False, error="owner_only")
+        resolved = self._by_key.get(str(customer_key or "").strip())
+        if resolved is None:
+            return DraftAction(False, error="customer_not_registered")
+        try:
+            from checkin_cli.customer_reporting import CustomerWeeklyReviewSource
+        except ImportError:
+            return DraftAction(False, error="weekly_review_api_unavailable")
+        if not isinstance(source, CustomerWeeklyReviewSource):
+            return DraftAction(False, error="weekly_review_source_invalid")
+        if source.customer_key != resolved.customer.spec.customer_key:
+            return DraftAction(False, error="weekly_review_customer_mismatch")
+        snapshot_getter = getattr(
+            resolved.bridge,
+            "latest_finalized_coaching_snapshot",
+            None,
+        )
+        snapshot = snapshot_getter() if callable(snapshot_getter) else None
+        if not isinstance(snapshot, Mapping):
+            return DraftAction(False, error="weekly_review_snapshot_unavailable")
+        session_id = str(snapshot.get("session_id", "") or "").strip()
+        if not session_id:
+            return DraftAction(False, error="weekly_review_snapshot_unavailable")
+        text = source.render_customer_body()
+        source_digest = hashlib.sha256(
+            canonical_json(
+                {
+                    "customer_key": source.customer_key,
+                    "period_start": source.period_start.isoformat(),
+                    "period_end": source.period_end.isoformat(),
+                    "body": text,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        token = hashlib.sha256(
+            f"weekly-review:{source.customer_key}:{source_digest}".encode("utf-8")
+        ).hexdigest()[:16]
+        try:
+            existing_request = self._read_requests().get(token)
+            if existing_request is not None:
+                if existing_request[0] != source.customer_key:
+                    return DraftAction(
+                        False,
+                        error="weekly_review_request_conflict",
+                    )
+            else:
+                self._save_request(token, source.customer_key, session_id)
+        except DraftLedgerError:
+            return DraftAction(False, error="draft_ledger_corrupt")
+        return self.create_draft(token, owner, text)
+    def create_draft(
+        self,
+        token: str,
+        owner: IncomingAddress,
+        text: str,
+    ) -> DraftAction:
+        with self._delivery_lock():
+            return self._create_draft_locked(token, owner, text)
+
+    def _create_draft_locked(
+        self,
+        token: str,
+        owner: IncomingAddress,
+        text: str,
+    ) -> DraftAction:
         """Persist an AI draft and its audit event; never sends to a customer."""
         if not self._ensure_live_registry():
             return DraftAction(False, error="customer_registry_unavailable")
@@ -1703,6 +1777,15 @@ class NutritionCoachingCoordinator:
         return DraftAction(True, token, candidate, "created", selection)
 
     def edit_draft(self, draft_id: str, owner: IncomingAddress, text: str) -> DraftAction:
+        with self._delivery_lock():
+            return self._edit_draft_locked(draft_id, owner, text)
+
+    def _edit_draft_locked(
+        self,
+        draft_id: str,
+        owner: IncomingAddress,
+        text: str,
+    ) -> DraftAction:
         if not self._ensure_live_registry():
             return DraftAction(False, draft_id=draft_id, error="customer_registry_unavailable")
         candidate = " ".join(str(text).split()).strip()
@@ -1715,8 +1798,8 @@ class NutritionCoachingCoordinator:
             return DraftAction(False, draft_id=draft_id, error="owner_or_text_invalid")
         try:
             drafts = self._read_drafts()
-            self._read_requests()
-            self._read_deliveries()
+            requests = self._read_requests()
+            deliveries = self._read_deliveries()
         except DraftLedgerError:
             return DraftAction(False, draft_id=draft_id, error="draft_ledger_corrupt")
         record = drafts.get(draft_id)
@@ -1728,6 +1811,96 @@ class NutritionCoachingCoordinator:
             eligibility_error = self._selection_eligibility_error(selection)
             if eligibility_error is not None:
                 return DraftAction(False, draft_id=draft_id, error=eligibility_error)
+        if record is not None and selection is not None and record.get("status") == "superseded":
+            child_id = str(record.get("superseded_by_draft_id", "") or "")
+            child = drafts.get(child_id)
+            if (
+                isinstance(child, Mapping)
+                and child.get("parent_draft_id") == draft_id
+                and child.get("text") == candidate
+                and child.get("status") in {"edited", "approved", "sent"}
+            ):
+                return DraftAction(
+                    True,
+                    child_id,
+                    candidate,
+                    str(child["status"]),
+                    selection,
+                )
+            return DraftAction(False, draft_id=draft_id, error="draft_not_editable")
+        if record is not None and selection is not None and record.get("status") == "approved":
+            if any(
+                isinstance(delivery, Mapping)
+                and delivery.get("draft_id") == draft_id
+                for delivery in deliveries.values()
+            ):
+                return DraftAction(False, draft_id=draft_id, error="draft_not_editable")
+            child_id = hashlib.sha256(
+                f"{draft_id}\0{candidate}".encode("utf-8")
+            ).hexdigest()[:16]
+            existing_child = drafts.get(child_id)
+            if existing_child is not None:
+                if (
+                    existing_child.get("customer_key") != record.get("customer_key")
+                    or existing_child.get("session_id") != record.get("session_id")
+                    or existing_child.get("text") != candidate
+                    or existing_child.get("parent_draft_id") != draft_id
+                ):
+                    return DraftAction(
+                        False,
+                        draft_id=child_id,
+                        error="draft_child_revision_conflict",
+                    )
+                return DraftAction(True, child_id, candidate, "edited", selection)
+            session_id = str(record.get("session_id", "") or "")
+            requests[child_id] = (
+                str(record.get("customer_key", "") or ""),
+                session_id,
+            )
+            try:
+                self._write_json_private(self._requests_path, {
+                    token: [customer_key, request_session_id]
+                    for token, (customer_key, request_session_id) in requests.items()
+                })
+            except (OSError, ValueError) as exc:
+                return DraftAction(
+                    False,
+                    draft_id=child_id,
+                    error=f"draft_ledger_write_failed:{type(exc).__name__}",
+                )
+            if not self._append_draft_event(
+                selection,
+                "edited",
+                child_id,
+                candidate,
+                actor="richard",
+                link=draft_id,
+            ):
+                return DraftAction(
+                    False,
+                    draft_id=child_id,
+                    error="draft_event_unavailable",
+                )
+            child = {
+                "customer_key": str(record["customer_key"]),
+                "session_id": session_id,
+                "text": candidate,
+                "status": "edited",
+                "parent_draft_id": draft_id,
+            }
+            record["status"] = "superseded"
+            record["superseded_by_draft_id"] = child_id
+            drafts[draft_id] = record
+            drafts[child_id] = child
+            try:
+                self._write_json_private(self._drafts_path, drafts)
+            except (OSError, ValueError) as exc:
+                return DraftAction(
+                    False,
+                    draft_id=child_id,
+                    error=f"draft_ledger_write_failed:{type(exc).__name__}",
+                )
+            return DraftAction(True, child_id, candidate, "edited", selection)
         if record is None or selection is None or record.get("status") not in {"created", "edited"}:
             return DraftAction(False, draft_id=draft_id, error="draft_not_editable")
         if not self._ensure_live_registry():
@@ -1751,6 +1924,14 @@ class NutritionCoachingCoordinator:
         return DraftAction(True, draft_id, candidate, "edited", selection)
 
     def approve_draft(self, draft_id: str, owner: IncomingAddress) -> DraftAction:
+        with self._delivery_lock():
+            return self._approve_draft_locked(draft_id, owner)
+
+    def _approve_draft_locked(
+        self,
+        draft_id: str,
+        owner: IncomingAddress,
+    ) -> DraftAction:
         if not self._ensure_live_registry():
             return DraftAction(False, draft_id=draft_id, error="customer_registry_unavailable")
         if owner.key != self._registry.owner.key:
@@ -2737,7 +2918,7 @@ class NutritionCoachingCoordinator:
             required = {"customer_key", "session_id", "text", "status"}
             if not required.issubset(value) or not all(isinstance(value[item], str) for item in required):
                 raise DraftLedgerError(f"drafts.json record {key!r} is malformed")
-            if value["status"] not in {"created", "edited", "approved", "sent"}:
+            if value["status"] not in {"created", "edited", "approved", "superseded", "sent"}:
                 raise DraftLedgerError(f"drafts.json record {key!r} has an invalid status")
             if (
                 not 1 <= len(value["text"]) <= 8_000
@@ -2764,17 +2945,31 @@ class NutritionCoachingCoordinator:
         os.replace(temporary, path)
         path.chmod(0o600)
 
-    def _save_request(self, token: str, customer_key: str, session_id: str) -> None:
-        requests = self._read_requests()
-        self._read_drafts()
-        self._read_deliveries()
-        requests[token] = (customer_key, session_id)
-        try:
-            self._write_json_private(self._requests_path, requests)
-        except (OSError, ValueError) as exc:
-            raise DraftLedgerError(
-                f"draft-requests.json could not be persisted; repair or restore it before retrying ({type(exc).__name__})"
-            ) from exc
+    def _save_request(
+        self,
+        token: str,
+        customer_key: str,
+        session_id: str,
+    ) -> tuple[str, str]:
+        with self._delivery_lock():
+            requests = self._read_requests()
+            self._read_drafts()
+            self._read_deliveries()
+            existing = requests.get(token)
+            if existing is not None:
+                if existing[0] != customer_key:
+                    raise DraftLedgerError(
+                        "draft request token is already bound to another customer"
+                    )
+                return existing
+            requests[token] = (customer_key, session_id)
+            try:
+                self._write_json_private(self._requests_path, requests)
+            except (OSError, ValueError) as exc:
+                raise DraftLedgerError(
+                    f"draft-requests.json could not be persisted; repair or restore it before retrying ({type(exc).__name__})"
+                ) from exc
+            return requests[token]
 
     def _read_requests(self) -> dict[str, tuple[str, str]]:
         if not self._requests_path.exists():
@@ -2813,6 +3008,7 @@ _ADAPTIVE_ACTIONS = frozenset(
         "release",
         "rollback",
         "approve",
+        "approve_and_send",
         "schedule_confirm",
         "activate",
         "delivery_enable",
@@ -2823,7 +3019,7 @@ _ADAPTIVE_ACTIONS = frozenset(
     }
 )
 _ADAPTIVE_CALLBACK_RE = re.compile(
-    r"^an1:([a-f0-9]{24}):(select|create|view|edit_note|hold|release|approve|schedule_confirm|activate|"
+    r"^an1:([a-f0-9]{24}):(select|create|view|edit_note|hold|release|approve|approve_and_send|schedule_confirm|activate|"
     r"delivery_enable|delivery_revoke|send|reconcile|back)$"
 )
 
@@ -2845,7 +3041,8 @@ _ADAPTIVE_SESSION_STATES: Mapping[str, frozenset[str]] = {
     "awaiting_input": frozenset({"consumed", "expired", "revoked"}),
     "publish_pending": frozenset({"publish_claimed", "published"}),
     "publish_claimed": frozenset({"publish_pending", "publish_claimed", "published"}),
-    "consumed": frozenset({"consumed", "publish_pending"}),
+    "consumed": frozenset({"consumed", "publish_pending", "schedule_confirmed"}),
+    "schedule_confirmed": frozenset({"schedule_confirmed", "consumed"}),
     "expired": frozenset(),
     "revoked": frozenset(),
     "published": frozenset(),
@@ -3155,6 +3352,8 @@ def adaptive_delivery_result_text(result: object) -> str:
     """Map durable delivery outcomes to Korean no-retry-safe operator text."""
     payload = result if isinstance(result, Mapping) else {}
     event_type = str(payload.get("event_type", payload.get("status", "")) or "")
+    if event_type == "delivery_preflight_rejected":
+        return "고객 전송 전에 안전하게 중단되었습니다. 최신 검토 카드에서 다시 시도해 주세요."
     if event_type in {"delivery_unknown", "unknown"} or payload.get("unknown") is True:
         return "전송 결과를 확인할 수 없습니다. 다시 보내지 마세요. 조정이 필요합니다."
     if event_type in {"audit_pending", "delivered_audit_pending"} or payload.get("audit_pending") is True:
@@ -3163,7 +3362,7 @@ def adaptive_delivery_result_text(result: object) -> str:
         return "이미 처리된 전송입니다."
     if event_type in {"delivered", "sent_audited", "success"}:
         return "고객 전송과 감사 기록이 완료되었습니다."
-    return "처리할 수 없습니다. 상태를 확인하고 다시 시도하지 마세요."
+    return "처리를 완료하지 못했습니다. 최신 상태를 확인해 주세요."
 
 
 def _audited_delivery_result(row: Mapping[str, object]) -> Mapping[str, object]:
@@ -4212,8 +4411,7 @@ class AdaptiveOperatorService:
             return ""
         result = str(value).strip()
         return result if result and len(result) <= 128 else ""
-    @staticmethod
-    def _validated_card_payload(value: object) -> dict[str, object]:
+    def _validated_card_payload(self, value: object) -> dict[str, object]:
         """Normalize one persisted review card before it can be published."""
         if not isinstance(value, Mapping):
             raise AdaptiveWorkflowError("adaptive review card payload is invalid")
@@ -4228,30 +4426,83 @@ class AdaptiveOperatorService:
             envelope = value.get("envelope")
             if not isinstance(envelope, Mapping):
                 raise AdaptiveWorkflowError("adaptive review card envelope is invalid")
-            required = ("marker", "customer_label", "kst_day", "revision", "state")
-            if any(field not in envelope for field in required):
-                raise AdaptiveWorkflowError("adaptive review card envelope is invalid")
-            if envelope.get("marker") != "테스트 전용":
-                raise AdaptiveWorkflowError("adaptive review card envelope is invalid")
+            required = ("customer_label", "kst_day")
             if any(
-                not isinstance(envelope.get(field), str) or not str(envelope[field]).strip()
-                for field in ("customer_label", "kst_day", "state")
+                not isinstance(envelope.get(field), str)
+                or not str(envelope[field]).strip()
+                for field in required
             ):
-                raise AdaptiveWorkflowError("adaptive review card envelope is invalid")
-            revision = envelope.get("revision")
-            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
-                raise AdaptiveWorkflowError("adaptive review card envelope is invalid")
+                raise AdaptiveWorkflowError(
+                    "adaptive review card envelope is invalid"
+                )
+            if any(str(envelope[field]) not in text for field in required):
+                raise AdaptiveWorkflowError(
+                    "adaptive review card envelope is invalid"
+                )
+            customer_key = value.get("customer_key")
+            proposal_digest = value.get("proposal_digest")
+            revision = value.get("revision")
+            lifecycle_state = value.get("lifecycle_state")
+            customer_preview = value.get("customer_preview")
+            preview_digest = value.get("customer_preview_digest")
+            if (
+                not isinstance(customer_key, str)
+                or not customer_key
+                or not isinstance(proposal_digest, str)
+                or re.fullmatch(r"[a-f0-9]{64}", proposal_digest) is None
+                or isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+                or not isinstance(lifecycle_state, str)
+                or not lifecycle_state
+                or not isinstance(customer_preview, str)
+                or not customer_preview
+                or not isinstance(preview_digest, str)
+                or hashlib.sha256(customer_preview.encode("utf-8")).hexdigest()
+                != preview_digest
+            ):
+                raise AdaptiveWorkflowError(
+                    "adaptive review card hidden pins are invalid"
+                )
             if any(
-                str(item) not in text
-                for item in (
-                    envelope["marker"],
-                    envelope["customer_label"],
-                    envelope["kst_day"],
-                    f"revision: {revision}",
-                    f"state: {envelope['state']}",
+                token in text.casefold()
+                for token in (
+                    "revision:",
+                    "digest:",
+                    "epoch:",
+                    "recovery:",
+                    "reservation:",
                 )
             ):
-                raise AdaptiveWorkflowError("adaptive review card envelope is invalid")
+                raise AdaptiveWorkflowError(
+                    "adaptive review card exposes lifecycle diagnostics"
+                )
+            resolver = getattr(
+                self.coordinator,
+                "adaptive_nutrition_coordinator",
+                None,
+            )
+            if not callable(resolver):
+                raise AdaptiveWorkflowError(
+                    "adaptive review card authority is unavailable"
+                )
+            adaptive = resolver(customer_key)
+            proposal = adaptive._latest_production_proposal()
+            expected_preview = adaptive.preview_registered_daily_projection(
+                proposal
+            )
+            expected_state = self._proposal_card_state(adaptive, proposal)
+            if (
+                proposal.digest != proposal_digest
+                or proposal.revision != revision
+                or expected_state != lifecycle_state
+                or expected_preview != customer_preview
+                or f"\n고객 전달 미리보기\n{customer_preview}\n\n안전·과장 점검:"
+                not in text
+            ):
+                raise AdaptiveWorkflowError(
+                    "adaptive review card authority is stale"
+                )
         raw_buttons = value.get("buttons", [])
         if not isinstance(raw_buttons, list):
             raise AdaptiveWorkflowError("adaptive review card buttons are invalid")
@@ -4360,9 +4611,9 @@ class AdaptiveOperatorService:
             if latest is None:
                 return None
             state = latest.get("state")
-            if state == "published" or self._publication_lease_active(latest):
+            if state in {"published", "publish_claimed"}:
                 return None
-            if state not in {"publish_pending", "publish_claimed"}:
+            if state != "publish_pending":
                 return None
             payload = self._validated_card_payload(latest.get("card_payload"))
             claim_id = self._publication_claim_id()
@@ -4593,10 +4844,6 @@ class AdaptiveOperatorService:
             (session_id, row)
             for session_id, row in latest_by_session.items()
             if row.get("state") == "publish_pending"
-            or (
-                row.get("state") == "publish_claimed"
-                and not self._publication_lease_active(row)
-            )
         )
 
     def recover_pending_cards(self, publisher: Callable[[Mapping[str, object]], object]) -> Mapping[str, object]:
@@ -4621,19 +4868,11 @@ class AdaptiveOperatorService:
                 self.validated_inline_buttons(card, require_sessions=True)
                 receipt = publisher(dict(card))
                 if inspect.isawaitable(receipt):
-                    released = self._release_publication_claim(
-                        session_id,
-                        claimed.get("claim_id"),
-                    )
-                    pending.append(released or row)
+                    pending.append(claimed)
                     continue
                 message_id = self._publish_receipt(receipt)
                 if not message_id:
-                    released = self._release_publication_claim(
-                        session_id,
-                        claimed.get("claim_id"),
-                    )
-                    pending.append(released or row)
+                    pending.append(claimed)
                     continue
                 recovered.append(
                     self.mark_published(
@@ -4643,11 +4882,7 @@ class AdaptiveOperatorService:
                     )
                 )
             except Exception:
-                released = self._release_publication_claim(
-                    session_id,
-                    claimed.get("claim_id") if claimed is not None else row.get("claim_id"),
-                )
-                pending.append(released or row)
+                pending.append(claimed or row)
         return {"recovered": tuple(recovered), "pending": tuple(pending)}
 
     async def recover_pending_cards_async(
@@ -4678,11 +4913,7 @@ class AdaptiveOperatorService:
                     receipt = await receipt
                 message_id = self._publish_receipt(receipt)
                 if not message_id:
-                    released = self._release_publication_claim(
-                        session_id,
-                        claimed.get("claim_id"),
-                    )
-                    pending.append(released or row)
+                    pending.append(claimed)
                     continue
                 recovered.append(
                     self.mark_published(
@@ -4692,11 +4923,7 @@ class AdaptiveOperatorService:
                     )
                 )
             except Exception:
-                released = self._release_publication_claim(
-                    session_id,
-                    claimed.get("claim_id") if claimed is not None else row.get("claim_id"),
-                )
-                pending.append(released or row)
+                pending.append(claimed or row)
         return {"recovered": tuple(recovered), "pending": tuple(pending)}
 
     def open_menu(
@@ -4740,55 +4967,48 @@ class AdaptiveOperatorService:
     ) -> list[dict[str, str]]:
         state_actions = {
             "proposed": (
-                ("일정 확정", "schedule_confirm"),
-                ("1/4 승인하기", "approve"),
+                ("승인하고 보내기", "approve_and_send"),
+                ("내용 수정", "edit_note"),
+                ("보류", "hold"),
                 ("고급 · 내용 보기", "view"),
-                ("고급 · 메모 수정", "edit_note"),
-                ("고급 · 보류", "hold"),
-                ("이전", "back"),
             ),
             "edited": (
-                ("일정 확정", "schedule_confirm"),
-                ("1/4 승인하기", "approve"),
+                ("승인하고 보내기", "approve_and_send"),
+                ("내용 수정", "edit_note"),
+                ("보류", "hold"),
                 ("고급 · 내용 보기", "view"),
-                ("고급 · 메모 수정", "edit_note"),
-                ("고급 · 보류", "hold"),
-                ("이전", "back"),
             ),
             "released": (
-                ("일정 확정", "schedule_confirm"),
-                ("1/4 승인하기", "approve"),
+                ("승인하고 보내기", "approve_and_send"),
+                ("내용 수정", "edit_note"),
+                ("보류", "hold"),
                 ("고급 · 내용 보기", "view"),
-                ("고급 · 메모 수정", "edit_note"),
-                ("고급 · 보류", "hold"),
-                ("이전", "back"),
             ),
             "held": (
                 ("검토 다시 시작", "release"),
                 ("고급 · 내용 보기", "view"),
-                ("이전", "back"),
             ),
             "approved": (
-                ("2/4 활성화하기", "activate"),
+                ("승인하고 보내기", "approve_and_send"),
+                ("고급 · 활성화하기", "activate"),
                 ("고급 · 내용 보기", "view"),
-                ("이전", "back"),
             ),
             "activated": (
-                ("3/4 고객 전송 허용", "delivery_enable"),
+                ("승인하고 보내기", "approve_and_send"),
+                ("고급 · 고객 전송 허용", "delivery_enable"),
                 ("고급 · 내용 보기", "view"),
-                ("이전", "back"),
             ),
             "delivery_enabled": (
-                ("4/4 고객에게 전송", "send"),
+                ("승인하고 보내기", "approve_and_send"),
+                ("고급 · 고객에게 전송", "send"),
                 ("고급 · 전송 권한 회수", "delivery_revoke"),
                 ("고급 · 전송 기록 확인", "reconcile"),
                 ("고급 · 내용 보기", "view"),
-                ("이전", "back"),
             ),
             "delivery_revoked": (
-                ("고객 전송 다시 허용", "delivery_enable"),
+                ("승인하고 보내기", "approve_and_send"),
+                ("고급 · 고객 전송 다시 허용", "delivery_enable"),
                 ("고급 · 내용 보기", "view"),
-                ("이전", "back"),
             ),
         }
         actions = state_actions.get(
@@ -4921,11 +5141,48 @@ class AdaptiveOperatorService:
                 elif event_type == "adaptive_plan_activated":
                     state = "activated"
                 elif event_type == "plan_edited":
-                    state = "edited"
+                    revision_action = payload.get("revision_action")
+                    state = (
+                        str(revision_action)
+                        if revision_action in {"held", "released"}
+                        else "held"
+                        if revision_action == "hold"
+                        else "released"
+                        if revision_action == "release"
+                        else "edited"
+                    )
                 elif event_type == "plan_proposed":
                     state = "proposed"
+            if state == "activated":
+                return (
+                    "delivery_enabled"
+                    if bool(getattr(adaptive, "delivery_enabled", False))
+                    else "delivery_revoked"
+                )
             return state
         return "proposed"
+
+    @staticmethod
+    def _normal_card_actions(body: str) -> tuple[str, ...]:
+        """Keep normal cards actionable without exposing lifecycle diagnostics."""
+        blocked = (
+            "revision", "digest", "epoch", "reservation", "recovery",
+            "internal reason", "내부 사유", "복구", "예약", "리비전",
+        )
+        actions: list[str] = []
+        for raw_line in body.splitlines():
+            line = " ".join(raw_line.strip().lstrip("-•0123456789. ").split())
+            if (
+                not line
+                or any(token in line.lower() for token in blocked)
+                or len(line) > 180
+            ):
+                continue
+            if raw_line.lstrip().startswith(("-", "•")):
+                actions.append(line)
+            if len(actions) == 3:
+                break
+        return tuple(actions) or ("승인 후 고객에게 전달할 행동을 확인합니다.",)
 
     def _operator_card_envelope(
         self,
@@ -4934,6 +5191,7 @@ class AdaptiveOperatorService:
         customer_key: str,
         state: str,
         body: object,
+        customer_preview: object | None = None,
     ) -> tuple[str, Mapping[str, object]]:
         text = str(body or "").strip()
         if not text:
@@ -4944,32 +5202,47 @@ class AdaptiveOperatorService:
         normalized_state = " ".join(str(state or "").split())
         if not normalized_state:
             raise AdaptiveWorkflowError("adaptive operator card state is invalid")
+        customer_preview = str(
+            customer_preview
+            if customer_preview is not None
+            else getattr(proposal, "customer_body", "")
+        ).strip()
+        if not customer_preview:
+            raise AdaptiveWorkflowError(
+                "adaptive customer delivery preview is unavailable"
+            )
         envelope: Mapping[str, object] = {
-            "marker": "테스트 전용",
             "customer_label": self._customer_display_label(customer_key),
             "kst_day": self._proposal_kst_day(proposal),
-            "revision": revision,
-            "state": normalized_state,
         }
-        progress = {
-            "proposed": "진행 1/4 · 제안 검토 중 · 다음: 승인하기",
-            "edited": "진행 1/4 · 메모 수정됨 · 다음: 승인하기",
-            "released": "진행 1/4 · 보류 해제됨 · 다음: 승인하기",
-            "held": "검토 보류 중 · 다음: 검토 다시 시작",
-            "approved": "진행 2/4 · 승인 완료 · 다음: 활성화하기",
-            "activated": "진행 3/4 · 활성화 완료 · 다음: 고객 전송 허용",
-            "delivery_enabled": "진행 4/4 · 전송 허용됨 · 다음: 고객에게 전송",
-            "delivery_revoked": "안전 잠금 · 고객 전송 비활성화 · 다음: 고객 전송 다시 허용",
-        }.get(normalized_state, f"현재 상태: {normalized_state}")
-        header = (
-            "테스트 전용 · "
-            f"고객: {envelope['customer_label']} · "
-            f"KST day: {envelope['kst_day']} · "
-            f"revision: {revision} · "
-            f"state: {normalized_state}\n"
-            f"{progress}"
+        actions = self._normal_card_actions(customer_preview)
+        compact = (
+            f"고객: {envelope['customer_label']} · 날짜: {envelope['kst_day']}\n"
+            "이전 기록과 이번 입력을 함께 반영했습니다.\n"
+            "판단: 현재 근거 범위에서만 잠금 · 승인 전 고객에게 전송되지 않습니다.\n\n"
+            "실행 제안\n"
+            + "\n".join(f"{index}. {action}" for index, action in enumerate(actions, 1))
+            + "\n\n고객 전달 미리보기\n"
+            + customer_preview
+            + "\n\n안전·과장 점검: 확인된 기록 범위를 넘는 단정이나 전송은 하지 않습니다."
         )
-        return f"{header}\n\n{text}", envelope
+        return compact, envelope
+
+    @staticmethod
+    def _card_hidden_pins(
+        proposal: object,
+        state: str,
+        customer_preview: str,
+    ) -> dict[str, object]:
+        return {
+            "proposal_digest": str(getattr(proposal, "digest", "") or ""),
+            "revision": int(getattr(proposal, "revision", 0) or 0),
+            "lifecycle_state": str(state or ""),
+            "customer_preview": customer_preview,
+            "customer_preview_digest": hashlib.sha256(
+                customer_preview.encode("utf-8")
+            ).hexdigest(),
+        }
 
     def _card_with_envelope(
         self,
@@ -4978,12 +5251,14 @@ class AdaptiveOperatorService:
         customer_key: str,
         state: str,
         body: object,
+        customer_preview: object | None = None,
     ) -> tuple[str, Mapping[str, object]]:
         return self._operator_card_envelope(
             proposal,
             customer_key=customer_key,
             state=state,
             body=body,
+            customer_preview=customer_preview,
         )
     def _render_latest_card(
         self,
@@ -4998,7 +5273,12 @@ class AdaptiveOperatorService:
         latest_resolver = getattr(adaptive, "_latest_production_proposal", None)
         renderer = getattr(adaptive, "render_proposal", None)
         registration_pin = getattr(adaptive, "_registration_pin", None)
-        if not callable(latest_resolver) or not callable(renderer):
+        previewer = getattr(adaptive, "preview_registered_daily_projection", None)
+        if (
+            not callable(latest_resolver)
+            or not callable(renderer)
+            or not callable(previewer)
+        ):
             raise AdaptiveWorkflowError("adaptive latest proposal is unavailable")
         proposal = latest_resolver()
         registration_digest = (
@@ -5007,17 +5287,17 @@ class AdaptiveOperatorService:
             else ""
         )
         state = lifecycle_state or self._proposal_card_state(adaptive, proposal)
+        customer_preview = previewer(proposal)
         text, envelope = self._card_with_envelope(
             proposal,
             customer_key=customer_key,
             state=state,
             body=renderer(proposal, topic_id=OPERATOR_REVIEW_TOPIC_ID),
+            customer_preview=customer_preview,
         )
         return {
             "status": "card",
             "customer_key": customer_key,
-            "proposal_digest": proposal.digest,
-            "revision": proposal.revision,
             "text": text,
             "envelope": envelope,
             "buttons": self._card_buttons(
@@ -5030,7 +5310,130 @@ class AdaptiveOperatorService:
                 source_digest=getattr(proposal, "source_digest", ""),
                 registration_digest=registration_digest,
             ),
+            **self._card_hidden_pins(proposal, state, customer_preview),
         }
+    def _transition_capability(
+        self,
+        session: Mapping[str, object],
+        *,
+        action: str,
+    ) -> AdaptiveOperatorCapability:
+        """Mint and claim one fresh, action-bound capability for a composite step."""
+        callback = self._issue(
+            action=action,
+            customer_key=str(session["customer_key"]),
+            proposal_digest=str(session["proposal_digest"]),
+            revision=int(session["revision"]),
+            source_digest=str(session.get("source_digest", "") or ""),
+            registration_digest=str(session.get("registration_digest", "") or ""),
+            originating_message_id=session.get("originating_message_id", ""),
+            originating_chat_id=session.get("originating_chat_id", ""),
+            originating_topic_id=session.get("originating_topic_id", 59),
+        )
+        parts = callback.split(":")
+        claimed = self._claim_issued_callback(parts[1], action)
+        if claimed is None or claimed.get("_claim_winner") is not True:
+            raise AdaptiveWorkflowError("adaptive composite transition capability is stale")
+        self._consume(claimed, state="consumed")
+        return self._capability(
+            self._find_session(parts[1], action) or claimed,
+            action=action,
+        )
+
+    def _schedule_confirmation_is_current(
+        self,
+        adaptive: object,
+        customer_key: str,
+    ) -> bool:
+        if not self._schedule_confirm_enabled:
+            return True
+        try:
+            reference = self._schedule_reference(customer_key)
+            rows = adaptive.store.read()
+        except (AdaptiveWorkflowError, AttributeError, OSError, TypeError, ValueError):
+            return False
+        return any(
+            isinstance(row, Mapping)
+            and row.get("event_type") == "schedule_strategy_confirmed"
+            and isinstance(row.get("payload"), Mapping)
+            and row["payload"].get("source_reference_id") == reference.event_id
+            for row in rows
+        )
+
+    def _approve_and_send(
+        self,
+        adaptive: object,
+        session: Mapping[str, object],
+        *,
+        customer_key: str,
+        proposal_digest: str,
+    ) -> object:
+        """Resume the durable lifecycle from its current state using fresh authority."""
+        state = self._proposal_card_state(
+            adaptive,
+            adaptive._proposal_for_digest(proposal_digest),
+        )
+        if state in {"proposed", "edited", "released"}:
+            if (
+                self._schedule_confirm_enabled
+                and not self._schedule_confirmation_is_current(
+                    adaptive,
+                    customer_key,
+                )
+            ):
+                schedule_capability = self._transition_capability(
+                    session, action="schedule_confirm",
+                )
+                schedule_session = self._find_session(
+                    schedule_capability.capability_id, "schedule_confirm",
+                )
+                if schedule_session is None:
+                    raise AdaptiveWorkflowError(
+                        "adaptive schedule confirmation capability is stale"
+                    )
+                self._resume_schedule_confirmation(
+                    schedule_session,
+                    schedule_capability,
+                )
+                latest_session = self._find_session(
+                    str(session.get("session_id", "")),
+                    "approve_and_send",
+                )
+                if latest_session is None:
+                    raise AdaptiveWorkflowError(
+                        "adaptive composite session is stale"
+                    )
+                self._consume(latest_session, state="schedule_confirmed")
+                return {
+                    "status": "operator_input_required",
+                    "text": (
+                        "일정 확인을 반영했습니다. 최신 근거로 새 초안을 생성해 "
+                        "다시 검토해 주세요."
+                    ),
+                }
+            adaptive.approve_latest(
+                proposal_digest,
+                operator_id=self._transition_capability(session, action="approve"),
+            )
+            state = "approved"
+        if state == "approved":
+            adaptive.activate_latest(
+                proposal_digest,
+                operator_id=self._transition_capability(session, action="activate"),
+            )
+            state = "activated"
+        if state in {"activated", "delivery_revoked"} or not bool(
+            getattr(adaptive, "delivery_enabled", False)
+        ):
+            self.coordinator.set_adaptive_delivery(
+                customer_key,
+                True,
+                operator_id=self._transition_capability(session, action="delivery_enable"),
+            )
+        return adaptive.deliver_latest_once(
+            proposal_digest,
+            operator_id=self._transition_capability(session, action="send"),
+        )
 
     def _find_session(self, token: str, action: str) -> dict[str, object] | None:
         if not isinstance(token, str) or re.fullmatch(r"[a-f0-9]{24}", token) is None:
@@ -5337,6 +5740,36 @@ class AdaptiveOperatorService:
                     response = dict(result)
                     response.update({"status": "duplicate", "duplicate": True})
                     return response
+                if (
+                    action == "approve_and_send"
+                    and session.get("state") in {"claimed", "consumed", "schedule_confirmed"}
+                ):
+                    if (
+                        str(session.get("originating_message_id", "") or "")
+                        and str(message_id or "")
+                        != str(session.get("originating_message_id", "") or "")
+                    ):
+                        raise AdaptiveWorkflowError(
+                            "adaptive operator session message mismatch"
+                        )
+                    key = str(session.get("customer_key", "") or "")
+                    digest_value = str(session.get("proposal_digest", "") or "")
+                    adaptive = self.coordinator.adaptive_nutrition_coordinator(key)
+                    result = self._approve_and_send(
+                        adaptive,
+                        session,
+                        customer_key=key,
+                        proposal_digest=digest_value,
+                    )
+                    if inspect.isawaitable(result):
+                        return {
+                            "status": "delivery_pending",
+                            "delivery": result,
+                            "proposal_digest": digest_value,
+                        }
+                    response = dict(result) if isinstance(result, Mapping) else {}
+                    response["duplicate"] = True
+                    return response
                 if session.get("state") in {"claimed", "consumed"}:
                     return {
                         "status": "duplicate",
@@ -5407,11 +5840,15 @@ class AdaptiveOperatorService:
                     operator_id=capability,
                     topic_id=OPERATOR_REVIEW_TOPIC_ID,
                 )
+                customer_preview = adaptive.preview_registered_daily_projection(
+                    proposal
+                )
                 text, envelope = self._card_with_envelope(
                     proposal,
                     customer_key=key,
                     state=self._action_card_state(action) or "proposed",
                     body=raw_text,
+                    customer_preview=customer_preview,
                 )
                 registration_digest = ""
                 registration_pin = getattr(adaptive, "_registration_pin", None)
@@ -5430,11 +5867,14 @@ class AdaptiveOperatorService:
                 return {
                     "status": "card",
                     "customer_key": key,
-                    "proposal_digest": proposal.digest,
-                    "revision": proposal.revision,
                     "text": text,
                     "envelope": envelope,
                     "buttons": buttons,
+                    **self._card_hidden_pins(
+                        proposal,
+                        "proposed",
+                        customer_preview,
+                    ),
                 }
             if action == "view":
                 if not digest_value:
@@ -5449,6 +5889,9 @@ class AdaptiveOperatorService:
                     customer_key=key,
                     state=self._proposal_card_state(adaptive, proposal),
                     body=raw_text,
+                    customer_preview=adaptive.preview_registered_daily_projection(
+                        proposal
+                    ),
                 )
                 response = {
                     "status": "view",
@@ -5488,6 +5931,18 @@ class AdaptiveOperatorService:
                 result = adaptive.release_latest(digest_value, operator_id=capability)
             elif action == "approve":
                 result = adaptive.approve_latest(digest_value, operator_id=capability)
+            elif action == "approve_and_send":
+                result = self._approve_and_send(
+                    adaptive,
+                    session,
+                    customer_key=key,
+                    proposal_digest=digest_value,
+                )
+                if inspect.isawaitable(result):
+                    return {
+                        "status": "delivery_pending",
+                        "delivery": result,
+                    }
             elif action == "schedule_confirm":
                 # The intent is issued with the capability and survives the
                 # generic consume row, so an exact replay can safely resume it.
@@ -5547,7 +6002,7 @@ class AdaptiveOperatorService:
             else:
                 response = dict(result) if isinstance(result, Mapping) else {"status": action}
                 response.setdefault("status", action)
-            if action in {"send", "reconcile"}:
+            if action in {"approve_and_send", "send", "reconcile"}:
                 response["text"] = adaptive_delivery_result_text(response)
             return response
         except AdaptiveWorkflowError as exc:
@@ -5614,6 +6069,9 @@ class AdaptiveOperatorService:
                     operator_id=capability,
                 )
                 self._consume(awaiting, state="consumed")
+                customer_preview = adaptive.preview_registered_daily_projection(
+                    revised
+                )
                 text, envelope = self._card_with_envelope(
                     revised,
                     customer_key=capability.customer_key,
@@ -5622,6 +6080,7 @@ class AdaptiveOperatorService:
                         revised,
                         topic_id=OPERATOR_REVIEW_TOPIC_ID,
                     ),
+                    customer_preview=customer_preview,
                 )
                 registration_digest = ""
                 registration_pin = getattr(adaptive, "_registration_pin", None)
@@ -5645,6 +6104,11 @@ class AdaptiveOperatorService:
                     "text": text,
                     "envelope": envelope,
                     "buttons": buttons,
+                    **self._card_hidden_pins(
+                        revised,
+                        "edited",
+                        customer_preview,
+                    ),
                 }
         except (AdaptiveWorkflowError, OSError, TypeError, ValueError):
             return {"status": "rejected", "text": "메모를 반영할 수 없습니다. 최신 검토 카드에서 다시 시작해 주세요."}
@@ -5660,6 +6124,10 @@ class AdaptiveOperatorService:
 
 class AdaptiveWorkflowError(ValueError):
     """Raised when an adaptive proposal crosses its operator-only boundary."""
+
+class AdaptiveTransportPreflightRejected(RuntimeError):
+    """Raised only when adaptive transport proves provider invocation did not start."""
+
 
 
 class AdaptiveNutritionCoordinator:
@@ -9927,6 +10395,181 @@ class AdaptiveNutritionCoordinator:
         except (OSError, TypeError) as exc:
             raise AdaptiveWorkflowError("adaptive approval could not be recorded") from exc
 
+    @staticmethod
+    def _customer_action_texts(proposal: NutritionProposal) -> tuple[str, ...]:
+        customer_body = str(proposal.customer_body or "").strip()
+        actions = tuple(
+            " ".join(line.split())
+            for line in customer_body.splitlines()[2:]
+            if line.strip()
+        )[:3]
+        if not actions:
+            raise AdaptiveWorkflowError(
+                "approved proposal has no canonical customer actions"
+            )
+        return actions
+
+    def _append_approved_action_continuity(self, proposal: NutritionProposal) -> None:
+        """Persist one to three authoritative customer actions for an approval."""
+        runtime = self.customer_runtime
+        if runtime is None:
+            raise AdaptiveWorkflowError("registered customer runtime is unavailable")
+        try:
+            from checkin_cli.adaptive_nutrition import CustomerActionContinuity
+        except ImportError as exc:
+            raise AdaptiveWorkflowError("customer action continuity API is unavailable") from exc
+        actions = self._customer_action_texts(proposal)
+        existing_approval_times = {
+            str(payload.get("approved_at_kst"))
+            for row in self.store.read()
+            if isinstance(row, Mapping)
+            and row.get("event_type") == "customer_action_continuity"
+            and isinstance((payload := row.get("payload")), Mapping)
+            and payload.get("customer_key") == proposal.customer_key
+            and payload.get("approved_proposal_digest") == proposal.digest
+            and payload.get("revision") == proposal.revision
+            and payload.get("approved_at_kst") is not None
+        }
+        if len(existing_approval_times) > 1:
+            raise AdaptiveWorkflowError("customer action approval time is inconsistent")
+        approved_at_kst = (
+            next(iter(existing_approval_times))
+            if existing_approval_times
+            else datetime.now(_KST).replace(microsecond=0).isoformat()
+        )
+        evaluation_day = getattr(proposal.snapshot, "evaluation_day", None)
+        if type(evaluation_day) is not date:
+            raise AdaptiveWorkflowError("approved proposal evaluation day is invalid")
+        next_check = f"{(evaluation_day + timedelta(days=1)).isoformat()}T08:00:00+09:00"
+        for index, action in enumerate(actions, 1):
+            continuity = CustomerActionContinuity(
+                customer_key=proposal.customer_key,
+                approved_proposal_digest=proposal.digest,
+                revision=proposal.revision,
+                effective_kst_day=evaluation_day,
+                action_text=action,
+                action_atom=f"approved_plan_action_{index}",
+                criterion_text="다음 체크인의 계획 준수 기록",
+                criterion_atom="adherence_recorded",
+                next_check_kst=next_check,
+                approved_at_kst=approved_at_kst,
+            )
+            payload = {
+                "customer_key": continuity.customer_key,
+                "approved_proposal_digest": continuity.approved_proposal_digest,
+                "revision": continuity.revision,
+                "effective_kst_day": continuity.effective_kst_day.isoformat(),
+                "action_id": continuity.action_id,
+                "action_text": continuity.action_text,
+                "action_atom": continuity.action_atom,
+                "criterion_text": continuity.criterion_text,
+                "criterion_atom": continuity.criterion_atom,
+                "next_check_kst": continuity.next_check_kst,
+                "approved_at_kst": continuity.approved_at_kst,
+            }
+            dedupe_key = f"customer-action:{continuity.action_id}"
+            if self._adaptive_store_lock_held:
+                self._append_locked(
+                    self.store,
+                    "customer_action_continuity",
+                    payload,
+                    dedupe_key=dedupe_key,
+                )
+            else:
+                self.store.append_customer_action_continuity(continuity)
+    def preview_registered_daily_projection(
+        self,
+        proposal: NutritionProposal,
+    ) -> str:
+        try:
+            from checkin_cli.adaptive_nutrition import CustomerActionContinuity
+            from checkin_cli.customer_coaching import (
+                build_registered_daily_customer_projection,
+            )
+        except ImportError as exc:
+            raise AdaptiveWorkflowError(
+                "registered daily projection API is unavailable"
+            ) from exc
+        evaluation_day = getattr(proposal.snapshot, "evaluation_day", None)
+        if type(evaluation_day) is not date:
+            raise AdaptiveWorkflowError("approved proposal evaluation day is invalid")
+        next_check = (
+            f"{(evaluation_day + timedelta(days=1)).isoformat()}T08:00:00+09:00"
+        )
+        actions = tuple(
+            CustomerActionContinuity(
+                customer_key=proposal.customer_key,
+                approved_proposal_digest=proposal.digest,
+                revision=proposal.revision,
+                effective_kst_day=evaluation_day,
+                action_text=action,
+                action_atom=f"approved_plan_action_{index}",
+                criterion_text="다음 체크인의 계획 준수 기록",
+                criterion_atom="adherence_recorded",
+                next_check_kst=next_check,
+            )
+            for index, action in enumerate(self._customer_action_texts(proposal), 1)
+        )
+        return build_registered_daily_customer_projection(
+            self.customer_runtime,
+            proposal,
+            actions=actions,
+            next_check=next_check,
+        ).render()
+    def _registered_daily_projection(
+        self,
+        proposal: NutritionProposal,
+        *,
+        canonical_events: Iterable[object],
+        as_of_kst_day: date,
+    ) -> str:
+        try:
+            from checkin_cli.adaptive_nutrition import CustomerActionContinuity
+            from checkin_cli.customer_coaching import build_registered_daily_customer_projection
+        except ImportError as exc:
+            raise AdaptiveWorkflowError("registered daily projection API is unavailable") from exc
+        actions = []
+        for row in self.store.read():
+            payload = row.get("payload") if isinstance(row, Mapping) else None
+            if (
+                not isinstance(payload, Mapping)
+                or row.get("event_type") != "customer_action_continuity"
+                or payload.get("customer_key") != proposal.customer_key
+                or payload.get("approved_proposal_digest") != proposal.digest
+                or payload.get("revision") != proposal.revision
+            ):
+                continue
+            actions.append(CustomerActionContinuity(
+                customer_key=proposal.customer_key,
+                approved_proposal_digest=proposal.digest,
+                revision=proposal.revision,
+                effective_kst_day=date.fromisoformat(str(payload["effective_kst_day"])),
+                action_id=str(payload["action_id"]),
+                action_text=str(payload["action_text"]),
+                action_atom=str(payload["action_atom"]),
+                criterion_text=str(payload["criterion_text"]),
+                criterion_atom=str(payload["criterion_atom"]),
+                next_check_kst=str(payload["next_check_kst"]),
+                approved_at_kst=(
+                    str(payload["approved_at_kst"])
+                    if payload.get("approved_at_kst") is not None
+                    else None
+                ),
+            ))
+        selected = tuple(actions[:3])
+        if not selected:
+            raise AdaptiveWorkflowError("approved customer actions are unavailable")
+        self.store.project_customer_action_outcomes(
+            customer_key=proposal.customer_key,
+            canonical_events=canonical_events,
+            as_of_kst_day=as_of_kst_day,
+        )
+        return build_registered_daily_customer_projection(
+            self.customer_runtime,
+            proposal,
+            actions=selected,
+            next_check=selected[0].next_check_kst,
+        ).render()
     def approve_latest(
         self,
         proposal_digest: str | None = None,
@@ -9999,13 +10642,15 @@ class AdaptiveNutritionCoordinator:
                     )
                     if last_fingerprint != final_fingerprint:
                         raise AdaptiveWorkflowError("adaptive approval authority is stale")
+                    self._append_approved_action_continuity(proposal)
                     payload = self._approval_payload(proposal, last_context[2], actor)
-                    return self._append_locked(
+                    approved = self._append_locked(
                         self.store,
                         "plan_approved",
                         payload,
                         dedupe_key=f"production-approve:{proposal.digest}:{actor}",
                     )
+                    return approved
                 except AdaptiveWorkflowError:
                     raise
                 except (OSError, TypeError, ValueError) as exc:
@@ -10887,9 +11532,13 @@ class AdaptiveNutritionCoordinator:
         expected_meal_digest = (
             proposal.meal_plan.digest if proposal.meal_plan is not None else ""
         )
+        rendered_body = attempt_payload.get("customer_body")
+        if not isinstance(rendered_body, str) or not rendered_body:
+            raise AdaptiveWorkflowError("adaptive delivery body pin is invalid")
+        rendered_digest = self._text_digest(rendered_body)
         expected = {
-            "customer_body_digest": proposal.customer_body_digest,
-            "rendered_digest": proposal.customer_body_digest,
+            "customer_body_digest": rendered_digest,
+            "rendered_digest": rendered_digest,
             "operator_body_digest": proposal.operator_body_digest,
             "meal_plan_digest": expected_meal_digest,
             "meal_digest": expected_meal_digest,
@@ -11206,16 +11855,14 @@ class AdaptiveNutritionCoordinator:
                 "proposal_digest": proposal.digest,
                 "message_id": persisted_message_id,
                 "provider_receipt": persisted_message_id,
-                "customer_body_digest": proposal.customer_body_digest,
+                "customer_body_digest": attempt_payload.get("customer_body_digest"),
                 "registration_digest": attempt_payload.get("registration_digest"),
                 "source_digest": attempt_payload.get("source_digest"),
                 "policy_digest": attempt_payload.get("policy_digest"),
                 "meal_constraints_digest": attempt_payload.get("meal_constraints_digest"),
                 "catalog_digest": attempt_payload.get("catalog_digest"),
                 "authority_digest": attempt_payload.get("authority_digest"),
-                "meal_plan_digest": (
-                    proposal.meal_plan.digest if proposal.meal_plan is not None else ""
-                ),
+                "meal_plan_digest": attempt_payload.get("meal_plan_digest"),
                 "destination": dict(destination_payload),
                 "topic_id": destination_payload.get("topic_id"),
                 "attempt_event_id": attempt_payload.get("attempt_event_id"),
@@ -11778,6 +12425,36 @@ class AdaptiveNutritionCoordinator:
                 payload,
                 dedupe_key=f"production-audit-pending:{delivery_id}",
             )
+    def _append_delivery_preflight_rejected(
+        self,
+        *,
+        delivery_id: str,
+        proposal_digest: str,
+        reason: str,
+        registration_digest: str | None = None,
+        attempt_event_id: str | None = None,
+    ) -> Mapping[str, object]:
+        self._require_non_diagnostic_delivery_runtime()
+        locked = getattr(self.store, "locked", None)
+        if not callable(locked):
+            raise AdaptiveWorkflowError("adaptive event store lock is unavailable")
+        with self._authority_lock(), self._lifecycle_lock, locked():
+            payload: dict[str, object] = {
+                "customer_key": self.customer_key,
+                "delivery_id": delivery_id,
+                "reservation_id": delivery_id,
+                "proposal_digest": proposal_digest,
+                "reason": reason,
+                "registration_digest": registration_digest,
+            }
+            if attempt_event_id is not None:
+                payload["attempt_event_id"] = attempt_event_id
+            return self._append_locked(
+                self.store,
+                "delivery_preflight_rejected",
+                payload,
+                dedupe_key=f"production-preflight-rejected:{delivery_id}:{reason}",
+            )
     def _append_delivery_unknown(
         self,
         *,
@@ -11958,9 +12635,15 @@ class AdaptiveNutritionCoordinator:
                 )
             ).hexdigest()
             pins = self._proposal_body_pins(proposal, spec)
-            rendered = proposal.customer_body
-            if rendered is None:
-                raise AdaptiveWorkflowError("adaptive customer body is unavailable")
+            reader = getattr(_events, "_read_events", None)
+            if not callable(reader):
+                raise AdaptiveWorkflowError("canonical customer evidence is unavailable")
+            rendered = self._registered_daily_projection(
+                proposal,
+                canonical_events=reader(),
+                as_of_kst_day=proposal.snapshot.evaluation_day,
+            )
+            rendered_digest = self._text_digest(rendered)
             source_pins = self._proposal_pins(proposal)
             attempt_payload = {
                 "customer_key": self.customer_key,
@@ -11975,8 +12658,8 @@ class AdaptiveNutritionCoordinator:
                     "topic_id": registered_key[2],
                 },
                 "topic_id": registered_key[2],
-                "rendered_digest": pins["customer_body_digest"],
-                "customer_body_digest": pins["customer_body_digest"],
+                "rendered_digest": rendered_digest,
+                "customer_body_digest": rendered_digest,
                 "operator_body_digest": pins["operator_body_digest"],
                 "meal_plan_digest": pins["meal_plan_digest"],
                 "meal_digest": pins["meal_digest"],
@@ -12034,14 +12717,20 @@ class AdaptiveNutritionCoordinator:
                     ):
                         raise AdaptiveWorkflowError("adaptive delivery already attempted")
                     if delivery_rows:
-                        persisted_attempt = next(
+                        persisted_attempt_row = next(
                             (
-                                row["payload"] for row in delivery_rows
+                                row
+                                for row in delivery_rows
                                 if row.get("event_type") == "delivery_attempt_started"
                                 and isinstance(row.get("payload"), Mapping)
                             ),
-                            attempt_payload,
+                            None,
                         )
+                        if persisted_attempt_row is None:
+                            raise AdaptiveWorkflowError(
+                                "adaptive delivery reservation is incomplete"
+                            )
+                        persisted_attempt = persisted_attempt_row["payload"]
                         if any(
                             persisted_attempt.get(key) != attempt_payload.get(key)
                             for key in (
@@ -12061,23 +12750,37 @@ class AdaptiveNutritionCoordinator:
                                 "risk_policy_document_digest",
                             )
                         ):
-                            raise AdaptiveWorkflowError("adaptive delivery reservation pins are stale")
-                        raise AdaptiveWorkflowError("adaptive delivery already attempted")
-                    reservation_row = self._append_locked(
-                        self.store,
-                        "delivery_attempt_started",
-                        attempt_payload,
-                        dedupe_key=f"production-attempt:{delivery_id}",
-                    )
-                    reservation_event_id = (
-                        reservation_row.get("event_id")
-                        if isinstance(reservation_row, Mapping)
-                        else None
-                    )
-                    attempt_payload = {
-                        **attempt_payload,
-                        "attempt_event_id": reservation_event_id,
-                    }
+                            raise AdaptiveWorkflowError(
+                                "adaptive delivery reservation pins are stale"
+                            )
+                        if not any(
+                            row.get("event_type") == "delivery_preflight_rejected"
+                            for row in delivery_rows
+                        ):
+                            raise AdaptiveWorkflowError(
+                                "adaptive delivery already attempted"
+                            )
+                        reservation_event_id = persisted_attempt_row.get("event_id")
+                        attempt_payload = {
+                            **persisted_attempt,
+                            "attempt_event_id": reservation_event_id,
+                        }
+                    else:
+                        reservation_row = self._append_locked(
+                            self.store,
+                            "delivery_attempt_started",
+                            attempt_payload,
+                            dedupe_key=f"production-attempt:{delivery_id}",
+                        )
+                        reservation_event_id = (
+                            reservation_row.get("event_id")
+                            if isinstance(reservation_row, Mapping)
+                            else None
+                        )
+                        attempt_payload = {
+                            **attempt_payload,
+                            "attempt_event_id": reservation_event_id,
+                        }
             except AdaptiveWorkflowError:
                 raise
             except (OSError, TypeError, ValueError) as exc:
@@ -12137,7 +12840,7 @@ class AdaptiveNutritionCoordinator:
                 )
                 else "post_reservation_revalidation_failed"
             )
-            self._append_delivery_unknown(
+            self._append_delivery_preflight_rejected(
                 delivery_id=delivery_id,
                 proposal_digest=proposal.digest,
                 registration_digest=attempt_payload.get("registration_digest"),
@@ -12154,7 +12857,7 @@ class AdaptiveNutritionCoordinator:
             else None
         )
         if not callable(sender):
-            return self._append_delivery_unknown(
+            return self._append_delivery_preflight_rejected(
                 delivery_id=delivery_id,
                 proposal_digest=proposal.digest,
                 registration_digest=attempt_payload.get("registration_digest"),
@@ -12169,6 +12872,14 @@ class AdaptiveNutritionCoordinator:
             )
             if inspect.isawaitable(receipt):
                 receipt = await receipt
+        except AdaptiveTransportPreflightRejected as exc:
+            return self._append_delivery_preflight_rejected(
+                delivery_id=delivery_id,
+                proposal_digest=proposal.digest,
+                registration_digest=attempt_payload.get("registration_digest"),
+                attempt_event_id=reservation_event_id,
+                reason=str(exc)[:160] or "transport_preflight_rejected",
+            )
         except asyncio.CancelledError:
             return self._append_delivery_unknown(
                 delivery_id=delivery_id,
@@ -12178,6 +12889,30 @@ class AdaptiveNutritionCoordinator:
                 reason="cancelled",
             )
         except Exception as exc:
+            try:
+                consumed = any(
+                    isinstance(row, Mapping)
+                    and row.get("event_type") == "delivery_attempt_consumed"
+                    and isinstance(row.get("payload"), Mapping)
+                    and row["payload"].get(
+                        "reservation_id",
+                        row["payload"].get("delivery_id"),
+                    )
+                    == delivery_id
+                    for row in self.store.read()
+                )
+            except (OSError, TypeError, ValueError):
+                consumed = True
+            if not consumed:
+                return self._append_delivery_preflight_rejected(
+                    delivery_id=delivery_id,
+                    proposal_digest=proposal.digest,
+                    registration_digest=attempt_payload.get(
+                        "registration_digest"
+                    ),
+                    attempt_event_id=reservation_event_id,
+                    reason=type(exc).__name__,
+                )
             return self._append_delivery_unknown(
                 delivery_id=delivery_id,
                 proposal_digest=proposal.digest,
@@ -12870,14 +13605,14 @@ class TelegramCustomerTransport:
         self._adapter = adapter
         self._coordinator = coordinator
 
-    async def _send_customer(
+    def _prepare_customer_send(
         self,
         customer_key: str,
         destination: object,
         text: str,
         *,
         adaptive: bool,
-    ) -> Mapping[str, object]:
+    ) -> tuple[Callable[..., object], dict[str, object]]:
         try:
             allowed = self._coordinator.customer_transport_allowed(
                 customer_key,
@@ -12886,8 +13621,13 @@ class TelegramCustomerTransport:
             )
         except TypeError as exc:
             if adaptive:
-                raise RuntimeError("adaptive customer transport authority unavailable") from exc
-            allowed = self._coordinator.customer_transport_allowed(customer_key, destination)
+                raise RuntimeError(
+                    "adaptive customer transport authority unavailable"
+                ) from exc
+            allowed = self._coordinator.customer_transport_allowed(
+                customer_key,
+                destination,
+            )
         if not allowed:
             raise RuntimeError("customer transport authority unavailable")
         customer = self._coordinator.customer(customer_key)
@@ -12903,27 +13643,50 @@ class TelegramCustomerTransport:
         if not isinstance(text, str) or not text.strip():
             raise RuntimeError("customer transport text is empty")
         if telegram_utf16_length(text) > TELEGRAM_SINGLE_MESSAGE_LIMIT_UTF16:
-            raise RuntimeError("customer transport requires one Telegram message receipt")
+            raise RuntimeError(
+                "customer transport requires one Telegram message receipt"
+            )
         chat_id = str(canonical.chat_id)
         topic_id = str(canonical.topic_id)
         strict_sender = getattr(self._adapter, "_send_message_strict_topic", None)
         if not callable(strict_sender):
-            strict_sender = getattr(self._adapter, "_send_message_with_strict_topic", None)
+            strict_sender = getattr(
+                self._adapter,
+                "_send_message_with_strict_topic",
+                None,
+            )
+        if not callable(strict_sender):
+            raise RuntimeError("Telegram strict topic sender is unavailable")
         thread_kwargs = self._adapter._thread_kwargs_for_send(
             chat_id,
             topic_id,
             {"thread_id": topic_id},
         )
         if thread_kwargs.get("message_thread_id") is None:
-            raise RuntimeError("Telegram customer delivery requires message_thread_id")
-        try:
-            result = strict_sender(
-                chat_id=chat_id,
-                text=text,
-                **thread_kwargs,
+            raise RuntimeError(
+                "Telegram customer delivery requires message_thread_id"
             )
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Telegram customer destination is invalid") from exc
+        return strict_sender, {
+            "chat_id": chat_id,
+            "text": text,
+            **thread_kwargs,
+        }
+
+    async def _send_customer(
+        self,
+        customer_key: str,
+        destination: object,
+        text: str,
+        *,
+        adaptive: bool,
+    ) -> Mapping[str, object]:
+        strict_sender, send_kwargs = self._prepare_customer_send(
+            customer_key,
+            destination,
+            text,
+            adaptive=adaptive,
+        )
+        result = strict_sender(**send_kwargs)
         if inspect.isawaitable(result):
             result = await result
         return _telegram_receipt(result)
@@ -12991,6 +13754,8 @@ class TelegramCustomerTransport:
             raise RuntimeError("adaptive delivery ledger lock is unavailable")
         body: str
         canonical_destination: object
+        strict_sender: Callable[..., object]
+        send_kwargs: dict[str, object]
         with adaptive._authority_lock():
             (
                 _customer,
@@ -13101,12 +13866,11 @@ class TelegramCustomerTransport:
                 body_value = reservation.get("customer_body")
                 if (
                     not isinstance(body_value, str)
-                    or body_value != proposal.customer_body
-                    or adaptive._text_digest(body_value) != reservation.get("customer_body_digest")
-                    or reservation.get("customer_body_digest")
-                    != body_pins["customer_body_digest"]
+                    or not body_value
+                    or adaptive._text_digest(body_value)
+                    != reservation.get("customer_body_digest")
                     or reservation.get("rendered_digest")
-                    != body_pins["customer_body_digest"]
+                    != reservation.get("customer_body_digest")
                 ):
                     raise RuntimeError("adaptive delivery body pin is invalid")
                 for key, value in (
@@ -13140,6 +13904,12 @@ class TelegramCustomerTransport:
                 ):
                     raise RuntimeError("adaptive customer transport authority unavailable")
                 body = body_value
+                strict_sender, send_kwargs = self._prepare_customer_send(
+                    customer_key,
+                    canonical_destination,
+                    body,
+                    adaptive=True,
+                )
                 consumed_payload = {
                     "customer_key": customer_key,
                     "reservation_id": reservation_id,
@@ -13159,16 +13929,20 @@ class TelegramCustomerTransport:
                     consumed_payload,
                     dedupe_key=f"production-consumed:{reservation_id}",
                 )
-            except RuntimeError:
-                raise
-            except (OSError, TypeError, ValueError) as exc:
-                raise RuntimeError("adaptive delivery reservation is invalid") from exc
-        return await self._send_customer(
-            customer_key,
-            canonical_destination,
-            body,
-            adaptive=True,
-        )
+            except RuntimeError as exc:
+                raise AdaptiveTransportPreflightRejected(str(exc)) from exc
+            except (TypeError, ValueError) as exc:
+                raise AdaptiveTransportPreflightRejected(
+                    "adaptive delivery reservation is invalid"
+                ) from exc
+            except OSError as exc:
+                raise RuntimeError(
+                    "adaptive delivery consume outcome is unknown"
+                ) from exc
+        result = strict_sender(**send_kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return _telegram_receipt(result)
 
 
 

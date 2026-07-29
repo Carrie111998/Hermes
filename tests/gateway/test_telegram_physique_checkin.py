@@ -48,6 +48,7 @@ from gateway.platforms.korean_humanizer import (
     DailyGroundingInput,
 )
 from cron.physique_inline_card import launch_morning_card
+from gateway.platforms.nutrition_coaching import AdaptiveOperatorService
 
 
 @dataclass
@@ -2468,3 +2469,60 @@ def test_dual_coach_review_runtime_drain_requires_topic_59_and_persists_receipt(
     }
     restarted._send_message_strict_topic.assert_not_awaited()
     wrong_topic._send_message_strict_topic.assert_not_awaited()
+def test_normal_adaptive_card_redacts_lifecycle_diagnostics() -> None:
+    service = object.__new__(AdaptiveOperatorService)
+    service._customer_display_label = lambda key: "고객 001"
+    service._proposal_kst_day = lambda proposal: "2026-07-29"
+    customer_body = (
+        "식단 제안\n"
+        "하루 목표는 2300kcal입니다.\n"
+        "하루 목표: 2300kcal · 탄수화물 280g · 단백질 150g · 지방 65g"
+    )
+    proposal = SimpleNamespace(
+        digest="a" * 64,
+        revision=1,
+        customer_body=customer_body,
+    )
+    text, envelope = service._operator_card_envelope(
+        proposal,
+        customer_key="customer-1",
+        state="proposed",
+        body=(
+            "- 단백질을 나누어 섭취합니다.\n"
+            "- revision: 7\n"
+            "- digest: abcdef\n"
+            "- 회복 상태를 기록합니다."
+        ),
+    )
+    adaptive = SimpleNamespace(
+        _latest_production_proposal=lambda: proposal,
+        preview_registered_daily_projection=lambda _proposal: customer_body,
+    )
+    service.coordinator = SimpleNamespace(
+        adaptive_nutrition_coordinator=lambda _key: adaptive,
+    )
+    service._proposal_card_state = lambda _adaptive, _proposal: "proposed"
+
+    assert envelope == {
+        "customer_label": "고객 001",
+        "kst_day": "2026-07-29",
+    }
+    assert "고객: 고객 001" in text
+    assert "이전 기록과 이번 입력" in text
+    assert "판단:" in text
+    assert "안전·과장 점검:" in text
+    assert "하루 목표: 2300kcal" in text
+    assert customer_body in text
+    assert "revision" not in text.lower()
+    assert "digest" not in text.lower()
+    assert "epoch" not in text.lower()
+    assert "state" not in envelope
+    persisted = service._validated_card_payload({
+        "status": "card",
+        "customer_key": "customer-1",
+        "text": text,
+        "envelope": envelope,
+        "buttons": [],
+        **service._card_hidden_pins(proposal, "proposed", customer_body),
+    })
+    assert persisted["text"] == text

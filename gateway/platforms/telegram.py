@@ -4680,11 +4680,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "adaptive_operator",
                 current_supplier,
             )
-            text = await self._humanize_korean_copy(
-                "adaptive_operator",
-                text,
-                grounding_input,
-            )
+            text = canonical_text
         buttons = payload.get("buttons")
         markup = None
         if isinstance(buttons, list):
@@ -5598,7 +5594,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ]]
         elif status == "approved":
             rows = [[
-                InlineKeyboardButton("수정", callback_data=f"nc2:{draft_id}:edit"),
+                InlineKeyboardButton("내용 수정", callback_data=f"nc2:{draft_id}:edit"),
                 InlineKeyboardButton("고객에게 보내기", callback_data=f"nc2:{draft_id}:send"),
             ]]
         else:
@@ -7837,57 +7833,44 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                     except (AttributeError, OSError, TypeError, ValueError):
                         pass
+                    try:
+                        from checkin_cli.adaptive_nutrition import AdaptiveEventStore
+                        from checkin_cli.wizard import WizardService
+                        from checkin_cli.customer_reporting import (
+                            build_customer_weekly_review_source,
+                        )
+
+                        event_source = WizardService.for_registered(customer)._events
+                        outcomes = AdaptiveEventStore.for_registered(
+                            customer
+                        ).project_customer_action_outcomes(
+                            customer_key=task.customer_key,
+                            canonical_events=event_source._read_events(),
+                            as_of_kst_day=task.kst_day,
+                        )
+                        source = build_customer_weekly_review_source(
+                            summary,
+                            customer_key=task.customer_key,
+                            latest_action=outcomes[-1] if outcomes else None,
+                            next_review_date=task.kst_day + timedelta(days=7),
+                        )
+                        created = coordinator.create_weekly_review_draft(
+                            task.customer_key,
+                            coordinator.owner,
+                            source,
+                        )
+                    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+                        failures.append(task_key)
+                        continue
+                    if not created.accepted:
+                        failures.append(task_key)
+                        continue
                     destination = coordinator.owner
-                    canonical_body = self._nutrition_report_text(
-                        customer.spec.display_name,
-                        summary,
-                        prior_summary,
-                    )
-                    grounding_input = self._weekly_grounding_input(
-                        summary,
-                        customer_key=task.customer_key,
-                        prior_summary=prior_summary,
-                        plan=customer.spec.plan,
-                        profile=customer.spec.profile,
-                    )
-                    def current_weekly_input() -> WeeklyGroundingInput | None:
-                        try:
-                            current_customer = coordinator.customer(task.customer_key)
-                            if current_customer is None:
-                                return None
-                            current_summary = build_customer_weekly_summary(
-                                current_customer.data_root / "wizard" / "events.jsonl",
-                                period_start,
-                                period_end,
-                                plan=current_customer.spec.plan,
-                                profile=current_customer.spec.profile,
-                            )
-                            current_prior = build_customer_period_report(
-                                current_customer.data_root / "wizard" / "events.jsonl",
-                                period_start - timedelta(days=7),
-                                period_start - timedelta(days=1),
-                                plan=current_customer.spec.plan,
-                                profile=current_customer.spec.profile,
-                            )
-                            return self._weekly_grounding_input(
-                                current_summary,
-                                customer_key=task.customer_key,
-                                prior_summary=current_prior,
-                                plan=current_customer.spec.plan,
-                                profile=current_customer.spec.profile,
-                            )
-                        except (AttributeError, OSError, TypeError, ValueError):
-                            return None
-                    self._coaching_current_input_supplier = (
-                        "weekly",
-                        current_weekly_input,
-                    )
-                    body = await self._humanize_korean_copy(
-                        "weekly",
-                        canonical_body,
-                        grounding_input,
-                    )
-                    reply_markup = None
+                    body = self._nutrition_draft_text(created)
+                    reply_markup = self._nutrition_draft_markup(created)
+                    canonical_body = body
+                    grounding_input = None
+                    current_weekly_input = lambda: None
                 if (
                     task.kind == "weekly"
                     and not self._coaching_authority_valid(
@@ -8650,10 +8633,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 from gateway.platforms.nutrition_coaching import adaptive_delivery_result_text
 
                 result["text"] = adaptive_delivery_result_text(result)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "[%s] adaptive approve-and-send stopped before a terminal delivery result: %s",
+                    self.name,
+                    exc,
+                )
                 result = {
-                    "status": "delivery_unknown",
-                    "text": "전송 결과를 확인할 수 없습니다. 다시 보내지 마세요. 조정이 필요합니다.",
+                    "status": "rejected",
+                    "text": "처리를 완료하지 못했습니다. 최신 검토 카드에서 다시 시도해 주세요.",
                 }
         payload = result if isinstance(result, dict) else {}
         terminal_states = {
@@ -8711,12 +8699,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "adaptive_operator",
                 current_supplier,
             )
-            text = await self._humanize_korean_copy(
-                "adaptive_operator",
-                text,
-                grounding_input,
-            )
-            payload = {**payload, "text": text}
+            payload = {**payload, "text": canonical_text}
         if publication_status in {"menu", "card", "view"} and text:
             markup = None
             if isinstance(buttons, list):
@@ -8753,6 +8736,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ):
                 await query.answer(text="검토 카드 권한이 변경되었습니다.")
                 return
+            publication_claim = None
             if publication_status in {"menu", "card"}:
                 try:
                     lock_factory = getattr(service, "_authority_session_lock", None)
@@ -8771,11 +8755,24 @@ class TelegramAdapter(BasePlatformAdapter):
                         ):
                             await query.answer(text="검토 카드 권한이 변경되었습니다.")
                             return
-                        service.mark_publish_pending(
+                        pending_publication = service.mark_publish_pending(
                             data,
                             card_payload=payload,
-                            origin_message_id=getattr(query_message, "message_id", ""),
+                            origin_message_id=getattr(
+                                query_message,
+                                "message_id",
+                                "",
+                            ),
                         )
+                        publication_claim = service._claim_pending_card(
+                            data,
+                            pending_publication,
+                        )
+                        if publication_claim is None:
+                            await query.answer(
+                                text="검토 카드 게시가 이미 처리 중이거나 완료되었습니다."
+                            )
+                            return
                 except Exception as exc:
                     logger.warning(
                         "[%s] adaptive review publication reservation failed: status=%s error=%s",
@@ -8805,7 +8802,11 @@ class TelegramAdapter(BasePlatformAdapter):
                             "message_id",
                             getattr(query_message, "message_id", ""),
                         )
-                        service.mark_published(data, published_message_id=published_id)
+                        service.mark_published(
+                            data,
+                            published_message_id=published_id,
+                            claim_id=publication_claim.get("claim_id"),
+                        )
                 except Exception as exc:
                     logger.warning(
                         "[%s] adaptive review card publication failed: status=%s error=%s",
@@ -8818,11 +8819,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     else:
                         await query.answer(text="검토 카드를 표시할 수 없습니다.")
                     return
-            envelope = payload.get("envelope")
-            lifecycle_state = (
-                str(envelope.get("state", "") or "")
-                if isinstance(envelope, dict)
-                else ""
+            lifecycle_state = str(
+                payload.get("lifecycle_state", "") or ""
             )
             feedback = {
                 "proposed": "초안 생성 완료.",

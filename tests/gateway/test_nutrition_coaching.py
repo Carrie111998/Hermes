@@ -344,6 +344,65 @@ def test_saved_customer_checkin_creates_owner_only_draft_request(tmp_path: Path)
     assert "체중" in correction.reply.prompt.text
 
 
+def test_typed_weekly_source_reuses_owner_draft_lifecycle(tmp_path: Path) -> None:
+    module = _module()
+    assert module is not None
+    coordinator = module.NutritionCoachingCoordinator(tmp_path, _registry(tmp_path))
+    address = module.IncomingAddress("client", "customer-chat", "customer-topic")
+    opening = coordinator.open_launcher("client_001")
+    assert opening.callback_data is not None
+    coordinator.bind_launcher("client_001", opening.callback_data, "44")
+    coordinator.handle_callback(module.CallbackInput(opening.callback_data, address, "44"))
+    bridge = coordinator.resolve(address).bridge
+    for action, value in zip(
+        (
+            "value", "value", "value", "value", "value", "value", "select",
+            "select", "select", "value", "value", "select",
+        ),
+        (
+            "70", "2300", "150 280 65", "계획대로 3식", "2.5", "7", "4",
+            "normal", "4", "식욕 3/5, 스트레스 2/5", "하체 70분", "skip",
+        ),
+        strict=True,
+    ):
+        reply = bridge.apply_model_action(action, value)
+    assert reply.prompt is not None
+    save = next(callback for label, callback in reply.prompt.buttons if label == "저장")
+    coordinator.handle_callback(module.CallbackInput(save, address, "44"))
+
+    from checkin_cli.customer_reporting import (
+        WeeklySummary,
+        build_customer_weekly_review_source,
+    )
+
+    summary = WeeklySummary(
+        starts_on=date(2026, 7, 21),
+        ends_on=date(2026, 7, 27),
+        eligible_weekdays=(date(2026, 7, 21),),
+        checkin_dates=(date(2026, 7, 21),),
+        checkin_rate_percent=100.0,
+        trends=("목표 범위를 유지했습니다.",),
+        keep_behaviors=("현재 식사 계획 유지",),
+        change_behaviors=(),
+        next_decision="유지: 현재 행동을 유지하고 다음 주 추세를 확인합니다.",
+    )
+    source = build_customer_weekly_review_source(
+        summary,
+        customer_key="client_001",
+        latest_action=None,
+        next_review_date=date(2026, 8, 3),
+    )
+    owner = coordinator.owner
+    first = coordinator.create_weekly_review_draft("client_001", owner, source)
+    replay = coordinator.create_weekly_review_draft("client_001", owner, source)
+
+    assert first.accepted is True
+    assert first.status == "created"
+    assert replay.draft_id == first.draft_id
+    assert replay.text == first.text
+    assert "지난 집중:" in first.text
+    assert all(value not in first.text for value in ("revision", "digest", "epoch"))
+
 def test_urgent_customer_note_notifies_owner_without_draft_token(tmp_path: Path) -> None:
     module = _module()
     assert module is not None
@@ -962,14 +1021,28 @@ def test_corrupt_delivery_ledger_fails_closed_without_transport(tmp_path: Path) 
     assert path.read_text(encoding="utf-8") == '{"broken": {"status": "delivered"}}'
 
 
-def test_approved_draft_cannot_be_edited_without_reapproval(tmp_path: Path) -> None:
+def test_approved_edit_creates_child_revision_and_requires_reapproval(tmp_path: Path) -> None:
     coordinator, owner, events = _approved_durable_draft(tmp_path)
 
-    result = coordinator.edit_draft("draft-001", owner, "몰래 바꾼 초안입니다.")
+    child = coordinator.edit_draft("draft-001", owner, "수정한 초안입니다.")
 
-    assert result.accepted is False
-    assert result.error == "draft_not_editable"
-    assert [event.event_type.value for event in events] == ["draft_created", "draft_approved"]
+    assert child.accepted is True
+    assert child.draft_id != "draft-001"
+    assert child.status == "edited"
+    replay = coordinator.edit_draft("draft-001", owner, "수정한 초안입니다.")
+    assert replay.draft_id == child.draft_id
+    assert replay.status == "edited"
+    assert coordinator.prepare_delivery("draft-001", owner).error == "draft_not_approved"
+    assert coordinator.prepare_delivery(child.draft_id, owner).error == "draft_not_approved"
+    approved = coordinator.approve_draft(child.draft_id, owner)
+    assert approved.accepted is True
+    assert coordinator.prepare_delivery(child.draft_id, owner).transport_required is True
+    assert [event.event_type.value for event in events] == [
+        "draft_created",
+        "draft_approved",
+        "draft_edited",
+        "draft_approved",
+    ]
 def test_sent_audit_write_failure_leaves_receipt_for_retry_without_resend(tmp_path: Path) -> None:
     coordinator, owner, events = _approved_durable_draft(tmp_path)
     assert coordinator.prepare_delivery("draft-001", owner).transport_required is True
@@ -1814,6 +1887,150 @@ def test_schedule_confirm_integration_rejects_stale_reference_and_wrong_review_a
     assert not adapter.accepts(module.IncomingAddress("wrong-user", "review-chat", "59"))
     assert not adapter.accepts(module.IncomingAddress("reviewer", "review-chat", "other-topic"))
     assert adaptive_path.read_bytes() == adaptive_before
+def test_approval_continuity_uses_authoritative_customer_body() -> None:
+    module = _module()
+    assert module is not None
+    appended = []
+    store = SimpleNamespace(
+        read=lambda: [],
+        append_customer_action_continuity=lambda continuity: appended.append(continuity),
+    )
+    coordinator = object.__new__(module.AdaptiveNutritionCoordinator)
+    coordinator.customer_runtime = object()
+    coordinator.store = store
+    coordinator._adaptive_store_lock_held = False
+    proposal = SimpleNamespace(
+        customer_key="client_001",
+        digest="c" * 64,
+        revision=2,
+        snapshot=SimpleNamespace(evaluation_day=date(2026, 7, 29)),
+        customer_body=(
+            "식단 제안\n"
+            "하루 목표는 2300kcal입니다.\n"
+            "하루 목표: 2300kcal · 탄수화물 280g · 단백질 150g · 지방 65g\n"
+            "아침: 승인 식단\n"
+            "점심: 승인 식단\n"
+            "저녁: 승인 식단"
+        ),
+    )
+
+    coordinator._append_approved_action_continuity(proposal)
+
+    assert [item.action_text for item in appended] == [
+        "하루 목표: 2300kcal · 탄수화물 280g · 단백질 150g · 지방 65g",
+        "아침: 승인 식단",
+        "점심: 승인 식단",
+    ]
+    assert {item.criterion_atom for item in appended} == {"adherence_recorded"}
+    assert len({item.approved_at_kst for item in appended}) == 1
+    assert all(item.approved_at_kst for item in appended)
+
+    appended.clear()
+    proposal.customer_body = "식단 제안\n설명만 있습니다."
+    with pytest.raises(module.AdaptiveWorkflowError, match="canonical customer actions"):
+        coordinator._append_approved_action_continuity(proposal)
+    assert appended == []
+
+def test_approve_and_send_uses_fresh_action_capabilities_and_stops_on_failure() -> None:
+    module = _module()
+    assert module is not None
+    proposal = SimpleNamespace(digest="b" * 64, revision=1)
+    session = {
+        "customer_key": "client_001",
+        "proposal_digest": proposal.digest,
+        "revision": 1,
+        "session_id": "composite-session",
+        "state": "consumed",
+    }
+    calls: list[str] = []
+
+    service = object.__new__(module.AdaptiveOperatorService)
+    service._schedule_confirm_enabled = True
+    service._proposal_card_state = lambda _adaptive, _proposal: "proposed"
+    service._transition_capability = lambda _session, *, action: SimpleNamespace(
+        action=action,
+        capability_id=f"cap-{action}",
+    )
+    service._find_session = lambda capability_id, action: {
+        "session_id": capability_id,
+        "action": action,
+    }
+    service._resume_schedule_confirmation = lambda _session, capability: (
+        calls.append(capability.action) or {"status": "schedule_confirm"}
+    )
+    service._consume = lambda _session, *, state: None
+
+    class Adaptive:
+        delivery_enabled = False
+
+        @staticmethod
+        def _proposal_for_digest(_digest):
+            return proposal
+
+        @staticmethod
+        def approve_latest(_digest, *, operator_id):
+            assert operator_id.action == "approve"
+            calls.append("approve")
+
+        @staticmethod
+        def activate_latest(_digest, *, operator_id):
+            assert operator_id.action == "activate"
+            calls.append("activate")
+
+        @staticmethod
+        def deliver_latest_once(_digest, *, operator_id):
+            assert operator_id.action == "send"
+            calls.append("send")
+            return {"status": "sent_audited"}
+
+    service.coordinator = SimpleNamespace(
+        set_adaptive_delivery=lambda _key, enabled, *, operator_id: (
+            calls.append(operator_id.action)
+            if enabled and operator_id.action == "delivery_enable"
+            else pytest.fail("invalid delivery capability")
+        )
+    )
+    service._schedule_confirmation_is_current = lambda _adaptive, _key: False
+    result = service._approve_and_send(
+        Adaptive(),
+        session,
+        customer_key="client_001",
+        proposal_digest=proposal.digest,
+    )
+    assert result["status"] == "operator_input_required"
+    assert calls == ["schedule_confirm"]
+
+    calls.clear()
+    service._schedule_confirmation_is_current = lambda _adaptive, _key: True
+    result = service._approve_and_send(
+        Adaptive(),
+        session,
+        customer_key="client_001",
+        proposal_digest=proposal.digest,
+    )
+    assert result == {"status": "sent_audited"}
+    assert calls == ["approve", "activate", "delivery_enable", "send"]
+    calls.clear()
+    session["state"] = "consumed"
+
+    calls.clear()
+
+    class FailingAdaptive(Adaptive):
+        @staticmethod
+        def activate_latest(_digest, *, operator_id):
+            assert operator_id.action == "activate"
+            calls.append("activate")
+            raise module.AdaptiveWorkflowError("stale activation")
+
+    with pytest.raises(module.AdaptiveWorkflowError, match="stale activation"):
+        service._approve_and_send(
+            FailingAdaptive(),
+            session,
+            customer_key="client_001",
+            proposal_digest=proposal.digest,
+        )
+    assert calls == ["approve", "activate"]
+
 def test_schedule_confirm_callback_claims_once_and_rejects_invalid_authority(
     tmp_path: Path,
     monkeypatch,
