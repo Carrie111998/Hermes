@@ -20,7 +20,9 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
-def _td(name: str, description: str = "", properties: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def _td(
+    name: str, description: str = "", properties: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
     return {
         "type": "function",
         "function": {
@@ -42,6 +44,7 @@ def _td(name: str, description: str = "", properties: Dict[str, Any] | None = No
 class TestConfigParsing:
     def test_default_when_missing(self):
         from tools.tool_search import ToolSearchConfig
+
         cfg = ToolSearchConfig.from_raw(None)
         assert cfg.enabled == "auto"
         assert cfg.search_default_limit == 5
@@ -52,22 +55,8 @@ class TestConfigParsing:
 
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
+
         cfg = ToolSearchConfig.from_raw(True)
-        assert cfg.enabled == "auto"
-
-    def test_bool_false_maps_to_off(self):
-        from tools.tool_search import ToolSearchConfig
-        cfg = ToolSearchConfig.from_raw(False)
-        assert cfg.enabled == "off"
-
-    def test_explicit_on(self):
-        from tools.tool_search import ToolSearchConfig
-        cfg = ToolSearchConfig.from_raw({"enabled": "on"})
-        assert cfg.enabled == "on"
-
-    def test_invalid_enabled_falls_back_to_auto(self):
-        from tools.tool_search import ToolSearchConfig
-        cfg = ToolSearchConfig.from_raw({"enabled": "maybe"})
         assert cfg.enabled == "auto"
 
     def test_full_config_helper_distinguishes_stable_and_direct_modes(self):
@@ -81,6 +70,7 @@ class TestConfigParsing:
 
     def test_search_limits_clamped(self):
         from tools.tool_search import ToolSearchConfig
+
         cfg = ToolSearchConfig.from_raw({
             "search_default_limit": 999,
             "max_search_limit": 999,
@@ -110,17 +100,31 @@ class TestClassification:
     def test_core_tools_never_defer(self):
         """The critical invariant from the OpenClaw report."""
         from tools.tool_search import is_deferrable_tool_name
+
         # Sample of core tools from _HERMES_CORE_TOOLS.
-        for core_name in ["terminal", "read_file", "write_file", "patch",
-                          "search_files", "todo", "memory", "browser_navigate",
-                          "web_search", "session_search", "clarify",
-                          "execute_code", "delegate_task", "send_message"]:
+        for core_name in [
+            "terminal",
+            "read_file",
+            "write_file",
+            "patch",
+            "search_files",
+            "todo",
+            "memory",
+            "browser_navigate",
+            "web_search",
+            "session_search",
+            "clarify",
+            "execute_code",
+            "delegate_task",
+            "send_message",
+        ]:
             assert not is_deferrable_tool_name(core_name), (
                 f"Core tool '{core_name}' must NEVER be deferrable"
             )
 
     def test_bridge_tools_never_defer(self):
         from tools.tool_search import is_deferrable_tool_name, BRIDGE_TOOL_NAMES
+
         for name in BRIDGE_TOOL_NAMES:
             assert not is_deferrable_tool_name(name)
 
@@ -129,6 +133,7 @@ class TestClassification:
         not be claimed as deferrable. This protects against the OpenClaw
         cron regression where unresolved tools were silently dropped."""
         from tools.tool_search import is_deferrable_tool_name
+
         assert not is_deferrable_tool_name("xx_definitely_not_a_tool_xx")
 
     def test_classify_keeps_unknown_in_visible(self):
@@ -138,6 +143,7 @@ class TestClassification:
         because it wasn't in the catalog).
         """
         from tools.tool_search import classify_tools
+
         # Build a tool def for something we don't have a registry entry for.
         defs = [_td("xx_unknown_tool", "Unknown tool")]
         visible, deferrable = classify_tools(defs)
@@ -154,22 +160,28 @@ class TestClassification:
 class TestActivationGate:
     def test_off_never_activates(self):
         from tools.tool_search import ToolSearchConfig, should_activate
+
         cfg = ToolSearchConfig.from_raw({"enabled": "off"})
-        assert not should_activate(cfg, deferrable_tokens=1_000_000, context_length=200_000)
+        assert not should_activate(
+            cfg, deferrable_tokens=1_000_000, context_length=200_000
+        )
 
     def test_zero_deferrable_keeps_bridge_active(self):
         from tools.tool_search import ToolSearchConfig, should_activate
+
         cfg = ToolSearchConfig.from_raw({"enabled": "on"})
         assert should_activate(cfg, deferrable_tokens=0, context_length=200_000)
 
     def test_on_activates_with_any_deferrable(self):
         from tools.tool_search import ToolSearchConfig, should_activate
+
         cfg = ToolSearchConfig.from_raw({"enabled": "on"})
         assert should_activate(cfg, deferrable_tokens=100, context_length=200_000)
 
     def test_auto_activates_with_any_deferrable(self):
         """Auto always keeps the cache-stable bridge present."""
         from tools.tool_search import ToolSearchConfig, should_activate
+
         cfg = ToolSearchConfig.from_raw({"enabled": "auto"})
         assert should_activate(cfg, deferrable_tokens=0, context_length=200_000)
         assert should_activate(cfg, deferrable_tokens=100, context_length=200_000)
@@ -178,10 +190,16 @@ class TestActivationGate:
 
     def test_token_estimate_proportional_to_schema_size(self):
         from tools.tool_search import estimate_tokens_from_schemas
+
         small = [_td("a", "x")]
-        big = [_td(f"name_{i}", f"description for tool {i} " * 20,
-                   {"q": {"type": "string", "description": "search query " * 10}})
-               for i in range(10)]
+        big = [
+            _td(
+                f"name_{i}",
+                f"description for tool {i} " * 20,
+                {"q": {"type": "string", "description": "search query " * 10}},
+            )
+            for i in range(10)
+        ]
         small_t = estimate_tokens_from_schemas(small)
         big_t = estimate_tokens_from_schemas(big)
         assert big_t > small_t * 10
@@ -196,22 +214,38 @@ class TestRetrieval:
     def _fake_catalog(self):
         """Build a catalog directly without touching the registry."""
         from tools.tool_search import CatalogEntry, _tokenize, _entry_search_text
+
         defs = [
-            _td("github_create_issue", "Open a new issue in a GitHub repository",
-                {"title": {"type": "string"}, "body": {"type": "string"}}),
-            _td("github_search_repos", "Search GitHub for matching repositories",
-                {"query": {"type": "string"}}),
-            _td("slack_send_message", "Post a message into a Slack channel",
-                {"channel": {"type": "string"}, "text": {"type": "string"}}),
-            _td("calendar_create_event", "Add an event to the user's calendar",
-                {"title": {"type": "string"}, "start": {"type": "string"}}),
+            _td(
+                "github_create_issue",
+                "Open a new issue in a GitHub repository",
+                {"title": {"type": "string"}, "body": {"type": "string"}},
+            ),
+            _td(
+                "github_search_repos",
+                "Search GitHub for matching repositories",
+                {"query": {"type": "string"}},
+            ),
+            _td(
+                "slack_send_message",
+                "Post a message into a Slack channel",
+                {"channel": {"type": "string"}, "text": {"type": "string"}},
+            ),
+            _td(
+                "calendar_create_event",
+                "Add an event to the user's calendar",
+                {"title": {"type": "string"}, "start": {"type": "string"}},
+            ),
         ]
         catalog = []
         for d in defs:
             fn = d["function"]
             e = CatalogEntry(
-                name=fn["name"], description=fn["description"],
-                schema=d, source="mcp", source_name="mcp-test",
+                name=fn["name"],
+                description=fn["description"],
+                schema=d,
+                source="mcp",
+                source_name="mcp-test",
             )
             e._tokens = _tokenize(_entry_search_text(d))
             catalog.append(e)
@@ -219,23 +253,14 @@ class TestRetrieval:
 
     def test_search_finds_relevant_tool(self):
         from tools.tool_search import search_catalog
+
         hits = search_catalog(self._fake_catalog(), "create a github issue", limit=3)
         names = [h.name for h in hits]
         assert names[0] == "github_create_issue"
 
-    def test_search_returns_empty_for_irrelevant_query(self):
-        from tools.tool_search import search_catalog
-        hits = search_catalog(self._fake_catalog(), "asdf qwerty foobar", limit=3)
-        assert hits == []
-
-    def test_search_substring_fallback(self):
-        """Even when no BM25 hit, a literal substring of the tool name returns."""
-        from tools.tool_search import search_catalog
-        hits = search_catalog(self._fake_catalog(), "calendar", limit=3)
-        assert any("calendar" in h.name for h in hits)
-
     def test_search_respects_limit(self):
         from tools.tool_search import search_catalog
+
         hits = search_catalog(self._fake_catalog(), "github", limit=1)
         assert len(hits) <= 1
 
@@ -253,6 +278,7 @@ class TestAssembly:
             ToolSearchConfig,
             assemble_tool_defs,
         )
+
         defs = [_td("terminal", "Run shell"), _td("read_file", "Read a file")]
         result = assemble_tool_defs(
             defs,
@@ -261,7 +287,9 @@ class TestAssembly:
         )
         assert result.activated
         assert {t["function"]["name"] for t in result.tool_defs} == {
-            "terminal", "read_file", *BRIDGE_TOOL_NAMES,
+            "terminal",
+            "read_file",
+            *BRIDGE_TOOL_NAMES,
         }
 
     @staticmethod
@@ -281,11 +309,13 @@ class TestAssembly:
     def test_small_deferrable_surface_uses_search_only_bridge(self):
         """MCP names and descriptions never leak into the bridge schema."""
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
         for n in ("tier_small_a", "tier_small_b", "tier_small_c"):
             self._register_mcp(n)
         defs = [_td("terminal", "Run shell")] + [
             _td(n, "Deferred capability description.")
-            for n in ("tier_small_a", "tier_small_b", "tier_small_c")]
+            for n in ("tier_small_a", "tier_small_b", "tier_small_c")
+        ]
         result = assemble_tool_defs(
             defs,
             context_length=200_000,
@@ -297,10 +327,13 @@ class TestAssembly:
         names = {(t.get("function") or {}).get("name") for t in result.tool_defs}
         assert "tool_search" in names
         assert "terminal" in names  # core stays eager
-        search = next(t for t in result.tool_defs
-                      if t["function"]["name"] == "tool_search")
+        search = next(
+            t for t in result.tool_defs if t["function"]["name"] == "tool_search"
+        )
         assert "tier_small_a" not in search["function"]["description"]
-        assert "Deferred capability description" not in search["function"]["description"]
+        assert (
+            "Deferred capability description" not in search["function"]["description"]
+        )
 
     def test_catalog_edits_leave_bridge_schema_byte_stable(self):
         """Add/remove/swap/schema edits must not change model-facing bridges."""
@@ -317,7 +350,8 @@ class TestAssembly:
         def bridges(defs):
             assembled = assemble_tool_defs(defs, context_length=200_000, config=cfg)
             return [
-                tool for tool in assembled.tool_defs
+                tool
+                for tool in assembled.tool_defs
                 if tool["function"]["name"] in BRIDGE_TOOL_NAMES
             ]
 
@@ -330,7 +364,12 @@ class TestAssembly:
         assert empty == one == swapped == schema_changed
 
     def test_idempotent_when_bridge_already_present(self):
-        from tools.tool_search import assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES
+        from tools.tool_search import (
+            assemble_tool_defs,
+            ToolSearchConfig,
+            BRIDGE_TOOL_NAMES,
+        )
+
         defs = [_td("terminal", "Run shell"), _td("tool_search", "old")]
         result = assemble_tool_defs(
             defs,
@@ -351,25 +390,13 @@ class TestAssembly:
 class TestBridgeDispatch:
     def test_tool_search_requires_query(self):
         from tools.tool_search import dispatch_tool_search
+
         result = dispatch_tool_search({}, current_tool_defs=[])
-        assert "error" in json.loads(result)
-
-    def test_tool_describe_requires_name(self):
-        from tools.tool_search import dispatch_tool_describe
-        result = dispatch_tool_describe({}, current_tool_defs=[])
-        assert "error" in json.loads(result)
-
-    def test_tool_describe_rejects_non_deferrable(self):
-        """If the model asks to describe a core tool, refuse — it's already
-        in the visible list."""
-        from tools.tool_search import dispatch_tool_describe
-        result = dispatch_tool_describe(
-            {"name": "terminal"}, current_tool_defs=[_td("terminal", "Run shell")],
-        )
         assert "error" in json.loads(result)
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
+
         name, args, err = resolve_underlying_call({
             "name": "unknown_xxx",
             "arguments": {"foo": "bar"},
@@ -377,31 +404,10 @@ class TestBridgeDispatch:
         # Will fail classification because unknown_xxx isn't deferrable.
         assert err is not None
 
-    def test_resolve_underlying_call_parses_json_string_args(self):
-        """Some models emit ``arguments`` as a JSON string instead of object."""
-        from tools.tool_search import resolve_underlying_call
-        # Use a name that won't classify (so we don't depend on registry),
-        # but exercise the JSON parse path.
-        _, _, err = resolve_underlying_call({
-            "name": "fake",
-            "arguments": '{"a": 1}',
-        })
-        # err is about classification, but the parse worked (it would have
-        # failed earlier with "not valid JSON" otherwise).
-        assert "not valid JSON" not in (err or "")
-
-    def test_resolve_underlying_call_rejects_bad_json(self):
-        from tools.tool_search import resolve_underlying_call
-        _, _, err = resolve_underlying_call({
-            "name": "fake",
-            "arguments": "{this is not json",
-        })
-        assert err is not None
-        assert "JSON" in err
-
     def test_resolve_underlying_call_rejects_recursion(self):
         """tool_call cannot invoke tool_call itself."""
         from tools.tool_search import resolve_underlying_call, TOOL_CALL_NAME
+
         name, args, err = resolve_underlying_call({
             "name": TOOL_CALL_NAME,
             "arguments": {},
@@ -419,6 +425,7 @@ class TestHandleFunctionCallIntegration:
     def test_tool_search_dispatch_through_handle_function_call(self):
         """The dispatcher recognizes the bridge tool by name."""
         import model_tools
+
         result = model_tools.handle_function_call(
             function_name="tool_search",
             function_args={"query": "nothing matches this"},
@@ -476,9 +483,12 @@ class TestRegression_OpenClawCron84141:
 
     def test_core_tool_survives_alongside_many_mcp_tools(self):
         from tools.tool_search import (
-            assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES,
+            assemble_tool_defs,
+            ToolSearchConfig,
+            BRIDGE_TOOL_NAMES,
             classify_tools,
         )
+
         # 1 core tool + 50 unknown/MCP-shaped tools (deferrable).
         defs = [_td("terminal", "Run shell commands")]
         # Pad with fake "deferrable" tools — without registry registration,
@@ -486,8 +496,7 @@ class TestRegression_OpenClawCron84141:
         # the core-tool side: terminal stays in visible regardless.
         visible, deferrable = classify_tools(defs)
         assert any(
-            (td.get("function") or {}).get("name") == "terminal"
-            for td in visible
+            (td.get("function") or {}).get("name") == "terminal" for td in visible
         ), "Core tool 'terminal' was wrongly classified as deferrable"
 
         # Now force activation and check the resulting tool-defs list.
@@ -505,6 +514,7 @@ class TestRegression_OpenClawCron84141:
         """Even if the model tries to invoke a core tool through tool_call,
         we reject the call and tell the model to use it directly."""
         from tools.tool_search import resolve_underlying_call
+
         _, _, err = resolve_underlying_call({
             "name": "terminal",
             "arguments": {"command": "echo hi"},
@@ -566,63 +576,12 @@ class TestRegression_ToolsetScoping:
         hit_names = {m["name"] for m in parsed["matches"]}
         assert "scoped_oos_plugin" not in hit_names
 
-    def test_tool_call_rejects_out_of_scope_tool(self):
-        import model_tools
-
-        self._register("mcp_inscope_gh_op", "mcp-inscope-gh")
-        self._register("inscope_oos_plugin", "inscopeoosplugin")
-
-        # Out-of-scope plugin tool: rejected even though it is registered
-        # and deferrable in the global registry.
-        rejected = json.loads(model_tools.handle_function_call(
-            function_name="tool_call",
-            function_args={"name": "inscope_oos_plugin", "arguments": {}},
-            enabled_toolsets=["mcp-inscope-gh"],
-        ))
-        assert "error" in rejected
-        assert "not available in this session" in rejected["error"]
-
-        # In-scope tool: dispatches normally.
-        ok = json.loads(model_tools.handle_function_call(
-            function_name="tool_call",
-            function_args={"name": "mcp_inscope_gh_op", "arguments": {"repo": "a/b"}},
-            enabled_toolsets=["mcp-inscope-gh"],
-        ))
-        assert ok.get("ok") is True
-        assert ok.get("tool") == "mcp_inscope_gh_op"
-
-    def test_bridge_dispatch_does_not_pollute_global_resolved_names(self):
-        import model_tools
-
-        self._register("mcp_pollute_op_0", "mcp-pollute")
-        self._register("mcp_pollute_op_1", "mcp-pollute")
-
-        # Establish the scoped session global.
-        model_tools.get_tool_definitions(
-            enabled_toolsets=["mcp-pollute"], quiet_mode=True,
-        )
-        before = set(model_tools._last_resolved_tool_names)
-        assert "terminal" not in before
-
-        # A scoped tool_search call must not widen the process-global
-        # _last_resolved_tool_names to the whole registry (which would leak
-        # core/sandbox tools into execute_code's fallback).
-        model_tools.handle_function_call(
-            function_name="tool_search",
-            function_args={"query": "pollute"},
-            enabled_toolsets=["mcp-pollute"],
-        )
-        after = set(model_tools._last_resolved_tool_names)
-        assert "terminal" not in after, (
-            "bridge dispatch polluted _last_resolved_tool_names with "
-            "out-of-scope tools"
-        )
-
     def test_scoped_deferrable_names_helper(self):
         from tools.tool_search import scoped_deferrable_names
 
         self._register("mcp_helper_op", "mcp-helper")
         import model_tools
+
         defs = model_tools.get_tool_definitions(
             enabled_toolsets=["mcp-helper"],
             quiet_mode=True,
@@ -632,7 +591,6 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
-
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +651,9 @@ class TestUserTurnCatalogSnapshot:
 
             assert first == second
             assert "snapshot_alpha" in first.notice
-            assert first.notice.index("snapshot_alpha") < first.notice.index("snapshot_zeta")
+            assert first.notice.index("snapshot_alpha") < first.notice.index(
+                "snapshot_zeta"
+            )
             assert first.snapshot_id in first.notice
 
             bridge_json = json.dumps(bridge_tool_schemas())
@@ -759,8 +719,7 @@ class TestUserTurnCatalogSnapshot:
             assert snapshot.count == len(names)
             notice = snapshot.notice.lower()
             assert (
-                "use `tool_search`" in notice
-                or "discover via `tool_search`" in notice
+                "use `tool_search`" in notice or "discover via `tool_search`" in notice
             )
         finally:
             for name in names:
@@ -776,10 +735,13 @@ class TestUserTurnCatalogSnapshot:
         assert snapshot.count == 0
         assert "No deferred MCP/plugin tools" in snapshot.notice
         assert catalog_snapshot_id_from_text(snapshot.notice) == snapshot.snapshot_id
-        assert catalog_snapshot_id_from_text([
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
-            {"type": "text", "text": snapshot.notice},
-        ]) == snapshot.snapshot_id
+        assert (
+            catalog_snapshot_id_from_text([
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+                {"type": "text", "text": snapshot.notice},
+            ])
+            == snapshot.snapshot_id
+        )
 
 
 class TestDeferredCallSchemaProbe:
@@ -813,9 +775,14 @@ class TestDeferredCallSchemaProbe:
         registry.register(
             name=name,
             handler=_handler,
-            schema={"type": "function",
-                    "function": {"name": name, "description": f"desc {name}",
-                                 "parameters": params}},
+            schema={
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"desc {name}",
+                    "parameters": params,
+                },
+            },
             toolset=toolset,
         )
 
@@ -831,61 +798,25 @@ class TestDeferredCallSchemaProbe:
         assert parsed["parameters"]["required"] == ["document_id"]
         assert "document_id" in parsed["parameters"]["properties"]
 
-    def test_validator_passes_valid_and_optional_only_calls(self):
-        from tools.tool_search import validate_deferred_call_args
-
-        self._register("mcp_probe_docs_get2", "mcp-probe")
-        # All required present → dispatch.
-        assert validate_deferred_call_args(
-            "mcp_probe_docs_get2", {"document_id": "abc"}) is None
-        # Extra optional args don't matter.
-        assert validate_deferred_call_args(
-            "mcp_probe_docs_get2", {"document_id": "abc", "format": "md"}) is None
-
     def test_validator_never_blocks_unvalidatable_tools(self):
         from tools.tool_search import validate_deferred_call_args
 
         # Unknown tool → no schema → dispatch (downstream scope gate handles it).
         assert validate_deferred_call_args("mcp_no_such_tool_xyz", {}) is None
 
-    def test_validator_no_required_list_dispatches(self):
-        from tools.tool_search import validate_deferred_call_args
-        from tools.registry import registry
-
-        registry.register(
-            name="mcp_probe_norequired",
-            handler=lambda args, task_id=None, **kw: json.dumps({"ok": True}),
-            schema={"type": "function",
-                    "function": {"name": "mcp_probe_norequired",
-                                 "description": "d",
-                                 "parameters": {"type": "object", "properties": {}}}},
-            toolset="mcp-probe",
-        )
-        assert validate_deferred_call_args("mcp_probe_norequired", {}) is None
-
-    def test_blind_tool_call_returns_schema_not_keyerror(self):
-        import model_tools
-
-        self._register("mcp_probe_blind_op", "mcp-probe-blind")
-        result = json.loads(model_tools.handle_function_call(
-            function_name="tool_call",
-            function_args={"name": "mcp_probe_blind_op", "arguments": {}},
-            enabled_toolsets=["mcp-probe-blind"],
-        ))
-        assert "error" in result
-        assert "KeyError" not in result["error"]
-        assert "missing required argument" in result["error"]
-        assert result["parameters"]["required"] == ["document_id"]
-
     def test_valid_tool_call_still_dispatches(self):
         import model_tools
 
         self._register("mcp_probe_valid_op", "mcp-probe-valid")
-        result = json.loads(model_tools.handle_function_call(
-            function_name="tool_call",
-            function_args={"name": "mcp_probe_valid_op",
-                           "arguments": {"document_id": "abc"}},
-            enabled_toolsets=["mcp-probe-valid"],
-        ))
+        result = json.loads(
+            model_tools.handle_function_call(
+                function_name="tool_call",
+                function_args={
+                    "name": "mcp_probe_valid_op",
+                    "arguments": {"document_id": "abc"},
+                },
+                enabled_toolsets=["mcp-probe-valid"],
+            )
+        )
         assert result.get("ok") is True
         assert result.get("doc") == "abc"

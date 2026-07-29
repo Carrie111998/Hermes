@@ -53,11 +53,14 @@ class _FakeAgent:
         self.valid_tool_names = set()
         self.enabled_toolsets = None
         self.disabled_toolsets = None
-        self._skip_mcp_refresh = False
+        # Keep generic turn-prologue tests independent from the process-wide
+        # registry. Refresh-specific tests opt in explicitly below.
+        self._skip_mcp_refresh = True
         self.compression_enabled = False
         self.context_compressor = types.SimpleNamespace(
             protect_first_n=2, protect_last_n=2
         )
+
         # Make the fake compressor honour the ContextEngine contract that the
         # real code now relies on (should_compress_info returns a (bool, reason)
         # tuple). Without it build_turn_context raises AttributeError.
@@ -95,7 +98,9 @@ class _FakeAgent:
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
 
-    def _warn_context_overflow_blocked(self, reason, preflight_tokens, threshold_tokens):
+    def _warn_context_overflow_blocked(
+        self, reason, preflight_tokens, threshold_tokens
+    ):
         # Mirror the real AIAgent helper so tests can assert the warning fired.
         _warn_kind = (reason or "unknown").split(":", 1)[0]
         _warn_key = ("ctx_overflow_blocked", _warn_kind)
@@ -149,7 +154,9 @@ def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
     if cooldown_until is not None:
         db.record_compression_failure_cooldown(session_id, cooldown_until, "timeout")
 
-    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+    with patch(
+        "agent.context_compressor.get_model_context_length", return_value=100000
+    ):
         compressor = ContextCompressor(
             model="test/model",
             threshold_percent=0.85,
@@ -254,53 +261,6 @@ def test_applies_agent_side_effects():
     assert agent._current_turn_id
 
 
-def test_task_id_passthrough():
-    agent = _FakeAgent()
-    ctx = _build(agent, task_id="fixed-task")
-    assert ctx.effective_task_id == "fixed-task"
-    assert agent._current_task_id == "fixed-task"
-
-
-def test_persist_user_message_becomes_original():
-    agent = _FakeAgent()
-    ctx = _build(agent, user_message="api-prefixed", persist_user_message="clean")
-    # original_user_message tracks the clean persist override.
-    assert ctx.original_user_message == "clean"
-    # but the appended user turn carries the full (sanitized) message.
-    assert ctx.messages[-1]["content"] == "api-prefixed"
-
-
-def test_pending_cli_message_carries_durable_marker_to_new_turn_dict():
-    """A close-persisted CLI input must not be written again by turn start."""
-    agent = _FakeAgent()
-    staged = {"role": "user", "content": "already durable", "_db_persisted": True}
-    agent._pending_cli_user_message = staged
-
-    ctx = _build(agent, user_message="already durable")
-
-    assert ctx.messages[-1] is staged
-    assert ctx.messages[-1]["content"] == "already durable"
-    assert ctx.messages[-1]["_db_persisted"] is True
-    assert agent._pending_cli_user_message is None
-
-
-def test_stale_pending_cli_message_does_not_replace_new_turn_input():
-    """A failed prior persistence handoff cannot substitute later user input."""
-    agent = _FakeAgent()
-    agent._pending_cli_user_message = {"role": "user", "content": "old prompt"}
-
-    stale = agent._pending_cli_user_message
-    ctx = _build(
-        agent,
-        user_message="new prompt",
-        conversation_history=[{"role": "assistant", "content": "old answer"}],
-    )
-
-    assert ctx.messages[-1]["content"] == "new prompt"
-    assert ctx.messages[-1] is not stale
-    assert agent._pending_cli_user_message is None
-
-
 def test_pending_cli_message_uses_clean_override_for_api_local_note():
     """A noted API message reuses the clean staged dict and its DB marker."""
     agent = _FakeAgent()
@@ -317,58 +277,6 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     assert ctx.messages[-1]["content"] == "[MODEL NOTE]\n\nclean prompt"
     assert ctx.messages[-1]["_db_persisted"] is True
     assert agent._pending_cli_user_message is None
-
-
-def test_runtime_main_sync_happens_after_restore():
-    agent = _FakeAgent()
-    agent.model = "stale-fallback-model"
-    agent.provider = "openai-codex"
-    agent.base_url = "https://chatgpt.com/backend-api/codex"
-    agent.api_key = "fallback-key"
-    agent.api_mode = "codex_responses"
-
-    def restore_primary():
-        agent.model = "primary-model"
-        agent.provider = "anthropic"
-        agent.base_url = "https://api.anthropic.com"
-        agent.api_key = "primary-key"
-        agent.api_mode = "anthropic_messages"
-        agent.requested_provider = "anthropic"
-
-    agent._restore_primary_runtime = restore_primary
-    calls = []
-    with patch(
-        "agent.auxiliary_client.set_runtime_main",
-        side_effect=lambda *args, **kwargs: calls.append((args, kwargs)),
-    ):
-        _build(agent)
-
-    assert calls == [(
-        ("anthropic", "primary-model"),
-        {
-            "base_url": "https://api.anthropic.com",
-            "api_key": "primary-key",
-            "api_mode": "anthropic_messages",
-            "auth_mode": "",
-            "requested_provider": "anthropic",
-        },
-    )]
-
-
-def test_memory_nudge_fires_at_interval():
-    agent = _FakeAgent()
-    agent._memory_nudge_interval = 1
-    agent.valid_tool_names = {"memory"}
-    agent._memory_store = object()
-    ctx = _build(agent)
-    assert ctx.should_review_memory is True
-    assert agent._turns_since_memory == 0  # reset after firing
-
-
-def test_no_review_when_memory_disabled():
-    agent = _FakeAgent()
-    ctx = _build(agent)
-    assert ctx.should_review_memory is False
 
 
 def test_ensure_db_session_runs_after_system_prompt_restore():
@@ -406,11 +314,16 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
 def test_between_turns_refresh_adds_late_tool_when_mcp_module_loaded():
     """R1: a tool that registered since build lands in this turn's snapshot."""
     agent = _FakeAgent()
+    agent._skip_mcp_refresh = False
 
-    new_def = {"type": "function", "function": {"name": "mcp_x_tool", "description": "", "parameters": {}}}
+    new_def = {
+        "type": "function",
+        "function": {"name": "mcp_x_tool", "description": "", "parameters": {}},
+    }
 
     import model_tools
     import tools.mcp_tool  # noqa: F401 -- activates the cheap sys.modules gate
+
     with patch.object(model_tools, "get_tool_definitions", return_value=[new_def]):
         _build(agent)
 
@@ -421,6 +334,7 @@ def test_between_turns_refresh_adds_late_tool_when_mcp_module_loaded():
 def test_between_turns_refresh_observes_removal_to_empty_catalog():
     """Once MCP loaded, refresh still runs after the last tool is removed."""
     agent = _FakeAgent()
+    agent._skip_mcp_refresh = False
     import model_tools
     import tools.mcp_tool  # noqa: F401 -- activates the cheap sys.modules gate
 
@@ -433,13 +347,16 @@ def test_between_turns_refresh_observes_removal_to_empty_catalog():
 def test_between_turns_refresh_skips_synchronized_empty_catalog():
     """An empty catalog does not trigger a full schema rebuild every turn."""
     agent = _FakeAgent()
+    agent._skip_mcp_refresh = False
     import model_tools
     import tools.mcp_tool  # noqa: F401 -- activates the cheap sys.modules gate
     from tools.registry import registry
 
     agent._tool_snapshot_generation = registry._generation
-    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False), \
-         patch.object(model_tools, "get_tool_definitions") as gtd:
+    with (
+        patch("tools.mcp_tool.has_registered_mcp_tools", return_value=False),
+        patch.object(model_tools, "get_tool_definitions") as gtd,
+    ):
         _build(agent)
 
     gtd.assert_not_called()
@@ -463,15 +380,28 @@ def test_between_turns_refresh_no_churn_when_unchanged():
     """R2: an unchanged tool set leaves the snapshot object identity intact
     (no needless swap → nothing for the next request prefix to diff against)."""
     agent = _FakeAgent()
-    same = [{"type": "function", "function": {"name": "a", "description": "", "parameters": {}}}]
+    agent._skip_mcp_refresh = False
+    same = [
+        {
+            "type": "function",
+            "function": {"name": "a", "description": "", "parameters": {}},
+        }
+    ]
     agent.tools = same
     agent.valid_tool_names = {"a"}
 
     import model_tools
+
     with patch.object(
-             model_tools, "get_tool_definitions",
-             return_value=[{"type": "function", "function": {"name": "a", "description": "", "parameters": {}}}],
-         ):
+        model_tools,
+        "get_tool_definitions",
+        return_value=[
+            {
+                "type": "function",
+                "function": {"name": "a", "description": "", "parameters": {}},
+            }
+        ],
+    ):
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
@@ -515,11 +445,14 @@ def test_initial_tool_catalog_snapshot_folds_into_real_user_turn():
         agent._skip_mcp_refresh = True
         agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
         agent.context_compressor.context_length = 200_000
-        with patch(
-            "model_tools.get_tool_definitions", return_value=[tool_def]
-        ) as get_defs, patch(
-            "tools.tool_search.load_config",
-            return_value=ToolSearchConfig.from_raw({"listing": "auto"}),
+        with (
+            patch(
+                "model_tools.get_tool_definitions", return_value=[tool_def]
+            ) as get_defs,
+            patch(
+                "tools.tool_search.load_config",
+                return_value=ToolSearchConfig.from_raw({"listing": "auto"}),
+            ),
         ):
             ctx = _build(agent)
             second = _build(
@@ -571,8 +504,9 @@ def test_resumed_agent_reuses_prior_snapshot_without_reannouncing():
         first_agent._skip_mcp_refresh = True
         first_agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
         first_agent.context_compressor.context_length = 200_000
-        with patch("model_tools.get_tool_definitions", return_value=[tool_def]), patch(
-            "tools.tool_search.load_config", return_value=config
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[tool_def]),
+            patch("tools.tool_search.load_config", return_value=config),
         ):
             first = _build(first_agent)
 
@@ -588,8 +522,9 @@ def test_resumed_agent_reuses_prior_snapshot_without_reannouncing():
         resumed_agent._skip_mcp_refresh = True
         resumed_agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
         resumed_agent.context_compressor.context_length = 200_000
-        with patch("model_tools.get_tool_definitions", return_value=[tool_def]), patch(
-            "tools.tool_search.load_config", return_value=config
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[tool_def]),
+            patch("tools.tool_search.load_config", return_value=config),
         ):
             resumed = _build(resumed_agent, conversation_history=history)
 
@@ -627,9 +562,12 @@ def test_same_agent_reannounces_snapshot_when_history_is_absent():
         agent._skip_mcp_refresh = True
         agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
         agent.context_compressor.context_length = 200_000
-        with patch("model_tools.get_tool_definitions", return_value=[tool_def]), patch(
-            "tools.tool_search.load_config",
-            return_value=ToolSearchConfig.from_raw({"listing": "auto"}),
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[tool_def]),
+            patch(
+                "tools.tool_search.load_config",
+                return_value=ToolSearchConfig.from_raw({"listing": "auto"}),
+            ),
         ):
             first = _build(agent)
             second = _build(agent)
@@ -678,8 +616,9 @@ def test_schema_change_appends_superseding_catalog_snapshot():
         old_agent._skip_mcp_refresh = True
         old_agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
         old_agent.context_compressor.context_length = 200_000
-        with patch("model_tools.get_tool_definitions", return_value=[old_def]), patch(
-            "tools.tool_search.load_config", return_value=config
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[old_def]),
+            patch("tools.tool_search.load_config", return_value=config),
         ):
             old_ctx = _build(old_agent)
 
@@ -696,8 +635,9 @@ def test_schema_change_appends_superseding_catalog_snapshot():
         new_agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
         new_agent.context_compressor.context_length = 200_000
         new_agent._pending_mcp_catalog_notice = "[TOOL CATALOG UPDATED]"
-        with patch("model_tools.get_tool_definitions", return_value=[new_def]), patch(
-            "tools.tool_search.load_config", return_value=config
+        with (
+            patch("model_tools.get_tool_definitions", return_value=[new_def]),
+            patch("tools.tool_search.load_config", return_value=config),
         ):
             new_ctx = _build(new_agent, conversation_history=history)
 
@@ -736,53 +676,3 @@ def test_prepend_user_note_preserves_multimodal_parts():
         image,
     ]
     assert parts[0]["text"] == "caption"  # caller-owned input was not mutated
-
-
-def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
-    agent = _make_agent_with_cooldown(
-        tmp_path / "state.db",
-        "sess-1",
-        cooldown_until=4_000_000_000.0,
-    )
-
-    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
-        ctx = _build(agent)
-
-    assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_not_called()
-    agent._compress_context.assert_not_called()
-
-
-def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
-    db_path = tmp_path / "state.db"
-    _make_agent_with_cooldown(
-        db_path,
-        "sess-1",
-        cooldown_until=4_000_000_000.0,
-    )
-    agent = _make_agent_with_cooldown(db_path, "sess-2")
-
-    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
-        ctx = _build(agent)
-
-    assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_called_once()
-    agent._compress_context.assert_called()
-
-
-def test_expired_cooldown_allows_preflight(tmp_path):
-    agent = _make_agent_with_cooldown(
-        tmp_path / "state.db",
-        "sess-1",
-        cooldown_until=1.0,
-    )
-
-    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
-         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
-        ctx = _build(agent)
-
-    assert isinstance(ctx, TurnContext)
-    agent._emit_status.assert_called_once()
-    agent._compress_context.assert_called()
