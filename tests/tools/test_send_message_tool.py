@@ -1,6 +1,7 @@
 """Tests for tools/send_message_tool.py."""
 
 import asyncio
+import importlib.util
 import json
 import os
 import sys
@@ -11,9 +12,31 @@ import pytest
 
 # python-telegram-bot is an optional dep — skip the entire module when
 # it isn't installed (e.g. CI bare env). Tests that patch telegram.Bot
-# or call _send_telegram need it; tests for other platforms don't but
-# keeping the whole file consistent is simpler.
-_HAS_TELEGRAM = pytest.importorskip("telegram", reason="python-telegram-bot not installed") is not None
+# or call _send_telegram need the ``telegram`` package importable; tests
+# for other platforms don't but keeping the whole file consistent is
+# simpler.
+#
+# Test-isolation guard (do NOT simplify back to a bare importorskip):
+# sibling suites — notably tests/gateway/conftest.py via _ensure_telegram_mock()
+# — install a MagicMock ``telegram`` stub into sys.modules at import time.
+# pytest imports every conftest before it collects any test module, so in a
+# shared-interpreter run (multiple files in one pytest invocation) that stub
+# is already present when this module is collected. A bare
+# ``importorskip("telegram")`` is satisfied by the stub and spuriously
+# un-skips this module, dragging the @pytest.mark.asyncio tests below into
+# environments that have neither the messaging extra (real telegram) nor the
+# dev extra (pytest-asyncio) — where they hard-error with "async def
+# functions are not natively supported". Require a *real* installation (a
+# MagicMock stub has no ``__file__``) so this module's collect/skip decision
+# is deterministic regardless of which other suites loaded first.
+_telegram_mod = pytest.importorskip("telegram", reason="python-telegram-bot not installed")
+if getattr(_telegram_mod, "__file__", None) is None:
+    pytest.skip(
+        "python-telegram-bot not installed (only a test stub is present in "
+        "sys.modules); skipping to keep collection isolated from other suites",
+        allow_module_level=True,
+    )
+_HAS_TELEGRAM = True
 
 
 @pytest.fixture(autouse=True)
@@ -2419,6 +2442,18 @@ class TestSendViaAdapterStandaloneFallback:
     its ``PlatformEntry``.  Without the hook, the existing error string
     is returned (with a more helpful tail).
     """
+
+    # These are the only real ``async def`` tests in this module — every
+    # other coroutine here is driven synchronously via ``asyncio.run``.
+    # They need pytest-asyncio (the ``dev`` extra) to run; without it pytest
+    # errors with "async def functions are not natively supported". Declare
+    # that dependency explicitly so they skip cleanly rather than erroring
+    # when the plugin is absent. With the plugin installed they run and must
+    # pass — this guard does not change their assertions.
+    pytestmark = pytest.mark.skipif(
+        importlib.util.find_spec("pytest_asyncio") is None,
+        reason="requires pytest-asyncio (dev extra) to run @pytest.mark.asyncio tests",
+    )
 
     @staticmethod
     def _make_entry(send_fn):
