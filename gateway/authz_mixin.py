@@ -33,11 +33,19 @@ def _auth_env(name: str, default: str = "") -> str:
     if not name:
         return default
     try:
-        from agent.secret_scope import get_secret
+        from agent.secret_scope import UnscopedSecretError, get_secret
+    except Exception:
+        return (os.getenv(name) or default).strip()
 
+    try:
         val = get_secret(name)
         if val is not None and str(val).strip():
             return str(val).strip()
+    except UnscopedSecretError:
+        # Multiplex mode intentionally rejects unscoped credential reads. Do
+        # not defeat that isolation boundary by falling through to another
+        # profile's process-global environment.
+        return default
     except Exception:
         pass
     return (os.getenv(name) or default).strip()
@@ -58,8 +66,76 @@ def _coerce_allow_set(raw) -> set[str]:
     return {part.strip() for part in str(raw).split(",") if part.strip()}
 
 
+def _telegram_config_authorizes_source(source: SessionSource, extra: object) -> Optional[bool]:
+    """Apply Telegram's config allowlists with their documented scopes.
+
+    ``allow_from`` applies in every chat type; ``group_allow_from`` and
+    ``group_allowed_chats`` only add grants for group-like sources.  Returning
+    ``None`` distinguishes a source with no non-empty applicable config
+    allowlist from a sender that was explicitly rejected by one. Empty lists
+    are common config defaults and contribute neither a grant nor a rejection.
+    """
+    if not isinstance(extra, dict):
+        return None
+
+    user_id = str(source.user_id or "").strip()
+    global_allowed = _coerce_allow_set(extra.get("allow_from"))
+    applicable_allowlists = [global_allowed]
+
+    if source.chat_type in {"group", "forum", "channel"}:
+        group_users = _coerce_allow_set(extra.get("group_allow_from"))
+        group_chats = _coerce_allow_set(extra.get("group_allowed_chats"))
+        applicable_allowlists.extend((group_users, group_chats))
+
+    if not any(applicable_allowlists):
+        return None
+
+    if user_id and ("*" in global_allowed or user_id in global_allowed):
+        return True
+
+    if source.chat_type in {"group", "forum", "channel"}:
+        if user_id and ("*" in group_users or user_id in group_users):
+            return True
+
+        chat_id = str(source.chat_id or "").strip()
+        if chat_id and ("*" in group_chats or chat_id in group_chats):
+            return True
+
+    return False
+
+
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
+
+    def _adapter_intake_authorization_decision(
+        self,
+        source: SessionSource,
+        *,
+        config_authorized: Optional[bool] = None,
+    ) -> Optional[bool]:
+        """Return a scoped early-auth decision, or ``None`` to preserve pairing."""
+        def decide() -> Optional[bool]:
+            if source.platform == Platform.TELEGRAM:
+                keys = (
+                    "TELEGRAM_ALLOWED_USERS",
+                    "TELEGRAM_GROUP_ALLOWED_USERS",
+                    "TELEGRAM_GROUP_ALLOWED_CHATS",
+                    "TELEGRAM_ALLOW_ALL_USERS",
+                    "GATEWAY_ALLOWED_USERS",
+                    "GATEWAY_ALLOW_ALL_USERS",
+                )
+                if config_authorized is None and not any(_auth_env(key) for key in keys):
+                    return None
+            return self._is_user_authorized(source)
+
+        config = getattr(self, "config", None)
+        if getattr(config, "multiplex_profiles", False):
+            from gateway.run import _profile_runtime_scope
+
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return decide()
+        return decide()
 
     def _authorization_adapter(
         self,
@@ -427,7 +503,7 @@ class GatewayAuthorizationMixin:
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
             if chat_allowlist_env:
-                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
+                raw_chat_allowlist = _auth_env(chat_allowlist_env)
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -437,21 +513,22 @@ class GatewayAuthorizationMixin:
                     if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
                         return True
 
-            # Fallback: also check adapter-level config (config.yaml)
-            # for platforms.<platform>.extra.group_allowed_chats.
-            # The Telegram observe-unmentioned mode strips user_id from
-            # triggered group messages (_apply_telegram_group_observe_attribution),
-            # so the env-var-only check above misses config.yaml-configured
-            # allowlists.  Read the live adapter's config.extra as a fallback.
+            # Fallback: also check adapter-level config (config.yaml). The
+            # Telegram observe-unmentioned mode strips user_id from triggered
+            # group messages, so this must happen before the no-user-id guard.
             try:
                 adapter = self._adapter_for_source(source)
                 if adapter is not None:
                     extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
-                    adapter_group_allowed = extra.get("group_allowed_chats")
-                    if adapter_group_allowed:
-                        allowed = _coerce_allow_set(adapter_group_allowed)
-                        if "*" in allowed or source.chat_id in allowed:
+                    if source.platform == Platform.TELEGRAM:
+                        if _telegram_config_authorizes_source(source, extra) is True:
                             return True
+                    else:
+                        adapter_group_allowed = extra.get("group_allowed_chats")
+                        if adapter_group_allowed:
+                            allowed = _coerce_allow_set(adapter_group_allowed)
+                            if "*" in allowed or source.chat_id in allowed:
+                                return True
             except Exception:
                 pass
 
@@ -568,11 +645,24 @@ class GatewayAuthorizationMixin:
         if pairing_store is not None and pairing_store.is_approved(platform_name, user_id):
             return True
 
+        # Telegram config allowlists are grants in the same union as pairing
+        # and environment allowlists. Evaluate them before the env-only branch
+        # so mixed YAML/environment configurations cannot hide a config grant.
+        if source.platform == Platform.TELEGRAM:
+            try:
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+                    if _telegram_config_authorizes_source(source, extra) is True:
+                        return True
+            except Exception:
+                pass
+
         # Check platform-specific and global allowlists
         platform_allowlist = _auth_env(platform_env_map.get(source.platform, ""))
         group_user_allowlist = ""
         group_chat_allowlist = ""
-        if source.chat_type in {"group", "forum"}:
+        if source.chat_type in {"group", "forum", "channel"}:
             group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
             group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
@@ -623,28 +713,33 @@ class GatewayAuthorizationMixin:
                     )
                 if effective_policy == "allowlist":
                     return True
-            # Some adapters (e.g. Telegram) gate access via config.extra.allow_from /
-            # group_allow_from at intake but do not override enforces_own_access_policy.
-            # Check their allowlist here so config.yaml-configured allow_from works
-            # without requiring a separate {PLATFORM}_ALLOWED_USERS env var.
-            adapter = self._adapter_for_source(source)
-            if adapter is not None:
-                extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
-                if source.chat_type in {"group", "forum", "channel"}:
-                    adapter_allow = extra.get("group_allow_from")
-                else:
-                    adapter_allow = extra.get("allow_from")
-                if adapter_allow:
-                    allowed = _coerce_allow_set(adapter_allow)
-                    if user_id in allowed or "*" in allowed:
-                        return True
+            # Some adapters (e.g. Telegram) gate access via config allowlists
+            # at intake but do not override enforces_own_access_policy. Keep
+            # the global and group-scoped Telegram grants as an OR-union here
+            # so the runner agrees with the intake gate for config-only setups.
+            if source.platform != Platform.TELEGRAM:
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+                    if source.chat_type in {"group", "forum", "channel"}:
+                        adapter_allow = extra.get("group_allow_from")
+                    else:
+                        adapter_allow = extra.get("allow_from")
+                    if adapter_allow:
+                        allowed = _coerce_allow_set(adapter_allow)
+                        if user_id in allowed or "*" in allowed:
+                            return True
             # No allowlists configured -- check global allow-all flag
             return _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
-        # the sender user ID for group/forum messages.
-        if group_chat_allowlist and source.chat_type in {"group", "forum"} and source.chat_id:
+        # the sender user ID for group/forum/channel messages.
+        if (
+            group_chat_allowlist
+            and source.chat_type in {"group", "forum", "channel"}
+            and source.chat_id
+        ):
             allowed_group_ids = {
                 chat_id.strip() for chat_id in group_chat_allowlist.split(",") if chat_id.strip()
             }
@@ -660,7 +755,7 @@ class GatewayAuthorizationMixin:
         if (
             source.platform == Platform.TELEGRAM
             and group_user_allowlist
-            and source.chat_type in {"group", "forum"}
+            and source.chat_type in {"group", "forum", "channel"}
             and source.chat_id
         ):
             legacy_chat_ids = {
@@ -681,7 +776,7 @@ class GatewayAuthorizationMixin:
                 if source.chat_id in legacy_chat_ids:
                     return True
 
-        # Check if user is in any allowlist. In group/forum chats,
+        # Check if user is in any allowlist. In group/forum/channel chats,
         # TELEGRAM_GROUP_ALLOWED_USERS is the scoped allowlist and should not
         # imply DM access; TELEGRAM_ALLOWED_USERS remains the platform-wide
         # allowlist and still works everywhere for backward compatibility.
