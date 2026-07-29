@@ -272,6 +272,12 @@ def _jobs_lock():
     Nested calls in the same thread reuse the held lock so legacy callers that
     invoke save_jobs() inside a broader mutation section don't deadlock or try
     to reacquire the advisory file lock.
+
+    Also what makes claim_dispatch()'s pre-run commit and the discard sites'
+    retirement (#73973) safe against a concurrent tick: both read-modify-write
+    the same job record under this lock, so a second process can't read a
+    stale ``repeat.completed`` and race a duplicate claim or a duplicate
+    retirement in.
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
@@ -1020,7 +1026,15 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage. Caller must hold _jobs_lock()."""
+    """Save all jobs to storage. Caller must hold _jobs_lock().
+
+    Writes to a temp file, fsyncs it, then ``atomic_replace``s it over
+    ``jobs_file`` (rename is atomic on both POSIX and Windows) so a reader
+    never observes a partially-written or truncated store. This is what
+    makes ``_retire_unconfirmed_oneshot_dispatch`` (#73973) trustworthy: the
+    retirement write itself can't be torn or lost mid-write the same way the
+    old delete-on-discard path silently lost the job record.
+    """
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged
