@@ -99,6 +99,7 @@ _MATCHING_PREFIX_STRIP_PROVIDERS: frozenset[str] = frozenset({
     "minimax-oauth",
     "minimax-cn",
     "alibaba",
+    "alibaba-coding-plan-cn",
     "qwen-oauth",
     "xiaomi",
     "arcee",

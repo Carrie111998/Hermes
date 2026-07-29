@@ -333,6 +333,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("ALIBABA_CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"),
         base_url_env_var="ALIBABA_CODING_PLAN_BASE_URL",
     ),
+    "alibaba-coding-plan-cn": ProviderConfig(
+        id="alibaba-coding-plan-cn",
+        name="Alibaba Cloud (Coding Plan CN)",
+        auth_type="api_key",
+        inference_base_url="https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        api_key_env_vars=("ALIBABA_CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"),
+        base_url_env_var="ALIBABA_CODING_PLAN_CN_BASE_URL",
+    ),
     "minimax-cn": ProviderConfig(
         id="minimax-cn",
         name="MiniMax (China)",
@@ -1885,6 +1893,8 @@ def resolve_provider(
         "minimax-portal": "minimax-oauth", "minimax-global": "minimax-oauth", "minimax_oauth": "minimax-oauth",
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
         "alibaba_coding_plan": "alibaba-coding-plan",
+        "alibaba_coding_plan_cn": "alibaba-coding-plan-cn",
+        "alibaba-coding-plan-cn": "alibaba-coding-plan-cn",
         "claude": "anthropic", "claude-code": "anthropic",
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",

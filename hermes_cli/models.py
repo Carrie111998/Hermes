@@ -523,6 +523,19 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "glm-4.7",
         "MiniMax-M2.5",
     ],
+    # Alibaba Coding Plan CN — China domestic endpoint (token-plan.cn-beijing.maas.aliyuncs.com).
+    "alibaba-coding-plan-cn": [
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+        "qwen3.5-plus",
+        "qwen3-max-2026-01-23",
+        "qwen3-coder-plus",
+        "qwen3-coder-next",
+        "kimi-k2.5",
+        "glm-5",
+        "glm-4.7",
+        "MiniMax-M2.5",
+    ],
     # Curated HF model list — only agentic models that map to OpenRouter defaults.
     "huggingface": [
         "moonshotai/Kimi-K2.5",
@@ -1085,6 +1098,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("openai-codex",   "OpenAI Codex",             "OpenAI Codex (Codex CLI via ChatGPT subscription or API key)"),
     ProviderEntry("openai-api",     "OpenAI API",               "OpenAI API (api.openai.com, API key)"),
     ProviderEntry("alibaba",        "Qwen Cloud",               "Qwen Cloud / DashScope (Qwen + multi-provider)"),
+    ProviderEntry("alibaba-coding-plan-cn", "Alibaba Cloud (Coding Plan CN)", "Alibaba Cloud Coding Plan CN (China domestic endpoint)"),
     ProviderEntry("xai-oauth",      "xAI Grok OAuth (SuperGrok / Premium+)", "xAI Grok OAuth (SuperGrok / Premium+ subscription)"),
     ProviderEntry("xiaomi",         "Xiaomi MiMo",              "Xiaomi MiMo (MiMo-V2.5 and V2 models: pro, omni, flash)"),
     ProviderEntry("tencent-tokenhub", "Tencent TokenHub",       "Tencent TokenHub (Hy3 Preview via tokenhub.tencentmaas.com)"),
@@ -1166,7 +1180,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
     "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
     "openai":   ("OpenAI",          "Codex CLI or direct OpenAI API",                  ["openai-codex", "openai-api"]),
-    "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
+    "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "alibaba-coding-plan-cn", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription",            ["opencode-zen", "opencode-go"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
 }
@@ -1291,6 +1305,8 @@ _PROVIDER_ALIASES = {
     "aliyun": "alibaba",
     "qwen": "alibaba",
     "alibaba-cloud": "alibaba",
+    "alibaba_coding_plan_cn": "alibaba-coding-plan-cn",
+    "alibaba-coding-plan-cn": "alibaba-coding-plan-cn",
     "qwen-portal": "qwen-oauth",
     "hf": "huggingface",
     "hugging-face": "huggingface",
