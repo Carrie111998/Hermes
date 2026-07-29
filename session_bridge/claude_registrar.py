@@ -471,6 +471,7 @@ class _WinPtyProcess:
         self._reader_thread: threading.Thread | None = None
         self._reader_result: queue.Queue[str | BaseException | None] | None = None
         self._reader_stop = threading.Event()
+        self._prompt_input_buffer = ""
         self._close_lock = threading.Lock()
         self._direct_native_pty = direct_native_pty
         if require_supported_layout:
@@ -502,7 +503,11 @@ class _WinPtyProcess:
     def read_until(self, timeout: float, *, prompt: str | None = None) -> str:
         timed_read = getattr(self._process, "read_with_timeout", None)
         if callable(timed_read):
-            return self._read_until_cancellable(timeout, prompt, timed_read)
+            initial_output = self._prompt_input_buffer
+            self._prompt_input_buffer = ""
+            return self._read_until_cancellable(
+                timeout, prompt, timed_read, initial_output=initial_output
+            )
         if self._reader_thread is not None:
             raise RuntimeError("PTY reader already started")
         result: queue.Queue[str | BaseException | None] = queue.Queue()
@@ -602,9 +607,11 @@ class _WinPtyProcess:
             if remaining <= 0:
                 if candidate_seen:
                     return "".join(chunks)
-                raise _PtyResponseTimeout(
-                    _prompt_input_timeout_reason("".join(chunks), prompt=prompt)
-                )
+                joined = "".join(chunks)
+                reason = _prompt_input_timeout_reason(joined, prompt=prompt)
+                if reason == "terminal_input_disabled":
+                    self._prompt_input_buffer = joined
+                raise _PtyResponseTimeout(reason)
             try:
                 value = timed_read(4096, remaining)
             except (EOFError, StopIteration) as exc:
@@ -750,11 +757,17 @@ class _WinPtyProcess:
         timeout: float,
         prompt: str | None,
         timed_read: Callable[[int, float], str | bytes | None],
+        *,
+        initial_output: str = "",
     ) -> str:
         deadline = time.monotonic() + timeout
-        settle_deadline: float | None = None
-        candidate_seen = False
-        chunks: list[str] = []
+        candidate_seen = _exact_registered_suffix(initial_output) is not None
+        settle_deadline = (
+            time.monotonic() + _RESPONSE_SETTLE_SECONDS
+            if candidate_seen
+            else None
+        )
+        chunks = [initial_output] if initial_output else []
         while True:
             now = time.monotonic()
             wake_at = (
@@ -1087,30 +1100,67 @@ class ClaudeNativeRegistrar:
             else:
                 process.write(_interactive_prompt_frame(prompt))
                 self._sleep(_PROMPT_SUBMIT_DELAY_SECONDS)
-                prompt_input = process.read_until_prompt_input(
-                    min(
-                        _PROMPT_ACCEPTANCE_TIMEOUT_SECONDS,
-                        self._remaining_process_time(deadline),
-                    ),
-                    prompt=prompt,
+                paste_auto_submitted = False
+                try:
+                    prompt_input = process.read_until_prompt_input(
+                        min(
+                            _PROMPT_ACCEPTANCE_TIMEOUT_SECONDS,
+                            self._remaining_process_time(deadline),
+                        ),
+                        prompt=prompt,
+                    )
+                except _PtyResponseTimeout as exc:
+                    if exc.reason != "terminal_input_disabled":
+                        raise
+                    paste_auto_submitted = True
+                    prompt_input = ""
+                prompt_response_observed, prompt_response = (
+                    _prompt_input_registered_response(
+                        prompt_input, prompt=prompt
+                    )
                 )
+                if prompt_response_observed:
+                    paste_auto_submitted = True
                 if _is_authentication_failure(prompt_input):
                     pending = (
                         "claude_authentication_unavailable",
                         "Claude authentication unavailable",
                     )
-                else:
-                    process.write("\r")
-                    output = process.read_until(
-                        self._remaining_process_time(deadline), prompt=prompt
+                elif _is_provider_limit_failure(prompt_input):
+                    pending = (
+                        "creation_ambiguous",
+                        "Claude provider limit interrupted authentication recovery",
                     )
+                else:
+                    if prompt_response_observed:
+                        output = prompt_response or ""
+                    else:
+                        if not paste_auto_submitted:
+                            process.write("\r")
+                        output = process.read_until(
+                            self._remaining_process_time(deadline), prompt=prompt
+                        )
                     if _is_authentication_failure(output):
                         pending = (
                             "claude_authentication_unavailable",
                             "Claude authentication unavailable",
                         )
+                    elif _is_provider_limit_failure(output):
+                        pending = (
+                            "creation_ambiguous",
+                            "Claude provider limit interrupted authentication recovery",
+                        )
                     elif not _has_exact_registered_response(output, prompt):
-                        pending = ("bridge_conflict", "recovery response malformed")
+                        if paste_auto_submitted:
+                            pending = (
+                                "creation_ambiguous",
+                                "recovery result ambiguous",
+                            )
+                        else:
+                            pending = (
+                                "bridge_conflict",
+                                "recovery response malformed",
+                            )
                     else:
                         process.write("/exit\r")
                         exit_code = process.wait(self._exit_timeout)
@@ -1353,13 +1403,27 @@ class ClaudeNativeRegistrar:
             else:
                 process.write(_interactive_prompt_frame(prompt))
                 self._sleep(_PROMPT_SUBMIT_DELAY_SECONDS)
-                prompt_input = process.read_until_prompt_input(
-                    min(
-                        _PROMPT_ACCEPTANCE_TIMEOUT_SECONDS,
-                        self._remaining_process_time(deadline),
-                    ),
-                    prompt=prompt,
+                paste_auto_submitted = False
+                try:
+                    prompt_input = process.read_until_prompt_input(
+                        min(
+                            _PROMPT_ACCEPTANCE_TIMEOUT_SECONDS,
+                            self._remaining_process_time(deadline),
+                        ),
+                        prompt=prompt,
+                    )
+                except _PtyResponseTimeout as exc:
+                    if exc.reason != "terminal_input_disabled":
+                        raise
+                    paste_auto_submitted = True
+                    prompt_input = ""
+                prompt_response_observed, prompt_response = (
+                    _prompt_input_registered_response(
+                        prompt_input, prompt=prompt
+                    )
                 )
+                if prompt_response_observed:
+                    paste_auto_submitted = True
                 if _is_authentication_failure(prompt_input):
                     pending = (
                         "retry",
@@ -1374,10 +1438,14 @@ class ClaudeNativeRegistrar:
                         "Claude provider limit interrupted registration",
                     )
                 else:
-                    process.write("\r")
-                    output = process.read_until(
-                        self._remaining_process_time(deadline), prompt=prompt
-                    )
+                    if prompt_response_observed:
+                        output = prompt_response or ""
+                    else:
+                        if not paste_auto_submitted:
+                            process.write("\r")
+                        output = process.read_until(
+                            self._remaining_process_time(deadline), prompt=prompt
+                        )
                     if _is_authentication_failure(output):
                         pending = (
                             "retry",
@@ -1392,11 +1460,18 @@ class ClaudeNativeRegistrar:
                             "Claude provider limit interrupted registration",
                         )
                     elif not _has_exact_registered_response(output, prompt):
-                        pending = (
-                            "fail",
-                            "bridge_conflict",
-                            "registration response malformed",
-                        )
+                        if paste_auto_submitted:
+                            pending = (
+                                "retry",
+                                "creation_ambiguous",
+                                "registration result ambiguous",
+                            )
+                        else:
+                            pending = (
+                                "fail",
+                                "bridge_conflict",
+                                "registration response malformed",
+                            )
                     else:
                         process.write("/exit\r")
                         exit_code = process.wait(self._exit_timeout)
@@ -1867,6 +1942,17 @@ def _pasted_input_visible(output: str) -> bool:
     )
 
 
+def _pasted_input_indicator(value: str) -> bool:
+    compact = _compact_terminal_text(value).casefold()
+    return (
+        re.fullmatch(
+            r"\[pastedtext#\d+(?:\+\d+lines)?\](?:pasteagaintoexpand)?",
+            compact,
+        )
+        is not None
+    )
+
+
 def _prompt_input_timeout_reason(output: str, *, prompt: str) -> str:
     if _known_claude_input_modal_visible(output):
         return "known_input_modal"
@@ -2046,6 +2132,8 @@ def _normalized_terminal_output(output: str, prompt: str | None) -> str:
     meaningful: list[str] = []
     for raw in cleaned.splitlines():
         line = raw.strip()
+        if _pasted_input_indicator(line):
+            continue
         for prefix in ("Claude>", ">"):
             if line.startswith(prefix):
                 line = line[len(prefix) :].strip()
@@ -2088,6 +2176,18 @@ def _has_exact_registered_response(output: str, prompt: str) -> bool:
         if line:
             meaningful.append(line)
     return meaningful == ["REGISTERED"]
+
+
+def _prompt_input_registered_response(
+    output: str, *, prompt: str
+) -> tuple[bool, str | None]:
+    normalized = _normalized_terminal_output(output, prompt)
+    response_observed = bool(normalized.strip())
+    if not response_observed:
+        return False, None
+    if not output.endswith(("\r", "\n")):
+        return True, None
+    return True, normalized
 
 
 def _exact_registered_suffix(output: str) -> str | None:

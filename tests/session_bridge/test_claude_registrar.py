@@ -441,6 +441,112 @@ def test_launch_waits_for_multiline_paste_before_submitting_return() -> None:
     assert events[3] == ("write", "\r")
 
 
+def test_launch_accepts_exact_response_after_paste_auto_submit() -> None:
+    item = claim()
+    process = FakePty(
+        output="REGISTERED\r\n",
+        prompt_input_error=_PtyResponseTimeout("terminal_input_disabled"),
+    )
+    source = FakeSource([None, projection_for(item)])
+
+    result = registrar(source, FakeFactory(process)).process(item)
+
+    assert result.status == "visible"
+    assert process.writes[0].startswith("\x1b[200~")
+    assert "\r" not in process.writes
+    assert process.writes[-1] == "/exit\r"
+
+
+def test_launch_keeps_auto_submit_without_exact_response_ambiguous() -> None:
+    item = claim()
+    process = FakePty(
+        output="input surface changed\r\n",
+        prompt_input_error=_PtyResponseTimeout("terminal_input_disabled"),
+    )
+    source = FakeSource([None])
+
+    result = registrar(source, FakeFactory(process)).process(item)
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert "\r" not in process.writes
+
+
+@pytest.mark.parametrize(
+    "prompt_input_output",
+    [
+        "[Pasted text #1 +12 lines]\r\nREGISTERED\r\n",
+        (
+            "[Pasted text #1 +12 lines]\r\n"
+            "REGISTERED\r\n"
+            "[Pasted text #1 +12 lines]\r\n"
+        ),
+    ],
+)
+def test_launch_accepts_auto_submitted_response_during_prompt_settle(
+    prompt_input_output: str,
+) -> None:
+    item = claim()
+    process = FakePty(
+        prompt_input_output=prompt_input_output,
+        read_error=_PtyResponseTimeout("no_response_output"),
+    )
+    source = FakeSource([None, projection_for(item)])
+
+    result = registrar(source, FakeFactory(process)).process(item)
+
+    assert result.status == "visible"
+    assert "\r" not in process.writes
+    assert process.writes[-1] == "/exit\r"
+
+
+def test_launch_rejects_substantive_text_before_auto_submitted_response() -> None:
+    item = claim()
+    process = FakePty(
+        prompt_input_output="unexpected text\r\nREGISTERED\r\n",
+        read_error=_PtyResponseTimeout("no_response_output"),
+    )
+    source = FakeSource([None])
+
+    result = registrar(source, FakeFactory(process)).process(item)
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert "\r" not in process.writes
+
+
+def test_launch_keeps_unterminated_auto_submitted_response_ambiguous() -> None:
+    item = claim()
+    process = FakePty(
+        prompt_input_output="[Pasted text #1 +12 lines]\r\nREGISTERED",
+        output=" extra\r\n",
+    )
+    source = FakeSource([None])
+
+    result = registrar(source, FakeFactory(process)).process(item)
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert "\r" not in process.writes
+    assert "/exit\r" not in process.writes
+
+
+def test_launch_never_discards_malformed_auto_submitted_response() -> None:
+    item = claim()
+    process = FakePty(
+        prompt_input_output="NOT REGISTERED\r\n",
+        output="REGISTERED\r\n",
+    )
+    source = FakeSource([None, projection_for(item)])
+
+    result = registrar(source, FakeFactory(process)).process(item)
+
+    assert result.status == "retry"
+    assert result.error_code == "creation_ambiguous"
+    assert "\r" not in process.writes
+    assert "/exit\r" not in process.writes
+
+
 def test_winpty_waits_until_multiline_paste_is_visible_before_submit() -> None:
     class Process:
         def __init__(self) -> None:
@@ -520,6 +626,24 @@ def test_winpty_prompt_input_wait_drains_post_acceptance_redraw() -> None:
     )
 
     assert "late redraw" in observed
+
+
+def test_winpty_hands_auto_submitted_response_to_response_reader() -> None:
+    class Process:
+        def __init__(self) -> None:
+            self.chunks = iter(["REGISTERED\r\n"])
+
+        def read_with_timeout(self, _size: int, _timeout: float) -> str | None:
+            return next(self.chunks, None)
+
+    prompt = "a multiline registration prompt"
+    process = _WinPtyProcess(Process())
+
+    with pytest.raises(_PtyResponseTimeout) as exc_info:
+        process.read_until_prompt_input(0.01, prompt=prompt)
+
+    assert exc_info.value.reason == "terminal_input_disabled"
+    assert process.read_until(1.0, prompt=prompt).strip() == "REGISTERED"
 
 
 @pytest.mark.parametrize(
@@ -737,6 +861,117 @@ def test_auth_recovery_resumes_exact_uuid_interactively_without_create() -> None
         "/exit\r",
     ]
     assert process.ready_trust_acceptances == [True]
+
+
+def test_auth_recovery_accepts_exact_response_after_paste_auto_submit() -> None:
+    item = claim()
+    prompt = "bounded same-UUID authentication recovery prompt"
+    recovery = {
+        "status": "claimed",
+        "job_id": item.job_id,
+        "reserved_claude_uuid": item.reserved_claude_uuid,
+        "lease_digest": "b" * 64,
+        "attempt_ordinal": 4,
+        "operation_id": "6ae1c4de-0000-4000-8000-000000000001",
+        "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+        "source_cwd": item.source_cwd,
+    }
+    process = FakePty(
+        output="REGISTERED\r\n",
+        prompt_input_error=_PtyResponseTimeout("terminal_input_disabled"),
+    )
+
+    outcome = registrar(FakeSource(), FakeFactory(process)).resume_auth_recovery(
+        recovery, prompt
+    )
+
+    assert outcome.status == "recovered"
+    assert "\r" not in process.writes
+    assert process.writes[-1] == "/exit\r"
+
+
+def test_auth_recovery_keeps_auto_submit_without_exact_response_ambiguous() -> None:
+    item = claim()
+    prompt = "bounded same-UUID authentication recovery prompt"
+    recovery = {
+        "status": "claimed",
+        "job_id": item.job_id,
+        "reserved_claude_uuid": item.reserved_claude_uuid,
+        "lease_digest": "b" * 64,
+        "attempt_ordinal": 4,
+        "operation_id": "6ae1c4de-0000-4000-8000-000000000001",
+        "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+        "source_cwd": item.source_cwd,
+    }
+    process = FakePty(
+        output="input surface changed\r\n",
+        prompt_input_error=_PtyResponseTimeout("terminal_input_disabled"),
+    )
+
+    outcome = registrar(FakeSource(), FakeFactory(process)).resume_auth_recovery(
+        recovery, prompt
+    )
+
+    assert outcome.status == "retry"
+    assert outcome.error_code == "creation_ambiguous"
+    assert "\r" not in process.writes
+
+
+@pytest.mark.parametrize("phase", ["prompt_input", "response"])
+def test_auth_recovery_keeps_provider_limit_transient(phase: str) -> None:
+    item = claim()
+    prompt = "bounded same-UUID authentication recovery prompt"
+    recovery = {
+        "status": "claimed",
+        "job_id": item.job_id,
+        "reserved_claude_uuid": item.reserved_claude_uuid,
+        "lease_digest": "b" * 64,
+        "attempt_ordinal": 4,
+        "operation_id": "6ae1c4de-0000-4000-8000-000000000001",
+        "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+        "source_cwd": item.source_cwd,
+    }
+    limited = "You've hit your limit · resets Jul 20, 4am"
+    process = (
+        FakePty(prompt_input_output=limited)
+        if phase == "prompt_input"
+        else FakePty(output=limited)
+    )
+
+    outcome = registrar(FakeSource(), FakeFactory(process)).resume_auth_recovery(
+        recovery, prompt
+    )
+
+    assert outcome.status == "retry"
+    assert outcome.error_code == "creation_ambiguous"
+
+
+def test_auth_recovery_never_discards_malformed_auto_submitted_response() -> None:
+    item = claim()
+    prompt = "bounded same-UUID authentication recovery prompt"
+    recovery = {
+        "status": "claimed",
+        "job_id": item.job_id,
+        "reserved_claude_uuid": item.reserved_claude_uuid,
+        "lease_digest": "b" * 64,
+        "attempt_ordinal": 4,
+        "operation_id": "6ae1c4de-0000-4000-8000-000000000001",
+        "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+        "source_cwd": item.source_cwd,
+    }
+    process = FakePty(
+        prompt_input_output="NOT REGISTERED\r\n",
+        output="REGISTERED\r\n",
+    )
+
+    outcome = registrar(FakeSource(), FakeFactory(process)).resume_auth_recovery(
+        recovery, prompt
+    )
+
+    assert outcome.status == "retry"
+    assert outcome.error_code == "creation_ambiguous"
+    assert "\r" not in process.writes
+    assert "/exit\r" not in process.writes
 
 
 def test_auth_recovery_durably_marks_call_started_before_spawn() -> None:
