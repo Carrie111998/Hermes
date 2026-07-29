@@ -429,6 +429,9 @@ export const zh: Translations = {
       uiScaleTitle: '界面缩放',
       uiScaleDesc: (percent: number) =>
         `缩放整个应用的文字和界面。也可使用 Cmd/Ctrl 加 +、- 或 0 调整。当前：${percent}%`,
+      conversationFontSizeTitle: '对话文字',
+      conversationFontSizeDesc: (size: number) =>
+        `仅放大你的消息和 Hermes 回复，同时保持其余界面紧凑。当前：${size}px。`,
       translucencyTitle: '窗口透明',
       translucencyDesc: '让整个窗口透出桌面。仅支持 macOS 和 Windows。',
       backdropTitle: '聊天背景',

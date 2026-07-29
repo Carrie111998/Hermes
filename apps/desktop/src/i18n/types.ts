@@ -347,6 +347,8 @@ export interface Translations {
       toolViewDesc: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
+      conversationFontSizeTitle: string
+      conversationFontSizeDesc: (size: number) => string
       translucencyTitle: string
       translucencyDesc: string
       backdropTitle: string

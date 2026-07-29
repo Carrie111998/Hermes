@@ -402,6 +402,9 @@
     --composer-shell-pad-block-end: 0.625rem;
     --message-text-indent: 0.75rem;
     --conversation-text-font-size: 0.8125rem;
+    /* Transcript prose has its own accessibility scale. Unlike Chromium zoom,
+       this leaves navigation, settings, and window chrome at their normal size. */
+    --conversation-prose-font-size: 13px;
     --conversation-tool-font-size: 0.6875rem;
     --conversation-caption-font-size: 0.75rem;
     --conversation-line-height: 1.125rem;
@@ -1059,7 +1062,7 @@ text-* variant utilities. */ .btn-arc {
 
 [data-slot='aui_assistant-message-content'] {
   padding-left: var(--message-text-indent);
-  font-size: var(--conversation-text-font-size);
+  font-size: var(--conversation-prose-font-size);
   line-height: 1.5;
 }
 
@@ -1139,7 +1142,7 @@ text-* variant utilities. */ .btn-arc {
 [data-slot='aui_user-message-root'],
 [data-slot='aui_edit-composer-root'] {
   --human-msg-line-height: 1.3;
-  font-size: var(--conversation-text-font-size);
+  font-size: var(--conversation-prose-font-size);
 }
 
 [data-slot='aui_user-inline-text'] {
@@ -1156,7 +1159,7 @@ text-* variant utilities. */ .btn-arc {
    swap) and fought stick-to-bottom when parked at the bottom. */
 .sticky-human-clamp {
   cursor: pointer;
-  max-height: calc(4 * var(--human-msg-line-height) * var(--conversation-text-font-size) + 0.15rem);
+  max-height: calc(4 * var(--human-msg-line-height) * var(--conversation-prose-font-size) + 0.15rem);
   overflow: hidden;
 }
 

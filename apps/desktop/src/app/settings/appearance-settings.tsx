@@ -13,6 +13,7 @@ import { selectableCardClass } from '@/lib/selectable-card'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $backdrop, setBackdrop } from '@/store/backdrop'
+import { $conversationFontSize, setConversationFontSize } from '@/store/conversation-font-size'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $toolViewMode, setToolViewMode } from '@/store/tool-view'
@@ -70,6 +71,7 @@ function ThemePreview({ name, mode }: { name: string; mode: 'light' | 'dark' }) 
 // presets highlights nothing, and the row description keeps showing the
 // exact current percent.
 const UI_SCALE_PRESETS = ['90', '100', '110', '125', '150', '175'] as const
+const CONVERSATION_FONT_SIZE_PRESETS = ['13', '16', '18', '20', '22', '24'] as const
 
 type UiScalePreset = (typeof UI_SCALE_PRESETS)[number]
 
@@ -247,6 +249,7 @@ export function AppearanceSettings() {
   const { themeName, mode, resolvedMode, availableThemes, setTheme, setMode } = useTheme()
   const toolViewMode = useStore($toolViewMode)
   const zoomPercent = useStore($zoomPercent)
+  const conversationFontSize = useStore($conversationFontSize)
   const embedMode = useStore($embedMode)
   const embedAllowed = useStore($embedAllowed)
   const translucency = useStore($translucency)
@@ -295,6 +298,11 @@ export function AppearanceSettings() {
   ] as const satisfies readonly { id: EmbedMode; label: string }[]
 
   const uiScaleOptions = UI_SCALE_PRESETS.map(preset => ({ id: preset, label: `${preset}%` }))
+
+  const conversationFontSizeOptions = CONVERSATION_FONT_SIZE_PRESETS.map(preset => ({
+    id: preset,
+    label: `${preset}px`
+  }))
 
   const matchedScalePreset = matchUiScalePreset(zoomPercent)
 
@@ -426,6 +434,21 @@ export function AppearanceSettings() {
             }
             description={a.uiScaleDesc(zoomPercent)}
             title={a.uiScaleTitle}
+          />
+
+          <ListRow
+            action={
+              <SegmentedControl
+                onChange={id => {
+                  triggerHaptic('selection')
+                  setConversationFontSize(Number(id))
+                }}
+                options={conversationFontSizeOptions}
+                value={String(conversationFontSize) as (typeof CONVERSATION_FONT_SIZE_PRESETS)[number]}
+              />
+            }
+            description={a.conversationFontSizeDesc(conversationFontSize)}
+            title={a.conversationFontSizeTitle}
           />
 
           <ListRow
