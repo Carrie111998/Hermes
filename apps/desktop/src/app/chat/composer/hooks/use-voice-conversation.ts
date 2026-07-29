@@ -62,7 +62,7 @@ export function useVoiceConversation({
   const speechSessionRef = useRef<null | SpeechStreamSession>(null)
   const stopBargeMonitorRef = useRef<(() => void) | null>(null)
   const bargeCapturePendingRef = useRef(false)
-  const speechStartSequenceRef = useRef(0)
+  const speechStartSequenceRef = useRef<number | null>(null)
   const enabledRef = useRef(enabled)
   const mutedRef = useRef(muted)
   const busyRef = useRef(busy)
@@ -268,10 +268,11 @@ export function useVoiceConversation({
       // If stopVoicePlayback() was called externally (Stop button, end), the
       // voice-playback sequence has advanced past what we captured at speech
       // start — don't auto-start the next sentence, the user chose to stop.
-      const stoppedByUser =
-        speechStartSequenceRef.current > 0 && $voicePlayback.get().sequence > speechStartSequenceRef.current
+      const speechStartSequence = speechStartSequenceRef.current
 
-      speechStartSequenceRef.current = 0
+      const stoppedByUser = speechStartSequence !== null && $voicePlayback.get().sequence > speechStartSequence
+
+      speechStartSequenceRef.current = null
 
       if (enabledRef.current && !stoppedByUser) {
         pendingStartRef.current = true
@@ -382,6 +383,18 @@ export function useVoiceConversation({
           return
         }
 
+        const speechStartSequence = speechStartSequenceRef.current
+
+        if (speechStartSequence !== null && $voicePlayback.get().sequence > speechStartSequence) {
+          // Preserve an explicit Stop made while a failed stream waits to hand
+          // off to whole-text playback. Starting fallback would otherwise bump
+          // the sequence again and erase the user's stop signal.
+          awaitingSpokenResponseRef.current = false
+          settleAfterSpeech(false)
+
+          return
+        }
+
         const response = pendingResponse()
 
         if (!response || response.id !== responseId) {
@@ -403,9 +416,14 @@ export function useVoiceConversation({
           barged = true
         })
 
+        const playback = playSpeechText(response.text, { source: 'voice-conversation' })
+
+        // playSpeechText() first stops any prior audio, which advances the
+        // sequence internally. Capture after that expected bump so only a
+        // later, external stop suppresses the next listening turn.
         speechStartSequenceRef.current = $voicePlayback.get().sequence
 
-        void playSpeechText(response.text, { source: 'voice-conversation' })
+        void playback
           .catch(error => notifyError(error, voiceCopy.playbackFailed))
           .finally(() => {
             if (responseIdRef.current === responseId) {
@@ -462,6 +480,9 @@ export function useVoiceConversation({
           return
         }
 
+        // startSpeechStream() stops prior playback before opening its session.
+        // Treat that sequence bump as startup, not a user-requested stop.
+        speechStartSequenceRef.current = $voicePlayback.get().sequence
         speechSessionRef.current = session
 
         // Timer-driven feed: reply text flows into the session at delta rate
