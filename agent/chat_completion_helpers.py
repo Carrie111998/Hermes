@@ -778,13 +778,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
         _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
 
     if _est_tokens_for_codex_watchdog > 100_000:
-        _codex_idle_timeout_default = 180.0
+        _codex_idle_timeout_default = 300.0
     elif _est_tokens_for_codex_watchdog > 50_000:
-        _codex_idle_timeout_default = 120.0
+        _codex_idle_timeout_default = 240.0
     elif _est_tokens_for_codex_watchdog > 10_000:
-        _codex_idle_timeout_default = 60.0
+        _codex_idle_timeout_default = 180.0
     else:
-        _codex_idle_timeout_default = 12.0
+        _codex_idle_timeout_default = 60.0
 
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
     # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
@@ -831,10 +831,40 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _ttfb_timeout = _ttfb_cap
 
     _codex_idle_enabled = _codex_watchdog_enabled
+    # Prefer explicit env when set; otherwise start from token-tier default.
+    _user_set_codex_idle = (
+        os.environ.get("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS") is not None
+    )
     _codex_idle_timeout = _env_float(
         "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
         _codex_idle_timeout_default,
     )
+    # Reasoning models (Grok 4.5, o-series, etc.) can emit a first SSE frame
+    # then stay silent for minutes while thinking — no keepalive. The post-
+    # first-byte idle watchdog used to sit at 60–180s and kill healthy
+    # streams (user-visible: "API call failed after 3 retries: Codex stream
+    # produced no SSE events for 120s"). Apply the same reasoning floor used
+    # on the non-codex stream path, unless the operator set the env explicitly.
+    if not _user_set_codex_idle and _codex_idle_timeout > 0:
+        try:
+            from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+
+            _rf = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
+            if _rf is not None and _rf > _codex_idle_timeout:
+                logger.info(
+                    "Raising Codex post-first-byte SSE idle timeout from %.0fs to "
+                    "%.0fs for reasoning model %s (context=~%s tokens). "
+                    "Override with HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS.",
+                    _codex_idle_timeout,
+                    _rf,
+                    api_kwargs.get("model", "unknown"),
+                    f"{_est_tokens_for_codex_watchdog:,}",
+                )
+                _codex_idle_timeout = float(_rf)
+        except Exception:
+            logger.debug(
+                "reasoning floor for codex idle timeout failed", exc_info=True
+            )
     if _codex_idle_timeout <= 0:
         _codex_idle_enabled = False
 

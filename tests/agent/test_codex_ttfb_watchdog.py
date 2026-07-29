@@ -802,3 +802,71 @@ def test_large_codex_request_hard_ceiling_caps_raised_stale_floor(tmp_path, monk
         assert "stale_call_kill" in closes, f"stale kill expected, got {closes}"
     finally:
         stop["flag"] = True
+
+
+def test_event_idle_applies_reasoning_floor_when_env_unset(tmp_path, monkeypatch):
+    """Reasoning models can stay silent after the first SSE frame while thinking.
+
+    The Codex post-first-byte idle watchdog must raise to the reasoning floor
+    when HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS is unset — otherwise Grok /
+    o-series streams die around the token-tier default (~60–120s) and fail
+    after 3 retries with "no SSE events for 120s after first byte".
+    """
+    from agent import chat_completion_helpers as h
+    import agent.reasoning_timeouts as rt
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.delenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "30")
+    # Floor short enough for a unit test. Tier default is forced low via
+    # _env_float so we can prove the floor *raises* the idle timeout.
+    monkeypatch.setattr(rt, "get_reasoning_stale_timeout_floor", lambda m: 2.5)
+    _orig_env_float = h._env_float
+
+    def _env_float(name, default=0.0):
+        if name == "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS":
+            # Env unset → return a low "token-tier default"; floor should raise.
+            return 1.0
+        return _orig_env_float(name, default)
+
+    monkeypatch.setattr(h, "_env_float", _env_float)
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    stop = {"flag": False}
+
+    def fake_stream(api_kwargs, client=None, on_first_delta=None):
+        agent._codex_stream_last_event_ts = time.time()
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+
+    t0 = time.time()
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "grok-4.5", "input": "hi"})
+        elapsed = time.time() - t0
+        msg = str(excinfo.value)
+        assert "after first byte" in msg
+        assert "codex_stream_idle_kill" in closes
+        # Floor 2.5s over a 1s tier default: kill ~2–3s, not the old 60–120s.
+        assert elapsed < 12.0, f"idle kill too slow (floor not applied?): {elapsed:.1f}s"
+        assert elapsed >= 2.0, f"idle kill too fast: {elapsed:.1f}s"
+        assert "threshold: 2s" in msg
+    finally:
+        stop["flag"] = True

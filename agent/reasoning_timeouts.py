@@ -114,14 +114,13 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     # at the default 180s (300s with context scaling), tripping the
     # cross-turn circuit breaker after 5 consecutive stale kills.
     ("claude-fable", 600),
-    # xAI Grok reasoning variants.  Explicit reasoning-only keys
-    # plus one for the ``non-reasoning`` variant so users picking
-    # the fast variant don't get the 300s floor.  Bare ``grok-3``,
-    # ``grok-4`` etc. don't match — only the explicit reasoning /
-    # non-reasoning pairs.
-    ("grok-4-fast-reasoning", 300),
-    ("grok-4.20-reasoning", 300),
-    ("grok-4.5", 300),
+    # xAI Grok reasoning variants. Explicit keys so non-reasoning fast
+    # variants stay lower. Bare grok-4.5 is a common Desktop default and
+    # routinely thinks >2–4 min with no SSE keepalive after the first
+    # frame — post-first-byte Codex idle must not sit at ~120s.
+    ("grok-4-fast-reasoning", 600),
+    ("grok-4.20-reasoning", 600),
+    ("grok-4.5", 600),
     ("grok-4-fast-non-reasoning", 180),
 )
 
@@ -206,7 +205,7 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     >>> get_reasoning_stale_timeout_floor("qwen/qwen3-235b-a22b-thinking")
     180.0
     >>> get_reasoning_stale_timeout_floor("x-ai/grok-4-fast-reasoning")
-    300.0
+    600.0
     >>> get_reasoning_stale_timeout_floor("anthropic/claude-opus-4-6")
     240.0
     >>> get_reasoning_stale_timeout_floor("anthropic/claude-fable-5")
