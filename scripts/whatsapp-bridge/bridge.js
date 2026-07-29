@@ -19,7 +19,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, fetchLatestWaWebVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -393,9 +393,17 @@ function emitPairEvent(event) {
   } catch {}
 }
 
+async function resolveWaVersion() {
+  const waWeb = await fetchLatestWaWebVersion();
+  if (waWeb.isLatest && !waWeb.error) {
+    return waWeb.version;
+  }
+  return (await fetchLatestBaileysVersion()).version;
+}
+
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await resolveWaVersion();
 
   sock = makeWASocket({
     version,
