@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { PetThumb } from '@/components/pet/pet-thumb'
@@ -12,7 +12,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { Download, Loader2, PawPrint, Pencil, Trash2 } from '@/lib/icons'
+import { Download, Loader2, PawPrint, Pencil, Trash2, Upload } from '@/lib/icons'
 import { selectableCardClass } from '@/lib/selectable-card'
 import { cn } from '@/lib/utils'
 import { $petInfo, $petRoam, setPetRoam } from '@/store/pet'
@@ -24,6 +24,7 @@ import {
   adoptPet,
   exportPet as exportPetAction,
   type GalleryPet,
+  importPet as importPetAction,
   loadPetGallery,
   loadPetThumb,
   PET_SCALE_DEFAULT,
@@ -61,6 +62,7 @@ export function PetSettings() {
   const [confirmDelete, setConfirmDelete] = useState<GalleryPet | null>(null)
   const [renameTarget, setRenameTarget] = useState<GalleryPet | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const importInput = useRef<HTMLInputElement>(null)
   const scale = petInfo.scale ?? PET_SCALE_DEFAULT
 
   useEffect(() => {
@@ -128,6 +130,40 @@ export function PetSettings() {
 
       <div className="mt-2">
         <ListRow
+          action={
+            <div>
+              <input
+                accept=".zip,.png,.webp,application/zip,image/png,image/webp"
+                className="hidden"
+                onChange={event => {
+                  const file = event.target.files?.[0]
+
+                  if (file) {
+                    void importPetAction(requestGateway, file, {
+                      failed: copy.importFailed,
+                      tooLarge: copy.importTooLarge
+                    }).then(ok => {
+                      if (ok) {
+                        triggerHaptic('crisp')
+                      }
+                    })
+                  }
+
+                  event.target.value = ''
+                }}
+                ref={importInput}
+                type="file"
+              />
+              <Button onClick={() => importInput.current?.click()} size="sm" type="button" variant="outline">
+                <Upload className="size-3.5" />
+                {copy.importPet}
+              </Button>
+            </div>
+          }
+          description={copy.createDesc}
+          title={copy.createTitle}
+        />
+        <ListRow
           below={
             <>
               <input
@@ -190,9 +226,9 @@ export function PetSettings() {
                                 <span className="truncate text-[length:var(--conversation-text-font-size)] font-medium">
                                   {pet.displayName}
                                 </span>
-                                {pet.generated && (
+                                {pet.createdBy && (
                                   <span className="shrink-0 rounded-full bg-primary/15 px-1.5 py-px text-[0.625rem] font-medium text-primary">
-                                    {copy.generatedTag}
+                                    {pet.createdBy === 'import' ? copy.importedPetTag : copy.generatedTag}
                                   </span>
                                 )}
                               </span>
@@ -203,9 +239,9 @@ export function PetSettings() {
                             </span>
                             {isBusy && <Loader2 className="size-4 shrink-0 animate-spin text-(--ui-text-tertiary)" />}
                           </button>
-                          {!isBusy && (pet.installed || pet.generated) && (
+                          {!isBusy && (pet.installed || pet.managedLocal) && (
                             <div className="absolute right-1.5 top-1.5 flex gap-1 opacity-0 transition focus-within:opacity-100 group-hover:opacity-100">
-                              {pet.generated && (
+                              {pet.managedLocal && (
                                 <PetAction
                                   icon={<Pencil className="size-3.5" />}
                                   label={copy.rename(pet.displayName)}
@@ -215,7 +251,7 @@ export function PetSettings() {
                                   }}
                                 />
                               )}
-                              {pet.generated && (
+                              {pet.managedLocal && (
                                 <PetAction
                                   icon={<Download className="size-3.5" />}
                                   label={copy.exportPet(pet.displayName)}
@@ -223,13 +259,15 @@ export function PetSettings() {
                                 />
                               )}
                               {pet.installed && (
-                                // Generated pets have no remote source — deletion is
-                                // permanent, so confirm; petdex pets just uninstall.
+                                // User-owned local pets have no remote source — deletion
+                                // is permanent, so confirm; petdex pets just uninstall.
                                 <PetAction
                                   danger
                                   icon={<Trash2 className="size-3.5" />}
-                                  label={pet.generated ? copy.delete(pet.displayName) : copy.uninstall(pet.displayName)}
-                                  onClick={() => (pet.generated ? setConfirmDelete(pet) : removePet(pet.slug))}
+                                  label={
+                                    pet.managedLocal ? copy.delete(pet.displayName) : copy.uninstall(pet.displayName)
+                                  }
+                                  onClick={() => (pet.managedLocal ? setConfirmDelete(pet) : removePet(pet.slug))}
                                 />
                               )}
                             </div>

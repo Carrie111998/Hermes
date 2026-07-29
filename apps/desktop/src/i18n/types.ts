@@ -376,6 +376,11 @@ export interface Translations {
         title: string
         intro: string
         restartHint: string
+        createTitle: string
+        createDesc: string
+        importPet: string
+        importFailed: string
+        importTooLarge: string
         on: string
         off: string
         scaleTitle: string
@@ -389,6 +394,7 @@ export interface Translations {
         noMatch: (query: string) => string
         installedTag: string
         generatedTag: string
+        importedPetTag: string
         countCapped: (cap: number, total: number) => string
         count: (n: number) => string
         uninstall: (name: string) => string
@@ -1023,6 +1029,7 @@ export interface Translations {
       turnOn: string
       installed: string
       generatedTag: string
+      importedTag: string
       adoptFailed: string
       toggleFailed: string
       noneAvailable: string
