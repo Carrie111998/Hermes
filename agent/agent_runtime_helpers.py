@@ -2439,11 +2439,31 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         from hermes_cli.config import load_config as _sm_load_config
 
         _reasoning_cfg = _sm_load_config() or {}
+
+        # Snapshot the current reasoning_config (may be a session override)
+        _prior_reasoning = getattr(agent, "reasoning_config", None)
+
+        # Resolve from config for the new model
         agent.reasoning_config = resolve_reasoning_config(_reasoning_cfg, agent.model)
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s",
             agent.model, agent.reasoning_config,
         )
+
+        # Preserve session-level reasoning overrides (Closes #72856).
+        # Compare the prior reasoning_config against what config would give
+        # for the OLD model — if they differ, the prior value was set by the
+        # caller as a session override and must survive the model switch.
+        if _prior_reasoning is not None:
+            _old_config_reasoning = resolve_reasoning_config(
+                _reasoning_cfg, old_model,
+            )
+            if _prior_reasoning != _old_config_reasoning:
+                agent.reasoning_config = _prior_reasoning
+                logger.info(
+                    "switch_model: preserved session-level reasoning_config: %s",
+                    _prior_reasoning,
+                )
     except Exception as _reasoning_err:
         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
 

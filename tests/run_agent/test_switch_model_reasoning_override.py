@@ -24,7 +24,12 @@ class TestSwitchModelReasoningOverride:
         agent._client_kwargs = {"api_key": "test-key", "base_url": "https://api.openai.com/v1"}
         agent._use_prompt_caching = False
         agent._use_native_cache_layout = False
-        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent.reasoning_config = None
+        # ^ None by default — in production it's set from config via
+        # resolve_reasoning_config() at agent init.  Tests that rely on a
+        # specific prior value set it explicitly, and the session-override
+        # preservation test sets it to a non-config value to simulate
+        # /reasoning --session.  See Closes #72856.
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._fallback_chain = []
@@ -218,3 +223,47 @@ class TestSwitchModelReasoningOverride:
         # No override for gpt-5 → global fallback with raw False
         assert agent.reasoning_config is not None
         assert agent.reasoning_config.get("enabled") is False
+
+    def test_session_reasoning_override_preserved_on_switch(self):
+        """Session-level reasoning_effort must survive /model switch (Closes #72856).
+
+        When the caller has applied a session override (simulated by setting
+        reasoning_config to a non-config value), switch_model must preserve
+        it rather than re-resolving from config alone.
+        """
+        from agent.agent_runtime_helpers import switch_model
+
+        agent = self._make_fake_agent(model="sonnet-4.6", provider="anthropic")
+
+        # Simulate a session-level override (as CLI /reasoning high or gateway
+        # /reasoning --session would set).
+        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        fake_cfg = {
+            "model": {"default": "sonnet-4.6"},
+            "agent": {
+                "reasoning_effort": "medium",  # global differs from session override
+                "reasoning_overrides": {},
+            },
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=fake_cfg):
+            try:
+                switch_model(
+                    agent,
+                    new_model="gpt-5",  # switch to a different model
+                    new_provider="openai",
+                    base_url="https://api.openai.com/v1",
+                    api_mode="openai",
+                )
+            except Exception:
+                pass
+
+        # Session override must be preserved — config says "medium"/gpt-5 would
+        # resolve to "medium" (no override), but the prior "xhigh" was a session
+        # override and should survive.
+        assert agent.reasoning_config is not None
+        assert agent.reasoning_config.get("effort") == "xhigh", (
+            f"Expected session override 'xhigh' to be preserved after model "
+            f"switch, got {agent.reasoning_config}"
+        )
