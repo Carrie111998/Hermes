@@ -1117,3 +1117,53 @@ class TestTurnOwnershipCleanup:
                 assert events[-1]["type"] == "turn.error"
         finally:
             host._executor.shutdown(wait=False)
+
+
+class TestReloadMcpLiftsRestriction:
+    """reload.mcp on an unpinned session must follow the global config, even
+    when that config resolves to "everything" (None)."""
+
+    def test_global_none_config_lifts_the_agent_restriction(
+        self, server, monkeypatch
+    ) -> None:
+        agent = SimpleNamespace(
+            enabled_toolsets=["file"], disabled_toolsets=None,
+            tools=[], valid_tool_names=set(),
+        )
+        session = {
+            "session_key": "k-mcp",
+            "agent": agent,
+            "create_enabled_toolsets": None,
+        }
+        seen: dict = {}
+
+        import model_tools
+
+        def _defs(**kw):
+            seen.update(kw)
+            return []
+
+        monkeypatch.setattr(model_tools, "get_tool_definitions", _defs)
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: None)
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+        monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+        monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+        import tools.mcp_tool as mcp_tool
+
+        monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda *a, **k: None,
+                            raising=False)
+        monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda *a, **k: None,
+                            raising=False)
+
+        with patch.dict(server._sessions, {"s-mcp": session}, clear=False):
+            resp = server.handle_request(
+                {"id": "r-mcp", "method": "reload.mcp",
+                 "params": {"session_id": "s-mcp", "confirm": True}}
+            )
+
+        assert "error" not in resp
+        assert resp["result"]["status"] == "reloaded"
+        # The restriction is gone: the rebuild asked for every toolset.
+        assert seen["enabled_toolsets"] is None
+        assert agent.enabled_toolsets is None

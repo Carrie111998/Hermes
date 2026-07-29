@@ -296,3 +296,65 @@ def test_wait_returns_instantly_when_no_discovery_thread(monkeypatch):
     t0 = time.time()
     mcp_startup.wait_for_mcp_discovery()
     assert time.time() - t0 < 0.2  # never blocks on the bound when nothing's pending
+
+
+def test_explicit_none_override_lifts_the_previous_restriction(monkeypatch):
+    """``enabled_override=None`` means "all toolsets", not "no override".
+
+    A session that never pinned a scope re-resolves the global config on
+    /reload-mcp. When that config resolves to None (everything enabled), the
+    agent's earlier restriction must be dropped, not silently kept.
+    """
+    agent = _agent(["read_file"], enabled=["file"])
+    seen = {}
+
+    import model_tools
+
+    def _capture(**kw):
+        seen.update(kw)
+        return [_tool("read_file"), _tool("terminal")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _capture)
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent, enabled_override=None)
+
+    assert seen["enabled_toolsets"] is None
+    assert agent.enabled_toolsets is None
+    assert added == {"terminal"}
+
+
+def test_omitted_override_keeps_the_agent_selection(monkeypatch):
+    """The automatic paths pass nothing and must not widen the agent's scope."""
+    agent = _agent(["read_file"], enabled=["file"])
+    seen = {}
+
+    import model_tools
+
+    def _capture(**kw):
+        seen.update(kw)
+        return [_tool("read_file")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _capture)
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert seen["enabled_toolsets"] == ["file"]
+    assert agent.enabled_toolsets == ["file"]
+
+
+def test_explicit_empty_override_pins_zero_toolset(monkeypatch):
+    agent = _agent(["read_file"], enabled=["file"])
+    seen = {}
+
+    import model_tools
+
+    def _capture(**kw):
+        seen.update(kw)
+        return []
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _capture)
+
+    mcp_tool.refresh_agent_mcp_tools(agent, enabled_override=[])
+
+    assert seen["enabled_toolsets"] == []
+    assert agent.enabled_toolsets == []

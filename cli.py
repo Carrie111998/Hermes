@@ -10489,11 +10489,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         if _name not in merged:
                             merged.append(_name)
                     enabled_override = merged
-                refresh_agent_mcp_tools(
-                    self.agent,
-                    enabled_override=enabled_override,
-                    quiet_mode=True,
-                )
+                # Pass the override only when one was actually computed:
+                # ``enabled_override=None`` now means "every toolset", which
+                # would widen a CLI pinned to a narrow (or empty) selection.
+                refresh_kwargs = {"quiet_mode": True}
+                if enabled_override is not None:
+                    refresh_kwargs["enabled_override"] = enabled_override
+                refresh_agent_mcp_tools(self.agent, **refresh_kwargs)
                 # Keep the CLI's own list in sync with what the agent now uses.
                 if enabled_override is not None:
                     self.enabled_toolsets = enabled_override

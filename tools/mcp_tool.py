@@ -5514,11 +5514,14 @@ def has_registered_mcp_tools() -> bool:
         return bool(_mcp_tool_server_names)
 
 
+_NO_OVERRIDE = object()
+
+
 def refresh_agent_mcp_tools(
     agent,
     *,
-    enabled_override=None,
-    disabled_override=None,
+    enabled_override=_NO_OVERRIDE,
+    disabled_override=_NO_OVERRIDE,
     quiet_mode: bool = True,
 ) -> set:
     """Re-derive an already-built agent's tool snapshot from the live registry.
@@ -5562,9 +5565,18 @@ def refresh_agent_mcp_tools(
     # the user just ENABLED in config is picked up; the agent's stored selection
     # is then updated to match. The automatic paths (between-turns, late-binding)
     # pass nothing and reuse the agent's build-time selection unchanged.
-    if enabled_override is not None or disabled_override is not None:
-        enabled = enabled_override if enabled_override is not None else getattr(agent, "enabled_toolsets", None)
-        disabled = disabled_override if disabled_override is not None else getattr(agent, "disabled_toolsets", None)
+    # A sentinel, not None: ``None`` is a MEANINGFUL override value (every
+    # toolset enabled), so a caller re-resolving an unrestricted global config
+    # must be able to lift the agent's earlier restriction.
+    if enabled_override is not _NO_OVERRIDE or disabled_override is not _NO_OVERRIDE:
+        enabled = (
+            enabled_override if enabled_override is not _NO_OVERRIDE
+            else getattr(agent, "enabled_toolsets", None)
+        )
+        disabled = (
+            disabled_override if disabled_override is not _NO_OVERRIDE
+            else getattr(agent, "disabled_toolsets", None)
+        )
         agent.enabled_toolsets = enabled
         agent.disabled_toolsets = disabled
     else:
