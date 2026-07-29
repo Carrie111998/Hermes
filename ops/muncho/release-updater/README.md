@@ -20,3 +20,8 @@ Do not install or activate these assets as a release updater until the complete
 host mutation set, fixed production entrypoint, recovery gate, and disposable
 Linux power-loss/restart E2E suite land together.  The missing entrypoint is an
 intentional deployment interlock, not a packaging omission.
+
+The dormant transaction identity is currently
+`muncho-production-release-update-intent.v3`.  An activation installer must
+prove that no v2 authority record or journal exists on the host, or perform an
+explicitly reviewed migration before enabling any updater or recovery caller.

@@ -27,13 +27,67 @@ def _authority_record() -> Mapping[str, Any]:
         predecessor_current_receipt_sha256=str(
             plan["predecessor_activation_receipt_sha256"]
         ),
-        transaction_nonce_sha256="3" * 64,
-        created_at_unix=NOW,
     )
 
 
 def _intent() -> Mapping[str, Any]:
     return _authority_record()["intent"]
+
+
+def test_signed_publication_deterministically_defines_transaction_identity() -> None:
+    _private, trusted, plan, approval, publication = _documents()
+    values = {
+        "publication": publication,
+        "trusted_predecessor": trusted,
+        "expected_predecessor_trust_sha256": str(trusted["trust_sha256"]),
+        "predecessor_current_receipt_sha256": str(
+            plan["predecessor_activation_receipt_sha256"]
+        ),
+    }
+
+    first_intent = runtime.build_intent(**values)
+    replayed_intent = runtime.build_intent(**values)
+    first_record = runtime.build_authority_record(**values)
+    replayed_record = runtime.build_authority_record(**values)
+
+    assert first_intent == replayed_intent
+    assert first_record == replayed_record
+    assert first_record["intent"] == first_intent
+    assert first_intent["schema"] == "muncho-production-release-update-intent.v3"
+    assert first_intent["transaction_nonce_sha256"] == approval["nonce_sha256"]
+    assert first_intent["created_at_unix"] == approval["issued_at_unix"]
+    assert first_intent["created_at_unix"] == first_intent["approval_issued_at_unix"]
+
+
+@pytest.mark.parametrize(
+    "builder",
+    (runtime.build_intent, runtime.build_authority_record),
+)
+@pytest.mark.parametrize(
+    ("override_name", "override_value"),
+    (
+        ("transaction_nonce_sha256", "f" * 64),
+        ("created_at_unix", NOW),
+    ),
+)
+def test_transaction_identity_rejects_caller_overrides(
+    builder: Any,
+    override_name: str,
+    override_value: object,
+) -> None:
+    _private, trusted, plan, _approval, publication = _documents()
+    values = {
+        "publication": publication,
+        "trusted_predecessor": trusted,
+        "expected_predecessor_trust_sha256": str(trusted["trust_sha256"]),
+        "predecessor_current_receipt_sha256": str(
+            plan["predecessor_activation_receipt_sha256"]
+        ),
+        override_name: override_value,
+    }
+
+    with pytest.raises(TypeError):
+        builder(**values)
 
 
 def _digest(label: str) -> str:
@@ -1270,8 +1324,6 @@ def test_active_predecessor_receipt_is_a_compare_and_swap_input() -> None:
             trusted_predecessor=trusted,
             expected_predecessor_trust_sha256=str(trusted["trust_sha256"]),
             predecessor_current_receipt_sha256="f" * 64,
-            transaction_nonce_sha256="3" * 64,
-            created_at_unix=NOW,
         )
 
 
@@ -1320,6 +1372,46 @@ def test_self_rehashed_intent_cannot_escape_signed_authority() -> None:
         runtime.validate_authority_record(forged_record)
 
 
+@pytest.mark.parametrize(
+    "identity_overrides",
+    (
+        {"transaction_nonce_sha256": "f" * 64},
+        {
+            "approval_issued_at_unix": NOW,
+            "created_at_unix": NOW,
+        },
+    ),
+)
+def test_self_rehashed_identity_must_exactly_match_signed_approval(
+    identity_overrides: Mapping[str, object],
+) -> None:
+    forged_intent = {**_intent(), **identity_overrides}
+    forged_intent["intent_sha256"] = runtime._sha(
+        runtime._canonical({
+            key: value for key, value in forged_intent.items() if key != "intent_sha256"
+        })
+    )
+    assert runtime.validate_intent(forged_intent) == forged_intent
+
+    forged_record = {
+        **_authority_record(),
+        "intent": forged_intent,
+    }
+    forged_record["authority_record_sha256"] = runtime._sha(
+        runtime._canonical({
+            key: value
+            for key, value in forged_record.items()
+            if key != "authority_record_sha256"
+        })
+    )
+
+    with pytest.raises(
+        runtime.ProductionReleaseUpdateRuntimeError,
+        match="release_update_runtime_authority_record_invalid",
+    ):
+        runtime.validate_authority_record(forged_record)
+
+
 def test_journal_authority_must_exactly_match_caller_authority() -> None:
     _private, trusted, plan, _approval, publication = _documents()
     other_record = runtime.build_authority_record(
@@ -1329,8 +1421,6 @@ def test_journal_authority_must_exactly_match_caller_authority() -> None:
         predecessor_current_receipt_sha256=str(
             plan["predecessor_activation_receipt_sha256"]
         ),
-        transaction_nonce_sha256="4" * 64,
-        created_at_unix=NOW,
     )
 
     with pytest.raises(

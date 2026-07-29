@@ -20,7 +20,7 @@ from scripts.canary import production_cutover_activation_lock as authority_lock
 from scripts.canary import production_release_update_contract as authority
 
 
-INTENT_SCHEMA = "muncho-production-release-update-intent.v2"
+INTENT_SCHEMA = "muncho-production-release-update-intent.v3"
 AUTHORITY_RECORD_SCHEMA = "muncho-production-release-update-authority-record.v1"
 EVENT_SCHEMA = "muncho-production-release-update-event.v1"
 ZERO_SHA256 = "0" * 64
@@ -530,15 +530,26 @@ def build_intent(
     trusted_predecessor: Mapping[str, Any],
     expected_predecessor_trust_sha256: str,
     predecessor_current_receipt_sha256: str,
-    transaction_nonce_sha256: str,
-    created_at_unix: int,
 ) -> Mapping[str, Any]:
+    raw_approval = publication.get("approval") if isinstance(
+        publication,
+        Mapping,
+    ) else None
+    signed_issued_at_unix = (
+        raw_approval.get("issued_at_unix")
+        if isinstance(raw_approval, Mapping)
+        else None
+    )
+    if type(signed_issued_at_unix) is not int:
+        raise ProductionReleaseUpdateRuntimeError(
+            "release_update_runtime_authority_invalid"
+        )
     try:
         validated = authority.validate_publication(
             publication,
             trusted_predecessor=trusted_predecessor,
             expected_predecessor_trust_sha256=(expected_predecessor_trust_sha256),
-            now_unix=created_at_unix,
+            now_unix=signed_issued_at_unix,
         )
     except authority.ProductionReleaseUpdateContractError as exc:
         raise ProductionReleaseUpdateRuntimeError(
@@ -566,8 +577,8 @@ def build_intent(
         **{name: plan[name] for name in _PLAN_PROJECTION_FIELDS},
         "approval_issued_at_unix": approval["issued_at_unix"],
         "approval_expires_at_unix": approval["expires_at_unix"],
-        "transaction_nonce_sha256": transaction_nonce_sha256,
-        "created_at_unix": created_at_unix,
+        "transaction_nonce_sha256": approval["nonce_sha256"],
+        "created_at_unix": approval["issued_at_unix"],
         "secret_material_recorded": False,
         "secret_digest_recorded": False,
     }
@@ -613,9 +624,8 @@ def validate_intent(value: Any) -> Mapping[str, Any]:
         or type(raw.get("approval_issued_at_unix")) is not int
         or type(raw.get("approval_expires_at_unix")) is not int
         or type(raw.get("created_at_unix")) is not int
-        or not raw["approval_issued_at_unix"]
-        <= raw["created_at_unix"]
-        < raw["approval_expires_at_unix"]
+        or raw["created_at_unix"] != raw["approval_issued_at_unix"]
+        or not raw["created_at_unix"] < raw["approval_expires_at_unix"]
         or raw["created_at_unix"] <= 0
         or raw.get("secret_material_recorded") is not False
         or raw.get("secret_digest_recorded") is not False
@@ -632,8 +642,6 @@ def build_authority_record(
     trusted_predecessor: Mapping[str, Any],
     expected_predecessor_trust_sha256: str,
     predecessor_current_receipt_sha256: str,
-    transaction_nonce_sha256: str,
-    created_at_unix: int,
 ) -> Mapping[str, Any]:
     """Build the exact signed-authority header persisted before event zero."""
 
@@ -642,8 +650,6 @@ def build_authority_record(
         trusted_predecessor=trusted_predecessor,
         expected_predecessor_trust_sha256=(expected_predecessor_trust_sha256),
         predecessor_current_receipt_sha256=(predecessor_current_receipt_sha256),
-        transaction_nonce_sha256=transaction_nonce_sha256,
-        created_at_unix=created_at_unix,
     )
     unsigned = {
         "schema": AUTHORITY_RECORD_SCHEMA,
@@ -694,8 +700,6 @@ def validate_authority_record(value: Any) -> Mapping[str, Any]:
             trusted_predecessor=trusted_predecessor,
             expected_predecessor_trust_sha256=str(expected_trust),
             predecessor_current_receipt_sha256=str(predecessor_receipt),
-            transaction_nonce_sha256=str(intent["transaction_nonce_sha256"]),
-            created_at_unix=int(intent["created_at_unix"]),
         )
     except (ProductionReleaseUpdateRuntimeError, TypeError, ValueError) as exc:
         raise ProductionReleaseUpdateRuntimeError(
