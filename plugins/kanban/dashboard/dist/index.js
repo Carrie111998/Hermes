@@ -4402,7 +4402,7 @@
           getDestructiveConfirm(t, "blocked")),
         b(tx(t, "unblock", "Unblock"),   { status: "ready" },    task.status === "blocked"),
         b(tx(t, "complete", "Complete"),  { status: "done" },
-          task.status === "running" || task.status === "ready" || task.status === "blocked",
+          !["done", "archived"].includes(task.status),
           getDestructiveConfirm(t, "done")),
         b(tx(t, "archive", "Archive"),   { status: "archived" }, task.status !== "archived",
           getDestructiveConfirm(t, "archived")),
