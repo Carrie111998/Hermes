@@ -44,6 +44,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from tools.registry import tool_error
+
 logger = logging.getLogger("tools.tool_search")
 
 
@@ -868,7 +870,7 @@ def dispatch_tool_search(args: Dict[str, Any],
         config = load_config()
     query = str(args.get("query") or "").strip()
     if not query:
-        return json.dumps({"error": "query is required"}, ensure_ascii=False)
+        return tool_error("query is required")
 
     raw_limit = args.get("limit")
     if raw_limit is None:
@@ -892,14 +894,12 @@ def dispatch_tool_describe(args: Dict[str, Any],
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
     name = str(args.get("name") or "").strip()
     if not name:
-        return json.dumps({"error": "name is required"}, ensure_ascii=False)
+        return tool_error("name is required")
     if not is_deferrable_tool_name(name):
-        return json.dumps({
-            "error": (
-                f"'{name}' is not a deferrable tool. If you see it in the tools list "
-                "already, call it directly; otherwise check the spelling against tool_search."
-            ),
-        }, ensure_ascii=False)
+        return tool_error(
+            f"'{name}' is not a deferrable tool. If you see it in the tools list "
+            "already, call it directly; otherwise check the spelling against tool_search."
+        )
     _, deferrable = classify_tools(current_tool_defs)
     for td in deferrable:
         fn = td.get("function") or {}
@@ -909,9 +909,9 @@ def dispatch_tool_describe(args: Dict[str, Any],
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {}),
             }, ensure_ascii=False)
-    return json.dumps({
-        "error": f"'{name}' is not currently available. Re-run tool_search to refresh.",
-    }, ensure_ascii=False)
+    return tool_error(
+        f"'{name}' is not currently available. Re-run tool_search to refresh."
+    )
 
 
 def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
@@ -932,6 +932,59 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
         if name and is_deferrable_tool_name(name):
             names.add(name)
     return frozenset(names)
+
+
+def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Probe-validate ``tool_call`` arguments against the deferred tool's schema.
+
+    A deferred tool's parameter schema is invisible to the model until it
+    calls ``tool_describe`` — so models routinely invoke deferred tools
+    "blind" by name alone, omitting required arguments. Dispatching such a
+    call produces an opaque downstream failure (``KeyError: 'document_id'``)
+    that tells the model nothing about what the tool expects, and cheap
+    models loop on it until the iteration budget dies.
+
+    Port of the describe-first probe-validation fix from nearai/ironclaw#5149:
+    when required arguments are missing, return the tool's parameter schema
+    instead of dispatching blind — the model repairs the call in one
+    round-trip. Valid calls (and any call we can't confidently validate)
+    dispatch untouched, so this can never block a legitimate invocation.
+
+    Only *key absence* of schema-``required`` fields counts as invalid.
+    No type checking, no null rejection — nullable/typed edge cases are the
+    tool's own business, and ``coerce_tool_args`` already handles type repair
+    downstream. Returns a JSON error string when invalid, ``None`` when the
+    call should dispatch.
+    """
+    try:
+        from tools.registry import registry as _registry
+        schema = _registry.get_schema(name)
+        if not isinstance(schema, dict):
+            return None
+        fn = schema.get("function") if schema.get("type") == "function" else schema
+        if not isinstance(fn, dict):
+            return None
+        params = fn.get("parameters")
+        if not isinstance(params, dict):
+            return None
+        required = params.get("required")
+        if not isinstance(required, list) or not required:
+            return None
+        missing = [r for r in required if isinstance(r, str) and r not in args]
+        if not missing:
+            return None
+        return tool_error(
+            f"tool_call to '{name}' is missing required argument(s): "
+            f"{', '.join(missing)}. The tool was NOT invoked.",
+            parameters=params,
+            hint=(
+                "Retry tool_call with 'arguments' matching the parameters "
+                "schema above."
+            ),
+        )
+    except Exception:  # pragma: no cover — never block dispatch on validator bugs
+        logger.debug("validate_deferred_call_args failed for %s", name, exc_info=True)
+        return None
 
 
 def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
@@ -992,4 +1045,5 @@ __all__ = [
     "dispatch_tool_describe",
     "resolve_underlying_call",
     "scoped_deferrable_names",
+    "validate_deferred_call_args",
 ]
