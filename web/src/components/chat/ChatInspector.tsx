@@ -4,7 +4,7 @@ import { Circle, Wrench } from "lucide-react";
 import { PendingPromptPanel } from "@/components/chat/PendingPromptPanel";
 import type { WebChatPendingPrompt, WebChatSessionInfo } from "@/components/chat/contracts";
 import { ToolCall, type ToolEntry } from "@/components/ToolCall";
-import { Card } from "@/components/ui/card";
+import { Card } from "@nous-research/ui/ui/components/card";
 import type { ConnectionState } from "@/lib/gatewayClient";
 import { cn } from "@/lib/utils";
 

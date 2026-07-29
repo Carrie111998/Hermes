@@ -3,7 +3,7 @@ import { AlertCircle, Check } from "lucide-react";
 import { useState } from "react";
 
 import type { WebChatPendingPrompt } from "@/components/chat/contracts";
-import { Card } from "@/components/ui/card";
+import { Card } from "@nous-research/ui/ui/components/card";
 
 interface PendingPromptPanelProps {
   pendingPrompt: WebChatPendingPrompt;
