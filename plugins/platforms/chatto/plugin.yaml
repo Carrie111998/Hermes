@@ -1,0 +1,54 @@
+name: chatto-platform
+label: Chatto
+kind: platform
+version: 1.0.0
+description: >
+  Chatto gateway adapter for Hermes Agent.
+  Connects to a Chatto server (self-hosted team chat) and relays messages
+  between rooms/DMs and the Hermes agent.  Uses the Chatto ConnectRPC API
+  (JSON over HTTP) for outbound messages and the Chatto realtime WebSocket
+  protocol (binary protobuf) for inbound events.  No Python packages
+  required beyond websockets — pure stdlib protobuf codec.
+author: Nous Research
+requires_env:
+  - name: CHATTO_URL
+    description: "Base URL of the Chatto server (e.g. https://chat.example.com)"
+    prompt: "Chatto server URL"
+    password: false
+  - name: CHATTO_LOGIN
+    description: "Chatto login (username)"
+    prompt: "Chatto login"
+    password: false
+  - name: CHATTO_PASSWORD
+    description: "Chatto password"
+    prompt: "Chatto password"
+    password: true
+optional_env:
+  - name: CHATTO_CHANNELS
+    description: "Comma-separated room IDs to watch (default: all joined rooms)"
+    prompt: "Room IDs (comma-separated)"
+    password: false
+  - name: CHATTO_HOME_CHANNEL
+    description: "Room ID for cron / notification delivery (defaults to the first watched room)"
+    prompt: "Home room ID (or empty)"
+    password: false
+  - name: CHATTO_ALLOWED_USERS
+    description: "Comma-separated Chatto logins allowed to talk to the agent"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: CHATTO_ALLOW_ALL_USERS
+    description: "Allow any Chatto user to talk to the agent (true/false)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: CHATTO_REQUIRE_MENTION
+    description: "Only respond to @mentions in rooms (default: true). DMs always get a response."
+    prompt: "Require mention in rooms? (true/false)"
+    password: false
+  - name: CHATTO_AUTO_THREAD
+    description: "Auto-create threads for replies in rooms (default: true). Set false to reply in the room timeline."
+    prompt: "Auto-thread replies? (true/false)"
+    password: false
+  - name: CHATTO_FREE_RESPONSE_CHANNELS
+    description: "Comma-separated room IDs where the bot responds without being tagged"
+    prompt: "Free-response room IDs (comma-separated)"
+    password: false
