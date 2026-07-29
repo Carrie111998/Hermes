@@ -1624,9 +1624,27 @@ def _resolve_explicit_runtime(
         elif provider == "xai":
             api_mode = "codex_responses"
         else:
+            from hermes_cli.providers import host_mandated_api_mode
+
+            # Resolution order, highest priority first:
+            #   1. Host-mandated protocol. Endpoints like DeepSeek's
+            #      ``/anthropic`` and Kimi's ``/coding`` accept exactly ONE
+            #      wire; a persisted api_mode must never redirect them to a
+            #      protocol they don't speak. ``model_switch.switch_model``
+            #      already applies this precedence — mirror it here.
+            #   2. A persisted ``model.api_mode``, but only when the config
+            #      block carrying it describes THIS provider. Otherwise it is
+            #      a stale value left behind by an earlier /model switch to a
+            #      different provider.
+            #   3. URL-derived detection, then the chat_completions default.
+            _mandated_mode = host_mandated_api_mode(base_url)
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
+            if _mandated_mode is not None:
+                api_mode = _mandated_mode
+            elif configured_mode and _provider_supports_explicit_api_mode(
+                provider, configured_provider
+            ):
                 api_mode = configured_mode
             else:
                 # URL detection first, then the provider's declared transport
