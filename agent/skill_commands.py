@@ -772,6 +772,7 @@ def build_preloaded_skills_prompt(
 
     seen_identifiers: set[str] = set()
     seen_loaded_names = set(excluded_loaded_names or ())
+    resolved_names: set[str] = set()
     for raw_identifier in skill_identifiers:
         identifier = (raw_identifier or "").strip()
         if not identifier or identifier in seen_identifiers:
@@ -789,11 +790,17 @@ def build_preloaded_skills_prompt(
             missing.append(identifier)
             continue
 
-        # Deduplicate only after a successful, enabled load. The canonical
-        # name returned by skill_view() is shared by aliases and path forms.
+        # Deduplicate prompt injection only after a successful, enabled load.
+        # The canonical name returned by skill_view() is shared by aliases and
+        # path forms. Already auto-loaded skills still count as successfully
+        # resolved explicit requests so a separate typo can degrade gracefully.
         if skill_name in seen_loaded_names:
+            if skill_name not in resolved_names:
+                loaded_names.append(skill_name)
+                resolved_names.add(skill_name)
             continue
         seen_loaded_names.add(skill_name)
+        resolved_names.add(skill_name)
 
         # Track active usage for Curator lifecycle management (#17782)
         try:

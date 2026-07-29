@@ -121,6 +121,30 @@ def test_build_auto_load_prompt_loads_skills(tmp_path):
     assert "auto-loaded via config (skills.auto_load)" in prompt
 
 
+def test_build_auto_load_prompt_substitutes_session_id(tmp_path):
+    from agent.skill_commands import build_auto_load_prompt
+
+    skill_dir = tmp_path / "session-aware"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: session-aware\ndescription: Test.\n---\n\n"
+        "Session: ${HERMES_SESSION_ID}\n",
+        encoding="utf-8",
+    )
+    config = {"skills": {"auto_load": ["session-aware"]}}
+
+    with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        prompt, loaded, missing = build_auto_load_prompt(
+            task_id="sess-real-123",
+            user_config=config,
+        )
+
+    assert loaded == ["session-aware"]
+    assert missing == []
+    assert "sess-real-123" in prompt
+    assert "${HERMES_SESSION_ID}" not in prompt
+
+
 def test_build_auto_load_prompt_activation_note_not_cli_specific(tmp_path):
     """The activation note is origin-agnostic, not CLI-specific."""
     from agent.skill_commands import build_auto_load_prompt
@@ -168,6 +192,28 @@ def test_build_auto_load_prompt_empty_config():
     assert missing == []
 
 
+def test_preloaded_overlap_counts_as_successful_resolution(tmp_path):
+    """An already auto-loaded canonical skill is resolved but not injected twice."""
+    from agent.skill_commands import build_preloaded_skills_prompt
+
+    loaded_payload = ({"content": "skill body"}, tmp_path, "shared-skill")
+    with (
+        patch(
+            "agent.skill_commands._load_skill_payload",
+            side_effect=[loaded_payload, None],
+        ),
+        patch("agent.skill_utils.get_disabled_skill_names", return_value=set()),
+    ):
+        prompt, loaded, missing = build_preloaded_skills_prompt(
+            ["shared-alias", "typo"],
+            excluded_loaded_names={"shared-skill"},
+        )
+
+    assert prompt == ""
+    assert loaded == ["shared-skill"]
+    assert missing == ["typo"]
+
+
 # ── CLI merge with --skills ──
 
 def test_cli_merges_auto_load_with_cli_skills(monkeypatch):
@@ -194,6 +240,11 @@ def test_cli_merges_auto_load_with_cli_skills(monkeypatch):
         def run(self): pass
 
     auto_load = ["auto-skill"]
+    auto_calls = []
+
+    def fake_auto_load(**kwargs):
+        auto_calls.append(kwargs)
+        return "auto prompt", list(auto_load), []
 
     monkeypatch.setattr(cli_mod, "HermesCLI", lambda **kw: _DummyCLI(**kw))
     monkeypatch.setattr(cli_mod, "CLI_CONFIG", {})
@@ -202,7 +253,7 @@ def test_cli_merges_auto_load_with_cli_skills(monkeypatch):
     monkeypatch.setattr(
         sc_mod,
         "build_auto_load_prompt",
-        lambda **kwargs: ("auto prompt", list(auto_load), []),
+        fake_auto_load,
     )
     monkeypatch.setattr(
         cli_mod,
@@ -218,6 +269,7 @@ def test_cli_merges_auto_load_with_cli_skills(monkeypatch):
     cli_obj = created["cli"]
     assert "auto-skill" in cli_obj.preloaded_skills
     assert "cli-skill" in cli_obj.preloaded_skills
+    assert auto_calls == [{"task_id": "sess-001", "user_config": {}}]
 
 
 def test_cli_deduplicates_overlapping_skills(monkeypatch):
@@ -252,12 +304,12 @@ def test_cli_deduplicates_overlapping_skills(monkeypatch):
         cli_mod,
         "build_preloaded_skills_prompt",
         lambda skills, task_id=None, excluded_loaded_names=None: (
-            "", [], [],
+            "", ["shared-skill"], ["typo"],
         ),
     )
 
     with pytest.raises(SystemExit):
-        cli_mod.main(skills="shared-skill", list_tools=True)
+        cli_mod.main(skills="shared-skill,typo", list_tools=True)
 
     cli_obj = created["cli"]
     # shared-skill should appear only once

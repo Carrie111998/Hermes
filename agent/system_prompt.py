@@ -348,7 +348,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _auto_missing = agent._auto_load_skills_result[2]
             if _auto_missing:
                 logger.warning(
-                    "Auto-load skill(s) not found: %s", ", ".join(_auto_missing)
+                    "Auto-load skill(s) not found or disabled: %s",
+                    ", ".join(_auto_missing),
                 )
         except Exception:
             # Non-fatal — config/skill errors must not break session start.

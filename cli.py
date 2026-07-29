@@ -17596,22 +17596,6 @@ def main(
             toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
     parsed_skills = _parse_skills_argument(skills)
-
-    # Resolve and build skills.auto_load now so CLI dedup is based on successful
-    # canonical loads, not raw config text. The result is handed to the lazily
-    # created AIAgent, whose shared system-prompt path injects and reuses it.
-    # --ignore-rules suppresses all auto-injection (AGENTS.md, SOUL.md,
-    # memory, skills), including when enabled through HERMES_IGNORE_RULES.
-    from agent.skill_commands import build_auto_load_prompt
-
-    effective_ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
-    auto_load_result = (
-        ("", [], [])
-        if effective_ignore_rules
-        else build_auto_load_prompt(user_config=CLI_CONFIG)
-    )
-    _auto_prompt, auto_load_skills, auto_load_missing = auto_load_result
-    auto_load_set = set(auto_load_skills)
     loaded_skills: list[str] = []
 
     # Create CLI instance
@@ -17629,6 +17613,26 @@ def main(
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
     )
+
+    # Resolve auto-load templates only after the session exists so
+    # ${HERMES_SESSION_ID} substitutions receive the real CLI session ID. The
+    # exact rendered bytes are handed to lazily created replacement agents and
+    # remain stable across model switches for this CLI session.
+    from agent.skill_commands import build_auto_load_prompt
+
+    effective_ignore_rules = (
+        ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+    )
+    auto_load_result = (
+        ("", [], [])
+        if effective_ignore_rules
+        else build_auto_load_prompt(
+            task_id=cli.session_id,
+            user_config=CLI_CONFIG,
+        )
+    )
+    _auto_prompt, auto_load_skills, auto_load_missing = auto_load_result
+    auto_load_set = set(auto_load_skills)
     cli._auto_load_skills_result = auto_load_result
     if auto_load_missing:
         logger.warning(
