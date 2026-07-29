@@ -4785,7 +4785,9 @@ def register(ctx) -> None:
         adapter_factory=_build_adapter,
         check_fn=check_matrix_requirements,
         is_connected=_is_connected,
-        required_env=["MATRIX_HOMESERVER", "MATRIX_ACCESS_TOKEN"],
+        # Auth is MATRIX_ACCESS_TOKEN *or* MATRIX_USER_ID + MATRIX_PASSWORD,
+        # so neither credential var can be listed as unconditionally required.
+        required_env=["MATRIX_HOMESERVER"],
         install_hint="pip install 'mautrix[encryption]'",
         setup_fn=interactive_setup,
         apply_yaml_config_fn=_apply_yaml_config,
