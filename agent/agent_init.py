@@ -1696,10 +1696,32 @@ def init_agent(
                     agent._memory_manager.initialize_all(**_init_kwargs)
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
-                    _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
+                    # A provider name was explicitly configured but it could not
+                    # be loaded or reported itself unavailable (dangling plugin
+                    # symlink, missing add-on packages, import error). Surface
+                    # this loudly instead of silently downgrading to built-in
+                    # memory -- otherwise new memories quietly go to the wrong
+                    # store for days before anyone notices (#49200).
+                    _warn_msg = (
+                        f"Configured memory provider '{_mem_provider_name}' failed to "
+                        "load and is not active; falling back to built-in memory. "
+                        "Check the plugin install/symlink (`hermes plugins`)."
+                    )
+                    _ra().logger.warning(_warn_msg)
+                    # Store for replay after gateway binds status_callback
+                    # (same pattern as _compression_warning replay).
+                    agent._init_memory_warning = _warn_msg
                     agent._memory_manager = None
         except Exception as _mpe:
-            _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
+            _failed_name = locals().get("_mem_provider_name") or "?"
+            _warn_msg = (
+                f"Configured memory provider '{_failed_name}' failed to load "
+                f"({_mpe}); falling back to built-in memory. "
+                "Check the plugin install/symlink (`hermes plugins`)."
+            )
+            _ra().logger.warning(_warn_msg)
+            # Store for replay after gateway binds status_callback.
+            agent._init_memory_warning = _warn_msg
             agent._memory_manager = None
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
