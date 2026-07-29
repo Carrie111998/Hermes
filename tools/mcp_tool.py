@@ -2199,9 +2199,19 @@ class MCPServerTask:
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
-                    t.cancel()
                     try:
+                        t.cancel()
                         await t
+                    except RuntimeError as exc:
+                        # Event loop may be closed during shutdown — the
+                        # cancel() call tries to schedule via call_soon on
+                        # a loop that was already stopped and closed
+                        # (shutdown_mcp_servers -> _stop_mcp_loop ->
+                        # loop.close()).  Swallow gracefully instead of
+                        # producing "Exception ignored in: <coroutine
+                        # object MCPServerTask.run>" on every parked server.
+                        if "Event loop is closed" not in str(exc):
+                            raise
                     except (asyncio.CancelledError, Exception):
                         pass
         if self._shutdown_event.is_set():
