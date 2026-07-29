@@ -191,3 +191,22 @@ class TestResolveDisplayContextLength:
 
         assert ctx == 256_000
         assert resolver.call_args.kwargs["config_context_length"] is None
+
+    def test_codex_gpt56_peer_uses_configured_context_pin(self):
+        """The /model confirmation mirrors the live Sol/Terra/Luna policy."""
+        with patch(
+            "agent.model_metadata.get_model_context_length",
+            side_effect=lambda _model, **kwargs: kwargs["config_context_length"],
+        ) as resolver:
+            ctx = resolve_display_context_length(
+                "gpt-5.6-terra",
+                "openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+                config_context_length=372_000,
+                configured_model="gpt-5.6-sol",
+                configured_provider="openai-codex",
+                configured_base_url="https://chatgpt.com/backend-api/codex",
+            )
+
+        assert ctx == 372_000
+        assert resolver.call_args.kwargs["config_context_length"] == 372_000

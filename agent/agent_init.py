@@ -2197,18 +2197,17 @@ def init_agent(
             except (TypeError, ValueError):
                 pass
         _active_base_url = _normalize_route_base_url(_active_route_url)
-        _route_mismatch = _context_route_mismatch(
+        from hermes_cli.route_identity import should_clear_context_pin
+
+        if should_clear_context_pin(
+            _configured_default_runtime_model,
+            _active_runtime_model,
             _configured_base_url,
             _active_base_url,
             _configured_provider,
             agent.provider,
-            already_normalized=True,
-        )
-        _model_mismatch = bool(
-            _configured_default_runtime_model
-            and _configured_default_runtime_model != _active_runtime_model
-        )
-        if _model_mismatch or _route_mismatch:
+            already_normalized_route=True,
+        ):
             _ra().logger.debug(
                 "Ignoring model.context_length=%s for startup runtime %s at %s "
                 "(configured default is %s at %s)",

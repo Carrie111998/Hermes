@@ -58,6 +58,71 @@ def _ra():
     return run_agent
 
 
+def refresh_builtin_compression_threshold(agent: Any, config: Any) -> None:
+    """Refresh the built-in compressor's route-scoped threshold policy.
+
+    The configured global threshold is the input to the compressor's normal
+    per-model ``model_thresholds`` resolution.  Codex's 85% threshold is a
+    separate, route-scoped autoraising policy, so it must be re-applied when
+    recovery or ``/model`` replaces the runtime.  Do not mutate plugin context
+    engines: they own their threshold policy themselves.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return
+    try:
+        from agent.context_compressor import ContextCompressor
+
+        if not isinstance(compressor, ContextCompressor):
+            return
+        compression_config = config.get("compression", {}) if isinstance(config, dict) else {}
+        if not isinstance(compression_config, dict):
+            compression_config = {}
+        global_threshold = float(compression_config.get("threshold", 0.50))
+        allow_codex_autoraise = str(
+            compression_config.get("codex_gpt55_autoraise", True)
+        ).lower() in {"true", "1", "yes"}
+
+        from agent.agent_init import _resolve_compression_threshold
+        from agent.auxiliary_client import (
+            _compression_threshold_for_model,
+            _is_codex_gpt54_or_gpt55,
+            _is_codex_spark,
+        )
+
+        model_threshold = _compression_threshold_for_model(
+            getattr(agent, "model", ""),
+            getattr(agent, "provider", ""),
+            allow_codex_gpt55_autoraise=allow_codex_autoraise,
+        )
+        effective_threshold, autoraise = _resolve_compression_threshold(
+            global_threshold,
+            model_threshold,
+            model=getattr(agent, "model", ""),
+            is_codex_autoraise=(
+                _is_codex_gpt54_or_gpt55(
+                    getattr(agent, "model", ""),
+                    getattr(agent, "provider", ""),
+                )
+                or _is_codex_spark(
+                    getattr(agent, "model", ""),
+                    getattr(agent, "provider", ""),
+                )
+            ),
+        )
+        # ``update_model`` resolves per-model config overrides from this raw
+        # value, so updating it before the model swap keeps startup, switch,
+        # and fallback behavior aligned.
+        compressor._config_threshold_percent = effective_threshold
+        compressor._configured_threshold_percent = effective_threshold
+        agent._compression_threshold_autoraised = autoraise
+    except Exception:
+        logger.debug(
+            "Could not refresh compression threshold policy for runtime switch",
+            exc_info=True,
+        )
+
+
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
     {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task"}
 )
@@ -2355,6 +2420,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         raise
 
     # ── LM Studio: preload before probing context length ──
+    _sm_cfg: dict[str, Any] | None = None
     _sm_custom_providers = None
     try:
         from hermes_cli.config import (
@@ -2363,13 +2429,22 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             load_config,
         )
 
-        _sm_cfg = load_config()
+        _sm_cfg = load_config() or {}
         _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
-        _destination_context_intent = get_custom_provider_context_length(
-            model=agent.model,
-            base_url=agent.base_url,
-            custom_providers=_sm_custom_providers,
+        from hermes_cli.route_identity import resolve_model_context_pin
+
+        _destination_context_intent = resolve_model_context_pin(
+            _sm_cfg.get("model", {}),
+            active_model=agent.model,
+            active_base_url=agent.base_url,
+            active_provider=agent.provider,
         )
+        if _destination_context_intent is None:
+            _destination_context_intent = get_custom_provider_context_length(
+                model=agent.model,
+                base_url=agent.base_url,
+                custom_providers=_sm_custom_providers,
+            )
     except Exception:
         _destination_context_intent = None
     agent._config_context_length = _destination_context_intent
@@ -2400,6 +2475,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # ── Update context compressor ──
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         from agent.model_metadata import get_model_context_length
+        if _sm_cfg is not None:
+            refresh_builtin_compression_threshold(agent, _sm_cfg)
         if _sm_custom_providers is None:
             try:
                 from hermes_cli.config import get_compatible_custom_providers, load_config

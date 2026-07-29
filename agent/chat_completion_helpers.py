@@ -1979,8 +1979,46 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             )
         )
 
+        # Re-resolve the configured context pin for the fallback runtime.  A
+        # pin must never leak to another model/provider/endpoint, but the
+        # Codex GPT-5.6 Sol/Terra/Luna peers deliberately share their explicit
+        # allocation on the same Codex route.
+        _fb_custom_providers = getattr(agent, "_custom_providers", None)
+        _fb_cfg = None
+        try:
+            from hermes_cli.config import (
+                get_compatible_custom_providers,
+                get_custom_provider_context_length,
+                load_config,
+            )
+            from hermes_cli.route_identity import resolve_model_context_pin
+
+            _fb_cfg = load_config() or {}
+            _fb_custom_providers = get_compatible_custom_providers(_fb_cfg)
+            _fallback_context_intent = resolve_model_context_pin(
+                _fb_cfg.get("model", {}),
+                active_model=agent.model,
+                active_base_url=agent.base_url,
+                active_provider=agent.provider,
+            )
+            if _fallback_context_intent is None:
+                _fallback_context_intent = get_custom_provider_context_length(
+                    model=agent.model,
+                    base_url=agent.base_url,
+                    custom_providers=_fb_custom_providers,
+                )
+        except Exception:
+            _fallback_context_intent = None
+        agent._config_context_length = _fallback_context_intent
+
         # LM Studio: preload before probing the fallback's context length.
-        agent._ensure_lmstudio_runtime_loaded()
+        _runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
+            _fallback_context_intent
+        )
+        _effective_context_length = agent._effective_lmstudio_context_length(
+            _fallback_context_intent,
+            _runtime_context_length,
+        )
 
         # Update context compressor limits for the fallback model.
         # Without this, compression decisions use the primary model's
@@ -1990,6 +2028,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (model.context_length in config.yaml) is respected — without this,
         # the fallback activation drops to 128K even when config says 204800.
         if hasattr(agent, 'context_compressor') and agent.context_compressor:
+            if isinstance(_fb_cfg, dict):
+                from agent.agent_runtime_helpers import (
+                    refresh_builtin_compression_threshold,
+                )
+
+                refresh_builtin_compression_threshold(agent, _fb_cfg)
             from agent.model_metadata import get_model_context_length
             # ``agent.api_key`` may be callable (Entra ID); the
             # context-length resolver expects a string for live
@@ -1999,8 +2043,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_context_length = get_model_context_length(
                 agent.model, base_url=agent.base_url,
                 api_key=_fb_ctx_api_key, provider=agent.provider,
-                config_context_length=getattr(agent, "_config_context_length", None),
-                custom_providers=getattr(agent, "_custom_providers", None),
+                config_context_length=_effective_context_length,
+                custom_providers=_fb_custom_providers,
             )
             agent.context_compressor.update_model(
                 model=agent.model,

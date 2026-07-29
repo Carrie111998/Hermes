@@ -785,16 +785,43 @@ def check_compression_model_feasibility(agent: Any) -> None:
         # than minting a bearer JWT just to look up a context length.
         _raw_aux_key = getattr(client, "api_key", "")
         aux_api_key = "" if (callable(_raw_aux_key) and not isinstance(_raw_aux_key, str)) else str(_raw_aux_key or "")
+        aux_provider = (
+            _aux_cfg_provider
+            if _aux_cfg_provider and _aux_cfg_provider != "auto"
+            else getattr(agent, "provider", "")
+        )
+        aux_context_config = getattr(
+            agent, "_aux_compression_context_length_config", None
+        )
+        # In auto mode compression follows the live main runtime.  Re-resolve
+        # its scoped model.context_length pin here as well, so a configured
+        # GPT-5.6 Codex allocation survives a Sol/Terra/Luna switch without
+        # leaking into an unrelated auxiliary route.  An explicit
+        # auxiliary.compression.context_length remains the more specific
+        # override and wins unchanged.
+        if aux_context_config is None:
+            try:
+                from hermes_cli.config import load_config
+                from hermes_cli.route_identity import resolve_model_context_pin
+
+                aux_context_config = resolve_model_context_pin(
+                    (load_config() or {}).get("model", {}),
+                    active_model=aux_model,
+                    active_base_url=aux_base_url,
+                    active_provider=aux_provider,
+                )
+            except Exception:
+                aux_context_config = None
 
         aux_context = get_model_context_length(
             aux_model,
             base_url=aux_base_url,
             api_key=aux_api_key,
-            config_context_length=getattr(agent, "_aux_compression_context_length_config", None),
+            config_context_length=aux_context_config,
             # Each model must be resolved with its own provider so that
             # provider-specific paths (e.g. Bedrock static table, OpenRouter API)
             # are invoked for the correct client, not inherited from the main model.
-            provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(agent, "provider", "")),
+            provider=aux_provider,
             custom_providers=agent._custom_providers,
         )
 

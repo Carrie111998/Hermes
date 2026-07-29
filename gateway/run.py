@@ -13893,15 +13893,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if isinstance(_msg_model_cfg, dict)
                     else _msg_model_cfg
                 )
-                if _msg_model != _msg_configured_model:
-                    _msg_config_ctx = None
                 if _msg_config_ctx is not None and isinstance(_msg_model_cfg, dict):
                     try:
                         from hermes_cli.route_identity import should_clear_context_pin_async
 
                         if await should_clear_context_pin_async(
-                            None,  # model match already checked above
-                            None,
+                            _msg_configured_model,
+                            _msg_model,
                             _msg_model_cfg.get("base_url"),
                             _msg_base_url,
                             _msg_model_cfg.get("provider"),

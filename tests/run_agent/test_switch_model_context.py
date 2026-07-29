@@ -8,6 +8,7 @@ from hermes_cli.models import LMStudioLoadResult
 from run_agent import AIAgent
 from agent.agent_init import _normalize_route_base_url
 from agent.context_compressor import ContextCompressor
+from agent.context_breakdown import compute_session_context_breakdown
 
 
 class _StubStartupCompressor:
@@ -183,6 +184,98 @@ def test_switch_model_without_config_context_length():
         mock_ctx_len.assert_called_once()
         call_kwargs = mock_ctx_len.call_args.kwargs
         assert call_kwargs.get("config_context_length") is None
+
+
+def test_codex_gpt56_context_pin_survives_peer_switches_and_restores_after_route_change(monkeypatch):
+    """Sol/Terra/Luna share only their explicit Codex-route context pin."""
+    context_pin = 372_000
+    codex_url = "https://chatgpt.com/backend-api/codex"
+    cfg = {
+        "model": {
+            "default": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "base_url": codex_url,
+            "context_length": context_pin,
+        }
+    }
+    agent = _make_agent_with_compressor(config_context_length=context_pin)
+    agent.model = "gpt-5.6-sol"
+    agent.provider = "openai-codex"
+    agent.base_url = codex_url
+    agent.api_key = "codex-token"
+    agent.api_mode = "codex_responses"
+    agent.context_compressor.update_model(
+        model=agent.model,
+        context_length=context_pin,
+        base_url=agent.base_url,
+        api_key=agent.api_key,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+
+    seen_context_pins = []
+
+    def resolve_context(model, **kwargs):
+        pin = kwargs.get("config_context_length")
+        seen_context_pins.append((model, pin))
+        return pin or 272_000
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr("hermes_cli.config.get_compatible_custom_providers", lambda _cfg: [])
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", resolve_context)
+
+    for model in ("gpt-5.6-terra", "gpt-5.6-luna"):
+        agent.switch_model(model, "openai-codex", api_key="codex-token", base_url=codex_url)
+        assert agent._config_context_length == context_pin
+        assert agent.context_compressor.context_length == context_pin
+        assert agent.context_compressor.threshold_tokens == int(context_pin * 0.85)
+
+    # A peer-tier slug is not enough: this allocation belongs only to the
+    # configured Codex provider and endpoint, never the direct OpenAI API.
+    agent.switch_model(
+        "gpt-5.6-terra",
+        "openai",
+        api_key="sk-openai",
+        base_url="https://api.openai.com/v1",
+    )
+    assert agent._config_context_length is None
+    assert agent.context_compressor.context_length == 272_000
+    # The normal small-window floor remains, but the Codex-only 85% policy
+    # must not escape to the direct OpenAI route.
+    assert agent.context_compressor.threshold_tokens == int(272_000 * 0.75)
+
+    # A different provider/model drops the Codex-only pin.
+    agent.switch_model(
+        "unrelated-model",
+        "openrouter",
+        api_key="sk-openrouter",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    assert agent._config_context_length is None
+    assert agent.context_compressor.context_length == 272_000
+    assert agent.context_compressor.threshold_tokens == int(272_000 * 0.75)
+
+    # Switching back to a Codex peer re-resolves the configured allocation.
+    agent.switch_model("gpt-5.6-sol", "openai-codex", api_key="codex-token", base_url=codex_url)
+    assert agent._config_context_length == context_pin
+    assert agent.context_compressor.context_length == context_pin
+    assert agent.context_compressor.threshold_tokens == int(context_pin * 0.85)
+    assert seen_context_pins == [
+        ("gpt-5.6-terra", context_pin),
+        ("gpt-5.6-luna", context_pin),
+        ("gpt-5.6-terra", None),
+        ("unrelated-model", None),
+        ("gpt-5.6-sol", context_pin),
+    ]
+
+    # The Desktop context meter reads this backend payload's context_max.
+    agent.context_compressor.last_prompt_tokens = 186_000
+    with patch(
+        "agent.system_prompt.build_system_prompt_parts",
+        return_value={"stable": "", "context": "", "volatile": ""},
+    ):
+        payload = compute_session_context_breakdown(agent, [])
+    assert payload["context_max"] == context_pin
 
 
 def test_direct_start_model_override_does_not_inherit_profile_context_length():
@@ -361,6 +454,29 @@ def test_direct_start_preserves_context_for_codex_default_endpoint():
     )
 
     assert agent.context_compressor.config_context_length == 272_000
+
+
+@pytest.mark.parametrize("runtime_model", ["gpt-5.6-terra", "gpt-5.6-luna"])
+def test_direct_start_preserves_codex_gpt56_peer_context_pin(runtime_model):
+    """A fresh peer-tier session retains the matching Codex allocation."""
+    cfg = {
+        "model": {
+            "default": "gpt-5.6-sol",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "context_length": 372_000,
+        }
+    }
+
+    agent = _make_direct_start_agent(
+        cfg,
+        model=runtime_model,
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+
+    assert agent.context_compressor.config_context_length == 372_000
+    assert agent.context_compressor.context_length == 372_000
 
 
 def test_direct_start_drops_context_for_codex_wrong_path():

@@ -236,6 +236,88 @@ def test_feasibility_check_ignores_invalid_context_length(mock_get_client, mock_
     )
 
 
+def test_feasibility_inherits_scoped_codex_gpt56_context_pin(monkeypatch):
+    """Auto compression follows the live GPT-5.6 Codex peer allocation."""
+    context_pin = 372_000
+    codex_url = "https://chatgpt.com/backend-api/codex"
+    agent = _make_agent(main_context=context_pin, threshold_percent=0.85)
+    agent.model = "gpt-5.6-sol"
+    agent.provider = "openai-codex"
+    agent.base_url = codex_url
+    agent.api_key = "codex-token"
+    agent._aux_compression_context_length_config = None
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "default": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "base_url": codex_url,
+                "context_length": context_pin,
+            }
+        },
+    )
+
+    with (
+        patch("agent.auxiliary_client.get_text_auxiliary_client") as mock_get_client,
+        patch("agent.model_metadata.get_model_context_length", return_value=context_pin) as mock_ctx_len,
+    ):
+        mock_client = MagicMock()
+        mock_client.base_url = codex_url
+        mock_client.api_key = "codex-token"
+        mock_get_client.return_value = (mock_client, "gpt-5.6-terra")
+        agent._emit_status = lambda msg: None
+        agent._check_compression_model_feasibility()
+
+    mock_ctx_len.assert_called_once_with(
+        "gpt-5.6-terra",
+        base_url=codex_url,
+        api_key="codex-token",
+        config_context_length=context_pin,
+        provider="openai-codex",
+        custom_providers=[],
+    )
+
+
+def test_feasibility_drops_codex_peer_pin_on_different_aux_endpoint(monkeypatch):
+    """An auto auxiliary client on another endpoint cannot borrow the pin."""
+    context_pin = 372_000
+    codex_url = "https://chatgpt.com/backend-api/codex"
+    agent = _make_agent(main_context=context_pin, threshold_percent=0.85)
+    agent.model = "gpt-5.6-sol"
+    agent.provider = "openai-codex"
+    agent.base_url = codex_url
+    agent.api_key = "codex-token"
+    agent._aux_compression_context_length_config = None
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "default": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "base_url": codex_url,
+                "context_length": context_pin,
+            }
+        },
+    )
+
+    with (
+        patch("agent.auxiliary_client.get_text_auxiliary_client") as mock_get_client,
+        patch("agent.model_metadata.get_model_context_length", return_value=372_000) as mock_ctx_len,
+    ):
+        mock_client = MagicMock()
+        mock_client.base_url = "https://api.openai.com/v1"
+        mock_client.api_key = "sk-openai"
+        mock_get_client.return_value = (mock_client, "gpt-5.6-terra")
+        agent._emit_status = lambda msg: None
+        agent._check_compression_model_feasibility()
+
+    assert mock_ctx_len.call_args.kwargs["config_context_length"] is None
+    assert mock_ctx_len.call_args.kwargs["provider"] == "openai-codex"
+
+
 def test_init_feasibility_check_uses_aux_context_override_from_config():
     """Lazy feasibility check should cache and forward auxiliary.compression.context_length.
 
