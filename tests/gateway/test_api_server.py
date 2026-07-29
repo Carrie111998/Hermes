@@ -2860,3 +2860,191 @@ class TestCreateAgentModelRecovery:
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
 
+
+# ---------------------------------------------------------------------------
+# /v1/chat/completions — hermes.tool_calls payload (issue #73389)
+# ---------------------------------------------------------------------------
+
+
+class TestChatCompletionsToolCallSignal:
+    """Surface hermes.tool_calls in the chat-completions response (#73389)."""
+
+    @staticmethod
+    def _fake_request(body: dict):
+        from aiohttp.test_utils import make_mocked_request
+
+        raw = json.dumps(body).encode("utf-8")
+
+        async def _fake_json():
+            return body
+
+        async def _fake_read():
+            return raw
+
+        req = make_mocked_request(
+            "POST",
+            "/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+        )
+        req.json = _fake_json
+        req.read = _fake_read
+        return req
+
+    @pytest.mark.asyncio
+    async def test_tool_call_stats_attached_to_successful_turn(self, adapter):
+        payload = {
+            "final_response": "Disposition at MEDIUM confidence",
+            "messages": [],
+            "api_calls": 1,
+            "tool_call_stats": {
+                "requests": 1,
+                "successful": 1,
+                "failed": 0,
+                "total_results": 1,
+                "used": True,
+            },
+        }
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (payload, usage)
+            req = self._fake_request(
+                {
+                    "model": "hermes-agent",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            )
+            resp = await adapter._handle_chat_completions(req)
+
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        assert body["choices"][0]["finish_reason"] == "stop"
+        assert body["hermes"]["tool_calls"] == {
+            "requests": 1,
+            "successful": 1,
+            "failed": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_zero_tool_success_includes_warning(self, adapter):
+        payload = {
+            "final_response": "MEDIUM confidence disposition",
+            "messages": [],
+            "api_calls": 1,
+            "tool_call_stats": {
+                "requests": 2,
+                "successful": 0,
+                "failed": 2,
+                "total_results": 2,
+                "used": True,
+            },
+        }
+        usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (payload, usage)
+            req = self._fake_request(
+                {
+                    "model": "hermes-agent",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            )
+            resp = await adapter._handle_chat_completions(req)
+
+        assert resp.status == 200
+        tool_calls = json.loads(resp.body)["hermes"]["tool_calls"]
+        assert tool_calls["requests"] == 2
+        assert tool_calls["successful"] == 0
+        assert tool_calls["failed"] == 2
+        assert "zero tool calls succeeded" in tool_calls["warning"]
+
+    @pytest.mark.asyncio
+    async def test_turn_without_tools_omits_hermes_tool_calls(self, adapter):
+        payload = {
+            "final_response": "hi",
+            "messages": [],
+            "api_calls": 1,
+            "tool_call_stats": {
+                "requests": 0,
+                "successful": 0,
+                "failed": 0,
+                "total_results": 0,
+                "used": False,
+            },
+        }
+        usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (payload, usage)
+            req = self._fake_request(
+                {
+                    "model": "hermes-agent",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            )
+            resp = await adapter._handle_chat_completions(req)
+
+        assert resp.status == 200
+        assert "tool_calls" not in json.loads(resp.body).get("hermes", {})
+
+    @pytest.mark.asyncio
+    async def test_missing_stats_safely_skipped(self, adapter):
+        payload = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (payload, usage)
+            req = self._fake_request(
+                {
+                    "model": "hermes-agent",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            )
+            resp = await adapter._handle_chat_completions(req)
+
+        assert resp.status == 200
+        assert "tool_calls" not in json.loads(resp.body).get("hermes", {})
+
+    @pytest.mark.asyncio
+    async def test_partial_turn_merges_tool_calls_alongside_existing_hermes(self, adapter):
+        payload = {
+            "final_response": "Partial",
+            "messages": [],
+            "api_calls": 1,
+            "partial": True,
+            "completed": False,
+            "failed": False,
+            "error": "response truncated",
+            "tool_call_stats": {
+                "requests": 1,
+                "successful": 0,
+                "failed": 1,
+                "total_results": 1,
+                "used": True,
+            },
+        }
+        usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (payload, usage)
+            req = self._fake_request(
+                {
+                    "model": "hermes-agent",
+                    "stream": False,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            )
+            resp = await adapter._handle_chat_completions(req)
+
+        assert resp.status == 200
+        hermes = json.loads(resp.body)["hermes"]
+        assert hermes["partial"] is True
+        assert hermes["completed"] is False
+        assert hermes["tool_calls"] == {
+            "requests": 1,
+            "successful": 0,
+            "failed": 1,
+            "warning": (
+                "The turn requested tool access but zero tool calls succeeded; "
+                "the assistant answer may not be evidence-backed."
+            ),
+        }

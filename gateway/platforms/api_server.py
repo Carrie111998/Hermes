@@ -4241,6 +4241,23 @@ class APIServerAdapter(BasePlatformAdapter):
             if err_msg:
                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
 
+        tool_call_stats = (
+            result.get("tool_call_stats") if isinstance(result, dict) else None
+        )
+        if isinstance(tool_call_stats, dict) and tool_call_stats.get("used"):
+            if "hermes" not in response_data:
+                response_data["hermes"] = {}
+            response_data["hermes"]["tool_calls"] = {
+                "requests": int(tool_call_stats.get("requests", 0)),
+                "successful": int(tool_call_stats.get("successful", 0)),
+                "failed": int(tool_call_stats.get("failed", 0)),
+            }
+            if finish_reason == "stop" and tool_call_stats.get("requests", 0) > 0 and tool_call_stats.get("successful", 0) == 0:
+                response_data["hermes"]["tool_calls"]["warning"] = (
+                    "zero tool calls succeeded during this run; "
+                    "assistant disposition is un-backed by tool evidence"
+                )
+
         return web.json_response(response_data, headers=response_headers)
 
     async def _write_sse_chat_completion(
