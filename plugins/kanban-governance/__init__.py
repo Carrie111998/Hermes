@@ -700,6 +700,27 @@ for _mutator in {
 }:
     _COMMAND_POLICIES[_mutator] = _CommandPolicy(targets=_all_operand_targets)
 
+# Opaque-code flags: the argument is a program, not a path, so its writes
+# cannot be resolved to targets. Such an invocation stays ambiguous.
+_OPAQUE_CODE_FLAGS = {"-c", "-e", "--eval", "-p", "--print", "--eval-file"}
+
+
+def _runner_targets(argv: list[str]) -> tuple[list[str], bool]:
+    if any(arg.split("=", 1)[0] in _OPAQUE_CODE_FLAGS for arg in argv[1:]):
+        return [], True
+    return _all_operand_targets(argv)
+
+
+# Verification runners. Without a policy every test/build command is
+# "ambiguous", and `_validate_worker` refuses it — leaving Development
+# required to hand off tested code but unable to run a test. Operands are
+# declared as targets so a runner pointed at a path outside the card
+# workspace is still refused.
+for _runner in {
+    "make", "node", "npm", "npx", "pnpm", "pytest", "python3", "vitest", "yarn",
+}:
+    _COMMAND_POLICIES[_runner] = _CommandPolicy(targets=_runner_targets)
+
 def _command_policy(argv: list[str]) -> Optional[_CommandPolicy]:
     raw_executable = argv[0]
     executable = os.path.basename(raw_executable).lower()
