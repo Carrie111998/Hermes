@@ -79,9 +79,14 @@ import pytest
     ("claude-fable-5", 600.0),
     ("claude-fable", 600.0),
     # xAI Grok reasoning variants — explicit, not bare `grok`.
+    # grok-4.5 / grok-build are GA flagships that accept reasoning_effort
+    # (high/xhigh); floor is 600s deep-reasoning tier (see #52217 follow-up).
     ("x-ai/grok-4-fast-reasoning", 300.0),
     ("x-ai/grok-4.20-reasoning", 300.0),
-    ("x-ai/grok-4.5", 300.0),
+    ("x-ai/grok-4.5", 600.0),
+    ("grok-4.5", 600.0),
+    ("grok-build-0.1", 600.0),
+    ("x-ai/grok-build", 600.0),
     ("x-ai/grok-4-fast-non-reasoning", 180.0),
 ])
 def test_reasoning_stale_timeout_floor_positive_cases(model, expected):
@@ -377,3 +382,55 @@ def test_stream_stale_timeout_unchanged_for_non_reasoning_models():
         est_tokens=5_000,
     )
     assert timeout == 180.0
+
+
+# ── effort-based floor (model-independent) ────────────────────────────────
+
+
+def test_effort_floor_xhigh_independent_of_model():
+    from agent.reasoning_timeouts import (
+        get_effective_reasoning_stale_timeout_floor,
+        get_reasoning_effort_stale_timeout_floor,
+    )
+
+    assert get_reasoning_effort_stale_timeout_floor("xhigh") == 900.0
+    assert get_reasoning_effort_stale_timeout_floor("high") == 600.0
+    assert get_reasoning_effort_stale_timeout_floor("medium") is None
+    assert get_reasoning_effort_stale_timeout_floor({"enabled": False}) is None
+    # gpt-4o is off the model allowlist, but xhigh still raises.
+    assert get_effective_reasoning_stale_timeout_floor("gpt-4o", "xhigh") == 900.0
+    assert get_effective_reasoning_stale_timeout_floor("gpt-4o", "medium") is None
+    # Model floor + effort floor → max.
+    assert (
+        get_effective_reasoning_stale_timeout_floor("openai/o3-mini", "xhigh")
+        == 900.0
+    )
+    assert (
+        get_effective_reasoning_stale_timeout_floor("openai/o3-mini", "medium")
+        == 300.0
+    )
+
+
+def test_non_stream_resolver_uses_effort_when_model_not_on_allowlist(
+    monkeypatch, tmp_path
+):
+    """xhigh on an unknown chat model must not fall through to the 90s default."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "get_provider_stale_timeout", lambda *a, **k: None)
+
+    agent = _make_agent(
+        tmp_path,
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o",  # not on model allowlist
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+    )
+    base, implicit = agent._resolved_api_call_stale_timeout_base()
+    assert base == 900.0
+    assert implicit is False
