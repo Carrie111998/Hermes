@@ -1021,3 +1021,27 @@ class TestUsageFromSanitizedResponse:
 
         assert seen["resp"] is resp
         assert captured["usage_details"] == {"input": 7, "output": 3}
+
+
+class TestPricingApiKey:
+    def test_venice_host_prefers_admin_key(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        monkeypatch.setenv("VENICE_ADMIN_KEY", "admin-test-key")
+        monkeypatch.setenv("VENICE_API_KEY", "inference-test-key")
+
+        assert mod._pricing_api_key(
+            provider="custom",
+            base_url="https://api.venice.ai/api/v1",
+        ) == "admin-test-key"
+
+    def test_custom_non_venice_host_receives_no_provider_key(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        monkeypatch.setenv("VENICE_ADMIN_KEY", "must-not-leak")
+        monkeypatch.setenv("OPENAI_API_KEY", "also-must-not-leak")
+
+        assert mod._pricing_api_key(
+            provider="custom",
+            base_url="https://models.example.test/v1",
+        ) == ""

@@ -193,6 +193,57 @@ def test_openrouter_models_api_pricing_is_converted_from_per_token_to_per_millio
     assert float(entry.cache_write_cost_per_million) == 6.25
 
 
+def test_venice_custom_endpoint_routes_to_live_models_api():
+    route = resolve_billing_route(
+        "venice/deepseek-v4-flash",
+        provider="custom",
+        base_url="https://api.venice.ai/api/v1",
+    )
+
+    assert route.provider == "venice"
+    assert route.model == "deepseek-v4-flash"
+    assert route.base_url == "https://api.venice.ai/api/v1"
+    assert route.billing_mode == "official_models_api"
+
+
+def test_venice_live_pricing_uses_bearer_key_and_nested_usd_rates(monkeypatch):
+    seen = {}
+
+    def fake_fetch(base_url, *, api_key=""):
+        seen["base_url"] = base_url
+        seen["api_key"] = api_key
+        return {
+            "deepseek-v4-flash": {
+                "pricing": {
+                    "prompt": "0.000000138",
+                    "completion": "0.000000275",
+                    "cache_read": "0.000000028",
+                }
+            }
+        }
+
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        fake_fetch,
+    )
+
+    entry = get_pricing_entry(
+        "deepseek-v4-flash",
+        provider="custom",
+        base_url="https://api.venice.ai/api/v1",
+        api_key="venice-test-key",
+    )
+
+    assert seen == {
+        "base_url": "https://api.venice.ai/api/v1",
+        "api_key": "venice-test-key",
+    }
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 0.138
+    assert float(entry.output_cost_per_million) == 0.275
+    assert float(entry.cache_read_cost_per_million) == 0.028
+
+
 def test_estimate_usage_cost_marks_subscription_routes_included():
     result = estimate_usage_cost(
         "gpt-5.3-codex",

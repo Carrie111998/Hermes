@@ -538,6 +538,25 @@ def _serialize_assistant_message(message: Any) -> dict[str, Any]:
     }
 
 
+def _pricing_api_key(*, provider: str, base_url: str) -> str:
+    """Return a credential only for the provider endpoint it belongs to."""
+    try:
+        from agent.model_metadata import base_url_host_matches
+
+        is_venice = (provider or "").strip().lower() == "venice" or (
+            base_url_host_matches(base_url or "", "api.venice.ai")
+        )
+    except Exception:
+        is_venice = False
+    if not is_venice:
+        return ""
+    return (
+        os.environ.get("VENICE_ADMIN_KEY")
+        or os.environ.get("VENICE_API_KEY")
+        or ""
+    ).strip()
+
+
 def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, base_url: str) -> tuple[dict[str, int], dict[str, float]]:
     usage_details: Dict[str, int] = {}
     cost_details: Dict[str, float] = {}
@@ -566,12 +585,15 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
             usage_details["cache_creation_input_tokens"] = canonical.cache_write_tokens
         if canonical.reasoning_tokens:
             usage_details["reasoning_tokens"] = canonical.reasoning_tokens
+        # Venice requires a Bearer key for GET /models. Keep credential
+        # selection host-scoped so a custom endpoint never receives it.
+        pricing_api_key = _pricing_api_key(provider=provider, base_url=base_url)
         cost = estimate_usage_cost(
             model,
             canonical,
             provider=provider,
             base_url=base_url,
-            api_key="",
+            api_key=pricing_api_key,
         )
         if cost.amount_usd is not None:
             # Langfuse cost_details keys must match usage_details keys.
@@ -580,7 +602,12 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
                 from agent.usage_pricing import get_pricing_entry
                 from decimal import Decimal
                 _ONE_M = Decimal("1000000")
-                entry = get_pricing_entry(model, provider=provider, base_url=base_url)
+                entry = get_pricing_entry(
+                    model,
+                    provider=provider,
+                    base_url=base_url,
+                    api_key=pricing_api_key,
+                )
                 if entry:
                     if entry.input_cost_per_million is not None and canonical.input_tokens:
                         cost_details["input"] = float(Decimal(canonical.input_tokens) * entry.input_cost_per_million / _ONE_M)
@@ -1000,7 +1027,13 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                 cache_write_tokens=_cache_write,
                 reasoning_tokens=_reasoning,
             )
-            entry = get_pricing_entry(model, provider=provider, base_url=base_url)
+            _pricing_key = _pricing_api_key(provider=provider, base_url=base_url)
+            entry = get_pricing_entry(
+                model,
+                provider=provider,
+                base_url=base_url,
+                api_key=_pricing_key,
+            )
             if entry:
                 if entry.input_cost_per_million is not None and _input:
                     cost_details["input"] = float(Decimal(_input) * entry.input_cost_per_million / _ONE_M)
@@ -1011,7 +1044,13 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                 if entry.cache_write_cost_per_million is not None and _cache_write:
                     cost_details["cache_creation_input_tokens"] = float(Decimal(_cache_write) * entry.cache_write_cost_per_million / _ONE_M)
             else:
-                _cost = estimate_usage_cost(model, _cu, provider=provider, base_url=base_url, api_key="")
+                _cost = estimate_usage_cost(
+                    model,
+                    _cu,
+                    provider=provider,
+                    base_url=base_url,
+                    api_key=_pricing_key,
+                )
                 if _cost.amount_usd is not None:
                     cost_details["total"] = float(_cost.amount_usd)
         except Exception:
