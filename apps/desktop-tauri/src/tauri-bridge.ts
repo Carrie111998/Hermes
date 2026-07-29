@@ -14,6 +14,14 @@ import { invoke } from '@tauri-apps/api/core'
 import { writeText, readText } from '@tauri-apps/plugin-clipboard-manager'
 import { open } from '@tauri-apps/plugin-shell'
 
+import type {
+  HermesGitBranch,
+  HermesGitBaseBranch,
+  HermesRepoStatus,
+  HermesReviewList,
+  HermesReviewShipInfo,
+} from '@/global'
+
 // ---------------------------------------------------------------------------
 // Stubs for methods that need a real Electron process (not available in Tauri).
 // These return sensible defaults so the renderer doesn't crash.
@@ -188,9 +196,15 @@ export function installDesktopBridge() {
 
     notify: () => Promise.resolve(false),
     requestMicrophoneAccess: () => Promise.resolve(true),
-    saveImageFromUrl: () => Promise.resolve(false),
-    saveImageBuffer: () => Promise.resolve(''),
-    saveClipboardImage: () => Promise.resolve(''),
+    saveImageFromUrl: async (url: string) => {
+      try { return await cmd<boolean>('saveImageFromUrl', { url }) }
+      catch { return false }
+    },
+    saveImageBuffer: async (data: Uint8Array, ext: string) => {
+      try { return await cmd<string>('saveImageBuffer', { data: Array.from(data), ext }) }
+      catch { return '' }
+    },
+    saveClipboardImage: () => cmd<string>('saveClipboardImage', {}).catch(() => ''),
     getPathForFile: () => '',
     normalizePreviewTarget: () => Promise.resolve(null),
     watchPreviewFile: () => Promise.resolve({ id: '', url: '' }),
@@ -226,24 +240,56 @@ export function installDesktopBridge() {
       worktreeList: () => Promise.resolve([]),
       worktreeAdd: () => Promise.resolve({ ok: false, error: 'not available' }),
       worktreeRemove: () => Promise.resolve({ ok: false, error: 'not available' }),
-      branchSwitch: () => Promise.resolve({ ok: false, error: 'not available' }),
-      branchList: () => Promise.resolve([]),
-      baseBranchList: () => Promise.resolve([]),
-      repoStatus: () => Promise.resolve({}),
-      fileDiff: () => Promise.resolve(''),
-      scanRepos: () => Promise.resolve([]),
+      branchSwitch: async (repoPath: string, branch: string) => {
+        await cmd<void>('branchSwitch', { path: repoPath, name: branch })
+        return { branch }
+      },
+      branchList: (repoPath: string) =>
+        cmd<HermesGitBranch[]>('branchList', { path: repoPath }),
+      baseBranchList: (repoPath: string) =>
+        cmd<HermesGitBaseBranch[]>('baseBranchList', { path: repoPath }),
+      repoStatus: (repoPath: string) =>
+        cmd<HermesRepoStatus | null>('repoStatus', { path: repoPath }),
+      fileDiff: (repoPath: string, filePath: string) =>
+        cmd<string>('fileDiff', { path: repoPath, file: filePath }),
+      scanRepos: (roots: string[], options?: { maxDepth?: number }) =>
+        cmd<string[]>('scanRepos', { dir: roots[0] ?? '' })
+          .then(paths => paths.map(root => ({ root, label: root.split('/').pop() || root }))),
       review: {
-        list: () => Promise.resolve([]),
-        diff: () => Promise.resolve(''),
-        stage: () => Promise.resolve({ ok: false, error: 'not available' }),
-        unstage: () => Promise.resolve({ ok: false, error: 'not available' }),
-        revert: () => Promise.resolve({ ok: false, error: 'not available' }),
-        revParse: () => Promise.resolve(''),
-        commit: () => Promise.resolve({ ok: false, error: 'not available' }),
-        commitContext: () => Promise.resolve({}),
-        push: () => Promise.resolve({ ok: false, error: 'not available' }),
-        shipInfo: () => Promise.resolve({}),
-        createPr: () => Promise.resolve({ ok: false, error: 'not available' }),
+        list: (repoPath: string, _scope: string, _baseRef?: null | string) =>
+          cmd<HermesReviewList>('reviewList', { path: repoPath }),
+        diff: (repoPath: string, filePath: string, _scope: string, _baseRef?: null | string, staged?: boolean) =>
+          cmd<string>('reviewDiff', { path: repoPath, file: filePath, staged }),
+        stage: async (repoPath: string, filePath?: null | string) => {
+          try { await cmd<void>('reviewStage', { path: repoPath, files: filePath ? [filePath] : [] }); return { ok: true } }
+          catch { return { ok: false } }
+        },
+        unstage: async (repoPath: string, filePath?: null | string) => {
+          try { await cmd<void>('reviewUnstage', { path: repoPath, files: filePath ? [filePath] : [] }); return { ok: true } }
+          catch { return { ok: false } }
+        },
+        revert: async (repoPath: string, filePath?: null | string) => {
+          try { await cmd<void>('reviewRevert', { path: repoPath, files: filePath ? [filePath] : [] }); return { ok: true } }
+          catch { return { ok: false } }
+        },
+        revParse: (repoPath: string, ref?: null | string) =>
+          cmd<string | null>('reviewRevParse', { path: repoPath, rev: ref ?? 'HEAD' }),
+        commit: async (repoPath: string, message: string, push: boolean) => {
+          try {
+            await cmd<void>('reviewCommit', { path: repoPath, message })
+            if (push) await cmd<void>('reviewPush', { path: repoPath })
+            return { ok: true }
+          } catch { return { ok: false } }
+        },
+        commitContext: (repoPath: string) =>
+          cmd<{ diff: string; recent: string }>('reviewCommitContext', { path: repoPath }),
+        push: async (repoPath: string) => {
+          try { await cmd<void>('reviewPush', { path: repoPath }); return { ok: true } }
+          catch { return { ok: false } }
+        },
+        shipInfo: (repoPath: string) =>
+          cmd<HermesReviewShipInfo>('reviewShipInfo', { path: repoPath }),
+        createPr: () => Promise.resolve({ url: '' }),
       },
     },
 

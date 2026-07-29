@@ -405,7 +405,7 @@ function ToolEntry({ part }: ToolEntryProps) {
           'size-5 rounded-md text-(--ui-text-tertiary) transition-opacity hover:text-(--ui-text-primary) hover:opacity-100',
           open
             ? 'opacity-80'
-            : 'opacity-0 group-hover/disclosure-row:opacity-80 group-focus-within/disclosure-row:opacity-80'
+            : 'opacity-80 group-hover/disclosure-row:opacity-100 group-focus-within/disclosure-row:opacity-100'
         )}
         onClick={event => {
           event.stopPropagation()

@@ -219,7 +219,7 @@ export function PanelRowMenu({ items, label = 'Actions' }: { items: PanelMenuIte
         <Tip label={label}>
           <Button
             aria-label={label}
-            className="size-5 rounded-[4px] bg-transparent text-(--ui-text-tertiary) transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:opacity-100 focus-visible:ring-0 group-hover/row:opacity-100 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground data-[state=open]:opacity-100 [&_svg]:size-3.5!"
+            className="size-5 rounded-[4px] bg-transparent text-(--ui-text-tertiary) transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:opacity-100 focus-visible:ring-0 opacity-100 group-hover/row:opacity-80 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground data-[state=open]:opacity-100 [&_svg]:size-3.5!"
             size="icon"
             variant="ghost"
           >

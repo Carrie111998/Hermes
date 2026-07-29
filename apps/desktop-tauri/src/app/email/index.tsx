@@ -1,10 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { cn } from '@/lib/utils'
 
-const API = 'http://127.0.0.1:19876/api/email'
+const EMAIL_API = 'http://127.0.0.1:19876/api/email'
+
+/** Tauri-safe fetch — routes through Rust api() proxy, bypasses WebKitGTK CORS */
+async function emailFetch<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+  const raw = await invoke<{ status: number; data: T }>('api', {
+    request: {
+      url: `${EMAIL_API}${path}`,
+      method,
+      headers: body && method === 'POST' ? [['Content-Type', 'application/json'] as [string, string]] : [],
+      body: body ?? null,
+    },
+  })
+  return raw.data
+}
 
 interface Email {
   id: string
@@ -37,8 +51,7 @@ export function EmailView() {
   const loadInbox = useCallback(async () => {
     setLoading(true)
     try {
-      const r = await fetch(`${API}/inbox`)
-      const data = await r.json()
+      const data = await emailFetch<Email[]>('/inbox')
       setEmails(Array.isArray(data) ? data : [])
     } catch { setEmails([]) }
     setLoading(false)
@@ -50,8 +63,8 @@ export function EmailView() {
     setDetailLoading(true)
     setView('detail')
     try {
-      const r = await fetch(`${API}/read/${id}`)
-      setDetail(await r.json())
+      const detail = await emailFetch<EmailDetail>(`/read/${id}`)
+      setDetail(detail)
     } catch { setDetail(null) }
     setDetailLoading(false)
   }, [])
@@ -71,12 +84,7 @@ export function EmailView() {
     setSending(true)
     setError('')
     try {
-      const r = await fetch(`${API}/send`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(compose),
-      })
-      const res = await r.json()
+      const res = await emailFetch<{ success: boolean; error?: string }>('/send', 'POST', compose)
       if (res.success) {
         setView('inbox')
         setCompose({ to: '', subject: '', body: '' })
