@@ -21415,16 +21415,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "" if last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
                 )
                 _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
-                # Single-line, capped preview for non-verbose modes.
+                # Capped preview for non-verbose modes.  Treat
+                # tool_preview_length as a TOTAL-length budget: when the whole
+                # command (all lines) fits the budget, render it in full — so a
+                # multi-line command a user opted into (by raising
+                # tool_preview_length) shows completely.  When it exceeds the
+                # budget, preserve the existing collapse-to-first-line behaviour
+                # exactly, so a long/multiline command never becomes a huge
+                # persistent block (the #42634 / commit 8d99b5bc size policy).
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
-                _lines = _cmd_full.splitlines()
-                _cmd_short = _lines[0] if _lines else _cmd_full
-                _multiline = len(_lines) > 1
-                if len(_cmd_short) > _cap:
-                    _cmd_short = _cmd_short[:_cap - 3] + "..."
-                elif _multiline:
-                    _cmd_short = _cmd_short + " ..."
+                if len(_cmd_full) <= _cap:
+                    _cmd_short = _cmd_full
+                else:
+                    _lines = _cmd_full.splitlines()
+                    _first = _lines[0] if _lines else _cmd_full
+                    _multiline = len(_lines) > 1
+                    if len(_first) > _cap:
+                        _cmd_short = _first[:_cap - 3] + "..."
+                    elif _multiline:
+                        _cmd_short = _first + " ..."
+                    else:
+                        _cmd_short = _first
                 _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
 
             # Verbose mode: show detailed arguments, respects tool_preview_length

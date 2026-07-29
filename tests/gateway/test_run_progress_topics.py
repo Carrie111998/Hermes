@@ -1711,6 +1711,62 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_terminal_progress_all_mode_full_command_when_within_budget(monkeypatch, tmp_path):
+    """Non-verbose ("all") mode renders the FULL multi-line command in a fenced
+    block when the whole command fits within tool_preview_length.  The default
+    cap still collapses over-budget commands to the first line
+    (test_terminal_progress_renders_fenced_code_block) — this covers the opt-in
+    path where an operator widened the budget."""
+    import yaml
+
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TerminalCommandAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    # Raise the budget above the command length so the whole thing fits.
+    config = {"display": {"tool_preview_length": 2000}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
+
+    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-terminal-code-block-all-full",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "done"
+    all_content = " ".join(call["content"] for call in adapter.sent)
+    all_content += " ".join(call["content"] for call in adapter.edits)
+    assert "```" in all_content
+    assert "```bash" not in all_content
+    # Whole multi-line command is present because it fits the raised budget.
+    assert "npm install -g hyperframes@latest" in all_content
+    assert "node --version" in all_content
+
+
+@pytest.mark.asyncio
 async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path):
     """Verbose mode on a markdown-capable gateway renders the FULL multi-line
     command in a bare fenced block (no truncation, no 'bash' tag).  This is the
