@@ -235,6 +235,14 @@ async def test_membership_event_subscribes_new_conversations():
         adapter._channel_state["new-dm"] = {"chat_type": "dm", "last_ts": 0, "seen": {}}
 
     adapter._discover_dms = fake_discover
+
+    # Membership handling also refreshes joined group channels, which shells
+    # out to the buzz CLI. Stub the CLI so this test never depends on the
+    # binary being installed (CI runners do not have it).
+    async def fake_run_cli(args, *, input_text=None):
+        return 0, "[]", ""
+
+    adapter._run_cli = fake_run_cli
     ws = _FakeWebSocket()
     subscriptions = {"hermes-buzz-0": "old-chan"}
     await adapter._handle_membership_event(
