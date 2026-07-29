@@ -1,8 +1,8 @@
 # Charterforge Roadmap to v1.0.0
 
-**Current Version:** v1.0.0-rc2 (2026-07-28)  
-**Release Type:** Release candidate — runtime proof passes, CI verification pending  
-**Gap:** CI green on combined test suite required before v1.0.0 final
+**Current Version:** v1.0.0 (2026-07-29)  
+**Release Type:** Final — runtime proof passes, CI verified  
+**Evidence:** Workflow run 30420568702, commit 73077d519
 
 ---
 
@@ -20,7 +20,7 @@
 | **0.27.0** | Monitoring & Observability | Metrics, traces, health dashboards | ✅ Released |
 | **0.28.0** | Disaster Recovery | Backup/restore, failover drill | ✅ Released |
 | **0.29.0** | Security Hardening | Audit logging, secret management | ✅ Released |
-| **1.0.0** | Production Release | Feature-complete, documented, stable API | 🟡 RC2 — CI verification pending |
+| **1.0.0** | Production Release | Feature-complete, documented, stable API | ✅ Released |
 
 ---
 
@@ -113,7 +113,7 @@
 
 **Goal:** Prove the full stack works as an autonomous business runtime under realistic failure conditions.
 
-**Status:** 🟡 RC2 — runtime proof passes, CI verification pending.
+**Status:** ✅ Released — runtime proof passes, CI verified (run 30420568702).
 
 ### What v1.0.0-rc2 proves (release-admissibility test)
 
@@ -158,7 +158,7 @@ two explicit tenants
 → no cross-tenant visibility or mutation at any point
 ```
 
-### Additional evidence required
+### Evidence (all satisfied)
 
 - [x] Multi-process test (subprocess spawn, not in-process bridge instantiation)
 - [x] Real lease expiry (accelerated via SQL after SIGKILL proves worker death)
@@ -166,8 +166,18 @@ two explicit tenants
 - [x] Explicit tenant propagation (HERMES_TENANT_ID set, not DEFAULT_TENANT_ID fallback)
 - [x] Cross-tenant isolation assertions (same task_id, different org per tenant)
 - [x] SIGKILL recovery (os.kill SIGKILL, not logical release)
-- [ ] CI green on combined test suite
+- [x] CI green on combined test suite (workflow run 30420568702)
 - [x] No raw SQL mutation in acceptance tests (public API only, except claim expiry acceleration)
+
+### Explicit exclusions
+
+The v1.0.0 release does NOT claim:
+
+- Live payment provider recovery (test uses a deterministic Postgres-based provider)
+- Multi-host failover (process-separated on a single machine, not distributed)
+- Managed Postgres failover or network-partition tolerance
+- Kubernetes or systemd supervision
+- Legal, regulatory, or organizational production readiness
 
 ---
 
