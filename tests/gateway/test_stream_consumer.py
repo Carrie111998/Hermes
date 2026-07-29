@@ -1541,6 +1541,11 @@ class TestFilterAndAccumulate:
         c._filter_and_accumulate("<think>internal reasoning</think>Answer here")
         assert c._accumulated == "Answer here"
 
+    def test_complete_minimax_m3_think_block_stripped(self):
+        c = _make_consumer()
+        c._filter_and_accumulate("<mm:think>internal reasoning</mm:think>Answer here")
+        assert c._accumulated == "Answer here"
+
     def test_think_block_in_middle(self):
         c = _make_consumer()
         c._filter_and_accumulate("Prefix\n<think>reasoning</think>\nSuffix")
@@ -1558,6 +1563,13 @@ class TestFilterAndAccumulate:
         # Partial tag held back
         assert c._accumulated == ""
         c._filter_and_accumulate("nk>hidden</think>shown")
+        assert c._accumulated == "shown"
+
+    def test_minimax_m3_opening_tag_split_across_deltas(self):
+        c = _make_consumer()
+        c._filter_and_accumulate("<mm:")
+        assert c._accumulated == ""
+        c._filter_and_accumulate("think>hidden</mm:think>shown")
         assert c._accumulated == "shown"
 
     def test_closing_tag_split_across_deltas(self):
