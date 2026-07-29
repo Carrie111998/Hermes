@@ -48,6 +48,7 @@ class _Snowflake:
         self.id = id
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
+_DEFAULT_AUTO_THREAD_ARCHIVE_MINUTES = 1440
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
@@ -850,6 +851,19 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw in {"true", "1", "yes", "on"}
+
+
+def _auto_thread_archive_minutes() -> int:
+    """Return the configured Discord auto-thread archive duration."""
+    try:
+        value = int(os.getenv("DISCORD_AUTO_THREAD_ARCHIVE_MINUTES", ""))
+    except (TypeError, ValueError):
+        return _DEFAULT_AUTO_THREAD_ARCHIVE_MINUTES
+    return (
+        value
+        if value in VALID_THREAD_AUTO_ARCHIVE_MINUTES
+        else _DEFAULT_AUTO_THREAD_ARCHIVE_MINUTES
+    )
 
 
 def _read_discord_prompt_timeout() -> int:
@@ -6557,6 +6571,7 @@ class DiscordAdapter(BasePlatformAdapter):
         burn through to the caller's failure path (#20243).
         """
         thread_name = self._derive_auto_thread_name(message.content or "")
+        auto_archive_duration = _auto_thread_archive_minutes()
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
         reason = f"Auto-threaded from mention by {display_name}"
 
@@ -6565,7 +6580,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
         for attempt in range(2):
             try:
-                thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+                thread = await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=auto_archive_duration,
+                )
                 try:
                     setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
                 except Exception:
@@ -6579,7 +6597,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
                     thread = await seed_msg.create_thread(
                         name=thread_name,
-                        auto_archive_duration=1440,
+                        auto_archive_duration=auto_archive_duration,
                         reason=reason,
                     )
                     try:
@@ -9686,6 +9704,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+    if (
+        "auto_thread_archive_minutes" in discord_cfg
+        and not os.getenv("DISCORD_AUTO_THREAD_ARCHIVE_MINUTES")
+    ):
+        os.environ["DISCORD_AUTO_THREAD_ARCHIVE_MINUTES"] = str(
+            discord_cfg["auto_thread_archive_minutes"]
+        )
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     seeded_extra = {}

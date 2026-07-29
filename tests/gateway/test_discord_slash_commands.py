@@ -574,7 +574,8 @@ def test_build_slash_event_uses_group_context_for_channels(adapter):
 
 
 @pytest.mark.asyncio
-async def test_auto_create_thread_uses_message_content_as_name(adapter):
+async def test_auto_create_thread_uses_message_content_as_name(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_AUTO_THREAD_ARCHIVE_MINUTES", raising=False)
     thread = SimpleNamespace(id=999, name="Hello world")
     message = SimpleNamespace(
         content="Hello world, how are you?",
@@ -591,6 +592,38 @@ async def test_auto_create_thread_uses_message_content_as_name(adapter):
     assert call_kwargs["name"] == "Hello world, how are you?"
     assert call_kwargs["auto_archive_duration"] == 1440
     assert thread._hermes_auto_thread_initial_name == "Hello world, how are you?"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_uses_configured_archive_duration(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_AUTO_THREAD_ARCHIVE_MINUTES", "4320")
+    thread = SimpleNamespace(id=999, name="Hello")
+    message = SimpleNamespace(
+        content="Hello",
+        create_thread=AsyncMock(return_value=thread),
+        channel=SimpleNamespace(send=AsyncMock()),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    await adapter._auto_create_thread(message)
+
+    assert message.create_thread.await_args.kwargs["auto_archive_duration"] == 4320
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_rejects_invalid_archive_duration(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_AUTO_THREAD_ARCHIVE_MINUTES", "999")
+    thread = SimpleNamespace(id=999, name="Hello")
+    message = SimpleNamespace(
+        content="Hello",
+        create_thread=AsyncMock(return_value=thread),
+        channel=SimpleNamespace(send=AsyncMock()),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    await adapter._auto_create_thread(message)
+
+    assert message.create_thread.await_args.kwargs["auto_archive_duration"] == 1440
 
 
 @pytest.mark.asyncio
@@ -930,10 +963,14 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
     hermes_dir.mkdir()
     config_path = hermes_dir / "config.yaml"
     config_path.write_text(yaml.dump({
-        "discord": {"auto_thread": True},
+        "discord": {
+            "auto_thread": True,
+            "auto_thread_archive_minutes": 4320,
+        },
     }))
 
     monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD_ARCHIVE_MINUTES", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
@@ -942,6 +979,7 @@ def test_discord_auto_thread_config_bridge(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_AUTO_THREAD") == "true"
+    assert os.getenv("DISCORD_AUTO_THREAD_ARCHIVE_MINUTES") == "4320"
 
 
 # ------------------------------------------------------------------

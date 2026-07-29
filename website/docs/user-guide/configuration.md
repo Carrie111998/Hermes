@@ -2006,11 +2006,13 @@ discord:
   require_mention: true          # Require @mention to respond in server channels
   free_response_channels: ""     # Comma-separated channel IDs where bot responds without @mention
   auto_thread: true              # Auto-create threads on @mention in channels
+  auto_thread_archive_minutes: 1440  # 60, 1440, 4320, or 10080
 ```
 
 - `require_mention` — when `true` (default), the bot only responds in server channels when mentioned with `@BotName`. DMs always work without mention.
 - `free_response_channels` — comma-separated list of channel IDs where the bot responds to every message without requiring a mention.
 - `auto_thread` — when `true` (default), mentions in channels automatically create a thread for the conversation, keeping channels clean (similar to Slack threading).
+- `auto_thread_archive_minutes` — auto-archive duration for automatically created threads. Discord accepts `60`, `1440`, `4320`, or `10080`; invalid values fall back to `1440`.
 
 ## Security
 
