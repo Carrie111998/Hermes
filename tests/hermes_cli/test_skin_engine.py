@@ -67,6 +67,31 @@ class TestBuiltinSkins:
         assert isinstance(wings[0], tuple)
         assert len(wings[0]) == 2
 
+    def test_hades_skin_loads(self):
+        from hermes_cli.skin_engine import load_skin
+        skin = load_skin("hades")
+        assert skin.name == "hades"
+        assert skin.tool_prefix == "╎"
+        # Violet identity: border stays blue-dominant over green (exact values
+        # are owned by the palette audit in test_skin_palettes.py, which
+        # enforces contrast floors — don't pin literals here).
+        border = skin.get_color("banner_border")
+        r, g, b = (int(border[i:i + 2], 16) for i in (1, 3, 5))
+        assert b > g and r > g, f"hades border lost its violet: {border}"
+        assert skin.get_color("response_border") == "#A855F7"
+        assert skin.get_color("session_label") == "#C084FC"
+        assert skin.get_color("session_border") == "#9F7AC4"
+        assert skin.get_branding("agent_name") == "Hades Agent"
+        assert skin.get_branding("help_header") == "(Ω) Available Commands"
+
+    def test_hades_has_spinner_customization(self):
+        from hermes_cli.skin_engine import load_skin
+        skin = load_skin("hades")
+        wings = skin.get_spinner_wings()
+        assert len(wings) > 0
+        assert isinstance(wings[0], tuple)
+        assert len(wings[0]) == 2
+
     def test_mono_skin_loads(self):
         from hermes_cli.skin_engine import load_skin
         skin = load_skin("mono")
@@ -147,6 +172,7 @@ class TestSkinManagement:
         names = [s["name"] for s in skins]
         assert "default" in names
         assert "ares" in names
+        assert "hades" in names
         assert "mono" in names
         assert "slate" in names
         assert "daylight" in names
