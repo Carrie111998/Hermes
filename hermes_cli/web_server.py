@@ -17139,7 +17139,12 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return False
 
     host_header = ws.headers.get("host", "")
-    if not _host_accepted(host_header):
+    # NOTE: Host header stays gated to the bound loopback host only. Public-host
+    # relaxation applies to the Origin header below (browsers send Origin across
+    # reverse proxies like cloudflared, but the Host header is rewritten upstream
+    # to localhost in those topologies — relaxing it here would broaden the
+    # surface unnecessarily. See PR #65965 review comment by @Kinkoolino-Hermes.
+    if not _is_accepted_host(host_header, bound_host):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
 
     origin = ws.headers.get("origin", "")
