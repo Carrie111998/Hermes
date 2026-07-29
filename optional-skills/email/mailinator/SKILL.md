@@ -45,9 +45,17 @@ curl -s "https://www.mailinator.com/api/v2/domains/public/inboxes/joe" | python3
 ```
 
 Response includes:
-- `msgs`: Array of email metadata (id, from, subject, time, seconds_ago)
+- `msgs`: Array of email metadata (`id`, `from`, `fromfull`, `origfrom`, `subject`, `to`, `time`, `seconds_ago`, `ip`)
 - `domain`: The domain used (public)
 - `to`: The inbox name
+
+> **Endpoint status:** The `domains/public/...` path above is verified working
+> (HTTP 200 with a live `msgs` array), but Mailinator's official API overview
+> (https://www.mailinator.com/mailinator-api/) documents the token-authenticated
+> **private**-inbox workflow rather than this public path. Treat the public
+> endpoint as a convenient, verified public interface and the token/private
+> workflow (see "Public vs Private Domains" below) as the authoritative,
+> upstream-documented contract for anything beyond throwaway public inboxes.
 
 ### Get Email Content
 
@@ -67,8 +75,15 @@ Response includes:
 
 ## Public vs Private Domains
 
-- **Public domains** (e.g., mailinator.com, gmail.com): No authentication required
-- **Private domains**: Require an API token (contact Mailinator for access)
+- **Public domains** (e.g., mailinator.com): No authentication required. Verified
+  working against `https://www.mailinator.com/api/v2/domains/public/...`.
+- **Private domains**: Require an API token. Per Mailinator's API overview, you
+  (1) sign up for a plan with a private domain and (2) generate your unique API
+  token in the dashboard. Private endpoints are documented under the
+  `api.mailinator.com` host, e.g.
+  `GET https://api.mailinator.com/api/v2/domains/private/inboxes/{inbox}` and
+  message/SMS fetch + HTTP POST inject variants. See the token-authenticated
+  examples in "Advanced Examples" below.
 
 ## HTTP API vs MCP
 
@@ -98,9 +113,11 @@ For detailed comparison, see `references/mcp-vs-http-api.md`.
 ### Private Domain Access (with API Token)
 
 ```bash
-# For private domains, include your API token
-curl -s "https://www.mailinator.com/api/v2/domains/{your-domain}/inboxes/{inbox}" \
-  -H "Authorization: Bearer YOUR_API_TOKEN"
+# For private domains, use the api.mailinator.com host and pass your API token.
+# The token is documented as a bearer credential; some tooling also accepts it
+# as a ?token= query parameter.
+curl -s "https://api.mailinator.com/api/v2/domains/{your-domain}/inboxes/{inbox}" \
+  -H "Authorization: Bearer ***"
 ```
 
 ### Error Handling
@@ -123,12 +140,19 @@ fi
 ### Integration with Hermes Agent
 
 ```python
-# Add this to your Hermes skill or agent tool
-from hermes_tools import terminal
+# Add this to your Hermes skill or agent tool.
+# SECURITY: never interpolate dynamic values straight into a shell string.
+# Quote every dynamic component with the supported shell_quote helper so a
+# quote, space, or command substitution ($(...), backticks) in inbox_name /
+# message_id cannot escape the URL and execute arbitrary commands.
+from hermes_tools import terminal, shell_quote, json_parse
+
+BASE = "https://www.mailinator.com/api/v2/domains/public/inboxes"
 
 def fetch_inbox(inbox_name: str) -> dict:
     """Fetch emails from a Mailinator inbox."""
-    cmd = f'curl -s "https://www.mailinator.com/api/v2/domains/public/inboxes/{inbox_name}"'
+    url = f"{BASE}/{inbox_name}"
+    cmd = f"curl -s {shell_quote(url)}"
     result = terminal(command=cmd)
     if result["exit_code"] == 0:
         return json_parse(result["output"])
@@ -136,46 +160,37 @@ def fetch_inbox(inbox_name: str) -> dict:
 
 def fetch_email(inbox_name: str, message_id: str) -> dict:
     """Fetch a specific email's content."""
-    cmd = f'curl -s "https://www.mailinator.com/api/v2/domains/public/inboxes/{inbox_name}/messages/{message_id}?format=raw"'
+    url = f"{BASE}/{inbox_name}/messages/{message_id}?format=raw"
+    cmd = f"curl -s {shell_quote(url)}"
     result = terminal(command=cmd)
     if result["exit_code"] == 0:
         return json_parse(result["output"])
     raise Exception(f"Failed to fetch email: {result['output']}")
 ```
 
-### Alert When New Email Arrives (Cron Job)
+### Alert When New Email Arrives (Cross-Platform Hermes Cronjob)
 
-```bash
-# Create a cron job to check for new emails every 5 minutes
-# Add to your crontab: */5 * * * * /path/to/mailinator-alert.sh
+Use Hermes' built-in `cronjob` tool rather than an OS-specific `crontab`/bash
+script. This works identically on Linux, macOS, and Windows (no `crontab`,
+no `/tmp`, no shell-specific syntax), which keeps this skill honest about its
+declared `platforms: [linux, macos, windows]`.
 
-#!/bin/bash
-# mailinator-alert.sh
+Ask Hermes to create a recurring job whose prompt does the polling and
+comparison in-agent. For example:
 
-INBOX="joe"
-LAST_CHECK_FILE="/tmp/mailinator_${INBOX}_last_check"
+> "Every 5 minutes, fetch the Mailinator inbox 'joe' via
+> `https://www.mailinator.com/api/v2/domains/public/inboxes/joe`, count the
+> messages, and if the count is higher than the previous run, alert me with how
+> many new messages arrived. Remember the last count between runs."
 
-# Get current message count
-CURRENT_COUNT=$(curl -s "https://www.mailinator.com/api/v2/domains/public/inboxes/${INBOX}" | \
-  python3 -c "import sys,json; print(len(json.load(sys.stdin).get('msgs',[])))" 2>/dev/null)
+The agent persists the previous count in its own state across runs, so there is
+no temp-file bookkeeping. Delivery/notification is handled by the cronjob's
+`deliver` target (a connected messaging platform), not by a hand-rolled
+notification block.
 
-# Get previous count
-if [ -f "$LAST_CHECK_FILE" ]; then
-  PREVIOUS_COUNT=$(cat "$LAST_CHECK_FILE")
-else
-  PREVIOUS_COUNT=0
-fi
-
-# Save current count for next check
-echo "$CURRENT_COUNT" > "$LAST_CHECK_FILE"
-
-# Alert if new messages arrived
-if [ "$CURRENT_COUNT" -gt "$PREVIOUS_COUNT" ]; then
-  NEW_MSGS=$((CURRENT_COUNT - PREVIOUS_COUNT))
-  echo "New email alert: ${NEW_MSGS} new message(s) in ${INBOX} inbox"
-  # Add your notification logic here (Slack, email, etc.)
-fi
-```
+If you specifically need a raw scripted poller on a Unix-like host, the logic is
+simply: GET the inbox, `len(msgs)`, compare to the previously stored count, and
+alert on an increase — but prefer the Hermes cronjob above for portability.
 
 ## References
 
