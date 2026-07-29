@@ -2,12 +2,8 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
-<<<<<<< HEAD
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
-=======
 import { bulkArchiveSessions, deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
->>>>>>> 239cbaba6 (Refresh onto current upstream/main (no behavior change))
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
@@ -17,12 +13,7 @@ import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
-<<<<<<< HEAD
-import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
-=======
 import { $activeGatewayProfile, $newChatProfile, $profileScope, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
-import { resolveNewSessionCwd, tombstoneSessions, untombstoneSessions } from '@/store/projects'
->>>>>>> 239cbaba6 (Refresh onto current upstream/main (no behavior change))
 import {
   beginSessionMutation,
   endSessionMutation,
@@ -40,8 +31,6 @@ import {
   $messages,
   $newChatWorkspaceTarget,
   $sessions,
-  $sessionsTotal,
-  $workingSessionIds,
   $yoloActive,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
@@ -69,6 +58,7 @@ import {
 } from '@/store/session'
 import {
   $sessionTiles,
+  $workingSessionIds,
   closeSessionTile,
   dropSessionState,
   openSessionTile,
@@ -78,11 +68,7 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
-<<<<<<< HEAD
-import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
-=======
-import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, UsageStats } from '@/types/hermes'
->>>>>>> 239cbaba6 (Refresh onto current upstream/main (no behavior change))
+import type { SessionCreateResponse, SessionInfo, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -1468,7 +1454,6 @@ export function useSessionActions({
     clearNotifications()
 
     const previousSessions = $sessions.get()
-    const previousTotal = $sessionsTotal.get()
     const preserveIds = new Set<string>([...$pinnedSessionIds.get(), ...$workingSessionIds.get()])
 
     if (selectedStoredSessionId) {
@@ -1490,7 +1475,6 @@ export function useSessionActions({
 
     const keptSessions = previousSessions.filter(shouldPreserve)
     setSessions(keptSessions)
-    setSessionsTotal(keptSessions.length)
 
     try {
       const result = await bulkArchiveSessions([...preserveIds], $profileScope.get())
@@ -1503,7 +1487,6 @@ export function useSessionActions({
       return result
     } catch (err) {
       setSessions(previousSessions)
-      setSessionsTotal(previousTotal)
       notifyError(err, 'Archive all failed')
       throw err
     }

@@ -8,9 +8,7 @@ import { useLocation } from 'react-router-dom'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-<<<<<<< HEAD
 import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from '@/components/ui/context-menu'
-=======
 import {
   Dialog,
   DialogContent,
@@ -19,7 +17,6 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
->>>>>>> 239cbaba6 (Refresh onto current upstream/main (no behavior change))
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { KbdGroup } from '@/components/ui/kbd'
 import { SearchField } from '@/components/ui/search-field'
@@ -32,12 +29,8 @@ import {
   SidebarMenuButton,
   SidebarMenuItem
 } from '@/components/ui/sidebar'
-<<<<<<< HEAD
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useContributions } from '@/contrib/react/use-contributions'
-=======
-import { Tip } from '@/components/ui/tooltip'
->>>>>>> 239cbaba6 (Refresh onto current upstream/main (no behavior change))
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
@@ -1030,11 +1023,6 @@ export function ChatSidebar({
     ? Object.values(sessionProfilesTruncated).some(Boolean)
     : Boolean(sessionProfilesTruncated[profileScope])
 
-<<<<<<< HEAD
-=======
-  const hasMoreSessions = knownSessionTotal > loadedSessionCount
-
-  const recentsMeta = countLabel(displayAgentSessions.length, knownSessionTotal)
   const archiveAllDisabled = sessionsLoading || agentSessions.length === 0 || archiveAllSubmitting
 
   const handleArchiveAll = async () => {
@@ -1054,7 +1042,6 @@ export function ChatSidebar({
     }
   }
 
->>>>>>> 239cbaba6 (Refresh onto current upstream/main (no behavior change))
   const displayRecentsCountRef = useRef(0)
   const loadedRecentsCountRef = useRef(0)
   displayRecentsCountRef.current = displayAgentSessions.length
@@ -1601,7 +1588,7 @@ export function ChatSidebar({
       </SidebarContent>
       <ProjectDialog />
       <ArchiveAllSessionsDialog
-        count={knownSessionTotal}
+        count={displayAgentSessions.length}
         onConfirm={handleArchiveAll}
         onOpenChange={setArchiveAllOpen}
         open={archiveAllOpen}
