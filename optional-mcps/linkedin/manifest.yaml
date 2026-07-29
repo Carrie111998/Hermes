@@ -1,0 +1,77 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: linkedin
+description: Read LinkedIn profiles, companies, employees, and jobs through an isolated browser session.
+source: https://github.com/stickerdaniel/linkedin-mcp-server
+
+# Community-maintained Apache-2.0 server. It runs locally and reuses a
+# persistent Patchright Chromium profile under ~/.linkedin-mcp/.
+transport:
+  type: stdio
+  command: "uvx"
+  # 4.17.0 was released 2026-06-28 and has completed the catalog's required
+  # two-week supply-chain cooldown. The catalog never auto-updates; a version
+  # bump is a reviewed PR to this manifest.
+  args:
+    - "mcp-server-linkedin==4.17.0"
+    - "--no-auto-import"
+    - "--timeout"
+    - "10000"
+    - "--tool-timeout"
+    - "300"
+  version: "4.17.0"
+  env:
+    UV_HTTP_TIMEOUT: "300"
+    AUTO_IMPORT_FROM_BROWSER: "false"
+
+# Authentication lives in the user's local browser profile, not an API key.
+auth:
+  type: none
+
+# The server advertises 17 tools in 4.17.0. Default to the read-only career
+# research surface. Connection requests, messages, inbox/conversation access,
+# the authenticated user's own profile, the home feed, and destructive session
+# cleanup require an explicit opt-in through `hermes mcp configure linkedin`.
+tools:
+  default_enabled:
+    - get_person_profile
+    - search_people
+    - get_sidebar_profiles
+    - get_company_profile
+    - get_company_posts
+    - search_companies
+    - get_company_employees
+    - get_job_details
+    - search_jobs
+
+post_install: |
+  One-time setup requires a manual LinkedIn login in an isolated browser:
+
+    uvx 'mcp-server-linkedin==4.17.0' --login --no-headless \
+      --no-auto-import --login-timeout 0
+
+  Complete login, 2FA, captcha, or account checkpoints yourself. The session
+  persists under ~/.linkedin-mcp/profile/. Managed browser files live under
+  ~/.linkedin-mcp/patchright-browsers/.
+
+  Automatic cookie import from your everyday browser is disabled by default.
+  This avoids silently reading browser credentials and macOS Safe Storage.
+  To erase the isolated session:
+
+    uvx 'mcp-server-linkedin==4.17.0' --logout
+
+  The default tool set is read-only career research. Connection requests,
+  messages, inbox/conversation access, your own profile, the home feed, and
+  destructive session cleanup are off by default. Review and change the
+  checklist deliberately with:
+
+    hermes mcp configure linkedin
+
+  LinkedIn can challenge automation and may change page structure. Keep one
+  stable home-network session when possible; switching proxies or locations
+  can trigger checkpoints. This project is independent and is not affiliated
+  with or endorsed by LinkedIn or Microsoft.
+
+  Start a new Hermes session after login so the LinkedIn tools are loaded.
