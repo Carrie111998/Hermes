@@ -142,3 +142,50 @@ class TestCrashInterruptedRecovery:
         store._prune_stale_sessions_locked()
 
         assert "idle_key" not in store._entries, "idle-timeout session_reset should be pruned"
+
+    def test_session_reset_within_crash_window_preserved(self, tmp_path):
+        """Gap 1: session_reset ended <5 min before boot should be preserved.
+
+        These sessions were killed by the same SIGTERM/fsfreeze chain but
+        never received the crash_interrupted marker because the gateway was
+        killed mid-drain before suspend_recently_active() ran.
+        """
+        from datetime import timezone
+
+        recent = datetime.now(timezone.utc) - timedelta(seconds=90)
+        db = _db_returning({
+            "sid_recent": {
+                "end_reason": "session_reset",
+                "id": "sid_recent",
+                "ended_at": recent.isoformat(),
+            }
+        })
+        store = _make_store_with_db(tmp_path, db)
+        store._entries["recent_key"] = _make_entry("recent_key", "sid_recent")
+
+        store._prune_stale_sessions_locked()
+
+        assert "recent_key" in store._entries, (
+            "session_reset within 5-min crash window should be preserved"
+        )
+
+    def test_session_reset_outside_crash_window_pruned(self, tmp_path):
+        """Gap 1: session_reset ended >5 min before boot should still be pruned."""
+        from datetime import timezone
+
+        old = datetime.now(timezone.utc) - timedelta(minutes=30)
+        db = _db_returning({
+            "sid_old": {
+                "end_reason": "session_reset",
+                "id": "sid_old",
+                "ended_at": old.isoformat(),
+            }
+        })
+        store = _make_store_with_db(tmp_path, db)
+        store._entries["old_key"] = _make_entry("old_key", "sid_old")
+
+        store._prune_stale_sessions_locked()
+
+        assert "old_key" not in store._entries, (
+            "session_reset outside crash window should be pruned"
+        )

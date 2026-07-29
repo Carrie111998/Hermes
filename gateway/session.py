@@ -1362,6 +1362,39 @@ class SessionStore:
                     # Keep crash-interrupted entries for /resume recovery.
                     if end_reason == "crash_interrupted":
                         continue
+                    # Belt-and-braces: a session_reset ended within the crash
+                    # window (5 min before this boot) was almost certainly killed
+                    # by the same SIGTERM/fsfreeze chain that crash_interrupted
+                    # catches, but never received the marker because the gateway
+                    # was killed mid-drain before suspend_recently_active() ran.
+                    # Preserve it for /resume recovery rather than pruning.
+                    if end_reason == "session_reset":
+                        ended_at_raw = row.get("ended_at") or row.get("updated_at")
+                        if ended_at_raw is not None:
+                            try:
+                                from datetime import timedelta as _td
+                                ended_at = None
+                                if isinstance(ended_at_raw, (int, float)):
+                                    ended_at = datetime.fromtimestamp(float(ended_at_raw))
+                                elif isinstance(ended_at_raw, str):
+                                    _parsed = datetime.fromisoformat(
+                                        ended_at_raw.replace("Z", "+00:00")
+                                    )
+                                    # Normalize to naive local time for comparison
+                                    # with _now() which is also naive.
+                                    if _parsed.tzinfo is not None:
+                                        _parsed = _parsed.replace(tzinfo=None)
+                                    ended_at = _parsed
+                                if ended_at is not None and (_now() - ended_at) < _td(minutes=5):
+                                    logger.info(
+                                        "gateway.session: preserving session_reset entry "
+                                        "%r -> %s (ended %ss ago, within crash window)",
+                                        key, entry.session_id,
+                                        int((_now() - ended_at).total_seconds()),
+                                    )
+                                    continue
+                            except Exception:
+                                pass  # parsing failed — fall through to normal prune logic
                     recovered_entry = None
                     recovery_lookup_failed = False
                     if entry.origin is not None:
