@@ -7581,8 +7581,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
     # we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            "webhook_admitted",
+        }
     )
+
+    async def admit_webhook_turn(
+        self,
+        event: MessageEvent,
+        *,
+        expected_session_key: str,
+    ) -> bool:
+        """Durably admit a managed webhook turn before its HTTP 202.
+
+        The delivery ledger intentionally cannot contain the prompt.  Hermes'
+        canonical transcript is therefore the durable work record: append the
+        rendered user turn under the provider message id, verify that SQLite
+        can read it back, then mark the existing session ``resume_pending``.
+        A fresh process can now synthesize the normal non-interactive resume
+        turn without an in-memory adapter event or task.
+
+        Returns True when this process should schedule the resume event.  A
+        duplicate arriving while either adapter or runner state is active is
+        already owned and must not enqueue a second turn.
+        """
+        source = getattr(event, "source", None)
+        if source is None or source.platform != Platform.WEBHOOK:
+            raise ValueError("Durable webhook admission requires a webhook source")
+        message_id = str(getattr(event, "message_id", "") or "").strip()
+        if not message_id:
+            raise ValueError("Durable webhook admission requires a message id")
+
+        session_entry = await self.async_session_store.get_or_create_session(
+            source
+        )
+        session_key = session_entry.session_key
+        if session_key != expected_session_key:
+            raise RuntimeError("Webhook session identity changed during admission")
+
+        already_persisted = await self.async_session_store.has_platform_message_id(
+            session_entry.session_id,
+            message_id,
+        )
+        if not already_persisted:
+            timestamp = _coerce_gateway_timestamp(
+                getattr(event, "timestamp", None)
+            )
+            await self.async_session_store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "user",
+                    "content": event.text or "",
+                    "message_id": message_id,
+                    "timestamp": timestamp if timestamp is not None else time.time(),
+                },
+            )
+            persisted = await self.async_session_store.has_platform_message_id(
+                session_entry.session_id,
+                message_id,
+            )
+            if not persisted:
+                raise RuntimeError("Webhook turn transcript write was not durable")
+
+        if not session_entry.resume_pending:
+            marked = await self.async_session_store.mark_resume_pending(
+                session_key,
+                reason="webhook_admitted",
+            )
+            if not marked:
+                raise RuntimeError("Webhook turn resume marker was not durable")
+
+        adapter = self._adapter_for_source(source)
+        adapter_active = bool(
+            adapter is not None
+            and session_key in getattr(adapter, "_active_sessions", {})
+        )
+        runner_active = session_key in self._running_agents
+        return not (adapter_active or runner_active)
 
     async def _run_startup_resume_event(
         self,
@@ -7748,19 +7826,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
                 ledger_enabled,
+                mark_abandoned,
                 mark_delivered,
                 mark_failed,
                 sweep_recoverable,
             )
 
-            if not ledger_enabled():
-                return 0
             # Only claim rows we can actually send this boot: self.adapters
             # holds a platform only after its connect() succeeded, and each
             # claim spends one of the row's three redelivery attempts.
             _deliverable = {
                 getattr(p, "value", str(p)) for p in self.adapters
             }
+            if not ledger_enabled():
+                # The config gate still disables the best-effort general
+                # messaging ledger. Managed webhook callbacks are different:
+                # their HTTP 202 contract requires durable admission/recovery.
+                _deliverable.intersection_update({Platform.WEBHOOK.value})
             claimed = await asyncio.to_thread(
                 sweep_recoverable, None, deliverable_platforms=_deliverable
             )
@@ -7785,18 +7867,95 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
+            delivery_context = row.get("delivery_context")
+            restored = False
+            if delivery_context is not None:
+                restore_context = getattr(
+                    adapter,
+                    "restore_delivery_ledger_context",
+                    None,
+                )
+                try:
+                    restored = bool(
+                        callable(restore_context)
+                        and restore_context(
+                            row["chat_id"],
+                            delivery_context,
+                            session_key=row.get("session_key"),
+                        )
+                    )
+                except Exception:
+                    restored = False
+                    logger.debug(
+                        "obligation %s: delivery context restore failed",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
+                if not restored:
+                    try:
+                        if row.get("state") == "accepted":
+                            mark_abandoned(
+                                row["obligation_id"],
+                                "accepted delivery context restore failed",
+                            )
+                        else:
+                            mark_failed(
+                                row["obligation_id"],
+                                "delivery context restore failed",
+                            )
+                    except Exception:
+                        logger.debug(
+                            "obligation %s: failed to record context error",
+                            row["obligation_id"],
+                            exc_info=True,
+                        )
+                    continue
+            if row.get("state") == "accepted":
+                if delivery_context is None:
+                    try:
+                        mark_abandoned(
+                            row["obligation_id"],
+                            "accepted delivery context is unavailable",
+                        )
+                    except Exception:
+                        logger.debug(
+                            "obligation %s: failed to abandon invalid admission",
+                            row["obligation_id"],
+                            exc_info=True,
+                        )
+                # Admission rows restore only the route needed by the upcoming
+                # startup-resumed turn. They have no terminal content to send,
+                # consume no retry attempt, and must leave resume_pending set.
+                continue
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
-            metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            )
+            metadata = {}
+            if row.get("thread_id"):
+                metadata["thread_id"] = row["thread_id"]
+            delivery_metadata = row.get("delivery_metadata")
+            if isinstance(delivery_metadata, dict):
+                metadata.update(delivery_metadata)
+            metadata = metadata or None
             try:
-                result = await adapter.send(
-                    chat_id=row["chat_id"],
-                    content=content,
-                    metadata=metadata,
+                redeliver_claimed = getattr(
+                    type(adapter),
+                    "redeliver_claimed_obligation",
+                    None,
                 )
+                if callable(redeliver_claimed):
+                    result = await redeliver_claimed(
+                        adapter,
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
+                else:
+                    result = await adapter.send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
             except Exception as send_err:
                 logger.warning(
                     "obligation %s: redelivery send raised: %s",
@@ -7814,9 +7973,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"], row["attempts"],
                     )
                 else:
+                    durable_error = (
+                        "recovered terminal callback failed"
+                        if delivery_context is not None
+                        else str(getattr(result, "error", "") or "send failed")
+                    )
                     mark_failed(
                         row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
+                        durable_error,
                     )
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
@@ -14592,13 +14756,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 self._clear_restart_failure_count(session_key)
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception as _e:
-                    logger.debug(
-                        "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
-                    )
+                # A durably admitted webhook owns a terminal callback
+                # obligation, not merely an agent-run obligation.  Its marker
+                # is cleared by WebhookAdapter only after the terminal target
+                # accepts the callback (or by startup terminal redelivery).
+                defer_webhook_clear = (
+                    source.platform == Platform.WEBHOOK
+                    and getattr(session_entry, "resume_reason", None)
+                    == "webhook_admitted"
+                )
+                if not defer_webhook_clear:
+                    try:
+                        await self.async_session_store.clear_resume_pending(
+                            session_key
+                        )
+                    except Exception as _e:
+                        logger.debug(
+                            "clear_resume_pending failed for %s: %s",
+                            session_key, _e,
+                        )
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.

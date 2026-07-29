@@ -22,6 +22,7 @@ import weakref
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
+from gateway.delivery_metadata import mark_terminal_delivery
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,25 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
     notify_metadata = dict(metadata) if metadata else {}
     notify_metadata["notify"] = True
     return notify_metadata
+
+
+def _mark_webhook_terminal_metadata(
+    metadata: dict | None,
+    *,
+    platform,
+    outcome: str,
+    correlation_id,
+    delivery_id,
+) -> dict:
+    """Mark terminal webhook text without changing other platform metadata."""
+    if _platform_name(platform) != "webhook":
+        return dict(metadata) if metadata else {}
+    return mark_terminal_delivery(
+        metadata,
+        outcome=outcome,
+        correlation_id=correlation_id,
+        delivery_id=delivery_id,
+    )
 
 
 def _reply_anchor_for_event(event) -> str | None:
@@ -5902,6 +5922,13 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_text_metadata = _mark_webhook_terminal_metadata(
+                    _final_thread_metadata,
+                    platform=self.platform,
+                    outcome="success",
+                    correlation_id=getattr(event, "message_id", None) or session_key,
+                    delivery_id=getattr(event, "message_id", None) or session_key,
+                )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -6009,9 +6036,32 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
-                        event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                    _adapter_manages_terminal_ledger = False
+                    _ledger_owner = getattr(
+                        delivery_adapter,
+                        "manages_terminal_delivery_ledger",
+                        None,
+                    )
+                    if callable(_ledger_owner):
+                        try:
+                            _adapter_manages_terminal_ledger = bool(
+                                _ledger_owner(
+                                    event.source.chat_id,
+                                    _final_text_metadata,
+                                )
+                            )
+                        except Exception:
+                            logger.debug(
+                                "adapter delivery-ledger ownership check failed",
+                                exc_info=True,
+                            )
+                    if (
+                        not _adapter_manages_terminal_ledger
+                        and not is_ephemeral_response
+                        and not str(event.text or "").lstrip().startswith(
+                            ("/", self.typed_command_prefix or "!")
+                        )
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
@@ -6045,7 +6095,7 @@ class BasePlatformAdapter(ABC):
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
+                        metadata=_final_text_metadata,
                     )
                     _record_delivery(result)
                     if _obligation_id is not None:
@@ -6309,6 +6359,13 @@ class BasePlatformAdapter(ABC):
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                _error_metadata = _mark_webhook_terminal_metadata(
+                    _thread_metadata,
+                    platform=self.platform,
+                    outcome="error",
+                    correlation_id=getattr(event, "message_id", None) or session_key,
+                    delivery_id=getattr(event, "message_id", None) or session_key,
+                )
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
@@ -6316,7 +6373,7 @@ class BasePlatformAdapter(ABC):
                         f"{error_detail}\n"
                         "Try again or use /reset to start a fresh session."
                     ),
-                    metadata=_thread_metadata,
+                    metadata=_error_metadata,
                 )
             except Exception as notify_err:
                 logger.error(

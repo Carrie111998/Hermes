@@ -24,6 +24,7 @@ from gateway.config import (
 )
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
+from gateway.session import build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +36,15 @@ def _make_adapter(routes, **extra_kw) -> WebhookAdapter:
     extra = {"host": "0.0.0.0", "port": 0, "routes": routes}
     extra.update(extra_kw)
     config = PlatformConfig(enabled=True, extra=extra)
-    return WebhookAdapter(config)
+    adapter = WebhookAdapter(config)
+    runner = MagicMock()
+    runner.adapters = {}
+    runner.config = GatewayConfig()
+    runner._session_key_for_source = lambda source: build_session_key(source)
+    runner.admit_webhook_turn = AsyncMock(return_value=True)
+    runner.async_session_store.clear_resume_pending = AsyncMock(return_value=True)
+    adapter.gateway_runner = runner
+    return adapter
 
 
 def _create_app(adapter: WebhookAdapter) -> web.Application:
@@ -134,13 +143,18 @@ class TestGitHubPRWebhook:
         await asyncio.sleep(0.05)
 
         assert len(captured_events) == 1
-        event = captured_events[0]
-        assert "Review PR #42 by contributor" in event.text
-        assert "Add webhook adapter" in event.text
-        assert event.source.chat_type == "webhook"
-        assert event.source.platform == Platform.WEBHOOK
-        assert "github-pr" in event.source.chat_id
-        assert event.message_id == "gh-delivery-001"
+        resume_event = captured_events[0]
+        admitted_event = (
+            adapter.gateway_runner.admit_webhook_turn.await_args.args[0]
+        )
+        assert resume_event.text == ""
+        assert resume_event.internal is True
+        assert "Review PR #42 by contributor" in admitted_event.text
+        assert "Add webhook adapter" in admitted_event.text
+        assert admitted_event.source.chat_type == "webhook"
+        assert admitted_event.source.platform == Platform.WEBHOOK
+        assert "github-pr" in admitted_event.source.chat_id
+        assert admitted_event.message_id == "gh-delivery-001"
 
 
 # ===================================================================
@@ -199,9 +213,11 @@ class TestSkillsInjection:
             await asyncio.sleep(0.05)
 
             assert len(captured_events) == 1
-            event = captured_events[0]
+            admitted_event = (
+                adapter.gateway_runner.admit_webhook_turn.await_args.args[0]
+            )
             # The prompt should be the skill content, not the raw template
-            assert "You are a code reviewer" in event.text
+            assert "You are a code reviewer" in admitted_event.text
             mock_build.assert_called_once()
 
 
@@ -234,6 +250,11 @@ class TestCrossPlatformDelivery:
         mock_runner.adapters = {Platform.TELEGRAM: mock_tg_adapter}
         mock_runner.config = GatewayConfig(
             platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")}
+        )
+        mock_runner._session_key_for_source = lambda source: build_session_key(source)
+        mock_runner.admit_webhook_turn = AsyncMock(return_value=True)
+        mock_runner.async_session_store.clear_resume_pending = AsyncMock(
+            return_value=True
         )
         adapter.gateway_runner = mock_runner
 

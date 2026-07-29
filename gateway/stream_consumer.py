@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from gateway.delivery_metadata import mark_terminal_delivery
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
@@ -307,6 +308,7 @@ class GatewayStreamConsumer:
         self,
         *,
         final: bool = False,
+        is_turn_final: bool = True,
         expect_edits: bool = False,
     ) -> dict | None:
         """Return per-send metadata for stream-created messages.
@@ -327,6 +329,16 @@ class GatewayStreamConsumer:
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            platform = getattr(self.adapter, "platform", None)
+            platform_name = str(getattr(platform, "value", platform) or "").lower()
+            if platform_name == "webhook" and is_turn_final:
+                delivery_identity = self._initial_reply_to_id or self.chat_id
+                meta = mark_terminal_delivery(
+                    meta,
+                    outcome="success",
+                    correlation_id=delivery_identity,
+                    delivery_id=delivery_identity,
+                )
         return meta or None
 
     @property
@@ -1855,7 +1867,10 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_send(final=True),
+                metadata=self._metadata_for_send(
+                    final=True,
+                    is_turn_final=is_turn_final,
+                ),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -2245,6 +2260,7 @@ class GatewayStreamConsumer:
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
                         final=finalize,
+                        is_turn_final=is_turn_final,
                         expect_edits=True,
                     ),
                 )

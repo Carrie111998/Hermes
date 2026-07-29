@@ -407,13 +407,7 @@ class TestWebhookEndpoints:
     def _setup(self, _isolate_hermes_home):
         self.client, _ = _client()
 
-    def test_list_disabled_and_create_blocked(self):
-        data = self.client.get("/api/webhooks").json()
-        assert data["enabled"] is False
-        r = self.client.post("/api/webhooks", json={"name": "gh", "deliver": "log"})
-        assert r.status_code == 400
-
-    def test_create_webhook_persists_script(self):
+    def _enable_webhook_platform(self):
         from hermes_cli.config import load_config, save_config
 
         cfg = load_config()
@@ -422,6 +416,15 @@ class TestWebhookEndpoints:
             "extra": {"host": "0.0.0.0", "port": 8644},
         }
         save_config(cfg)
+
+    def test_list_disabled_and_create_blocked(self):
+        data = self.client.get("/api/webhooks").json()
+        assert data["enabled"] is False
+        r = self.client.post("/api/webhooks", json={"name": "gh", "deliver": "log"})
+        assert r.status_code == 400
+
+    def test_create_webhook_persists_script(self):
+        self._enable_webhook_platform()
 
         r = self.client.post(
             "/api/webhooks",
@@ -436,6 +439,150 @@ class TestWebhookEndpoints:
 
         subs = self.client.get("/api/webhooks").json()["subscriptions"]
         assert subs[0]["script"] == "todoist_filter.py"
+
+    def test_create_and_list_project_exact_deliver_chat_id_without_list_secret(self):
+        """Authoritative secret-safe correlation binding for dashboard bootstrap.
+
+        Create stores deliver_extra.chat_id and must project the exact non-secret
+        deliver_chat_id on both create and list. The HMAC secret is one-time on
+        create only; list must never return secret or the raw deliver_extra bag.
+        """
+        import json as _json
+
+        self._enable_webhook_platform()
+
+        create = self.client.post(
+            "/api/webhooks",
+            json={
+                "name": "ella-synthetic",
+                "description": "Synthetic callback route",
+                "events": ["ella.synthetic"],
+                "prompt": "Return only the reviewed synthetic marker.",
+                "deliver": "ella_callback",
+                "deliver_only": False,
+                "deliver_chat_id": "{correlation_id}",
+                "skills": [],
+            },
+        )
+        assert create.status_code == 200
+        created = create.json()
+        assert created["deliver_chat_id"] == "{correlation_id}"
+        assert created["deliver"] == "ella_callback"
+        assert created["deliver_only"] is False
+        assert created["secret_set"] is True
+        assert isinstance(created.get("secret"), str) and len(created["secret"]) >= 32
+        assert "deliver_extra" not in created
+        one_time_secret = created["secret"]
+
+        listed = self.client.get("/api/webhooks").json()
+        assert listed["enabled"] is True
+        assert len(listed["subscriptions"]) == 1
+        route = listed["subscriptions"][0]
+        assert route["name"] == "ella-synthetic"
+        assert route["deliver_chat_id"] == "{correlation_id}"
+        assert route["deliver"] == "ella_callback"
+        assert route["deliver_only"] is False
+        assert route["secret_set"] is True
+        assert "secret" not in route
+        assert "deliver_extra" not in route
+        assert one_time_secret not in _json.dumps(listed)
+
+    def test_omitted_deliver_chat_id_does_not_invent_binding(self):
+        self._enable_webhook_platform()
+
+        create = self.client.post(
+            "/api/webhooks",
+            json={"name": "no-bind", "deliver": "log"},
+        )
+        assert create.status_code == 200
+        created = create.json()
+        assert created.get("deliver_chat_id") is None
+        assert "deliver_extra" not in created
+        assert isinstance(created.get("secret"), str) and len(created["secret"]) >= 32
+
+        route = self.client.get("/api/webhooks").json()["subscriptions"][0]
+        assert route.get("deliver_chat_id") is None
+        assert "secret" not in route
+        assert "deliver_extra" not in route
+
+    def test_malformed_deliver_extra_does_not_invent_binding(self):
+        """Summary must fail closed when stored deliver_extra is not a string chat_id."""
+        from hermes_cli.web_server import _webhook_route_summary
+
+        base = "http://localhost:8644"
+        cases = [
+            {},  # missing deliver_extra
+            {"deliver_extra": None},
+            {"deliver_extra": "not-a-dict"},
+            {"deliver_extra": ["{correlation_id}"]},
+            {"deliver_extra": {"chat_id": 12345}},
+            {"deliver_extra": {"chat_id": True}},
+            {"deliver_extra": {"chat_id": {"nested": "{correlation_id}"}}},
+            {"deliver_extra": {"other": "{correlation_id}"}},
+        ]
+        for route in cases:
+            summary = _webhook_route_summary("probe", route, base)
+            assert summary["deliver_chat_id"] is None, route
+            assert "secret" not in summary
+            assert "deliver_extra" not in summary
+
+        # Exact string binding is projected without rewrite.
+        exact = _webhook_route_summary(
+            "probe",
+            {"deliver_extra": {"chat_id": "{correlation_id}"}},
+            base,
+        )
+        assert exact["deliver_chat_id"] == "{correlation_id}"
+        assert "deliver_extra" not in exact
+
+    def test_webhook_subscriptions_file_remains_denylisted_from_managed_files(
+        self, monkeypatch
+    ):
+        """HMAC store stays inaccessible via managed-files; summaries must not leak it."""
+        import json as _json
+
+        from hermes_constants import get_hermes_home
+
+        self._enable_webhook_platform()
+        create = self.client.post(
+            "/api/webhooks",
+            json={
+                "name": "secret-route",
+                "deliver": "log",
+                "deliver_chat_id": "{correlation_id}",
+            },
+        )
+        assert create.status_code == 200
+        secret = create.json()["secret"]
+
+        home = get_hermes_home()
+        subs_path = home / "webhook_subscriptions.json"
+        assert subs_path.is_file()
+        on_disk = subs_path.read_text(encoding="utf-8")
+        assert secret in on_disk
+        assert "{correlation_id}" in on_disk
+
+        # Operator can point the managed root at HERMES_HOME; secret basenames
+        # must still be denylisted from list/read/download.
+        monkeypatch.setenv("HERMES_DASHBOARD_FILES_ROOT", str(home))
+
+        listing = self.client.get("/api/files", params={"path": str(home)})
+        assert listing.status_code == 200
+        names = [e["name"] for e in listing.json()["entries"]]
+        assert "webhook_subscriptions.json" not in names
+
+        read = self.client.get("/api/files/read", params={"path": str(subs_path)})
+        assert read.status_code == 403
+        download = self.client.get(
+            "/api/files/download", params={"path": str(subs_path)}
+        )
+        assert download.status_code == 403
+
+        listed = self.client.get("/api/webhooks").json()
+        dump = _json.dumps(listed)
+        assert secret not in dump
+        assert listed["subscriptions"][0]["deliver_chat_id"] == "{correlation_id}"
+        assert "secret" not in listed["subscriptions"][0]
 
     def test_enable_platform_starts_gateway_restart(self, monkeypatch):
         import hermes_cli.web_server as ws
