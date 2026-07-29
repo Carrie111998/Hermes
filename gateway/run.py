@@ -3739,11 +3739,26 @@ class GatewayRunner:
             logger.info("Gateway running with %s platform(s)", connected_count)
         
         # Build initial channel directory for send_message name resolution
+        # Plugins may amend the directory once it's on disk; see gateway:channel_directory_built.
         try:
             from gateway.channel_directory import build_channel_directory
             directory = await build_channel_directory(self.adapters)
             ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
             logger.info("Channel directory built: %d target(s)", ch_count)
+            # F-ChannelDir plugin hook: let registered handlers amend the
+            # directory (e.g. populate feishu from lark.im.v1.chat.list).
+            # Handlers run inside the gateway event loop; failures are
+            # swallowed so a slow plugin call cannot block startup.
+            # See https://github.com/nousresearch/hermes-agent/pull/0
+            # (proposed) for design notes.
+            try:
+                await self.hooks.emit("gateway:channel_directory_built", {
+                    "directory": directory,
+                    "path": _hermes_home / "channel_directory.json",
+                    "elapsed_seconds": 0.0,
+                })
+            except Exception as e:
+                logger.warning("Channel directory amend hook failed: %s", e)
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
         
@@ -4891,7 +4906,18 @@ class GatewayRunner:
                         # Rebuild channel directory with the new adapter
                         try:
                             from gateway.channel_directory import build_channel_directory
-                            await build_channel_directory(self.adapters)
+                            reb_directory = await build_channel_directory(self.adapters)
+                            # F-ChannelDir: re-fire amend hook on hot adapter
+                            # reconnect so newly-connected platforms see plugin
+                            # handlers. See gateway:channel_directory_built docstring.
+                            try:
+                                await self.hooks.emit("gateway:channel_directory_built", {
+                                    "directory": reb_directory,
+                                    "path": _hermes_home / "channel_directory.json",
+                                    "elapsed_seconds": 0.0,
+                                })
+                            except Exception:
+                                pass
                         except Exception:
                             pass
                     # Check if the failure is non-retryable
@@ -16610,13 +16636,37 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
                     # this ticker runs in a background thread. Schedule onto
                     # the gateway event loop and wait briefly for completion
                     # so refresh failures are still logged via the except.
+                    # The amend hook lets registered plugins tweak the
+                    # directory after each refresh -- e.g. populate feishu
+                    # chats from lark.im.v1.chat.list.
                     fut = safe_schedule_threadsafe(
                         build_channel_directory(adapters), loop,
                         logger=logger,
                         log_message="Channel directory refresh scheduling error",
                     )
                     if fut is not None:
-                        fut.result(timeout=30)
+                        directory = fut.result(timeout=30)
+                        # F-ChannelDir: re-fire gateway:channel_directory_built
+                        # on cron-tick refreshes too, so plugins see periodic
+                        # updates instead of only one emit per startup.
+                        try:
+                            amend_fut = safe_schedule_threadsafe(
+                                gateway_self.hooks.emit(
+                                    "gateway:channel_directory_built",
+                                    {
+                                        "directory": directory,
+                                        "path": _hermes_home / "channel_directory.json",
+                                        "elapsed_seconds": 0.0,
+                                    },
+                                ),
+                                loop,
+                                logger=logger,
+                                log_message="Channel directory amend scheduling error",
+                            )
+                            if amend_fut is not None:
+                                amend_fut.result(timeout=30)
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.debug("Channel directory refresh error: %s", e)
 

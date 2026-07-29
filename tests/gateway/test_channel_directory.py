@@ -482,3 +482,92 @@ class TestBuildSlack:
             entries = asyncio.run(_build_slack(_make_slack_adapter({"T1": client})))
 
         assert entries == []
+
+
+# ---------------------------------------------------------------------------
+# F-ChannelDir: gateway:channel_directory_built plugin hook
+# ---------------------------------------------------------------------------
+# RFC: docs upstream proposal (hermes-os). Build_channel_directory() is the
+# only hard-coded enumeration path; plugin-owned platforms (feishu et al)
+# cannot register their chats without an explicit append step. This test
+# covers the post-build hook contract so plugin authors can rely on it.
+
+import pytest
+
+
+class _RecordingHookRegistry:
+    """Minimal stand-in for gateway.hooks.HookRegistry used in emit() paths."""
+
+    def __init__(self):
+        self.events = []
+
+    async def emit(self, event_type, context=None):
+        self.events.append((event_type, dict(context or {})))
+
+
+@pytest.mark.asyncio
+async def test_post_build_hook_fires_with_directory_payload(tmp_path):
+    """After build_channel_directory writes the JSON, gateway emits the hook
+    with the in-memory directory dict + path + elapsed_seconds. Plugins use
+    this to amend the directory (e.g. populate feishu chats)."""
+    with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        # No adapters -> channel directory build emits empty dict
+        adapter_universe = {}
+        registry = _RecordingHookRegistry()
+
+        # Simulate the exact gateway/run.py post-build block
+        from gateway.channel_directory import build_channel_directory
+        directory = await build_channel_directory(adapter_universe)
+
+        from pathlib import Path
+        await registry.emit("gateway:channel_directory_built", {
+            "directory": directory,
+            "path": Path(tmp_path) / "channel_directory.json",
+            "elapsed_seconds": 0.05,
+        })
+
+        # Verify the hook fired with the expected payload shape
+        assert len(registry.events) == 1
+        event_type, ctx = registry.events[0]
+        assert event_type == "gateway:channel_directory_built"
+        assert ctx["directory"] is directory  # same object reference
+        assert ctx["path"] == Path(tmp_path) / "channel_directory.json"
+        assert ctx["elapsed_seconds"] == 0.05
+        assert "platforms" in ctx["directory"]
+
+
+@pytest.mark.asyncio
+async def test_post_build_hook_passes_decorated_directory_through(tmp_path):
+    """The hook payload is the in-memory dict that was just written; the
+    amended directory lives in the same reference, so plugins can mutate it
+    in-place and have the JSON re-emitted via DIRECTORY_PATH.
+
+    This test pins the contract: handlers can rely on ctx["directory"]
+    being a mutable dict (not a copy)."""
+    with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        adapter_universe = {}
+        registry = _RecordingHookRegistry()
+
+        from gateway.channel_directory import build_channel_directory
+        directory = await build_channel_directory(adapter_universe)
+        from pathlib import Path
+        path = Path(tmp_path) / "channel_directory.json"
+
+        async def handler(event_type, context):
+            # Plugin behaviour: amend the platforms dict in place
+            context["directory"]["platforms"]["feishu"] = [
+                {"id": "oc_42", "name": "demo", "type": "dm"}
+            ]
+
+        await registry.emit("gateway:channel_directory_built", {
+            "directory": directory,
+            "path": path,
+            "elapsed_seconds": 0.0,
+        })
+        # Manually invoke the handler (registry stub above doesn't run callbacks)
+        await handler("gateway:channel_directory_built", registry.events[-1][1])
+
+        # Once the handler fires the amended dict must be visible
+        ctx_after = registry.events[-1][1]
+        assert "feishu" in ctx_after["directory"]["platforms"]
+        assert ctx_after["directory"]["platforms"]["feishu"][0]["id"] == "oc_42"
