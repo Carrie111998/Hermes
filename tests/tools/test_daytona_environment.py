@@ -221,9 +221,11 @@ class TestCleanup:
 class TestExecute:
     def test_basic_command(self, make_env):
         sb = _make_sandbox()
-        # Calls: (1) $HOME detection, (2) init_session bootstrap, (3) actual command
+        # Calls: (1) $HOME, (2) ambient PATH probe, (3) init_session bootstrap,
+        # (4) actual command
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),       # $HOME
+            _make_exec_response(result="", exit_code=0),  # ambient PATH probe
             _make_exec_response(result="", exit_code=0),  # init_session
             _make_exec_response(result="hello", exit_code=0),  # actual cmd
         ]
@@ -239,6 +241,7 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
+            _make_exec_response(result="", exit_code=0),  # ambient PATH probe
             _make_exec_response(result="", exit_code=0),  # init_session
             _make_exec_response(result="ok", exit_code=0),
         ]
@@ -258,6 +261,7 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
+            _make_exec_response(result="", exit_code=0),  # ambient PATH probe
             _make_exec_response(result="", exit_code=0),  # init_session
             _make_exec_response(result="", exit_code=124),  # actual cmd
         ]
@@ -271,6 +275,7 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
+            _make_exec_response(result="", exit_code=0),  # ambient PATH probe
             _make_exec_response(result="", exit_code=0),  # init_session
             _make_exec_response(result="not found", exit_code=127),
         ]
@@ -284,6 +289,7 @@ class TestExecute:
         sb = _make_sandbox()
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),
+            _make_exec_response(result="", exit_code=0),  # ambient PATH probe
             _make_exec_response(result="", exit_code=0),  # init_session
             _make_exec_response(result="ok", exit_code=0),
         ]
@@ -305,6 +311,7 @@ class TestExecute:
         sb.state = "started"
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),  # $HOME
+            _make_exec_response(result="", exit_code=0),  # ambient PATH probe
             _make_exec_response(result="", exit_code=0),  # init_session
             daytona_sdk.DaytonaError("transient"),  # first attempt fails
             _make_exec_response(result="ok", exit_code=0),  # retry succeeds
@@ -355,8 +362,9 @@ class TestInterrupt:
             calls["n"] += 1
             if calls["n"] == 1:
                 return _make_exec_response(result="/root")  # $HOME detection
-            if calls["n"] == 2:
-                return _make_exec_response(result="", exit_code=0)  # init_session
+            if calls["n"] in (2, 3):
+                # ambient PATH probe, then the init_session bootstrap
+                return _make_exec_response(result="", exit_code=0)
             event.wait(timeout=5)  # simulate long-running command
             return _make_exec_response(result="done", exit_code=0)
 
@@ -387,6 +395,7 @@ class TestRetryExhausted:
         sb.state = "started"
         sb.process.exec.side_effect = [
             _make_exec_response(result="/root"),       # $HOME
+            _make_exec_response(result="", exit_code=0),  # ambient PATH probe
             _make_exec_response(result="", exit_code=0),  # init_session
             daytona_sdk.DaytonaError("fail1"),         # actual command fails
         ]
