@@ -2107,3 +2107,36 @@ class TestCountSkillsMatchesApiSkills:
         assert api == 1, (
             f"parity broken: api={api}, cli={cli}, expected both == 1"
         )
+
+    def test_parity_external_only_profile(self, tmp_path, monkeypatch):
+        """Profile with skills.external_dirs but NO local skills/ dir.
+
+        Regression for the GottZ triage finding on #51707 (comment
+        5118178368): the original _count_skills rework exited early
+        when ``profile_dir / "skills"`` was absent, returning 0 before
+        reading skills.external_dirs. The dashboard's /api/skills
+        handled this correctly via _profile_scope, so the card count
+        and the dashboard disagreed for external-only profiles.
+        """
+        default_home = self._make_hermes_env(tmp_path, monkeypatch)
+        prof_dir = default_home / "profiles" / "xt-only"
+        prof_dir.mkdir(parents=True)
+        # Deliberately do NOT create a skills/ subdirectory — this
+        # profile must rely entirely on skills.external_dirs.
+
+        external_pool = tmp_path / "shared-skills" / "xt-pool"
+        external_pool.mkdir(parents=True)
+        _write_skill(external_pool / "xt-a", name="xt-a")
+        _write_skill(external_pool / "xt-b", name="xt-b")
+        _write_profile_config(prof_dir, external_dirs=[external_pool])
+
+        client = self._web_client(tmp_path, monkeypatch)
+        api = self._api_count(client, "xt-only")
+        cli = profiles._count_skills(prof_dir)
+        assert cli == 2, (
+            f"CLI count={cli}; expected 2 (xt-a + xt-b from external dir only)"
+        )
+        assert api == cli == 2, (
+            f"parity broken: api={api}, cli={cli}, expected both == 2 "
+            f"(external-only profile must match dashboard)"
+        )

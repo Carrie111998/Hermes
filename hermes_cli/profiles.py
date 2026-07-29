@@ -951,10 +951,18 @@ def _count_skills(profile_dir: Path) -> int:
     from tools.skills_tool import _collect_skills_from_dirs
 
     skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
+    external_dirs = _load_profile_external_dirs(profile_dir)
+
+    # Return 0 only when there are no directories to scan at all.
+    # A profile may rely exclusively on skills.external_dirs without a
+    # local skills/ tree — the dashboard's /api/skills endpoint handles
+    # this correctly via _profile_scope, and _count_skills must match.
+    # Loading external_dirs BEFORE the guard ensures external-only
+    # profiles get counted (the old raw-rglob guard returned 0 early
+    # and never reached the external-dirs path).
+    if not skills_dir.is_dir() and not external_dirs:
         return 0
 
-    external_dirs = _load_profile_external_dirs(profile_dir)
     # Disabled is NOT passed to the filter (kept only as a cache-key
     # component so that toggling skills.disabled invalidates the cache
     # without affecting the count). Pass an empty set; this matches the
@@ -973,7 +981,10 @@ def _count_skills(profile_dir: Path) -> int:
     ):
         return cached[2]
 
-    dirs_to_scan = [skills_dir] + external_dirs
+    dirs_to_scan: list = []
+    if skills_dir.is_dir():
+        dirs_to_scan.append(skills_dir)
+    dirs_to_scan.extend(external_dirs)
     skills = _collect_skills_from_dirs(dirs_to_scan, disabled=set())
     count = len(skills)
     _SKILL_COUNT_CACHE[key] = (signature, now, count)
