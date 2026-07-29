@@ -55,7 +55,17 @@ def _validate_bundle_path(label: str, value: str, *, require_substantial: bool =
         ctx = ssl.create_default_context(cafile=str(path))
     except Exception as exc:
         raise _ssl_err(f"{label} CA bundle at {value} cannot be loaded: {exc}") from exc
-    if not ctx.get_ca_certs():
+    try:
+        certs = ctx.get_ca_certs()
+    except NotImplementedError:
+        # truststore injects an SSLContext whose get_ca_certs() is not
+        # implemented (it delegates to the OS trust store, which doesn't
+        # expose CA enumeration).  The bundle loaded fine — we just can't
+        # inspect it the way certifi-backed contexts allow.  Trust the
+        # load and skip the emptiness check rather than firing a false
+        # positive on a working corporate-CA setup.
+        certs = None
+    if certs == []:
         raise _ssl_err(f"{label} CA bundle at {value} did not load any certificates")
 
 
