@@ -70,6 +70,8 @@ from session_bridge.worktree import (
 
 _CLAUDE_PENDING_KEY = "session-bridge:scan:claude:pending"
 _CLAUDE_PROGRESS_KEY = "session-bridge:scan:claude:progress"
+_CLAUDE_FINGERPRINT_KEY = "session-bridge:scan:claude:fingerprints"
+_CLAUDE_STAGED_KEY = "session-bridge:scan:claude:staged-fingerprints"
 _CODEX_PENDING_KEY = "session-bridge:scan:codex:pending"
 _CODEX_PROGRESS_KEY = "session-bridge:scan:codex:progress"
 _CODEX_SEEN_KEY = "session-bridge:scan:codex:seen"
@@ -1956,6 +1958,68 @@ async def test_claude_bounded_scan_isolates_a_path_that_disappears_before_stat(
     assert summary.rebuilt == 0
     assert summary.failed == 1
     assert adapter.parsed_native_ids == ["claude-available"]
+
+
+@pytest.mark.asyncio
+async def test_claude_bounded_scan_isolates_one_parse_failure_and_retries_it(
+    tmp_path: Path,
+) -> None:
+    paths = {
+        native_id: tmp_path / f"{native_id}.jsonl"
+        for native_id in ("claude-new", "claude-failing", "claude-old")
+    }
+    for native_id, mtime in (
+        ("claude-new", 300.0),
+        ("claude-failing", 200.0),
+        ("claude-old", 100.0),
+    ):
+        paths[native_id].write_text("{}\n", encoding="utf-8")
+        os.utime(paths[native_id], (mtime, mtime))
+    operations: list[tuple[object, ...]] = []
+    store = _StateStore(operations)
+    secret = "private-parse-secret"
+
+    class OneFailureAdapter(_BacklogClaudeAdapter):
+        def parse(self, path: Path) -> ClaudeParseResult:
+            if path.stem == "claude-failing":
+                raise RuntimeError(f"{secret} at {path}")
+            return super().parse(path)
+
+    adapter = OneFailureAdapter(
+        discover_batches=[list(paths.values())],
+        paths_by_native_id=paths,
+        operations=operations,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CLAUDE: adapter},
+        scan_batch_size=3,
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.discovered == 3
+    assert summary.indexed == 2
+    assert summary.failed == 1
+    assert store.upsert_attempts == ["claude-new", "claude-old"]
+    assert store.get_state(_CLAUDE_PENDING_KEY) == {
+        "version": 1,
+        "native_ids": ["claude-failing"],
+    }
+    assert set(store.get_state(_CLAUDE_FINGERPRINT_KEY)["sessions"]) == {
+        "claude-new",
+        "claude-old",
+    }
+    assert set(store.get_state(_CLAUDE_STAGED_KEY)["sessions"]) == {
+        "claude-failing",
+    }
+    health = coordinator.health()
+    assert health["providers"]["claude"]["degraded_reason"] == "scan_failed"
+    assert health["recent_error_codes"] == ["claude_scan_failed"]
+    serialized = json.dumps(health, sort_keys=True)
+    assert secret not in serialized
+    assert str(paths["claude-failing"]) not in serialized
 
 
 @pytest.mark.asyncio
@@ -3955,6 +4019,80 @@ async def test_sidebar_registration_accepts_plain_source_without_indexed_git_met
 
 
 @pytest.mark.asyncio
+async def test_sidebar_registration_preserves_claude_catalog_indexed_at(
+    sidebar_db: SessionDB,
+) -> None:
+    source_active_at = 3_000_000.0
+    indexed_at = source_active_at + 6.0
+    registration_time = indexed_at + 8.0
+    clock = [indexed_at]
+    store = SessionBridgeStore(sidebar_db, clock=lambda: clock[0])
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="indexed-timing-claude",
+            content="Measure this Claude delivery pipeline",
+            last_active=source_active_at,
+            cwd=str(_sidebar_source_repo(sidebar_db)),
+        )
+    )
+    clock[0] = registration_time
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: registration_time,
+    )
+
+    summary = await coordinator.register_sidebar_jobs_once(
+        now=registration_time,
+        limit=1,
+    )
+
+    assert summary.queued == 1
+    job = store.get_sidebar_job_for_source("claude:indexed-timing-claude")
+    assert job is not None
+    assert job["eligible_at"] == source_active_at
+    assert job["indexed_at"] == indexed_at
+    assert job["created_at"] == registration_time
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_uses_cycle_time_for_hermes_indexed_at(
+    sidebar_db: SessionDB,
+) -> None:
+    source_active_at = 3_000_000.0
+    registration_time = source_active_at + 14.0
+    _add_hermes_sidebar_source(
+        sidebar_db,
+        session_id="indexed-timing-hermes",
+        content="Measure this Hermes delivery pipeline",
+        last_active=source_active_at,
+    )
+    store = SessionBridgeStore(sidebar_db, clock=lambda: registration_time)
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: registration_time,
+    )
+
+    summary = await coordinator.register_sidebar_jobs_once(
+        now=registration_time,
+        limit=1,
+    )
+
+    assert summary.queued == 1
+    job = store.get_sidebar_job_for_source("indexed-timing-hermes")
+    assert job is not None
+    assert job["eligible_at"] == source_active_at
+    assert job["indexed_at"] == registration_time
+    assert job["created_at"] == registration_time
+
+
+@pytest.mark.asyncio
 async def test_sidebar_registration_accepts_head_sentinel_without_git_identity(
     sidebar_db: SessionDB,
     tmp_path: Path,
@@ -4287,6 +4425,68 @@ async def test_sidebar_registration_is_bounded_durable_and_probes_newest_first(
 
     assert older_summary is not None
     assert store.get_sidebar_job_for_source("older-eligible") is not None
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_probes_new_profile_session_before_catchup(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    profile_path = sidebar_db.db_path.parent / "profiles" / "main" / "state.db"
+    store = _BudgetRecordingSidebarStore(sidebar_db, clock=lambda: now)
+    store._hermes_profile_db_paths = lambda: (("main", profile_path),)
+    for offset in range(50):
+        _add_hermes_sidebar_source(
+            sidebar_db,
+            session_id=f"profile-catchup-ack-{offset:02d}",
+            content="yes",
+            last_active=now - offset,
+        )
+    first = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    await first.register_sidebar_jobs_once(now=now, limit=1)
+    durable_cursor = store.get_state("session-bridge:sidebar:registration-cursor")
+    assert durable_cursor is not None
+
+    profile_path.parent.mkdir(parents=True)
+    profile_db = SessionDB(profile_path)
+    try:
+        profile_db.create_session(
+            "fresh-profile-session",
+            "tui",
+            cwd=str(_sidebar_source_repo(sidebar_db)),
+        )
+        profile_db.append_message(
+            "fresh-profile-session",
+            "user",
+            "Queue this newly persisted profile session",
+            timestamp=now + 1,
+        )
+    finally:
+        profile_db.close()
+    restarted = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now + 1,
+    )
+
+    summary = await restarted.register_sidebar_jobs_once(now=now + 1, limit=1)
+
+    assert summary.queued == 1
+    assert summary.by_provider == {"claude": 0, "hermes": 1}
+    assert store.get_sidebar_job_for_source("fresh-profile-session") is not None
+    assert (
+        store.get_state("session-bridge:sidebar:registration-cursor")
+        == durable_cursor
+    )
 
 
 @pytest.mark.asyncio

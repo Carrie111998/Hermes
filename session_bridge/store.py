@@ -742,6 +742,7 @@ class SidebarSource:
     worktree_id: str | None
     automation_only: bool
     subagent_only: bool
+    indexed_at: float | None = None
 
 
 class SidebarSourcePage(list[SidebarSource]):
@@ -4193,7 +4194,7 @@ class SessionBridgeStore:
                               e.native_id AS external_native_id,
                               e.native_path, e.native_status,
                               e.last_native_cursor, e.last_native_hash,
-                              e.parser_version, e.origin_kind,
+                              e.last_indexed_at, e.parser_version, e.origin_kind,
                               e.origin_bridge_id,
                               CASE
                                   WHEN e.provider = :claude THEN CAST(json_extract(
@@ -4352,6 +4353,15 @@ class SessionBridgeStore:
                     worktree_id=None,
                     automation_only=bool(row["automation_only"]),
                     subagent_only=bool(row["subagent_only"]),
+                    indexed_at=(
+                        _finite_number(
+                            row["last_indexed_at"],
+                            "sidebar source indexed_at",
+                        )
+                        if provider is Provider.CLAUDE
+                        and row["last_indexed_at"] is not None
+                        else None
+                    ),
                 )
             )
 
@@ -4775,6 +4785,7 @@ class SessionBridgeStore:
         candidate: SidebarCandidate,
         *,
         worktree_snapshot: WorktreeSnapshot | None = None,
+        indexed_at: float | None = None,
     ) -> dict[str, Any]:
         from .sidebar import (
             SidebarCandidate,
@@ -4808,6 +4819,14 @@ class SessionBridgeStore:
             raise ValueError("sidebar candidate bridge ID does not match source")
         eligible_at = _finite_number(candidate.eligible_at, "sidebar eligible_at")
         now = _finite_number(self._clock(), "store clock")
+        effective_indexed_at = (
+            max(eligible_at, now)
+            if indexed_at is None
+            else _finite_number(indexed_at, "sidebar indexed_at")
+        )
+        if effective_indexed_at < eligible_at:
+            raise ValueError("sidebar indexed_at precedes eligible_at")
+        created_at = max(now, effective_indexed_at)
         job_id = f"sidebar-job:{hashlib.sha256(idempotency_key.encode()).hexdigest()}"
         launch_metadata = self.get_session_launch_metadata(candidate.source_session_id)
         profile = (
@@ -4852,8 +4871,9 @@ class SessionBridgeStore:
             insert = conn.execute(
                 """INSERT OR IGNORE INTO session_sidebar_jobs (
                    id, idempotency_key, source_session_id, bridge_id, state,
-                   attempts, next_attempt_at, eligible_at, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+                   attempts, next_attempt_at, eligible_at, indexed_at,
+                   created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
                 (
                     job_id,
                     idempotency_key,
@@ -4862,8 +4882,9 @@ class SessionBridgeStore:
                     SidebarJobState.PENDING.value,
                     eligible_at,
                     eligible_at,
-                    now,
-                    now,
+                    effective_indexed_at,
+                    created_at,
+                    created_at,
                 ),
             )
             row = conn.execute(
@@ -7889,6 +7910,16 @@ class SessionBridgeStore:
                     LIMIT ?""",
                 (SidebarJobState.VISIBLE.value, _SIDEBAR_LATENCY_SAMPLE_LIMIT),
             ).fetchall()
+            stage_rows = conn.execute(
+                """SELECT eligible_at,
+                          COALESCE(indexed_at, created_at) AS effective_indexed_at,
+                          created_at, visible_at
+                     FROM session_sidebar_jobs
+                    WHERE state = ? AND visible_at IS NOT NULL
+                    ORDER BY visible_at DESC, id DESC
+                    LIMIT ?""",
+                (SidebarJobState.VISIBLE.value, _SIDEBAR_LATENCY_SAMPLE_LIMIT),
+            ).fetchall()
             expired_row = conn.execute(
                 """SELECT COUNT(*) AS job_count
                      FROM session_sidebar_jobs
@@ -7962,6 +7993,31 @@ class SessionBridgeStore:
             if code in allowed_codes and code not in recent_codes:
                 recent_codes.append(code)
         latencies = sorted(max(0.0, float(row["latency"])) for row in latency_rows)
+        stage_latencies: dict[str, list[float]] = {
+            "source_to_index": [],
+            "index_to_queue": [],
+            "queue_to_visible": [],
+            "source_to_visible": [],
+        }
+        for row in stage_rows:
+            eligible_at = float(row["eligible_at"])
+            indexed_at = float(row["effective_indexed_at"])
+            created_at = float(row["created_at"])
+            visible_at = float(row["visible_at"])
+            stage_latencies["source_to_index"].append(
+                max(0.0, indexed_at - eligible_at)
+            )
+            stage_latencies["index_to_queue"].append(
+                max(0.0, created_at - indexed_at)
+            )
+            stage_latencies["queue_to_visible"].append(
+                max(0.0, visible_at - created_at)
+            )
+            stage_latencies["source_to_visible"].append(
+                max(0.0, visible_at - eligible_at)
+            )
+        for values in stage_latencies.values():
+            values.sort()
         return {
             "eligible_by_provider": eligible_by_provider,
             "counts": counts,
@@ -7992,6 +8048,13 @@ class SessionBridgeStore:
                 "p50": _nearest_rank_percentile(latencies, 0.50),
                 "p95": _nearest_rank_percentile(latencies, 0.95),
                 "p99": _nearest_rank_percentile(latencies, 0.99),
+            },
+            "stage_latency_seconds": {
+                stage: {
+                    "p50": _nearest_rank_percentile(values, 0.50),
+                    "p95": _nearest_rank_percentile(values, 0.95),
+                }
+                for stage, values in stage_latencies.items()
             },
             "scheduler": {
                 "fresh_claims_since_oldest": fresh_claims,

@@ -81,6 +81,7 @@ from session_bridge.sidebar_hydration_executor import (
     SidebarHydrationExecutor,
     SidebarHydrationExecutionResult,
 )
+from session_bridge.sidebar_runtime import sidebar_registration_app_server_args
 from session_bridge.store import SessionBridgeStore
 
 
@@ -3120,6 +3121,12 @@ def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
         "last_visible_task_id": None,
         "recent_error_codes": [],
         "delivery_latency_seconds": {"p50": None, "p95": None, "p99": None},
+        "stage_latency_seconds": {
+            "source_to_index": {"p50": 1.0, "p95": 2.0},
+            "index_to_queue": {"p50": 3.0, "p95": 4.0},
+            "queue_to_visible": {"p50": 5.0, "p95": 6.0},
+            "source_to_visible": {"p50": 9.0, "p95": 12.0},
+        },
     })
 
     status = backend.sidebar_status()
@@ -3127,6 +3134,12 @@ def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
     assert status["healthy"] is True
     assert status["degraded_reasons"] == []
     assert status["last_successful_heartbeat_at"] is None
+    assert status["stage_latency_seconds"] == {
+        "source_to_index": {"p50": 1.0, "p95": 2.0},
+        "index_to_queue": {"p50": 3.0, "p95": 4.0},
+        "queue_to_visible": {"p50": 5.0, "p95": 6.0},
+        "source_to_visible": {"p50": 9.0, "p95": 12.0},
+    }
 
     fresh_pending = _production_sidebar_backend({
         "eligible_by_provider": {"claude": 1, "hermes": 0},
@@ -3427,6 +3440,9 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
                 "last_cycle_at": 1.0,
             }
         },
+        {"stage_latency_seconds": {"secret_stage": {"p50": 1.0}}},
+        {"stage_latency_seconds": {"source_to_index": {"p99": 1.0}}},
+        {"stage_latency_seconds": {"source_to_index": "private timing"}},
     ),
 )
 def test_sidebar_status_rejects_invalid_scheduler_or_recovery_progress(
@@ -5766,8 +5782,11 @@ def test_production_sidebar_recovery_recycles_unavailable_codex_client(
     closed: list[str] = []
 
     class Client:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
         def close(self) -> None:
-            closed.append("client")
+            closed.append(self.name)
 
     class Store:
         def record_sidebar_recovery_progress(self, **value: object) -> None:
@@ -5784,10 +5803,12 @@ def test_production_sidebar_recovery_recycles_unavailable_codex_client(
                 error_code="codex_tool_unavailable",
             )
 
-    client = Client()
+    normal_client = Client("normal")
+    registration_client = Client("registration")
     hydration = HydrationExecutor()
     registration = RegistrationExecutor()
-    backend._sidebar_codex_client = client  # type: ignore[assignment]
+    backend._sidebar_codex_client = normal_client  # type: ignore[assignment]
+    backend._sidebar_registration_codex_client = registration_client  # type: ignore[assignment]
     backend._sidebar_hydration_executor = hydration  # type: ignore[assignment]
     backend._sidebar_executor = registration
     monkeypatch.setattr(backend, "_require_store", lambda: Store())
@@ -5799,8 +5820,9 @@ def test_production_sidebar_recovery_recycles_unavailable_codex_client(
         "thread_id": None,
         "error_code": "codex_tool_unavailable",
     }
-    assert closed == ["client"]
+    assert closed == ["normal", "registration"]
     assert backend._sidebar_codex_client is None
+    assert backend._sidebar_registration_codex_client is None
     assert backend._sidebar_hydration_executor is None
     assert backend._sidebar_executor is None
 
@@ -5814,8 +5836,11 @@ def test_production_sidebar_recovery_recycles_retryable_codex_transport(
     closed: list[str] = []
 
     class Client:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
         def close(self) -> None:
-            closed.append("client")
+            closed.append(self.name)
 
     class Store:
         def record_sidebar_recovery_progress(self, **value: object) -> None:
@@ -5833,10 +5858,12 @@ def test_production_sidebar_recovery_recycles_retryable_codex_transport(
                 error_code="bridge_temporarily_unavailable",
             )
 
-    client = Client()
+    normal_client = Client("normal")
+    registration_client = Client("registration")
     hydration = HydrationExecutor()
     registration = RegistrationExecutor()
-    backend._sidebar_codex_client = client  # type: ignore[assignment]
+    backend._sidebar_codex_client = normal_client  # type: ignore[assignment]
+    backend._sidebar_registration_codex_client = registration_client  # type: ignore[assignment]
     backend._sidebar_hydration_executor = hydration  # type: ignore[assignment]
     backend._sidebar_executor = registration
     monkeypatch.setattr(backend, "_require_store", lambda: Store())
@@ -5848,8 +5875,9 @@ def test_production_sidebar_recovery_recycles_retryable_codex_transport(
         "thread_id": None,
         "error_code": "bridge_temporarily_unavailable",
     }
-    assert closed == ["client"]
+    assert closed == ["normal", "registration"]
     assert backend._sidebar_codex_client is None
+    assert backend._sidebar_registration_codex_client is None
     assert backend._sidebar_hydration_executor is None
     assert backend._sidebar_executor is None
 
@@ -6281,6 +6309,30 @@ def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
     class ProtocolCodexClient:
         def __init__(self) -> None:
             self.closed = False
+            self._initialized = False
+
+        def initialize(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs == {
+                "capabilities": {"experimentalApi": True},
+                "timeout": 30.0,
+            }
+            self._initialized = True
+            return {}
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, object],
+            *,
+            timeout: float,
+        ) -> dict[str, object]:
+            assert method == "config/read"
+            assert params == {
+                "cwd": str(Path.cwd()),
+                "includeLayers": False,
+            }
+            assert timeout == 30.0
+            return {"config": {"mcp_servers": {}}}
 
         def close(self) -> None:
             self.closed = True
@@ -6384,12 +6436,46 @@ def test_production_sidebar_executor_uses_a_dedicated_codex_transport(
         def __init__(self, name: str) -> None:
             self.name = name
             self.close_count = 0
+            self._initialized = False
+            self.requests: list[tuple[str, dict[str, object], float]] = []
+
+        def initialize(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs == {
+                "capabilities": {"experimentalApi": True},
+                "timeout": 30.0,
+            }
+            self._initialized = True
+            return {}
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, object],
+            *,
+            timeout: float,
+        ) -> dict[str, object]:
+            self.requests.append((method, dict(params), timeout))
+            assert method == "config/read"
+            return {
+                "config": {
+                    "mcp_servers": {
+                        "session_bridge": {"url": "http://127.0.0.1"},
+                        "gbrain": {"url": "http://127.0.0.1"},
+                    }
+                }
+            }
 
         def close(self) -> None:
             self.close_count += 1
 
     provider_client = ProtocolCodexClient("provider")
-    sidebar_client = ProtocolCodexClient("sidebar")
+    created: list[tuple[dict[str, object], ProtocolCodexClient]] = []
+
+    def client_factory(**kwargs: object) -> ProtocolCodexClient:
+        client = ProtocolCodexClient(f"sidebar-{len(created)}")
+        created.append((dict(kwargs), client))
+        return client
+
     monkeypatch.setattr(backend, "_codex_client", provider_client)
     captured: dict[str, Any] = {}
 
@@ -6408,21 +6494,49 @@ def test_production_sidebar_executor_uses_a_dedicated_codex_transport(
     )
     monkeypatch.setattr(
         "session_bridge.cli.CodexAppServerClient",
-        lambda **_kwargs: sidebar_client,
+        client_factory,
     )
     monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
 
     try:
         assert backend.sidebar_run_once()["status"] == "idle"
-        assert captured["native"]._client is sidebar_client
-        assert captured["verifier"]._source_adapter._client is sidebar_client
+        normal_client = created[0][1]
+        registration_client = created[1][1]
+        assert created[0][0] == {"codex_bin": "codex"}
+        assert normal_client.requests == [
+            (
+                "config/read",
+                {"cwd": str(Path.cwd()), "includeLayers": False},
+                30.0,
+            )
+        ]
+        assert created[1][0] == {
+            "codex_bin": "codex",
+            "extra_args": sidebar_registration_app_server_args(
+                ("gbrain", "session_bridge")
+            ),
+        }
+        assert captured["native"]._client is registration_client
+        assert captured["verifier"]._source_adapter._client is registration_client
         assert backend._codex_client is provider_client
-        assert backend._sidebar_codex_client is sidebar_client
+        assert backend._sidebar_registration_codex_client is registration_client
+        assert backend._sidebar_codex_client is normal_client
+
+        fresh_client = captured["native"]._fresh_client_factory()
+        assert created[2][0] == {"codex_bin": "codex"}
+        assert fresh_client is created[2][1]
+        fresh_client.close()
+
+        terminal = backend._require_sidebar_terminal_delivery()
+        assert terminal._client is normal_client
+        assert backend._sidebar_codex_client is normal_client
     finally:
         backend.close()
 
     assert provider_client.close_count == 1
-    assert sidebar_client.close_count == 1
+    assert created[0][1].close_count == 1
+    assert created[1][1].close_count == 1
+    assert created[2][1].close_count == 1
 
 
 def test_production_backend_close_closes_both_codex_transports_once_and_resets_lifecycle(
@@ -6439,8 +6553,14 @@ def test_production_backend_close_closes_both_codex_transports_once_and_resets_l
 
     provider_client = ProtocolCodexClient()
     sidebar_client = ProtocolCodexClient()
+    registration_client = ProtocolCodexClient()
     monkeypatch.setattr(backend, "_codex_client", provider_client)
     monkeypatch.setattr(backend, "_sidebar_codex_client", sidebar_client)
+    monkeypatch.setattr(
+        backend,
+        "_sidebar_registration_codex_client",
+        registration_client,
+    )
     monkeypatch.setattr(backend, "_sidebar_executor", object())
 
     backend.close()
@@ -6448,8 +6568,10 @@ def test_production_backend_close_closes_both_codex_transports_once_and_resets_l
 
     assert provider_client.close_count == 1
     assert sidebar_client.close_count == 1
+    assert registration_client.close_count == 1
     assert backend._codex_client is None
     assert backend._sidebar_codex_client is None
+    assert backend._sidebar_registration_codex_client is None
     assert backend._sidebar_executor is None
 
 
@@ -6470,9 +6592,15 @@ def test_production_backend_close_attempts_all_cleanup_when_first_client_close_f
 
     provider_client = CloseProbe(failure=RuntimeError("provider close failed"))
     sidebar_client = CloseProbe()
+    registration_client = CloseProbe()
     database = CloseProbe()
     monkeypatch.setattr(backend, "_codex_client", provider_client)
     monkeypatch.setattr(backend, "_sidebar_codex_client", sidebar_client)
+    monkeypatch.setattr(
+        backend,
+        "_sidebar_registration_codex_client",
+        registration_client,
+    )
     monkeypatch.setattr(backend, "_db", database)
 
     with pytest.raises(RuntimeError, match="provider close failed"):
@@ -6481,9 +6609,11 @@ def test_production_backend_close_attempts_all_cleanup_when_first_client_close_f
 
     assert provider_client.close_count == 1
     assert sidebar_client.close_count == 1
+    assert registration_client.close_count == 1
     assert database.close_count == 1
     assert backend._codex_client is None
     assert backend._sidebar_codex_client is None
+    assert backend._sidebar_registration_codex_client is None
     assert backend._db is None
 
 

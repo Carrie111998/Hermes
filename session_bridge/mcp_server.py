@@ -1425,6 +1425,7 @@ def _sidebar_status(value: object) -> dict[str, Any]:
     state_counts = _status_mapping(counts)
     latencies = source.get("delivery_latency_seconds")
     latency_values = _status_mapping(latencies)
+    stage_latency_values = _status_mapping(source.get("stage_latency_seconds"))
     task_id = source.get("last_visible_task_id")
     if type(task_id) is not str or re.fullmatch(r"task:[0-9a-f]{16}", task_id) is None:
         task_id = None
@@ -1562,6 +1563,20 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         "delivery_latency_seconds": {
             percentile: _finite_status_number(latency_values.get(percentile))
             for percentile in ("p50", "p95", "p99")
+        },
+        "stage_latency_seconds": {
+            stage: {
+                percentile: _finite_status_number(
+                    _status_mapping(stage_latency_values.get(stage)).get(percentile)
+                )
+                for percentile in ("p50", "p95")
+            }
+            for stage in (
+                "source_to_index",
+                "index_to_queue",
+                "queue_to_visible",
+                "source_to_visible",
+            )
         },
         "scheduler": {
             "fresh_claims_since_oldest": fresh_claims,

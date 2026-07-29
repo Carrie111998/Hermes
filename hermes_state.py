@@ -1145,6 +1145,7 @@ CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
     codex_thread_id TEXT UNIQUE,
     error_code TEXT,
     eligible_at REAL NOT NULL,
+    indexed_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     visible_at REAL,

@@ -392,6 +392,10 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledgers(db) -> No
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
         ("session_claude_visibility_characterization_events",),
     ) == [{"name": "session_claude_visibility_characterization_events"}]
+    assert "indexed_at" in {
+        row["name"]
+        for row in _rows(db, 'PRAGMA table_info("session_sidebar_jobs")')
+    }
     assert [
         row["name"]
         for row in _rows(
@@ -542,6 +546,34 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledgers(db) -> No
         "trg_session_sidebar_unbound_resolutions_no_update",
         "trg_session_sidebar_unbound_resolutions_no_delete",
     }
+
+
+def test_sidebar_indexed_at_column_reconciles_into_existing_database(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-sidebar-indexed-at.db"
+    initial = SessionDB(path)
+    initial.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("ALTER TABLE session_sidebar_jobs DROP COLUMN indexed_at")
+        assert "indexed_at" not in {
+            row[1]
+            for row in connection.execute(
+                'PRAGMA table_info("session_sidebar_jobs")'
+            ).fetchall()
+        }
+
+    reopened = SessionDB(path)
+    try:
+        assert "indexed_at" in {
+            row["name"]
+            for row in _rows(
+                reopened,
+                'PRAGMA table_info("session_sidebar_jobs")',
+            )
+        }
+    finally:
+        reopened.close()
 
 
 def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
@@ -6639,6 +6671,7 @@ def test_named_profile_hermes_session_is_a_sidebar_candidate_and_snapshot(db, tm
     assert page[0].projection.messages[0].content == (
         "ship the cross-profile sidebar bridge"
     )
+    assert page[0].indexed_at is None
     assert snapshot is not None
     assert snapshot["session_id"] == "hermes-profile-native"
     assert snapshot["profile"] == "main"
@@ -7804,7 +7837,33 @@ def test_sidebar_enqueue_is_source_idempotent_and_preserves_one_bridge(db) -> No
     assert first["bridge_id"] == candidate.bridge_id
     assert first["state"] == SidebarJobState.PENDING.value
     assert first["eligible_at"] == candidate.eligible_at
+    assert first["indexed_at"] == 125.0
     assert len(_rows(db, "SELECT * FROM session_sidebar_jobs")) == 1
+
+
+def test_sidebar_enqueue_persists_explicit_indexed_at(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 125.0)
+    candidate = _sidebar_candidate(db, eligible_at=100.0)
+
+    queued = store.enqueue_sidebar_job(candidate, indexed_at=110.0)
+
+    assert queued["eligible_at"] == 100.0
+    assert queued["indexed_at"] == 110.0
+    assert queued["created_at"] == 125.0
+
+
+@pytest.mark.parametrize(
+    "indexed_at",
+    (True, -1.0, 99.0, float("nan"), float("inf")),
+)
+def test_sidebar_enqueue_rejects_invalid_indexed_at(db, indexed_at: object) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 125.0)
+    candidate = _sidebar_candidate(db, eligible_at=100.0)
+
+    with pytest.raises((TypeError, ValueError)):
+        store.enqueue_sidebar_job(candidate, indexed_at=indexed_at)  # type: ignore[arg-type]
+
+    assert _rows(db, "SELECT * FROM session_sidebar_jobs") == []
 
 
 def test_sidebar_worktree_snapshot_roundtrips_without_git_metadata(
@@ -9788,9 +9847,9 @@ def test_sidebar_delivery_latency_uses_fixed_recent_indexed_sample(db) -> None:
             """INSERT INTO session_sidebar_jobs (
                    id, idempotency_key, source_session_id, bridge_id, state,
                    attempts, next_attempt_at, completion_digest,
-                   codex_thread_id, eligible_at, created_at, updated_at,
-                   visible_at
-               ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_thread_id, eligible_at, indexed_at, created_at,
+                   updated_at, visible_at
+               ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     f"latency-job-{index:04d}",
@@ -9802,7 +9861,8 @@ def test_sidebar_delivery_latency_uses_fixed_recent_indexed_sample(db) -> None:
                     f"latency-digest-{index:04d}",
                     f"latency-thread-{index:04d}",
                     float(index - 990 if index < 75 else index),
-                    float(index),
+                    float(index + 2),
+                    float(index + 4),
                     float(index + 10),
                     float(index + 10),
                 )
@@ -9844,6 +9904,12 @@ def test_sidebar_delivery_latency_uses_fixed_recent_indexed_sample(db) -> None:
         "p50": 10.0,
         "p95": 10.0,
         "p99": 10.0,
+    }
+    assert status["stage_latency_seconds"] == {
+        "source_to_index": {"p50": 2.0, "p95": 2.0},
+        "index_to_queue": {"p50": 2.0, "p95": 2.0},
+        "queue_to_visible": {"p50": 6.0, "p95": 6.0},
+        "source_to_visible": {"p50": 10.0, "p95": 10.0},
     }
 
 

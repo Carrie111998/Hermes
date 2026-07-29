@@ -694,6 +694,7 @@ def test_codex_delivery_starts_registration_turn_when_exact_marker_is_absent() -
         ),
     ]
     assert client.notification_timeouts == [0.25]
+    assert fresh_client.initialize_timeouts == [5.0]
     assert fresh_client.calls == [("thread/resume", {"threadId": THREAD_1}, 5.0)]
     assert fresh_client.close_calls == 1
 

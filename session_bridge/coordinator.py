@@ -2041,6 +2041,9 @@ class SessionBridgeCoordinator:
                         "worktree_snapshot"
                         in inspect.signature(enqueue_method).parameters
                     )
+                    indexed_at_aware = callable(enqueue_method) and (
+                        "indexed_at" in inspect.signature(enqueue_method).parameters
+                    )
                     try:
                         first_request = _first_sidebar_request(projection)
                         if (
@@ -2133,17 +2136,26 @@ class SessionBridgeCoordinator:
                         by_provider[projection.provider.value] += 1
                     else:
                         assert callable(enqueue_method)
+                        enqueue_kwargs: dict[str, Any] = {}
                         if worktree_snapshot is not None:
-                            result = await asyncio.to_thread(
-                                enqueue_method,
-                                candidate,
-                                worktree_snapshot=worktree_snapshot,
+                            enqueue_kwargs["worktree_snapshot"] = worktree_snapshot
+                        if indexed_at_aware:
+                            enqueue_kwargs["indexed_at"] = max(
+                                projection.last_active,
+                                (
+                                    _finite_number(
+                                        source.indexed_at,
+                                        "sidebar source indexed_at",
+                                    )
+                                    if source.indexed_at is not None
+                                    else registration_time
+                                ),
                             )
-                        else:
-                            result = await asyncio.to_thread(
-                                enqueue_method,
-                                candidate,
-                            )
+                        result = await asyncio.to_thread(
+                            enqueue_method,
+                            candidate,
+                            **enqueue_kwargs,
+                        )
                         if (
                             not isinstance(result, Mapping)
                             or type(result.get("created")) is not bool
