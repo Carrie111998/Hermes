@@ -7,8 +7,15 @@ CLOSE-WAIT heartbeat is blind to it. ``_probe_pending_updates`` watches
 ``get_webhook_info().pending_update_count`` and escalates to the existing
 network-error recovery ladder after two consecutive stuck probes.
 
-The same probe also covers the harsher case where the updater has stopped
-entirely (``running=False``) with no reconnect in flight — the long-poll task
+The same probe also covers two failures after Telegram has already removed an
+update from its server-side queue: a stopped PTB ``Application`` dispatcher and
+a local ``Application.update_queue`` that is no longer draining. Those cases
+report ``pending_update_count == 0`` even though the gateway is alive-but-deaf,
+so they require a full retryable adapter rebuild rather than merely restarting
+the Updater.
+
+The probe also covers the harsher case where the updater has stopped entirely
+(``running=False``) with no reconnect in flight — the long-poll task
 is gone, so the gateway silently stops receiving messages while the process
 stays alive (#55769) — and feeds it into the same recovery ladder.
 """
@@ -37,11 +44,14 @@ _ensure_telegram_mock()
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
-def _make_adapter(*, pending: int) -> TelegramAdapter:
+def _make_adapter(*, pending: int, local_pending: int = 0) -> TelegramAdapter:
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     adapter._webhook_mode = False
-    adapter._app = MagicMock()
-    adapter._app.updater.running = True
+    app = MagicMock()
+    app.running = True
+    app.updater.running = True
+    app.update_queue.qsize.return_value = local_pending
+    adapter._app = app
     bot = MagicMock()
     bot.get_webhook_info = AsyncMock(
         return_value=MagicMock(pending_update_count=pending)
@@ -88,6 +98,61 @@ async def test_zero_pending_resets_counter():
         await adapter._probe_pending_updates(adapter._app.bot, 5)
     assert adapter._polling_pending_stuck_count == 0
     rec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_local_update_queue_stall_forces_retryable_adapter_rebuild():
+    """Updates pulled off Telegram but stuck locally must rebuild Application."""
+    adapter = _make_adapter(pending=0, local_pending=1)
+    with patch.object(
+        adapter, "_handoff_polling_fatal_error", new=AsyncMock()
+    ) as handoff:
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+        assert adapter._dispatch_queue_stuck_count == 1
+        handoff.assert_not_called()
+
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+
+    assert adapter.fatal_error_code == "telegram_update_dispatch_stalled"
+    assert adapter.fatal_error_retryable is True
+    handoff.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_local_update_queue_progress_resets_stall_debounce():
+    """A shrinking local queue is forward progress, not a dispatcher wedge."""
+    adapter = _make_adapter(pending=0)
+    adapter._app.update_queue.qsize.side_effect = [2, 1]
+    with patch.object(
+        adapter, "_handoff_polling_fatal_error", new=AsyncMock()
+    ) as handoff:
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+
+    assert adapter._dispatch_queue_stuck_count == 1
+    assert adapter._dispatch_queue_last_size == 1
+    assert not adapter.has_fatal_error
+    handoff.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stopped_application_dispatcher_forces_retryable_rebuild():
+    """Updater health cannot mask a stopped PTB Application dispatcher."""
+    adapter = _make_adapter(pending=0)
+    adapter._app.running = False
+    with patch.object(
+        adapter, "_handoff_polling_fatal_error", new=AsyncMock()
+    ) as handoff:
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+        assert adapter._application_not_running_count == 1
+        handoff.assert_not_called()
+
+        await adapter._probe_pending_updates(adapter._app.bot, 5)
+
+    assert adapter.fatal_error_code == "telegram_update_dispatch_stalled"
+    assert adapter.fatal_error_retryable is True
+    handoff.assert_awaited_once()
+    adapter._app.bot.get_webhook_info.assert_not_called()
 
 
 @pytest.mark.asyncio

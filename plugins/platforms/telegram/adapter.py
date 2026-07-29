@@ -779,6 +779,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # error_callback ever fires and the gateway silently stops receiving
         # messages with the process still alive (#55769).
         self._polling_not_running_count: int = 0
+        # Telegram removes updates from its server-side queue as soon as
+        # getUpdates succeeds, before PTB's Application dispatcher invokes our
+        # handlers. A dead Application consumer therefore looks healthy to both
+        # the getUpdates progress marker and pending_update_count (which returns
+        # zero) while messages pile up in the local update_queue. Track two
+        # consecutive no-progress probes and force a full retryable adapter
+        # rebuild instead of merely restarting the Updater (#71239).
+        self._dispatch_app_ref = None
+        self._dispatch_queue_stuck_count: int = 0
+        self._dispatch_queue_last_size: Optional[int] = None
+        self._application_not_running_count: int = 0
         # A polling generation stays degraded until the dedicated getUpdates
         # request makes successful progress. start_polling() return and getMe()
         # success on the general request path are not polling-health signals.
@@ -2736,6 +2747,12 @@ class TelegramAdapter(BasePlatformAdapter):
         task is gone rather than wedged, so even ``get_webhook_info`` can't
         report a queue against a live consumer. We detect the stopped updater
         directly and feed the same ladder (#55769).
+
+        Finally, getUpdates can successfully remove updates from Telegram's
+        server queue while PTB's Application dispatcher is stopped or its local
+        ``update_queue`` is no longer draining. In that state both the transport
+        progress marker and ``pending_update_count`` look healthy, so two
+        no-progress local probes force a full retryable adapter rebuild.
         """
         if getattr(self, "_polling_teardown_started", False):
             return
@@ -2787,6 +2804,86 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return
         self._polling_not_running_count = 0
+
+        app = self._app
+        if app is not self._dispatch_app_ref:
+            self._dispatch_app_ref = app
+            self._dispatch_queue_stuck_count = 0
+            self._dispatch_queue_last_size = None
+            self._application_not_running_count = 0
+
+        if not getattr(app, "running", False):
+            self._dispatch_queue_stuck_count = 0
+            self._dispatch_queue_last_size = None
+            self._application_not_running_count += 1
+            logger.warning(
+                "[%s] Telegram polling heartbeat: PTB Application dispatcher "
+                "stopped while Updater remains active (stuck probe %d/2)",
+                self.name,
+                self._application_not_running_count,
+            )
+            if self._application_not_running_count >= 2:
+                self._application_not_running_count = 0
+                message = (
+                    "Telegram Application dispatcher stopped while polling "
+                    "remained active; rebuilding adapter"
+                )
+                logger.error("[%s] %s", self.name, message)
+                self._set_fatal_error(
+                    "telegram_update_dispatch_stalled", message, retryable=True
+                )
+                await self._handoff_polling_fatal_error()
+            return
+        self._application_not_running_count = 0
+
+        update_queue = getattr(app, "update_queue", None)
+        queue_size = getattr(update_queue, "qsize", None)
+        local_pending: Optional[int] = None
+        if callable(queue_size):
+            try:
+                raw_local_pending = queue_size()
+                if isinstance(raw_local_pending, int):
+                    local_pending = raw_local_pending
+            except Exception:
+                logger.debug(
+                    "[%s] Could not inspect Telegram Application update queue",
+                    self.name,
+                    exc_info=True,
+                )
+
+        if local_pending is None or local_pending <= 0:
+            self._dispatch_queue_stuck_count = 0
+            self._dispatch_queue_last_size = None
+        else:
+            previous_size = self._dispatch_queue_last_size
+            if previous_size is None or local_pending < previous_size:
+                # The queue shrank since the last probe, so the dispatcher made
+                # progress. Start a fresh debounce window for the remaining item.
+                self._dispatch_queue_stuck_count = 1
+            else:
+                self._dispatch_queue_stuck_count += 1
+            self._dispatch_queue_last_size = local_pending
+            logger.warning(
+                "[%s] Telegram polling heartbeat: %d update(s) stuck in PTB's "
+                "local dispatch queue (stuck probe %d/2)",
+                self.name,
+                local_pending,
+                self._dispatch_queue_stuck_count,
+            )
+            if self._dispatch_queue_stuck_count >= 2:
+                self._dispatch_queue_stuck_count = 0
+                self._dispatch_queue_last_size = None
+                message = (
+                    "Telegram Application update queue stopped draining after "
+                    "getUpdates succeeded; rebuilding adapter"
+                )
+                logger.error("[%s] %s", self.name, message)
+                self._set_fatal_error(
+                    "telegram_update_dispatch_stalled", message, retryable=True
+                )
+                await self._handoff_polling_fatal_error()
+                return
+
         get_webhook_info = getattr(bot, "get_webhook_info", None)
         if not callable(get_webhook_info):
             return
