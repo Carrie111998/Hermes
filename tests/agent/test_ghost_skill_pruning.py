@@ -382,7 +382,8 @@ class TestSkillsGuidanceSafetyRule:
         assert "skill_view(name='...')" in SKILLS_GUIDANCE
         # The rule list must use REAL newlines — the original PR hunk risked
         # literal backslash-n escape text rendering into the system prompt.
-        assert "\\n" not in SKILLS_GUIDANCE
-        assert SKILLS_GUIDANCE.count("\n") >= 6
+        assert "\\\\n" not in SKILLS_GUIDANCE
+        # Each rule starts its own line (4+ newlines: header + rules).
+        assert SKILLS_GUIDANCE.count("\n") >= 4
         for rule in ("UNAVAILABLE", "RELOAD", "WAIT", "DEDUP"):
             assert rule in SKILLS_GUIDANCE

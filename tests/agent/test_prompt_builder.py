@@ -1643,34 +1643,59 @@ class TestToolUseEnforcementGuidance:
 
 
 class TestOpenAIModelExecutionGuidance:
-    """Tests for GPT/Codex-specific execution discipline guidance."""
+    """Behavior contracts for GPT/Codex execution discipline guidance.
 
-    def test_guidance_covers_tool_persistence(self):
+    Rewritten 2026-07-28: the old block told the model to act instead of ask
+    and to retry empty searches with new queries — both measured to cause
+    ceremony blowups on anchorless turns. These tests pin the NEW contract:
+    grounding + calibrated asking + verification, and the absence of the
+    retired anti-patterns.
+    """
+
+    def test_covers_grounding(self):
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
-        assert "tool_persistence" in text
-        assert "retry" in text
-        assert "empty" in text or "partial" in text
+        assert "live facts" in text or "grounding" in text
+        assert "memory" in text  # memory describes the user, not this machine
+        assert "fabricate" in text
 
-    def test_guidance_covers_prerequisite_checks(self):
+    def test_covers_calibrated_asking(self):
+        """Must say WHEN to ask — the anchor-gate contract, not 'act don't ask'."""
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
-        assert "prerequisite" in text
-        assert "dependency" in text
+        assert "anchor" in text
+        assert "ask" in text
+        # asking is presented as the correct move for anchorless requests,
+        # and acting as the default for anchored ones
+        assert "obvious default" in text
 
-    def test_guidance_covers_verification(self):
+    def test_covers_verification(self):
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
         assert "verification" in text or "verify" in text
-        assert "correctness" in text
+        assert "side-effect" in text or "satisfies every stated requirement" in text
 
-    def test_guidance_covers_missing_context(self):
+    def test_retires_act_dont_ask(self):
+        """The block must NOT steer 'act instead of ask' as a blanket rule."""
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
-        assert "missing_context" in text or "missing context" in text
-        assert "hallucinate" in text or "guess" in text
+        assert "act_dont_ask" not in text
+        assert "instead of asking for clarification" not in text
 
-    def test_guidance_uses_xml_tags(self):
-        assert "<tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-        assert "</tool_persistence>" in OPENAI_MODEL_EXECUTION_GUIDANCE
+    def test_retires_empty_retry_loop(self):
+        """Must NOT tell the model to retry empty searches with new queries —
+        that instruction legitimised the ceremony empty-search loop."""
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "retry with a different query" not in text
+        assert "tool_persistence" not in text
+
+    def test_retires_tool_enumeration(self):
+        """The per-task tool list (arithmetic→terminal etc.) priced frontier
+        models for knowledge they already have; it stays out."""
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "mandatory_tool_use" not in text
+        assert "arithmetic" not in text
+
+    def test_uses_xml_tags(self):
+        assert "<grounding>" in OPENAI_MODEL_EXECUTION_GUIDANCE
+        assert "<ambiguity>" in OPENAI_MODEL_EXECUTION_GUIDANCE
         assert "<verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
-        assert "</verification>" in OPENAI_MODEL_EXECUTION_GUIDANCE
 
     def test_guidance_is_string(self):
         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
