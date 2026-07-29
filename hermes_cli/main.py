@@ -13161,6 +13161,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("FTS optimize notice failed: %s", e)
 
+        # Post-update cleanup: prune stale pre-update snapshots, but never let
+        # cleanup failure turn a successful update into a failed one.
+        try:
+            from hermes_cli.backup import prune_pre_update_snapshots
+
+            pruned = prune_pre_update_snapshots()
+            if pruned:
+                print(f"  ✓ Pruned {pruned} old pre-update snapshot(s)")
+        except Exception as exc:
+            logger.debug("Pre-update snapshot cleanup failed: %s", exc)
+
         # Curator first-run heads-up. Only prints when curator is enabled AND
         # has never run — i.e. the window where the ticker would otherwise
         # have fired against a fresh skill library. Kept silent on steady
