@@ -5,6 +5,8 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal } from '@xterm/xterm'
 import { useEffect, useRef } from 'react'
 
+import { writeClipboardText } from '@/components/ui/copy-button'
+import { triggerHaptic } from '@/lib/haptics'
 import { useTheme } from '@/themes/context'
 
 import { registerAgentTerminalWriter } from './agent-terminal-stream'
@@ -12,6 +14,8 @@ import { makeTerminalReader, registerTerminalReader } from './buffer'
 import { resolveSurfaceColor, terminalTheme } from './selection'
 import { prepareTerminalFontFamily } from './terminal-font'
 import { useTerminalFontController } from './use-terminal-font'
+import { mirrorSelection, terminalClipboardIntent } from './clipboard'
+import { isMacPlatform, resolveSurfaceColor, terminalTheme } from './selection'
 
 // Read-only terminal for an agent background process: a write-only xterm (no PTY,
 // no input) fed live by the backend output stream, keyed by process id. Shares
@@ -68,6 +72,30 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
     term.loadAddon(new Unicode11Addon())
     term.loadAddon(new WebLinksAddon())
     term.unicode.activeVersion = '11'
+
+    // Read-only mirror, but the output is exactly what people want to copy.
+    // No paste path: this terminal has no PTY to paste into.
+    const selectionDisposable = term.onSelectionChange(() => mirrorSelection(host, term.getSelection()))
+
+    term.attachCustomKeyEventHandler(event => {
+      const intent = terminalClipboardIntent(event, {
+        hasSelection: Boolean(term.getSelection()),
+        isMac: isMacPlatform()
+      })
+
+      if (intent !== 'copy') {
+        return true
+      }
+
+      event.preventDefault()
+      void writeClipboardText(term.getSelection()).catch(() => {
+        // Clipboard unavailable — leave the selection so the user can retry.
+      })
+      term.clearSelection()
+      triggerHaptic('selection')
+
+      return false
+    })
 
     fitRef.current = () => {
       if (host.clientWidth > 0 && host.clientHeight > 0) {
@@ -128,6 +156,8 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
       unregisterReader()
       observer?.disconnect()
       fitRef.current = null
+      selectionDisposable.dispose()
+      observer.disconnect()
       term.dispose()
       termRef.current = null
       webglRef.current = null
