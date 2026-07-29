@@ -2439,7 +2439,9 @@ def _prune_orphaned_branches(repo_root: str) -> None:
 _ACCENT_ANSI_DEFAULT = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold — fallback
 _BOLD = "\033[1m"
 _RST = "\033[0m"
-_STREAM_PAD = "    "  # 4-space indent for streamed response text (matches Panel padding)
+_STREAM_PAD = ""  # No indent for streamed response text — leading whitespace pollutes
+# terminal copy/paste (every selected line carried 4 spaces).  Matches the
+# response Panel's flush-left padding.
 
 
 def _hex_to_ansi(hex_color: str, *, bold: bool = False) -> str:
@@ -2851,12 +2853,13 @@ def _preserve_windows_dot_segments_for_markdown(text: str) -> str:
 def _terminal_width_for_streaming() -> int:
     """Display cells available inside the streamed response box.
 
-    The streaming path indents every line by ``_STREAM_PAD`` (4 cells)
-    inside an open response panel.  The realigner uses this number as
-    its budget when deciding whether to keep a horizontal table or
-    fall back to vertical key-value rendering.  We subtract a small
-    safety margin so terminal-resize races don't push a borderline
-    table into mid-cell soft-wrap.
+    The streaming path prefixes every line with ``_STREAM_PAD`` (now
+    empty — flush-left so copy/paste stays clean) inside an open
+    response panel.  The realigner uses this number as its budget when
+    deciding whether to keep a horizontal table or fall back to
+    vertical key-value rendering.  We subtract a small safety margin
+    so terminal-resize races don't push a borderline table into
+    mid-cell soft-wrap.
     """
 
     try:
@@ -2871,16 +2874,16 @@ def _render_final_assistant_content(text: str, mode: str = "render"):
     from rich.markdown import Markdown
 
     # Estimate the cells available to the rendered table.  The Panel
-    # used by the background-task / final-response path has 4 cells of
-    # left+right padding plus 1 cell of border on each side, plus the
-    # _STREAM_PAD indent that streamed content uses.  Subtract a small
-    # safety margin so resize races don't push a borderline table into
-    # soft-wrap.
+    # used by the background-task / final-response path renders
+    # flush-left (no horizontal padding — leading spaces pollute
+    # terminal copy/paste) with 1 cell of border on each side.
+    # Subtract a small safety margin so resize races don't push a
+    # borderline table into soft-wrap.
     try:
         cols = shutil.get_terminal_size((80, 24)).columns
     except Exception:
         cols = 80
-    panel_width = max(20, cols - 12)
+    panel_width = max(20, cols - 4)
 
     normalized_mode = str(mode or "render").strip().lower()
     if normalized_mode == "strip":
@@ -12247,6 +12250,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"  {_DIM}/voice tts  to toggle speech output{_RST}")
         _cprint(f"  {_DIM}/voice off  to disable voice mode{_RST}")
 
+    def _typed_voice_stop(self, user_input) -> bool:
+        """Typed bare stop phrase during an active voice chat ends the chat.
+
+        Saying "stop" ends the voice chat (PR #73106); TYPING the same bare
+        stop phrase while voice mode is on must behave identically instead of
+        sending "stop" to the agent as a turn. Guarded on voice mode being ON
+        — typed "stop" outside voice chat passes through to the agent exactly
+        as before. Reuses ``is_voice_stop_phrase`` (same config
+        ``voice.stop_phrases``, same exact-match semantics), so longer typed
+        messages containing "stop" are never swallowed.
+        """
+        if not isinstance(user_input, str):
+            return False
+        with self._voice_lock:
+            voice_on = self._voice_mode or self._voice_continuous
+        if not voice_on:
+            return False
+        try:
+            from tools.voice_mode import is_voice_stop_phrase
+            if not is_voice_stop_phrase(user_input):
+                return False
+        except Exception:
+            return False
+        _cprint(f"\n{_DIM}Stop phrase typed — ending voice chat.{_RST}")
+        self._disable_voice_mode()
+        return True
+
     def _disable_voice_mode(self):
         """Disable voice mode, cancel any active recording, and stop TTS."""
         recorder = None
@@ -13759,7 +13789,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         border_style=_resp_color,
                         style=_resp_text,
                         box=rich_box.HORIZONTALS,
-                        padding=(1, 4),
+                        padding=(1, 0),
                         width=self._scrollback_box_width(),
                     ))
 
@@ -16519,6 +16549,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
                         if _had_mouse_reports:
                             self._recover_terminal_input_modes(reason="mouse reports leaked into submitted input")
+
+                    # Typed bare stop phrase while a voice chat is active ends
+                    # the voice chat (same semantics as SAYING "stop") instead
+                    # of sending the word to the agent. Voice transcripts are
+                    # already stop-checked at the transcription points, so this
+                    # only intercepts typed input.
+                    if not is_voice_input and self._typed_voice_stop(user_input):
+                        continue
                     
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.
