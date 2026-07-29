@@ -2,6 +2,7 @@
 
 import json
 import os
+import socket
 import stat
 import sys
 from io import BytesIO
@@ -675,6 +676,38 @@ class TestPasteCallbackReader:
 
 class TestWaitForCallbackPasteIntegration:
     """_wait_for_callback offers the paste prompt only when interactive."""
+
+    def test_paste_callback_stops_http_listener_and_releases_port(self, monkeypatch):
+        """The paste winner must not leave the loopback listener blocked in accept."""
+        import tools.mcp_oauth as mod
+
+        port = _find_free_port()
+        monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+        monkeypatch.setattr(
+            mod.sys.stdin,
+            "readline",
+            lambda: "code=from_paste&state=paste_state\n",
+        )
+
+        real_thread = mod.threading.Thread
+        created_threads = []
+
+        def recording_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            created_threads.append(thread)
+            return thread
+
+        monkeypatch.setattr(mod.threading, "Thread", recording_thread)
+
+        result = asyncio.run(mod._make_callback_waiter(port)())
+
+        assert result == ("from_paste", "paste_state")
+        listener_thread = created_threads[0]
+        listener_thread.join(timeout=1.0)
+        assert not listener_thread.is_alive()
+
+        with socket.socket() as rebound:
+            rebound.bind(("127.0.0.1", port))
 
     def test_paste_prompt_shown_on_tty(self, monkeypatch, capsys):
         import tools.mcp_oauth as mod

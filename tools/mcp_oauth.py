@@ -892,7 +892,12 @@ def _make_callback_waiter(port: int):
                 "in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+            name=f"mcp-oauth-callback-{port}",
+        )
         server_thread.start()
 
         # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -923,7 +928,14 @@ def _make_callback_waiter(port: int):
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
-            server.server_close()
+            # server_close() alone does not reliably wake a listener blocked in
+            # accept() on another thread. Stop serve_forever first and wait for
+            # the thread to exit so an immediate retry can reuse a pinned port.
+            try:
+                server.shutdown()
+                server_thread.join(timeout=1.0)
+            finally:
+                server.server_close()
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
