@@ -29,6 +29,7 @@ landed via #28754 / #28781 ahead of this fix.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import time
 from pathlib import Path
 
@@ -74,6 +75,114 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             promoted = kb.recompute_ready(conn)
             assert promoted == 0, "worker-blocked task must not auto-promote"
             assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_initial_blocked_task_is_not_auto_promoted_by_recompute_ready(
+    kanban_home: Path,
+) -> None:
+    """A task created directly in ``blocked`` state is intentionally parked.
+
+    Bulk backlog staging relies on ``initial_status='blocked'`` being atomic:
+    the next dispatcher tick must not silently promote and claim the task.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="parked backlog item",
+            assignee="coder",
+            initial_status="blocked",
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        for _ in range(5):
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0, "initially blocked task must stay parked"
+            assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_manual_promotion_clears_initial_sticky_block(
+    kanban_home: Path,
+) -> None:
+    """Manual promotion releases a parked task for future auto-recovery."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="parked then released",
+            assignee="coder",
+            initial_status="blocked",
+        )
+        promoted, error = kb.promote_task(conn, tid, actor="operator")
+        assert promoted is True
+        assert error is None
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # Simulate a later recoverable circuit-breaker block.  This path has
+        # no worker-issued ``blocked`` event and remains below the default
+        # failure limit, so the dispatcher should be allowed to retry it.
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=1, "
+            "last_failure_error='transient error' WHERE id=?",
+            (tid,),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'gave_up', NULL, ?)",
+            (tid, int(time.time())),
+        )
+        conn.commit()
+
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_manual_promotion_atomically_clears_racing_sticky_block(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Promotion must use the status protected by its write transaction."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="racing promotion", assignee="coder")
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+        conn.commit()
+
+        real_write_txn = kb.write_txn
+        injected = False
+
+        @contextmanager
+        def racing_write_txn(connection):
+            nonlocal injected
+            if not injected:
+                injected = True
+                # Reproduce a worker/operator block after promote_task's
+                # initial status read but before it acquires the write lock.
+                connection.execute(
+                    "UPDATE tasks SET status='blocked' WHERE id=?", (tid,),
+                )
+                connection.execute(
+                    "INSERT INTO task_events "
+                    "(task_id, kind, payload, created_at) "
+                    "VALUES (?, 'blocked', NULL, ?)",
+                    (tid, int(time.time())),
+                )
+                connection.commit()
+            with real_write_txn(connection):
+                yield
+
+        monkeypatch.setattr(kb, "write_txn", racing_write_txn)
+        promoted, error = kb.promote_task(conn, tid, actor="operator")
+        assert promoted is True
+        assert error is None
+
+        # A later recoverable circuit-breaker block must not inherit the
+        # sticky event that the manual promotion explicitly released.
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=1 "
+            "WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
 
 
 def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Path) -> None:
