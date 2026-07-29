@@ -72,6 +72,54 @@ class TestNormalizeVoiceRecordKeyForPromptToolkit:
     # TUI falls back to Ctrl+B.
 
 
+class TestPromptToolkitKeyBindingArgs:
+    """Regression for #74169: ``alt+<key>`` crashed the CLI at startup.
+
+    prompt_toolkit 3.0.x has no Alt/Meta keys in its ``Keys`` enum, so
+    ``@kb.add("a-v")`` raises ``ValueError: Invalid key`` and takes the whole
+    CLI down. Alt must instead bind as the ``(escape, <key>)`` two-key sequence
+    the terminal actually sends.
+    """
+
+    def test_ctrl_keys_bind_as_a_single_string(self):
+        from hermes_cli.voice import prompt_toolkit_key_binding_args
+
+        assert prompt_toolkit_key_binding_args("c-b") == ("c-b",)
+        assert prompt_toolkit_key_binding_args("c-o") == ("c-o",)
+        assert prompt_toolkit_key_binding_args("c-space") == ("c-space",)
+
+    def test_alt_keys_expand_to_an_escape_sequence(self):
+        from hermes_cli.voice import prompt_toolkit_key_binding_args
+
+        assert prompt_toolkit_key_binding_args("a-v") == ("escape", "v")
+        assert prompt_toolkit_key_binding_args("a-space") == ("escape", "space")
+        assert prompt_toolkit_key_binding_args("a-enter") == ("escape", "enter")
+
+    def test_every_normalized_key_actually_binds_in_prompt_toolkit(self):
+        """The real crash: the translated args must be accepted by ``kb.add``."""
+        from prompt_toolkit.key_binding.key_bindings import KeyBindings
+
+        from hermes_cli.voice import (
+            normalize_voice_record_key_for_prompt_toolkit,
+            prompt_toolkit_key_binding_args,
+        )
+
+        for raw in ("alt+v", "alt+space", "alt+enter", "option+r", "ctrl+b", "ctrl+o", "super+b", ""):
+            normalized = normalize_voice_record_key_for_prompt_toolkit(raw)
+            args = prompt_toolkit_key_binding_args(normalized)
+            kb = KeyBindings()
+            # Must not raise — this is exactly what cli.py does at startup.
+            kb.add(*args)(lambda event: None)
+
+    def test_raw_alt_string_would_crash_without_the_fix(self):
+        """Documents the underlying prompt_toolkit limitation this guards."""
+        from prompt_toolkit.key_binding.key_bindings import KeyBindings
+
+        kb = KeyBindings()
+        with pytest.raises(ValueError):
+            kb.add("a-v")(lambda event: None)
+
+
 class TestVoiceRecordKeyFromConfig:
     """Round-11 Copilot review regression on #19835.
 

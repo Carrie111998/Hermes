@@ -16100,6 +16100,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from hermes_cli.config import load_config
             from hermes_cli.voice import (
                 normalize_voice_record_key_for_prompt_toolkit,
+                prompt_toolkit_key_binding_args,
                 voice_record_key_from_config,
             )
             _raw_key = voice_record_key_from_config(load_config())
@@ -16125,7 +16126,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # voice.record_key mid-session (Copilot round-13 on #19835).
         self.set_voice_record_key_cache(_raw_key)
 
-        @kb.add(_voice_key)
+        # prompt_toolkit has no Alt/Meta keys, so an ``a-<key>`` string can't be
+        # bound directly (it raises ``ValueError: Invalid key`` and crashes
+        # startup, #74169). Bind Alt keys as the ``(escape, <key>)`` two-key
+        # sequence the terminal actually sends; ctrl keys are unchanged.
+        from hermes_cli.voice import prompt_toolkit_key_binding_args
+        _voice_binding = prompt_toolkit_key_binding_args(_voice_key)
+
+        @kb.add(*_voice_binding)
         def handle_voice_record(event):
             """Toggle voice recording when voice mode is active.
 
