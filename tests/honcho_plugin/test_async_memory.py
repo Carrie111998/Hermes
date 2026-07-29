@@ -13,8 +13,10 @@ import json
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 from plugins.memory.honcho.client import HonchoClientConfig
+from plugins.memory.honcho import HonchoMemoryProvider
 from plugins.memory.honcho.session import (
     HonchoSession,
     HonchoSessionManager,
@@ -327,12 +329,308 @@ class TestAsyncWriterThread:
         assert len(flushed) == 1
         assert flushed[0] is sess
 
+    def test_flush_all_uses_writer_barrier_without_duplicate_write(self):
+        mgr = _make_manager(write_frequency="async")
+        sess = _make_session()
+        sess.add_message("user", "pending")
+        mgr._cache[sess.key] = sess
+        entered = threading.Event()
+        release = threading.Event()
+        remote_writes = []
+
+        def controlled_flush(session):
+            unsynced = [msg for msg in session.messages if not msg.get("_synced")]
+            if not unsynced:
+                return True
+            entered.set()
+            release.wait(timeout=2)
+            remote_writes.append(list(unsynced))
+            for msg in unsynced:
+                msg["_synced"] = True
+            return True
+
+        mgr._flush_session = controlled_flush
+        assert mgr._async_queue is not None
+        mgr._async_queue.put(sess)
+        assert entered.wait(timeout=1)
+        flush_thread = threading.Thread(target=mgr.flush_all)
+        flush_thread.start()
+        release.set()
+        flush_thread.join(timeout=2)
+        mgr.shutdown()
+
+        assert not flush_thread.is_alive()
+        assert len(remote_writes) == 1
+
     def test_shutdown_sentinel_stops_loop(self):
         mgr = _make_manager(write_frequency="async")
         thread = mgr._async_thread
         mgr.shutdown()
         thread.join(timeout=10)
         assert not thread.is_alive()
+
+    def test_shutdown_flushes_session_mode(self):
+        """Manager shutdown preserves the provider's final-flush contract."""
+        mgr = _make_manager(write_frequency="session")
+        sess = _make_session()
+        sess.add_message("user", "pending")
+        mgr._cache[sess.key] = sess
+
+        with patch.object(mgr, "_flush_session", return_value=True) as flush:
+            mgr.shutdown()
+
+        flush.assert_called_once_with(sess)
+
+    def test_shutdown_joins_manager_prefetch_worker(self):
+        mgr = _make_manager(write_frequency="turn")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_context(*_args, **_kwargs):
+            entered.set()
+            release.wait(timeout=2)
+            return {"representation": "ready"}
+
+        mgr.get_prefetch_context = slow_context
+        mgr.prefetch_context("cli:test", "hello")
+        assert entered.wait(timeout=1)
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        try:
+            mgr.shutdown()
+        finally:
+            release.set()
+            timer.join(timeout=1)
+
+        with mgr._background_threads_lock:
+            assert not any(thread.is_alive() for thread in mgr._background_threads)
+
+    def test_shutdown_waits_for_in_flight_async_write(self):
+        mgr = _make_manager(write_frequency="async")
+        assert mgr._config is not None
+        mgr._config.timeout = 0.01
+        sess = _make_session()
+        sess.add_message("user", "pending")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_flush(session):
+            assert session is sess
+            entered.set()
+            release.wait(timeout=2)
+            return True
+
+        mgr._flush_session = blocked_flush
+        assert mgr._async_queue is not None
+        mgr._async_queue.put(sess)
+        assert entered.wait(timeout=1)
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        try:
+            mgr.shutdown()
+        finally:
+            release.set()
+            timer.join(timeout=1)
+
+        assert mgr._async_thread is not None
+        assert not mgr._async_thread.is_alive()
+
+    def test_save_enqueue_is_atomic_with_shutdown_sentinel(self):
+        mgr = _make_manager(write_frequency="async")
+        sess = _make_session()
+        sess.add_message("user", "pending")
+        entered = threading.Event()
+        release = threading.Event()
+        flushed = threading.Event()
+        assert mgr._async_queue is not None
+        original_put = mgr._async_queue.put
+
+        def controlled_put(item, *args, **kwargs):
+            if item is sess:
+                entered.set()
+                release.wait(timeout=2)
+            return original_put(item, *args, **kwargs)
+
+        mgr._async_queue.put = controlled_put
+        mgr._flush_session = lambda session: flushed.set() or session is sess
+        save_thread = threading.Thread(target=mgr.save, args=(sess,))
+        save_thread.start()
+        assert entered.wait(timeout=1)
+        shutdown_thread = threading.Thread(target=mgr.shutdown)
+        shutdown_thread.start()
+        release.set()
+        save_thread.join(timeout=1)
+        shutdown_thread.join(timeout=2)
+
+        assert not save_thread.is_alive()
+        assert not shutdown_thread.is_alive()
+        assert flushed.is_set()
+        assert mgr._async_thread is not None
+        assert not mgr._async_thread.is_alive()
+
+    def test_manager_shutdown_timeout_is_retryable(self):
+        mgr = _make_manager(write_frequency="turn")
+        release = threading.Event()
+
+        def blocked_worker() -> None:
+            release.wait(timeout=2)
+
+        worker = mgr._start_background_thread(
+            name="blocked-prefetch",
+            target=blocked_worker,
+        )
+        assert worker is not None
+        mgr._join_timeout_seconds = lambda: 0.01
+
+        with pytest.raises(RuntimeError, match="blocked-prefetch"):
+            mgr.shutdown()
+
+        assert not mgr._shutdown_complete
+        release.set()
+        worker.join(timeout=1)
+        mgr.shutdown()
+        assert mgr._shutdown_complete
+
+    def test_shutdown_rejects_new_manager_workers(self):
+        mgr = _make_manager(write_frequency="turn")
+        mgr.shutdown()
+
+        assert mgr._start_background_thread(name="late", target=lambda: None) is None
+
+    def test_provider_shutdown_stops_async_writer(self):
+        """The provider owns the manager and must stop its daemon writer."""
+        mgr = _make_manager(write_frequency="async")
+        provider = HonchoMemoryProvider()
+        provider._manager = mgr
+        provider._session_initialized = True
+        thread = mgr._async_thread
+        assert thread is not None
+
+        try:
+            provider.shutdown()
+            assert not thread.is_alive()
+        finally:
+            # Keep the RED case from leaking its daemon into the test process.
+            mgr.shutdown()
+
+    def test_provider_shutdown_stops_manager_published_during_init(self):
+        provider = HonchoMemoryProvider()
+        provider._config = MagicMock(timeout=0.01)
+        manager = MagicMock()
+        provider._initializing_manager = manager
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_init():
+            entered.set()
+            release.wait(timeout=2)
+
+        provider._init_thread = provider._start_background_thread(
+            target=blocked_init,
+            name="honcho-session-init",
+        )
+        assert entered.wait(timeout=1)
+        timer = threading.Timer(0.05, release.set)
+        timer.start()
+        try:
+            provider.shutdown()
+        finally:
+            release.set()
+            timer.join(timeout=1)
+
+        manager.shutdown.assert_called_once_with()
+        assert provider._init_thread is not None
+        assert not provider._init_thread.is_alive()
+
+    def test_init_created_after_shutdown_is_stopped_before_publication(self):
+        provider = HonchoMemoryProvider()
+        provider._shutdown_event.set()
+        cfg = MagicMock(context_tokens=1000)
+        manager = MagicMock()
+
+        with (
+            patch(
+                "plugins.memory.honcho.client.get_honcho_client",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "plugins.memory.honcho.session.HonchoSessionManager",
+                return_value=manager,
+            ),
+        ):
+            provider._do_session_init(cfg, "test-session")
+
+        manager.shutdown.assert_called_once_with()
+        assert provider._manager is None
+        assert provider._initializing_manager is None
+
+    def test_provider_shutdown_rejects_new_workers(self):
+        provider = HonchoMemoryProvider()
+        provider.shutdown()
+
+        assert provider._start_background_thread(target=lambda: None, name="late") is None
+
+    def test_provider_retains_and_reports_failed_manager_shutdown(self):
+        provider = HonchoMemoryProvider()
+        manager = MagicMock()
+        manager.shutdown.side_effect = [
+            RuntimeError("blocked once"),
+            RuntimeError("blocked twice"),
+            None,
+        ]
+        provider._manager = manager
+        provider._owned_managers.add(manager)
+
+        with pytest.raises(RuntimeError, match="1 Honcho manager"):
+            provider.shutdown()
+
+        assert manager in provider._owned_managers
+        assert provider._manager is manager
+        provider.shutdown()
+        assert manager not in provider._owned_managers
+        assert provider._manager is None
+
+    def test_provider_shutdown_timeout_covers_internal_retry(self):
+        provider = HonchoMemoryProvider()
+        provider._config = MagicMock(timeout=2.0)
+        provider._dialectic_depth = 1
+
+        # Provider workers: 5s. Manager: one flush plus two 8s attempts.
+        assert provider.shutdown_timeout_seconds() == 29.0
+
+        provider._owned_managers.update((MagicMock(), MagicMock()))
+        # One flush plus two attempts for each of two retained managers.
+        assert provider.shutdown_timeout_seconds() == 45.0
+
+    def test_lazy_initialization_is_serialized(self):
+        provider = HonchoMemoryProvider()
+        provider._config = MagicMock()
+        provider._lazy_init_kwargs = {}
+        provider._lazy_init_session_id = "test"
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def initialize_once(*_args, **_kwargs):
+            calls.append(1)
+            entered.set()
+            release.wait(timeout=2)
+            provider._manager = MagicMock()
+            provider._session_initialized = True
+
+        provider._do_session_init = initialize_once
+        first = threading.Thread(target=provider._ensure_session)
+        second = threading.Thread(target=provider._ensure_session)
+        first.start()
+        assert entered.wait(timeout=1)
+        second.start()
+        release.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
