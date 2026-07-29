@@ -626,6 +626,15 @@ export function ChatBar({
         triggerKeyConsumedRef.current = true
         closeTrigger()
 
+        // Esc also interrupts a running turn — same semantics as the Stop
+        // button and the general Esc handler below. The trigger popover is
+        // closed first so a single Esc both dismisses the popover and stops
+        // the generation, instead of needing a second Esc press.
+        if (busy && !awaitingInput) {
+          triggerHaptic('cancel')
+          void Promise.resolve(haltRun())
+        }
+
         return
       }
     }
