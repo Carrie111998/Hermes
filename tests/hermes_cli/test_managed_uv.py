@@ -23,6 +23,18 @@ def _make_executable(path: Path) -> None:
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
 
 
+def _uv_path(home: Path) -> Path:
+    """Return the managed-uv binary path under *home* for the current test platform.
+
+    On Windows the binary is ``uv.exe``; on POSIX it is ``uv``. Mirrors the
+    production path logic in :func:`hermes_cli.managed_uv.managed_uv_path` so
+    tests that don't explicitly patch the platform still get the right
+    artifact name on the host they're running on.
+    """
+    suffix = ".exe" if sys.platform == "win32" else ""
+    return home / "bin" / f"uv{suffix}"
+
+
 def _runtime_info(
     executable: Path,
     sqlite_version: tuple[int, int, int],
@@ -86,14 +98,18 @@ class TestResolveUv:
             assert resolve_uv() is None
 
     def test_existing_executable(self, tmp_path):
-        _make_executable(tmp_path / "bin" / "uv")
+        _make_executable(_uv_path(tmp_path))
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path):
             from hermes_cli.managed_uv import resolve_uv
             result = resolve_uv()
-            assert result == str(tmp_path / "bin" / "uv")
+            assert result == str(_uv_path(tmp_path))
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows has no Unix-style execute bit; os.access(path, os.X_OK) returns True for any existing file, so this test cannot meaningfully assert 'non-executable' on Windows.",
+    )
     def test_non_executable_file_returns_none(self, tmp_path):
-        uv = tmp_path / "bin" / "uv"
+        uv = _uv_path(tmp_path)
         uv.parent.mkdir(parents=True)
         uv.write_text("not a binary")
         # Ensure no execute bit
@@ -109,23 +125,28 @@ class TestResolveUv:
 
 class TestEnsureUv:
     def test_already_installed_no_bootstrap(self, tmp_path):
-        _make_executable(tmp_path / "bin" / "uv")
+        _make_executable(_uv_path(tmp_path))
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path):
             from hermes_cli.managed_uv import ensure_uv
             path = ensure_uv()
-            assert path == str(tmp_path / "bin" / "uv")
+            assert path == str(_uv_path(tmp_path))
 
     def test_installs_if_missing(self, tmp_path):
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
-             patch("hermes_cli.managed_uv._install_uv") as mock_install:
+             patch("hermes_cli.managed_uv._install_uv") as mock_install, \
+             patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
             # Simulate the installer creating the binary
             def fake_install(target):
                 _make_executable(target)
             mock_install.side_effect = fake_install
+            # Stub the post-install "uv --version" probe; on Windows a real
+            # subprocess.run would try to execute the fake POSIX-shell file
+            # we just created and fail with WinError 216.
+            mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.1.2")
 
             from hermes_cli.managed_uv import ensure_uv
             path = ensure_uv()
-            assert path == str(tmp_path / "bin" / "uv")
+            assert path == str(_uv_path(tmp_path))
             mock_install.assert_called_once()
 
     def test_install_reports_runtime_repair_to_observer(self, tmp_path):
@@ -151,12 +172,15 @@ class TestEnsureUv:
             "hermes_cli.managed_uv._install_uv",
             side_effect=fake_install,
         ), patch(
+            "hermes_cli.managed_uv.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="uv 0.11.31\n"),
+        ), patch(
             "hermes_cli.managed_uv.repair_vulnerable_runtime",
             return_value=repair,
         ):
             path = ensure_uv(repair_observer=observed.append)
 
-        assert path == str(tmp_path / "bin" / "uv")
+        assert path == str(_uv_path(tmp_path))
         assert observed == [repair]
 
     def test_install_failure_returns_falsy(self, tmp_path):
@@ -274,27 +298,27 @@ class TestUpdateManagedUv:
             assert update_managed_uv() is None
 
     def test_self_update_success(self, tmp_path):
-        _make_executable(tmp_path / "bin" / "uv")
+        _make_executable(_uv_path(tmp_path))
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
              patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
             # uv self update succeeds
             mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.2.0")
             from hermes_cli.managed_uv import update_managed_uv
             result = update_managed_uv()
-            assert result == str(tmp_path / "bin" / "uv")
+            assert result == str(_uv_path(tmp_path))
             # First call is self update, second is --version
             assert mock_run.call_count == 2
-            assert mock_run.call_args_list[0][0][0] == [str(tmp_path / "bin" / "uv"), "self", "update"]
+            assert mock_run.call_args_list[0][0][0] == [str(_uv_path(tmp_path)), "self", "update"]
 
     def test_self_update_failure_non_fatal(self, tmp_path):
-        _make_executable(tmp_path / "bin" / "uv")
+        _make_executable(_uv_path(tmp_path))
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
              patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stderr="nope")
             from hermes_cli.managed_uv import update_managed_uv
             result = update_managed_uv()
             # Still returns the path — failure is non-fatal
-            assert result == str(tmp_path / "bin" / "uv")
+            assert result == str(_uv_path(tmp_path))
 
     def test_fresh_stamp_skips_network_self_update_but_not_repair(self, tmp_path, monkeypatch):
         """A recent success stamp must skip `uv self update` entirely while the
@@ -406,7 +430,7 @@ class TestUpdateManagedUv:
     def test_update_reports_runtime_repair_to_observer(self, tmp_path):
         from hermes_cli.managed_uv import RuntimeRepairResult, update_managed_uv
 
-        uv = tmp_path / "bin" / "uv"
+        uv = _uv_path(tmp_path)
         _make_executable(uv)
         repair = RuntimeRepairResult(
             "repaired",
@@ -759,6 +783,10 @@ class TestRuntimeCutover:
 # ---------------------------------------------------------------------------
 
 class TestInstallUvInternals:
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX-only test: exercises the _install_uv_posix path which only runs on POSIX; on Windows _install_uv routes to _install_uv_windows instead.",
+    )
     def test_posix_sets_uv_unmanaged_install(self, tmp_path):
         target = tmp_path / "bin" / "uv"
         with patch("hermes_cli.managed_uv._install_uv_posix") as mock_posix:
