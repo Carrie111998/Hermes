@@ -15,14 +15,43 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def _grant_reconciliation_grace_if_needed(agent: Any) -> None:
-    """Allow one request only when the normal loop budget is exhausted."""
+_GRACE_TURN_ATTR = "_delegation_reconciliation_grace_turn_id"
 
-    api_calls = int(getattr(agent, "_api_call_count", 0) or 0)
-    max_iterations = int(getattr(agent, "max_iterations", 0) or 0)
+
+def _normal_budget_available(agent: Any) -> bool:
+    """Mirror the conversation-loop's normal iteration-budget predicate."""
+
+    max_iterations = getattr(agent, "max_iterations", None)
     budget = getattr(agent, "iteration_budget", None)
+    # Lightweight helper users/tests do not necessarily expose loop-budget
+    # state. In production both attributes exist; absent state must not make a
+    # non-blocking queue drain manufacture a grace-call contract of its own.
+    if max_iterations is None or budget is None:
+        return True
+    api_calls = int(getattr(agent, "_api_call_count", 0) or 0)
     remaining = int(getattr(budget, "remaining", 0) or 0)
-    if (max_iterations and api_calls >= max_iterations) or remaining <= 0:
+    return api_calls < int(max_iterations or 0) and remaining > 0
+
+
+def _has_reconciliation_capacity(agent: Any, turn_id: str) -> bool:
+    """Return whether one more model request can consume an inject event."""
+
+    if _normal_budget_available(agent):
+        return True
+    # A generic budget grace already granted by the loop can carry this inject;
+    # record it as this turn's sole reconciliation boundary after acceptance.
+    if bool(getattr(agent, "_budget_grace_call", False)):
+        return True
+    return str(getattr(agent, _GRACE_TURN_ATTR, "") or "") != str(turn_id)
+
+
+def _grant_reconciliation_grace_if_needed(agent: Any, turn_id: str) -> None:
+    """Reserve at most one exhausted-budget reconciliation call per turn."""
+
+    if _normal_budget_available(agent):
+        return
+    setattr(agent, _GRACE_TURN_ATTR, str(turn_id))
+    if not bool(getattr(agent, "_budget_grace_call", False)):
         agent._budget_grace_call = True
 
 
@@ -48,7 +77,7 @@ def reconcile_provisional_final(
     # One reconciliation request must remain possible if the provisional final
     # consumed the nominal iteration budget. This grants no waiting and does not
     # bypass a budget that still has room.
-    _grant_reconciliation_grace_if_needed(agent)
+    _grant_reconciliation_grace_if_needed(agent, turn_id)
     return True
 
 
@@ -70,6 +99,13 @@ def drain_ready_injects(agent: Any, messages: list[dict[str, Any]], turn_id: str
     # sequence repairer to rewrite cached context. Leave all events queued until
     # an assistant response establishes the next append-only boundary.
     if messages and messages[-1].get("role") == "user":
+        return 0
+    # Once this turn has consumed its sole exhausted-budget reconciliation
+    # request, a later child must remain pending. The gateway/idle watcher will
+    # deliver it through the normal late-result turn after the parent exits;
+    # appending it here would mark it delivered even though no model call could
+    # read it.
+    if not _has_reconciliation_capacity(agent, turn_id):
         return 0
 
     from tools.async_delegation import (
@@ -151,5 +187,5 @@ def drain_ready_injects(agent: Any, messages: list[dict[str, Any]], turn_id: str
 
     for event, claim_id, _text in accepted:
         complete_event_delivery(event, claim_id)
-    _grant_reconciliation_grace_if_needed(agent)
+    _grant_reconciliation_grace_if_needed(agent, turn_id)
     return len(accepted)

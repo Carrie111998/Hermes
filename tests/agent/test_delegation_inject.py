@@ -218,6 +218,40 @@ def test_retry_tail_user_defers_new_inject_without_rewriting_history():
     assert [event["delivery_event_key"] for event in _queue_contents()] == ["task:1"]
 
 
+def test_exhausted_budget_grants_only_one_reconciliation_per_turn():
+    delegation_id = _record(goals=("first", "second"))
+    agent = SimpleNamespace(
+        _active_turn_id="turn-current",
+        _budget_grace_call=False,
+        _api_call_count=1,
+        max_iterations=1,
+        iteration_budget=SimpleNamespace(remaining=0),
+    )
+    messages = [{"role": "assistant", "content": "working"}]
+
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "first result")
+    )
+    assert drain_ready_injects(agent, messages, "turn-current") == 1
+    assert agent._budget_grace_call is True
+
+    # Simulate the conversation loop consuming the one reconciliation request
+    # and producing an assistant response. A child that finishes afterwards
+    # must stay pending for the late/after-turn delivery path instead of being
+    # acknowledged without any model request left to read it.
+    agent._budget_grace_call = False
+    messages.append({"role": "assistant", "content": "reconciled first result"})
+    assert ad.publish_batch_child_completion(
+        delegation_id, 1, _child(1, "second result")
+    )
+
+    snapshot = deepcopy(messages)
+    assert drain_ready_injects(agent, messages, "turn-current") == 0
+    assert messages == snapshot
+    assert [event["delivery_event_key"] for event in _queue_contents()] == ["task:1"]
+    assert _event_state(delegation_id, "task:1") == ("pending", 0)
+
+
 def test_inject_batch_publishes_first_child_without_waiting_for_sibling():
     gate = threading.Event()
     ready = threading.Event()
@@ -275,6 +309,15 @@ def test_inject_batch_publishes_first_child_without_waiting_for_sibling():
     while ad.active_count() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+
+    restored_queue = __import__("queue").Queue()
+    assert ad.restore_undelivered_completions(restored_queue) == 2
+    restored = [restored_queue.get_nowait(), restored_queue.get_nowait()]
+    assert {event.get("delivery_event_key") for event in restored} == {
+        "task:0",
+        "task:1",
+    }
+    assert all(event.get("delivery_event_key") for event in restored)
 
 
 def test_after_turn_remains_default_and_emits_only_combined_batch_event():
@@ -354,6 +397,21 @@ def test_model_schema_defaults_after_turn_and_dispatch_forwards_explicit_mode(mo
     result = AIAgent._dispatch_delegate_task(
         SimpleNamespace(_delegate_depth=0),
         {"goal": "audit", "result_delivery": "inject"},
+    )
+    assert result == "ok"
+    assert captured["background"] is True
+    assert captured["result_delivery"] == "inject"
+
+    # The registry fallback is a distinct model-facing dispatch path. It must
+    # preserve the same delivery choice if the run_agent intercept is bypassed.
+    captured.clear()
+    from tools.registry import registry
+
+    entry = registry.get_entry("delegate_task")
+    assert entry is not None
+    result = entry.handler(
+        {"goal": "audit", "result_delivery": "inject"},
+        parent_agent=SimpleNamespace(_delegate_depth=0),
     )
     assert result == "ok"
     assert captured["background"] is True

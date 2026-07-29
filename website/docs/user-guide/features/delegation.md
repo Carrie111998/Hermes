@@ -59,8 +59,11 @@ delegate_task(
 Injection is append-only: Hermes never rewrites earlier history or interrupts a
 tool-call/result sequence. Multiple results already ready at one boundary are
 coalesced into one synthetic user message, then the parent model receives a
-reconciliation request. If no result is ready, the foreground turn finalizes
-normally; Hermes does not poll or extend it just to wait for a subagent.
+reconciliation request. If the normal iteration budget is exhausted, at most
+one extra reconciliation request is granted for the originating turn; children
+that finish after that bounded window stay pending and arrive as separate late-
+result turns. If no result is ready, the foreground turn finalizes normally;
+Hermes does not poll or extend it just to wait for a subagent.
 
 ## How Subagent Context Works
 

@@ -316,15 +316,30 @@ def _prune_durable_records() -> None:
         )
 
 
-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+def _persist_completion(
+    event: Dict[str, Any],
+    result: Dict[str, Any],
+    *,
+    delivery_state: str = "pending",
+) -> None:
     now = time.time()
+    state = "delivered" if delivery_state == "delivered" else "pending"
+    delivered_at = now if state == "delivered" else None
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
+               event_json=?, result_json=?, delivery_state=?, delivered_at=?
                WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+            (
+                event.get("status", "completed"),
+                event.get("completed_at", now),
+                now,
+                json.dumps(event),
+                json.dumps(result),
+                state,
+                delivered_at,
+                event["delegation_id"],
+            ),
         )
 
 
@@ -1373,27 +1388,23 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    _persist_completion(evt, combined)
     if str(event_record.get("result_delivery") or "after_turn").lower() == "inject":
         # Child callbacks normally publish immediately. Re-publish here as an
-        # idempotent safety net for callback failures, then acknowledge the
-        # aggregate parent row so restart recovery cannot replay a duplicate
-        # combined event.
+        # idempotent safety net for callback failures. Persist every child event
+        # before atomically acknowledging the aggregate parent row: otherwise a
+        # crash between a pending aggregate write and a separate acknowledgement
+        # could restore both the aggregate and its child events after restart.
         delegation_id = str(event_record.get("delegation_id") or "")
         for child in combined.get("results") or []:
-            try:
-                publish_batch_child_completion(
-                    delegation_id,
-                    int(child.get("task_index", 0)),
-                    child,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to persist inject child event for %s", delegation_id
-                )
+            publish_batch_child_completion(
+                delegation_id,
+                int(child.get("task_index", 0)),
+                child,
+            )
         _publish_batch_terminal_event(event_record, combined, status)
-        mark_completion_delivered(delegation_id)
+        _persist_completion(evt, combined, delivery_state="delivered")
         return
+    _persist_completion(evt, combined)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover

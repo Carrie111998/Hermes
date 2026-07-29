@@ -3971,10 +3971,12 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "How child results are delivered back to the parent context. "
                     "'inject': use for auditors, reviewers, and dependent work "
-                    "whose result must be read before the parent continues or "
-                    "finalizes; ready results are appended only at safe boundaries "
-                    "after complete tool-result sequences and before the next model "
-                    "request. Batch children inject independently as they finish. "
+                    "whose result can affect the current turn; a result that is "
+                    "ready in time is appended only at a safe boundary after complete "
+                    "tool-result sequences and before the next model request. Batch "
+                    "children inject independently as they finish; results that miss "
+                    "the bounded reconciliation window become separate late-result "
+                    "turns. "
                     "'after_turn' (default): use for independent background work; "
                     "the result arrives in a separate synthetic turn after the "
                     "foreground turn. Running children are never waited on."
@@ -4040,6 +4042,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        result_delivery=args.get("result_delivery"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
