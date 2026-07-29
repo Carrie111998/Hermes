@@ -8,6 +8,7 @@ ACTIVE_LINK="/opt/adventico-ai-platform/hermes-agent"
 SERVICE="hermes-cloud-gateway.service"
 GATEWAY_FRAGMENT="/etc/systemd/system/hermes-cloud-gateway.service"
 GATEWAY_CONNECTOR_DROP_IN="/etc/systemd/system/hermes-cloud-gateway.service.d/20-discord-connector.conf"
+GATEWAY_CANONICAL_GCLOUD_DROP_IN="/etc/systemd/system/hermes-cloud-gateway.service.d/20-canonical-gcloud-config.conf"
 CUTOVER_PLAN_PATH="/var/lib/muncho-production-legacy-cutover/staged/cutover-plan.json"
 CUTOVER_UNIT_INPUT_PLAN_PATH="/var/lib/muncho-production-legacy-cutover/staged/unit-input-plan.json"
 CUTOVER_UNIT_INPUT_APPROVAL_PATH="/var/lib/muncho-production-legacy-cutover/staged/unit-input-approval.json"
@@ -238,6 +239,7 @@ gateway_deploy_topology_json() {
   python3 - \
     "$GATEWAY_FRAGMENT" \
     "$GATEWAY_CONNECTOR_DROP_IN" \
+    "$GATEWAY_CANONICAL_GCLOUD_DROP_IN" \
     "$CUTOVER_PLAN_PATH" \
     "$ACTIVE_LINK" \
     "$RELEASES" \
@@ -263,16 +265,23 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 MAX_UNIT_BYTES = 1024 * 1024
 MAX_PLAN_BYTES = 8 * 1024 * 1024
 MAX_SYSTEMD_BYTES = 64 * 1024
+CANONICAL_GCLOUD_DROP_IN_BYTES = (
+    b"[Service]\n"
+    b"RuntimeDirectory=hermes-canonical-gcloud\n"
+    b"RuntimeDirectoryMode=0700\n"
+    b"Environment=CLOUDSDK_CONFIG=/run/hermes-canonical-gcloud\n"
+)
 
 fragment = Path(sys.argv[1])
 drop_in = Path(sys.argv[2])
-plan_path = Path(sys.argv[3])
-active_link = Path(sys.argv[4])
-releases = Path(sys.argv[5])
-service = sys.argv[6]
-trusted_uid = int(sys.argv[7])
-trusted_gid = int(sys.argv[8])
-systemd_raw = sys.argv[9]
+canonical_gcloud_drop_in = Path(sys.argv[3])
+plan_path = Path(sys.argv[4])
+active_link = Path(sys.argv[5])
+releases = Path(sys.argv[6])
+service = sys.argv[7]
+trusted_uid = int(sys.argv[8])
+trusted_gid = int(sys.argv[9])
+systemd_raw = sys.argv[10]
 
 
 class GateError(RuntimeError):
@@ -459,13 +468,30 @@ try:
     except UnicodeError as exc:
         raise GateError("gateway_fragment_not_utf8") from exc
     lines = fragment_text.splitlines()
+    legacy_ancillary_sha256 = None
+    if systemd["drop_in_paths"] == [str(canonical_gcloud_drop_in)]:
+        canonical_gcloud_raw = read_exact(
+            canonical_gcloud_drop_in,
+            modes={0o644},
+            owners={trusted_uid},
+            groups={trusted_gid},
+            maximum=MAX_UNIT_BYTES,
+        )
+        if canonical_gcloud_raw != CANONICAL_GCLOUD_DROP_IN_BYTES:
+            raise GateError("legacy_ancillary_drop_in_drifted")
+        legacy_ancillary_sha256 = hashlib.sha256(
+            canonical_gcloud_raw
+        ).hexdigest()
     pinned_signal = (
         os.path.lexists(plan_path)
         or PINNED_HEADER in lines
         or any(line.startswith("# ReleaseRevision=") for line in lines)
         or STARTUP_FLAG in fragment_text
         or str(releases) + "/hermes-agent-" in fragment_text
-        or bool(systemd["drop_in_paths"])
+        or (
+            bool(systemd["drop_in_paths"])
+            and legacy_ancillary_sha256 is None
+        )
     )
     if not pinned_signal:
         legacy_working_directory = [
@@ -482,10 +508,24 @@ try:
             )
         ):
             raise GateError("legacy_topology_not_symlink_bound")
+        legacy_identity = {
+            "fragment_sha256": hashlib.sha256(fragment_raw).hexdigest(),
+        }
+        if legacy_ancillary_sha256 is not None:
+            legacy_identity.update(
+                {
+                    "canonical_gcloud_drop_in_path": str(
+                        canonical_gcloud_drop_in
+                    ),
+                    "canonical_gcloud_drop_in_sha256": (
+                        legacy_ancillary_sha256
+                    ),
+                }
+            )
         emit(
             "legacy",
             "trusted_legacy_symlink_topology",
-            fragment_sha256=hashlib.sha256(fragment_raw).hexdigest(),
+            **legacy_identity,
         )
         raise SystemExit(0)
     if not os.path.lexists(plan_path):

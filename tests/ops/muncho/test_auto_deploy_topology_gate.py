@@ -35,14 +35,23 @@ def _executable(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
-def _systemd_show(fragment: Path, drop_in: Path | None) -> str:
+def _systemd_show(
+    fragment: Path,
+    drop_in: Path | list[Path] | tuple[Path, ...] | None,
+) -> str:
+    if drop_in is None:
+        drop_in_paths = ""
+    elif isinstance(drop_in, Path):
+        drop_in_paths = str(drop_in)
+    else:
+        drop_in_paths = " ".join(str(path) for path in drop_in)
     return "\n".join(
         (
             "Names=hermes-cloud-gateway.service",
             f"FragmentPath={fragment}",
             "LoadState=loaded",
             "UnitFileState=enabled",
-            f"DropInPaths={'' if drop_in is None else drop_in}",
+            f"DropInPaths={drop_in_paths}",
             "NeedDaemonReload=no",
             "TriggeredBy=",
             "Triggers=",
@@ -58,6 +67,11 @@ def _unit_paths(tmp_path: Path) -> dict[str, Path]:
             tmp_path
             / "etc/systemd/system/hermes-cloud-gateway.service.d"
             / "20-discord-connector.conf"
+        ),
+        "canonical_gcloud_drop_in": (
+            tmp_path
+            / "etc/systemd/system/hermes-cloud-gateway.service.d"
+            / "20-canonical-gcloud-config.conf"
         ),
         "plan": tmp_path / "cutover/staged/cutover-plan.json",
         "releases": tmp_path / "releases",
@@ -181,7 +195,11 @@ def _write_pinned_topology(paths: dict[str, Path]) -> dict[str, str]:
     }
 
 
-def _write_legacy_topology(paths: dict[str, Path]) -> None:
+def _write_legacy_topology(
+    paths: dict[str, Path],
+    *,
+    canonical_gcloud_drop_in: bool = False,
+) -> None:
     fragment = paths["fragment"]
     fragment.parent.mkdir(parents=True)
     fragment.write_text(
@@ -202,8 +220,20 @@ def _write_legacy_topology(paths: dict[str, Path]) -> None:
         encoding="utf-8",
     )
     fragment.chmod(0o644)
+    loaded_drop_in = None
+    if canonical_gcloud_drop_in:
+        loaded_drop_in = paths["canonical_gcloud_drop_in"]
+        loaded_drop_in.parent.mkdir(parents=True, exist_ok=True)
+        loaded_drop_in.write_text(
+            "[Service]\n"
+            "RuntimeDirectory=hermes-canonical-gcloud\n"
+            "RuntimeDirectoryMode=0700\n"
+            "Environment=CLOUDSDK_CONFIG=/run/hermes-canonical-gcloud\n",
+            encoding="utf-8",
+        )
+        loaded_drop_in.chmod(0o644)
     paths["show"].write_text(
-        _systemd_show(fragment, None),
+        _systemd_show(fragment, loaded_drop_in),
         encoding="utf-8",
     )
 
@@ -253,6 +283,9 @@ def _fake_commands(paths: dict[str, Path]) -> dict[str, str]:
         "DEPLOY_HELPER": str(DEPLOY_HELPER),
         "TEST_FRAGMENT": str(paths["fragment"]),
         "TEST_DROP_IN": str(paths["drop_in"]),
+        "TEST_CANONICAL_GCLOUD_DROP_IN": str(
+            paths["canonical_gcloud_drop_in"]
+        ),
         "TEST_PLAN": str(paths["plan"]),
         "TEST_RELEASES": str(paths["releases"]),
         "TEST_ACTIVE": str(paths["active"]),
@@ -280,6 +313,7 @@ def _shell_prefix() -> str:
 source "$DEPLOY_HELPER"
 GATEWAY_FRAGMENT="$TEST_FRAGMENT"
 GATEWAY_CONNECTOR_DROP_IN="$TEST_DROP_IN"
+GATEWAY_CANONICAL_GCLOUD_DROP_IN="$TEST_CANONICAL_GCLOUD_DROP_IN"
 CUTOVER_PLAN_PATH="$TEST_PLAN"
 RELEASES="$TEST_RELEASES"
 ACTIVE_LINK="$TEST_ACTIVE"
@@ -684,6 +718,148 @@ def test_trusted_legacy_symlink_topology_keeps_existing_start_behavior(
     assert operations.count("systemctl:show ") == 1
     assert "systemd-run:--unit=muncho-auto-deploy-aaaaaaaaaaaa-pr101" in operations
     assert "systemctl:restart" not in operations
+
+
+def test_trusted_legacy_topology_accepts_exact_canonical_gcloud_drop_in(
+    tmp_path: Path,
+) -> None:
+    paths = _unit_paths(tmp_path)
+    _write_legacy_topology(paths, canonical_gcloud_drop_in=True)
+
+    classified = _run_shell(paths, "gateway_deploy_topology_json")
+
+    assert classified.returncode == 0, classified.stderr
+    observed = json.loads(classified.stdout)
+    assert observed["classification"] == "legacy"
+    assert observed["reason_code"] == "trusted_legacy_symlink_topology"
+    assert observed["canonical_gcloud_drop_in_path"] == str(
+        paths["canonical_gcloud_drop_in"]
+    )
+    assert observed["canonical_gcloud_drop_in_sha256"] == hashlib.sha256(
+        paths["canonical_gcloud_drop_in"].read_bytes()
+    ).hexdigest()
+
+    start_paths = _unit_paths(tmp_path / "start")
+    _write_legacy_topology(
+        start_paths,
+        canonical_gcloud_drop_in=True,
+    )
+    started = _run_shell(
+        start_paths,
+        'start_unit "$TEST_SHA" "$TEST_PR"',
+    )
+
+    assert started.returncode == 0, started.stderr
+    receipt = _receipt(start_paths)
+    assert receipt["status"] == "deploy_unit_started"
+    operations = start_paths["operations"].read_text(encoding="utf-8")
+    assert "systemd-run:--unit=muncho-auto-deploy-aaaaaaaaaaaa-pr101" in operations
+    assert "systemctl:restart" not in operations
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("content", "legacy_ancillary_drop_in_drifted"),
+        ("mode", "trusted_file_identity_invalid"),
+    ),
+)
+def test_drifted_canonical_gcloud_drop_in_is_not_accepted_as_legacy(
+    tmp_path: Path,
+    mutation: str,
+    reason: str,
+) -> None:
+    paths = _unit_paths(tmp_path)
+    _write_legacy_topology(paths, canonical_gcloud_drop_in=True)
+    ancillary = paths["canonical_gcloud_drop_in"]
+    if mutation == "content":
+        with ancillary.open("a", encoding="utf-8") as handle:
+            handle.write("# drift\n")
+    else:
+        ancillary.chmod(0o666)
+
+    completed = _run_shell(
+        paths,
+        'start_unit "$TEST_SHA" "$TEST_PR"',
+    )
+
+    assert completed.returncode == 8
+    receipt = _receipt(paths)
+    assert receipt["status"] == "blocked_gateway_deploy_topology_ambiguous"
+    assert receipt["gateway_topology"]["classification"] == "ambiguous"
+    assert receipt["gateway_topology"]["reason_code"] == reason
+    operations = paths["operations"].read_text(encoding="utf-8")
+    assert "systemd-run:" not in operations
+    assert "systemctl:restart" not in operations
+
+
+@pytest.mark.parametrize("include_canonical", (False, True))
+def test_unapproved_or_mixed_drop_ins_remain_pinned_signals(
+    tmp_path: Path,
+    include_canonical: bool,
+) -> None:
+    paths = _unit_paths(tmp_path)
+    _write_legacy_topology(
+        paths,
+        canonical_gcloud_drop_in=include_canonical,
+    )
+    connector = paths["drop_in"]
+    connector.parent.mkdir(parents=True, exist_ok=True)
+    connector.write_text(
+        "[Unit]\nBindsTo=muncho-discord-connector.service\n",
+        encoding="utf-8",
+    )
+    connector.chmod(0o644)
+    loaded = [connector]
+    if include_canonical:
+        loaded.append(paths["canonical_gcloud_drop_in"])
+    paths["show"].write_text(
+        _systemd_show(paths["fragment"], loaded),
+        encoding="utf-8",
+    )
+
+    completed = _run_shell(
+        paths,
+        'start_unit "$TEST_SHA" "$TEST_PR"',
+    )
+
+    assert completed.returncode == 8
+    receipt = _receipt(paths)
+    assert receipt["status"] == "blocked_gateway_deploy_topology_ambiguous"
+    assert (
+        receipt["gateway_topology"]["reason_code"]
+        == "pinned_topology_cutover_plan_missing"
+    )
+    assert "systemd-run:" not in paths["operations"].read_text(
+        encoding="utf-8"
+    )
+
+
+def test_canonical_gcloud_drop_in_does_not_mask_pinned_fragment_signal(
+    tmp_path: Path,
+) -> None:
+    paths = _unit_paths(tmp_path)
+    _write_legacy_topology(paths, canonical_gcloud_drop_in=True)
+    with paths["fragment"].open("a", encoding="utf-8") as handle:
+        handle.write(
+            "# Exact SHA-bound Cloud Muncho production gateway; do not edit.\n"
+        )
+
+    completed = _run_shell(
+        paths,
+        'start_unit "$TEST_SHA" "$TEST_PR"',
+    )
+
+    assert completed.returncode == 8
+    receipt = _receipt(paths)
+    assert receipt["status"] == "blocked_gateway_deploy_topology_ambiguous"
+    assert (
+        receipt["gateway_topology"]["reason_code"]
+        == "pinned_topology_cutover_plan_missing"
+    )
+    assert "systemd-run:" not in paths["operations"].read_text(
+        encoding="utf-8"
+    )
 
 
 def test_unknown_legacy_fragment_is_not_treated_as_safe_legacy(
