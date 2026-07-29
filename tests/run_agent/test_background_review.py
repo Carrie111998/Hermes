@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import run_agent as run_agent_module
 from run_agent import AIAgent
+from agent.background_review import _SKILL_REVIEW_PROMPT, _COMBINED_REVIEW_PROMPT
 
 
 def _bare_agent() -> AIAgent:
@@ -30,6 +31,21 @@ def _bare_agent() -> AIAgent:
     agent.status_callback = None
     agent._safe_print = lambda *_args, **_kwargs: None
     return agent
+
+
+def test_background_skill_prompts_allow_noop_and_forbid_private_state():
+    for prompt in (_SKILL_REVIEW_PROMPT, _COMBINED_REVIEW_PROMPT):
+        low = prompt.lower()
+        assert "nothing to save" in low
+        assert "preferences" in low
+        assert "memory" in low
+        assert "user-home paths" in low
+        assert "credentials" in low
+        assert "backup, snapshot, or timestamped copies" in low
+
+    combined = _COMBINED_REVIEW_PROMPT.lower()
+    assert "for skills, act only on durable, verified, non-personal signal" in combined
+    assert "memory may retain durable personal facts and preferences" in combined
 
 
 class ImmediateThread:

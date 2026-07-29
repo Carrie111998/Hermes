@@ -173,6 +173,21 @@ class TestValidateFilePath:
         assert _validate_file_path("scripts/train.py") is None
         assert _validate_file_path("assets/image.png") is None
 
+    @pytest.mark.parametrize(
+        "file_path",
+        [
+            "references/source.md.bak",
+            "references/source.md.bak-20260728",
+            "templates/config.yaml.snapshot",
+            "scripts/check.py.orig",
+            "assets/image.png~",
+        ],
+    )
+    def test_backup_artifact_names_rejected(self, file_path):
+        err = _validate_file_path(file_path)
+        assert "backup" in err.lower()
+        assert "snapshot" in err.lower()
+
     def test_empty_path(self):
         assert _validate_file_path("") == "file_path is required."
 
@@ -694,6 +709,95 @@ class TestSkillManageDispatcher:
         assert (tmp_path / "bundled" / "SKILL.md").exists()
 
 
+class TestBackgroundReviewSkillHygiene:
+    def test_private_content_is_rejected_before_staging(self, tmp_path):
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        private_content = VALID_SKILL_CONTENT + "\nSee /Users/sensitive-account/project.\n"
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with _skill_dir(tmp_path), \
+                 patch("tools.skill_manager_tool._apply_skill_write_gate") as gate:
+                raw = skill_manage("create", "private-skill", content=private_content)
+        finally:
+            reset_current_write_origin(token)
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "user-home paths" in result["error"]
+        assert "sensitive-account" not in result["error"]
+        gate.assert_not_called()
+        assert not (tmp_path / "private-skill").exists()
+
+    def test_placeholder_identity_is_allowed(self, tmp_path):
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        content = VALID_SKILL_CONTENT + (
+            "\nExample: /Users/example/project and owner@example.com.\n"
+        )
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with _skill_dir(tmp_path), \
+                 patch(
+                     "tools.skill_manager_tool._apply_skill_write_gate",
+                     return_value=None,
+                 ), \
+                 patch("tools.skill_manager_tool._security_scan_skill", return_value=None):
+                raw = skill_manage("create", "example-skill", content=content)
+        finally:
+            reset_current_write_origin(token)
+
+        assert json.loads(raw)["success"] is True
+
+    def test_patch_checks_complete_result_not_only_inserted_fragment(self, tmp_path):
+        from tools.skill_manager_tool import mark_background_review_skill_read
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        legacy = VALID_SKILL_CONTENT + "\nContact owner@TOKEN for support.\n"
+        with _skill_dir(tmp_path), \
+             patch("tools.skill_manager_tool._security_scan_skill", return_value=None), \
+             patch(
+                 "tools.skill_usage.load_usage",
+                 return_value={"legacy-skill": {"created_by": "agent"}},
+             ):
+            assert json.loads(
+                skill_manage("create", "legacy-skill", content=legacy)
+            )["success"] is True
+
+            token = set_current_write_origin(BACKGROUND_REVIEW)
+            try:
+                mark_background_review_skill_read(
+                    tmp_path / "legacy-skill" / "SKILL.md"
+                )
+                raw = skill_manage(
+                    "patch",
+                    "legacy-skill",
+                    old_string="TOKEN",
+                    new_string="private-company.com",
+                )
+            finally:
+                reset_current_write_origin(token)
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "email addresses" in result["error"]
+        assert "owner@TOKEN" in (
+            tmp_path / "legacy-skill" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+
+
 class TestSecurityScanGate:
     """_security_scan_skill is gated by skills.guard_agent_created config flag."""
 
@@ -752,6 +856,78 @@ class TestSecurityScanGate:
 
         assert result is not None
         assert "Security scan blocked" in result
+
+    def test_background_review_forces_guard_when_config_is_off(self):
+        from tools.skill_manager_tool import _guard_agent_created_enabled
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={"skills": {"guard_agent_created": False}},
+            ):
+                assert _guard_agent_created_enabled() is True
+        finally:
+            reset_current_write_origin(token)
+
+    def test_background_review_blocks_when_scan_errors(self, tmp_path):
+        from tools.skill_manager_tool import _security_scan_skill
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with patch(
+                "tools.skill_manager_tool.scan_skill",
+                side_effect=RuntimeError("private scanner detail"),
+            ):
+                result = _security_scan_skill(tmp_path)
+        finally:
+            reset_current_write_origin(token)
+
+        assert result == (
+            "Security scan failed; autonomous skill write was not applied."
+        )
+        assert "private scanner detail" not in result
+
+    def test_background_review_blocks_when_scanner_is_unavailable(self, tmp_path):
+        from tools.skill_manager_tool import _security_scan_skill
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with patch("tools.skill_manager_tool._GUARD_AVAILABLE", False):
+                result = _security_scan_skill(tmp_path)
+        finally:
+            reset_current_write_origin(token)
+
+        assert result == (
+            "Security scan unavailable; autonomous skill write was not applied."
+        )
+
+    def test_foreground_scan_error_remains_best_effort(self, tmp_path):
+        from tools.skill_manager_tool import _security_scan_skill
+
+        with patch(
+            "tools.skill_manager_tool._guard_agent_created_enabled",
+            return_value=True,
+        ), patch(
+            "tools.skill_manager_tool.scan_skill",
+            side_effect=RuntimeError("scanner unavailable"),
+        ):
+            assert _security_scan_skill(tmp_path) is None
 
     def test_guard_flag_reads_config_default_false(self):
         """_guard_agent_created_enabled returns False when config doesn't set it."""

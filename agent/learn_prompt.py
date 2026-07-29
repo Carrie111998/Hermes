@@ -93,7 +93,19 @@ Quality bar:
 - Larger scripts/parsers belong in a `scripts/` file (add via
   `skill_manage` write_file), referenced from SKILL.md by relative path — not
   inlined for the agent to re-type every run. References go in `references/`,
-  templates in `templates/`."""
+  templates in `templates/`.
+
+No private or transient material:
+- A skill is shareable procedure, not a user profile or session archive. Do
+  not store personal names or preferences, concrete user-home paths,
+  non-placeholder email addresses, credentials, private URLs, session IDs,
+  or machine-specific state. Use obvious placeholders where paths or
+  identities are structurally necessary.
+- Do not cache current project status, remembered benchmark/pricing values,
+  or vendor claims as permanent facts. Record the authoritative source and
+  the procedure for re-checking volatile evidence.
+- Do not preserve destructive or guard-bypass shortcuts. Do not add backup,
+  snapshot, or timestamped copies to the live skill package."""
 
 
 def build_learn_prompt(user_request: str) -> str:

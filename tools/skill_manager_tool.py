@@ -95,7 +95,8 @@ def _reset_background_review_read_marks() -> None:
     _background_review_read_paths.set(frozenset())
 
 # Import security scanner — external hub installs always get scanned;
-# agent-created skills only get scanned when skills.guard_agent_created is on.
+# foreground agent-created skills follow skills.guard_agent_created, while
+# autonomous background-review writes are always scanned.
 try:
     from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
     _GUARD_AVAILABLE = True
@@ -103,14 +104,114 @@ except ImportError:
     _GUARD_AVAILABLE = False
 
 
-def _guard_agent_created_enabled() -> bool:
-    """Read skills.guard_agent_created from config (default False).
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@"
+    r"(?P<domain>[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)"
+)
+_POSIX_HOME_RE = re.compile(
+    r"(?<![A-Za-z0-9])/(?:Users|home)/(?P<account>[^/\s`'\"<>]+)"
+)
+_WINDOWS_HOME_RE = re.compile(
+    r"(?i)(?:^|[\s`'\"])[A-Z]:\\Users\\(?P<account>[^\\/\s`'\"<>]+)"
+)
+_BACKUP_ARTIFACT_RE = re.compile(
+    r"(?i)(?:~|\.bak(?:[._-].*)?|\.backup(?:[._-].*)?|"
+    r"\.snapshot(?:[._-].*)?|\.orig|\.old)$"
+)
+_PLACEHOLDER_ACCOUNTS = frozenset({
+    "account", "example", "home", "name", "user", "username", "your-user",
+    "your_user",
+})
+_RESERVED_EMAIL_DOMAINS = frozenset({
+    "example.com", "example.net", "example.org",
+})
 
-    Off by default because the agent can already execute the same code
-    paths via terminal() with no gate, so the scan adds friction without
-    meaningful security.  Users who want belt-and-suspenders can turn it
-    on via `hermes config set skills.guard_agent_created true`.
+
+def _is_placeholder_account(value: str) -> bool:
+    normalized = value.strip().lower()
+    return (
+        normalized in _PLACEHOLDER_ACCOUNTS
+        or normalized.startswith(("$", "%", "{", "["))
+        or normalized.endswith("%")
+    )
+
+
+def _contains_private_identity(content: str) -> bool:
+    """Return whether reusable content contains a concrete private identity.
+
+    The caller deliberately receives only a boolean: rejected private values
+    must never be copied into tool errors or logs.
     """
+    for pattern in (_POSIX_HOME_RE, _WINDOWS_HOME_RE):
+        for match in pattern.finditer(content or ""):
+            if not _is_placeholder_account(match.group("account")):
+                return True
+
+    for match in _EMAIL_RE.finditer(content or ""):
+        domain = match.group("domain").lower()
+        if (
+            domain not in _RESERVED_EMAIL_DOMAINS
+            and not domain.endswith((".example", ".invalid", ".localhost", ".test"))
+        ):
+            return True
+    return False
+
+
+def _background_review_hygiene_result(
+    proposed: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Reject private material from an autonomous write candidate."""
+    try:
+        from tools.skill_provenance import is_background_review
+        if not is_background_review():
+            return None
+    except Exception:
+        return None
+
+    if proposed and _contains_private_identity(proposed):
+        return {
+            "success": False,
+            "error": (
+                "Autonomous skill write rejected: reusable skills must not "
+                "contain concrete user-home paths or non-placeholder email "
+                "addresses."
+            ),
+        }
+    return None
+
+
+def _background_review_hygiene_preflight(
+    action: str,
+    *,
+    content: Optional[str] = None,
+    file_content: Optional[str] = None,
+    new_string: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Reject private material before an autonomous write can be staged."""
+    proposed = {
+        "create": content,
+        "edit": content,
+        "write_file": file_content,
+        # Inspect inserted text before staging. The complete patched file is
+        # checked again after fuzzy matching and before the actual write.
+        "patch": new_string,
+    }.get(action)
+    return _background_review_hygiene_result(proposed)
+
+
+def _guard_agent_created_enabled() -> bool:
+    """Return whether agent-created skill writes require a security scan.
+
+    Autonomous background reviews are untrusted no-user-present writers and
+    are always scanned. Foreground writes retain the opt-in configuration.
+    """
+    try:
+        from tools.skill_provenance import is_background_review
+        if is_background_review():
+            return True
+    except Exception:
+        pass
+
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -123,14 +224,27 @@ def _guard_agent_created_enabled() -> bool:
 
 
 def _security_scan_skill(skill_dir: Path) -> Optional[str]:
-    """Scan a skill directory after write. Returns error string if blocked, else None.
+    """Scan a skill after writes that require the agent-created guard.
 
-    No-op when skills.guard_agent_created is disabled (the default).
+    Autonomous writes fail closed if the scanner is missing or errors.
+    Foreground writes retain the configured best-effort behavior.
     """
-    if not _GUARD_AVAILABLE:
-        return None
+    try:
+        from tools.skill_provenance import is_background_review
+        autonomous = is_background_review()
+    except Exception:
+        autonomous = False
+
     if not _guard_agent_created_enabled():
         return None
+    if not _GUARD_AVAILABLE:
+        if autonomous:
+            return (
+                "Security scan unavailable; autonomous skill write was not "
+                "applied."
+            )
+        return None
+
     try:
         result = scan_skill(skill_dir, source="agent-created")
         allowed, reason = should_allow_install(result)
@@ -139,13 +253,17 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             return f"Security scan blocked this skill ({reason}):\n{report}"
         if allowed is None:
             # "ask" verdict — for agent-created skills this means dangerous
-            # findings were detected.  Surface as an error so the agent can
+            # findings were detected. Surface as an error so the agent can
             # retry with the flagged content removed.
             report = format_scan_report(result)
             logger.warning("Agent-created skill blocked (dangerous findings): %s", reason)
             return f"Security scan blocked this skill ({reason}):\n{report}"
     except Exception as e:
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
+        if autonomous:
+            return (
+                "Security scan failed; autonomous skill write was not applied."
+            )
     return None
 
 import yaml
@@ -778,6 +896,12 @@ def _validate_file_path(file_path: str) -> Optional[str]:
 
     normalized = Path(file_path)
 
+    if _BACKUP_ARTIFACT_RE.search(normalized.name):
+        return (
+            "Backup and snapshot artifacts are not allowed in a live skill "
+            "package; use the curator backup store instead."
+        )
+
     # Prevent path traversal (checked before any allow-listing so the SKILL.md
     # exception below can never be reached by a traversal-laden path).
     if has_traversal_component(file_path):
@@ -1040,6 +1164,10 @@ def _patch_skill(
             "error": err_msg,
             "file_preview": preview,
         }
+
+    hygiene = _background_review_hygiene_result(new_content)
+    if hygiene is not None:
+        return hygiene
 
     # Check size limit on the result
     target_label = "SKILL.md" if not file_path else file_path
@@ -1331,7 +1459,13 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         return tool_error(decision.message, success=False)
 
     # stage — record the full skill_manage kwargs so approval can replay it.
-    payload = {"action": action, "name": name}
+    # Preserve the origin inside the payload so an approved background write
+    # still receives autonomous hygiene and security checks during replay.
+    payload = {
+        "action": action,
+        "name": name,
+        "_write_origin": wa.current_origin(),
+    }
     payload.update({k: v for k, v in payload_kwargs.items() if v is not None})
     gist = wa.skill_gist(
         action, name,
@@ -1349,11 +1483,16 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
 
 
 def apply_skill_pending(payload: Dict[str, Any]) -> str:
-    """Replay a staged skill write, bypassing the gate. Returns the tool result
-    JSON string. Called by the /skills approve handler.
-    """
-    token = _skill_gate_bypass.set(True)
+    """Replay a staged skill write with its original safety context."""
+    gate_token = _skill_gate_bypass.set(True)
+    origin_token = None
     try:
+        if payload.get("_write_origin") == "background_review":
+            from tools.skill_provenance import (
+                BACKGROUND_REVIEW,
+                set_current_write_origin,
+            )
+            origin_token = set_current_write_origin(BACKGROUND_REVIEW)
         return skill_manage(
             action=payload.get("action", ""),
             name=payload.get("name", ""),
@@ -1367,7 +1506,10 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             absorbed_into=payload.get("absorbed_into"),
         )
     finally:
-        _skill_gate_bypass.reset(token)
+        if origin_token is not None:
+            from tools.skill_provenance import reset_current_write_origin
+            reset_current_write_origin(origin_token)
+        _skill_gate_bypass.reset(gate_token)
 
 
 def skill_manage(
@@ -1390,6 +1532,15 @@ def skill_manage(
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
+
+    hygiene = _background_review_hygiene_preflight(
+        action,
+        content=content,
+        file_content=file_content,
+        new_string=new_string,
+    )
+    if hygiene is not None:
+        return json.dumps(hygiene, ensure_ascii=False)
 
     # Approval gate: when on, stages the write for review (skills are too large
     # to review inline, so they always stage regardless of origin); when off

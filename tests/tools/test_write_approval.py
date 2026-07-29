@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import shutil
+from unittest.mock import patch
 
 import pytest
 
@@ -209,6 +210,45 @@ def test_skill_gate_on_then_apply_writes_file(hermes_home):
     res = json.loads(smt.apply_skill_pending(rec["payload"]))
     assert res["success"] is True
     assert smt._find_skill("applied-skill") is not None
+
+def test_background_origin_survives_approved_skill_replay(hermes_home):
+    import importlib
+    import tools.skill_manager_tool as smt
+    from tools import write_approval as wa
+    from tools.skill_provenance import (
+        BACKGROUND_REVIEW,
+        is_background_review,
+        reset_current_write_origin,
+        set_current_write_origin,
+    )
+
+    importlib.reload(smt)
+    _set_approval("skills", True)
+    token = set_current_write_origin(BACKGROUND_REVIEW)
+    try:
+        staged = json.loads(
+            smt.skill_manage("create", "background-approved", content=_SKILL)
+        )
+    finally:
+        reset_current_write_origin(token)
+
+    record = wa.get_pending("skills", staged["pending_id"])
+    assert record["payload"]["_write_origin"] == BACKGROUND_REVIEW
+
+    observed_origins = []
+
+    def allow_scan(_skill_dir):
+        observed_origins.append(is_background_review())
+        return None
+
+    with patch(
+        "tools.skill_manager_tool._security_scan_skill",
+        side_effect=allow_scan,
+    ):
+        result = json.loads(smt.apply_skill_pending(record["payload"]))
+
+    assert result["success"] is True
+    assert observed_origins == [True]
 
 
 def test_skill_create_diff_is_full_content(hermes_home):

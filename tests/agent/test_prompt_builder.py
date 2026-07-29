@@ -31,6 +31,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
+    SKILLS_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
@@ -53,6 +54,14 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_skill_guidance_separates_procedure_from_private_state(self):
+        low = SKILLS_GUIDANCE.lower()
+        assert "shareable procedural knowledge" in low
+        assert "not user profiles or session archives" in low
+        assert "use memory for personal preferences" in low
+        assert "record how to re-check volatile facts" in low
+        assert "do not create or modify a skill" in low
 
 
 # =========================================================================
