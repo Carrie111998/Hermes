@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import get_hermes_home, _expand_env_vars
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from utils import is_truthy_value
 
@@ -1288,6 +1288,19 @@ def load_gateway_config() -> GatewayConfig:
             # the messaging gateway. Fail-open via the shared helper.
             from hermes_cli import managed_scope
             yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
+
+            # Expand ${VAR} / ${env:VAR} references against os.environ, for
+            # consistency with hermes_cli.config.load_config() (which this
+            # loader otherwise bypasses entirely, per the comment above) and
+            # the existing expansion call sites in gateway/run.py. Without
+            # this, e.g. platforms.telegram.extra.group_allow_admin_from:
+            # ['${TELEGRAM_ADMIN_ID}'] kept the literal string, which
+            # gateway/slash_access.py's policy_from_extra() then treated as
+            # a real (unmatchable) admin id -- silently locking every user
+            # out of every tiered slash command with no error or log line
+            # (issue #72096). Applied after the managed overlay so an
+            # admin-pinned value can reference an env var too.
+            yaml_cfg = _expand_env_vars(yaml_cfg)
 
             # Shared nested-fallback source: settings meant to be top-level
             # keys are also accepted when a user nests them under `gateway:`

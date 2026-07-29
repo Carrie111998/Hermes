@@ -286,3 +286,52 @@ class TestPolicyForSource:
         p = policy_for_source(cfg, tg_src)
         assert p.enabled is False
         assert p.can_run("999", "stop") is True
+
+
+class TestUnresolvedEnvVarReference:
+    """Regression tests for issue #72096: a literal, unresolved ${VAR} /
+    ${env:VAR} reference in an admin list must never be treated as a real
+    (unmatchable) user id -- it must be filtered out, so the policy falls
+    back to 'disabled' rather than silently locking out every user with an
+    admin list nothing can ever satisfy.
+    """
+
+    def test_sole_unresolved_reference_disables_gating(self):
+        p = policy_from_extra({"allow_admin_from": ["${TELEGRAM_ADMIN_ID}"]}, "dm")
+        assert p.enabled is False
+        assert p.admin_user_ids == frozenset()
+        # And gating being off means everyone can run everything, matching
+        # the "misconfiguration should fail open to old behavior" intent.
+        assert p.can_run("anyone", "stop") is True
+
+    def test_env_style_reference_also_filtered(self):
+        p = policy_from_extra({"allow_admin_from": ["${env:TELEGRAM_ADMIN_ID}"]}, "dm")
+        assert p.enabled is False
+
+    def test_mixed_resolved_and_unresolved_keeps_only_resolved(self):
+        """A real id alongside a stray unresolved reference: the real id
+        must still work, the bogus one must not silently expand the
+        matchable set to include a string nobody can ever send."""
+        p = policy_from_extra(
+            {"allow_admin_from": ["111", "${SOME_UNSET_VAR}"]}, "dm"
+        )
+        assert p.enabled is True
+        assert p.admin_user_ids == frozenset({"111"})
+        assert p.is_admin("111") is True
+
+    def test_resolved_value_is_not_filtered(self):
+        """Sanity: a value that HAPPENS to contain literal braces but isn't
+        the exact ${...} shape (e.g. already-expanded content) must not be
+        mistakenly filtered."""
+        p = policy_from_extra({"allow_admin_from": ["555444333"]}, "dm")
+        assert p.enabled is True
+        assert p.admin_user_ids == frozenset({"555444333"})
+
+    def test_unresolved_reference_logs_a_warning(self, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="gateway.slash_access"):
+            policy_from_extra({"allow_admin_from": ["${TELEGRAM_ADMIN_ID}"]}, "dm")
+        assert any(
+            "TELEGRAM_ADMIN_ID" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        ), [r.message for r in caplog.records]

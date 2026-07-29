@@ -34,8 +34,22 @@ included here — only the slash-command access split.
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Iterable, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# Matches an entry that is STILL a literal, unresolved ${VAR} / ${env:VAR}
+# reference after config loading -- i.e. hermes_cli.config._expand_env_vars()
+# ran but the named variable wasn't set in os.environ (or, before issue
+# #72096's fix, gateway/config.py never called it at all). Such a value can
+# never be a legitimate user id, so filtering it out here is a second,
+# defense-in-depth layer independent of the loader-level fix: it also
+# protects against any other config path that might someday bypass
+# expansion the same way, and gives an explicit log line either way.
+_UNRESOLVED_VAR_REF_RE = re.compile(r"^\$\{[^}]*\}$")
 
 
 # Slash commands that MUST stay reachable for any allowed user, even when
@@ -107,10 +121,26 @@ def _coerce_id_list(raw: Any) -> FrozenSet[str]:
         # single scalar (int user id, etc.)
         items = (raw,)
     out: list[str] = []
+    unresolved: list[str] = []
     for it in items:
         s = str(it).strip()
-        if s:
-            out.append(s)
+        if not s:
+            continue
+        if _UNRESOLVED_VAR_REF_RE.match(s):
+            unresolved.append(s)
+            continue
+        out.append(s)
+    if unresolved:
+        logger.warning(
+            "Ignoring unresolved config reference(s) in an admin/user id "
+            "list: %s — the referenced environment variable is unset (or "
+            "wasn't expanded before this list was built). A literal "
+            "'${...}' can never match a real user id, so it would "
+            "otherwise silently enable gating with an admin list nothing "
+            "can satisfy (issue #72096). Set the variable, or remove the "
+            "reference if it's no longer needed.",
+            ", ".join(unresolved),
+        )
     return frozenset(out)
 
 
