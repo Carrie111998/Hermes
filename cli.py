@@ -50,8 +50,6 @@ logger = logging.getLogger(__name__)
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
-import yaml
-
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
@@ -2439,7 +2437,11 @@ def _prune_orphaned_branches(repo_root: str) -> None:
 _ACCENT_ANSI_DEFAULT = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold — fallback
 _BOLD = "\033[1m"
 _RST = "\033[0m"
-_STREAM_PAD = "    "  # 4-space indent for streamed response text (matches Panel padding)
+_STREAM_PAD = ""  # No indent for streamed response text — leading whitespace pollutes
+# terminal copy/paste (every selected line carried 4 spaces).  Matches the
+# response Panel's flush-left padding.
+_STREAM_PARTIAL_PREVIEW_LEN = 60  # tail of an unfinished logical line mirrored
+# into the spinner while streaming (TTFT perception without hard-wrapping)
 
 
 def _hex_to_ansi(hex_color: str, *, bold: bool = False) -> str:
@@ -2851,12 +2853,13 @@ def _preserve_windows_dot_segments_for_markdown(text: str) -> str:
 def _terminal_width_for_streaming() -> int:
     """Display cells available inside the streamed response box.
 
-    The streaming path indents every line by ``_STREAM_PAD`` (4 cells)
-    inside an open response panel.  The realigner uses this number as
-    its budget when deciding whether to keep a horizontal table or
-    fall back to vertical key-value rendering.  We subtract a small
-    safety margin so terminal-resize races don't push a borderline
-    table into mid-cell soft-wrap.
+    The streaming path prefixes every line with ``_STREAM_PAD`` (now
+    empty — flush-left so copy/paste stays clean) inside an open
+    response panel.  The realigner uses this number as its budget when
+    deciding whether to keep a horizontal table or fall back to
+    vertical key-value rendering.  We subtract a small safety margin
+    so terminal-resize races don't push a borderline table into
+    mid-cell soft-wrap.
     """
 
     try:
@@ -2871,16 +2874,16 @@ def _render_final_assistant_content(text: str, mode: str = "render"):
     from rich.markdown import Markdown
 
     # Estimate the cells available to the rendered table.  The Panel
-    # used by the background-task / final-response path has 4 cells of
-    # left+right padding plus 1 cell of border on each side, plus the
-    # _STREAM_PAD indent that streamed content uses.  Subtract a small
-    # safety margin so resize races don't push a borderline table into
-    # soft-wrap.
+    # used by the background-task / final-response path renders
+    # flush-left (no horizontal padding — leading spaces pollute
+    # terminal copy/paste) with 1 cell of border on each side.
+    # Subtract a small safety margin so resize races don't push a
+    # borderline table into soft-wrap.
     try:
         cols = shutil.get_terminal_size((80, 24)).columns
     except Exception:
         cols = 80
-    panel_width = max(20, cols - 12)
+    panel_width = max(20, cols - 4)
 
     normalized_mode = str(mode or "render").strip().lower()
     if normalized_mode == "strip":
@@ -6634,32 +6637,34 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 line = _strip_markdown_syntax(line)
             _emit_one(line)
 
-        # Force-flush long partial lines so a response that opens with a
-        # long paragraph paints as tokens arrive instead of staying blank
-        # until the first newline (TTFT perception fix — the reasoning box
-        # has done this at 80 chars since day one; the response box never
-        # did). Wrap at the terminal's visible width so we only ever emit
-        # text that would have line-broken at that point anyway; the
-        # remainder stays buffered as the logical line's continuation.
-        # Table-shaped partials are exempt — they need the whole block for
-        # realignment (see the table side-buffer above).
+        # Long partial lines are emitted ONLY at real newlines — we no
+        # longer hard-wrap paragraphs at terminal width ourselves.  Each
+        # logical line lands in scrollback as one line; the TERMINAL
+        # soft-wraps it visually, and emulators (iTerm2/kitty/VTE/
+        # xterm.js/Windows Terminal) rejoin soft-wrapped rows on copy,
+        # so highlight-copy yields the original unwrapped text — same
+        # outcome as the TUI's selection copy.  (The pre-July-2026 chunk
+        # emitter baked real '\n's into every long paragraph, which is
+        # exactly what polluted copy/paste.)
+        #
+        # TTFT perception: while a long opening paragraph accumulates
+        # without a newline, mirror its tail into the status-bar spinner
+        # line so the user sees tokens arriving instead of a blank box.
         if (
             self._stream_buf
             and not self._in_stream_table
             and not self._stream_buf.lstrip().startswith("|")
+            and len(self._stream_buf) >= 80
         ):
-            wrap_w = max(40, _terminal_width_for_streaming())
-            while len(self._stream_buf) >= wrap_w:
-                cut = self._stream_buf.rfind(" ", 0, wrap_w)
-                if cut <= 0:
-                    cut = wrap_w  # single unbreakable run — hard wrap
-                chunk, self._stream_buf = (
-                    self._stream_buf[:cut],
-                    self._stream_buf[cut:].lstrip(" "),
-                )
-                if self.final_response_markdown == "strip":
-                    chunk = _strip_markdown_syntax(chunk)
-                _emit_one(chunk)
+            preview = self._stream_buf[-int(_STREAM_PARTIAL_PREVIEW_LEN):]
+            cut = preview.find(" ")
+            if 0 < cut < len(preview) - 1:
+                preview = preview[cut + 1:]
+            try:
+                self._spinner_text = f"… {preview}"
+                self._invalidate()
+            except Exception:
+                pass
 
     def _flush_stream(self) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
@@ -7157,9 +7162,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
 
     def _write_osc52_clipboard(self, text: str) -> None:
-        """Copy *text* to terminal clipboard via OSC 52."""
+        """Copy *text* to terminal clipboard via OSC 52.
+
+        Wrapped for tmux/screen passthrough (mirrors the TUI's
+        wrapForMultiplexer in ui-tui/src/lib/osc52.ts) — without the DCS
+        wrapper the multiplexer consumes the sequence and the copy is
+        silently lost.
+        """
         payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
         seq = f"\x1b]52;c;{payload}\x07"
+        if os.environ.get("TMUX"):
+            seq = "\x1bPtmux;" + seq.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+        elif os.environ.get("STY"):
+            seq = "\x1bP" + seq + "\x1b\\"
         out = getattr(self, "_app", None)
         output = getattr(out, "output", None) if out else None
         if output and hasattr(output, "write_raw"):
@@ -9042,7 +9057,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         from hermes_cli.model_switch import (
             switch_model,
-            parse_model_flags_detailed,
+            parse_model_switch_args,
             resolve_persist_behavior,
         )
         from hermes_cli.providers import get_label
@@ -9052,18 +9067,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         raw_args = parts[1].strip() if len(parts) > 1 else ""
 
         # Parse --provider, --global, --session, --once, and --refresh flags
-        parsed_flags = parse_model_flags_detailed(raw_args)
-        model_input = parsed_flags.model_input
-        explicit_provider = parsed_flags.explicit_provider
-        is_global_flag = parsed_flags.is_global
-        force_refresh = parsed_flags.force_refresh
-        is_session = parsed_flags.is_session
-        one_turn = parsed_flags.is_once
-        if is_global_flag and one_turn:
-            _cprint("  ✗ /model --once cannot be combined with --global")
-            return
-        if one_turn and not model_input and not explicit_provider:
-            _cprint("  ✗ /model --once requires a model or provider.")
+        # via the shared single-owner parser (hermes_cli.model_switch).
+        request = parse_model_switch_args(raw_args)
+        model_input = request.target
+        explicit_provider = request.explicit_provider
+        is_global_flag = request.is_global
+        force_refresh = request.force_refresh
+        is_session = request.is_session
+        one_turn = request.is_once
+        if request.errors:
+            # CLI decoration: "  ✗ " prefix over the canonical error copy.
+            _cprint(f"  ✗ {request.error_messages()[0]}")
             return
         # Resolve the effective persistence once: --global forces persist,
         # --session/--once force session-scope, otherwise defer to
@@ -9740,9 +9754,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "context":
             self._show_context_breakdown(cmd_original)
         elif canonical == "egress":
-            from hermes_cli.proxy_cli import format_status_text
+            from hermes_cli.slash_exec import CommandContext, execute_command
 
-            self._console_print(format_status_text(), highlight=False, markup=False)
+            self._console_print(
+                execute_command("egress", CommandContext(surface="cli")).text,
+                highlight=False, markup=False,
+            )
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
@@ -9986,8 +10003,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the CLI process which
                             # has all API keys in os.environ.
-                            from tools.environments.local import _sanitize_subprocess_env
-                            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+                            from tools.environments.local import build_subprocess_env
+                            sanitized_env = build_subprocess_env()
                             from hermes_cli._subprocess_compat import windows_hide_flags
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,
@@ -11618,7 +11635,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # it must commit at least the same line.
             if function_name and self.tool_progress_mode in {"new", "all", "verbose"}:
                 duration = kwargs.get("duration", 0.0)
-                is_error = kwargs.get("is_error", False)
                 # Pop stored args from tool.started for this function
                 stored = self._pending_tool_info.get(function_name)
                 stored_args = stored.pop(0) if stored else {}
@@ -11997,14 +12013,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
 
             # Track consecutive no-speech cycles to avoid infinite restart loops.
+            # While the agent is mid-turn or TTS is speaking, the user is
+            # CORRECTLY silent (waiting/listening) — those cycles must not
+            # count, or a multi-minute tool run ends the voice chat under
+            # the user. The stop phrase and barge-in still work during the
+            # hold (they run on their own paths above).
             stop_continuous_restart = False
+            _tts_done = getattr(self, "_voice_tts_done", None)
+            _activity_hold = bool(
+                getattr(self, "_agent_running", False)
+                or (_tts_done is not None and not _tts_done.is_set())
+            )
             if not submitted:
-                self._no_speech_count = getattr(self, '_no_speech_count', 0) + 1
-                if self._no_speech_count >= 3:
-                    self._voice_continuous = False
-                    self._no_speech_count = 0
-                    _cprint(f"{_DIM}No speech detected 3 times, continuous mode stopped.{_RST}")
-                    stop_continuous_restart = True
+                if _activity_hold:
+                    pass  # held: keep listening without counting the cycle
+                else:
+                    self._no_speech_count = getattr(self, '_no_speech_count', 0) + 1
+                    if self._no_speech_count >= 3:
+                        self._voice_continuous = False
+                        self._no_speech_count = 0
+                        _cprint(f"{_DIM}No speech detected 3 times, continuous mode stopped.{_RST}")
+                        stop_continuous_restart = True
             else:
                 self._no_speech_count = 0
 
@@ -12030,6 +12059,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             args=(text,),
             daemon=True,
         ).start()
+        # Spoken barge-in must work on the whole-file fallback path too. The
+        # full-duplex agent-turn listener normally already covers playback
+        # (armed at turn start in chat()); this arm is an idempotent safety
+        # net for speak calls outside a chat turn — the listener refuses to
+        # double-arm via _voice_fd_active.
+        if self._voice_continuous:
+            threading.Thread(
+                target=self._voice_full_duplex_listener,
+                daemon=True,
+            ).start()
 
     def _voice_speak_response(self, text: str):
         """Speak the agent's response aloud using TTS (runs in background thread)."""
@@ -12104,36 +12143,107 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._voice_tts_done.set()
 
 
-    def _voice_barge_in_monitor(self, stop_event: threading.Event) -> None:
-        """VAD barge-in: cut streaming TTS the moment the user starts talking.
+    def _voice_full_duplex_listener(self) -> None:
+        """Full-duplex agent-turn listener: mic live for the WHOLE turn.
 
-        Runs for one turn alongside the streaming pipeline (continuous voice
-        mode only — the mic is otherwise idle during playback). On speech,
-        playback is cut immediately while the monitor KEEPS capturing (with
-        pre-roll, so the interruption is transcribed from its first syllable
-        — restarting the recorder after detection would lose the opening
-        words). ``_voice_barge_capture`` suppresses process_loop's auto-
-        restart until the captured utterance has been submitted.
+        Armed at utterance-submit (chat() start in continuous voice mode) and
+        disarmed when the turn is fully done (agent finished + TTS played).
+        Replaces the old per-playback ``_voice_barge_in_monitor``, which only
+        listened while TTS audio was playing — during LLM generation the mic
+        was dead, so the user could not interject by voice at all (and the
+        playback monitor calibrated against its own speaker bleed, making
+        the trigger unreachable; see tools.voice_mode.full_duplex_listen).
+
+        Phase behaviour:
+
+        * generation (no TTS audio yet): speech interrupts the in-flight
+          agent turn via ``self.agent.interrupt()`` — the same seam the
+          typed/Ctrl+C interrupt uses — and the captured utterance is
+          submitted as the next message.
+        * playback: speech cuts TTS (pipeline stop event + stop_playback)
+          and the interruption is captured with pre-roll and submitted.
+
+        The stop phrase ends the voice chat in BOTH phases (a stop during
+        generation means "stop everything": the turn is already interrupted
+        at trip time, then ``_voice_submit_barge_utterance`` disables voice
+        mode).
         """
+        fd_active = getattr(self, "_voice_fd_active", None)
+        if fd_active is None:
+            fd_active = threading.Event()
+            self._voice_fd_active = fd_active
+        if fd_active.is_set():
+            return  # one listener owns the mic for this turn
+        fd_active.set()
         try:
             from hermes_cli.config import load_config
             voice_cfg = load_config().get("voice") or {}
             if not (isinstance(voice_cfg, dict) and voice_cfg.get("barge_in", True)):
                 return
-            from tools.voice_mode import listen_for_speech, stop_playback
+            from tools.voice_mode import (
+                full_duplex_listen,
+                is_audio_output_active,
+                stop_playback,
+            )
 
-            def _cut_playback():
-                if not self._voice_tts_done.is_set():
+            try:
+                _mult = float(voice_cfg.get("barge_in_threshold_multiplier", 0) or 0)
+            except (TypeError, ValueError):
+                _mult = 0.0
+            try:
+                _grace_ms = int(float(voice_cfg.get("barge_in_grace_seconds", 0.5)) * 1000)
+            except (TypeError, ValueError):
+                _grace_ms = 500
+
+            tts_done = getattr(self, "_voice_tts_done", None)
+
+            def _should_stop() -> bool:
+                if not (getattr(self, "_voice_mode", False) and getattr(self, "_voice_continuous", False)):
+                    return True
+                if getattr(self, "_agent_running", False):
+                    return False
+                # Agent finished — keep listening until TTS fully played.
+                if tts_done is not None and not tts_done.is_set():
+                    return False
+                return not is_audio_output_active()
+
+            def _on_trigger(phase: str) -> None:
+                # Latch BEFORE cutting anything: suppresses process_loop's
+                # auto-restart until the capture is submitted.
+                self._voice_barge_capture.set()
+                if phase == "playback":
+                    logger.debug(
+                        "TTS CUT: full-duplex listener tripped during playback"
+                    )
                     from tools.tts_streaming import mark_speech_interrupted
                     mark_speech_interrupted()
-                    self._voice_barge_capture.set()
-                    stop_event.set()
+                    _pipe_stop = getattr(self, "_voice_tts_stop", None)
+                    if _pipe_stop is not None:
+                        _pipe_stop.set()
                     stop_playback()
+                else:
+                    # Generation phase: no audio to cut — interrupt the
+                    # in-flight agent turn (same seam as typed interrupt).
+                    logger.debug(
+                        "full-duplex listener tripped during generation — "
+                        "interrupting agent turn"
+                    )
+                    _pipe_stop = getattr(self, "_voice_tts_stop", None)
+                    if _pipe_stop is not None:
+                        _pipe_stop.set()  # never let the stale reply speak
+                    try:
+                        if self.agent is not None and getattr(self, "_agent_running", False):
+                            _cprint(f"\n{_DIM}🎤 Voice interjection — interrupting…{_RST}")
+                            self.agent.interrupt()
+                    except Exception as e:
+                        logger.debug("voice interjection interrupt failed: %s", e)
 
-            wav_path = listen_for_speech(
-                lambda: stop_event.is_set() or self._voice_tts_done.is_set(),
-                capture=True,
-                on_trigger=_cut_playback,
+            wav_path = full_duplex_listen(
+                _should_stop,
+                is_playing=is_audio_output_active,
+                on_trigger=_on_trigger,
+                multiplier=_mult or None,
+                grace_ms=max(0, _grace_ms),
             )
             if wav_path and self._voice_barge_capture.is_set():
                 self._voice_submit_barge_utterance(wav_path)
@@ -12141,7 +12251,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._voice_barge_capture.clear()
         except Exception as e:
             self._voice_barge_capture.clear()
-            logger.debug("Voice barge-in monitor failed: %s", e)
+            logger.debug("Voice full-duplex listener failed: %s", e)
+        finally:
+            fd_active.clear()
 
     def _voice_submit_barge_utterance(self, wav_path: str) -> None:
         """Transcribe a barge-captured interruption and queue it as the next turn."""
@@ -12244,8 +12356,44 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _ptt_display = self._voice_record_key_label()
         _cprint(f"\n{_ACCENT}Voice mode enabled{tts_status}{_RST}")
         _cprint(f"  {_DIM}{_ptt_display} to start/stop recording{_RST}")
+        # Spoken-stop hint sourced from voice.stop_phrases (first entry); the
+        # helper returns "" when stop phrases are disabled — show no hint then.
+        try:
+            from tools.voice_mode import voice_stop_hint
+            _stop_hint = voice_stop_hint()
+        except Exception:
+            _stop_hint = ""
+        if _stop_hint:
+            _cprint(f"  {_DIM}{_stop_hint}{_RST}")
         _cprint(f"  {_DIM}/voice tts  to toggle speech output{_RST}")
         _cprint(f"  {_DIM}/voice off  to disable voice mode{_RST}")
+
+    def _typed_voice_stop(self, user_input) -> bool:
+        """Typed bare stop phrase during an active voice chat ends the chat.
+
+        Saying "stop" ends the voice chat (PR #73106); TYPING the same bare
+        stop phrase while voice mode is on must behave identically instead of
+        sending "stop" to the agent as a turn. Guarded on voice mode being ON
+        — typed "stop" outside voice chat passes through to the agent exactly
+        as before. Reuses ``is_voice_stop_phrase`` (same config
+        ``voice.stop_phrases``, same exact-match semantics), so longer typed
+        messages containing "stop" are never swallowed.
+        """
+        if not isinstance(user_input, str):
+            return False
+        with self._voice_lock:
+            voice_on = self._voice_mode or self._voice_continuous
+        if not voice_on:
+            return False
+        try:
+            from tools.voice_mode import is_voice_stop_phrase
+            if not is_voice_stop_phrase(user_input):
+                return False
+        except Exception:
+            return False
+        _cprint(f"\n{_DIM}Stop phrase typed — ending voice chat.{_RST}")
+        self._disable_voice_mode()
+        return True
 
     def _disable_voice_mode(self):
         """Disable voice mode, cancel any active recording, and stop TTS."""
@@ -12272,6 +12420,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Stop any active TTS playback (file player + streaming pipeline)
         try:
             if self._voice_tts_stop is not None:
+                logger.info("TTS CUT: _disable_voice_mode setting stop event")
                 self._voice_tts_stop.set()
             from tools.voice_mode import stop_playback
             stop_playback()
@@ -13268,16 +13417,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # reset at the start of each user turn.
             self._reasoning_shown_this_turn = False
 
+            # Full-duplex agent-turn listener (continuous voice mode): arm
+            # the mic NOW — at utterance-submit — not when TTS playback
+            # starts. It spans generation (speech interrupts the turn) and
+            # playback (speech cuts TTS), and disarms itself when the turn
+            # is fully done. See _voice_full_duplex_listener.
+            if self._voice_mode and self._voice_continuous:
+                threading.Thread(
+                    target=self._voice_full_duplex_listener, daemon=True
+                ).start()
+
             # --- Streaming TTS setup ---
             # Any working TTS provider streams sentence-by-sentence as the agent
             # generates tokens: PCM-streaming providers (ElevenLabs, OpenAI) play
             # chunks as they arrive, everything else synthesizes per sentence.
             use_streaming_tts = False
             _streaming_box_opened = False
+            _thinking_started = False
             text_queue = None
             tts_thread = None
             stream_callback = None
             stop_event = None
+            _tts_normal_exit = False
 
             if self._voice_tts:
                 try:
@@ -13295,33 +13456,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 text_queue = queue.Queue()
                 stop_event = threading.Event()
 
-                def display_callback(sentence: str):
-                    """Called by TTS consumer when a sentence is ready to display + speak."""
-                    nonlocal _streaming_box_opened
-                    if not _streaming_box_opened:
-                        _streaming_box_opened = True
-                        w = self._scrollback_box_width(getattr(self.console, "width", 80))
-                        label = " ⚕ Hermes "
-                        if self.show_timestamps:
-                            label = f"{label}{datetime.now().strftime(getattr(self, 'timestamp_format', '%H:%M'))} "
-                        fill = w - 2 - HermesCLI._status_bar_display_width(label)
-                        _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
-                    _cprint(f"{_STREAM_PAD}{sentence.rstrip()}")
+                # When token streaming is enabled (the common case), the
+                # CLI's _stream_delta already renders text token-by-token as
+                # the model generates it. Passing a display_callback here too
+                # would render every sentence a second time. Only attach the
+                # callback when streaming is disabled, so the TTS consumer
+                # becomes the sole display path.
+                _tts_display_cb = None
+                if not self.streaming_enabled:
+                    def display_callback(sentence: str):
+                        """Called by TTS consumer when a sentence is ready to display + speak."""
+                        nonlocal _streaming_box_opened
+                        if not _streaming_box_opened:
+                            _streaming_box_opened = True
+                            w = self._scrollback_box_width(getattr(self.console, "width", 80))
+                            label = " ⚕ Hermes "
+                            if self.show_timestamps:
+                                label = f"{label}{datetime.now().strftime(getattr(self, 'timestamp_format', '%H:%M'))} "
+                            fill = w - 2 - HermesCLI._status_bar_display_width(label)
+                            _cprint(f"\n{_ACCENT}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}")
+                        _cprint(f"{_STREAM_PAD}{sentence.rstrip()}")
+                    _tts_display_cb = display_callback
 
                 tts_thread = threading.Thread(
                     target=stream_tts_to_speaker,
                     args=(text_queue, stop_event, self._voice_tts_done),
-                    kwargs={"display_callback": display_callback},
+                    kwargs={"display_callback": _tts_display_cb},
                     daemon=True,
                 )
                 tts_thread.start()
                 # Expose the pipeline's stop event so barge-in paths (voice
-                # key, VAD monitor) can cut playback from outside this turn.
+                # key, full-duplex listener) can cut playback from outside
+                # this turn. The full-duplex listener itself was armed at
+                # turn start (see above) — it spans generation AND playback.
                 self._voice_tts_stop = stop_event
-                if self._voice_continuous:
-                    threading.Thread(
-                        target=self._voice_barge_in_monitor, args=(stop_event,), daemon=True
-                    ).start()
 
                 def stream_callback(delta: str):
                     if text_queue is not None:
@@ -13468,6 +13636,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             agent_thread = threading.Thread(target=run_agent, daemon=True)
             agent_thread.start()
 
+            # Ambient "thinking" sound: calm bubble blips while the agent
+            # works in voice mode with no audio flowing, so the user knows
+            # it's alive during long thinking/tool stretches. Skipped per-blip
+            # while TTS speaks, the mic records, or a barge capture is live;
+            # stopped outright as soon as the turn ends. voice.thinking_sound
+            # gates it (default on); macOS is handled inside (TCC-safe skip).
+            _thinking_started = False
+            if self._voice_mode:
+                try:
+                    from tools.voice_mode import start_thinking_sound
+
+                    _thinking_started = start_thinking_sound(
+                        should_play=lambda: (
+                            self._voice_tts_done.is_set()
+                            and not self._voice_recording
+                            and not self._voice_barge_capture.is_set()
+                        )
+                    )
+                except Exception:
+                    _thinking_started = False
+
             # Monitor the dedicated interrupt queue while the agent runs.
             # _interrupt_queue is separate from _pending_input, so process_loop
             # and chat() never compete for the same queue.
@@ -13581,6 +13770,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 text_queue.put(None)  # sentinel
                 if tts_thread is not None:
                     tts_thread.join(timeout=120)
+                # Mark normal completion only if the thread actually
+                # finished.  If join() timed out and the thread is still
+                # alive, leave _tts_normal_exit False so the finally block
+                # sets stop_event to kill the runaway worker.
+                if tts_thread is not None and not tts_thread.is_alive():
+                    _tts_normal_exit = True
 
             # Drain any remaining agent output still in the StdoutProxy
             # buffer so tool/status lines render ABOVE our response box.
@@ -13759,7 +13954,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         border_style=_resp_color,
                         style=_resp_text,
                         box=rich_box.HORIZONTALS,
-                        padding=(1, 4),
+                        padding=(1, 0),
                         width=self._scrollback_box_width(),
                     ))
 
@@ -13868,16 +14063,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print(f"Error: {e}")
             return None
         finally:
+            # Stop the ambient thinking sound the moment the turn ends —
+            # every exit path (normal, error, interrupt) lands here.
+            if _thinking_started:
+                try:
+                    from tools.voice_mode import stop_thinking_sound
+                    stop_thinking_sound()
+                except Exception:
+                    pass
             # Ensure streaming TTS resources are cleaned up even on error.
             # Normal path sends the sentinel at line ~3568; this is a safety
             # net for exception paths that skip it.  Duplicate sentinels are
             # harmless — stream_tts_to_speaker exits on the first None.
+            #
+            # Only set stop_event on the exception path.  On normal exit
+            # (_tts_normal_exit is True) the pipeline has already drained —
+            # setting stop_event here would race the playback worker and
+            # could cut the final sentence mid-audio.
             if text_queue is not None:
                 try:
                     text_queue.put_nowait(None)
                 except Exception:
                     pass
-            if stop_event is not None:
+            if stop_event is not None and not _tts_normal_exit:
+                logger.info("TTS CUT: exception finally block setting stop_event")
                 stop_event.set()
             if tts_thread is not None and tts_thread.is_alive():
                 tts_thread.join(timeout=5)
@@ -15377,6 +15586,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # the stop event drains the streaming pipeline if one is live.
                 if not cli_ref._voice_tts_done.is_set():
                     try:
+                        logger.info("TTS CUT: record key handler cutting TTS")
                         from tools.tts_streaming import mark_speech_interrupted
                         mark_speech_interrupted()
                         if cli_ref._voice_tts_stop is not None:
@@ -16519,6 +16729,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
                         if _had_mouse_reports:
                             self._recover_terminal_input_modes(reason="mouse reports leaked into submitted input")
+
+                    # Typed bare stop phrase while a voice chat is active ends
+                    # the voice chat (same semantics as SAYING "stop") instead
+                    # of sending the word to the agent. Voice transcripts are
+                    # already stop-checked at the transcription points, so this
+                    # only intercepts typed input.
+                    if not is_voice_input and self._typed_voice_stop(user_input):
+                        continue
                     
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.
