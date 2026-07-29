@@ -358,6 +358,62 @@ class TestDMTopicFallbackReplyToMode:
         )
         assert result == 999
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "not-a-message",
+            "123abc",
+            "",
+            " ",
+            "0",
+            "-1",
+            "2147483648",
+            0,
+            -1,
+            2_147_483_648,
+            True,
+            False,
+            1.5,
+            None,
+        ],
+    )
+    def test_invalid_reply_ids_are_ignored(self, value):
+        metadata = {
+            **self.DM_TOPIC_METADATA,
+            "telegram_reply_to_message_id": value,
+        }
+        assert TelegramAdapter._metadata_reply_to_message_id(metadata) is None
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("12345", 12345),
+            (" 12345 ", 12345),
+            (12345, 12345),
+            ("2147483647", 2_147_483_647),
+            (2_147_483_647, 2_147_483_647),
+        ],
+    )
+    def test_valid_reply_ids_are_normalized(self, value, expected):
+        metadata = {
+            **self.DM_TOPIC_METADATA,
+            "telegram_reply_to_message_id": value,
+        }
+        assert TelegramAdapter._metadata_reply_to_message_id(metadata) == expected
+
+    def test_invalid_explicit_reply_id_uses_metadata_anchor(self):
+        result = TelegramAdapter._reply_to_message_id_for_send(
+            "session-meta-id", self.DM_TOPIC_METADATA, reply_to_mode="first",
+        )
+        assert result == 12345
+
+    def test_oversized_numeric_reply_id_is_ignored(self):
+        metadata = {
+            **self.DM_TOPIC_METADATA,
+            "telegram_reply_to_message_id": "9" * 5000,
+        }
+        assert TelegramAdapter._metadata_reply_to_message_id(metadata) is None
+
     # -- _thread_kwargs_for_send classmethod --
 
     def test_thread_kwargs_suppressed_reply_anchor_when_off(self):
@@ -384,6 +440,64 @@ class TestDMTopicFallbackReplyToMode:
         )
         assert result == {"message_thread_id": 42}
 
+    def test_invalid_dm_topic_anchor_refuses_unrouted_send(self):
+        metadata = {
+            **self.DM_TOPIC_METADATA,
+            "telegram_reply_to_message_id": "session-meta-id",
+        }
+        with pytest.raises(ValueError, match="requires a reply anchor"):
+            TelegramAdapter._thread_kwargs_for_send(
+                "100",
+                "42",
+                metadata,
+                reply_to_message_id=None,
+                reply_to_mode="first",
+            )
+
+    @pytest.mark.asyncio
+    async def test_control_send_with_invalid_dm_topic_anchor_fails_loudly(
+        self, adapter_factory,
+    ):
+        adapter = adapter_factory(reply_to_mode="first")
+        adapter._bot = MagicMock()
+        adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+        metadata = {
+            **self.DM_TOPIC_METADATA,
+            "telegram_reply_to_message_id": "session-meta-id",
+        }
+
+        result = await adapter.send_update_prompt(
+            "12345", "Continue?", metadata=metadata,
+        )
+
+        assert result.success is False
+        assert "requires a reply anchor" in (result.error or "")
+        adapter._bot.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_document_with_invalid_explicit_reply_uses_metadata_anchor(
+        self, adapter_factory, tmp_path,
+    ):
+        adapter = adapter_factory(reply_to_mode="first")
+        adapter._bot = MagicMock()
+        adapter._bot.send_document = AsyncMock(
+            return_value=MagicMock(message_id=1),
+        )
+        document = tmp_path / "proof.txt"
+        document.write_text("proof", encoding="utf-8")
+
+        result = await adapter.send_document(
+            "12345",
+            str(document),
+            reply_to="session-meta-id",
+            metadata=self.DM_TOPIC_METADATA,
+        )
+
+        assert result.success is True
+        call = adapter._bot.send_document.await_args
+        assert call.kwargs["reply_to_message_id"] == 12345
+        assert call.kwargs["message_thread_id"] == 42
+
     # -- send() integration test --
 
     @pytest.mark.asyncio
@@ -394,7 +508,12 @@ class TestDMTopicFallbackReplyToMode:
         adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
         adapter.truncate_message = lambda content, max_len, **kw: ["chunk1"]
 
-        await adapter.send("12345", "test content", metadata=self.DM_TOPIC_METADATA)
+        await adapter.send(
+            "12345",
+            "test content",
+            reply_to="999",
+            metadata=self.DM_TOPIC_METADATA,
+        )
 
         call = adapter._bot.send_message.call_args_list[0]
         assert call.kwargs.get("reply_to_message_id") is None
@@ -409,5 +528,25 @@ class TestDMTopicFallbackReplyToMode:
 
         await adapter.send("12345", "test content", metadata=self.DM_TOPIC_METADATA)
 
+        call = adapter._bot.send_message.call_args_list[0]
+        assert call.kwargs.get("reply_to_message_id") == 12345
+
+    @pytest.mark.asyncio
+    async def test_send_dm_topic_invalid_explicit_reply_uses_metadata_anchor(
+        self, adapter_factory,
+    ):
+        adapter = adapter_factory(reply_to_mode="first")
+        adapter._bot = MagicMock()
+        adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
+        adapter.truncate_message = lambda content, max_len, **kw: ["chunk1"]
+
+        result = await adapter.send(
+            "12345",
+            "test content",
+            reply_to="session-meta-id",
+            metadata=self.DM_TOPIC_METADATA,
+        )
+
+        assert result.success is True
         call = adapter._bot.send_message.call_args_list[0]
         assert call.kwargs.get("reply_to_message_id") == 12345

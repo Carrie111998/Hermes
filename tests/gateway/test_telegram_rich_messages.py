@@ -562,6 +562,69 @@ async def test_reply_to_propagates_as_reply_parameters():
 
 
 @pytest.mark.asyncio
+async def test_invalid_explicit_reply_uses_dm_topic_metadata_anchor():
+    adapter = _make_adapter()
+    metadata = {
+        "thread_id": "42",
+        "telegram_dm_topic_reply_fallback": True,
+        "telegram_reply_to_message_id": "12345",
+    }
+
+    result = await adapter.send(
+        "12345",
+        RICH_CONTENT,
+        reply_to="session-meta-id",
+        metadata=metadata,
+    )
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert api_kwargs["reply_parameters"] == {"message_id": 12345}
+    assert api_kwargs["message_thread_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_invalid_dm_topic_anchor_fails_non_retryable_before_rich_send():
+    adapter = _make_adapter()
+    metadata = {
+        "thread_id": "42",
+        "telegram_dm_topic_reply_fallback": True,
+        "telegram_reply_to_message_id": "session-meta-id",
+    }
+
+    result = await adapter.send("12345", RICH_CONTENT, metadata=metadata)
+
+    assert result.success is False
+    assert result.retryable is False
+    assert "requires a reply anchor" in (result.error or "")
+    adapter._bot.do_api_request.assert_not_awaited()
+    adapter._bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dm_topic_reply_mode_off_suppresses_explicit_rich_anchor():
+    adapter = _make_adapter()
+    adapter._reply_to_mode = "off"
+    metadata = {
+        "thread_id": "42",
+        "telegram_dm_topic_reply_fallback": True,
+        "telegram_reply_to_message_id": "12345",
+    }
+
+    result = await adapter.send(
+        "12345",
+        RICH_CONTENT,
+        reply_to="999",
+        metadata=metadata,
+    )
+
+    assert result.success is True
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert "reply_parameters" not in api_kwargs
+    assert api_kwargs["message_thread_id"] == 42
+
+
+@pytest.mark.asyncio
 async def test_notification_silent_by_default():
     adapter = _make_adapter()
 
