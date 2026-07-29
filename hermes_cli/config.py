@@ -1920,6 +1920,15 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                         "Add the API endpoint URL, e.g.: base_url: https://api.example.com/v1",
                     ))
 
+    # ── fallback_policy: exact failover boundary ─────────────────────────
+    fallback_policy = config.get("fallback_policy", "any")
+    if fallback_policy not in {"off", "local-only", "any"}:
+        issues.append(ConfigIssue(
+            "error",
+            "fallback_policy must be exactly one of: off, local-only, any",
+            "Set the top-level field, e.g. `fallback_policy: local-only`",
+        ))
+
     # ── fallback_model: single dict OR list of dicts (chain) ─────────────
     fb = config.get("fallback_model")
     if fb is not None:

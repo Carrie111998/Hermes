@@ -26,6 +26,7 @@ import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { restoreFallbackNotices } from '@/lib/fallback-notices'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
@@ -319,7 +320,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
           const latest = await getSessionMessages(storedSessionId, storedProfile)
-          const messages = toChatMessages(latest.messages)
+          const messages = restoreFallbackNotices(storedSessionId, toChatMessages(latest.messages))
           updateSessionState(
             runtimeSessionId,
             state => ({ ...state, messages: preserveLocalAssistantErrors(messages, state.messages) }),
@@ -374,7 +375,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       }
 
       messagingTranscriptSignatureRef.current.set(signatureKey, sig)
-      const messages = toChatMessages(latest.messages)
+      const messages = restoreFallbackNotices(storedSessionId, toChatMessages(latest.messages))
 
       updateSessionState(
         runtimeSessionId,

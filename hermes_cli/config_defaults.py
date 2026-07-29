@@ -7,6 +7,9 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Cross-provider fallback safety boundary. Compatibility default is
+    # ``any``; supported values are exactly: off | local-only | any.
+    "fallback_policy": "any",
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
