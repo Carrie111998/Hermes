@@ -32,6 +32,7 @@ from tools.environments.file_sync import (
     FileSyncManager,
     _credential_host_paths,
     iter_sync_files,
+    normalize_forward_env_names,
     quoted_mkdir_command,
     quoted_rm_command,
     unique_parent_dirs,
@@ -49,7 +50,6 @@ _SNAPSHOT_RETIRED_NAMESPACE = "retired"
 _CREATE_ATTEMPT_NAMESPACE = "create-attempt"
 _REMOTE_BINDING_NAMESPACE = "remote-binding"
 _CREATE_ATTEMPT_EXPIRY_GRACE = 3600
-_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TENKI_CPU_RANGE = (1, 16)
 _TENKI_MEMORY_MB_RANGE = (128, 65_536)
 _TENKI_DISK_GB_RANGE = (5, 100)
@@ -273,12 +273,6 @@ def _load_snapshots(store_path: Path | None = None) -> dict:
     path = store_path or _snapshot_store_path()
     with _snapshot_store_lock(path):
         return _load_recovery_registry(path)
-
-
-def _save_snapshots(data: dict, store_path: Path | None = None) -> None:
-    path = store_path or _snapshot_store_path()
-    with _snapshot_store_lock(path):
-        _atomic_save_snapshots(path, data)
 
 
 def _snapshot_platform() -> str:
@@ -879,25 +873,6 @@ def _migrate_snapshot_pointer(
             snapshots.pop(task_id, None)
 
 
-def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in forward_env or []:
-        if not isinstance(item, str):
-            logger.warning("Ignoring non-string tenki_forward_env entry: %r", item)
-            continue
-        name = item.strip()
-        if not name:
-            continue
-        if not _ENV_NAME_RE.match(name):
-            logger.warning("Ignoring invalid tenki_forward_env entry: %r", item)
-            continue
-        if name not in seen:
-            normalized.append(name)
-            seen.add(name)
-    return normalized
-
-
 def _safe_name(value: str, *, fallback: str = "default", max_len: int = 48) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value or "").strip("-._")
     return (safe or fallback)[:max_len]
@@ -1009,7 +984,6 @@ class TenkiEnvironment(BaseEnvironment):
     ``_ThreadedProcessHandle``.
     """
 
-    _stdin_mode = "pipe"
     _snapshot_timeout = 60
     _terminal_states = frozenset({"TERMINATING", "TERMINATED", "DELETED", "FAILED", "ERROR"})
 
@@ -1106,13 +1080,33 @@ class TenkiEnvironment(BaseEnvironment):
         self._workspace_id = resolve_tenki_workspace_id(workspace_id)
         self._auth_token = resolve_tenki_auth_token()
         self._name_prefix = _safe_name(name_prefix, fallback="hermes", max_len=28)
+        # Every name this wrapper will ever answer to is fixed here: the prefix,
+        # the profile token, and the task id never change after construction.
+        # Precomputing turns the per-row match in _sandbox_matches_task into a
+        # dict lookup — a workspace listing is scanned up to three times per
+        # create, and re-deriving (and re-sanitizing) one name per legacy
+        # profile candidate per listed sandbox was hundreds of regex substs per
+        # environment init. First candidate wins on a name collision, matching
+        # the previous first-match-wins scan order.
+        self._canonical_sandbox_name = self._sandbox_name_for(
+            self._profile_token,
+            self._task_id,
+        )
+        self._expected_sandbox_names: dict[str, tuple[str, str]] = {}
+        for candidate_identity in self._profile_task_candidates:
+            self._expected_sandbox_names.setdefault(
+                self._sandbox_name_for(*candidate_identity),
+                candidate_identity,
+            )
         self._allow_inbound = allow_inbound
         self._allow_outbound = allow_outbound
-        self._max_duration = max_duration
         self._effective_max_duration = _positive_float(max_duration) or 3600
         self._idle_timeout = idle_timeout
         self._pause_retention = pause_retention
-        self._forward_env = _normalize_forward_env_names(forward_env)
+        self._forward_env = normalize_forward_env_names(
+            forward_env,
+            setting_name="tenki_forward_env",
+        )
         self._remote_home = "/home/tenki"
         # Hold this profile/task lock for the wrapper's full lifetime. It is
         # acquired before pointer discovery and remote listing/creation, so two
@@ -1390,7 +1384,7 @@ class TenkiEnvironment(BaseEnvironment):
     def _sandbox_name(self) -> str:
         # The profile token namespaces the name so two profiles sharing one
         # Tenki account never collide on a name or reuse each other's sandbox.
-        return self._sandbox_name_for(self._profile_token, self._task_id)
+        return self._canonical_sandbox_name
 
     def _sandbox_name_for(self, profile_token: str, task_id: str) -> str:
         return f"{self._name_prefix}-{profile_token}-{_safe_name(task_id)}"
@@ -1410,13 +1404,13 @@ class TenkiEnvironment(BaseEnvironment):
         info = getattr(sandbox, "info", None)
         if not name and info is not None:
             name = getattr(info, "name", "")
-        matched_identity = next(
-            (
-                (profile_token, task_id)
-                for profile_token, task_id in self._profile_task_candidates
-                if name == self._sandbox_name_for(profile_token, task_id)
-            ),
-            None,
+        # ``isinstance`` guard, not a behavior change: a non-``str`` name could
+        # never equal one of the generated names under the old scan either, and
+        # an unhashable one would raise inside the lookup.
+        matched_identity = (
+            self._expected_sandbox_names.get(name)
+            if isinstance(name, str)
+            else None
         )
         if matched_identity is None:
             return False
@@ -1642,7 +1636,7 @@ class TenkiEnvironment(BaseEnvironment):
             self._validate_created_lineage()
             self._wait_created_sandbox_ready(self._sandbox)
             self._after_sandbox_ownership_confirmed()
-            sandbox_id = getattr(self._sandbox, "id", None) or getattr(self._sandbox, "sandbox_id", None)
+            sandbox_id = self._sandbox_identity(self._sandbox)
             logger.info("Tenki: created sandbox %s for task %s", sandbox_id or "<unknown>", self._task_id)
 
     def _after_sandbox_ownership_confirmed(self) -> None:
@@ -2755,6 +2749,9 @@ class TenkiEnvironment(BaseEnvironment):
                 self._validate_created_lineage()
             return
 
+        # Not shared with _dispose_remote: the binding clear runs inside the
+        # walk and gates it, so a successful terminate() whose clear failed
+        # deliberately falls through to close() for a second clear attempt.
         last_exc: BaseException | None = None
         for method_name in ("terminate", "close"):
             method = getattr(sandbox, method_name, None)
@@ -2860,6 +2857,42 @@ class TenkiEnvironment(BaseEnvironment):
         )
         self._create_lineage_ambiguous = True
         return True
+
+    @staticmethod
+    def _dispose_remote(
+        sandbox: Any,
+        method_names: tuple[str, ...],
+        *,
+        delays: tuple[float, ...] = _TERMINATE_RETRY_DELAYS,
+    ) -> tuple[bool, BaseException | None]:
+        """Try each supported disposal method until one returns cleanly.
+
+        Walks *method_names* in order, skipping names the SDK object does not
+        expose, and retries each one over *delays* before moving on. Returns
+        ``(disposed, last_exception)`` instead of raising so every caller keeps
+        its own failure policy — some log and continue, some quarantine
+        ownership. ``BaseException`` is caught deliberately: a disposal that
+        dies on ``KeyboardInterrupt`` must still let the caller decide whether
+        the remote is safe, and the exception is handed back rather than
+        swallowed.
+
+        Callers that must run extra work (a durable binding clear) *inside* the
+        walk cannot use this — see ``cleanup`` and ``_resolve_remote_binding``.
+        """
+        last_exc: BaseException | None = None
+        for method_name in method_names:
+            method = getattr(sandbox, method_name, None)
+            if not callable(method):
+                continue
+            for attempt in range(len(delays) + 1):
+                try:
+                    method()
+                    return True, last_exc
+                except BaseException as exc:
+                    last_exc = exc
+                    if attempt < len(delays):
+                        time.sleep(delays[attempt])
+        return False, last_exc
 
     def _reconcile_uncertain_create(self) -> bool:
         """Resolve exactly one durable create attempt without touching siblings."""
@@ -3028,23 +3061,7 @@ class TenkiEnvironment(BaseEnvironment):
             self._create_outcome_uncertain = False
             return True
 
-        disposed = False
-        last_exc: BaseException | None = None
-        for method_name in ("terminate", "close"):
-            method = getattr(sandbox, method_name, None)
-            if not callable(method):
-                continue
-            for attempt in range(len(_TERMINATE_RETRY_DELAYS) + 1):
-                try:
-                    method()
-                    disposed = True
-                    break
-                except BaseException as exc:
-                    last_exc = exc
-                    if attempt < len(_TERMINATE_RETRY_DELAYS):
-                        time.sleep(_TERMINATE_RETRY_DELAYS[attempt])
-            if disposed:
-                break
+        disposed, last_exc = self._dispose_remote(sandbox, ("terminate", "close"))
         if not disposed:
             logger.error(
                 "Tenki: could not dispose exact uncertain create %s for task "
@@ -3087,21 +3104,10 @@ class TenkiEnvironment(BaseEnvironment):
                     if self._persistent
                     else ("terminate", "close")
                 )
-                for method_name in method_names:
-                    method = getattr(sandbox, method_name, None)
-                    if not callable(method):
-                        continue
-                    for attempt in range(len(_TERMINATE_RETRY_DELAYS) + 1):
-                        try:
-                            method()
-                            remote_safe = True
-                            break
-                        except BaseException as exc:
-                            last_exc = exc
-                            if attempt < len(_TERMINATE_RETRY_DELAYS):
-                                time.sleep(_TERMINATE_RETRY_DELAYS[attempt])
-                    if remote_safe:
-                        break
+                remote_safe, last_exc = self._dispose_remote(
+                    sandbox,
+                    method_names,
+                )
         except BaseException as exc:
             # Rollback itself must never obscure the constructor failure or
             # release ownership in an unknown remote state.
@@ -3271,6 +3277,10 @@ class TenkiEnvironment(BaseEnvironment):
                 cleanup_succeeded = True
                 return
 
+            # Not shared with _dispose_remote: the durable binding clear runs
+            # INSIDE the retry body, so a failed clear deliberately re-invokes
+            # terminate() on the next attempt. Hoisting the clear out of the
+            # loop would drop that retry.
             for method_name in ("terminate", "close"):
                 method = getattr(sandbox, method_name, None)
                 if not callable(method):

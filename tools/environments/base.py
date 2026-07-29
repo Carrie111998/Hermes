@@ -307,11 +307,11 @@ def _atomic_save_json_durable(
     path: Path,
     data: dict,
     *,
-    subject: str = "file",
-    store_label: str = "This JSON store",
-    commit_uncertain_error: Callable[[str], BaseException] = OSError,
-    platform: str | None = None,
-    replace_write_through: Callable[[str, Path], None] | None = None,
+    subject: str,
+    store_label: str,
+    commit_uncertain_error: Callable[[str], BaseException],
+    platform: str,
+    replace_write_through: Callable[[str, Path], None],
 ) -> None:
     """Write *data* to *path* as JSON with a crash-durable atomic commit.
 
@@ -323,12 +323,13 @@ def _atomic_save_json_durable(
     *commit_uncertain_error* so a caller with recovery state can keep both the
     old and the new referents alive.
 
-    *platform* and *replace_write_through* exist so a caller can substitute its
-    own (testable) platform detection and Windows replace implementation.
+    Every policy input is required rather than defaulted: a caller that reaches
+    for this primitive is one with recovery state to protect, and silently
+    inheriting a generic uncertain-commit error or this module's own platform
+    detection would hide exactly the substitutions such a caller depends on.
+    *platform* and *replace_write_through* in particular let it supply its own
+    (testable) platform detection and Windows replace implementation.
     """
-    platform = platform if platform is not None else os.name
-    if replace_write_through is None:
-        replace_write_through = _windows_replace_file_write_through
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: str | None = None
     try:

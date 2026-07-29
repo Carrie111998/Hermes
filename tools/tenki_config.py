@@ -90,7 +90,7 @@ def _first_string(data: dict[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
-def _normalize_cli_auth_token(secret: str, key: str = "") -> str:
+def _normalize_cli_auth_token(secret: str, key: str) -> str:
     """Return a Tenki SDK-compatible auth token from Tenki CLI config.
 
     Tenki CLI v0.6 stores its browser session cookie as a bare ``auth_token``.
@@ -162,7 +162,7 @@ def resolve_tenki_workspace_id(explicit: str = "") -> str:
     return _first_string(load_tenki_cli_config(), ("current_workspace_id", "workspace_id", "workspace"))
 
 
-def resolve_tenki_auth_token(explicit: str = "") -> str:
+def resolve_tenki_auth_token() -> str:
     """Resolve a Tenki auth token/API key without logging or persisting it.
 
     Reads are profile-scope-aware (see :func:`_scoped_env`): under a
@@ -170,9 +170,6 @@ def resolve_tenki_auth_token(explicit: str = "") -> str:
     machine ``tenki login`` credential is consulted only when no profile scope
     is authoritative.
     """
-    explicit = _string(explicit)
-    if explicit:
-        return explicit
     for env_name in ("TENKI_AUTH_TOKEN", "TENKI_API_KEY"):
         value = _scoped_env(env_name)
         if value:

@@ -10,6 +10,7 @@ import hashlib
 import logging
 import os
 import posixpath
+import re
 import shlex
 import shutil
 import signal
@@ -41,6 +42,42 @@ _monotonic = time.monotonic
 
 _SYNC_INTERVAL_SECONDS = 5.0
 _FORCE_SYNC_ENV = "HERMES_FORCE_FILE_SYNC"
+
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def normalize_forward_env_names(
+    forward_env: list[str] | None,
+    *,
+    setting_name: str,
+) -> list[str]:
+    """Return a deduplicated list of valid environment variable names.
+
+    *setting_name* names the backend setting being validated (e.g.
+    ``docker_forward_env``) and only appears in the warning text.
+    """
+    normalized: list[str] = []
+    seen: set[str] = set()
+
+    for item in forward_env or []:
+        if not isinstance(item, str):
+            logger.warning("Ignoring non-string %s entry: %r", setting_name, item)
+            continue
+
+        key = item.strip()
+        if not key:
+            continue
+        if not _ENV_VAR_NAME_RE.match(key):
+            logger.warning("Ignoring invalid %s entry: %r", setting_name, item)
+            continue
+        if key in seen:
+            continue
+
+        seen.add(key)
+        normalized.append(key)
+
+    return normalized
+
 
 # Transport callbacks provided by each backend
 UploadFn = Callable[[str, str], None]  # (host_path, remote_path) -> raises on failure
