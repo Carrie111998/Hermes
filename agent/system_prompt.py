@@ -328,6 +328,28 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         stable_parts.append(skills_prompt)
 
+    # Auto-loaded skills: inject skill CONTENT for skills listed in
+    # config.yaml skills.auto_load.  Runs in the stable tier before the
+    # prompt is cached — cache-safe (config doesn't change mid-session).
+    # Same _load_skill_payload + disabled-skill gate as --skills / TUI
+    # preloading, just sourced from config instead of CLI/env.  All surfaces
+    # that go through build_system_prompt_parts get this automatically.
+    try:
+        from agent.skill_commands import build_auto_load_skills_prompt
+
+        _auto_prompt, _auto_loaded, _auto_missing = build_auto_load_skills_prompt(
+            task_id=getattr(agent, "session_id", None),
+        )
+        if _auto_prompt:
+            stable_parts.append(_auto_prompt)
+        if _auto_missing:
+            logger.warning(
+                "skills.auto_load: skipped missing/disabled: %s",
+                ", ".join(_auto_missing),
+            )
+    except Exception:
+        logger.debug("skills.auto_load: injection skipped", exc_info=True)
+
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
     # so the agent can correctly report which model it is (workaround for API bug).

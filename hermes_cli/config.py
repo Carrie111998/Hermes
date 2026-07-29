@@ -2587,6 +2587,14 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Skills auto-loaded into every session's system prompt — their
+        # CONTENT is injected alongside the skill index at system prompt
+        # build time (stable tier, cache-safe).  Unlike ``--skills`` /
+        # ``HERMES_TUI_SKILLS`` (which preload per-session via CLI/env),
+        # ``auto_load`` is config-native and applies to ALL surfaces
+        # (CLI, gateway, cron, TUI, API server, …) automatically.
+        # Default ``[]`` = no auto-load (existing behaviour unchanged).
+        "auto_load": [],
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled

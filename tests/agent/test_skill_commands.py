@@ -8,6 +8,7 @@ import pytest
 
 import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
+    build_auto_load_skills_prompt,
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
     resolve_skill_command_key,
@@ -563,6 +564,141 @@ class TestBuildPreloadedSkillsPrompt:
 
         assert missing == []
         assert loaded == ["first-skill", "second-skill"]
+
+
+class TestBuildAutoLoadSkillsPrompt:
+    """Unit tests for build_auto_load_skills_prompt — the config-native
+    variant of build_preloaded_skills_prompt (skills.auto_load)."""
+
+    def test_returns_nonempty_prompt_for_existing_skill(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "existing-skill")
+            prompt, loaded, missing = build_auto_load_skills_prompt(
+                {"skills": {"auto_load": ["existing-skill"]}}
+            )
+
+        assert missing == []
+        assert loaded == ["existing-skill"]
+        assert prompt
+        assert "existing-skill" in prompt
+        assert "auto-loaded via config" in prompt
+
+    def test_returns_empty_prompt_for_empty_config(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "some-skill")
+            prompt, loaded, missing = build_auto_load_skills_prompt({})
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == []
+
+    def test_returns_empty_prompt_for_empty_auto_load_list(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "some-skill")
+            prompt, loaded, missing = build_auto_load_skills_prompt(
+                {"skills": {"auto_load": []}}
+            )
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == []
+
+    def test_missing_skill_in_missing_list_not_in_prompt(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "present-skill")
+            prompt, loaded, missing = build_auto_load_skills_prompt(
+                {"skills": {"auto_load": ["present-skill", "nonexistent-skill"]}}
+            )
+
+        assert loaded == ["present-skill"]
+        assert "nonexistent-skill" in missing
+        assert "present-skill" in prompt
+        assert "nonexistent-skill" not in prompt
+
+    def test_multiple_skills_all_loaded(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "alpha-skill")
+            _make_skill(tmp_path, "beta-skill")
+            prompt, loaded, missing = build_auto_load_skills_prompt(
+                {"skills": {"auto_load": ["alpha-skill", "beta-skill"]}}
+            )
+
+        assert missing == []
+        assert loaded == ["alpha-skill", "beta-skill"]
+        assert "alpha-skill" in prompt
+        assert "beta-skill" in prompt
+
+    def test_none_config_returns_empty_prompt(self, tmp_path, monkeypatch):
+        """When config is None, the function lazy-loads via load_config().
+        Patch load_config to return an empty dict so the no-op path holds."""
+        from hermes_cli import config as config_module
+
+        monkeypatch.setattr(config_module, "load_config", lambda: {})
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "some-skill")
+            prompt, loaded, missing = build_auto_load_skills_prompt(config=None)
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == []
+
+    def test_skips_disabled_skill(self, tmp_path, monkeypatch):
+        """A globally-disabled skill must not be force-loaded via
+        skills.auto_load (same gate as --skills, #59156)."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "enabled-skill", body="Enabled content.")
+            _make_skill(tmp_path, "disabled-skill", body="SECRET DISABLED CONTENT.")
+
+            import agent.skill_utils as su_module
+
+            monkeypatch.setattr(
+                su_module,
+                "get_disabled_skill_names",
+                lambda platform=None: {"disabled-skill"},
+            )
+
+            prompt, loaded, missing = build_auto_load_skills_prompt(
+                {"skills": {"auto_load": ["enabled-skill", "disabled-skill"]}}
+            )
+
+        assert loaded == ["enabled-skill"]
+        assert "disabled-skill" in missing
+        assert "SECRET DISABLED CONTENT." not in prompt
+        assert "enabled-skill" in prompt
+
+    def test_skills_section_not_a_dict_returns_empty(self, tmp_path):
+        """Malformed skills config (not a dict) should be a safe no-op."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "some-skill")
+            prompt, loaded, missing = build_auto_load_skills_prompt(
+                {"skills": "not-a-dict"}
+            )
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == []
+
+    def test_auto_load_not_a_list_returns_empty(self, tmp_path):
+        """Malformed auto_load value (not a list) should be a safe no-op."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "some-skill")
+            prompt, loaded, missing = build_auto_load_skills_prompt(
+                {"skills": {"auto_load": "not-a-list"}}
+            )
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == []
+
+    def test_deduplicates_repeated_skill_names(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "dup-skill")
+            prompt, loaded, missing = build_auto_load_skills_prompt(
+                {"skills": {"auto_load": ["dup-skill", "dup-skill"]}}
+            )
+
+        assert missing == []
+        assert loaded == ["dup-skill"]
 
 
 class TestBuildSkillInvocationMessage:

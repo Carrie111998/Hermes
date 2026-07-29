@@ -508,6 +508,54 @@ in the pending JSON file). Memory writes have the same gate under
 > (dangerous-pattern heuristics), not an approval gate — the two are
 > independent. See [Guard on agent-created skill writes](/user-guide/configuration#guard-on-agent-created-skill-writes).
 
+## Auto-loading skills into every session (`skills.auto_load`)
+
+Some skills are useful as permanent context rather than on-demand recall —
+for example household standards, a daily-log convention, or a butler protocol
+you want the agent to always follow. `skills.auto_load` lets you list skill
+names whose **content** is injected into the system prompt at build time, on
+every session across every surface (CLI, gateway, cron, TUI, API server,
+desktop app).
+
+```yaml
+skills:
+  auto_load:
+    - butler-standards
+    - daily-log
+    - home-brain-kb
+```
+
+Each listed skill is resolved and loaded the same way `--skills` /
+`HERMES_TUI_SKILLS` loads a preloaded skill (same disabled-skill gate, same
+skill resolution path) — the only difference is the source: `auto_load` reads
+from `config.yaml` and applies to all surfaces automatically, while `--skills`
+and `HERMES_TUI_SKILLS` are per-session CLI/env mechanisms.
+
+### Cache safety
+
+Auto-loaded skill content is injected into the **stable tier** of the system
+prompt — the cross-session-stable prefix that is built once per session and
+cached for the conversation lifetime. Because `config.yaml` does not change
+mid-session, the same skills load every turn. This is cache-safe by design.
+
+### Behaviour notes
+
+- **Missing skills are non-fatal.** A skill listed in `auto_load` that can't
+  be found (or is disabled via `skills.disabled` / `skills.platform_disabled`)
+  is skipped with a warning — the rest still load.
+- **Coexists with `--skills` / `HERMES_TUI_SKILLS`.** If a skill appears in
+  both `auto_load` and a per-session preload list, it is loaded once via each
+  path; there is no conflict.
+- **`--ignore-rules` does not strip auto-loaded skills.** Consistent with
+  existing behaviour — `--ignore-rules` strips identity/memory, not skills.
+  Use `--skills none` or disable the `skills` toolset to suppress all skills.
+- **Subagents do not inherit auto-loaded skills.** Subagents use an ephemeral
+  system prompt that bypasses `build_system_prompt_parts`. This is a
+  deliberate first-PR limitation; a follow-up can add subagent support if
+  needed.
+
+Default: `[]` (no auto-load — existing behaviour is unchanged).
+
 ## Skills Hub
 
 Browse, search, install, and manage skills from online registries, `skills.sh`, direct well-known skill endpoints, and official optional skills.
