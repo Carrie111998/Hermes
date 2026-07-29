@@ -48,9 +48,16 @@ class TestBuildSSHCommand:
     def test_base_flags(self):
         env = SSHEnvironment(host="h", user="u")
         cmd = " ".join(env._build_ssh_command())
-        for flag in ("ControlMaster=auto", "ControlPersist=300",
-                      "BatchMode=yes", "StrictHostKeyChecking=accept-new"):
+        # BatchMode and StrictHostKeyChecking are always present
+        for flag in ("BatchMode=yes", "StrictHostKeyChecking=accept-new"):
             assert flag in cmd
+        # ControlMaster is only supported on non-Windows
+        if os.name != "nt":
+            for flag in ("ControlMaster=auto", "ControlPersist=300"):
+                assert flag in cmd
+        else:
+            for flag in ("ControlMaster=auto", "ControlPersist=300"):
+                assert flag not in cmd
 
     def test_custom_port(self):
         env = SSHEnvironment(host="h", user="u", port=2222)
