@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -4747,7 +4748,11 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
     """dispatch_once with stale_timeout_seconds reclaims stale running tasks."""
     import hermes_cli.kanban_db as _kb
 
+    signals = []
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb.os, "kill", lambda pid, sig: signals.append((pid, sig))
+    )
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="stale-dispatch", assignee="worker")
@@ -4772,6 +4777,7 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
         )
         assert t in res.stale, "Stale task should appear in result.stale"
         assert kb.get_task(conn, t).status == "ready"
+        assert signals == [(99999, signal.SIGTERM)]
 
 
 def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch):
