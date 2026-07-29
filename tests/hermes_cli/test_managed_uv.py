@@ -296,6 +296,86 @@ class TestUpdateManagedUv:
             # Still returns the path — failure is non-fatal
             assert result == str(tmp_path / "bin" / "uv")
 
+    def test_fresh_stamp_skips_network_self_update_but_not_repair(self, tmp_path, monkeypatch):
+        """A recent success stamp must skip `uv self update` entirely while the
+        vulnerable-runtime repair probe still runs (CVE repair is never gated)."""
+        from hermes_cli.managed_uv import RuntimeRepairResult, update_managed_uv
+
+        uv = tmp_path / "bin" / "uv"
+        _make_executable(uv)
+        # Fresh stamp under the isolated HERMES_HOME.
+        import hermes_constants
+        stamp = hermes_constants.get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.subprocess.run") as mock_run, \
+             patch(
+                 "hermes_cli.managed_uv.repair_vulnerable_runtime",
+                 return_value=RuntimeRepairResult("skipped"),
+             ) as mock_repair:
+            result = update_managed_uv()
+
+        assert result == str(uv)
+        assert mock_run.call_count == 0, "fresh stamp must skip the network self-update"
+        mock_repair.assert_called_once_with(str(uv))
+
+    def test_force_overrides_fresh_stamp(self, tmp_path):
+        from hermes_cli.managed_uv import update_managed_uv
+
+        uv = tmp_path / "bin" / "uv"
+        _make_executable(uv)
+        import hermes_constants
+        stamp = hermes_constants.get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.2.0")
+            result = update_managed_uv(force=True)
+
+        assert result == str(uv)
+        assert mock_run.call_args_list[0][0][0] == [str(uv), "self", "update"]
+
+    def test_stale_stamp_runs_self_update_and_refreshes_stamp(self, tmp_path):
+        import os as _os
+        import time as _time
+
+        from hermes_cli.managed_uv import UV_SELF_UPDATE_INTERVAL_SECONDS, update_managed_uv
+
+        uv = tmp_path / "bin" / "uv"
+        _make_executable(uv)
+        import hermes_constants
+        stamp = hermes_constants.get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        old = _time.time() - UV_SELF_UPDATE_INTERVAL_SECONDS - 60
+        _os.utime(stamp, (old, old))
+
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.2.0")
+            update_managed_uv()
+
+        assert mock_run.call_args_list[0][0][0] == [str(uv), "self", "update"]
+        assert stamp.stat().st_mtime > old + 30, "successful self-update must refresh the stamp"
+
+    def test_self_update_timeout_non_fatal(self, tmp_path):
+        import subprocess as _subprocess
+
+        from hermes_cli.managed_uv import update_managed_uv
+
+        uv = tmp_path / "bin" / "uv"
+        _make_executable(uv)
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
+            mock_run.side_effect = _subprocess.TimeoutExpired(cmd="uv self update", timeout=60)
+            result = update_managed_uv()
+        # Timeout is non-fatal; path still returned.
+        assert result == str(uv)
+
     def test_old_updater_api_triggers_runtime_repair(self, tmp_path):
         """The pre-pull main.py call site must activate the fresh module hook."""
         from hermes_cli.managed_uv import RuntimeRepairResult, update_managed_uv
@@ -1067,3 +1147,151 @@ class TestListAvailablePatches:
 
         monkeypatch.setattr(managed_uv.subprocess, "run", fake_run)
         assert managed_uv._list_available_patches("uv", "3.11", cwd=tmp_path, env={}) == []
+
+
+# ---------------------------------------------------------------------------
+# _refresh_managed_uv_catalog + provisioning retry (issue #72093)
+# ---------------------------------------------------------------------------
+
+class TestRefreshManagedUvCatalog:
+    """The managed uv is UV_UNMANAGED_INSTALL'd, so `uv self update` is
+    disabled and its python-build-standalone catalog freezes at bootstrap
+    age. python-build-standalone re-releases the same patch versions with
+    fixed SQLite, so a stale catalog makes provisioning fail forever with
+    no newer patch number to retry (issue #72093)."""
+
+    def test_foreign_uv_path_is_never_refreshed(self, tmp_path):
+        import hermes_cli.managed_uv as managed_uv
+
+        _make_executable(tmp_path / "bin" / "uv")
+        foreign = tmp_path / "elsewhere" / "uv"
+        _make_executable(foreign)
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
+             patch("hermes_cli.managed_uv._install_uv") as mock_install:
+            assert managed_uv._refresh_managed_uv_catalog(str(foreign)) is False
+        mock_install.assert_not_called()
+
+    def test_version_change_reports_true(self, tmp_path):
+        import hermes_cli.managed_uv as managed_uv
+
+        uv_path = tmp_path / "bin" / "uv"
+        _make_executable(uv_path)
+        versions = iter(["uv 0.1.0", "uv 0.2.0"])
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
+             patch("hermes_cli.managed_uv._install_uv"), \
+             patch(
+                 "hermes_cli.managed_uv._uv_version_string",
+                 side_effect=lambda _uv: next(versions),
+             ):
+            assert managed_uv._refresh_managed_uv_catalog(str(uv_path)) is True
+
+    def test_same_version_reports_false(self, tmp_path):
+        import hermes_cli.managed_uv as managed_uv
+
+        uv_path = tmp_path / "bin" / "uv"
+        _make_executable(uv_path)
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
+             patch("hermes_cli.managed_uv._install_uv"), \
+             patch(
+                 "hermes_cli.managed_uv._uv_version_string",
+                 return_value="uv 0.1.0",
+             ):
+            assert managed_uv._refresh_managed_uv_catalog(str(uv_path)) is False
+
+    def test_installer_failure_reports_false(self, tmp_path):
+        import hermes_cli.managed_uv as managed_uv
+
+        uv_path = tmp_path / "bin" / "uv"
+        _make_executable(uv_path)
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
+             patch(
+                 "hermes_cli.managed_uv._install_uv",
+                 side_effect=RuntimeError("network down"),
+             ):
+            assert managed_uv._refresh_managed_uv_catalog(str(uv_path)) is False
+
+
+class TestRepairRetriesAfterUvRefresh:
+    def _run_repair(self, tmp_path, *, refresh_result, second_attempt):
+        """Drive repair with the first provisioning attempt failing."""
+        from hermes_cli.managed_uv import repair_vulnerable_runtime
+
+        root, live, sentinel = _make_runtime_install(tmp_path)
+        current = _runtime_info(live / "bin" / "python", (3, 50, 4))
+
+        attempts = []
+
+        def fake_install(uv_bin, *, project_root, current):
+            attempts.append(uv_bin)
+            if len(attempts) == 1:
+                return None
+            return second_attempt(project_root)
+
+        with patch("hermes_cli.managed_uv.platform.system", return_value="Linux"), \
+             patch(
+                 "hermes_cli.managed_uv.probe_sqlite_runtime",
+                 return_value=current,
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._install_safe_python_generation",
+                 side_effect=fake_install,
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._refresh_managed_uv_catalog",
+                 return_value=refresh_result,
+             ) as mock_refresh, \
+             patch(
+                 "hermes_cli.managed_uv._stage_candidate_venv",
+                 return_value=None,
+             ):
+            result = repair_vulnerable_runtime("uv", project_root=root)
+        return result, attempts, mock_refresh, sentinel
+
+    def test_no_retry_when_refresh_did_not_change_uv(self, tmp_path):
+        result, attempts, mock_refresh, sentinel = self._run_repair(
+            tmp_path,
+            refresh_result=False,
+            second_attempt=lambda root: None,
+        )
+        assert result.status == "failed"
+        assert len(attempts) == 1
+        mock_refresh.assert_called_once_with("uv")
+        assert sentinel.read_text(encoding="utf-8") == "live"
+
+    def test_retries_once_after_successful_refresh(self, tmp_path):
+        result, attempts, mock_refresh, sentinel = self._run_repair(
+            tmp_path,
+            refresh_result=True,
+            second_attempt=lambda root: None,
+        )
+        # Second attempt ran (and also failed) — exactly one retry, no loop.
+        assert result.status == "failed"
+        assert len(attempts) == 2
+        mock_refresh.assert_called_once_with("uv")
+        assert sentinel.read_text(encoding="utf-8") == "live"
+
+    def test_retry_success_proceeds_to_staging(self, tmp_path):
+        def second_attempt(root):
+            generation = root / ".hermes-runtime" / "python" / "generation-retry"
+            candidate_python = generation / "bin" / "python"
+            candidate_python.parent.mkdir(parents=True)
+            candidate_python.write_text("candidate", encoding="utf-8")
+            return generation, candidate_python, _runtime_info(
+                candidate_python, (3, 53, 1)
+            )
+
+        result, attempts, mock_refresh, sentinel = self._run_repair(
+            tmp_path,
+            refresh_result=True,
+            second_attempt=second_attempt,
+        )
+        # Provisioning succeeded on retry; staging (mocked to None) is what
+        # failed — proving the retry result flows into the normal pipeline.
+        assert result.status == "failed"
+        assert "replacement environment" in result.detail
+        assert len(attempts) == 2
+        assert sentinel.read_text(encoding="utf-8") == "live"

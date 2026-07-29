@@ -138,8 +138,13 @@ class _RepairLock:
 def _report_runtime_repair_failure(repair: RuntimeRepairResult) -> None:
     if repair.backup_venv is None:
         print(
-            "  ⚠ Managed Python runtime was not replaced; "
+            "  ℹ Managed Python runtime was not replaced; "
             f"the existing venv is unchanged ({repair.detail})."
+        )
+        print(
+            "    Sessions stay protected meanwhile: Hermes keeps databases "
+            "out of WAL mode on this SQLite build. The next `hermes update` "
+            "will retry."
         )
         return
     print(f"  ✗ Managed Python runtime cutover needs manual recovery: {repair.detail}")
@@ -269,9 +274,46 @@ def ensure_uv(
     return _UvResult(result)
 
 
+def _uv_self_update_is_fresh(now: float | None = None) -> bool:
+    """Return True when ``uv self update`` ran recently enough to skip.
+
+    uv releases roughly weekly while many users run ``hermes update`` daily;
+    re-running a blocking network self-update on every invocation is waste
+    and, offline, an unbounded hang risk. A stamp file under HERMES_HOME
+    caches the last successful self-update time.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        stamp = get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        age = (now if now is not None else time.time()) - stamp.stat().st_mtime
+        return 0 <= age < UV_SELF_UPDATE_INTERVAL_SECONDS
+    except Exception:
+        return False
+
+
+def _touch_uv_self_update_stamp() -> None:
+    try:
+        from hermes_constants import get_hermes_home
+
+        stamp = get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+    except OSError:
+        pass
+
+
+# uv ships releases ~weekly; refresh the managed binary at most this often.
+UV_SELF_UPDATE_INTERVAL_SECONDS = 7 * 24 * 3600
+# `uv self update` is a network call; unbounded it can hang forever on a
+# blackholed connection (no default timeout in uv's downloader path).
+UV_SELF_UPDATE_TIMEOUT_SECONDS = 60
+
+
 def update_managed_uv(
     *,
     repair_observer: Callable[[RuntimeRepairResult], None] | None = None,
+    force: bool = False,
 ) -> Optional[str]:
     """Run ``uv self update`` on the managed uv binary.
 
@@ -279,31 +321,43 @@ def update_managed_uv(
     Returns the managed path when uv is available and ``None`` otherwise.
     A self-update failure is non-fatal because the old version still works.
     ``repair_observer``, when provided, receives the runtime repair result.
+
+    The network self-update is skipped when it succeeded within the last
+    ``UV_SELF_UPDATE_INTERVAL_SECONDS`` (7 days) unless ``force=True``; the
+    vulnerable-runtime repair probe below ALWAYS runs — CVE-driven runtime
+    repair must never be gated behind the freshness stamp.
     """
     existing = resolve_uv()
     if not existing:
         # Not installed yet — ensure_uv() will handle that elsewhere.
         return None
 
-    result = subprocess.run(
-        [existing, "self", "update"],
-        capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
-        check=False,
-    )
-    if result.returncode == 0:
-        version = subprocess.run(
-            [existing, "--version"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            check=False,
-        ).stdout.strip()
-        print(f"  ✓ Managed uv updated ({version})")
-    else:
-        # Non-fatal — old uv still works fine.
-        logger.debug(
-            "uv self update failed (rc=%d): %s", result.returncode, result.stderr
-        )
+    if force or not _uv_self_update_is_fresh():
+        try:
+            result = subprocess.run(
+                [existing, "self", "update"],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                check=False,
+                timeout=UV_SELF_UPDATE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("uv self update timed out after %ss", UV_SELF_UPDATE_TIMEOUT_SECONDS)
+            result = None
+        if result is not None and result.returncode == 0:
+            _touch_uv_self_update_stamp()
+            version = subprocess.run(
+                [existing, "--version"],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                check=False,
+            ).stdout.strip()
+            print(f"  ✓ Managed uv updated ({version})")
+        elif result is not None:
+            # Non-fatal — old uv still works fine.
+            logger.debug(
+                "uv self update failed (rc=%d): %s", result.returncode, result.stderr
+            )
 
     # Keep this hook inside the long-standing API. During an update, main.py is
     # already imported from the old checkout, then ``git pull`` replaces this
@@ -874,6 +928,64 @@ def _windows_runtime_holders() -> tuple[bool, str]:
     return False, ""
 
 
+def _uv_version_string(uv_bin: str) -> str:
+    """Return ``uv --version`` output, or ``""`` when it cannot be read."""
+    try:
+        result = subprocess.run(
+            [uv_bin, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=15,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _refresh_managed_uv_catalog(uv_bin: str) -> bool:
+    """Re-bootstrap the managed uv binary to refresh its Python catalog.
+
+    The managed uv is installed with ``UV_UNMANAGED_INSTALL``, which disables
+    ``uv self update`` by design — so its embedded python-build-standalone
+    download catalog stays frozen at bootstrap age.  python-build-standalone
+    re-releases existing CPython patch versions with newer SQLite (e.g. the
+    3.11.15 build was re-cut with SQLite 3.53.x), so a stale catalog can make
+    every provisioning attempt resolve to a vulnerable build even though a
+    fixed build of the SAME patch version exists (issue #72093).  The
+    patch-retry loop cannot recover from that: the fixed build carries no
+    newer version number to retry with.
+
+    Re-running the official installer is the only supported refresh path for
+    unmanaged installs.  Only the Hermes-managed binary is ever refreshed;
+    a caller-supplied foreign uv path is left alone.
+
+    Returns ``True`` when the binary's version actually changed — i.e. a
+    provisioning retry can now see a different catalog.  ``False`` means a
+    retry would resolve identically and is not worth the download cycle.
+    """
+    managed = managed_uv_path()
+    try:
+        if Path(uv_bin).resolve() != managed.resolve():
+            return False
+    except OSError:
+        return False
+    before = _uv_version_string(uv_bin)
+    try:
+        _install_uv(managed)
+    except Exception as exc:
+        logger.warning("managed uv refresh failed: %s", exc)
+        return False
+    after = _uv_version_string(uv_bin)
+    if not after:
+        return False
+    return after != before
+
+
 def repair_vulnerable_runtime(
     uv_bin: str,
     *,
@@ -948,6 +1060,19 @@ def repair_vulnerable_runtime(
             project_root=root,
             current=current,
         )
+        if provisioned is None:
+            # Likely a stale managed-uv catalog: python-build-standalone
+            # re-releases the same patch versions with fixed SQLite, but a
+            # frozen catalog keeps resolving the old vulnerable build and the
+            # patch-retry loop has no newer number to try (issue #72093).
+            # Refresh the managed binary and retry once.
+            if _refresh_managed_uv_catalog(uv_bin):
+                print("  → Managed uv refreshed; retrying provisioning...")
+                provisioned = _install_safe_python_generation(
+                    uv_bin,
+                    project_root=root,
+                    current=current,
+                )
         if provisioned is None:
             return RuntimeRepairResult(
                 "failed",
