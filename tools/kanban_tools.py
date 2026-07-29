@@ -818,6 +818,11 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     note = args.get("note")
+    if not note or not note.strip():
+        return tool_error(
+            "note is required — describe your current progress "
+            "so humans can track what you're working on"
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1689,13 +1694,13 @@ KANBAN_HEARTBEAT_SCHEMA = {
             "note": {
                 "type": "string",
                 "description": (
-                    "Optional short note describing current progress. "
+                    "REQUIRED: short note describing current progress. "
                     "Shown in the event log."
                 ),
             },
             "board": _board_schema_prop(),
         },
-        "required": [],
+        "required": ["note"],
     },
 }
 
