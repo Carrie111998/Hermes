@@ -9,6 +9,8 @@ metadata: {"synapse":{"category":"memory","requires":{"env":["SYNAPSE_TOKEN"]},"
 
 # Synapse Layer — Persistent Memory for Hermes
 
+> Scope of this PR: This pull request adds documentation and a manifest for the Synapse Layer skill only; it does NOT include runtime implementation or handlers. Implementation, automated tests, and runtime integration will be submitted in a follow-up PR.
+
 **Credits**: Rafa Martins  
 **Website**: [synapselayer.org](https://synapselayer.org) | **Forge**: [forge.synapselayer.org/forge](https://synapselayer.org/forge) | **GitHub**: [github.com/SynapseLayer/synapse-layer](https://github.com/SynapseLayer/synapse-layer)
 
@@ -34,7 +36,7 @@ mcp_servers:
 
 ### 2. Add Token to .env
 
-Add your Synapse Layer token to `~/.hermes/.env`:
+Add your Synapse Layer token to `~/.hermes/.env`. Use `skills/synapse-layer/.env.example` as a template and DO NOT commit real tokens to source control.
 
 ```
 SYNAPSE_TOKEN=sk_connect_your_token_here
@@ -132,12 +134,14 @@ Results from `recall` include a `tq` score (0.0 to 1.0). When multiple results m
 All project-related memories MUST be stored in Synapse Layer. Below is the canonical list of memory categories the agent must maintain:
 
 ### 1. USER PROFILE
-- Full name, role, company (Rafa Martins — Analista de Tecnologia na Ramel Tecnologia)
+- Full name, role, company (Ex.: Rafa Martins — Analista de Tecnologia na [COMPANY])
 - Communication style (pt-BR, feminine, cheerful, relaxed, cautious)
 - Voice preference (Edge-TTS Thalita, pt-BR)
 - Contact info (email, phone)
 - Website
 - **Save when**: User shares preferences, corrections, or personal details
+
+> WARNING: Do NOT include real PII or secrets in public commits. Use `skills/synapse-layer/.env.example` as a template for environment variables and never commit real tokens or credentials to the repository. For production, prefer a secrets manager or CI secrets.
 
 ### 2. USER PROJECTS (PRIORITY)
 Every active project the user works on must be stored with:
@@ -283,3 +287,5 @@ View and manage memories at: https://forge.synapselayer.org/forge
 
 **Created by**: Rafa Martins  
 **Last integrated**: 17/04/2026
+
+Relates to: NousResearch/hermes-agent PR #11678
