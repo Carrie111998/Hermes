@@ -854,3 +854,69 @@ def test_apply_gateway_defaults_sets_stt_use_gateway(monkeypatch):
     assert "stt" in changed
     assert config["stt"]["provider"] == "openai"
     assert config["stt"]["use_gateway"] is True
+
+
+class TestHasAgentBrowser:
+    def test_detects_local_cmd_shim_on_windows(self, monkeypatch, tmp_path):
+        import shutil
+
+        bin_dir = tmp_path / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True)
+        cmd_file = bin_dir / "agent-browser.cmd"
+        cmd_file.touch()
+
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+
+        def _fake_runnable(path):
+            return path is not None and ".cmd" in str(path)
+
+        import hermes_constants
+        monkeypatch.setattr(hermes_constants, "agent_browser_runnable", _fake_runnable)
+
+        import hermes_cli.nous_subscription as mod
+        fake_file = tmp_path / "hermes_cli" / "nous_subscription.py"
+        monkeypatch.setattr(mod, "__file__", str(fake_file))
+
+        result = mod._has_agent_browser()
+        assert result is True
+
+    def test_falls_back_to_bare_binary_on_non_windows(self, monkeypatch, tmp_path):
+        import shutil
+
+        bin_dir = tmp_path / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True)
+        bare_file = bin_dir / "agent-browser"
+        bare_file.touch()
+
+        monkeypatch.setattr("sys.platform", "darwin")
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+
+        def _fake_runnable(path):
+            return path is not None and ".cmd" not in str(path)
+
+        import hermes_constants
+        monkeypatch.setattr(hermes_constants, "agent_browser_runnable", _fake_runnable)
+
+        import hermes_cli.nous_subscription as mod
+        fake_file = tmp_path / "hermes_cli" / "nous_subscription.py"
+        monkeypatch.setattr(mod, "__file__", str(fake_file))
+
+        result = mod._has_agent_browser()
+        assert result is True
+
+    def test_global_binary_takes_precedence(self, monkeypatch):
+        import shutil
+
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/agent-browser")
+
+        def _fake_runnable(path):
+            return path is not None
+
+        import hermes_constants
+        monkeypatch.setattr(hermes_constants, "agent_browser_runnable", _fake_runnable)
+
+        import hermes_cli.nous_subscription as mod
+        result = mod._has_agent_browser()
+        assert result is True

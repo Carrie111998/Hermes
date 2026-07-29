@@ -158,6 +158,7 @@ def _toolset_enabled(config: Dict[str, object], toolset_key: str) -> bool:
 
 def _has_agent_browser() -> bool:
     import shutil
+    import sys
 
     from hermes_constants import agent_browser_runnable
 
@@ -166,9 +167,13 @@ def _has_agent_browser() -> bool:
     # the local node_modules copy, which the validator also checks.
     if agent_browser_runnable(shutil.which("agent-browser")):
         return True
-    local_bin = (
-        Path(__file__).parent.parent / "node_modules" / ".bin" / "agent-browser"
-    )
+
+    bin_dir = Path(__file__).parent.parent / "node_modules" / ".bin"
+    if sys.platform == "win32":
+        cmd_candidate = bin_dir / "agent-browser.cmd"
+        if cmd_candidate.exists() and agent_browser_runnable(str(cmd_candidate)):
+            return True
+    local_bin = bin_dir / "agent-browser"
     return agent_browser_runnable(str(local_bin)) if local_bin.exists() else False
 
 
