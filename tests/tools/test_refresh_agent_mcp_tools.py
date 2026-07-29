@@ -61,6 +61,24 @@ def test_refresh_no_change_returns_empty_and_leaves_agent_untouched(monkeypatch)
     assert agent.tools is original_tools  # not replaced → no churn / no cache thrash
 
 
+def test_refresh_is_blocked_for_static_lazy_session(monkeypatch):
+    """A static-lazy session never swaps its model-visible tools array."""
+    agent = _agent(["read_file", "tool_search", "tool_describe", "tool_call"])
+    agent._deferred_tool_snapshot_locked = True
+    original_tools = agent.tools
+
+    import model_tools
+
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("must not rebuild")),
+    )
+
+    assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+    assert agent.tools is original_tools
+
+
 def test_refresh_detects_equal_size_swap(monkeypatch):
     """Name-based diff catches an add+remove of equal count (count-compare can't)."""
     agent = _agent(["a", "old_mcp_tool"])  # 2 tools
@@ -77,6 +95,33 @@ def test_refresh_detects_equal_size_swap(monkeypatch):
     assert added == {"new_mcp_tool"}
     assert agent.valid_tool_names == {"a", "new_mcp_tool"}
     assert "old_mcp_tool" not in agent.valid_tool_names
+
+
+def test_refresh_publishes_matching_deferred_snapshot(monkeypatch):
+    agent = _agent(["read_file"])
+    agent._deferred_tool_defs_snapshot = [_tool("mcp_old")]
+    agent._deferred_tool_names_snapshot = {"mcp_old"}
+
+    import model_tools
+
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool("mcp_fresh")],
+    )
+    monkeypatch.setattr(
+        model_tools,
+        "assemble_tool_search_definitions",
+        lambda defs, quiet_mode=False: defs,
+    )
+
+    assert mcp_tool.refresh_agent_mcp_tools(agent) == {"mcp_fresh"}
+    snapshot_names = {
+        tool["function"]["name"]
+        for tool in agent._deferred_tool_defs_snapshot
+    }
+    assert snapshot_names == {"read_file", "mcp_fresh"}
+    assert not hasattr(agent, "_deferred_tool_names_snapshot")
 
 
 def test_refresh_passes_agent_toolset_filters(monkeypatch):
