@@ -181,6 +181,27 @@ def test_retrieval_count_accumulates_across_repeated_searches(retriever_with_fac
         )
 
 
+def test_returned_dict_matches_db_retrieval_count(retriever_with_facts):
+    """The retrieval_count in the returned result dicts must match
+    what the DB holds after the increment — not the stale pre-increment value.
+    """
+    retriever = retriever_with_facts
+    store = retriever.store
+
+    results = retriever.search("deployment rollback")
+    assert len(results) >= 1
+
+    for r in results:
+        # Read from DB after search
+        db_row = store._conn.execute(
+            "SELECT retrieval_count FROM facts WHERE fact_id = ?", (r["fact_id"],)
+        ).fetchone()
+        assert r["retrieval_count"] == db_row["retrieval_count"], (
+            f"Returned dict has retrieval_count={r['retrieval_count']} "
+            f"but DB has {db_row['retrieval_count']}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Entity-based retrieval fixtures — facts with extracted entities
 # ---------------------------------------------------------------------------
