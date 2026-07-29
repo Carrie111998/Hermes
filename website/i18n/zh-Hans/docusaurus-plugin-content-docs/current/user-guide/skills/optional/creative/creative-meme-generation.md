@@ -99,9 +99,9 @@ python "$SKILL_DIR/scripts/generate_meme.py" --search "disaster"
      python "$SKILL_DIR/scripts/generate_meme.py" --image /path/to/scene.png --bars /tmp/meme.png "top text" "bottom text"
      ```
    当图片内容复杂/细节丰富、文字叠加后难以辨认时，使用 `--bars`。
-5. **使用视觉验证**（如果 `vision_analyze` 可用）：检查结果是否美观：
+5. **使用视觉验证**（如果 `image_analyze` 可用）：检查结果是否美观：
    ```
-   vision_analyze(image_url="/tmp/meme.png", question="Is the text legible and well-positioned? Does the meme work visually?")
+   image_analyze(image_url="/tmp/meme.png", question="Is the text legible and well-positioned? Does the meme work visually?")
    ```
    如果视觉模型发现问题（文字难以辨认、位置不佳等），尝试切换另一种模式（在 overlay 和 bars 之间切换）或重新生成场景。
 6. 使用 `MEDIA:/tmp/meme.png` 返回图片。

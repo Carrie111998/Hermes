@@ -57,7 +57,7 @@ Hermes 将自身注册为 MCP server，以便 Codex 能够回调获取 Codex 自
 
 - **`web_search`** / **`web_extract`** — 基于 Firecrawl；对于结构化内容，通常比直接抓取更干净。
 - **`browser_navigate` / `browser_click` / `browser_type` / `browser_press` / `browser_snapshot` / `browser_scroll` / `browser_back` / `browser_get_images` / `browser_console` / `browser_vision`** — 通过 Camofox 或 Browserbase 实现完整的浏览器自动化。
-- **`vision_analyze`** — 调用独立的视觉模型检查图像（与 Codex 的 `view_image` 不同，后者是将图像加载到对话中）。
+- **`image_analyze`** — 调用独立的视觉模型检查一个或多个图像（与 Codex 的 `view_image` 不同，后者是将图像加载到对话中）。
 - **`image_generate`** — 通过 Hermes 的 image_gen 插件链生成图像。
 - **`skill_view` / `skills_list`** — 读取 Hermes 的技能库。
 - **`text_to_speech`** — 通过 Hermes 配置的提供商进行 TTS。
@@ -109,7 +109,7 @@ Kanban 工具通过分发器设置的 `HERMES_KANBAN_TASK` 环境变量进行访
 | `memory`、`session_search`、`todo` | 是 | 不可用——需要 agent 循环上下文 |
 | `web_search`、`web_extract` | 是 | 是（通过 MCP 回调） |
 | 浏览器自动化（Camofox/Browserbase） | 是 | 是（通过 MCP 回调） |
-| `vision_analyze`、`image_generate` | 是 | 是（通过 MCP 回调） |
+| `image_analyze`、`image_generate` | 是 | 是（通过 MCP 回调） |
 | `skill_view`、`skills_list` | 是 | 是（通过 MCP 回调） |
 | `text_to_speech` | 是 | 是（通过 MCP 回调） |
 | Codex `shell`（终端/读/写/搜索/查找/运行） | — | 是（Codex 内置） |
@@ -357,7 +357,7 @@ tool_timeout_sec = 600.0
 
 当模型调用 `web_search`（或其他暴露的 Hermes 工具）时，Codex 通过 stdio 生成 `hermes_tools_mcp_server` 子进程，请求通过 `model_tools.handle_function_call()` 分发，结果像其他 MCP 响应一样投影回 Codex。
 
-**通过回调可用的工具：** `web_search`、`web_extract`、`browser_navigate`、`browser_click`、`browser_type`、`browser_press`、`browser_snapshot`、`browser_scroll`、`browser_back`、`browser_get_images`、`browser_console`、`browser_vision`、`vision_analyze`、`image_generate`、`skill_view`、`skills_list`、`text_to_speech`。
+**通过回调可用的工具：** `web_search`、`web_extract`、`browser_navigate`、`browser_click`、`browser_type`、`browser_press`、`browser_snapshot`、`browser_scroll`、`browser_back`、`browser_get_images`、`browser_console`、`browser_vision`、`image_analyze`、`image_generate`、`skill_view`、`skills_list`、`text_to_speech`。
 
 **不可用的工具：** `delegate_task`、`memory`、`session_search`、`todo`。这些工具需要运行中的 AIAgent 上下文（循环中间状态）才能分发，无状态的 MCP 回调无法驱动它们。需要这些工具时，请使用默认 Hermes 运行时（`/codex-runtime auto`）。
 
@@ -433,7 +433,7 @@ tool_timeout_sec = 600.0
                                                         ▼
         ┌──────────────────────────────────────────────────────────┐
         │  hermes_tools_mcp_server.py (subprocess on demand)        │
-        │   web_search, web_extract, browser_*, vision_analyze,    │
+        │   web_search, web_extract, browser_*, image_analyze,     │
         │   image_generate, skill_view, skills_list, text_to_speech│
         └──────────────────────────────────────────────────────────┘
 ```

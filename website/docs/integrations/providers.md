@@ -1198,14 +1198,14 @@ extra_body:
 
 The `hermes model` → Custom Endpoint wizard now prompts for `api_mode` explicitly and persists your answer to `config.yaml`. URL-based auto-detection (e.g. `/anthropic` paths → `anthropic_messages`) still happens as a fallback when the field is left blank.
 
-**Native vision for custom-provider models.** If your custom endpoint serves a vision-capable model that isn't in models.dev, set `model.supports_vision: true` so Hermes routes attached images natively (as `image_url` parts) instead of pre-processing them through `vision_analyze`. Single knob — no need to also set `agent.image_input_mode: native`.
+**Native vision for custom-provider models.** If your custom endpoint serves a vision-capable model that isn't in models.dev, set `model.supports_vision: true` so Hermes routes attached images natively (as `image_url` parts) instead of pre-processing them through the auxiliary vision pipeline. Single knob — no need to also set `agent.image_input_mode: native`.
 
 ```yaml
 model:
   provider: custom
   base_url: http://localhost:8080/v1
   default: qwen3.6-35b-a3b
-  supports_vision: true   # send images natively; otherwise vision_analyze pre-describes them
+  supports_vision: true   # send images natively; otherwise auxiliary vision pre-describes them
 ```
 
 The same key is honored on per-named-provider models (`custom_providers[*].models[*].supports_vision`) and accepts standard YAML booleans (`true/false/yes/no/on/off/1/0`).

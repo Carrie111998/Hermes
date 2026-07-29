@@ -792,7 +792,7 @@ Hermes 中的每个模型槽位 —— 辅助任务、压缩、回退 —— 使
 
 ```yaml
 auxiliary:
-  # 图像分析（vision_analyze 工具 + 浏览器截图）
+  # 图像分析（image_analyze 工具 + 浏览器截图）
   vision:
     provider: "auto"           # "auto"、"openrouter"、"nous"、"codex"、"main" 等
     model: ""                  # 例如 "openai/gpt-4o"、"google/gemini-2.5-flash"

@@ -903,7 +903,7 @@ violate them.
    MCP servers the skill explicitly expects.** When the skill needs a
    capability, point at the proper tool by name in backticks
    (`` `terminal` ``, `` `web_extract` ``, `` `read_file` ``,
-   `` `patch` ``, `` `search_files` ``, `` `vision_analyze` ``,
+   `` `patch` ``, `` `search_files` ``, `` `image_analyze` ``,
    `` `browser_navigate` ``, `` `delegate_task` ``, etc.). Do NOT
    name shell utilities the agent already has wrapped — `grep` →
    `search_files`, `cat`/`head`/`tail` → `read_file`, `sed`/`awk` →

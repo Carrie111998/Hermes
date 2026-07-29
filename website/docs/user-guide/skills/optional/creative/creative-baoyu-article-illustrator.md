@@ -112,7 +112,7 @@ If the user asks for a different layout (e.g., images alongside the article, or 
 
 If the user supplies reference images (paths pasted inline, attachments, or a URL):
 
-1. For each reference, call `vision_analyze` with the path/URL and a question asking for style, palette, composition, and subject. Record the returned description in `{output-dir}/references/NN-ref-{slug}.md` via `write_file`.
+1. For each reference, call `image_analyze` with the path/URL and a question asking for style, palette, composition, and subject. Record the returned description in `{output-dir}/references/NN-ref-{slug}.md` via `write_file`.
 2. **Do not** try to copy the binary via `write_file` / `read_file` — those are text-only. If you want a local copy for the record, use `terminal` (`cp "$src" "{output-dir}/references/NN-ref-{slug}.{ext}"`). The skill itself never needs to read the binary; it works off the vision description.
 3. Since `image_generate` doesn't take image inputs, the vision description is what gets embedded in prompts during Step 5.
 

@@ -70,7 +70,7 @@ hermes tools                            # curses UI to enable/disable per platfo
 | `kanban` | `kanban_block`, `kanban_comment`, `kanban_complete`, `kanban_create`, `kanban_heartbeat`, `kanban_link`, `kanban_list`, `kanban_show`, `kanban_unblock` | 多 agent 协调工具。为调度器生成的任务工作者（`HERMES_KANBAN_TASK`）以及显式启用 `kanban` 工具集的 profile 注册。工作者可标记任务完成、阻塞、心跳、评论以及创建/关联后续任务；编排器 profile 还额外获得看板路由工具，如 list/unblock。 |
 | `memory` | `memory` | 持久化跨会话记忆管理。 |
 | `messaging` | `send_message` | 在会话中向其他平台（Telegram、Discord 等）发送消息。 |
-| `safe` | `image_generate`, `vision_analyze`, `web_extract`, `web_search`（通过 `includes`） | 只读研究 + 媒体生成。无文件写入、无终端、无代码执行。 |
+| `safe` | `image_analyze`, `image_generate`, `web_extract`, `web_search`（通过 `includes`） | 只读研究 + 媒体生成。无文件写入、无终端、无代码执行。 |
 | `search` | `web_search` | 仅网页搜索（不含提取）。 |
 | `session_search` | `session_search` | 搜索历史会话记录。 |
 | `skills` | `skill_manage`, `skill_view`, `skills_list` | 技能的增删改查与浏览。 |
@@ -78,7 +78,7 @@ hermes tools                            # curses UI to enable/disable per platfo
 | `terminal` | `process`, `terminal` | Shell 命令执行和后台进程管理。 |
 | `todo` | `todo` | 会话内任务列表管理。 |
 | `tts` | `text_to_speech` | 文本转语音音频生成。 |
-| `vision` | `vision_analyze` | 通过视觉能力模型进行图像分析。 |
+| `vision` | `image_analyze` | 通过已配置的辅助视觉模型进行图像分析。 |
 | `video` | `video_analyze` | 视频分析与理解工具（需手动启用，不在默认工具集中——通过 `--toolsets` 显式添加）。 |
 | `web` | `web_extract`, `web_search` | 网页搜索和页面内容提取。 |
 | `x_search` | `x_search` | 通过 xAI 内置的 `x_search` Responses 工具搜索 X（Twitter）帖子和话题。默认关闭；通过 `hermes tools` 启用。仅在配置了 xAI 凭据（SuperGrok OAuth 或 `XAI_API_KEY`）时注册 schema。 |

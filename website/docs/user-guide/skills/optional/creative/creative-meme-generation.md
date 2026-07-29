@@ -99,9 +99,9 @@ Use this when no classic template fits, or when the user wants something origina
      python "$SKILL_DIR/scripts/generate_meme.py" --image /path/to/scene.png --bars /tmp/meme.png "top text" "bottom text"
      ```
    Use `--bars` when the image is busy/detailed and text would be hard to read on top of it.
-5. **Verify with vision** (if `vision_analyze` is available): Check the result looks good:
+5. **Verify with vision** (if `image_analyze` is available): Check the result looks good:
    ```
-   vision_analyze(image_url="/tmp/meme.png", question="Is the text legible and well-positioned? Does the meme work visually?")
+   image_analyze(image_url="/tmp/meme.png", question="Is the text legible and well-positioned? Does the meme work visually?")
    ```
    If the vision model flags issues (text hard to read, bad placement, etc.), try the other mode (switch between overlay and bars) or regenerate the scene.
 6. Return the image with `MEDIA:/tmp/meme.png`
