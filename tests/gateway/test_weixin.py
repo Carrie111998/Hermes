@@ -318,6 +318,20 @@ class TestWeixinStatePersistence:
         assert json.loads(token_path.read_text(encoding="utf-8")) == {"user-a": "old-token"}
         warning_mock.assert_called_once()
 
+    def test_context_token_delete_removes_memory_and_disk_entry(self, tmp_path):
+        store = ContextTokenStore(str(tmp_path))
+        store.set("acct", "user-a", "stale-token")
+        store.set("acct", "user-b", "fresh-token")
+
+        store.delete("acct", "user-a")
+
+        assert store.get("acct", "user-a") is None
+        assert store.get("acct", "user-b") == "fresh-token"
+        token_path = tmp_path / "weixin" / "accounts" / "acct.context-tokens.json"
+        assert json.loads(token_path.read_text(encoding="utf-8")) == {
+            "user-b": "fresh-token"
+        }
+
     def test_save_sync_buf_preserves_existing_file_on_replace_failure(self, tmp_path, monkeypatch):
         sync_path = tmp_path / "weixin" / "accounts" / "acct.sync.json"
         sync_path.parent.mkdir(parents=True, exist_ok=True)
@@ -445,6 +459,32 @@ class TestWeixinChunkDelivery:
         retry = send_message_mock.await_args_list[2].kwargs
         assert first_try["text"] == retry["text"]
         assert first_try["client_id"] == retry["client_id"]
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_empty_errmsg_minus_2_retries_without_stale_context_token(
+        self, send_message_mock, tmp_path
+    ):
+        adapter = self._connected_adapter()
+        token_store = ContextTokenStore(str(tmp_path))
+        token_store.set("test-account", "wxid_test123", "stale-ctx-token")
+        adapter._token_store = token_store
+        send_message_mock.side_effect = [
+            {"ret": -2, "errcode": None, "errmsg": None},
+            {"ret": 0, "errcode": 0},
+        ]
+
+        result = asyncio.run(adapter.send("wxid_test123", "scheduled journal"))
+
+        assert result.success is True
+        assert send_message_mock.await_count == 2
+        first_attempt = send_message_mock.await_args_list[0].kwargs
+        tokenless_retry = send_message_mock.await_args_list[1].kwargs
+        assert first_attempt["context_token"] == "stale-ctx-token"
+        assert tokenless_retry["context_token"] is None
+        assert token_store.get("test-account", "wxid_test123") is None
+        token_path = tmp_path / "weixin" / "accounts" / "test-account.context-tokens.json"
+        assert json.loads(token_path.read_text(encoding="utf-8")) == {}
+        assert adapter._rate_limit_events == []
 
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
@@ -958,9 +998,9 @@ class TestIsStaleSessionRet:
         # Genuine rate limit — must NOT be treated as stale session.
         assert weixin._is_stale_session_ret(-2, None, "freq limit") is False
 
-    def test_ret_minus_2_with_no_errmsg_is_not_stale(self):
-        assert weixin._is_stale_session_ret(-2, None, None) is False
-        assert weixin._is_stale_session_ret(-2, None, "") is False
+    def test_ret_minus_2_with_no_errmsg_is_stale(self):
+        assert weixin._is_stale_session_ret(-2, None, None) is True
+        assert weixin._is_stale_session_ret(-2, None, "") is True
 
     def test_errcode_minus_14_is_not_matched_here(self):
         # -14 is handled by the separate SESSION_EXPIRED_ERRCODE path; the

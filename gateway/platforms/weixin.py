@@ -93,19 +93,24 @@ MAX_CONSECUTIVE_FAILURES = 3
 RETRY_DELAY_SECONDS = 2
 BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
-RATE_LIMIT_ERRCODE = -2  # iLink frequency limit — backoff and retry
+RATE_LIMIT_ERRCODE = -2  # iLink overloads -2 for rate limits and stale/invalid context
 MESSAGE_DEDUP_TTL_SECONDS = 300
 
 
 def _is_stale_session_ret(
     ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
 ) -> bool:
-    """True when iLink returns ret=-2 / errcode=-2 with 'unknown error',
-    which is a stale-session signal (same as errcode=-14) rather than
-    a genuine rate limit."""
+    """Return whether ``-2`` is iLink's stale-context variant.
+
+    Cron pushes to an inactive peer can return ``ret=-2`` with either an empty
+    error message or ``"unknown error"``.  Both recover when the saved
+    ``context_token`` is removed and the message is retried tokenless.  An
+    explicit frequency/rate-limit message must continue through the normal
+    backoff path instead.
+    """
     if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
         return False
-    return (errmsg or "").lower() == "unknown error"
+    return (errmsg or "").strip().lower() in {"", "unknown error"}
 
 
 MEDIA_IMAGE = 1
@@ -312,6 +317,11 @@ class ContextTokenStore:
 
     def set(self, account_id: str, user_id: str, token: str) -> None:
         self._cache[self._key(account_id, user_id)] = token
+        self._persist(account_id)
+
+    def delete(self, account_id: str, user_id: str) -> None:
+        """Remove a stale peer token from memory and durable storage."""
+        self._cache.pop(self._key(account_id, user_id), None)
         self._persist(account_id)
 
     def _persist(self, account_id: str) -> None:
@@ -1812,12 +1822,12 @@ class WeixinAdapter(BasePlatformAdapter):
                         if is_session_expired and not retried_without_token and context_token:
                             retried_without_token = True
                             context_token = None
-                            self._token_store._cache.pop(
-                                self._token_store._key(self._account_id, chat_id), None
-                            )
+                            self._token_store.delete(self._account_id, chat_id)
                             logger.warning(
-                                "[%s] session expired for %s; retrying without context_token",
-                                self.name, _safe_id(chat_id),
+                                "[%s] stale context_token for %s "
+                                "(ret=%s errcode=%s errmsg=%r); retrying tokenless",
+                                self.name, _safe_id(chat_id), ret, errcode,
+                                resp.get("errmsg"),
                             )
                             continue
                         # Rate limit (-2) — backoff and retry
