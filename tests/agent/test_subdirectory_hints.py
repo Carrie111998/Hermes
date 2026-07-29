@@ -158,6 +158,46 @@ class TestSubdirectoryHintTracker:
         # Reading a hint file outside working_dir — should NOT load hints
         assert result is None
 
+    def test_denied_subtree_does_not_load_context(self, project):
+        """permissions.deny.paths blocks progressive context discovery."""
+        private = project / "private"
+        private.mkdir()
+        (private / "AGENTS.md").write_text("PRIVATE CONTEXT MUST NOT LEAK")
+        (private / "data.txt").write_text("private data")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        with patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=[str(private / "**")],
+        ):
+            result = tracker.check_tool_call(
+                "read_file", {"path": str(private / "data.txt")}
+            )
+
+        assert result is None
+
+    def test_denied_hint_file_is_skipped(self, project):
+        """A file-specific deny applies before context hint content is read."""
+        mixed = project / "mixed"
+        mixed.mkdir()
+        agents = mixed / "AGENTS.md"
+        agents.write_text("DENIED AGENTS CONTEXT")
+        (mixed / "CLAUDE.md").write_text("Allowed sibling context")
+        (mixed / "data.txt").write_text("ordinary data")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        with patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=[str(agents)],
+        ):
+            result = tracker.check_tool_call(
+                "read_file", {"path": str(mixed / "data.txt")}
+            )
+
+        assert result is not None
+        assert "Allowed sibling context" in result
+        assert "DENIED AGENTS CONTEXT" not in result
+
     def test_inside_workspace_subdir_allowed(self, project):
         """Paths inside working_dir are still allowed."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))

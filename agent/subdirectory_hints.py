@@ -54,6 +54,33 @@ def _is_ancestor_or_same(a: Path, b: Path) -> bool:
     except ValueError:
         return False
 
+
+def _is_denied_context_path(path: Path) -> bool:
+    """Return whether progressive context discovery must not inspect *path*.
+
+    Context hints are an implicit file-read path, so they inherit the same
+    ``permissions.deny.paths`` floor as explicit file tools. Policy evaluation
+    errors fail closed rather than leaking context from an uncertain boundary.
+    """
+    try:
+        from agent.deny_policy import (
+            match_permissions_deny_path,
+            permissions_deny_paths,
+        )
+
+        patterns = permissions_deny_paths()
+        return match_permissions_deny_path(
+            str(path), patterns=patterns, canonicalize=True
+        ) is not None
+    except Exception:
+        logger.warning(
+            "permissions.deny.paths context check failed closed for %s",
+            path,
+            exc_info=True,
+        )
+        return True
+
+
 class SubdirectoryHintTracker:
     """Track which directories the agent visits and load hints on first access.
 
@@ -130,7 +157,11 @@ class SubdirectoryHintTracker:
             p = Path(raw_path).expanduser()
             if not p.is_absolute():
                 p = self.working_dir / p
+            if _is_denied_context_path(p):
+                return
             p = p.resolve()
+            if _is_denied_context_path(p):
+                return
             # Use parent if it's a file path (has extension or doesn't exist as dir)
             if p.suffix or (p.exists() and p.is_file()):
                 p = p.parent
@@ -221,6 +252,8 @@ class SubdirectoryHintTracker:
         found_hints = []
         for filename in _HINT_FILENAMES:
             hint_path = directory / filename
+            if _is_denied_context_path(hint_path):
+                continue
             try:
                 if not hint_path.is_file():
                     continue

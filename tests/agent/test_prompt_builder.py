@@ -712,6 +712,61 @@ class TestBuildContextFilesPrompt:
         assert "Project Context" in result
         assert "Hermes Agent" in result
 
+    def test_permissions_deny_skips_project_context(self, tmp_path):
+        """Startup context discovery inherits permissions.deny.paths."""
+        from unittest.mock import patch
+
+        (tmp_path / "AGENTS.md").write_text("PRIVATE STARTUP CONTEXT")
+
+        with patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=[str(tmp_path / "**")],
+        ):
+            result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert result == ""
+        assert "PRIVATE STARTUP CONTEXT" not in result
+
+    def test_permissions_deny_real_config_skips_project_context(
+        self, tmp_path, monkeypatch
+    ):
+        """Real temp HERMES_HOME config protects startup context discovery."""
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        project = tmp_path / "private-project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("REAL CONFIG PRIVATE CONTEXT")
+        (hermes_home / "config.yaml").write_text(
+            "permissions:\n"
+            "  deny:\n"
+            "    paths:\n"
+            f"      - '{project.as_posix()}/**'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        result = build_context_files_prompt(cwd=str(project), skip_soul=True)
+
+        assert result == ""
+        assert "REAL CONFIG PRIVATE CONTEXT" not in result
+
+    def test_permissions_deny_skips_exact_context_file(self, tmp_path):
+        """A denied AGENTS.md cannot shadow an allowed lower-priority file."""
+        from unittest.mock import patch
+
+        agents = tmp_path / "AGENTS.md"
+        agents.write_text("DENIED STARTUP CONTEXT")
+        (tmp_path / "CLAUDE.md").write_text("Allowed startup context")
+
+        with patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=[str(agents)],
+        ):
+            result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert "Allowed startup context" in result
+        assert "DENIED STARTUP CONTEXT" not in result
+
     def test_loads_agents_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
         result = build_context_files_prompt(cwd=str(tmp_path))
