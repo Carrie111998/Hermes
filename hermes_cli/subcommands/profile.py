@@ -176,12 +176,14 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
 
     profile_update = profile_subparsers.add_parser(
         "update",
-        help="Re-pull a distribution and apply updates (user data preserved)",
+        help="Re-pull a distribution and apply updates (user additions preserved)",
         description=(
-            "Fetch the distribution from its recorded source and overwrite "
-            "distribution-owned files (SOUL.md, skills/, cron/, mcp.json). "
-            "User data (memories, sessions, auth, .env) is never touched. "
-            "config.yaml is preserved unless --force-config is passed."
+            "Fetch the distribution from its recorded source, update "
+            "distribution-owned files (SOUL.md, mcp.json, distribution.yaml), "
+            "and merge distribution-owned directories (skills/, cron/) so "
+            "skills or cron jobs you added locally remain in place. User data "
+            "(memories, sessions, auth, .env) is never touched. config.yaml "
+            "is preserved unless --force-config is passed."
         ),
     )
     profile_update.add_argument("profile_name", help="Profile to update")
