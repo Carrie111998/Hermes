@@ -311,6 +311,87 @@ def test_same_session_recorded_cwd_survives_across_commands(monkeypatch):
     assert calls[1] == ("pwd", {"timeout": 60, "cwd": "/workspace/deep", "bounded_capture": True})
 
 
+def test_explicit_workdir_does_not_override_session_cwd(monkeypatch):
+    """workdir= on a command must NOT overwrite the session's recorded cwd (#73683)."""
+    calls = []
+
+    class FakeEnv:
+        env = {}
+        cwd = "/tmp/from-workdir"
+
+        def execute(self, command, **kwargs):
+            calls.append(kwargs)
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "session-cwd-test"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/original"))
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+    # Establish a prior session cwd (from a normal `cd` command).
+    terminal_tool.record_session_cwd(task_id, "/workspace/original")
+
+    # Run a command with explicit workdir= override.
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            command="pwd",
+            task_id=task_id,
+            workdir="/tmp/one-off",
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert calls == [{"timeout": 60, "cwd": "/tmp/one-off", "bounded_capture": True}]
+    # The session's recorded cwd must remain unchanged — the workdir= was one-off.
+    assert terminal_tool.get_session_cwd(task_id) == "/workspace/original"
+
+
+def test_explicit_workdir_does_not_override_session_cwd_first_command(monkeypatch):
+    """workdir= on the very first command (no prior session cwd) must not seed
+    a session cwd record either — subsequent commands should use the default."""
+
+    class FakeEnv:
+        env = {}
+        cwd = "/tmp/from-workdir"
+
+        def execute(self, command, **kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "first-cmd-workdir"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/default"))
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            command="pwd",
+            task_id=task_id,
+            workdir="/tmp/one-off",
+        )
+    )
+
+    assert result["exit_code"] == 0
+    # No session cwd should have been recorded (workdir was a one-off).
+    assert terminal_tool.get_session_cwd(task_id) is None
+
+
 def test_safe_getcwd_returns_real_cwd(monkeypatch):
     monkeypatch.setattr(terminal_tool.os, "getcwd", lambda: "/home/user/project")
     assert terminal_tool._safe_getcwd() == "/home/user/project"

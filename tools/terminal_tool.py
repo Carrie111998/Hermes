@@ -2770,7 +2770,13 @@ def terminal_tool(
             # session — record it under the session key so the durable record
             # never depends on the shared env surviving or on who drives the
             # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
+            #
+            # BUT: when an explicit workdir= was passed, it's a one-off
+            # override — do NOT record that directory as the session's
+            # persistent cwd, otherwise a single "workdir=/tmp" command
+            # permanently relocates the session (#73683).
+            if not workdir:
+                record_session_cwd(session_key, getattr(env, "cwd", None))
 
             # Extract output
             output = result.get("output", "")
