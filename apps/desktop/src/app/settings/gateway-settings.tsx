@@ -1245,6 +1245,8 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
                   <div className="grid gap-1">
                     {cloudAgents.map(agent => {
                       const connected = isConnectedAgent(agent)
+                      const gatewayState = agent.dashboardGatewayState.trim()
+                      const hasKnownGatewayState = gatewayState.length > 0 && gatewayState.toLowerCase() !== 'unknown'
 
                       return (
                         <div
@@ -1273,7 +1275,7 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
                                 </Button>
                               )
                             }
-                            description={g.cloudStatusLabel(agent.dashboardGatewayState)}
+                            description={hasKnownGatewayState ? g.cloudStatusLabel(gatewayState) : undefined}
                             title={agent.name}
                           />
                         </div>
