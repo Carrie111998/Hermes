@@ -13,7 +13,11 @@ import { selectableCardClass } from '@/lib/selectable-card'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $backdrop, setBackdrop } from '@/store/backdrop'
-import { $conversationFontSize, setConversationFontSize } from '@/store/conversation-font-size'
+import {
+  $conversationFontSize,
+  CONVERSATION_FONT_SIZE_PRESETS,
+  setConversationFontSize
+} from '@/store/conversation-font-size'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $toolViewMode, setToolViewMode } from '@/store/tool-view'
@@ -71,12 +75,15 @@ function ThemePreview({ name, mode }: { name: string; mode: 'light' | 'dark' }) 
 // presets highlights nothing, and the row description keeps showing the
 // exact current percent.
 const UI_SCALE_PRESETS = ['90', '100', '110', '125', '150', '175'] as const
-const CONVERSATION_FONT_SIZE_PRESETS = ['13', '16', '18', '20', '22', '24'] as const
-
 type UiScalePreset = (typeof UI_SCALE_PRESETS)[number]
+type ConversationFontSizePreset = (typeof CONVERSATION_FONT_SIZE_PRESETS)[number]
 
 function matchUiScalePreset(percent: number): UiScalePreset | null {
   return UI_SCALE_PRESETS.find(preset => Number(preset) === percent) ?? null
+}
+
+function matchConversationFontSizePreset(size: number): ConversationFontSizePreset {
+  return CONVERSATION_FONT_SIZE_PRESETS.find(preset => Number(preset) === size) ?? CONVERSATION_FONT_SIZE_PRESETS[0]
 }
 
 function useDebounced<T>(value: T, delayMs: number): T {
@@ -444,7 +451,7 @@ export function AppearanceSettings() {
                   setConversationFontSize(Number(id))
                 }}
                 options={conversationFontSizeOptions}
-                value={String(conversationFontSize) as (typeof CONVERSATION_FONT_SIZE_PRESETS)[number]}
+                value={matchConversationFontSizePreset(conversationFontSize)}
               />
             }
             description={a.conversationFontSizeDesc(conversationFontSize)}

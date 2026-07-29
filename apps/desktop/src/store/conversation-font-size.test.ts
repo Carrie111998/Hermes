@@ -14,9 +14,9 @@ describe('conversation font size', () => {
     document.documentElement.style.removeProperty(CONVERSATION_FONT_SIZE_CSS_VAR)
   })
 
-  it('clamps and rounds values to the supported readable range', () => {
+  it('clamps and snaps values to the supported readable presets', () => {
     expect(clampConversationFontSize(8)).toBe(13)
-    expect(clampConversationFontSize(16.6)).toBe(17)
+    expect(clampConversationFontSize(17.2)).toBe(18)
     expect(clampConversationFontSize(30)).toBe(24)
     expect(clampConversationFontSize(Number.NaN)).toBe(13)
   })

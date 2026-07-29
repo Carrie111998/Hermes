@@ -18,13 +18,18 @@ export const CONVERSATION_FONT_SIZE_CSS_VAR = '--conversation-prose-font-size'
 export const MIN_CONVERSATION_FONT_SIZE = 13
 export const MAX_CONVERSATION_FONT_SIZE = 24
 export const DEFAULT_CONVERSATION_FONT_SIZE = 13
+export const CONVERSATION_FONT_SIZE_PRESETS = ['13', '16', '18', '20', '22', '24'] as const
 
 export function clampConversationFontSize(value: number): number {
   if (!Number.isFinite(value)) {
     return DEFAULT_CONVERSATION_FONT_SIZE
   }
 
-  return Math.min(MAX_CONVERSATION_FONT_SIZE, Math.max(MIN_CONVERSATION_FONT_SIZE, Math.round(value)))
+  const clamped = Math.min(MAX_CONVERSATION_FONT_SIZE, Math.max(MIN_CONVERSATION_FONT_SIZE, value))
+
+  return CONVERSATION_FONT_SIZE_PRESETS.map(Number).reduce((nearest, preset) =>
+    Math.abs(preset - clamped) < Math.abs(nearest - clamped) ? preset : nearest
+  )
 }
 
 function readConversationFontSize(): number {
