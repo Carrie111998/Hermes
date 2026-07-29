@@ -16,6 +16,7 @@ import {
   mergeSessionPage,
   rememberedSessionProfile,
   resolveComposerSessionKey,
+  sessionAliasIds,
   sessionPinId,
   setCurrentCwd,
   setRememberedSessionId,
@@ -104,6 +105,18 @@ describe('resolveComposerSessionKey', () => {
 
   it('falls back to the live id when the tip row is not loaded yet', () => {
     expect(resolveComposerSessionKey('tip-new', [])).toBe('tip-new')
+  })
+})
+
+describe('sessionAliasIds', () => {
+  it('returns every lineage alias once', () => {
+    expect(
+      sessionAliasIds({ id: 'tip', _lineage_ids: ['root', 'mid', 'tip'], _lineage_root_id: 'root' })
+    ).toEqual(['tip', 'root', 'mid'])
+  })
+
+  it('falls back to the live id for uncompressed sessions', () => {
+    expect(sessionAliasIds(session({ id: 'solo' }))).toEqual(['solo'])
   })
 })
 
