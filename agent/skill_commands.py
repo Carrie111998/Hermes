@@ -853,24 +853,67 @@ def build_auto_load_prompt(
     (prompt_text, loaded_names, missing_names).  Missing skills are
     listed in ``missing_names`` rather than raising an error — callers
     should log a warning for them.
+
+    Uses ``_load_skill_payload`` + the disabled-skill gate directly
+    (same primitives as ``build_preloaded_skills_prompt``) with a
+    purpose-built activation note, rather than reusing
+    ``build_preloaded_skills_prompt`` and string-replacing the note.
+    A string replace is fragile: if the upstream note wording changes,
+    the replace silently breaks and the CLI-specific note leaks into
+    all sessions.
     """
     auto_skills = resolve_auto_load_skills(user_config)
     if not auto_skills:
         return "", [], []
 
-    prompt_text, loaded, missing = build_preloaded_skills_prompt(
-        auto_skills, task_id=task_id
-    )
+    # Same disabled-skill gate as build_preloaded_skills_prompt (#59156).
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+        disabled_names = get_disabled_skill_names()
+    except Exception:
+        disabled_names = set()
 
-    # Rewrite the activation note to be origin-agnostic (not CLI-specific).
-    if prompt_text:
-        prompt_text = prompt_text.replace(
-            'The user launched this CLI session with the',
-            'The',
-        )
-        prompt_text = prompt_text.replace(
-            'preloaded. Treat its instructions as active guidance for the duration of this session unless the user overrides them.]',
-            'skill is auto-loaded from skills.auto_load config. Treat its instructions as active guidance for the duration of this session unless the user overrides them.]',
-        )
+    prompt_parts: list[str] = []
+    loaded_names: list[str] = []
+    missing: list[str] = []
+    seen: set[str] = set()
 
-    return prompt_text, loaded, missing
+    for identifier in auto_skills:
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+
+        loaded = _load_skill_payload(identifier, task_id=task_id)
+        if not loaded:
+            missing.append(identifier)
+            continue
+
+        loaded_skill, skill_dir, skill_name = loaded
+
+        if skill_name in disabled_names or identifier in disabled_names:
+            missing.append(identifier)
+            continue
+
+        # Track active usage for Curator lifecycle management (#17782)
+        try:
+            from tools.skill_usage import bump_use
+            bump_use(skill_name)
+        except Exception:
+            pass  # Non-critical
+
+        activation_note = (
+            f'[IMPORTANT: The "{skill_name}" skill is auto-loaded via config '
+            "(skills.auto_load). Treat its instructions as active guidance "
+            "for the duration of this session unless the user overrides them.]"
+        )
+        prompt_parts.append(
+            _build_skill_message(
+                loaded_skill,
+                skill_dir,
+                activation_note,
+                session_id=task_id,
+            )
+        )
+        loaded_names.append(skill_name)
+
+    return "\n\n".join(prompt_parts), loaded_names, missing

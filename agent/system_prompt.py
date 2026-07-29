@@ -352,7 +352,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if _auto_prompt:
                 stable_parts.append(_auto_prompt)
         except Exception:
-            pass  # Non-fatal — config read errors must not break session start
+            logger.debug("skills.auto_load: injection skipped", exc_info=True)  # Non-fatal — config read errors must not break session start
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
     # so the agent can correctly report which model it is (workaround for API bug).

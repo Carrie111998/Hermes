@@ -111,7 +111,7 @@ def test_build_auto_load_prompt_loads_skills(tmp_path):
     assert missing == []
     assert loaded == ["test-auto"]
     assert "test-auto" in prompt
-    assert "auto-loaded from skills.auto_load config" in prompt
+    assert "auto-loaded via config (skills.auto_load)" in prompt
 
 
 def test_build_auto_load_prompt_activation_note_not_cli_specific(tmp_path):
@@ -132,7 +132,7 @@ def test_build_auto_load_prompt_activation_note_not_cli_specific(tmp_path):
     # Must NOT contain the CLI-specific phrase
     assert "launched this CLI session" not in prompt
     # Must contain the auto_load-specific phrase
-    assert "auto-loaded from skills.auto_load config" in prompt
+    assert "auto-loaded via config (skills.auto_load)" in prompt
 
 
 def test_build_auto_load_prompt_reports_missing_non_fatal(tmp_path):
@@ -343,7 +343,7 @@ def test_aiagent_build_system_prompt_injects_auto_load(tmp_path):
     with patch("tools.skills_tool.SKILLS_DIR", tmp_path), \
          patch("agent.skill_commands.resolve_auto_load_skills", return_value=["buildsys-skill"]), \
          patch("run_agent.AIAgent._ensure_db_session"), \
-         patch("run_agent._install_safe_stdio"):
+         patch("agent.process_bootstrap._install_safe_stdio"):
 
         agent = AIAgent.__new__(AIAgent)
         agent.valid_tool_names = {"skills_list", "skill_view", "skill_manage"}
@@ -364,7 +364,7 @@ def test_aiagent_build_system_prompt_injects_auto_load(tmp_path):
 
         prompt = agent._build_system_prompt()
 
-    assert "auto-loaded from skills.auto_load config" in prompt
+    assert "auto-loaded via config (skills.auto_load)" in prompt
     assert "buildsys-skill" in prompt
 
 
@@ -374,7 +374,7 @@ def test_aiagent_build_system_prompt_no_auto_load_when_empty(tmp_path):
 
     with patch("agent.skill_commands.resolve_auto_load_skills", return_value=[]), \
          patch("run_agent.AIAgent._ensure_db_session"), \
-         patch("run_agent._install_safe_stdio"):
+         patch("agent.process_bootstrap._install_safe_stdio"):
 
         agent = AIAgent.__new__(AIAgent)
         agent.valid_tool_names = {"skills_list", "skill_view", "skill_manage"}
@@ -395,7 +395,7 @@ def test_aiagent_build_system_prompt_no_auto_load_when_empty(tmp_path):
 
         prompt = agent._build_system_prompt()
 
-    assert "auto-loaded from skills.auto_load config" not in prompt
+    assert "auto-loaded via config (skills.auto_load)" not in prompt
 
 
 def test_aiagent_build_system_prompt_survives_config_errors(tmp_path):
@@ -407,7 +407,7 @@ def test_aiagent_build_system_prompt_survives_config_errors(tmp_path):
         side_effect=RuntimeError("config read failed"),
     ), \
          patch("run_agent.AIAgent._ensure_db_session"), \
-         patch("run_agent._install_safe_stdio"):
+         patch("agent.process_bootstrap._install_safe_stdio"):
 
         agent = AIAgent.__new__(AIAgent)
         agent.valid_tool_names = {"skills_list", "skill_view", "skill_manage"}
