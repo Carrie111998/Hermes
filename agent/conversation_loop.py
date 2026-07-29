@@ -2380,13 +2380,14 @@ def run_conversation(
                                     response_invalid = True
                                     error_details.append("response.output is empty")
                 elif agent.api_mode == "anthropic_messages":
-                    _tv = agent._get_transport()
-                    if not _tv.validate_response(response):
-                        response_invalid = True
-                        if response is None:
-                            error_details.append("response is None")
-                        else:
-                            error_details.append("response.content invalid (not a non-empty list)")
+                    if getattr(response, "id", "") != PARTIAL_STREAM_STUB_ID:
+                        _tv = agent._get_transport()
+                        if not _tv.validate_response(response):
+                            response_invalid = True
+                            if response is None:
+                                error_details.append("response is None")
+                            else:
+                                error_details.append("response.content invalid (not a non-empty list)")
                 elif agent.api_mode == "bedrock_converse":
                     _btv = agent._get_transport()
                     if not _btv.validate_response(response):
@@ -2611,8 +2612,11 @@ def run_conversation(
                     else:
                         finish_reason = "stop"
                 elif agent.api_mode == "anthropic_messages":
-                    _tfr = agent._get_transport()
-                    finish_reason = _tfr.map_finish_reason(response.stop_reason)
+                    if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
+                        finish_reason = response.choices[0].finish_reason
+                    else:
+                        _tfr = agent._get_transport()
+                        finish_reason = _tfr.map_finish_reason(response.stop_reason)
                 elif agent.api_mode == "bedrock_converse":
                     # Bedrock response already normalized at dispatch — use transport
                     _bt_fr = agent._get_transport()
@@ -2736,6 +2740,54 @@ def run_conversation(
                         error_detail=_refusal_text or "model declined (content_filter)",
                     )
 
+                # A stream that delivered content/reasoning or a tool delta
+                # and then lost its terminal frame is not replayable.  The
+                # wrapper marks this response explicitly so the conversation
+                # loop does not turn a preserved partial into a second
+                # provider request (or execute an uncertain tool call).
+                if getattr(response, "_stream_no_retry", False):
+                    _partial_msg = response.choices[0].message
+                    _partial_content = getattr(_partial_msg, "content", None) or ""
+                    _partial_reasoning = (
+                        getattr(_partial_msg, "reasoning_content", None)
+                        or getattr(_partial_msg, "reasoning", None)
+                        or ""
+                    )
+                    if _partial_content or _partial_reasoning:
+                        messages.append(
+                            agent._build_assistant_message(
+                                _partial_msg, finish_reason
+                            )
+                        )
+                    _partial_final = agent._strip_think_blocks(
+                        "".join([
+                            *truncated_response_parts,
+                            _partial_content,
+                        ])
+                    ).strip()
+                    if not _partial_final:
+                        _partial_final = (
+                            "The provider stream ended before completion; "
+                            "no tool was executed."
+                        )
+                    from agent import relay_llm
+
+                    relay_llm.complete_logical_call(
+                        api_request_id,
+                        outcome="failed",
+                    )
+                    agent._cleanup_task_resources(effective_task_id)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _partial_final,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "failed": False,
+                        "error": "network_stream_interrupted_after_partial_response",
+                    }
+
                 if finish_reason == "length":
                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
                         agent._vprint(
@@ -2759,7 +2811,9 @@ def run_conversation(
                     # would have been appended in the non-truncated path.
                     _trunc_msg = None
                     _trunc_transport = agent._get_transport()
-                    if agent.api_mode == "anthropic_messages":
+                    if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
+                        _trunc_result = response.choices[0].message
+                    elif agent.api_mode == "anthropic_messages":
                         _trunc_result = _trunc_transport.normalize_response(
                             response, strip_tool_prefix=agent._is_anthropic_oauth
                         )

@@ -18,6 +18,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
@@ -69,7 +70,7 @@ class TestPartialStreamStubFinishReason:
 
         def _stalling_stream():
             yield _make_stream_chunk(content="Here's my answer so far")
-            raise RuntimeError("simulated upstream stall")
+            raise httpx.RemoteProtocolError("simulated upstream stall")
 
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = lambda *a, **kw: _stalling_stream()
@@ -106,7 +107,7 @@ class TestPartialStreamStubFinishReason:
             yield _make_stream_chunk(tool_calls=[
                 _make_tool_call_delta(index=0, arguments='{"path": "/tmp/x", '),
             ])
-            raise RuntimeError("simulated upstream stall")
+            raise httpx.RemoteProtocolError("simulated upstream stall")
 
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = lambda *a, **kw: _stalling_stream()
@@ -264,6 +265,7 @@ class TestCleanStreamEndMidToolCall:
         assert response.choices[0].finish_reason == FINISH_REASON_LENGTH
         assert response.choices[0].message.content == "Let me compare the vision configs:"
         assert response.choices[0].message.tool_calls is None
+        assert getattr(response, "_stream_no_retry", False) is True
         assert getattr(response, "_dropped_tool_names", None) is None, (
             "Text-only drops must not carry dropped tool names — there "
             "were no tool calls in flight."
@@ -402,6 +404,219 @@ class TestConversationLoopPartialStreamContinuation:
         assert "first half of" in result["final_response"]
         assert "forty-two" in result["final_response"]
 
+    def test_transport_partial_runs_wrapper_to_loop_once(
+        self, loop_agent, monkeypatch,
+    ):
+        """A real ReadError preserves the accumulator without a continuation."""
+        attempts = {"count": 0}
+
+        def _stream():
+            yield _make_stream_chunk(content="Recovered before disconnect")
+            raise httpx.ReadError("incomplete chunked read")
+
+        request_client = MagicMock()
+
+        def _create(*_args, **_kwargs):
+            attempts["count"] += 1
+            return _stream()
+
+        request_client.chat.completions.create.side_effect = _create
+        loop_agent.stream_delta_callback = lambda _text: None
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+
+        with (
+            patch.object(
+                loop_agent,
+                "_create_request_openai_client",
+                return_value=request_client,
+            ),
+            patch.object(loop_agent, "_close_request_openai_client"),
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+            patch("agent.relay_llm.complete_logical_call") as complete_logical,
+        ):
+            result = loop_agent.run_conversation("keep the partial")
+
+        assert attempts["count"] == 1
+        assert result["final_response"] == "Recovered before disconnect"
+        assert result["partial"] is True
+        assert result["failed"] is False
+        assert result["messages"][-1]["finish_reason"] == FINISH_REASON_LENGTH
+        assert result["messages"][-1]["content"] == "Recovered before disconnect"
+        complete_logical.assert_called_once()
+        assert complete_logical.call_args.kwargs == {"outcome": "failed"}
+
+    def test_anthropic_transport_partial_runs_to_loop_once(self, monkeypatch):
+        """The OpenAI-shaped recovery stub bypasses native validation."""
+        from run_agent import AIAgent
+
+        attempts = {"count": 0}
+
+        class _BrokenStream:
+            response = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(
+                    type="content_block_delta",
+                    delta=SimpleNamespace(
+                        type="text_delta",
+                        text="anthropic partial",
+                    ),
+                )
+                raise httpx.ReadError("incomplete chunked read")
+
+        request_client = MagicMock()
+
+        def _make_stream(**_kwargs):
+            attempts["count"] += 1
+            return _BrokenStream()
+
+        request_client.messages.stream.side_effect = _make_stream
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://api.anthropic.com",
+                provider="anthropic",
+                model="claude-test",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+        agent.stream_delta_callback = lambda _text: None
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+
+        with (
+            patch.object(
+                agent,
+                "_create_request_anthropic_client",
+                return_value=request_client,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("keep the partial")
+
+        assert attempts["count"] == 1
+        assert result["partial"] is True
+        assert result["final_response"] == "anthropic partial"
+        assert result["messages"][-1]["finish_reason"] == FINISH_REASON_LENGTH
+        assert "tool_calls" not in result["messages"][-1]
+
+    def test_anthropic_clean_eof_tool_is_not_executed(self, monkeypatch):
+        """A complete-looking tool without stop_reason remains uncertain."""
+        from run_agent import AIAgent
+
+        attempts = {"count": 0}
+
+        class _CleanToolEOF:
+            response = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(
+                    type="content_block_start",
+                    content_block=SimpleNamespace(
+                        type="tool_use",
+                        name="terminal",
+                    ),
+                )
+                yield SimpleNamespace(
+                    type="content_block_delta",
+                    delta=SimpleNamespace(
+                        type="input_json_delta",
+                        partial_json='{"command":"ls"}',
+                    ),
+                )
+
+            def get_final_message(self):
+                return SimpleNamespace(
+                    content=[
+                        SimpleNamespace(
+                            type="tool_use",
+                            id="tool_1",
+                            name="terminal",
+                            input={"command": "ls"},
+                        ),
+                    ],
+                    stop_reason=None,
+                )
+
+        request_client = MagicMock()
+
+        def _make_stream(**_kwargs):
+            attempts["count"] += 1
+            return _CleanToolEOF()
+
+        request_client.messages.stream.side_effect = _make_stream
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://api.anthropic.com",
+                provider="anthropic",
+                model="claude-test",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+
+        with (
+            patch.object(
+                agent,
+                "_create_request_anthropic_client",
+                return_value=request_client,
+            ),
+            patch.object(agent, "_execute_tool_calls") as execute_tools,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("do not replay this tool")
+
+        assert attempts["count"] == 1
+        assert result["partial"] is True
+        assert "tool_calls" not in result["messages"][-1]
+        execute_tools.assert_not_called()
+
 
 class TestContentFilterStallActivatesFallback:
     """Regression for #32421: a provider output-layer content safety filter
@@ -458,6 +673,7 @@ class TestContentFilterStallActivatesFallback:
             "MiniMax new_sensitive stream stall must tag the stub so the loop "
             "can route to fallback (#32421)."
         )
+        assert getattr(response, "_stream_no_retry", False) is False
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
@@ -470,7 +686,7 @@ class TestContentFilterStallActivatesFallback:
 
         def _network_stall():
             yield _make_stream_chunk(content="Writing the file: ")
-            raise RuntimeError("connection reset by peer")
+            raise httpx.RemoteProtocolError("connection reset by peer")
 
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = (
