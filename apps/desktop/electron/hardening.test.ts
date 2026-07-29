@@ -13,11 +13,15 @@ import {
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret,
+  filenameFromContentDisposition,
+  PLUGIN_DOWNLOAD_MAX_BYTES,
   readFileDataUrlForIpc,
   resolveDirectoryForIpc,
+  resolveDownloadCollision,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
+  safeDownloadFilename,
   sensitiveFileBlockReason
 } from './hardening'
 
@@ -351,4 +355,82 @@ test('resolveDirectoryForIpc accepts directory symlinks or junctions', async () 
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true })
   }
+})
+
+test('safeDownloadFilename strips every path escape a server or DB row could inject', () => {
+  // Separators become underscores rather than being dropped, so the name stays
+  // recognisable and can never address a parent directory. The leading-dot
+  // strip then runs on the result, so a leading '..' loses its dots too.
+  assert.equal(safeDownloadFilename('../../etc/passwd'), '_.._etc_passwd')
+  assert.equal(safeDownloadFilename('..\\..\\Windows\\System32\\cfg'), '_.._Windows_System32_cfg')
+  assert.equal(safeDownloadFilename('/absolute/path.txt'), '_absolute_path.txt')
+
+  // Bare traversal tokens and dotfile-forcing prefixes carry no usable name.
+  assert.equal(safeDownloadFilename('..'), 'download')
+  assert.equal(safeDownloadFilename('.'), 'download')
+  assert.equal(safeDownloadFilename('...'), 'download')
+  assert.equal(safeDownloadFilename('.hidden'), 'hidden')
+
+  // Empty / missing / NUL-poisoned input falls back instead of throwing.
+  assert.equal(safeDownloadFilename(''), 'download')
+  assert.equal(safeDownloadFilename(null), 'download')
+  assert.equal(safeDownloadFilename('a\0b.txt'), 'ab.txt')
+  assert.equal(safeDownloadFilename('', 'fallback.bin'), 'fallback.bin')
+
+  // An ordinary name survives untouched.
+  assert.equal(safeDownloadFilename('report 2026.pdf'), 'report 2026.pdf')
+})
+
+test('filenameFromContentDisposition prefers RFC 5987 and sanitizes both forms', () => {
+  assert.equal(filenameFromContentDisposition('attachment; filename="notes.txt"'), 'notes.txt')
+  assert.equal(filenameFromContentDisposition('attachment; filename=notes.txt'), 'notes.txt')
+
+  // filename* wins when both are present, and percent-decoding is applied.
+  assert.equal(
+    filenameFromContentDisposition("attachment; filename=\"fallback.txt\"; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf"),
+    'résumé.pdf'
+  )
+
+  // A traversal smuggled through either form is still neutralized.
+  assert.equal(filenameFromContentDisposition('attachment; filename="../../evil.sh"'), '_.._evil.sh')
+  assert.equal(filenameFromContentDisposition("attachment; filename*=UTF-8''%2e%2e%2f%2e%2e%2fevil.sh"), '_.._evil.sh')
+
+  // Malformed percent-encoding falls back to the plain form rather than throwing.
+  assert.equal(filenameFromContentDisposition("attachment; filename=\"ok.txt\"; filename*=UTF-8''%E0%A4%A"), 'ok.txt')
+
+  // No header, or no filename in it, yields empty so the caller can fall back.
+  assert.equal(filenameFromContentDisposition('attachment'), '')
+  assert.equal(filenameFromContentDisposition(''), '')
+  assert.equal(filenameFromContentDisposition(null), '')
+})
+
+test('resolveDownloadCollision suffixes before the extension and never clobbers', () => {
+  const dir = path.join(os.tmpdir(), 'dl')
+  const taken = new Set([path.join(dir, 'a.txt'), path.join(dir, 'a (1).txt')])
+  const exists = (candidate: string) => taken.has(candidate)
+
+  // A free name is returned untouched.
+  assert.equal(resolveDownloadCollision(path.join(dir, 'free.txt'), exists), path.join(dir, 'free.txt'))
+
+  // Occupied names walk forward past every taken index.
+  assert.equal(resolveDownloadCollision(path.join(dir, 'a.txt'), exists), path.join(dir, 'a (2).txt'))
+
+  // The suffix goes before the extension so the file still opens correctly,
+  // including for multi-dot names.
+  const archive = path.join(dir, 'bundle.tar.gz')
+  assert.equal(resolveDownloadCollision(archive, c => c === archive), path.join(dir, 'bundle.tar (1).gz'))
+
+  // A leading-dot file is all name, no extension.
+  const dotfile = path.join(dir, '.gitignore')
+  assert.equal(resolveDownloadCollision(dotfile, c => c === dotfile), path.join(dir, '.gitignore (1)'))
+
+  // An exhausted range raises instead of spinning forever.
+  assert.throws(() => resolveDownloadCollision(path.join(dir, 'x.txt'), () => true, 3), /after 3 attempts/)
+})
+
+test('the plugin download cap matches the backend attachment limit', () => {
+  // A blob the backend refused to accept can't come back down, so the ceiling
+  // tracks KANBAN_ATTACHMENT_MAX_BYTES rather than drifting on its own.
+  assert.equal(PLUGIN_DOWNLOAD_MAX_BYTES, 25 * 1024 * 1024)
+  assert.ok(PLUGIN_DOWNLOAD_MAX_BYTES < ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES)
 })
