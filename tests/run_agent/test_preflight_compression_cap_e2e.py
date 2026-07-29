@@ -23,6 +23,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from agent.conversation_loop import _context_admission_input_limit
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -147,3 +150,113 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
     assert len(compress_calls) == 6
 
 
+@pytest.mark.parametrize(
+    ("context_limit", "output_reserve", "expected"),
+    [
+        (272_000, 0, 267_904),
+        (200_000, 10_000, 190_000),
+        (32_000, 0, 31_488),
+        (0, 0, 0),
+    ],
+)
+def test_context_admission_limit(context_limit, output_reserve, expected):
+    assert _context_admission_input_limit(
+        context_limit,
+        reserved_output_tokens=output_reserve,
+    ) == expected
+
+
+def test_pre_provider_admission_blocks_uncompressible_request(monkeypatch, tmp_path):
+    agent = _make_agent(monkeypatch, tmp_path, max_attempts=3)
+    agent.context_compressor.context_length = 200_000
+    agent.max_tokens = 0
+    safe_limit = _context_admission_input_limit(200_000)
+
+    with (
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=safe_limit,
+        ),
+        patch.object(
+            agent,
+            "_interruptible_api_call",
+            side_effect=AssertionError("provider call must remain local"),
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is False
+    assert result["provider_call_blocked"] is True
+    assert result["api_calls"] == 0
+    assert result["safe_input_limit"] == safe_limit
+
+
+def test_safe_boundary_overrides_preflight_deferral(monkeypatch, tmp_path):
+    agent = _make_agent(monkeypatch, tmp_path, max_attempts=3)
+    compressor = agent.context_compressor
+    compressor.context_length = 200_000
+    compressor.threshold_tokens = 100_000
+    agent.max_tokens = 0
+    safe_limit = _context_admission_input_limit(200_000)
+    defer = MagicMock(return_value=True)
+    compressor.should_defer_preflight_to_real_usage = defer
+    compress_calls = []
+
+    def _fake_compress(messages, system_message, **_kwargs):
+        compress_calls.append(len(messages))
+        return messages, system_message
+
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+        for i in range(40)
+    ]
+
+    with (
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=safe_limit,
+        ),
+        patch.object(agent, "_compress_context", side_effect=_fake_compress),
+        patch.object(
+            agent,
+            "_interruptible_api_call",
+            side_effect=AssertionError("provider call must remain local"),
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello", conversation_history=history)
+
+    assert len(compress_calls) == 1
+    # The turn-start estimator may consult deferral for its small real input;
+    # the oversized loop request must not.
+    assert all(call.args[0] < safe_limit for call in defer.call_args_list)
+    assert result["provider_call_blocked"] is True
+
+
+def test_request_below_safe_boundary_reaches_provider(monkeypatch, tmp_path):
+    agent = _make_agent(monkeypatch, tmp_path, max_attempts=3)
+    agent.context_compressor.context_length = 200_000
+    agent.max_tokens = 0
+    safe_limit = _context_admission_input_limit(200_000)
+
+    with (
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=safe_limit - 1,
+        ),
+        patch.object(
+            agent,
+            "_interruptible_api_call",
+            return_value=_stop_response(),
+        ) as provider_call,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    provider_call.assert_called_once()

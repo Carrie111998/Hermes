@@ -88,6 +88,35 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+_CONTEXT_ADMISSION_MARGIN_MIN = 512
+_CONTEXT_ADMISSION_MARGIN_MAX = 4096
+_CONTEXT_ADMISSION_MARGIN_DIVISOR = 64
+
+
+def _context_admission_input_limit(
+    context_limit: int,
+    *,
+    reserved_output_tokens: int = 0,
+) -> int:
+    """Return a conservative pre-provider input ceiling."""
+    try:
+        limit = int(context_limit or 0)
+    except (TypeError, ValueError):
+        return 0
+    if limit <= 0:
+        return 0
+
+    try:
+        output_reserve = max(0, int(reserved_output_tokens or 0))
+    except (TypeError, ValueError):
+        output_reserve = 0
+
+    estimator_margin = min(
+        _CONTEXT_ADMISSION_MARGIN_MAX,
+        max(_CONTEXT_ADMISSION_MARGIN_MIN, limit // _CONTEXT_ADMISSION_MARGIN_DIVISOR),
+    )
+    return max(1, limit - max(estimator_margin, output_reserve))
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -1796,6 +1825,17 @@ def run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
+        _configured_context_limit = int(
+            getattr(_compressor, "context_length", 0) or 0
+        )
+        _safe_input_limit = _context_admission_input_limit(
+            _configured_context_limit,
+            reserved_output_tokens=getattr(agent, "max_tokens", 0),
+        )
+        _request_over_safe_limit = (
+            _safe_input_limit > 0
+            and request_pressure_tokens >= _safe_input_limit
+        )
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
         )
@@ -1833,12 +1873,17 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        _preflight_deferred = False
+        if not _request_over_safe_limit:
+            _preflight_deferred = bool(
+                _defer_preflight(request_pressure_tokens)
+            )
         if (
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
+            and not _preflight_deferred
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
         ):
@@ -1898,9 +1943,9 @@ def run_conversation(
                 # attempt (it must not burn the shared overflow-recovery
                 # budget toward compression_exhausted → gateway auto-reset,
                 # #9893/#35809) and leave the insufficient-progress blocker
-                # unarmed. Proceed with the current request: if it truly does
-                # not fit, the provider's 413/overflow handler returns the
-                # soft compression_deferred result with that stronger signal.
+                # unarmed. Requests below the safe admission boundary may
+                # proceed for a stronger provider signal; oversized requests
+                # are blocked by the final local gate below.
                 compression_attempts -= 1
                 _last_preflight_pressure = None
                 if pending_moa_prepared_request is _moa_prepared_request:
@@ -1934,7 +1979,7 @@ def run_conversation(
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
-            and not _defer_preflight(request_pressure_tokens)
+            and not _preflight_deferred
             and _compression_cooldown
         ):
             # Blocked by the summary-LLM cooldown. Surface a deduped warning
@@ -1956,6 +2001,42 @@ def run_conversation(
                     request_pressure_tokens,
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
+
+        # Compression above is the remediation path. If it was unavailable,
+        # exhausted, or made insufficient progress, do not dispatch a request
+        # that is already at the configured context boundary.
+        if _request_over_safe_limit:
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            logger.error(
+                "Blocking provider call above safe input limit: "
+                "estimated_input=%s safe_input_limit=%s configured_context=%s "
+                "compression_attempts=%s/%s model=%s session=%s",
+                request_pressure_tokens,
+                _safe_input_limit,
+                _configured_context_limit,
+                compression_attempts,
+                max_compression_attempts,
+                agent.model,
+                agent.session_id,
+            )
+            return {
+                "final_response": (
+                    "Request remains above the configured safe input limit after "
+                    "available context compression. Provider call blocked locally."
+                ),
+                "messages": messages,
+                "completed": False,
+                "api_calls": api_call_count,
+                "provider_call_blocked": True,
+                "estimated_input_tokens": request_pressure_tokens,
+                "safe_input_limit": _safe_input_limit,
+                "configured_context_limit": _configured_context_limit,
+            }
         
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
