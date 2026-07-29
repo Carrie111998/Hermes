@@ -7946,6 +7946,8 @@ class DiscordAdapter(BasePlatformAdapter):
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
+            if self._pending_text_batch_tasks.get(key) is not current_task:
+                return
             event = self._pending_text_batches.pop(key, None)
             if not event:
                 return
@@ -7961,7 +7963,10 @@ class DiscordAdapter(BasePlatformAdapter):
             # into handle_message → the agent's streaming request,
             # aborting the response the user was waiting on.  The new
             # chunk is handled by the fresh flush task regardless.
-            await asyncio.shield(self.handle_message(event))
+            from gateway.platforms.helpers import dispatch_text_batch_safely
+            await dispatch_text_batch_safely(
+                self.handle_message, event, self._pending_text_batch_tasks, key
+            )
         except asyncio.CancelledError:
             # Only reached if cancel landed before the pop — the shielded
             # handle_message is unaffected either way.  Let the task exit

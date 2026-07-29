@@ -1,0 +1,29 @@
+filesystem.read:
+  sources:
+    - hermes:search_files
+    - hermes:read_file
+    - codex:read_file
+
+filesystem.write:
+  sources:
+    - hermes:write_file
+    - hermes:patch
+    - codex:apply_patch
+
+execution.command:
+  sources:
+    - hermes:terminal
+    - codex:terminal
+    - codex:shell
+
+execution.code:
+  sources:
+    - hermes:execute_code
+
+memory.read:
+  sources:
+    - hermes:memory_read
+
+memory.write:
+  sources:
+    - hermes:memory_write

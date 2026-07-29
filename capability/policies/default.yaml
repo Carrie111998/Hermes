@@ -1,0 +1,26 @@
+filesystem.read:
+  decision: ALLOW
+
+filesystem.write:
+  decision: APPROVAL_REQUIRED
+
+execution.code:
+  decision: APPROVAL_REQUIRED
+
+docker.restart:
+  decision: DENY
+
+memory.read:
+  decision: ALLOW
+
+memory.write:
+  decision: APPROVAL_REQUIRED
+
+skill.read:
+  decision: ALLOW
+
+task.manage:
+  decision: APPROVAL_REQUIRED
+
+agent.delegate:
+  decision: APPROVAL_REQUIRED

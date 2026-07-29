@@ -1,0 +1,41 @@
+search_files:
+  capability: filesystem.read
+
+read_file:
+  capability: filesystem.read
+
+write_file:
+  capability: filesystem.write
+
+terminal:
+  capability: execution.command
+
+execute_code:
+  capability: execution.code
+
+docker_inspect:
+  capability: docker.inspect
+
+docker_restart:
+  capability: docker.restart
+
+memory_search:
+  capability: memory.read
+
+memory_write:
+  capability: memory.write
+
+skill_view:
+  capability: skill.read
+
+session_search:
+  capability: memory.read
+
+memory:
+  capability: memory.write
+
+todo:
+  capability: task.manage
+
+delegate_task:
+  capability: agent.delegate

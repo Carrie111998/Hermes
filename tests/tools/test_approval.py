@@ -1599,6 +1599,77 @@ class TestHeredocScriptExecution:
         assert dangerous is False
 
 
+class TestStrictReadOnlyPythonInline:
+    """Known local read-only Python snippets do not need script-form approval."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python3 -c \"from pathlib import Path; print(Path('/tmp/report.md').read_text())\"",
+            "python3 -c \"import openpyxl; print(openpyxl.load_workbook('/tmp/report.xlsx', read_only=True).sheetnames)\"",
+            "python3 -c \"import sqlite3; print(sqlite3.connect('file:/tmp/report.db?mode=ro', uri=True).execute('SELECT 1').fetchall())\"",
+            "python3 -c \"import yaml; from pathlib import Path; print(yaml.safe_load(Path('/tmp/report.yaml').read_text()))\"",
+            "python3 -c \"import hashlib; from pathlib import Path; print(hashlib.sha256(Path('/tmp/report.bin').read_bytes()).hexdigest())\"",
+            "python3 <<'PY'\nfrom pathlib import Path\nprint(Path('/tmp/report.md').read_text())\nPY",
+            "python3 -c \"import extract_msg; msg = extract_msg.Message('/tmp/zulip-attach-report.msg'); print(msg.subject, msg.sender, msg.body, msg.date)\"",
+            "python3 -c \"import fitz; doc = fitz.open('/tmp/report.pdf'); print(doc.metadata); print(doc[0].get_text('text'))\"",
+            "python3 -c \"from pypdf import PdfReader; reader = PdfReader('/tmp/report.pdf'); print(reader.metadata); print(reader.pages[0].extract_text())\"",
+            "python3 -c \"import json; from pathlib import Path; print(json.loads(Path('/tmp/report.json').read_text()))\"",
+            "python3 -c \"import openpyxl; print(openpyxl.load_workbook('/home/ai/.hermes/cache/documents/report.xlsx', data_only=True).sheetnames)\"",
+            "python3 -c \"import extract_msg; msg = extract_msg.Message('/home/ai/.hermes/cache/documents/report.msg'); print(msg.subject)\"",
+            "python3 <<'PY'\nfrom decimal import Decimal\nprint(Decimal('1.2') + Decimal('3.4'))\nPY",
+            "python3 - <<'PY'\nfrom pathlib import Path\nimport extract_msg, json\npaths = [\n    '/tmp/zulip-attach-first.msg',\n    '/tmp/zulip-attach-second.msg',\n]\nfor path in paths:\n    msg = extract_msg.Message(path)\n    print(msg.subject, msg.sender, msg.body, msg.date)\nPY",
+        ],
+    )
+    def test_known_read_only_python_is_not_flagged(self, command):
+        dangerous, _, _ = detect_dangerous_command(command)
+        assert dangerous is False
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python3 -c \"import os; os.remove('/tmp/report')\"",
+            "python3 -c \"from pathlib import Path; Path('/tmp/report').write_text('changed')\"",
+            "python3 -c \"open('/tmp/report', 'w').write('changed')\"",
+            "python3 -c \"import subprocess; subprocess.run(['id'])\"",
+            "python3 -c \"import requests; requests.get('https://example.com')\"",
+            "python3 -c \"eval('1 + 1')\"",
+            "python3 -c \"import os; os.chmod('/tmp/report', 0o600)\"",
+            "python3 -c \"from pathlib import Path; print(Path('/home/ai/.ssh/id_rsa').read_text())\"",
+            "python3 <<'PY'\nfrom pathlib import Path\nPath('/tmp/report').write_text('changed')\nPY",
+            "python3 -c \"import extract_msg; extract_msg.Message('/tmp/report.msg').save('/tmp/output')\"",
+            "python3 -c \"import extract_msg; msg = extract_msg.Message('/tmp/report.msg'); msg.attachments[0].save('/tmp/output')\"",
+            "python3 -c \"import fitz; fitz.open('/tmp/report.pdf').save('/tmp/output.pdf')\"",
+            "python3 -c \"import pypdf; writer = pypdf.PdfWriter(); print(writer)\"",
+            "python3 -c \"import fitz; fitz.open('/home/ai/.ssh/id_rsa')\"",
+            "python3 -c \"import fitz; path = '/tmp/report.pdf'; fitz.open(path)\"",
+            "python3 -c \"import fitz; fitz.open('https://example.com/report.pdf')\"",
+            "python3 -c \"import extract_msg; msg = extract_msg.Message('/tmp/report.msg'); print(msg.attachments)\"",
+            "python3 -c \"import extract_msg; msg = extract_msg.Message('/tmp/report.msg'); print(msg.subject)\"",
+            "python3 -c \"import extract_msg; msg = extract_msg.Message('/tmp/zulip-attach-../secret.msg'); print(msg.subject)\"",
+            "python3 -c \"import extract_msg; msg = extract_msg.Message('/tmp/./zulip-attach-report.msg'); print(msg.subject)\"",
+            "python3 <<'PY'\nimport extract_msg\npath = input()\nmsg = extract_msg.Message(path)\nprint(msg.subject)\nPY",
+            "python3 <<'PY'\nfrom pathlib import Path\nimport extract_msg, json\npaths = json.loads(Path('/tmp/paths.json').read_text())\nfor path in paths:\n    msg = extract_msg.Message(path)\n    print(msg.subject)\nPY",
+            "python3 <<'PY'\nimport extract_msg\npaths = ['/tmp/zulip-attach-ok.msg', '/tmp/arbitrary.msg']\nfor path in paths:\n    msg = extract_msg.Message(path)\n    print(msg.subject)\nPY",
+            "python3 <<'PY'\nimport extract_msg\npaths = ['/tmp/zulip-attach-ok.msg']\npaths[0] = '/tmp/arbitrary.msg'\nfor path in paths:\n    msg = extract_msg.Message(path)\n    print(msg.subject)\nPY",
+            "python3 <<'PY'\nfrom pathlib import Path\nimport extract_msg, json\npaths = ['/tmp/zulip-attach-ok.msg']\n(paths := json.loads(Path('/tmp/paths.json').read_text()))\nfor path in paths:\n    msg = extract_msg.Message(path)\n    print(msg.subject)\nPY",
+            "python3 -c \"import fitz; doc = fitz.open('/tmp/report.pdf'); print(doc.is_dirty)\"",
+            "python3 -c \"from pypdf import PdfReader; reader = PdfReader('/tmp/report.pdf'); print(reader.outline)\"",
+            "python3 -c \"from decimal import Decimal; Decimal = eval; Decimal('1 + 1')\"",
+            "python3 -c \"from decimal import Decimal; print = eval; Decimal('1'); print('1 + 1')\"",
+            "python3 -c \"import hashlib; hashlib.sha256 = eval; hashlib.sha256('1 + 1')\"",
+            "python3 -c \"from pathlib import Path; Path.read_text = print; print(Path('/tmp/report').read_text())\"",
+            "python3 -c \"from decimal import Decimal as print; print('1.2')\"",
+            "python3 <<'PY'\nfrom decimal import Decimal\nfor Decimal in [eval]:\n    Decimal('1 + 1')\nPY",
+            "python3 -c \"from decimal import Decimal; values = [Decimal('1')]; values[0] = eval; print(values[0]('1 + 1'))\"",
+            "python3 -c \"from decimal import Decimal; (Decimal := eval)('1 + 1')\"",
+        ],
+    )
+    def test_python_with_side_effect_or_sensitive_read_stays_flagged(self, command):
+        dangerous, _, _ = detect_dangerous_command(command)
+        assert dangerous is True
+
+
 class TestPgrepKillExpansion:
     """kill -9 $(pgrep hermes) bypasses the pkill/killall name-matching
     pattern because the command substitution is opaque to regex.

@@ -1317,6 +1317,33 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     ws_client_module.loop = loop
     adapter._ws_thread_loop = loop
 
+    # The SDK creates its receive loop with ``loop.create_task`` and keeps no
+    # reference to it.  A normal CLOSE frame can therefore finish that task
+    # with ConnectionClosedOK before our final ``asyncio.all_tasks`` sweep;
+    # completed tasks are absent from all_tasks(), so asyncio later reports
+    # "Task exception was never retrieved" during an otherwise clean stop.
+    # Keep strong references to every SDK-loop task until teardown and observe
+    # completed exceptions after pending tasks have been cancelled/gathered.
+    tracked_tasks: set[asyncio.Task] = set()
+    previous_task_factory = loop.get_task_factory()
+
+    def _tracking_task_factory(
+        task_loop: asyncio.AbstractEventLoop,
+        coro: Any,
+        context: Any = None,
+    ) -> asyncio.Task:
+        if previous_task_factory is None:
+            task = asyncio.Task(coro, loop=task_loop, context=context)
+        else:
+            try:
+                task = previous_task_factory(task_loop, coro, context=context)
+            except TypeError:
+                task = previous_task_factory(task_loop, coro)
+        tracked_tasks.add(task)
+        return task
+
+    loop.set_task_factory(_tracking_task_factory)
+
     original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
 
@@ -1360,6 +1387,16 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
             task.cancel()
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        for task in tracked_tasks:
+            if task.done() and not task.cancelled():
+                try:
+                    task.exception()
+                except Exception:
+                    # Retrieving is sufficient: the SDK already logged the
+                    # operational failure at its source.  This prevents a
+                    # second, misleading asyncio teardown warning.
+                    pass
+        loop.set_task_factory(previous_task_factory)
         try:
             loop.stop()
         except Exception:
@@ -3769,6 +3806,8 @@ class FeishuAdapter(BasePlatformAdapter):
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
+            if self._pending_text_batch_tasks.get(key) is not current_task:
+                return
             await self._flush_text_batch_now(key)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
@@ -3785,7 +3824,13 @@ class FeishuAdapter(BasePlatformAdapter):
             key,
             len(event.text or ""),
         )
-        await self._handle_message_with_guards(event)
+        from gateway.platforms.helpers import dispatch_text_batch_safely
+        await dispatch_text_batch_safely(
+            self._handle_message_with_guards,
+            event,
+            self._pending_text_batch_tasks,
+            key,
+        )
 
     # =========================================================================
     # Message content extraction and resource download

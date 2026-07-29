@@ -207,6 +207,7 @@ class LSPClient:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
+        self._dispatch_tasks: Set[asyncio.Task] = set()
 
         # Request/response correlation
         self._next_id: int = 0
@@ -360,7 +361,7 @@ class LSPClient:
                 if kind == "response":
                     self._dispatch_response(key, msg)
                 elif kind == "request":
-                    asyncio.create_task(self._dispatch_request(key, msg))
+                    self._start_dispatch_request(key, msg)
                 elif kind == "notification":
                     self._dispatch_notification(key, msg)
                 else:
@@ -480,6 +481,13 @@ class LSPClient:
                 await self._reader_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        dispatch_tasks = list(self._dispatch_tasks)
+        for task in dispatch_tasks:
+            if not task.done():
+                task.cancel()
+        if dispatch_tasks:
+            await asyncio.gather(*dispatch_tasks, return_exceptions=True)
+        self._dispatch_tasks.clear()
         if self._stderr_task is not None and not self._stderr_task.done():
             self._stderr_task.cancel()
             try:
@@ -585,6 +593,14 @@ class LSPClient:
             )
         else:
             fut.set_result(msg.get("result"))
+
+    def _start_dispatch_request(self, req_id: Any, msg: dict) -> None:
+        task = asyncio.create_task(
+            self._dispatch_request(req_id, msg),
+            name=f"lsp-{self.server_id}-request-{req_id}",
+        )
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(self._dispatch_tasks.discard)
 
     async def _dispatch_request(self, req_id: Any, msg: dict) -> None:
         method = msg.get("method", "")

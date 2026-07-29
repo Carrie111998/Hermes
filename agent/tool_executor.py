@@ -479,6 +479,16 @@ def _run_agent_tool_execution_middleware(
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
+        try:
+            from capability.shadow_hook import observe_tool_call
+
+            observe_tool_call(function_name=function_name)
+        except Exception:
+            logger.debug(
+                "capability shadow observation failed",
+                exc_info=True,
+            )
+
         _advance_start_order(_begin)
         return execute(final_args)
 

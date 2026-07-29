@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.config import GatewayConfig, HomeChannel, Platform, _apply_env_overrides
+from gateway.config import GatewayConfig, HomeChannel, Platform, _apply_env_overrides, load_gateway_config
 from gateway.platforms.base import SendResult
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms import weixin
@@ -247,6 +247,56 @@ class TestWeixinConfig:
         assert platform_config.extra["split_multiline_messages"] == "true"
         assert platform_config.extra["allow_from"] == "wxid_1,wxid_2"
         assert platform_config.home_channel == HomeChannel(Platform.WEIXIN, "wxid_1", "Primary DM")
+
+    def test_explicit_top_level_enabled_false_wins_over_env_credentials(
+        self, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "weixin:\n"
+            "  enabled: false\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("WEIXIN_TOKEN", "bot-token")
+        monkeypatch.setenv("WEIXIN_ACCOUNT_ID", "bot-account")
+
+        config = load_gateway_config()
+
+        platform_config = config.platforms[Platform.WEIXIN]
+        assert platform_config.enabled is False
+        assert platform_config.token == "bot-token"
+        assert platform_config.extra["account_id"] == "bot-account"
+        assert "_enabled_explicit" not in platform_config.extra
+
+    def test_explicit_nested_enabled_false_wins_over_env_credentials(
+        self, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  weixin:\n"
+            "    enabled: false\n"
+            "    extra:\n"
+            "      dm_policy: allowlist\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("WEIXIN_TOKEN", "bot-token")
+        monkeypatch.setenv("WEIXIN_ACCOUNT_ID", "bot-account")
+
+        config = load_gateway_config()
+
+        platform_config = config.platforms[Platform.WEIXIN]
+        assert platform_config.enabled is False
+        assert platform_config.token == "bot-token"
+        assert platform_config.extra["account_id"] == "bot-account"
+        assert platform_config.extra["dm_policy"] == "allowlist"
+        assert "_enabled_explicit" not in platform_config.extra
 
     def test_get_connected_platforms_includes_weixin_with_token(self):
         config = GatewayConfig(

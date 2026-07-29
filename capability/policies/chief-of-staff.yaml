@@ -1,0 +1,11 @@
+filesystem.read:
+  decision: ALLOW
+
+memory.read:
+  decision: ALLOW
+
+memory.write:
+  decision: APPROVAL_REQUIRED
+
+execution.code:
+  decision: APPROVAL_REQUIRED

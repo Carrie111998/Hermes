@@ -534,6 +534,23 @@ class TestResolveDeliveryTarget:
 class TestRoutingIntents:
     """``all`` routing intent expands at fire time."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_home_targets(self, monkeypatch):
+        """Start each routing-intent test with no inherited home channels."""
+        from cron import scheduler
+
+        for platform in scheduler._iter_home_target_platforms():
+            env_var = scheduler._resolve_home_env_var(platform)
+            if not env_var:
+                continue
+            monkeypatch.delenv(env_var, raising=False)
+            monkeypatch.delenv(f"{env_var}_THREAD_ID", raising=False)
+            legacy = scheduler._LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
+            if legacy:
+                monkeypatch.delenv(legacy, raising=False)
+                monkeypatch.delenv(f"{legacy}_THREAD_ID", raising=False)
+        monkeypatch.delenv("TELEGRAM_CRON_THREAD_ID", raising=False)
+
     def test_all_expands_to_every_connected_home_channel(self, monkeypatch):
         """deliver='all' fans out to every platform with a configured home channel."""
         from cron.scheduler import _resolve_delivery_targets
@@ -670,10 +687,11 @@ class TestDeliverResultWrapping:
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "Cronjob Response: daily-report" in sent_content
-        assert "(job_id: test-job)" in sent_content
+        assert "job_id: test-job" in sent_content
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
-        assert "To stop or manage this job" in sent_content
+        assert "要管理此任务" in sent_content
+        assert '"stop daily-report"' in sent_content
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""

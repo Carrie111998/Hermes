@@ -7,11 +7,13 @@ pyright/gopls/etc. are still alive on the host.
 from __future__ import annotations
 
 import atexit
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
 
 from agent import lsp as lsp_module
+from agent.lsp.client import LSPClient
 
 
 @pytest.fixture(autouse=True)
@@ -142,3 +144,38 @@ def test_get_service_returns_none_when_create_fails(monkeypatch):
     monkeypatch.setattr(atexit, "register", lambda fn: None)
 
     assert lsp_module.get_service() is None
+
+
+def test_client_cleanup_cancels_server_request_dispatch_tasks():
+    async def scenario():
+        client = LSPClient(
+            server_id="dispatch-cleanup",
+            workspace_root=".",
+            command=["unused"],
+        )
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked_handler(params):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        client._request_handlers["test/blocked"] = blocked_handler
+        client._start_dispatch_request(
+            7,
+            {"method": "test/blocked", "params": {}},
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        dispatch_task = next(iter(client._dispatch_tasks))
+
+        await asyncio.wait_for(client._cleanup_process(), timeout=1.0)
+
+        assert dispatch_task.cancelled()
+        assert cancelled.is_set()
+        assert client._dispatch_tasks == set()
+
+    asyncio.run(scenario())
