@@ -39,6 +39,7 @@ from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
+from agent.message_sanitization import apply_reasoning_content_policy, reapply_reasoning_echo
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -3337,8 +3338,6 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
     ``agent.message_sanitization.apply_reasoning_content_policy`` (audit F4);
     this only supplies the agent's cached provider-direction flag.
     """
-    from agent.message_sanitization import apply_reasoning_content_policy
-
     apply_reasoning_content_policy(
         source_msg, api_msg, agent._needs_thinking_reasoning_pad()
     )
@@ -3373,8 +3372,6 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     Returns the number of assistant turns whose reasoning_content was added or
     removed.
     """
-    from agent.message_sanitization import reapply_reasoning_echo
-
     return reapply_reasoning_echo(
         api_messages, agent._needs_thinking_reasoning_pad()
     )
