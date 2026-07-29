@@ -463,6 +463,16 @@ def _validate_cron_base_url(
     bu = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
     if not bu:
         return None
+    # Allow localhost/loopback URLs — traffic stays on-machine and cannot
+    # exfiltrate a stored credential (CWE-200/CWE-522). This covers local
+    # Ollama, llama.cpp, vLLM, and other endpoints at 127.0.0.1, localhost,
+    # or IPv6 ::1.  Must import base_url_hostname here (before the later try
+    # block imports it) so the inline localhost check can reference it.
+    from utils import base_url_hostname as _bu_hostname
+    _LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "::1"}
+    if _bu_hostname(bu) in _LOCALHOST_HOSTS:
+        return None
+
     prov = _normalize_optional_job_value(provider)
     if not prov:
         # A base_url with no explicit provider inherits the default/session

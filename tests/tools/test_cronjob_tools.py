@@ -704,3 +704,26 @@ class TestValidateCronBaseUrl:
 
     def test_base_url_without_provider_rejected(self):
         assert self._v(None, "https://x.example/v1") is not None
+    def test_localhost_127_allowed_with_any_provider(self):
+        # localhost loopback cannot exfiltrate — always safe.
+        assert self._v("ollama", "http://127.0.0.1:11434/v1") is None
+        assert self._v("ollama", "https://127.0.0.1:11434/v1") is None
+
+    def test_localhost_hostname_allowed_with_any_provider(self):
+        assert self._v("ollama", "http://localhost:11434/v1") is None
+
+    def test_localhost_ipv6_allowed_with_any_provider(self):
+        assert self._v("ollama", "http://[::1]:11434/v1") is None
+
+    def test_localhost_allowed_without_provider(self):
+        # Even without a provider, localhost is safe — no exfiltration risk.
+        assert self._v(None, "http://127.0.0.1:11434/v1") is None
+        assert self._v(None, "http://localhost:11434/v1") is None
+
+    def test_localhost_allowed_with_named_registry_provider(self):
+        # Anthropic + localhost is safe — data stays on-machine.
+        assert self._v("anthropic", "http://127.0.0.1:8080/v1") is None
+
+    def test_offhost_still_blocked_for_named_providers(self):
+        # Non-localhost off-host URLs must still be blocked.
+        assert self._v("anthropic", "https://evil.example/v1") is not None
