@@ -1796,7 +1796,7 @@ class GatewaySlashCommandsMixin:
         """
         from gateway.run import _hermes_home, _load_gateway_config
         from hermes_cli.model_switch import (
-            switch_model as _switch_model, parse_model_flags_detailed,
+            switch_model as _switch_model, parse_model_switch_args,
             resolve_persist_behavior,
             list_authenticated_providers,
             list_picker_providers,
@@ -1826,18 +1826,18 @@ class GatewaySlashCommandsMixin:
             one_turn = False
             persist_global = False
         else:
-            # Parse --provider, --global, --session, --once, and --refresh flags.
-            parsed_flags = parse_model_flags_detailed(raw_args)
-            model_input = parsed_flags.model_input
-            explicit_provider = parsed_flags.explicit_provider
-            is_global_flag = parsed_flags.is_global
-            force_refresh = parsed_flags.force_refresh
-            is_session = parsed_flags.is_session
-            one_turn = parsed_flags.is_once
-            if is_global_flag and one_turn:
-                return "❌ /model --once cannot be combined with --global"
-            if one_turn and not model_input and not explicit_provider:
-                return "❌ /model --once requires a model or provider."
+            # Parse --provider, --global, --session, --once, and --refresh flags
+            # via the shared single-owner parser (hermes_cli.model_switch).
+            request = parse_model_switch_args(raw_args)
+            model_input = request.target
+            explicit_provider = request.explicit_provider
+            is_global_flag = request.is_global
+            force_refresh = request.force_refresh
+            is_session = request.is_session
+            one_turn = request.is_once
+            if request.errors:
+                # Gateway decoration: "❌ " prefix over the canonical error copy.
+                return f"❌ {request.error_messages()[0]}"
             persist_global = resolve_persist_behavior(
                 is_global_flag,
                 is_session,
@@ -3232,14 +3232,13 @@ class GatewaySlashCommandsMixin:
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
         and their interactive pickers)."""
-        import yaml
         from gateway.run import _hermes_home
+        from hermes_cli.config import read_user_config_raw
         config_path = _hermes_home / "config.yaml"
         try:
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
+            # Write-back round-trip: raw read is correct (merged defaults must
+            # not be persisted back to the user's file).
+            user_config = read_user_config_raw(config_path)
             keys = key_path.split(".")
             current = user_config
             for k in keys[:-1]:
@@ -3488,11 +3487,10 @@ class GatewaySlashCommandsMixin:
         config_path = _hermes_home / "config.yaml"
 
         def _set_approval(enabled: bool):
-            import yaml
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
+            # Write-back round-trip: raw read is correct (merged defaults must
+            # not be persisted back to the user's file).
+            from hermes_cli.config import read_user_config_raw
+            user_config = read_user_config_raw(config_path)
             user_config.setdefault("memory", {})["write_approval"] = bool(enabled)
             atomic_config_write(config_path, user_config)
             # New setting must take effect next message → drop cached agent.
@@ -3544,11 +3542,10 @@ class GatewaySlashCommandsMixin:
                     "writes here with /skills pending.")
 
         def _set_approval(enabled: bool):
-            import yaml
-            user_config = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
+            # Write-back round-trip: raw read is correct (merged defaults must
+            # not be persisted back to the user's file).
+            from hermes_cli.config import read_user_config_raw
+            user_config = read_user_config_raw(config_path)
             user_config.setdefault("skills", {})["write_approval"] = bool(enabled)
             atomic_config_write(config_path, user_config)
             # New setting must take effect next message → drop cached agent.
