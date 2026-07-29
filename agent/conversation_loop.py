@@ -320,6 +320,45 @@ def _billing_or_entitlement_message(
     return "\n".join(lines)
 
 
+def _invalid_response_error_code(response: Any) -> Optional[int]:
+    """Return a provider error code from an invalid response, when usable."""
+    if not response:
+        return None
+    error = getattr(response, "error", None)
+    if not error:
+        return None
+    code = error.get("code") if isinstance(error, dict) else getattr(error, "code", None)
+    if code is None:
+        return None
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _invalid_response_failure_hint(
+    error_code: Optional[int], api_duration: float
+) -> str:
+    """Classify an invalid provider response without touching retry state."""
+    if error_code == 524:
+        return f"upstream provider timed out (Cloudflare 524, {api_duration:.0f}s)"
+    if error_code == 504:
+        return f"upstream gateway timeout (504, {api_duration:.0f}s)"
+    if error_code == 429:
+        return "rate limited by upstream provider (429)"
+    if error_code in {500, 502}:
+        return f"upstream server error ({error_code}, {api_duration:.0f}s)"
+    if error_code in {503, 529}:
+        return f"upstream provider overloaded ({error_code})"
+    if error_code is not None:
+        return f"upstream error (code {error_code}, {api_duration:.0f}s)"
+    if api_duration < 10:
+        return f"fast response ({api_duration:.1f}s) — likely rate limited"
+    if api_duration > 60:
+        return f"slow response ({api_duration:.0f}s) — likely upstream timeout"
+    return f"response time {api_duration:.1f}s"
+
+
 def _print_billing_or_entitlement_guidance(
     agent,
     *,
@@ -1812,38 +1851,12 @@ def run_conversation(
                         if agent.verbose_logging:
                             logging.debug(f"Response attributes for invalid response: {resp_attrs}")
                     
-                    # Extract error code from response for contextual diagnostics
-                    _resp_error_code = None
-                    if response and hasattr(response, 'error') and response.error:
-                        _code_raw = getattr(response.error, 'code', None)
-                        if _code_raw is None and isinstance(response.error, dict):
-                            _code_raw = response.error.get('code')
-                        if _code_raw is not None:
-                            try:
-                                _resp_error_code = int(_code_raw)
-                            except (TypeError, ValueError):
-                                pass
-
-                    # Build a human-readable failure hint from the error code
-                    # and response time, instead of always assuming rate limiting.
-                    if _resp_error_code == 524:
-                        _failure_hint = f"upstream provider timed out (Cloudflare 524, {api_duration:.0f}s)"
-                    elif _resp_error_code == 504:
-                        _failure_hint = f"upstream gateway timeout (504, {api_duration:.0f}s)"
-                    elif _resp_error_code == 429:
-                        _failure_hint = "rate limited by upstream provider (429)"
-                    elif _resp_error_code in {500, 502}:
-                        _failure_hint = f"upstream server error ({_resp_error_code}, {api_duration:.0f}s)"
-                    elif _resp_error_code in {503, 529}:
-                        _failure_hint = f"upstream provider overloaded ({_resp_error_code})"
-                    elif _resp_error_code is not None:
-                        _failure_hint = f"upstream error (code {_resp_error_code}, {api_duration:.0f}s)"
-                    elif api_duration < 10:
-                        _failure_hint = f"fast response ({api_duration:.1f}s) — likely rate limited"
-                    elif api_duration > 60:
-                        _failure_hint = f"slow response ({api_duration:.0f}s) — likely upstream timeout"
-                    else:
-                        _failure_hint = f"response time {api_duration:.1f}s"
+                    # Keep invalid-response classification pure and separately
+                    # testable; the surrounding block owns retry/fallback state.
+                    _resp_error_code = _invalid_response_error_code(response)
+                    _failure_hint = _invalid_response_failure_hint(
+                        _resp_error_code, api_duration
+                    )
 
                     agent._buffer_vprint(f"⚠️  Invalid API response (attempt {retry_count}/{max_retries}): {', '.join(error_details)}")
                     agent._buffer_vprint(f"   🏢 Provider: {provider_name}")
