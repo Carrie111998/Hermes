@@ -22,6 +22,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     SUPPORTED_VIDEO_TYPES,
+    utf16_len,
 )
 
 
@@ -51,6 +52,7 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 # Now we can safely import
+from plugins.platforms.telegram import adapter as telegram_adapter_mod  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
@@ -696,6 +698,61 @@ class TestSendVoice:
         connected_adapter._bot.send_audio.assert_awaited_once()
         connected_adapter._bot.send_document.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_mp3_caption_uses_markdownv2_parse_mode(
+        self, connected_adapter, tmp_path
+    ):
+        audio_file = tmp_path / "clip.mp3"
+        audio_file.write_bytes(b"ID3" + b"\x00" * 32)
+        connected_adapter._bot.send_audio = AsyncMock(
+            return_value=MagicMock(message_id=104)
+        )
+        caption = "## Solar\n**Charge from grid** is enabled."
+
+        result = await connected_adapter.send_voice(
+            chat_id="12345",
+            audio_path=str(audio_file),
+            caption=caption,
+        )
+
+        assert result.success is True
+        call_kwargs = connected_adapter._bot.send_audio.await_args.kwargs
+        assert call_kwargs["caption"] == connected_adapter.format_message(caption)
+        assert call_kwargs["parse_mode"] == telegram_adapter_mod.ParseMode.MARKDOWN_V2
+
+    @pytest.mark.asyncio
+    async def test_mp3_caption_parse_failure_retries_plain_caption(
+        self, connected_adapter, tmp_path
+    ):
+        audio_file = tmp_path / "clip.mp3"
+        audio_file.write_bytes(b"ID3" + b"\x00" * 32)
+        positions = []
+
+        async def mock_send_audio(**kwargs):
+            stream = kwargs["audio"]
+            positions.append(stream.tell())
+            if len(positions) == 1:
+                stream.read()
+                raise RuntimeError(
+                    "can't parse entities: can't find end of Bold entity"
+                )
+            return MagicMock(message_id=105)
+
+        connected_adapter._bot.send_audio = AsyncMock(side_effect=mock_send_audio)
+
+        result = await connected_adapter.send_voice(
+            chat_id="12345",
+            audio_path=str(audio_file),
+            caption="**Important:** caption",
+        )
+
+        assert result.success is True
+        assert connected_adapter._bot.send_audio.await_count == 2
+        assert positions == [0, 0]
+        retry_kwargs = connected_adapter._bot.send_audio.await_args_list[1].kwargs
+        assert "parse_mode" not in retry_kwargs
+        assert retry_kwargs["caption"] == "Important: caption"
+
 
 # ---------------------------------------------------------------------------
 # TestSendDocument — outbound file attachment delivery
@@ -735,6 +792,73 @@ class TestSendDocument:
         assert call_kwargs["chat_id"] == 12345
         assert call_kwargs["filename"] == "report.pdf"
         assert call_kwargs["caption"] == "Here's the report"
+        assert call_kwargs["parse_mode"] == telegram_adapter_mod.ParseMode.MARKDOWN_V2
+
+    @pytest.mark.asyncio
+    async def test_send_document_caption_uses_markdownv2_parse_mode(
+        self, connected_adapter, tmp_path
+    ):
+        test_file = tmp_path / "report.pdf"
+        test_file.write_bytes(b"%PDF-1.4 fake content")
+        connected_adapter._bot.send_document = AsyncMock(
+            return_value=MagicMock(message_id=99)
+        )
+        caption = "**Important:** see `report.pdf`."
+
+        result = await connected_adapter.send_document(
+            chat_id="12345", file_path=str(test_file), caption=caption
+        )
+
+        assert result.success is True
+        call_kwargs = connected_adapter._bot.send_document.await_args.kwargs
+        assert call_kwargs["caption"] == connected_adapter.format_message(caption)
+        assert call_kwargs["parse_mode"] == telegram_adapter_mod.ParseMode.MARKDOWN_V2
+
+    @pytest.mark.asyncio
+    async def test_send_document_formatter_failure_uses_plain_caption(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        test_file = tmp_path / "report.pdf"
+        test_file.write_bytes(b"%PDF-1.4 fake content")
+        connected_adapter._bot.send_document = AsyncMock(
+            return_value=MagicMock(message_id=100)
+        )
+        monkeypatch.setattr(
+            connected_adapter,
+            "format_message",
+            MagicMock(side_effect=ValueError("format failed")),
+        )
+
+        result = await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(test_file),
+            caption="**Important:** see report.",
+        )
+
+        assert result.success is True
+        call_kwargs = connected_adapter._bot.send_document.call_args[1]
+        assert call_kwargs["caption"] == "**Important:** see report."
+        assert "parse_mode" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_send_document_caption_uses_utf16_safe_prefix(
+        self, connected_adapter, tmp_path
+    ):
+        test_file = tmp_path / "report.pdf"
+        test_file.write_bytes(b"%PDF-1.4 fake content")
+        connected_adapter._bot.send_document = AsyncMock(
+            return_value=MagicMock(message_id=100)
+        )
+
+        await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(test_file),
+            caption="😀" * 513,
+        )
+
+        call_kwargs = connected_adapter._bot.send_document.await_args.kwargs
+        assert call_kwargs["caption"] == "😀" * 512
+        assert utf16_len(call_kwargs["caption"]) == 1024
 
     @pytest.mark.asyncio
     async def test_send_document_custom_filename(self, connected_adapter, tmp_path):
@@ -832,7 +956,7 @@ class TestSendDocument:
         test_file.write_bytes(b"data")
 
         connected_adapter._bot.send_document = AsyncMock(
-            side_effect=RuntimeError("Telegram API error")
+            side_effect=RuntimeError("markdown transport unavailable")
         )
 
         # The base fallback calls self.send() which is also on _bot, so mock it
@@ -844,8 +968,11 @@ class TestSendDocument:
         result = await connected_adapter.send_document(
             chat_id="12345",
             file_path=str(test_file),
+            caption="**Important:** report",
         )
 
+        # A non-parse failure must not trigger the plain-caption retry.
+        connected_adapter._bot.send_document.assert_awaited_once()
         # Should have fallen back to base class
         assert result.success is True
         assert result.message_id == "fallback"

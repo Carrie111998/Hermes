@@ -20,7 +20,7 @@ import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +278,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
+    _prefix_within_utf16_limit,
     utf16_len,
 )
 from plugins.platforms.telegram.telegram_ids import (
@@ -1276,6 +1277,44 @@ class TelegramAdapter(BasePlatformAdapter):
         except ImportError:
             return False
 
+    @staticmethod
+    def _looks_like_markdown_parse_error(error: Exception) -> bool:
+        return classify_send_error(error) == "bad_format"
+
+    def _caption_kwargs(self, caption: Optional[str]) -> Dict[str, Any]:
+        """Build a Telegram caption without splitting UTF-16 code points."""
+        if not caption:
+            return {"caption": None}
+        if ParseMode is not None:
+            try:
+                formatted = self.format_message(caption)
+                if utf16_len(formatted) <= 1024:
+                    return {
+                        "caption": formatted,
+                        "parse_mode": ParseMode.MARKDOWN_V2,
+                    }
+            except Exception:
+                logger.debug(
+                    "[%s] media caption MarkdownV2 formatting failed; "
+                    "sending plain caption",
+                    self.name,
+                    exc_info=True,
+                )
+        return {"caption": _prefix_within_utf16_limit(caption, 1024)}
+
+    @staticmethod
+    def _plain_caption_retry_kwargs(
+        send_kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        retry_kwargs = dict(send_kwargs)
+        caption = retry_kwargs.get("caption")
+        if caption:
+            retry_kwargs["caption"] = _prefix_within_utf16_limit(
+                _strip_mdv2(str(caption)), 1024
+            )
+        retry_kwargs.pop("parse_mode", None)
+        return retry_kwargs
+
     @classmethod
     def _should_retry_without_dm_topic_reply_anchor(
         cls,
@@ -1328,15 +1367,57 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to_message_id: Optional[int],
         media_label: str,
         reset_media: Optional[Any] = None,
+        allow_plain_caption_retry: bool = True,
+        allow_topic_anchor_retry: bool = True,
+        plain_caption_retry_factory: Optional[
+            Callable[[Dict[str, Any]], Dict[str, Any]]
+        ] = None,
     ) -> Any:
-        """Retry stale private-topic media replies once without the topic anchor."""
+        """Retry media sends through bounded caption and topic fallbacks."""
         try:
             return await send_fn(**send_kwargs)
         except Exception as send_err:
-            if not self._should_retry_without_dm_topic_reply_anchor(
-                send_err,
-                metadata,
-                reply_to_message_id,
+            has_formatted_caption = bool(
+                send_kwargs.get("parse_mode") is not None
+                and send_kwargs.get("caption")
+            )
+            if (
+                allow_plain_caption_retry
+                and (plain_caption_retry_factory is not None or has_formatted_caption)
+                and self._looks_like_markdown_parse_error(send_err)
+            ):
+                logger.warning(
+                    "[%s] Telegram %s caption MarkdownV2 parse failed, "
+                    "retrying as plain text: %s",
+                    self.name,
+                    media_label,
+                    _redact_telegram_error_text(send_err),
+                )
+                if reset_media is not None:
+                    reset_media()
+                retry_kwargs = (
+                    plain_caption_retry_factory(send_kwargs)
+                    if plain_caption_retry_factory is not None
+                    else self._plain_caption_retry_kwargs(send_kwargs)
+                )
+                return await self._send_with_dm_topic_reply_anchor_retry(
+                    send_fn,
+                    retry_kwargs,
+                    metadata,
+                    reply_to_message_id,
+                    media_label,
+                    reset_media=reset_media,
+                    allow_plain_caption_retry=False,
+                    allow_topic_anchor_retry=allow_topic_anchor_retry,
+                    plain_caption_retry_factory=plain_caption_retry_factory,
+                )
+            if (
+                not allow_topic_anchor_retry
+                or not self._should_retry_without_dm_topic_reply_anchor(
+                    send_err,
+                    metadata,
+                    reply_to_message_id,
+                )
             ):
                 raise
             logger.warning(
@@ -1348,11 +1429,20 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             if reset_media is not None:
                 reset_media()
-            retry_kwargs = dict(send_kwargs)
-            retry_kwargs["reply_to_message_id"] = None
-            retry_kwargs.pop("message_thread_id", None)
-            retry_kwargs.pop("direct_messages_topic_id", None)
-            return await send_fn(**retry_kwargs)
+            send_kwargs["reply_to_message_id"] = None
+            send_kwargs.pop("message_thread_id", None)
+            send_kwargs.pop("direct_messages_topic_id", None)
+            return await self._send_with_dm_topic_reply_anchor_retry(
+                send_fn,
+                send_kwargs,
+                metadata,
+                reply_to_message_id,
+                media_label,
+                reset_media=reset_media,
+                allow_plain_caption_retry=allow_plain_caption_retry,
+                allow_topic_anchor_retry=False,
+                plain_caption_retry_factory=plain_caption_retry_factory,
+            )
 
     def _fallback_ips(self) -> list[str]:
         """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
@@ -6773,7 +6863,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         "[%s] voice caption MarkdownV2 formatting failed; "
                         "sending plain caption", self.name, exc_info=True,
                     )
-                _caption_variants.append((caption[:1024], None))
+                _caption_variants.append(
+                    (_prefix_within_utf16_limit(caption, 1024), None)
+                )
             else:
                 _caption_variants.append((None, None))
 
@@ -6792,33 +6884,36 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     msg = None
                     _last_parse_error: Optional[Exception] = None
+                    voice_send_kwargs = {
+                        "chat_id": normalize_telegram_chat_id(chat_id),
+                        "voice": audio_file,
+                        "reply_to_message_id": reply_to_id,
+                        "duration": _duration_secs,
+                        **voice_thread_kwargs,
+                        **self._notification_kwargs(metadata),
+                    }
                     for _cap_text, _cap_parse_mode in _caption_variants:
+                        voice_send_kwargs["caption"] = _cap_text
+                        voice_send_kwargs["parse_mode"] = _cap_parse_mode
                         try:
                             msg = await self._send_with_dm_topic_reply_anchor_retry(
                                 self._bot.send_voice,
-                                {
-                                    "chat_id": normalize_telegram_chat_id(chat_id),
-                                    "voice": audio_file,
-                                    "caption": _cap_text,
-                                    "parse_mode": _cap_parse_mode,
-                                    "reply_to_message_id": reply_to_id,
-                                    "duration": _duration_secs,
-                                    **voice_thread_kwargs,
-                                    **self._notification_kwargs(metadata),
-                                },
+                                voice_send_kwargs,
                                 metadata,
-                                reply_to_id,
+                                voice_send_kwargs.get("reply_to_message_id"),
                                 "voice",
                                 reset_media=lambda: audio_file.seek(0),
+                                allow_plain_caption_retry=False,
                             )
                             break
                         except Exception as _cap_error:
                             # Only retry the next (plain) variant on entity
                             # parse failures; anything else is a real send
                             # error for the outer handler.
-                            if (_cap_parse_mode is not None
-                                    and ("parse" in str(_cap_error).lower()
-                                         or "entit" in str(_cap_error).lower())):
+                            if (
+                                _cap_parse_mode is not None
+                                and self._looks_like_markdown_parse_error(_cap_error)
+                            ):
                                 logger.warning(
                                     "[%s] voice caption MarkdownV2 rejected, "
                                     "retrying plain: %s",
@@ -6849,7 +6944,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         {
                             "chat_id": normalize_telegram_chat_id(chat_id),
                             "audio": audio_file,
-                            "caption": caption[:1024] if caption else None,
+                            **self._caption_kwargs(caption),
                             "reply_to_message_id": reply_to_id,
                             "duration": _duration_secs,
                             **audio_thread_kwargs,
@@ -6944,22 +7039,51 @@ class TelegramAdapter(BasePlatformAdapter):
 
             media: List[Any] = []
             opened_files: List[Any] = []
-            try:
-                for image_url, alt_text in chunk:
-                    caption = alt_text[:1024] if alt_text else None
-                    if image_url.startswith("file://"):
-                        local_path = _unquote(image_url[7:])
-                        if not os.path.exists(local_path):
-                            logger.warning(
-                                "[%s] Skipping missing image in media group: %s",
-                                self.name, local_path,
+
+            def _close_opened_files(files: List[Any]) -> None:
+                for fh in files:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+
+            def _build_media_group(
+                plain_captions: bool = False,
+            ) -> tuple[List[Any], List[Any]]:
+                built_media: List[Any] = []
+                built_files: List[Any] = []
+                try:
+                    for image_url, alt_text in chunk:
+                        caption_kwargs = self._caption_kwargs(alt_text)
+                        if plain_captions:
+                            caption_kwargs = self._plain_caption_retry_kwargs(
+                                caption_kwargs
                             )
-                            continue
-                        fh = open(local_path, "rb")
-                        opened_files.append(fh)
-                        media.append(InputMediaPhoto(media=fh, caption=caption))
-                    else:
-                        media.append(InputMediaPhoto(media=image_url, caption=caption))
+                        if image_url.startswith("file://"):
+                            local_path = _unquote(image_url[7:])
+                            if not os.path.exists(local_path):
+                                logger.warning(
+                                    "[%s] Skipping missing image in media group: %s",
+                                    self.name,
+                                    local_path,
+                                )
+                                continue
+                            fh = open(local_path, "rb")
+                            built_files.append(fh)
+                            built_media.append(
+                                InputMediaPhoto(media=fh, **caption_kwargs)
+                            )
+                        else:
+                            built_media.append(
+                                InputMediaPhoto(media=image_url, **caption_kwargs)
+                            )
+                except Exception:
+                    _close_opened_files(built_files)
+                    raise
+                return built_media, built_files
+
+            try:
+                media, opened_files = _build_media_group()
 
                 if not media:
                     continue
@@ -6984,6 +7108,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
+                def _plain_media_group_retry_kwargs(
+                    current_kwargs: Dict[str, Any],
+                ) -> Dict[str, Any]:
+                    nonlocal media, opened_files
+                    _close_opened_files(opened_files)
+                    media, opened_files = _build_media_group(
+                        plain_captions=True
+                    )
+                    retry_kwargs = dict(current_kwargs)
+                    retry_kwargs["media"] = media
+                    return retry_kwargs
+
                 await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_media_group,
                     {
@@ -6997,6 +7133,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_id,
                     "media group",
                     reset_media=_reset_opened_files,
+                    plain_caption_retry_factory=(
+                        _plain_media_group_retry_kwargs
+                        if any(alt_text for _, alt_text in chunk)
+                        else None
+                    ),
                 )
             except Exception as e:
                 logger.warning(
@@ -7009,11 +7150,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id, chunk, metadata, human_delay=human_delay,
                 )
             finally:
-                for fh in opened_files:
-                    try:
-                        fh.close()
-                    except Exception:
-                        pass
+                _close_opened_files(opened_files)
 
     async def send_image_file(
         self,
@@ -7047,7 +7184,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "photo": image_file,
-                        "caption": caption[:1024] if caption else None,
+                        **self._caption_kwargs(caption),
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
@@ -7144,7 +7281,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "document": f,
                         "filename": display_name,
-                        "caption": caption[:1024] if caption else None,
+                        **self._caption_kwargs(caption),
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
@@ -7194,7 +7331,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "video": f,
-                        "caption": caption[:1024] if caption else None,
+                        **self._caption_kwargs(caption),
                         "reply_to_message_id": reply_to_id,
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
@@ -7249,7 +7386,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 {
                     "chat_id": normalize_telegram_chat_id(chat_id),
                     "photo": image_url,
-                    "caption": caption[:1024] if caption else None,
+                    **self._caption_kwargs(caption),
                     "reply_to_message_id": reply_to_id,
                     **photo_thread_kwargs,
                     **self._notification_kwargs(metadata),
@@ -7291,7 +7428,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
                         "photo": image_data,
-                        "caption": caption[:1024] if caption else None,
+                        **self._caption_kwargs(caption),
                         "reply_to_message_id": reply_to_id,
                         **upload_thread_kwargs,
                         **self._notification_kwargs(metadata),
@@ -7338,7 +7475,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 {
                     "chat_id": normalize_telegram_chat_id(chat_id),
                     "animation": animation_url,
-                    "caption": caption[:1024] if caption else None,
+                    **self._caption_kwargs(caption),
                     "reply_to_message_id": reply_to_id,
                     **animation_thread_kwargs,
                     **self._notification_kwargs(metadata),
