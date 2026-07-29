@@ -737,7 +737,6 @@ export const SECTIONS: DesktopConfigSection[] = [
       'tts.piper.voice',
       'tts.deepinfra.model',
       'tts.deepinfra.voice',
-      'tts.pronunciation.substitutions',
       'stt.local.model',
       'stt.local.language',
       'stt.openai.model',
