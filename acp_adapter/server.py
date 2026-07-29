@@ -1799,8 +1799,16 @@ class HermesACPAgent(acp.Agent):
             # the new task so clients can render a per-session board). Save
             # and restore around the agent call so a re-used executor thread
             # never leaks one session's id into the next session's tools.
+            #
+            # Use set_current_session_id() to synchronize both the ContextVar
+            # (task-local, concurrency-safe) and os.environ (process-global,
+            # racy under concurrent sessions) so tools that read either path
+            # see the correct session id.  Direct os.environ manipulation is
+            # replaced to avoid cross-session contamination when multiple ACP
+            # sessions run concurrently on the shared ThreadPoolExecutor.
+            from gateway.session_context import set_current_session_id
             previous_session_id = os.environ.get("HERMES_SESSION_ID")
-            os.environ["HERMES_SESSION_ID"] = session_id
+            set_current_session_id(session_id)
             try:
                 result = agent.run_conversation(
                     user_message=user_content,
@@ -1816,11 +1824,15 @@ class HermesACPAgent(acp.Agent):
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)
-                # Restore HERMES_SESSION_ID symmetrically.
+                # Restore HERMES_SESSION_ID symmetrically — both ContextVar
+                # and os.environ via set_current_session_id() so concurrent
+                # sessions don't leave a stale id in the process-global env.
+                from gateway.session_context import set_current_session_id, _SESSION_ID
                 if previous_session_id is None:
                     os.environ.pop("HERMES_SESSION_ID", None)
+                    _SESSION_ID.set("")
                 else:
-                    os.environ["HERMES_SESSION_ID"] = previous_session_id
+                    set_current_session_id(previous_session_id)
                 if approval_cb:
                     try:
                         from tools import terminal_tool as _terminal_tool
