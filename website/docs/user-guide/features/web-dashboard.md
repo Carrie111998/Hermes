@@ -18,7 +18,7 @@ Hosted-mode auth uses Nous Portal OAuth; if you also want the dashboard to talk 
 hermes dashboard
 ```
 
-This starts a local web server and opens `http://127.0.0.1:9119` in your browser. The dashboard runs entirely on your machine — no data leaves localhost.
+This starts a web server on the local loopback interface and opens `http://127.0.0.1:9119` in your browser. The dashboard listener and its local state stay on your machine; configured model, tool, update, or authentication providers may still make their normal outbound requests.
 
 ### Options
 
@@ -27,14 +27,14 @@ This starts a local web server and opens `http://127.0.0.1:9119` in your browser
 | `--port` | `9119` | Port to run the web server on |
 | `--host` | `127.0.0.1` | Bind address |
 | `--no-open` | — | Don't auto-open the browser |
-| `--insecure` | off | Allow binding to non-localhost hosts (**DANGEROUS** — exposes API keys on the network; pair with a firewall and strong auth) |
+| `--insecure` | off | **Deprecated / no-op.** Non-loopback binds always require an auth provider |
 | `--isolated` | off | When launched from a named profile (`worker dashboard`), run a dedicated per-profile server instead of routing to the machine dashboard |
 
 ```bash
 # Custom port
 hermes dashboard --port 8080
 
-# Bind to all interfaces (use with caution on shared networks)
+# Bind to all interfaces (requires a configured auth provider)
 hermes dashboard --host 0.0.0.0
 
 # Start without opening browser
@@ -129,57 +129,7 @@ The **Chat** tab embeds the full Hermes TUI (the same interface you get from `he
 
 Close the browser tab and the PTY is reaped cleanly on the server. Re-opening spawns a fresh session.
 
-To point [Hermes Desktop](#connecting-hermes-desktop-to-a-remote-backend) at a dashboard running on another machine instead of its own bundled backend, see the remote-backend section below.
-
-### Connecting Hermes Desktop to a remote backend
-
-Hermes Desktop normally launches its own local backend, but it can also attach to a dashboard running on a remote machine (a VM, a homelab box, etc.) via **Settings → Gateway → Remote gateway**. This is the most common source of "Desktop says the backend is ready but chat never works" reports, because Desktop's readiness check verifies less than the live chat connection actually needs.
-
-:::info Prerequisite: a `hermes dashboard` must be running on the remote host
-The "remote backend" Desktop connects to **is** a `hermes dashboard` process running on the remote machine — the same server this page documents. It has to be up and reachable before any of the steps below matter; Desktop attaches to it, it doesn't start it for you. Keep it running under `systemd`/`tmux`/etc. so it survives logout and reboots. The **gateway** (Telegram/Discord/Slack/etc.) is a *separate* long-running process — start it independently if you rely on messaging channels; it is not the thing the desktop app connects to.
-:::
-
-Desktop's "remote backend is ready" probe only hits `GET /api/status`, which is a public endpoint — it answers as soon as *any* dashboard is running on the host. The live chat connection is a **separate** WebSocket to `/api/ws` (and `/api/pty`), and that socket is gated by two more checks the status probe never touches:
-
-1. **You must be authenticated.** When the dashboard is bound to a non-loopback address it engages its auth gate. Protect it with a username and password (the bundled [username/password provider](#usernamepassword-provider-no-oauth-idp)); Desktop signs in once and reuses the resulting session for the WebSocket via a single-use ticket. Without a configured provider, a non-loopback dashboard **fails closed at startup**.
-2. **The bind host must allow the client and match the Host header.** A loopback bind (`127.0.0.1`) only accepts loopback clients, so a remote machine is rejected at the socket layer regardless of credentials. Bind to a non-loopback address (`--host 0.0.0.0`) so the peer-IP guard lets the remote client through. The remote URL you enter in Desktop must reach the dashboard by the same host it bound to — the DNS-rebinding guard requires the Host header to match.
-
-#### Remote dashboard setup
-
-Set a username and password, then run the dashboard bound to a reachable address. For a `systemd` service:
-
-```ini
-[Service]
-EnvironmentFile=%h/.hermes/.env
-ExecStart=/path/to/venv/bin/python -m hermes_cli.main dashboard \
-    --host 0.0.0.0 --port 9119 --no-open
-```
-
-with `~/.hermes/.env` containing:
-
-```bash
-HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
-HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=choose-a-strong-password
-HERMES_DASHBOARD_BASIC_AUTH_SECRET=<32+ random bytes; openssl rand -base64 32>
-```
-
-Then in Desktop enter the **Remote URL** (e.g. `http://VM_IP:9119`) and **Sign in** with that username and password. See the [username/password provider](#usernamepassword-provider-no-oauth-idp) section for the full configuration surface.
-
-:::tip Verify the gate is on before retrying Desktop
-From any machine, check that the dashboard advertises the username/password provider:
-
-```bash
-curl -s http://VM_IP:9119/api/status | jq '.auth_required, .auth_providers'
-# true
-# ["basic"]
-```
-
-- `auth_required: true` and `"basic"` in the providers list → Desktop's **Sign in** flow will work.
-- `auth_required: false` → the bind is loopback, or the gate didn't engage. Bind to a non-loopback address.
-- `auth_required: true` but no `"basic"` provider → the username/password env vars aren't loaded. Fix those first.
-:::
-
-If `/api/status` shows the gate is on with the `"basic"` provider and Desktop *still* fails to connect after signing in, the issue is past basic setup — grab a fresh `desktop.log` (Settings → Gateway → Open logs) plus the dashboard's logs from the same retry window and look for the `/api/ws` close code (4403 = chat WS rejected by the request guard, e.g. Host/peer mismatch; 4401 = the WS ticket didn't authenticate).
+To connect Hermes Desktop to another machine, see [Connecting Hermes Desktop to a remote backend](#connecting-hermes-desktop-to-a-remote-backend) below. That section covers the explicit Remote URL path that uses this server and its auth gate. Desktop also supports managed [Hermes Cloud and SSH modes](/user-guide/desktop#connecting-to-a-remote-backend), which do not require a publicly reachable dashboard URL.
 
 ### Config
 
@@ -300,7 +250,7 @@ Browse, search, and toggle installed skills and toolsets, and install new ones f
 
 ### MCP
 
-Manage [MCP](/integrations/mcp) servers without the CLI. The same `mcp_servers`
+Manage [MCP](/user-guide/features/mcp) servers without the CLI. The same `mcp_servers`
 block in `config.yaml` that `hermes mcp` reads from.
 
 **Your MCP servers:**
@@ -383,7 +333,7 @@ Creating a shell hook (note the consent checkbox and the run-arbitrary-commands 
 ![New shell hook modal](/img/dashboard/admin-hook-create.png)
 
 :::warning Security
-The web dashboard reads and writes your `.env` file, which contains API keys and secrets. It binds to `127.0.0.1` by default — only accessible from your local machine. If you bind to `0.0.0.0`, anyone on your network can view and modify your credentials. The dashboard has no authentication of its own.
+The web dashboard reads and writes your `.env` file, which contains API keys and secrets. It binds to `127.0.0.1` by default, where only local clients can reach it. Any non-loopback bind — including `0.0.0.0` — engages the fail-closed [authentication gate](#authentication-gated-mode) and will not start until an auth provider is configured. Authentication does not replace network-layer protection: use TLS for an internet-facing deployment, or keep a password-gated deployment behind a trusted LAN or VPN.
 :::
 
 ## `/reload` Slash Command
@@ -558,13 +508,13 @@ same auth gate as the rest of `/api/`.
 
 ## Authentication (gated mode)
 
-When the dashboard is bound to a public or non-loopback address — anything other than `127.0.0.1` / `localhost` — Hermes Agent engages an auth gate. Every request must carry a verified session cookie or it's bounced to the login page. Three providers ship in the box:
+When the dashboard is bound to a public or non-loopback address — anything other than `127.0.0.1`, `::1`, or `localhost` — Hermes Agent engages an auth gate. Protected browser and API routes require a verified session cookie. A deliberately small read-only allowlist remains public for liveness and pre-login metadata (`/api/health`, `/api/status`, config defaults/schema, model metadata, and theme/plugin manifests); `/api/cron/fire` verifies its own callback JWT, and provider-registered machine routes can use independently verified bearer tokens. Three interactive providers ship in the box:
 
 - **[Username/password](#usernamepassword-provider-no-oauth-idp)** — the simplest way to put auth on a self-hosted / on-prem / homelab dashboard. No external identity provider. **Use it only on a trusted network or behind a VPN — not for public-internet exposure.**
 - **[OAuth (Nous Portal)](#default-provider-nous-research)** — for hosted deployments and any dashboard reachable over the public internet, and the recommended path for a [remote Hermes Desktop connection](#connecting-hermes-desktop-to-a-remote-backend). Every login is verified against your Nous account, so this is the provider suitable for internet-facing use.
 - **[Self-hosted OIDC](#self-hosted-oidc-provider)** — for bringing your own identity provider via standard OpenID Connect (Keycloak, Auth0, Okta, Google, GitHub via an OIDC bridge, etc.). No Nous Portal involved; suitable for public-internet exposure when fronted by a conformant OIDC server.
 
-Operator-owned dashboards bound to loopback are unaffected — no auth, no login page.
+Loopback dashboards do not engage the interactive provider gate and show no login page. Sensitive `/api/*` routes still require the per-process dashboard session token injected into the SPA, except for the shared public allowlist and explicitly registered bearer-token routes.
 
 ### When the gate engages
 
@@ -573,13 +523,10 @@ Operator-owned dashboards bound to loopback are unaffected — no auth, no login
 | `hermes dashboard` (default — binds to `127.0.0.1`) | OFF | Local development |
 | `hermes dashboard --host 0.0.0.0` | **ON** | Remote / production — protect with the username/password provider or OAuth |
 
-The gate is on if and only if:
+The gate is on whenever the bind host is not `127.0.0.1`, `::1`, or `localhost`. `0.0.0.0`, `::`, LAN/Tailscale addresses, and public addresses are all non-loopback binds and therefore require authentication.
 
-1. The bind host is not `127.0.0.1`, `::1`, `localhost`, or `0.0.0.0` AND
-2. The `--insecure` flag is **not** set.
-
-:::danger `--insecure` disables auth entirely
-`--insecure` skips the gate and serves an unauthenticated dashboard that reads/writes your `.env` (API keys, secrets) and can run agent commands. **Do not use it for a remote connection.** To expose the dashboard to another machine, configure the [username/password provider](#usernamepassword-provider-no-oauth-idp) (or OAuth) and leave `--insecure` off. The flag exists only as a last-resort escape hatch on a fully trusted, firewalled single-host network.
+:::warning `--insecure` is deprecated and does not disable authentication
+Since the June 2026 hardening, `--insecure` is accepted only for command-line compatibility and logs a warning; it is otherwise a no-op. There is no unauthenticated public-bind option. To keep a backend local, bind it to `127.0.0.1` and use Desktop's managed SSH mode or your own tunnel.
 :::
 
 ### Fail-closed semantics
@@ -638,14 +585,13 @@ non-loopback binds, but no auth providers are registered.
 
 Bundled providers reported these issues:
   • nous: HERMES_DASHBOARD_OAUTH_CLIENT_ID is not set (and
-    dashboard.oauth.client_id in config.yaml is empty). The Nous Portal
-    provisions this env var (shape 'agent:{instance_id}') when it
-    deploys a Hermes Agent instance — set it to your provisioned
-    client id (either as an env var or under dashboard.oauth.client_id
-    in config.yaml), or pass --insecure to skip the OAuth gate entirely.
+    dashboard.oauth.client_id in config.yaml is empty).
 
-Or pass --insecure to skip the auth gate (NOT recommended on untrusted
-networks).
+Configure an auth provider before exposing the dashboard:
+  • Password: set dashboard.basic_auth.username + password_hash
+  • OAuth: run `hermes dashboard register`
+There is no unauthenticated public-bind option — bind 127.0.0.1 and
+tunnel in if the backend must remain local.
 ```
 
 #### Worked example: Nous Research
@@ -661,7 +607,7 @@ hermes dashboard register
 # …writes HERMES_DASHBOARD_OAUTH_CLIENT_ID to ~/.hermes/.env
 ```
 
-**2. Run the dashboard on a reachable address.** A non-loopback bind without `--insecure` engages the OAuth gate, and the `client_id` just written activates the `nous` provider:
+**2. Run the dashboard on a reachable address.** A non-loopback bind always engages the auth gate, and the `client_id` just written activates the Nous OAuth provider:
 
 ```bash
 hermes dashboard --host 0.0.0.0 --port 9119 --no-open
@@ -681,7 +627,7 @@ curl -s http://<host>:9119/api/status | jq '.auth_required, .auth_providers'
 
 If you don't want to wire up an OAuth identity provider — a self-hosted "just put a password on my dashboard" deployment — the bundled `plugins/dashboard_auth/basic` plugin registers a `DashboardAuthProvider` named `basic` that authenticates with a **username and password** instead of an OAuth redirect.
 
-It plugs into the same gate as the OAuth provider: the gate engages on a non-loopback bind without `--insecure`, the login page renders a credential form for this provider (instead of a "Log in with X" button), and everything downstream of login — session cookies, transparent refresh, WS tickets, logout, the audit log — is identical to the OAuth path. Sessions are stateless HMAC-signed tokens the provider mints itself, so there's **no database and no external IDP**. Password hashing uses stdlib `scrypt` (no third-party dependency).
+It plugs into the same gate as the OAuth provider: every non-loopback bind engages the gate, the login page renders a credential form for this provider (instead of a "Log in with X" button), and everything downstream of login — session cookies, transparent refresh, WS tickets, logout, the audit log — is identical to the OAuth path. Sessions are stateless HMAC-signed tokens the provider mints itself, so there's **no database and no external IDP**. Password hashing uses stdlib `scrypt` (no third-party dependency).
 
 :::warning Use this on trusted networks only — not the public internet
 The username/password provider is intended for self-hosted / on-prem / homelab dashboards on a **trusted network**, or reachable only over a **VPN**. It protects a single shared credential with no external identity provider, MFA, or per-user accounts behind it, so it is **not suitable for exposing a dashboard directly to the public internet**. For an internet-facing dashboard, use the [Nous Research provider](#default-provider-nous-research) (or your own [self-hosted OIDC](#self-hosted-oidc-provider) / [custom OAuth](#custom-providers) provider) instead.
@@ -689,7 +635,7 @@ The username/password provider is intended for self-hosted / on-prem / homelab d
 
 #### Configuration
 
-Like the Nous provider, it reads from `config.yaml` (canonical) with environment variables winning when set non-empty. It activates only when `username` plus either `password_hash` (preferred) or `password` are configured — otherwise it's a no-op, so OAuth users and loopback/`--insecure` operators are unaffected.
+Like the Nous provider, it reads from `config.yaml` (canonical) with environment variables winning when set non-empty. It activates only when `username` plus either `password_hash` (preferred) or `password` are configured — otherwise it's a no-op, so OAuth users and loopback-only operators are unaffected.
 
 **`config.yaml`:**
 
@@ -740,7 +686,7 @@ EOF
 chmod 600 ~/.hermes/.env
 ```
 
-**2. Run the dashboard on a reachable address.** A non-loopback bind without `--insecure` engages the gate, and the username + hash activate the `basic` provider:
+**2. Run the dashboard on a reachable address.** A non-loopback bind always engages the gate, and the username + hash activate the `basic` provider:
 
 ```bash
 hermes dashboard --host 0.0.0.0 --port 9119 --no-open
@@ -766,11 +712,11 @@ If you run your own identity provider, the bundled `plugins/dashboard_auth/self_
 
 > **Authentik · Keycloak · Zitadel · Authelia · Auth0 · Okta · Google · …**
 
-Like the Nous provider, it auto-loads and only registers itself once it's configured, so it's a no-op for loopback / `--insecure` dashboards.
+Like the Nous provider, it auto-loads and only registers itself once it's configured, so it is a no-op until its OIDC settings are present. Loopback dashboards do not require any provider.
 
 #### Configuration
 
-Configure an **issuer** and a **client_id** (a public PKCE client — no client secret). The plugin fetches the IDP's `authorization_endpoint`, `token_endpoint`, and `jwks_uri` from `{issuer}/.well-known/openid-configuration`, so you never hardcode endpoint URLs.
+Configure an **issuer** and a **client_id**. Public clients use PKCE without a secret; confidential clients add a `client_secret` while retaining PKCE. The plugin fetches the IDP's `authorization_endpoint`, `token_endpoint`, and `jwks_uri` from `{issuer}/.well-known/openid-configuration`, so you never hardcode endpoint URLs.
 
 **`config.yaml`** — the canonical surface:
 
@@ -782,6 +728,7 @@ dashboard:
       issuer: https://auth.example.com/application/o/hermes/   # required
       client_id: hermes-dashboard                              # required
       scopes: "openid profile email"                           # optional (this is the default)
+      # client_secret: ""                                      # optional; prefer ~/.hermes/.env
 ```
 
 **Environment variables** — operator overrides (env wins over `config.yaml` when set non-empty; an empty value is treated as unset):
@@ -789,10 +736,11 @@ dashboard:
 | Env var | Overrides | Notes |
 |---------|-----------|-------|
 | `HERMES_DASHBOARD_OIDC_ISSUER` | `dashboard.oauth.self_hosted.issuer` | OIDC issuer URL — required |
-| `HERMES_DASHBOARD_OIDC_CLIENT_ID` | `dashboard.oauth.self_hosted.client_id` | Public client id — required |
+| `HERMES_DASHBOARD_OIDC_CLIENT_ID` | `dashboard.oauth.self_hosted.client_id` | Client id — required |
 | `HERMES_DASHBOARD_OIDC_SCOPES` | `dashboard.oauth.self_hosted.scopes` | Defaults to `openid profile email` |
+| `HERMES_DASHBOARD_OIDC_CLIENT_SECRET` | `dashboard.oauth.self_hosted.client_secret` | Optional secret for a confidential client; keep it in `~/.hermes/.env` |
 
-In your IDP, register a **public** application/client with the authorization-code + PKCE (S256) grant and add the dashboard's callback as an allowed redirect URI. The callback is `<dashboard public URL>/auth/callback` (see [Public URL override](#public-url-override) for how the dashboard derives its public URL behind a proxy).
+In your IDP, register either a **public** PKCE-only client or a **confidential** client using PKCE plus a `client_secret`, and add the dashboard's callback as an allowed redirect URI. Both modes use the authorization-code flow with PKCE (S256). For confidential clients, the provider chooses `client_secret_basic` or `client_secret_post` from the IDP's discovery metadata. The callback is `<dashboard public URL>/auth/callback` (see [Public URL override](#public-url-override) for how the dashboard derives its public URL behind a proxy).
 
 #### What it verifies
 
@@ -807,7 +755,7 @@ The provider verifies the OpenID Connect **ID token** (RS256/ES256) against the 
 
 The ID token is what establishes identity — the access token is treated as opaque (the OIDC spec does not require it to be a JWT). Endpoint URLs are required to be HTTPS (loopback `http://` is allowed for local-dev IDPs), and the discovery document's advertised `issuer` must match your configured one (a trailing-slash difference is tolerated). Refresh tokens, when the IDP issues them, are used for silent re-auth via the standard `refresh_token` grant; logout calls the IDP's RFC 7009 `revocation_endpoint` when advertised.
 
-> **Confidential clients** (those with a `client_secret`) are not supported yet — configure a public + PKCE client, which is the typical choice for a browser-facing dashboard.
+Public clients authenticate the token exchange with PKCE alone. Confidential clients add client authentication with `HERMES_DASHBOARD_OIDC_CLIENT_SECRET`; PKCE remains required and the secret never replaces it. The worked Keycloak example below deliberately uses the simpler public-client mode.
 
 #### Worked example: Keycloak
 
@@ -875,8 +823,8 @@ hermes dashboard --host 0.0.0.0 --port 9119 --no-open
 
 `HERMES_DASHBOARD_PUBLIC_URL` tells the dashboard its OAuth callback is
 `http://localhost:9119/auth/callback` — the redirect URI the realm registered
-above. Binding to `0.0.0.0` (a non-loopback bind) without `--insecure` is what
-engages the OAuth gate.
+above. Binding to `0.0.0.0` is non-loopback and therefore always engages the
+OAuth gate.
 
 **3. Log in.** Open `http://localhost:9119/`, you'll be bounced to `/login`. Click **Sign in with Self-Hosted OIDC** → authenticate at Keycloak as `testuser` / `testpassword` → land back on the authenticated dashboard. The sidebar shows `Logged in as Test User via self-hosted`, and `GET /api/auth/me` returns the verified session (`provider: self-hosted`, `email: testuser@example.com`).
 
@@ -919,20 +867,26 @@ The provider implements the [Nous Portal OAuth contract v1](https://github.com/N
 2. Login page shows a "Continue with Nous Research" button → `/auth/login?provider=nous`.
 3. Server stashes PKCE state in a short-lived cookie, redirects user to `https://portal.nousresearch.com/oauth/authorize?…`.
 4. User authenticates with Portal, lands at `/auth/callback?code=…&state=…`.
-5. Server exchanges the code for an access token at `POST /api/oauth/token`, verifies the JWT signature against the Portal's JWKS (`/.well-known/jwks.json`), and sets the `hermes_session_at` cookie.
+5. Server exchanges the code for an access token and rotating refresh token at `POST /api/oauth/token`, verifies the access-token JWT signature against the Portal's JWKS (`/.well-known/jwks.json`), and sets the session cookies.
 6. User is redirected to `/` (or to the original deep-link path via the `next=` query parameter).
 
-Access tokens have a 15-minute TTL. **There is no refresh token in contract v1** — when the token expires, the SPA's fetch wrapper detects the 401 envelope and full-page-navigates back to `/login` to re-run the flow.
+Access tokens have a 15-minute TTL. Nous Portal also issues a rotating refresh token with a 24-hour session lifetime. When the access token expires, the middleware uses the HttpOnly refresh-token cookie to rotate both tokens transparently. An expired, revoked, or reuse-detected refresh token is cleared and the user is sent through login again.
 
 ### Cookies set
 
 | Name | Lifetime | Notes |
 |------|----------|-------|
-| `hermes_session_at` | Token TTL (15 min) | HttpOnly, SameSite=Lax, Secure-when-HTTPS |
-| `hermes_session_pkce` | 10 min | HttpOnly; holds the PKCE verifier + provider hint during the round trip |
-| `hermes_session_rt` | unused in v1 | Reserved for forward-compat; not written when `refresh_token` is empty |
+| `hermes_session_at` | Access-token TTL (15 min for Nous) | HttpOnly verified session token |
+| `hermes_session_rt` | 24-hour underlying token (30-day browser Max-Age upper bound) | HttpOnly rotating refresh token; replaced after every successful refresh. Providers that omit a refresh token do not write it |
+| `hermes_session_provider` | 30-day browser Max-Age upper bound | HttpOnly non-secret provider-routing hint used during refresh |
+| `hermes_session_pkce` | 10 min | HttpOnly; holds the PKCE verifier + provider hint during the login round trip |
+| `hermes_sso_attempt` | 60 sec, when auto-SSO runs | HttpOnly one-shot loop guard; contains no session secret |
 
-All three are `Path=/` and `SameSite=Lax`. The `Secure` flag is set when the dashboard is reached over HTTPS (detected via the request URL scheme — honours `X-Forwarded-Proto` from an upstream TLS terminator under `proxy_headers=True`).
+Session cookies are scoped to the active deployment path and use
+`SameSite=Lax`. The `Secure` flag is set when the dashboard is reached over
+HTTPS (detected via the request URL scheme — honours `X-Forwarded-Proto` from
+an upstream TLS terminator under `proxy_headers=True`). Direct HTTPS deploys
+use the `__Host-` cookie prefix; path-prefixed HTTPS deploys use `__Secure-`.
 
 ### Logout
 
@@ -1000,9 +954,11 @@ The dashboard's React StatusPage shows the same fields under "Web server". A sid
 
 ## Connecting Hermes Desktop to a remote backend
 
-Hermes Desktop can drive a Hermes backend running on another machine (a VPS, a home server, a Mini behind Tailscale). In the app this lives under **Settings → Gateway → Remote gateway**, which asks for a **Remote URL** and a way to **Sign in**. (For the desktop app itself — install, settings, chat — see the [Hermes Desktop](/user-guide/desktop) page.)
+This section covers Desktop's **explicit Remote gateway URL** mode. In this architecture you operate a persistent backend, expose it at a reachable URL, and Desktop attaches to it. For the complete four-mode matrix — Local, Hermes Cloud, Remote URL, and managed SSH — see [Hermes Desktop → Connecting to a remote backend](/user-guide/desktop#connecting-to-a-remote-backend).
 
-You protect the remote dashboard with one of the bundled auth providers, and the desktop app signs in against whichever one the backend advertises. For a backend reachable beyond your own machine — a VPS, a public host, anything internet-facing — the recommended provider is **OAuth (Nous Portal)** (register it with [`hermes dashboard register`](#registering-a-dashboard) and sign in with *Sign in with Nous Research*). The bundled [username/password provider](#usernamepassword-provider-no-oauth-idp) is the quickest option when the backend is on a trusted LAN or reachable only over a VPN, but is **not suitable for direct public-internet exposure**. Binding the dashboard to a non-loopback address engages its auth gate; once signed in, Desktop reuses the session for the chat WebSocket automatically — there is no token to copy or paste.
+The preferred headless process is **`hermes serve`**. It hosts the same REST and JSON-RPC/WebSocket backend as `hermes dashboard` without serving or opening the dashboard UI. Desktop does not start this Remote URL backend; run it under `systemd`, `tmux`, or another supervisor so it survives logout and reboot. The messaging gateway is a separate process.
+
+Protect the backend with one of the bundled auth providers, and Desktop signs in against whichever provider it advertises. For an internet-facing endpoint, use **OAuth (Nous Portal)** or [self-hosted OIDC](#self-hosted-oidc-provider). The bundled [username/password provider](#usernamepassword-provider-no-oauth-idp) is for a trusted LAN or VPN only. Every non-loopback bind requires a provider; `--insecure` cannot bypass the gate.
 
 The recipe below uses the username/password path because it's the quickest to stand up on a trusted network; for the OAuth path see [Default provider: Nous Research](#default-provider-nous-research).
 
@@ -1013,22 +969,23 @@ The recipe below uses the username/password path because it's the quickest to st
 cat >> ~/.hermes/.env <<'EOF'
 HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
 HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=choose-a-strong-password
-# Recommended: a stable signing secret so sessions survive restarts.
-HERMES_DASHBOARD_BASIC_AUTH_SECRET=$(openssl rand -base64 32)
 EOF
+# Add a generated stable signing secret so sessions survive restarts.
+printf 'HERMES_DASHBOARD_BASIC_AUTH_SECRET=%s\n' \
+  "$(openssl rand -base64 32)" >> ~/.hermes/.env
 chmod 600 ~/.hermes/.env
 
-# 2. Run the dashboard bound to a reachable address. The non-loopback bind
+# 2. Run the headless backend on a reachable address. The non-loopback bind
 #    engages the auth gate; the username/password provider handles login.
-hermes dashboard --no-open --host 0.0.0.0 --port 9119
+hermes serve --host 0.0.0.0 --port 9119
 ```
 
 Prefer no plaintext at rest? Use `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH` with a scrypt hash instead — see [Username/password provider](#usernamepassword-provider-no-oauth-idp) for the full surface.
 
-If you run the dashboard as a systemd service, `~/.hermes/.env` is picked up automatically when the unit has `EnvironmentFile=%h/.hermes/.env`, so the credentials are in the environment at boot.
+If you run `hermes serve` as a systemd service, give the unit `EnvironmentFile=%h/.hermes/.env` so the credentials are in the environment at boot.
 
 :::warning
-The dashboard reads and writes your `.env` (API keys, secrets) and can run agent commands. The **username/password** setup shown here is for a trusted network — never expose a password-protected dashboard directly to the open internet. Put it behind a VPN. [Tailscale](https://tailscale.com/) is the clean option: bind to the machine's tailscale IP (`--host <tailscale-ip>`) and use `http://<tailscale-ip>:9119` as the Remote URL. Only devices on your tailnet can reach it. To reach a backend over the public internet, use the **OAuth (Nous Portal)** provider instead.
+The backend reads and writes your `.env` (API keys, secrets) and can run agent commands. The **username/password** setup shown here is for a trusted network — never expose it directly to the open internet. Put it behind a VPN. [Tailscale](https://tailscale.com/) is the clean option: bind to the machine's Tailscale IP (`--host <tailscale-ip>`) and use `http://<tailscale-ip>:9119` as the Remote URL. Only devices on your tailnet can reach it. For a public endpoint, use **OAuth (Nous Portal)** or self-hosted OIDC with TLS.
 :::
 
 ### In Hermes Desktop
@@ -1036,26 +993,30 @@ The dashboard reads and writes your `.env` (API keys, secrets) and can run agent
 **Settings → Gateway → Remote gateway:**
 
 - **Remote URL** — `http://<backend-host>:9119` (path prefixes like `/hermes` are supported if you front it with a reverse proxy)
-- **Sign in** — the app detects the username/password gateway and shows a **Sign in** button; click it and enter the credentials from step 1
+- **Sign in** — the app probes the advertised provider and shows the appropriate username/password or OAuth/OIDC sign-in flow
 - **Save and reconnect** — switches the desktop shell onto the remote backend
 
 The session refreshes automatically and survives restarts when `HERMES_DASHBOARD_BASIC_AUTH_SECRET` is set on the backend.
 
 ### Environment-variable override
 
-Instead of the in-app setting, you can point the desktop at a backend with an env var before launching it. When `HERMES_DESKTOP_REMOTE_URL` is set, it overrides the saved in-app URL (the Gateway settings panel shows an "env override" badge and disables editing); you still **Sign in** with your username and password from the panel.
+Instead of the in-app setting, an unattended deployment can point Desktop at a static-token backend before launch. This override is **token-auth only**: both variables are mandatory, the global/default Gateway settings show an "env override" badge and disable editing, and interactive username/password or OAuth/OIDC sign-in is unavailable for that global connection. Named profiles can still keep explicit Cloud, Remote URL, or SSH overrides; profiles set to Local inherit the environment-selected global backend. For interactive providers, configure **Remote URL** in the app instead.
 
 | Env var | Value |
 |---------|-------|
 | `HERMES_DESKTOP_REMOTE_URL` | `http://<backend-host>:9119` |
+| `HERMES_DESKTOP_REMOTE_TOKEN` | Static session token accepted by that backend |
 
 ### Troubleshooting
 
 - **"Remote gateway incomplete"** — you haven't entered a remote URL.
+- **`HERMES_DESKTOP_REMOTE_URL` is set but `HERMES_DESKTOP_REMOTE_TOKEN` is not** — the environment override requires both values. Remove the URL override to use interactive sign-in in Settings.
 - **Sign-in fails with 401 / "Invalid credentials"** — the username or password doesn't match the backend's `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` / `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD`. The backend returns the same generic error for unknown user and wrong password, so check both. Confirm the gate with `curl -s http://<host>:9119/api/status | jq '.auth_required, .auth_providers'` — it should report `true` and include `"basic"`.
 - **No "Sign in" button — it asks for a session token instead** — the username/password provider isn't active (`/api/status` won't list `"basic"`). Make sure the username and a password (or password hash) are set and the dashboard process loaded them.
 - **Signed out on every restart** — set `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to a stable value; otherwise the signing key is regenerated per boot.
 - **Connection refused / times out** — the backend bound to `127.0.0.1` (the default) instead of a reachable address, or a firewall/VPN is blocking the port. Bind to `0.0.0.0` or the tailscale IP and open the port to your trusted network.
+
+Desktop first probes `GET /api/status`, then establishes the authenticated `/api/ws` connection used by chat. If status succeeds but chat still fails, collect a fresh `desktop.log` plus the server logs from the same retry window. WebSocket close code `4401` means the ticket did not authenticate; `4403` means the request guard rejected the socket, such as a Host/peer mismatch.
 
 ## CORS
 

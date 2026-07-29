@@ -13,6 +13,7 @@ Sidebar is updated to nest all per-skill pages under Skills → Bundled / Option
 """
 
 from __future__ import annotations
+import argparse
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -23,6 +24,16 @@ import yaml
 REPO = Path(__file__).resolve().parent.parent.parent
 DOCS = REPO / "website" / "docs"
 SKILLS_PAGES = DOCS / "user-guide" / "skills"
+ZH_DOCS = (
+    REPO
+    / "website"
+    / "i18n"
+    / "zh-Hans"
+    / "docusaurus-plugin-content-docs"
+    / "current"
+)
+ZH_BUNDLED_CATALOG = ZH_DOCS / "reference" / "skills-catalog.md"
+ZH_OPTIONAL_CATALOG = ZH_DOCS / "reference" / "optional-skills-catalog.md"
 
 SKILL_SOURCES = [
     ("bundled", REPO / "skills"),
@@ -395,8 +406,11 @@ def render_skill_page(
             if skill_index is not None:
                 target_meta = skill_index.get(r)
             if target_meta is not None:
+                # Route paths are relative to the configured baseUrl. Do not
+                # bake `/docs` into generated links: Docusaurus localizes the
+                # baseUrl, and a hardcoded copy becomes `/zh-Hans/docs/...`.
                 href = (
-                    f"/docs/user-guide/skills/{target_meta['source_kind']}"
+                    f"/user-guide/skills/{target_meta['source_kind']}"
                     f"/{target_meta['category']}/{page_id(target_meta)}"
                 )
                 link_parts.append(f"[`{r}`]({href})")
@@ -495,7 +509,7 @@ def build_catalog_md_bundled(entries: list[tuple[dict[str, Any], dict[str, Any]]
             desc = (fm.get("description") or "").strip()
             if len(desc) > 240:
                 desc = desc[:237].rstrip() + "..."
-            link_target = f"/docs/user-guide/skills/bundled/{meta['category']}/{page_id(meta)}"
+            link_target = f"/user-guide/skills/bundled/{meta['category']}/{page_id(meta)}"
             path = f"`{meta['rel_path']}`"
             desc_esc = mdx_escape_body(desc).replace("|", "\\|").replace("\n", " ")
             lines.append(
@@ -556,7 +570,7 @@ def build_catalog_md_optional(entries: list[tuple[dict[str, Any], dict[str, Any]
             desc = (fm.get("description") or "").strip()
             if len(desc) > 240:
                 desc = desc[:237].rstrip() + "..."
-            link_target = f"/docs/user-guide/skills/optional/{meta['category']}/{page_id(meta)}"
+            link_target = f"/user-guide/skills/optional/{meta['category']}/{page_id(meta)}"
             desc_esc = mdx_escape_body(desc).replace("|", "\\|").replace("\n", " ")
             lines.append(f"| [**{name}**]({link_target}) | {desc_esc} |")
         lines.append("")
@@ -576,6 +590,116 @@ def build_catalog_md_optional(entries: list[tuple[dict[str, Any], dict[str, Any]
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
+
+
+_LOCALIZED_CATALOG_ROW_RE = re.compile(
+    r"\]\((?P<target>/user-guide/skills/"
+    r"(?P<source>bundled|optional)/(?P<category>[^/]+)/[^)]+)\)"
+)
+_LOCALIZED_CATEGORY_RE = re.compile(
+    r"^## [A-Za-z0-9][A-Za-z0-9_-]*\s*$", re.MULTILINE
+)
+
+
+def _catalog_target(meta: dict[str, Any]) -> str:
+    return (
+        f"/user-guide/skills/{meta['source_kind']}"
+        f"/{meta['category']}/{page_id(meta)}"
+    )
+
+
+def synchronize_localized_catalog(
+    entries: list[tuple[dict[str, Any], dict[str, Any]]],
+    source_kind: str,
+    current_text: str,
+) -> str:
+    """Rebuild localized catalog structure while preserving translated rows.
+
+    Localized descriptions are human-authored, so the generator keeps each
+    existing row verbatim and keys it by its canonical skill route. Categories,
+    ordering, additions, and removals still come from the source SKILL.md tree.
+    This prevents a translated row from silently remaining under the wrong
+    category while ``--check`` reports a false green.
+    """
+    if source_kind not in {"bundled", "optional"}:
+        raise ValueError(f"unsupported source kind: {source_kind}")
+
+    first_category = _LOCALIZED_CATEGORY_RE.search(current_text)
+    if first_category is None:
+        raise RuntimeError(f"localized {source_kind} catalog has no category headings")
+
+    prefix = current_text[: first_category.start()].rstrip()
+    footer_start = current_text.find("\n---\n", first_category.start())
+    suffix = current_text[footer_start:].strip() if footer_start != -1 else ""
+
+    translated_rows: dict[str, str] = {}
+    for line in current_text.splitlines():
+        if not line.startswith("|"):
+            continue
+        match = _LOCALIZED_CATALOG_ROW_RE.search(line)
+        if match is None or match.group("source") != source_kind:
+            continue
+        target = match.group("target")
+        if target in translated_rows:
+            raise RuntimeError(f"duplicate localized catalog route: {target}")
+        translated_rows[target] = line
+
+    by_category: dict[
+        str, list[tuple[dict[str, Any], dict[str, Any]]]
+    ] = defaultdict(list)
+    for meta, parsed in entries:
+        if meta["source_kind"] == source_kind:
+            by_category[meta["category"]].append((meta, parsed))
+    for category_entries in by_category.values():
+        category_entries.sort(key=lambda item: item[0]["slug"])
+
+    sections: list[str] = []
+    for category in sorted(by_category):
+        sections.extend(
+            [
+                f"## {category}",
+                "",
+                (
+                    "| 技能 | 描述 | 路径 |"
+                    if source_kind == "bundled"
+                    else "| 技能 | 描述 |"
+                ),
+                (
+                    "|-------|-------------|------|"
+                    if source_kind == "bundled"
+                    else "|-------|-------------|"
+                ),
+            ]
+        )
+        for meta, parsed in by_category[category]:
+            target = _catalog_target(meta)
+            existing_row = translated_rows.get(target)
+            if existing_row is not None:
+                sections.append(existing_row)
+                continue
+
+            frontmatter = parsed["frontmatter"]
+            name = frontmatter.get("name", meta["slug"])
+            description = (frontmatter.get("description") or "").strip()
+            if len(description) > 240:
+                description = description[:237].rstrip() + "..."
+            description = (
+                mdx_escape_body(description)
+                .replace("|", "\\|")
+                .replace("\n", " ")
+            )
+            if source_kind == "bundled":
+                sections.append(
+                    f"| [`{name}`]({target}) | {description} | `{meta['rel_path']}` |"
+                )
+            else:
+                sections.append(f"| [**{name}**]({target}) | {description} |")
+        sections.append("")
+
+    result = prefix + "\n\n" + "\n".join(sections).rstrip() + "\n"
+    if suffix:
+        result += "\n" + suffix + "\n"
+    return result
 
 
 def build_sidebar_items(entries: list[tuple[dict[str, Any], dict[str, Any]]]) -> dict:
@@ -650,7 +774,8 @@ def _render_sidebar_item(item: Any, indent: int) -> list[str]:
     return lines
 
 
-def write_sidebar(entries):
+def render_sidebar(entries, text: str) -> str:
+    """Return ``sidebars.ts`` with its generated Skills block replaced."""
     # Sidebar layout:
     #   Skills
     #   ├── reference/skills-catalog
@@ -694,18 +819,7 @@ def write_sidebar(entries):
     }
     skills_subtree = "\n".join(_render_sidebar_item(skills_top, 8)) + "\n"
 
-    sidebar_path = REPO / "website" / "sidebars.ts"
-    text = sidebar_path.read_text(encoding="utf-8")
-    # Replace the existing Skills block.
-    pattern = re.compile(
-        r"        \{\n"
-        r"          type: 'category',\n"
-        r"          label: 'Skills',\n"
-        r"(?:.*?\n)*?"
-        r"        \},\n",
-        re.DOTALL,
-    )
-    # Safer: match the exact current block shape.
+    # Replace the existing Skills block by matching its exact current shape.
     old_block_start = "        {\n          type: 'category',\n          label: 'Skills',\n"
     i = text.find(old_block_start)
     if i == -1:
@@ -727,47 +841,127 @@ def write_sidebar(entries):
     else:
         raise RuntimeError("Could not find end of Skills sidebar block")
 
-    new_text = text[:i] + skills_subtree + text[end:]
-    sidebar_path.write_text(new_text, encoding="utf-8")
-    print(f"Updated sidebar: {sidebar_path}")
+    return text[:i] + skills_subtree + text[end:]
 
-
-def main():
-    entries = discover_skills()
-    print(f"Discovered {len(entries)} skills")
-
-    # Build name -> meta index for related-skill cross-linking
+def build_skill_index(entries) -> dict[str, dict[str, Any]]:
+    """Build the name-to-metadata index used for related-skill links."""
     skill_index: dict[str, dict[str, Any]] = {}
     for meta, parsed in entries:
         name = parsed["frontmatter"].get("name", meta["slug"])
         # Prefer bundled over optional if a name collision exists
         if name not in skill_index or meta["source_kind"] == "bundled":
             skill_index[name] = meta
+    return skill_index
 
-    # Write per-skill pages
-    written = 0
+
+def expected_outputs(entries) -> dict[Path, str]:
+    """Return every generated artifact and its expected content."""
+    skill_index = build_skill_index(entries)
+    outputs: dict[Path, str] = {}
+
     for meta, parsed in entries:
-        out_path = page_output_path(meta)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        content = render_skill_page(
+        outputs[page_output_path(meta)] = render_skill_page(
             meta, parsed["frontmatter"], parsed["body"], skill_index=skill_index
         )
-        out_path.write_text(content, encoding="utf-8")
-        written += 1
-    print(f"Wrote {written} per-skill pages under {SKILLS_PAGES}")
 
-    # Regenerate catalogs
-    bundled_catalog = build_catalog_md_bundled(entries)
-    (DOCS / "reference" / "skills-catalog.md").write_text(bundled_catalog, encoding="utf-8")
+    outputs[DOCS / "reference" / "skills-catalog.md"] = build_catalog_md_bundled(entries)
+    outputs[DOCS / "reference" / "optional-skills-catalog.md"] = build_catalog_md_optional(entries)
+    outputs[ZH_BUNDLED_CATALOG] = synchronize_localized_catalog(
+        entries,
+        "bundled",
+        ZH_BUNDLED_CATALOG.read_text(encoding="utf-8"),
+    )
+    outputs[ZH_OPTIONAL_CATALOG] = synchronize_localized_catalog(
+        entries,
+        "optional",
+        ZH_OPTIONAL_CATALOG.read_text(encoding="utf-8"),
+    )
+
+    sidebar_path = REPO / "website" / "sidebars.ts"
+    outputs[sidebar_path] = render_sidebar(
+        entries, sidebar_path.read_text(encoding="utf-8")
+    )
+    return outputs
+
+
+def existing_generated_pages() -> set[Path]:
+    """Return generated skill pages currently present on disk."""
+    pages: set[Path] = set()
+    for source_kind in ("bundled", "optional"):
+        root = SKILLS_PAGES / source_kind
+        if root.exists():
+            pages.update(root.rglob("*.md"))
+    return pages
+
+
+def generated_output_drift(entries) -> dict[str, list[Path]]:
+    """Classify missing, stale, and orphaned generated artifacts."""
+    outputs = expected_outputs(entries)
+    missing: list[Path] = []
+    stale: list[Path] = []
+    for path, content in outputs.items():
+        if not path.exists():
+            missing.append(path)
+        elif path.read_text(encoding="utf-8") != content:
+            stale.append(path)
+
+    expected_pages = {path for path in outputs if SKILLS_PAGES in path.parents}
+    orphaned = sorted(existing_generated_pages() - expected_pages)
+    return {
+        "missing": sorted(missing),
+        "stale": sorted(stale),
+        "orphaned": orphaned,
+    }
+
+
+def check_generated_outputs(entries, *, report: bool = True) -> bool:
+    """Return whether checked-in generated artifacts match their sources."""
+    drift = generated_output_drift(entries)
+    clean = not any(drift.values())
+    if report:
+        if clean:
+            print("Generated skill documentation is synchronized.")
+        else:
+            for kind, paths in drift.items():
+                for path in paths:
+                    print(f"{kind}: {path.relative_to(REPO)}")
+    return clean
+
+
+def write_outputs(entries) -> None:
+    """Write expected artifacts and remove pages with no source skill."""
+    outputs = expected_outputs(entries)
+    expected_pages = {path for path in outputs if SKILLS_PAGES in path.parents}
+    orphaned = sorted(existing_generated_pages() - expected_pages)
+    for path in orphaned:
+        path.unlink()
+        print(f"Removed orphaned generated page: {path.relative_to(REPO)}")
+
+    for path, content in outputs.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    print(f"Wrote {len(expected_pages)} per-skill pages under {SKILLS_PAGES}")
     print("Updated reference/skills-catalog.md")
-
-    optional_catalog = build_catalog_md_optional(entries)
-    (DOCS / "reference" / "optional-skills-catalog.md").write_text(optional_catalog, encoding="utf-8")
     print("Updated reference/optional-skills-catalog.md")
+    print("Updated zh-Hans translated skill catalogs")
+    print(f"Updated sidebar: {REPO / 'website' / 'sidebars.ts'}")
 
-    # Update sidebar
-    write_sidebar(entries)
+
+def main(*, check: bool = False) -> int:
+    entries = discover_skills()
+    print(f"Discovered {len(entries)} skills")
+    if check:
+        return 0 if check_generated_outputs(entries) else 1
+    write_outputs(entries)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="fail without writing if generated pages, catalogs, or sidebar drifted",
+    )
+    args = parser.parse_args()
+    raise SystemExit(main(check=args.check))

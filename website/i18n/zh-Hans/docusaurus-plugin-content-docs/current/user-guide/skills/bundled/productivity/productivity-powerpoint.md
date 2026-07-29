@@ -16,8 +16,12 @@ description: "创建、读取、编辑"
 |---|---|
 | 来源 | 内置（默认安装） |
 | 路径 | `skills/productivity/powerpoint` |
+| 版本 | `2.0.0` |
+| 作者 | Anthropic（由 Nous Research 改编） |
 | 许可证 | 专有。完整条款见 LICENSE.txt |
 | 平台 | linux, macos, windows |
+| 标签 | `PowerPoint`, `PPTX`, `Presentations`, `Office`, `Productivity` |
+| 相关 skill | [`docx`](/user-guide/skills/bundled/productivity/productivity-docx), [`xlsx`](/user-guide/skills/bundled/productivity/productivity-xlsx), [`pdf`](/user-guide/skills/bundled/productivity/productivity-pdf) |
 
 ## 参考：完整 SKILL.md
 
@@ -229,7 +233,7 @@ Report ALL issues found, including minor ones.
 
 ---
 
-## 转换为图片
+## 转换为图片 {#converting-to-images}
 
 将演示文稿转换为单张幻灯片图片以供视觉检查：
 

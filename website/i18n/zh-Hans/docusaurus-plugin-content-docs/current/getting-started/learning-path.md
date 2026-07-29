@@ -18,15 +18,15 @@ Hermes Agent 功能丰富——CLI 助手、Telegram/Discord 机器人、任务�
 - **有明确目标？** 跳至[按使用场景](#by-use-case)，找到匹配的场景。
 - **随便浏览？** 查看[主要功能](#key-features-at-a-glance)表格，快速了解 Hermes Agent 的全部能力。
 
-## 按经验水平
+## 按经验水平 {#by-experience-level}
 
 | 水平 | 目标 | 推荐阅读 | 预计时间 |
 |---|---|---|---|
 | **初级** | 快速上手，进行基本对话，使用内置工具 | [安装](/getting-started/installation) → [快速入门](/getting-started/quickstart) → [CLI 用法](/user-guide/cli) → [配置](/user-guide/configuration) | 约 1 小时 |
 | **中级** | 搭建消息机器人，使用记忆、cron 任务、技能等高级功能 | [会话](/user-guide/sessions) → [消息](/user-guide/messaging) → [工具](/user-guide/features/tools) → [技能](/user-guide/features/skills) → [记忆](/user-guide/features/memory) → [Cron](/user-guide/features/cron) | 约 2–3 小时 |
-| **高级** | 构建自定义工具、创建技能、使用强化学习训练模型、参与项目贡献 | [架构](/developer-guide/architecture) → [添加工具](/developer-guide/adding-tools) → [创建技能](/developer-guide/creating-skills) → [强化学习训练](/user-guide/features/rl-training) → [贡献指南](/developer-guide/contributing) | 约 4–6 小时 |
+| **高级** | 构建自定义工具、创建技能、使用可选的 ML/MLOps 技能、参与项目贡献 | [架构](/developer-guide/architecture) → [添加工具](/developer-guide/adding-tools) → [创建技能](/developer-guide/creating-skills) → [ML/MLOps 技能](/reference/optional-skills-catalog#mlops) → [贡献指南](/developer-guide/contributing) | 约 4–6 小时 |
 
-## 按使用场景
+## 按使用场景 {#by-use-case}
 
 选择与您目标匹配的场景，每个场景均按推荐顺序链接到相关文档。
 
@@ -95,11 +95,11 @@ Cron 任务让 Hermes Agent 按计划执行任务——每日摘要、定期检�
 
 ### "我想训练模型"
 
-使用强化学习（RL）通过 Hermes Agent 内置的 RL 训练流水线对模型行为进行微调。
+使用 Hermes Agent 的可选 ML/MLOps 技能探索微调、偏好优化与强化学习工作流。
 
 1. [快速入门](/getting-started/quickstart)
 2. [配置](/user-guide/configuration)
-3. [强化学习训练](/user-guide/features/rl-training)
+3. [ML/MLOps 技能目录](/reference/optional-skills-catalog#mlops)
 4. [Provider 路由](/user-guide/features/provider-routing)
 5. [架构](/developer-guide/architecture)
 
@@ -118,7 +118,7 @@ Cron 任务让 Hermes Agent 按计划执行任务——每日摘要、定期检�
 5. [工具](/user-guide/features/tools)
 6. [会话](/user-guide/sessions)
 
-## 主要功能一览
+## 主要功能一览 {#key-features-at-a-glance}
 
 不确定有哪些功能？以下是主要功能的快速目录：
 
@@ -135,7 +135,7 @@ Cron 任务让 Hermes Agent 按计划执行任务——每日摘要、定期检�
 | **浏览器** | 网页浏览与抓取 | [浏览器](/user-guide/features/browser) |
 | **Hooks** | 事件驱动的回调与中间件 | [Hooks](/user-guide/features/hooks) |
 | **批处理** | 批量处理多个输入 | [批处理](/user-guide/features/batch-processing) |
-| **强化学习训练** | 使用强化学习微调模型 | [强化学习训练](/user-guide/features/rl-training) |
+| **ML/MLOps 技能** | 探索模型微调、偏好优化和强化学习 | [可选技能目录](/reference/optional-skills-catalog#mlops) |
 | **Provider 路由** | 在多个 LLM provider 之间路由请求 | [Provider 路由](/user-guide/features/provider-routing) |
 
 ## 下一步阅读

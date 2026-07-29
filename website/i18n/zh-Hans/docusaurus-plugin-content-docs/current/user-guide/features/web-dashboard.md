@@ -14,7 +14,7 @@ Web Dashboard 是一个基于浏览器的 UI，用于管理你的 Hermes Agent �
 hermes dashboard
 ```
 
-这将启动一个本地 Web 服务器，并在浏览器中打开 `http://127.0.0.1:9119`。Dashboard 完全在你的机器上运行——数据不会离开 localhost。
+这会在本机回环接口启动 Web 服务器，并在浏览器中打开 `http://127.0.0.1:9119`。Dashboard 监听器及其本地状态留在你的机器上；已配置的模型、工具、更新或身份验证提供商仍可能按正常方式发出网络请求。
 
 ### 选项
 
@@ -23,18 +23,33 @@ hermes dashboard
 | `--port` | `9119` | Web 服务器运行端口 |
 | `--host` | `127.0.0.1` | 绑定地址 |
 | `--no-open` | — | 不自动打开浏览器 |
-| `--insecure` | 关闭 | 允许绑定到非 localhost 主机（**危险**——会在网络上暴露 API 密钥；请配合防火墙和强认证使用） |
+| `--insecure` | 已弃用 | 此标志会被忽略，不能绕过身份验证；非回环绑定仍必须配置受支持的身份验证提供商 |
+| `--isolated` | 关闭 | 从命名 profile（如 `worker dashboard`）启动时，运行独立的 per-profile 服务器，而不是路由到机器级 Dashboard |
 
 ```bash
 # 自定义端口
 hermes dashboard --port 8080
 
-# 绑定到所有接口（在共享网络上请谨慎使用）
+# 绑定到所有接口（必须先配置身份验证提供商）
 hermes dashboard --host 0.0.0.0
 
 # 启动时不打开浏览器
 hermes dashboard --no-open
 ```
+
+## 管理多个 profile {#managing-multiple-profiles}
+
+Dashboard 是一个**机器级**管理界面：同一台机器上的一个服务器管理所有 [profile](../profiles.md)。当存在多个 profile 时，侧边栏会显示 profile 切换器；Config、API Keys、Skills、MCP、Models 和 Chat 页面都以该选择为读写目标。选择的不是 Dashboard 自身 profile 时，页面会显示醒目的目标提示，避免把更改写入错误的 `HERMES_HOME`。
+
+当前选择保存在 URL 的 `?profile=<name>` 参数中，因此深链接（如 `http://127.0.0.1:9119/skills?profile=worker`）可在刷新后保留目标。通过 profile 别名启动时，Hermes 默认路由到机器级 Dashboard，而不是启动第二个服务器：
+
+```bash
+worker dashboard
+# 已在运行：打开 ?profile=worker
+# 尚未运行：启动机器级 Dashboard，并预选 worker
+```
+
+只有显式传入 `--isolated` 才会为该命名 profile 启动独立服务器。Chat 也跟随切换器：切换 profile 会以所选 profile 的 `HERMES_HOME` 启动新的 PTY 会话。Gateway 进程、各 profile 的会话数据库以及 cron 调度器仍保持 per-profile；Gateway 应通过 `hermes -p <name> gateway …` 管理，Cron 页面使用自己的跨 profile 聚合与过滤。
 
 ## 前置条件
 
@@ -63,7 +78,7 @@ Chat 标签页是每次 `hermes dashboard` 启动的一部分——内嵌的浏�
 
 状态页每 5 秒自动刷新一次。
 
-### Chat（聊天）
+### Chat（聊天） {#chat}
 
 **Chat** 标签页将完整的 Hermes TUI（与 `hermes --tui` 相同的界面）直接嵌入浏览器。你在终端 TUI 中能做的一切——斜杠命令、模型选择器、工具调用卡片、Markdown 流式输出、clarify/sudo/approval 提示、皮肤主题——在这里都完全一致，因为 Dashboard 运行的是真实的 TUI 二进制文件，并通过 [xterm.js](https://xtermjs.org/) 的 WebGL 渲染器以像素级精度渲染其 ANSI 输出。
 
@@ -178,7 +193,7 @@ Chat 标签页是每次 `hermes dashboard` 启动的一部分——内嵌的浏�
 - **Toolsets** — 单独的部分显示内置工具集（文件操作、Web 浏览等），包含其活跃/非活跃状态、设置要求和包含的工具列表
 
 :::warning 安全提示
-Web Dashboard 会读写包含 API 密钥和机密的 `.env` 文件。它默认绑定到 `127.0.0.1`——只能从本机访问。如果绑定到 `0.0.0.0`，网络上的任何人都可以查看和修改你的凭据。Dashboard 本身没有任何认证机制。
+Web Dashboard 会读写包含 API 密钥和机密的 `.env` 文件。它默认绑定到 `127.0.0.1`，且敏感 API 仍受每进程 session token 保护。非回环绑定（包括 `0.0.0.0`）在没有受支持身份验证提供商时会 fail-closed；对外提供服务时还应使用 TLS 终止或受信 VPN。
 :::
 
 ## `/reload` 斜杠命令
@@ -291,6 +306,84 @@ Web Dashboard 暴露了一个供前端使用的 REST API。你也可以直接调
 ### GET /api/tools/toolsets
 
 返回所有工具集，包含其标签、描述、工具列表以及活跃/已配置状态。
+
+## 身份验证（门控模式） {#authentication-gated-mode}
+
+Web Dashboard 与 `hermes serve` 使用同一套身份验证门控。只有少量只读端点保持公开：`/api/health`、`/api/status`、配置 schema/defaults、模型元数据以及主题/插件清单；机器调用端点另行使用 JWT 或 bearer token 身份验证。回环地址上的本地开发不显示身份提供商登录门控，但敏感的 `/api/*` 路由仍要求前端注入的每进程 session token。任何非回环绑定（包括 `0.0.0.0`）都必须配置受支持的身份验证提供商，否则启动会失败。`--insecure` 已弃用，不能绕过身份验证。
+
+### 默认提供商：Nous Research {#default-provider-nous-research}
+
+面向互联网的 Dashboard 或远程 Hermes Desktop 推荐使用 Nous Portal OAuth。先运行：
+
+```bash
+hermes dashboard register
+```
+
+该命令配置 `HERMES_DASHBOARD_OAUTH_CLIENT_ID`（或等价的 `dashboard.oauth.client_id`）。用户通过浏览器完成 OAuth 登录，后端验证回调并签发会话。Nous access token 的有效期为 15 分钟；Portal 同时签发会旋转的 refresh token，其底层会话有效期为 24 小时。access token 过期后，中间件使用 HttpOnly refresh cookie 透明地轮换两种 token；refresh token 过期、撤销或检测到重用时会清除会话并要求重新登录。
+
+| Cookie | 生命周期 | 用途 |
+|--------|----------|------|
+| `hermes_session_at` | Nous access token 的 15 分钟 TTL | HttpOnly、已验证的 session token |
+| `hermes_session_rt` | 底层 token 为 24 小时（浏览器 `Max-Age` 上限为 30 天） | HttpOnly、每次成功刷新后都会替换的旋转 refresh token |
+| `hermes_session_provider` | 浏览器 `Max-Age` 上限为 30 天 | HttpOnly、用于刷新路由的非敏感 provider 提示 |
+
+这些 cookie 使用 `SameSite=Lax` 并限定到当前部署路径。HTTPS 根路径部署使用 `__Host-` 前缀；带路径前缀的 HTTPS 部署使用 `__Secure-` 前缀。
+
+### 用户名/密码提供商（无 OAuth IdP） {#usernamepassword-provider-no-oauth-idp}
+
+可信 LAN 或 VPN 内可使用内置用户名/密码提供商：
+
+```bash
+HASH=$(python -c "from plugins.dashboard_auth.basic import hash_password; print(hash_password('choose-a-strong-password'))")
+cat >> ~/.hermes/.env <<EOF
+HERMES_DASHBOARD_BASIC_AUTH_USERNAME=hermes
+HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=$HASH
+HERMES_DASHBOARD_BASIC_AUTH_SECRET=$(openssl rand -base64 32)
+EOF
+chmod 600 ~/.hermes/.env
+```
+
+应优先保存密码哈希，而不是明文密码，并为会话签名设置稳定的随机 secret。该方式不适合直接暴露到公网；公网部署应使用 OAuth/OIDC 和 TLS。
+
+### 自托管 OIDC 提供商 {#self-hosted-oidc-provider}
+
+如需接入 Keycloak、Authentik、Zitadel、Auth0、Okta 等符合 OIDC 的身份提供商，可配置内置的自托管 OIDC 提供商。将配置持久化到 Hermes 的密钥文件后再启动非回环服务：
+
+```bash
+cat >> ~/.hermes/.env <<'EOF'
+HERMES_DASHBOARD_OIDC_ISSUER=https://auth.example.com/application/o/hermes/
+HERMES_DASHBOARD_OIDC_CLIENT_ID=hermes-dashboard
+HERMES_DASHBOARD_OIDC_SCOPES=openid profile email
+# 仅机密客户端需要；请替换为真实 secret：
+# HERMES_DASHBOARD_OIDC_CLIENT_SECRET=replace-with-client-secret
+EOF
+chmod 600 ~/.hermes/.env
+hermes serve --host 0.0.0.0 --port 9119
+```
+
+在身份提供商中注册**公开 PKCE 客户端**，或注册使用 PKCE 加 `client_secret` 的**机密客户端**，并允许 `<Dashboard 公共 URL>/auth/callback` 作为回调地址。两种模式都使用授权码流程和 PKCE（S256）；机密客户端还需设置 `HERMES_DASHBOARD_OIDC_CLIENT_SECRET`，插件会根据 discovery 元数据选择 `client_secret_basic` 或 `client_secret_post`。PKCE 在两种模式中都保持启用，secret 不会替代它。插件通过 issuer 的 discovery 文档解析端点，并验证 ID token 的签名、`iss` 与 `aud`。非回环 issuer 必须使用 HTTPS；仅本地开发的回环 issuer 可使用 HTTP。配置无效时插件不会注册，非回环 Dashboard 仍保持 fail-closed。
+
+### 自定义提供商 {#custom-providers}
+
+如需接入内置 Nous、用户名/密码或自托管 OIDC 以外的认证系统，请创建 Hermes 插件，实现 `DashboardAuthProvider` 的登录、会话验证、刷新和撤销方法，并通过 `ctx.register_dashboard_auth_provider(...)` 注册。登录页会列出所有已注册的提供商。自定义实现必须保持门控的 fail-closed 行为，不能在认证初始化失败时退回匿名访问。
+
+## 将 Hermes Desktop 连接到远程后端 {#connecting-hermes-desktop-to-a-remote-backend}
+
+Hermes Desktop 有四种独立连接方式：本地托管后端、Hermes Cloud、显式 Remote URL，以及 Desktop 管理的 SSH 后端。完整的生命周期、传输、认证、端口暴露和清理说明见 [Hermes Desktop 指南](/user-guide/desktop)。
+
+Desktop 客户端支持 macOS、Windows 和 Linux；Desktop 管理的 SSH 目标主机同样支持 macOS、Windows 和 Linux。
+
+显式 **Remote URL** 模式连接到由操作者维护的持久后端。远程机器运行：
+
+```bash
+hermes serve --host 0.0.0.0 --port 9119
+```
+
+非回环监听必须先配置 OAuth/OIDC 或可信 LAN/VPN 场景下的用户名/密码认证，并通过 TLS 终止或受信 VPN 保护。然后在 Desktop 的 Gateway 设置中选择 **Remote URL**、输入基础 URL，并按后端公布的方式登录。
+
+无人值守部署也可以在启动 Desktop 前同时设置 `HERMES_DESKTOP_REMOTE_URL` 与 `HERMES_DESKTOP_REMOTE_TOKEN`。这是**仅限静态 token 身份验证**的全局/默认连接覆盖：两个变量都必须设置；对应的全局/默认 Gateway 控件会被锁定，且该连接不提供交互式用户名/密码或 OAuth/OIDC 登录。命名 profile 仍可保存明确的 Cloud、Remote URL 或 SSH 覆盖；设为 Local 的命名 profile 继承环境变量选择的全局后端。交互式提供商应使用应用内 Remote URL 模式。
+
+**SSH** 不是 Remote URL 的别名，也不要求手动创建 tunnel。Desktop 使用系统 OpenSSH，在远程回环地址启动隔离的 `hermes serve --isolated --host 127.0.0.1 --port 0`，并负责客户端回环转发、监控和经过身份验证的复用。正常断开只关闭转发和 SSH 连接；分离的远程后端会继续运行以供后续安全复用。Desktop 只有在能够证明所有权且进程已过期，或启动失败需要回滚时，才会移除远程进程。
 
 ## CORS
 

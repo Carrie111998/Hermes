@@ -22,7 +22,7 @@ description: "为 NeurIPS/ICML/ICLR 撰写 ML 论文：设计→投稿"
 | 依赖项 | `semanticscholar`, `arxiv`, `habanero`, `requests`, `scipy`, `numpy`, `matplotlib`, `SciencePlots` |
 | 平台 | linux, macos |
 | 标签 | `Research`, `Paper Writing`, `Experiments`, `ML`, `AI`, `NeurIPS`, `ICML`, `ICLR`, `ACL`, `AAAI`, `COLM`, `LaTeX`, `Citations`, `Statistical Analysis` |
-| 相关 skill | [`arxiv`](/user-guide/skills/bundled/research/research-arxiv), [`subagent-driven-development`](/user-guide/skills/bundled/software-development/software-development-subagent-driven-development), [`plan`](/user-guide/skills/bundled/software-development/software-development-plan) |
+| 相关 skill | [`arxiv`](/user-guide/skills/bundled/research/research-arxiv), [`subagent-driven-development`](/user-guide/skills/optional/software-development/software-development-subagent-driven-development), [`plan`](/user-guide/skills/bundled/software-development/software-development-plan) |
 
 ## 参考：完整 SKILL.md
 
@@ -2076,7 +2076,7 @@ ACL 系列会议有不同的投稿类型：
 
 ---
 
-## 超越实证 ML 的论文类型
+## 超越实证 ML 的论文类型 {#paper-types-beyond-empirical-ml}
 
 上述主要流水线针对实证 ML 论文。其他论文类型需要不同的结构和证据标准。每种类型的详细指导请参见 [references/paper-types.md](https://github.com/NousResearch/hermes-agent/blob/main/skills/research/research-paper-writing/references/paper-types.md)。
 

@@ -9,7 +9,7 @@ sidebar_position: 3
 
 Hermes 可在 Windows 10 和 Windows 11 上原生运行——无需 WSL、Cygwin 或 Docker。本页是深度指南：原生支持哪些功能、哪些仅限 WSL、安装程序实际做了什么，以及你可能需要调整的 Windows 专属配置项。
 
-如果你只是想安装，[首页](/) 或[安装页面](../getting-started/installation#windows原生powershell)上的一行命令就够了。遇到意外情况时再回来查阅本页。
+如果你只是想安装，[首页](/) 或[安装页面](../getting-started/installation#windows-native)上的一行命令就够了。遇到意外情况时再回来查阅本页。
 
 :::tip 想用 WSL？
 如果你更倾向于真正的 POSIX 环境（用于 dashboard 内嵌终端、`fork` 语义、Linux 风格文件监视器等），请参阅 **[Windows（WSL2）指南](./windows-wsl-quickstart.md)**。两者可以干净共存：原生数据存放在 `%LOCALAPPDATA%\hermes`，WSL 数据存放在 `~/.hermes`。
@@ -43,7 +43,7 @@ iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 
 安装程序会自动重试不稳定的 git 拉取，并剥离下载的 `install.ps1` 内容中的 BOM，因此 HTTP 传输中携带的 UTF-8 BOM 不再会破坏 `[scriptblock]::Create((irm ...))` 形式。
 
-### 桌面安装程序（备选方案）
+### 桌面安装程序（备选方案） {#desktop-installer-alternative}
 
 也提供了一个轻量 GUI 安装程序——如果你更倾向于双击 `.exe` 而非打开 PowerShell，可以使用它。下载 Hermes Desktop，运行安装程序，首次启动时 GUI 会在后台调用 `install.ps1` 来配置 Python（通过 `uv`）、Node、PortableGit 以及下文描述的其余依赖引导流程。首次运行后，桌面应用与 PowerShell 安装的 `hermes` CLI 共享同一个 `%LOCALAPPDATA%\hermes\hermes-agent` 安装目录和 `%USERPROFILE%\.hermes` 数据目录——可以在 GUI 和 CLI 之间自由切换。
 
@@ -82,7 +82,7 @@ iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 在 Windows 上，逐个配置工具 API key（Firecrawl、FAL、Browser Use、OpenAI TTS）是获得可用 agent 摩擦最大的部分。[Nous Portal](/user-guide/features/tool-gateway) 订阅通过一次 OAuth 登录即可覆盖模型**以及**所有这些工具。安装程序完成后，运行 `hermes setup --portal` 完成配置。
 :::
 
-## 功能矩阵
+## 功能矩阵 {#feature-matrix}
 
 除 dashboard 内嵌终端面板外，所有功能均可在 Windows 上原生运行。
 
@@ -101,7 +101,7 @@ iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 
 Dashboard 的 `/chat` 标签页通过 POSIX PTY（`ptyprocess`）内嵌了真实终端。原生 Windows 没有等效的原语；Python 的 `pywinpty` / Windows ConPTY 可以实现，但需要单独的实现——视为未来工作。**dashboard 的其余部分均可原生运行**——只有该标签页会显示"请使用 WSL2"的提示横幅。
 
-## Hermes 在 Windows 上如何运行 shell 命令
+## Hermes 在 Windows 上如何运行 shell 命令 {#how-hermes-runs-shell-commands-on-windows}
 
 Hermes 的终端工具通过 **Git Bash** 运行命令，与 Claude Code 采用相同策略。这在不重写每个工具的情况下绕过了 POSIX 与 Windows 的差异。
 

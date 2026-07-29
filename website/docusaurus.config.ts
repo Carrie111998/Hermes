@@ -13,12 +13,16 @@ const config: Config = {
   organizationName: 'NousResearch',
   projectName: 'hermes-agent',
 
-  onBrokenLinks: 'warn',
+  // Broken navigation is a release blocker. Keep all three checks fatal so a
+  // successful production build means the site has no known link defects.
+  onBrokenLinks: 'throw',
+  onBrokenAnchors: 'throw',
+  onDuplicateRoutes: 'throw',
 
   markdown: {
     mermaid: true,
     hooks: {
-      onBrokenMarkdownLinks: 'warn',
+      onBrokenMarkdownLinks: 'throw',
     },
   },
 

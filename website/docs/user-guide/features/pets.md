@@ -18,7 +18,7 @@ the agent's behavior** — the sprite is a display concern only. The feature is
 ## How it works
 
 - Pets are installed into your profile's `pets/` directory
-  (`<HERMES_HOME>/pets/<slug>/`), so each [profile](../profiles.md) keeps its
+  (`<HERMES_HOME>/pets/<slug>/`), so each [profile](/user-guide/profiles) keeps its
   own set.
 - Selecting a pet writes `display.pet.slug` and `display.pet.enabled` to
   `config.yaml` — nothing is stored as a secret or env var.
@@ -206,6 +206,6 @@ Common gotchas:
 
 ## See also
 
-- The [`hermes-agent` skill](../skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent.md)
+- The [`hermes-agent` skill](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent)
   lets the agent install and switch pets for you on request (see its
   `references/petdex.md`).

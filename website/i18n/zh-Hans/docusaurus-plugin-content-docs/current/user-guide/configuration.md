@@ -122,7 +122,7 @@ terminal:
 Agent 拥有与您的用户账户相同的文件系统访问权限。使用 `hermes tools` 禁用不需要的工具，或切换到 Docker 进行沙箱隔离。
 :::
 
-### Docker 后端
+### Docker 后端 {#docker-backend}
 
 在具有安全加固的 Docker 容器内运行命令（所有权限已删除、无权限提升、PID 限制）。
 
@@ -166,7 +166,7 @@ terminal:
 
 **凭据转发：** `docker_forward_env` 中列出的环境变量首先从您的 shell 环境解析，然后回退到 `~/.hermes/.env`。技能也可以声明 `required_environment_variables`，这些变量会自动合并。
 
-### SSH 后端
+### SSH 后端 {#ssh-backend}
 
 通过 SSH 在远程服务器上运行命令。使用 ControlMaster 进行连接复用（5 分钟空闲保活）。默认启用持久 shell —— 状态（cwd、环境变量）在命令之间保持。
 
@@ -411,7 +411,7 @@ export TERMINAL_LOCAL_PERSISTENT=true
 
 有关每个后端的详细信息，请参阅[代码执行](features/code-execution.md)和 [README 的终端部分](features/tools.md)。
 
-## 技能设置
+## 技能设置 {#skill-settings}
 
 技能可以通过其 SKILL.md frontmatter 声明自己的配置设置。这些是非机密值（路径、偏好、域设置），存储在 `config.yaml` 的 `skills.config` 命名空间下。
 
@@ -541,7 +541,7 @@ worktree: true    # 始终创建 worktree（与 hermes -w 相同）
 node_modules/
 ```
 
-## 上下文压缩
+## 上下文压缩 {#context-compression}
 
 Hermes 自动压缩长对话以保持在模型的上下文窗口内。压缩摘要器是一个单独的 LLM 调用 —— 您可以将其指向任何 provider 或端点。
 
@@ -693,7 +693,7 @@ Hermes 对流式传输有单独的超时层，以及用于非流式调用的陈�
 
 上下文压力是自动的 —— 无需配置。它纯粹作为面向用户的通知触发，不修改消息流或向模型上下文注入任何内容。
 
-## 凭据池策略
+## 凭据池策略 {#credential-pool-strategies}
 
 当您为同一 provider 拥有多个 API 密钥或 OAuth token 时，配置轮换策略：
 
@@ -705,7 +705,7 @@ credential_pool_strategies:
 
 选项：`fill_first`（默认）、`round_robin`、`least_used`、`random`。完整文档请参阅[凭据池](/user-guide/features/credential-pools)。
 
-## Prompt 缓存
+## Prompt 缓存 {#prompt-caching}
 
 当活跃 provider 支持时，Hermes 自动开启跨会话 prompt 缓存 —— 无需用户配置。
 
@@ -715,7 +715,7 @@ Qwen Cloud（阿里巴巴 DashScope）上游将缓存 TTL 限制为 5 分钟，�
 
 不存在禁用此功能的旋钮 —— 缓存始终开启，即使在单轮对话中也能节省费用，因为仅系统提示词就占输入 token 数的相当大比例。
 
-## 辅助模型
+## 辅助模型 {#auxiliary-models}
 
 Hermes 使用"辅助"模型处理图像分析、网页摘要、浏览器截图分析、会话标题生成和上下文压缩等附带任务。默认情况下（`auxiliary.*.provider: "auto"`），Hermes 将每个辅助任务路由到您的**主聊天模型** —— 与您在 `hermes model` 中选择的相同 provider/模型。您无需配置任何内容即可开始，但请注意，在昂贵的推理模型（Opus、MiniMax M2.7 等）上，辅助任务会增加显著成本。如果您希望无论主模型如何都使用便宜且快速的附带任务，请显式设置 `auxiliary.<task>.provider` 和 `auxiliary.<task>.model`（例如，在 OpenRouter 上使用 Gemini Flash 进行视觉和网页提取）。
 
@@ -781,7 +781,7 @@ Hermes 中的每个模型槽位 —— 辅助任务、压缩、回退 —— 使
 `"main"` provider 选项表示"使用我的主 agent 使用的任何 provider" —— 它仅在 `auxiliary:`、`compression:` 和 `fallback_model:` 配置中有效。它**不是**顶级 `model.provider` 设置的有效值。如果您使用自定义 OpenAI 兼容端点，请在 `model:` 部分设置 `provider: custom`。所有主模型 provider 选项请参阅 [AI Providers](/integrations/providers)。
 :::
 
-### 完整辅助配置参考
+### 完整辅助配置参考 {#full-auxiliary-config-reference}
 
 ```yaml
 auxiliary:
@@ -886,7 +886,7 @@ auxiliary:
 
 `fallback_chain` 适用于任何辅助任务 —— `compression`、`vision`、`web_extract`、`approval`、`skills_hub`、`mcp` 等。
 
-### OpenRouter 路由和辅助任务的 Pareto Code
+### OpenRouter 路由和辅助任务的 Pareto Code {#openrouter-routing--pareto-code-for-auxiliary-tasks}
 
 当辅助任务解析到 OpenRouter（显式或通过 `provider: "main"` 而您的主 agent 在 OpenRouter 上）时，主 agent 的 `provider_routing` 和 `openrouter.min_coding_score` 设置**不会传播** —— 按设计，每个辅助任务是独立的。要为特定辅助任务设置 OpenRouter provider 偏好或使用 [Pareto Code 路由器](/integrations/providers#openrouter-pareto-code-router)，请通过 `extra_body` 按任务设置：
 
@@ -1139,7 +1139,7 @@ tts:
 
 **速度回退层次：** provider 特定速度（例如 `tts.edge.speed`）→ 全局 `tts.speed` → `1.0` 默认值。设置全局 `tts.speed` 以在所有 provider 上应用统一速度，或按 provider 覆盖以进行精细控制。
 
-## 显示设置
+## 显示设置 {#display-settings}
 
 ```yaml
 display:
@@ -1375,7 +1375,7 @@ whatsapp:
 - `ignore` 静默丢弃未授权的 DM。
 - 平台部分覆盖全局默认值，因此您可以在广泛范围内保持配对启用，同时使一个平台更安静。
 
-## 快速命令
+## 快速命令 {#quick-commands}
 
 定义自定义命令，这些命令要么在不调用 LLM 的情况下运行 shell 命令，要么将一个斜杠命令别名为另一个。Exec 快速命令是零 token 的，对于从消息平台（Telegram、Discord 等）进行快速服务器检查或实用脚本很有用。
 
@@ -1550,7 +1550,7 @@ security:
 - `tirith_timeout` —— 等待 tirith 扫描的最大秒数。如果扫描超时，命令继续执行。
 - `tirith_fail_open` —— 为 `true`（默认）时，如果 tirith 不可用或失败，允许命令执行。设置为 `false` 以在 tirith 无法验证时阻止命令。
 
-## 网站黑名单
+## 网站黑名单 {#website-blocklist}
 
 阻止 agent 的 web 和浏览器工具访问特定域名：
 

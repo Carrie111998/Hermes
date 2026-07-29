@@ -221,7 +221,7 @@ python -m pip install -e '.[termux]' -c constraints-termux.txt
 
 ---
 
-## 手机上的已知限制
+## 手机上的已知限制 {#known-limitations-on-phones}
 
 - Docker 后端不可用
 - 通过 `faster-whisper` 进行的本地语音转录在已验证路径中不可用

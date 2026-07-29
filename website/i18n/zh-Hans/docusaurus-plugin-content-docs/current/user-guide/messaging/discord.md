@@ -38,7 +38,7 @@ Hermes 在 Discord 上不是无状态回复的 webhook（网络钩子）。它�
 
 这一点很重要，因为在繁忙服务器中的行为取决于 Discord 路由和 Hermes 会话策略两者。
 
-### Discord 中的会话模型
+### Discord 中的会话模型 {#session-model-in-discord}
 
 默认情况下：
 
@@ -566,7 +566,7 @@ display:
   tool_progress_command: true
 ```
 
-## 斜杠命令访问控制
+## 斜杠命令访问控制 {#slash-command-access-control}
 
 默认情况下，每个允许的用户都可以运行每个斜杠命令。要将你的允许列表分为**管理员**（完整斜杠命令访问权限）和**普通用户**（仅你明确启用的命令），请在 Discord 平台的 `extra` 块中添加 `allow_admin_from` 和 `user_allowed_commands`：
 
@@ -809,7 +809,7 @@ DISCORD_ALLOWED_ROLES=987654321098765432,876543210987654321
 
 当管理团队频繁变动时，这是首选模式——新管理员一旦被授予角色即可获得访问权限，无需编辑 `.env` 或重启网关。
 
-### 提及控制
+### 提及控制 {#mention-control}
 
 默认情况下，Hermes 会阻止机器人 ping `@everyone`、`@here` 和角色提及，即使其回复中包含这些 token 也不例外。这可防止措辞不当的 prompt 或回显的用户内容向整个服务器发送垃圾消息。个人 `@user` ping 和回复引用 ping（"回复……"小标签）保持启用，以便正常对话仍然有效。
 

@@ -13,7 +13,7 @@ Docker 与 Hermes Agent 的交集有两种截然不同的方式：
 
 本页介绍选项 1。容器将所有用户数据（配置、API 密钥、会话、技能、记忆）存储在从宿主机挂载于 `/opt/data` 的单个目录中。镜像本身是无状态的，可通过拉取新版本进行升级而不会丢失任何配置。
 
-## 快速开始
+## 快速开始 {#quick-start}
 
 如果这是你第一次运行 Hermes Agent，请在宿主机上创建一个数据目录，并以交互方式启动容器以运行设置向导：
 
@@ -84,12 +84,9 @@ Dashboard 由 s6 监管：若进程崩溃，`s6-supervise` 会在短暂退避后
 
 容器内的 dashboard 默认绑定 `0.0.0.0`，否则发布的 `-p 9119:9119` 端口将无法从宿主机访问。若你要把它限制在容器回环地址（例如 sidecar / 反向代理拓扑），请显式设置 `HERMES_DASHBOARD_HOST=127.0.0.1`。
 
-当以下两项同时满足时，dashboard 的鉴权门控会自动启用：
+只要绑定地址为非回环地址（例如容器内默认的 `0.0.0.0`），dashboard 的鉴权门控就会自动启用。此时必须至少有一个 `DashboardAuthProvider` 成功注册，否则服务会 fail-closed 并终止启动。
 
-1. 绑定地址为非回环地址，**且**
-2. 注册了一个 `DashboardAuthProvider` 插件。
-
-有三种内置方式可满足第二个条件：
+有三种内置方式可满足该提供方要求：
 
 - **用户名/密码** —— 最简单的自托管 / 局域网 / VPN 内部署方式：设置 `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` + `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD`（以及用于跨重启稳定 session 的 `HERMES_DASHBOARD_BASIC_AUTH_SECRET`）。不适合直接暴露到公网上。
 - **OAuth（Nous Portal）** —— 适合托管/公网部署：设置 `HERMES_DASHBOARD_OAUTH_CLIENT_ID` 后，`dashboard_auth/nous` 提供者会自动激活。
@@ -184,7 +181,7 @@ docker exec hermes hermes -p coder gateway restart
 docker exec hermes hermes -p coder gateway status
 ```
 
-若第二个 profile 也要暴露 OpenAI 兼容 API server，请在**该 profile 自己的** `.env` 中设置不同的 `API_SERVER_PORT`，然后重启该 profile 的 gateway；不要把端口放进容器级 `environment:`，否则所有 profile 都会争抢同一个端口。更底层的监管细节见后文的 [Per-profile gateway 监管](#per-profile-gateway-监管)。
+若第二个 profile 也要暴露 OpenAI 兼容 API server，请在**该 profile 自己的** `.env` 中设置不同的 `API_SERVER_PORT`，然后重启该 profile 的 gateway；不要把端口放进容器级 `environment:`，否则所有 profile 都会争抢同一个端口。更底层的监管细节见后文的 [Per-profile gateway 监管](#per-profile-gateway-supervision)。
 
 ## 环境变量转发
 
@@ -233,7 +230,7 @@ services:
           cpus: "2.0"
 ```
 
-使用 `docker compose up -d` 启动，使用 `docker compose logs -f` 查看日志。Dashboard 的 stdout/stderr 会直接出现在这里；gateway 主日志则写入每个 profile 的 s6 日志文件，见下方的 [Per-profile gateway 监管](#per-profile-gateway-监管)。
+使用 `docker compose up -d` 启动，使用 `docker compose logs -f` 查看日志。Dashboard 的 stdout/stderr 会直接出现在这里；gateway 主日志则写入每个 profile 的 s6 日志文件，见下方的 [Per-profile gateway 监管](#per-profile-gateway-supervision)。
 
 ## 资源限制
 
@@ -258,7 +255,7 @@ docker run -d \
   nousresearch/hermes-agent gateway run
 ```
 
-## Dockerfile 说明
+## Dockerfile 说明 {#what-the-dockerfile-does}
 
 官方镜像基于 `debian:13.4`，包含：
 
@@ -289,7 +286,7 @@ docker run -d \
 除非你在命令链中保留 `/init`（或等效的旧版 `docker/entrypoint.sh` shim，它会转发到 stage2 hook），否则不要覆盖镜像入口点。s6-overlay 的 `/init` 以 root 运行，以便在首次启动时对卷执行 chown，然后通过 `s6-setuidgid` 为每个受监管的服务**以及**主程序降权至 `hermes` 用户。在官方镜像内以 root 启动 `hermes gateway run` 默认会被拒绝，因为这可能在 `/opt/data` 中留下 root 所有的文件，导致后续 dashboard 或 gateway 启动失败。仅在你有意接受该风险时才设置 `HERMES_ALLOW_ROOT_GATEWAY=1`。
 :::
 
-### Per-profile gateway 监管
+### Per-profile gateway 监管 {#per-profile-gateway-supervision}
 
 在容器内，每个通过 `hermes profile create <name>` 创建的 profile 都会自动在 `/run/service/gateway-<name>/` 注册一个受 s6 监管的 gateway 服务。你在宿主机上运行的生命周期命令在此同样适用：
 
@@ -417,7 +414,7 @@ networks:
 
 如果某个工具可能对大多数 Hermes Agent 用户有用，考虑将其贡献到上游，而不是在私有派生镜像中维护。在 [hermes-agent 仓库](https://github.com/NousResearch/hermes-agent)提交 issue 或 pull request，描述该工具及其使用场景。被纳入官方镜像的工具惠及所有用户，并避免了维护下游 fork 的开销。
 
-## 连接本地推理服务器（vLLM、Ollama 等）
+## 连接本地推理服务器（vLLM、Ollama 等） {#connecting-to-local-inference-servers-vllm-ollama-etc}
 
 在 Docker 中运行 Hermes 且推理服务器（vLLM、Ollama、text-generation-inference 等）也在宿主机或另一个容器中运行时，网络配置需要额外注意。
 

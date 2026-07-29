@@ -6,7 +6,7 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 
 # 环境变量参考
 
-所有变量均写入 `~/.hermes/.env`。也可以使用 `hermes config set VAR value` 进行设置。
+Hermes 从进程环境读取环境变量；用户管理的密钥也可以放在 `~/.hermes/.env`。API key、bot token、OAuth secret 和其他凭据应保存在 `.env` 中；存在对应配置键时，非密钥行为设置应优先写入 `config.yaml`。下列部分变量仅用于进程级覆盖或内部桥接，不应仅因为列在此处就写入 `.env`。
 
 ## LLM 提供商
 
@@ -413,7 +413,35 @@ description: "Hermes Agent 使用的所有环境变量完整参考"
 | `GATEWAY_ALLOWED_USERS` | 跨所有平台允许的逗号分隔用户 ID |
 | `GATEWAY_ALLOW_ALL_USERS` | 无需白名单允许所有用户（`true`/`false`，默认：`false`） |
 
-### Microsoft Graph（Teams 会议）
+### Web Dashboard 与 Hermes Desktop {#web-dashboard--hermes-desktop}
+
+这些变量用于 [Web Dashboard](/user-guide/features/web-dashboard) 的身份验证，以及 [Hermes Desktop 的远程后端连接](/user-guide/desktop)。凭据应存放在 `~/.hermes/.env`；OAuth `client_id` 更适合放在 `config.yaml` 的 `dashboard.oauth` 下（同时设置时环境变量优先）。
+
+远程 Desktop 或面向互联网的 Dashboard 推荐使用 **Nous Portal OAuth**。可信 LAN/VPN 内可使用内置的**用户名/密码**提供商；直接暴露到公网时不应使用该提供商。若要连接自有身份提供商，请使用**自托管 OIDC**。任何非回环绑定都会启用身份验证门控。
+
+| 变量 | 描述 |
+|----------|-------------|
+| `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` | 内置用户名/密码提供商的用户名；与密码同时设置时启用。 |
+| `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` | 内置用户名/密码提供商的明文密码；加载时仅在内存中进行哈希。环境变量优先于配置。 |
+| `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH` | 内置用户名/密码提供商的 scrypt 密码哈希（推荐，避免明文静态存储）。 |
+| `HERMES_DASHBOARD_BASIC_AUTH_SECRET` | 内置用户名/密码提供商用于签署无状态会话 token 的 HMAC 密钥（至少 32 字节）。必须显式设置，才能让会话跨重启或多个 worker 保持有效。 |
+| `HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS` | 内置用户名/密码提供商访问 token 的有效期（默认 12 小时）。 |
+| `HERMES_DASHBOARD_OAUTH_CLIENT_ID` | 门控 Dashboard 的 Nous OAuth 客户端 ID；使用 `hermes dashboard register` 配置。 |
+| `HERMES_DASHBOARD_PUBLIC_URL` | 反向代理后用户访问 Dashboard 的完整公开 URL，用于构造 OAuth 回调。 |
+| `HERMES_DASHBOARD_OIDC_ISSUER` | 内置自托管 OIDC 提供商的 issuer URL。 |
+| `HERMES_DASHBOARD_OIDC_CLIENT_ID` | 自托管 OIDC 提供商的客户端 ID（授权码 + PKCE）；支持公开客户端和机密客户端。 |
+| `HERMES_DASHBOARD_OIDC_SCOPES` | 自托管 OIDC 请求的 scope（默认 `openid profile email`）。 |
+| `HERMES_DASHBOARD_OIDC_CLIENT_SECRET` | 机密自托管 OIDC 客户端的可选 secret；PKCE 仍为必需。该凭据应存放在 `~/.hermes/.env`。 |
+| `HERMES_DESKTOP_REMOTE_URL` | Desktop 侧仅用于静态 token 认证的全局/默认连接基础 URL，例如 `http://host:9119`。必须与 `HERMES_DESKTOP_REMOTE_TOKEN` 同时设置；启用后会禁用全局/默认 Gateway 控件和交互式登录。命名 profile 仍可保留明确的 Cloud、Remote URL 或 SSH 覆盖。 |
+| `HERMES_DESKTOP_REMOTE_TOKEN` | 与 `HERMES_DESKTOP_REMOTE_URL` 配对的静态会话 token，两者均为必填。若需用户名/密码或 OAuth/OIDC 交互式登录，请使用应用内 Remote URL 模式。 |
+| `HERMES_DESKTOP_HERMES` | Desktop 后端命令覆盖，用于打包、Nix 或故障排查。 |
+| `HERMES_DESKTOP_HERMES_ROOT` | `hermes desktop --hermes-root` 使用的源码检出目录覆盖。 |
+| `HERMES_DESKTOP_IGNORE_EXISTING` | 设为 `1` 时，Desktop 在解析后端时忽略 `PATH` 中已有的 `hermes`。 |
+| `HERMES_DESKTOP_CWD` | Desktop 聊天会话的初始项目目录。 |
+| `HERMES_DESKTOP_PYTHON` | Desktop 后端使用的 Python 解释器绝对路径。 |
+| `HERMES_DESKTOP_DEV_SERVER` | Electron 开发模式加载的 Vite dev-server URL。 |
+
+### Microsoft Graph（Teams 会议） {#microsoft-graph-teams-meetings}
 
 用于即将推出的 Teams 会议摘要流水线的 Microsoft Graph REST 客户端的仅应用凭证。Azure 门户操作步骤和所需 API 权限详见[注册 Microsoft Graph 应用程序](/guides/microsoft-graph-app-registration)。
 
