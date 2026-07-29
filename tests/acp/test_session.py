@@ -308,6 +308,66 @@ class TestListAndCleanup:
         hits = {r["session_id"] for r in db.search_messages("needle")}
         assert state.session_id in hits
 
+    def test_acp_compress_preserves_the_pre_compaction_transcript(self, tmp_path):
+        """Regression: ``/compress`` must not hard-DELETE the stored transcript.
+
+        ``_cmd_compress`` unsets ``agent._session_db`` to avoid the
+        session-splitting side effect inside ``_compress_context``. That also
+        suppresses ``archive_and_compact()``, so NO ``active=0`` rows are
+        created — which is exactly the condition ``_persist`` reads as "fresh
+        create/fork with no archived history to lose" before taking the
+        destructive ``replace_messages(active_only=False)`` branch. The guard
+        is defeated by the very action that creates the need for it, and the
+        whole conversation (plus its FTS rows) is deleted, leaving the summary.
+
+        Reproduces the post-``/compress`` state exactly: a full stored
+        transcript, zero archived rows, and an in-memory history holding only
+        the summary — then saves.
+        """
+        db = SessionDB(tmp_path / "state.db")
+
+        def factory():
+            # A freshly restored / model-switched agent: it persists to this db
+            # but has not flushed anything yet, so it does not own persistence.
+            return SimpleNamespace(
+                model="test-model",
+                _session_db=db,
+                _session_db_created=False,
+            )
+
+        manager = SessionManager(agent_factory=factory, db=db)
+        state = manager.create_session(cwd="/work")
+
+        for role, content in (
+            ("user", "what is the migration needle policy?"),
+            ("assistant", "expand-migrate-contract, never drop in one release"),
+            ("user", "rollback window?"),
+            ("assistant", "24h, verified by the smoke suite"),
+        ):
+            db.append_message(session_id=state.session_id, role=role, content=content)
+
+        # /compress ran with _session_db unset, so nothing was archived.
+        assert db.has_archived_messages(state.session_id) is False
+
+        state.history = [{"role": "user", "content": "compacted summary"}]
+        manager.save_session(state.session_id)
+
+        # The live context is the summary only...
+        assert [
+            m["content"] for m in db.get_messages_as_conversation(state.session_id)
+        ] == ["compacted summary"]
+
+        # ...but every pre-compaction turn survives on disk and stays findable.
+        contents = [
+            m["content"]
+            for m in db.get_messages(state.session_id, include_inactive=True)
+        ]
+        assert "expand-migrate-contract, never drop in one release" in contents
+        assert "24h, verified by the smoke suite" in contents
+        assert db.has_archived_messages(state.session_id) is True
+        hits = {r["session_id"] for r in db.search_messages("needle")}
+        assert state.session_id in hits
+
     def test_save_session_still_replaces_when_agent_not_self_persisting(self, manager):
         """Agents that don't own DB persistence keep ACP as the source of truth.
 
