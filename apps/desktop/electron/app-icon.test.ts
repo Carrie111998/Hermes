@@ -31,9 +31,7 @@ test('darwin includes icns before png favicon fallback', () => {
   assert.equal(candidates[0], path.join('/Applications/Hermes.app/Contents/Resources', 'icon.ico'))
   assert.ok(candidates.includes(path.join('/Applications/Hermes.app/Contents/Resources', 'icon.icns')))
   assert.ok(
-    candidates.indexOf(
-      path.join('/Applications/Hermes.app/Contents/Resources/app.asar', 'assets', 'icon.icns')
-    ) <
+    candidates.indexOf(path.join('/Applications/Hermes.app/Contents/Resources/app.asar', 'assets', 'icon.icns')) <
       candidates.indexOf(
         path.join('/Applications/Hermes.app/Contents/Resources/app.asar', 'public', 'apple-touch-icon.png')
       )
@@ -57,9 +55,8 @@ test('resolveAppIconPath returns first existing candidate', () => {
 test('resolveAppIconPath falls back to apple-touch when ico missing', () => {
   const existing = new Set([path.join('/app', 'public', 'apple-touch-icon.png')])
 
-  const resolved = resolveAppIconPath(
-    { appRoot: '/app', resourcesPath: '/resources', platform: 'linux' },
-    filePath => existing.has(filePath)
+  const resolved = resolveAppIconPath({ appRoot: '/app', resourcesPath: '/resources', platform: 'linux' }, filePath =>
+    existing.has(filePath)
   )
 
   assert.equal(resolved, path.join('/app', 'public', 'apple-touch-icon.png'))

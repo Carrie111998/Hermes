@@ -27,7 +27,8 @@ const BLEND_MODES = [
 type BlendMode = (typeof BLEND_MODES)[number]
 const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`
 
-const isHttpUrl = (value: string) => /^https?:\/\//i.test(value) || value.startsWith('data:') || value.startsWith('file:')
+const isHttpUrl = (value: string) =>
+  /^https?:\/\//i.test(value) || value.startsWith('data:') || value.startsWith('file:')
 const isAbsPath = (value: string) => /^([A-Za-z]:[\\/]|\\\\|\/)/.test(value)
 
 export function Backdrop() {
@@ -74,18 +75,22 @@ export function Backdrop() {
 
     if (!raw) {
       setSkinWallpaperUrl(null)
+
       return
     }
 
     if (isHttpUrl(raw)) {
       setSkinWallpaperUrl(raw)
+
       return
     }
 
     const path = isAbsPath(raw) ? raw : undefined
+
     if (!path || !window.hermesDesktop?.readFileDataUrl) {
       // Relative skin filenames need HERMES_HOME; fall back to default statue.
       setSkinWallpaperUrl(null)
+
       return
     }
 
@@ -144,6 +149,7 @@ export function Backdrop() {
 
   useEffect(() => {
     document.documentElement.classList.toggle('has-skin-wallpaper', hasWallpaper)
+
     return () => document.documentElement.classList.remove('has-skin-wallpaper')
   }, [hasWallpaper])
 
