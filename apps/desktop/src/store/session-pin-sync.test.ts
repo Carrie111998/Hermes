@@ -186,4 +186,97 @@ describe('watchSessionPins remote pull', () => {
 
     expect($pinnedSessionIds.get()).not.toContain('race')
   })
+
+  it('does not let an older successful pin clear a newer unpin guard', async () => {
+    const settle: Array<(v: { ok: boolean }) => void> = []
+    patch.mockImplementation(
+      () => new Promise(resolve => settle.push(resolve))
+    )
+
+    $sessions.set([row('rapid', { pinned: false })])
+    $pinnedSessionIds.set(['rapid'])
+    await flush()
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect(settle).toHaveLength(2)
+    settle[0]?.({ ok: true })
+    await flush()
+    await flush()
+
+    $sessions.set([row('rapid', { pinned: true })])
+    await flush()
+    const remainedUnpinned = !$pinnedSessionIds.get().includes('rapid')
+
+    settle[1]?.({ ok: true })
+    await flush()
+    await flush()
+
+    expect(remainedUnpinned).toBe(true)
+  })
+
+  it('does not let an older successful unpin clear a newer pin guard', async () => {
+    const settle: Array<(v: { ok: boolean }) => void> = []
+    patch.mockImplementation(
+      () => new Promise(resolve => settle.push(resolve))
+    )
+
+    $sessions.set([row('rapid-repin', { pinned: true })])
+    await flush()
+    $pinnedSessionIds.set([])
+    await flush()
+    $pinnedSessionIds.set(['rapid-repin'])
+    await flush()
+
+    expect(settle).toHaveLength(2)
+    settle[0]?.({ ok: true })
+    await flush()
+    await flush()
+
+    $sessions.set([row('rapid-repin', { pinned: false })])
+    await flush()
+    const remainedPinned = $pinnedSessionIds.get().includes('rapid-repin')
+
+    settle[1]?.({ ok: true })
+    await flush()
+    await flush()
+
+    expect(remainedPinned).toBe(true)
+  })
+
+  it('does not let an older failed pin restart a newer unpin write', async () => {
+    const settle: Array<{ reject: (error: Error) => void; resolve: (v: { ok: boolean }) => void }> = []
+    patch.mockImplementation(
+      () =>
+        new Promise((resolve, reject) => {
+          settle.push({ reject, resolve })
+        })
+    )
+
+    $sessions.set([row('rapid-failure', { pinned: false })])
+    $pinnedSessionIds.set(['rapid-failure'])
+    await flush()
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect(settle).toHaveLength(2)
+    settle[0]?.reject(new Error('older write failed'))
+    await flush()
+    await flush()
+
+    $sessions.set([row('rapid-failure', { pinned: true })])
+    await flush()
+    const remainedUnpinned = !$pinnedSessionIds.get().includes('rapid-failure')
+    const writeCount = settle.length
+
+    for (const deferred of settle.slice(1)) {
+      deferred.resolve({ ok: true })
+    }
+
+    await flush()
+    await flush()
+
+    expect(remainedUnpinned).toBe(true)
+    expect(writeCount).toBe(2)
+  })
 })

@@ -28,11 +28,15 @@ import { $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session
 const mirrored = new Set<string>()
 // pin ids awaiting their row so we can resolve the owning profile before PATCH.
 const pending = new Set<string>()
-// Writes we've issued but not yet had acked, id -> value written. A list page
-// already in flight when we PATCH still carries the old value, so it must not
-// be read as the server disagreeing with us. Cleared when the write settles —
-// the request's own lifetime is the guard, so nothing can leave one open.
-const unconfirmed = new Map<string, boolean>()
+interface PendingPinWrite {
+  generation: number
+  pinned: boolean
+}
+
+// Latest in-flight write per pin id. Generation identity prevents an older
+// request from clearing or retrying a newer click's guard.
+const unconfirmed = new Map<string, PendingPinWrite>()
+let nextWriteGeneration = 0
 
 function profileFor(pinId: string): null | string | undefined {
   return $sessions.get().find(row => sessionMatchesStoredId(row, pinId))?.profile
@@ -40,15 +44,24 @@ function profileFor(pinId: string): null | string | undefined {
 
 /** PATCH the flag, guarding reads against pages that predate the write. */
 function writePin(id: string, pinned: boolean, profile?: null | string): Promise<void> {
-  unconfirmed.set(id, pinned)
+  const generation = ++nextWriteGeneration
+  unconfirmed.set(id, { generation, pinned })
 
   return setSessionPinnedRemote(id, pinned, profile).then(
     () => {
-      unconfirmed.delete(id)
+      const current = unconfirmed.get(id)
+
+      if (current?.generation === generation) {
+        unconfirmed.delete(id)
+      }
     },
     (err: unknown) => {
-      unconfirmed.delete(id)
-      throw err
+      const current = unconfirmed.get(id)
+
+      if (current?.generation === generation) {
+        unconfirmed.delete(id)
+        throw err
+      }
     }
   )
 }
@@ -75,9 +88,10 @@ function pullRemotePins(): void {
     const heldLocally = local.has(pinId) || local.has(row.id)
 
     // A write of ours the page hasn't caught up to yet is newer than the page.
-    const awaited = unconfirmed.has(pinId) ? unconfirmed.get(pinId) : unconfirmed.get(row.id)
+    const awaitedId = unconfirmed.has(pinId) ? pinId : row.id
+    const awaited = unconfirmed.get(awaitedId)
 
-    if (awaited !== undefined && awaited !== row.pinned) {
+    if (awaited && awaited.pinned !== row.pinned) {
       continue
     }
 
