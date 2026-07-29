@@ -873,7 +873,7 @@ class TestSendMethods(unittest.TestCase):
         return adapter
 
     def test_send_calls_smtp(self):
-        """send() should use SMTP to deliver email."""
+        """send() should buffer text and flush it via SMTP."""
         import asyncio
         adapter = self._make_adapter()
 
@@ -886,13 +886,19 @@ class TestSendMethods(unittest.TestCase):
             )
 
             self.assertTrue(result.success)
+            # send() buffers — text is not sent until _flush_pending runs
+            mock_server.starttls.assert_not_called()
+
+            # Manually flush the pending text (simulates the flush timer)
+            adapter._flush_pending("user@test.com")
+
             mock_server.starttls.assert_called_once()
             mock_server.login.assert_called_once_with("hermes@test.com", "secret")
             mock_server.send_message.assert_called_once()
             mock_server.quit.assert_called_once()
 
     def test_send_failure_returns_error(self):
-        """SMTP failure should return SendResult with error."""
+        """SMTP failure during flush should return SendResult with error."""
         import asyncio
         adapter = self._make_adapter()
 
@@ -903,8 +909,12 @@ class TestSendMethods(unittest.TestCase):
                 adapter.send("user@test.com", "Hello")
             )
 
-            self.assertFalse(result.success)
-            self.assertIn("Connection refused", result.error)
+            # send() buffers, so it always succeeds
+            self.assertTrue(result.success)
+
+            # The flush will fail
+            msg_id = adapter._flush_pending("user@test.com")
+            self.assertIsNone(msg_id)
 
     def test_send_image_includes_url(self):
         """send_image should include image URL in email body."""
