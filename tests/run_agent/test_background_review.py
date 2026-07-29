@@ -206,6 +206,8 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
 
     agent = _bare_agent()
+    setattr(agent, "provider", "custom")
+    setattr(agent, "requested_provider", "custom:anthropic-proxy")
 
     AIAgent._spawn_background_review(
         agent,
@@ -219,6 +221,8 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
         "shutdown_memory_provider",
         "close",
     ]
+    assert events[0][1]["provider"] == "custom"
+    assert events[0][1]["requested_provider"] == "custom:anthropic-proxy"
 
 
 def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
