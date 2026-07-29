@@ -231,6 +231,33 @@ class TestSessionCreate:
         assert "error" in resp
         assert not calls
 
+    @pytest.mark.parametrize(
+        "selection",
+        [[1], ["file", None], [{"name": "file"}], [True], [["file"]]],
+    )
+    def test_non_string_items_are_rejected_without_coercion(
+        self, server, monkeypatch, selection
+    ) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        calls = _capture_builds(server, monkeypatch)
+
+        resp = _create(server, {"cols": 80, "enabled_toolsets": selection})
+        assert "error" in resp
+        assert "result" not in resp
+        assert not calls
+        assert not server._sessions
+
+    def test_string_items_are_trimmed(self, server, monkeypatch) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        calls = _capture_builds(server, monkeypatch)
+
+        resp = _create(server, {"cols": 80, "enabled_toolsets": ["  file  ", ""]})
+        assert "error" not in resp
+        _run_deferred_build(server, monkeypatch, resp["result"]["session_id"])
+        assert calls[-1]["enabled_toolsets_override"] == ["file"]
+
 
 # ── session.resume ───────────────────────────────────────────────────
 
@@ -306,6 +333,24 @@ class TestSessionResume:
         )
         assert "error" in resp
         assert not calls
+
+    @pytest.mark.parametrize("selection", [[1], ["file", None], [{"name": "file"}]])
+    def test_non_string_items_are_rejected_without_coercion(
+        self, server, monkeypatch, selection
+    ) -> None:
+        _quiet(server, monkeypatch)
+        monkeypatch.setattr(server, "_get_db", lambda: _DB(self.TARGET))
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+        monkeypatch.setattr(server, "sanitize_replay_history", lambda h: h)
+        calls = _capture_builds(server, monkeypatch)
+
+        resp = _resume(
+            server, {"session_id": self.TARGET, "enabled_toolsets": selection}
+        )
+        assert "error" in resp
+        assert "result" not in resp
+        assert not calls
+        assert not server._sessions
 
     def test_lazy_resume_build_receives_empty_selection(self, server, monkeypatch) -> None:
         _quiet(server, monkeypatch)

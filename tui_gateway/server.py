@@ -2986,7 +2986,16 @@ def _requested_enabled_toolsets(params: dict) -> list[str] | None:
             "enabled_toolsets must be a list of toolset names; "
             "omit the field to inherit the configured toolsets"
         )
-    return [str(item).strip() for item in raw if str(item).strip()]
+    # No coercion: str(item) on a number/dict/bool would invent a toolset name
+    # the caller never asked for, and an unknown name resolves to no tools at
+    # all, so the mistake would pass as a scope instead of surfacing.
+    for item in raw:
+        if not isinstance(item, str):
+            raise _ToolsetSelectionError(
+                "enabled_toolsets entries must be strings; "
+                f"got {type(item).__name__}"
+            )
+    return [item.strip() for item in raw if item.strip()]
 
 
 def _session_toolset_selection(session: dict) -> list[str] | None:
