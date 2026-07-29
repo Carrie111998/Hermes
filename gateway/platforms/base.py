@@ -2230,6 +2230,14 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # Sanitized delivery receipt metadata.  These fields are deliberately
+    # scalar and content-free so cross-layer audit consumers never need to
+    # inspect ``raw_response`` (which is adapter-specific and may contain
+    # provider payloads). ``delivery_route`` is a short namespaced enum such
+    # as ``telegram.rich``; ``chunk_count`` counts provider-acknowledged
+    # messages, not chunks merely planned before the send.
+    delivery_route: Optional[str] = None
+    chunk_count: Optional[int] = None
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -6078,7 +6086,18 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if getattr(result, "success", False):
-                                mark_delivered(_obligation_id)
+                                mark_delivered(
+                                    _obligation_id,
+                                    provider_message_id=getattr(
+                                        result, "message_id", None
+                                    ),
+                                    delivery_route=getattr(
+                                        result, "delivery_route", None
+                                    ),
+                                    chunk_count=getattr(
+                                        result, "chunk_count", None
+                                    ),
+                                )
                             else:
                                 mark_failed(
                                     _obligation_id,

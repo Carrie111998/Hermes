@@ -43,6 +43,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -107,9 +108,27 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
-            last_error TEXT
+            last_error TEXT,
+            provider_message_id TEXT,
+            delivery_route TEXT,
+            chunk_count INTEGER
         )"""
     )
+    # Additive migration for ledgers created before delivery receipts were
+    # persisted.  Fixed column names/types keep the DDL non-dynamic in spirit;
+    # this mirrors the state.db migration convention in async_delegation.py.
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+    }
+    for name, sql_type in (
+        ("provider_message_id", "TEXT"),
+        ("delivery_route", "TEXT"),
+        ("chunk_count", "INTEGER"),
+    ):
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE delivery_obligations ADD COLUMN {name} {sql_type}"
+            )
 
 
 @contextmanager
@@ -215,8 +234,55 @@ def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
 
-def mark_delivered(obligation_id: str) -> None:
-    _update_state(obligation_id, "delivered")
+def mark_delivered(
+    obligation_id: str,
+    *,
+    provider_message_id: Any = None,
+    delivery_route: Any = None,
+    chunk_count: Any = None,
+) -> None:
+    """Mark an obligation delivered and persist a content-free provider ACK.
+
+    Receipt fields are allowlisted scalars rather than a serialized
+    ``SendResult.raw_response``.  This keeps message content, provider payloads,
+    credentials, and arbitrary exception text out of the audit columns.
+    """
+    safe_message_id = None
+    if isinstance(provider_message_id, (str, int)) and not isinstance(
+        provider_message_id, bool
+    ):
+        safe_message_id = str(provider_message_id)[:200]
+
+    safe_route = None
+    if isinstance(delivery_route, str) and re.fullmatch(
+        r"[a-z0-9][a-z0-9_.+-]{0,63}", delivery_route
+    ):
+        safe_route = delivery_route
+
+    safe_chunk_count = None
+    if (
+        isinstance(chunk_count, int)
+        and not isinstance(chunk_count, bool)
+        and 0 <= chunk_count <= 1_000_000
+    ):
+        safe_chunk_count = chunk_count
+
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='delivered', updated_at=?, last_error=NULL,
+                   provider_message_id=COALESCE(?, provider_message_id),
+                   delivery_route=COALESCE(?, delivery_route),
+                   chunk_count=COALESCE(?, chunk_count)
+               WHERE obligation_id=?""",
+            (
+                time.time(),
+                safe_message_id,
+                safe_route,
+                safe_chunk_count,
+                obligation_id,
+            ),
+        )
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
@@ -356,8 +422,9 @@ def debug_rows(limit: int = 20) -> str:
     """Human-readable dump for ad-hoc inspection (sqlite3-free path)."""
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT obligation_id, session_key, state, attempts,
-                      created_at, updated_at, last_error
+            """SELECT obligation_id, session_key, platform, state, attempts,
+                      created_at, updated_at, last_error, provider_message_id,
+                      delivery_route, chunk_count
                FROM delivery_obligations
                ORDER BY updated_at DESC LIMIT ?""",
             (limit,),
@@ -365,8 +432,11 @@ def debug_rows(limit: int = 20) -> str:
     return json.dumps(
         [
             {
-                "id": r[0], "session": r[1], "state": r[2], "attempts": r[3],
-                "created_at": r[4], "updated_at": r[5], "last_error": r[6],
+                "id": r[0], "session": r[1], "platform": r[2],
+                "state": r[3], "attempts": r[4], "created_at": r[5],
+                "updated_at": r[6], "last_error": r[7],
+                "provider_message_id": r[8], "delivery_route": r[9],
+                "chunk_count": r[10],
             }
             for r in rows
         ],

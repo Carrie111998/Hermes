@@ -84,6 +84,66 @@ def _rich_api_kwargs(adapter):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "expected_id"),
+    [
+        (SimpleNamespace(message_id=123), "123"),
+        ({"message_id": 123}, "123"),
+        ({"result": {"message_id": 123}}, "123"),
+        ({"result": None}, None),
+    ],
+)
+async def test_rich_result_shapes_extract_message_id(raw, expected_id):
+    """The raw Bot API path may return either a PTB object or a raw dict."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(return_value=raw)
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    assert result.message_id == expected_id
+    assert result.delivery_route == "telegram.rich"
+    assert result.chunk_count == 1
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_awaited_once()
+    bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rich_happy_path_sends_raw_markdown():
+    adapter = _make_adapter()
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    assert result.message_id == "123"
+    assert result.delivery_route == "telegram.rich"
+    assert result.chunk_count == 1
+    adapter._bot.do_api_request.assert_awaited_once()
+    api_kwargs = _rich_api_kwargs(adapter)
+    # Raw markdown — NOT MarkdownV2-escaped. Table pipes still present.
+    assert api_kwargs["rich_message"]["markdown"] == RICH_CONTENT
+    assert "| Case | Status |" in api_kwargs["rich_message"]["markdown"]
+    assert "- [x] table renders" in api_kwargs["rich_message"]["markdown"]
+    # Legacy path must not run on rich success.
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_details_with_math_skips_rich_send_to_avoid_tdesktop_crash():
+    adapter = _make_adapter()
+
+    result = await adapter.send("12345", DANGEROUS_DETAILS_MATH)
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_details_without_math_still_uses_rich_send():
     adapter = _make_adapter()
 
