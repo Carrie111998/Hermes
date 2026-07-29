@@ -1,14 +1,14 @@
 ---
-title: "Pytorch Fsdp"
+title: "Pytorch Fsdp — Fully sharded data-parallel training for large models"
 sidebar_label: "Pytorch Fsdp"
-description: "Expert guidance for Fully Sharded Data Parallel training with PyTorch FSDP - parameter sharding, mixed precision, CPU offloading, FSDP2"
+description: "Fully sharded data-parallel training for large models"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Pytorch Fsdp
 
-Expert guidance for Fully Sharded Data Parallel training with PyTorch FSDP - parameter sharding, mixed precision, CPU offloading, FSDP2
+Fully sharded data-parallel training for large models.
 
 ## Skill metadata
 
@@ -20,6 +20,7 @@ Expert guidance for Fully Sharded Data Parallel training with PyTorch FSDP - par
 | Author | Orchestra Research |
 | License | MIT |
 | Dependencies | `torch>=2.0`, `transformers` |
+| Platforms | linux, macos |
 | Tags | `Distributed Training`, `PyTorch`, `FSDP`, `Data Parallel`, `Sharding`, `Mixed Precision`, `CPU Offloading`, `FSDP2`, `Large-Scale Training` |
 
 ## Reference: full SKILL.md

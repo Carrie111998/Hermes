@@ -1,189 +1,104 @@
-# Hermes Desktop Computer Use
+# Containerized noVNC Desktop
 
-This directory provides an optional persistent desktop VM for Hermes Agent. It gives Hermes a full graphical "computer body" with:
+This optional stack gives Hermes's built-in `computer_use` toolset a
+persistent Linux/Xfce desktop with Chrome and browser-based noVNC takeover.
+It does not add another computer-use tool or bypass Hermes approval checks.
 
-- Xfce desktop
-- Google Chrome with a persistent profile
-- VNC and noVNC for live user takeover
-- SSH access for Hermes terminal/computer-use commands
-- `xdotool` for mouse and keyboard control
-- `scrot` and ImageMagick for screenshots
+Hermes talks MCP over stdio to the official `cua-driver` inside the container:
 
-The feature is disabled by default. It only appears when `COMPUTER_USE_ENABLED=true`.
+```text
+Hermes computer_use approval gate
+  -> hermes-desktop/cua-driver-docker
+  -> docker compose exec -T desktop cua-driver mcp
+```
 
-## Why Use This
+## Setup
 
-Hermes already has browser and terminal tools. The desktop VM adds full screen-level workflows for tasks that need a real GUI:
-
-- websites that require a logged-in browser session
-- visual workflows that are difficult to express through DOM-only browser automation
-- desktop applications and file managers
-- live user takeover for login, MFA, CAPTCHA, or sensitive actions
-- persistent browser cookies and application state across restarts
-
-The user can watch the desktop at any time through noVNC and take over manually.
-
-## Quick Start
+Requirements: Docker with Compose v2 and an installed `hermes` CLI.
 
 ```bash
 cd hermes-desktop
 ./setup.sh
 ```
 
-The setup script is idempotent. It checks Docker, creates `.env` with generated passwords if needed, builds the image, starts the desktop, and runs health checks.
+The script:
 
-Open the live desktop:
+1. generates a VNC password in the ignored `hermes-desktop/.env`;
+2. builds and starts the persistent desktop;
+3. saves the non-secret wrapper path as
+   `computer_use.driver_command` in the active Hermes `config.yaml`;
+4. verifies noVNC, X11 control, persistence, and `cua-driver`.
 
-```text
-http://localhost:6080/vnc.html
-```
-
-SSH into the desktop:
+Then run:
 
 ```bash
-ssh hermes@localhost -p 2222
+hermes -t computer_use chat
 ```
 
-Run health checks any time:
+Open <http://localhost:6080/vnc.html> for live viewing or manual takeover.
+Both noVNC (`6080`) and raw VNC (`5901`) bind to `127.0.0.1` by default.
+
+## Safety
+
+- Mutating actions still use the approval and hard-block rules in
+  `tools/computer_use/tool.py`.
+- No SSH service or direct command-execution backend is exposed.
+- VNC and noVNC are loopback-only. Use an authenticated VPN or SSH tunnel for
+  remote access; do not change the bindings to `0.0.0.0` on a public host.
+- The `desktop_home` Docker volume retains cookies and login state. Treat it
+  like a normal signed-in browser profile.
+- Use noVNC yourself for passwords, MFA, CAPTCHAs, payments, and other
+  sensitive steps.
+
+## Commands
 
 ```bash
 ./verify.sh
+docker compose logs --tail 100 desktop
+docker compose restart desktop
+docker compose down
 ```
 
-## Enable The Tool
+`docker compose down` preserves the desktop volume. Adding `-v` deletes the
+saved browser profile.
 
-Set these variables for the Hermes process that should use the desktop, for example in `~/.hermes/.env`:
+## Custom ports or resolution
+
+Keep secrets in `.env`. Put non-secret Compose overrides in an untracked
+`compose.override.yml`, for example:
+
+```yaml
+services:
+  desktop:
+    ports:
+      - "127.0.0.1:5902:5901"
+      - "127.0.0.1:6081:6080"
+    environment:
+      VNC_RESOLUTION: 1440x900
+```
+
+Run it explicitly:
 
 ```bash
-COMPUTER_USE_ENABLED=true
-COMPUTER_USE_BACKEND=ssh
-COMPUTER_USE_DISPLAY=:1
-COMPUTER_USE_VNC_URL=http://localhost:6080/vnc.html
-TERMINAL_SSH_HOST=localhost
-TERMINAL_SSH_PORT=2222
-TERMINAL_SSH_USER=hermes
+docker compose -f docker-compose.yml -f compose.override.yml up -d
 ```
 
-Then restart Hermes so tool discovery picks up `computer_use`.
-
-When `COMPUTER_USE_ENABLED` is not set to `true`, `1`, or `yes`, the tool check fails closed and default Hermes behavior is unchanged.
-
-## Basic Workflow
-
-1. Take a screenshot with `computer_use(action="screenshot")`.
-2. Use the returned visual analysis to identify the next action.
-3. Click, type, press keys, scroll, move, or drag with `computer_use`.
-4. Take another screenshot to verify the result.
-5. Ask the user to open the noVNC URL when login, MFA, CAPTCHA, payment, or other sensitive manual takeover is required.
-
-## Manual Login Via noVNC
-
-Some sites require human login, MFA, CAPTCHA, or device verification. Use noVNC for those steps:
-
-1. Open `http://localhost:6080/vnc.html`.
-2. Enter the `VNC_PASSWORD` from `.env`.
-3. Open Chrome in the desktop.
-4. Log into the site manually.
-5. Close only the tab or leave Chrome open. The browser profile is stored in the persistent Docker volume, so cookies and sessions survive container restarts.
-
-## Security Considerations
-
-- Change `VNC_PASSWORD` and `HERMES_PASSWORD` before exposing ports.
-- Prefer SSH key auth through `AUTHORIZED_KEYS` instead of password auth for remote deployments.
-- Do not expose VNC/noVNC/SSH directly to the public internet without firewalling, VPN, or a trusted reverse proxy.
-- The desktop browser profile is persistent. Treat it like a real user browser profile because it may contain cookies and logged-in sessions.
-- The tool can click, type, and operate the OS-level desktop. Keep it disabled unless you intentionally want this capability.
-- Public or irreversible actions should still require user confirmation at the agent/policy layer.
+If the noVNC port changes, use that new URL for manual takeover. The wrapper
+and `computer_use` MCP connection do not depend on the published ports.
 
 ## Troubleshooting
 
-### Docker is not installed or not running
-
-`./setup.sh` checks both Docker and Docker Compose. If it fails here:
-
-```bash
-docker --version
-docker compose version
-docker info
-```
-
-Install Docker from the official Docker docs or start the Docker service/daemon, then rerun `./setup.sh`.
-
-### Port conflicts
-
-Defaults are SSH `2222`, VNC `5901`, and noVNC `6080`. If Docker cannot bind a port, edit `.env`:
+Run `./verify.sh` first. If the wrapper is no longer at the configured path
+(for example, the checkout moved), rerun `./setup.sh` or set it directly:
 
 ```bash
-TERMINAL_SSH_PORT=2223
-VNC_PORT=5902
-NOVNC_PORT=6081
+hermes config set computer_use.driver_command \
+  /absolute/path/to/hermes-agent/hermes-desktop/cua-driver-docker
 ```
 
-Then restart:
+To return to a host-installed driver:
 
 ```bash
-docker compose up -d
-./verify.sh
+hermes config unset computer_use.driver_command
+hermes computer-use install
 ```
-
-### Permission errors
-
-If the container starts but Chrome or the profile fails to write, check the persistent volume:
-
-```bash
-docker logs hermes-desktop --tail 100
-docker exec hermes-desktop bash -lc 'id hermes && ls -ld /home/hermes /home/hermes/.config'
-```
-
-If permissions are corrupted, recreate the desktop volume only if you are willing to lose browser state.
-
-### Browser not starting
-
-Use the helper inside the desktop container:
-
-```bash
-ssh -p 2222 hermes@localhost '/home/hermes/bin/open-chrome https://example.com'
-```
-
-Then open noVNC and verify Chrome appears. If it does not, inspect logs:
-
-```bash
-docker logs hermes-desktop --tail 100
-```
-
-### Tool not registered
-
-The tool is intentionally hidden unless enabled. Confirm the Hermes process sees:
-
-```bash
-COMPUTER_USE_ENABLED=true
-```
-
-Then restart Hermes and check:
-
-```bash
-hermes tools | grep computer_use
-```
-
-If it still does not appear, verify `tools/computer_use_tool.py` exists in the Hermes install and run `./verify.sh`.
-
-### Profile not persisting
-
-The browser profile lives under `/home/hermes` in the `desktop_home` Docker volume. Confirm the volume exists:
-
-```bash
-docker volume ls | grep desktop_home
-```
-
-Do not run `docker compose down -v` unless you intentionally want to delete browser state.
-
-### noVNC opens but login sites fail
-
-This is expected for MFA, CAPTCHA, device checks, or bot detection. Use noVNC to log in manually once. After login, the persistent browser profile should keep cookies/session state for future Hermes runs.
-
-## Limitations
-
-- Coordinate accuracy depends on screenshot quality and the selected vision model.
-- Some websites block automation or require human login/MFA.
-- GUI state can drift. Agents should verify after each action and stop after repeated failures instead of looping.
-- Large screenshots can be expensive to analyze. The tool sends images to the vision model internally and does not return raw base64 image data by default.

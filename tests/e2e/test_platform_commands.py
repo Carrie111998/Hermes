@@ -57,6 +57,16 @@ class TestSlashCommands:
         assert "no" in response_lower or "stop" in response_lower or "not running" in response_lower
 
     @pytest.mark.asyncio
+    async def test_leading_space_stop_is_still_a_command(self, adapter, platform):
+        """Slack users type `` /stop`` to avoid native Slack slash interception."""
+        send = await send_and_capture(adapter, " /stop", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        response_lower = response_text.lower()
+        assert "no" in response_lower or "stop" in response_lower or "not running" in response_lower
+
+    @pytest.mark.asyncio
     async def test_commands_shows_listing(self, adapter, platform):
         send = await send_and_capture(adapter, "/commands", platform)
 
@@ -137,6 +147,29 @@ class TestSlashCommands:
         send.assert_called_once()
         response_text = send.call_args[1].get("content") or send.call_args[0][1]
         assert "compress" in response_text.lower() or "context" in response_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_quick_command_alias_targets_builtin_command_with_args(
+        self, adapter, runner, platform
+    ):
+        """Alias targets with args must reach the built-in command handler."""
+        runner.config.quick_commands = {
+            "s": {"type": "alias", "target": "/status extra-arg"}
+        }
+        async def _handle_status(event):
+            assert event.get_command_args() == "extra-arg"
+            return "status via alias"
+
+        runner._handle_status_command = AsyncMock(side_effect=_handle_status)
+
+        send = await send_and_capture(adapter, "/s", platform)
+
+        send.assert_called_once()
+        response_text = send.call_args[1].get("content") or send.call_args[0][1]
+        assert response_text == "status via alias"
+        runner._handle_status_command.assert_awaited_once()
+        runner._handle_message_with_agent.assert_not_awaited()
+
 
 
 class TestSessionLifecycle:

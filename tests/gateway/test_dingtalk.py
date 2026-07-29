@@ -1,13 +1,86 @@
 """Tests for DingTalk platform adapter."""
 import asyncio
-import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+
+
+class _FakeDingTalkModel:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _FakeChatbotMessage(SimpleNamespace):
+    @classmethod
+    def from_dict(cls, data):
+        data = data or {}
+        return cls(
+            message_id=data.get("msgId") or data.get("messageId") or data.get("message_id") or "",
+            conversation_id=data.get("conversationId") or data.get("conversation_id") or "",
+            conversation_type=str(data.get("conversationType") or data.get("conversation_type") or "1"),
+            sender_id=data.get("senderId") or data.get("sender_id") or "",
+            sender_staff_id=data.get("senderStaffId") or data.get("sender_staff_id") or data.get("senderId") or "",
+            sender_nick=data.get("senderNick") or data.get("sender_nick") or "",
+            text=data.get("text") or "",
+            rich_text=data.get("richText") or data.get("rich_text"),
+            rich_text_content=data.get("richTextContent") or data.get("rich_text_content"),
+            session_webhook=data.get("sessionWebhook") or data.get("session_webhook") or "",
+            session_webhook_expired_time=data.get("sessionWebhookExpiredTime") or data.get("session_webhook_expired_time") or 0,
+            create_at=data.get("createAt") or data.get("create_at") or 0,
+            at_users=data.get("atUsers") or data.get("at_users") or [],
+            is_in_at_list=bool(data.get("isInAtList") or data.get("is_in_at_list")),
+        )
+
+
+@pytest.fixture(autouse=True)
+def _fake_dingtalk_optional_sdks(monkeypatch):
+    """Keep DingTalk adapter tests hermetic when optional SDKs are absent."""
+    import plugins.platforms.dingtalk.adapter as dt
+
+    card_models = SimpleNamespace(**{
+        name: _FakeDingTalkModel
+        for name in (
+            "CreateCardRequest",
+            "CreateCardRequestCardData",
+            "CreateCardRequestImGroupOpenSpaceModel",
+            "CreateCardRequestImRobotOpenSpaceModel",
+            "CreateCardHeaders",
+            "DeliverCardRequest",
+            "DeliverCardRequestImGroupOpenDeliverModel",
+            "DeliverCardRequestImRobotOpenDeliverModel",
+            "DeliverCardHeaders",
+            "StreamingUpdateRequest",
+            "StreamingUpdateHeaders",
+        )
+    })
+    robot_models = SimpleNamespace(**{
+        name: _FakeDingTalkModel
+        for name in (
+            "RobotReplyEmotionRequestTextEmotion",
+            "RobotReplyEmotionRequest",
+            "RobotReplyEmotionHeaders",
+            "RobotRecallEmotionRequestTextEmotion",
+            "RobotRecallEmotionRequest",
+            "RobotRecallEmotionHeaders",
+            "RobotMessageFileDownloadRequest",
+            "RobotMessageFileDownloadHeaders",
+        )
+    })
+
+    monkeypatch.setattr(dt, "ChatbotMessage", _FakeChatbotMessage, raising=False)
+    monkeypatch.setattr(
+        dt,
+        "AckMessage",
+        SimpleNamespace(STATUS_OK=200, STATUS_SYSTEM_EXCEPTION=500),
+        raising=False,
+    )
+    monkeypatch.setattr(dt, "tea_util_models", SimpleNamespace(RuntimeOptions=_FakeDingTalkModel), raising=False)
+    monkeypatch.setattr(dt, "dingtalk_card_models", card_models, raising=False)
+    monkeypatch.setattr(dt, "dingtalk_robot_models", robot_models, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -18,31 +91,32 @@ from gateway.config import Platform, PlatformConfig
 class TestDingTalkRequirements:
 
     def test_returns_false_when_sdk_missing(self, monkeypatch):
-        with patch.dict("sys.modules", {"dingtalk_stream": None}):
+        with patch.dict("sys.modules", {"dingtalk_stream": None}), \
+             patch("tools.lazy_deps.ensure", side_effect=ImportError("dingtalk_stream unavailable")):
             monkeypatch.setattr(
-                "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", False
+                "plugins.platforms.dingtalk.adapter.DINGTALK_STREAM_AVAILABLE", False
             )
-            from gateway.platforms.dingtalk import check_dingtalk_requirements
+            from plugins.platforms.dingtalk.adapter import check_dingtalk_requirements
             assert check_dingtalk_requirements() is False
 
     def test_returns_false_when_env_vars_missing(self, monkeypatch):
         monkeypatch.setattr(
-            "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", True
+            "plugins.platforms.dingtalk.adapter.DINGTALK_STREAM_AVAILABLE", True
         )
-        monkeypatch.setattr("gateway.platforms.dingtalk.HTTPX_AVAILABLE", True)
+        monkeypatch.setattr("plugins.platforms.dingtalk.adapter.HTTPX_AVAILABLE", True)
         monkeypatch.delenv("DINGTALK_CLIENT_ID", raising=False)
         monkeypatch.delenv("DINGTALK_CLIENT_SECRET", raising=False)
-        from gateway.platforms.dingtalk import check_dingtalk_requirements
+        from plugins.platforms.dingtalk.adapter import check_dingtalk_requirements
         assert check_dingtalk_requirements() is False
 
     def test_returns_true_when_all_available(self, monkeypatch):
         monkeypatch.setattr(
-            "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", True
+            "plugins.platforms.dingtalk.adapter.DINGTALK_STREAM_AVAILABLE", True
         )
-        monkeypatch.setattr("gateway.platforms.dingtalk.HTTPX_AVAILABLE", True)
+        monkeypatch.setattr("plugins.platforms.dingtalk.adapter.HTTPX_AVAILABLE", True)
         monkeypatch.setenv("DINGTALK_CLIENT_ID", "test-id")
         monkeypatch.setenv("DINGTALK_CLIENT_SECRET", "test-secret")
-        from gateway.platforms.dingtalk import check_dingtalk_requirements
+        from plugins.platforms.dingtalk.adapter import check_dingtalk_requirements
         assert check_dingtalk_requirements() is True
 
 
@@ -54,7 +128,7 @@ class TestDingTalkRequirements:
 class TestDingTalkAdapterInit:
 
     def test_reads_config_from_extra(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         config = PlatformConfig(
             enabled=True,
             extra={"client_id": "cfg-id", "client_secret": "cfg-secret"},
@@ -67,47 +141,11 @@ class TestDingTalkAdapterInit:
     def test_falls_back_to_env_vars(self, monkeypatch):
         monkeypatch.setenv("DINGTALK_CLIENT_ID", "env-id")
         monkeypatch.setenv("DINGTALK_CLIENT_SECRET", "env-secret")
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         config = PlatformConfig(enabled=True)
         adapter = DingTalkAdapter(config)
         assert adapter._client_id == "env-id"
         assert adapter._client_secret == "env-secret"
-
-
-# ---------------------------------------------------------------------------
-# Message text extraction
-# ---------------------------------------------------------------------------
-
-
-class TestExtractText:
-
-    def test_extracts_dict_text(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        msg = MagicMock()
-        msg.text = {"content": "  hello world  "}
-        msg.rich_text = None
-        assert DingTalkAdapter._extract_text(msg) == "hello world"
-
-    def test_extracts_string_text(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        msg = MagicMock()
-        msg.text = "plain text"
-        msg.rich_text = None
-        assert DingTalkAdapter._extract_text(msg) == "plain text"
-
-    def test_falls_back_to_rich_text(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        msg = MagicMock()
-        msg.text = ""
-        msg.rich_text = [{"text": "part1"}, {"text": "part2"}, {"image": "url"}]
-        assert DingTalkAdapter._extract_text(msg) == "part1 part2"
-
-    def test_returns_empty_for_no_content(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
-        msg = MagicMock()
-        msg.text = ""
-        msg.rich_text = None
-        assert DingTalkAdapter._extract_text(msg) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -118,24 +156,24 @@ class TestExtractText:
 class TestDeduplication:
 
     def test_first_message_not_duplicate(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         assert adapter._dedup.is_duplicate("msg-1") is False
 
     def test_second_same_message_is_duplicate(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._dedup.is_duplicate("msg-1")
         assert adapter._dedup.is_duplicate("msg-1") is True
 
     def test_different_messages_not_duplicate(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._dedup.is_duplicate("msg-1")
         assert adapter._dedup.is_duplicate("msg-2") is False
 
     def test_cache_cleanup_on_overflow(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         max_size = adapter._dedup._max_size
         # Fill beyond max
@@ -154,7 +192,7 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_send_posts_to_webhook(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
         mock_response = MagicMock()
@@ -180,7 +218,7 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_send_fails_without_webhook(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._http_client = AsyncMock()
 
@@ -190,7 +228,7 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_send_uses_cached_webhook(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
         mock_response = MagicMock()
@@ -206,7 +244,7 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_send_handles_http_error(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
         mock_response = MagicMock()
@@ -223,6 +261,51 @@ class TestSend:
         assert result.success is False
         assert "400" in result.error
 
+    @pytest.mark.asyncio
+    async def test_send_image_renders_markdown_image(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "OK"
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        adapter._http_client = mock_client
+
+        result = await adapter.send_image(
+            "chat-123",
+            "https://example.com/demo.png",
+            caption="Screenshot",
+            metadata={"session_webhook": "https://dingtalk.example/webhook"},
+        )
+
+        assert result.success is True
+        payload = mock_client.post.call_args.kwargs["json"]
+        assert payload["msgtype"] == "markdown"
+        assert payload["markdown"]["text"] == "Screenshot\n\n![image](https://example.com/demo.png)"
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_returns_explicit_unsupported_error(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        result = await adapter.send_image_file("chat-123", "/tmp/demo.png")
+
+        assert result.success is False
+        assert result.error and "do not support local image uploads" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_document_returns_explicit_unsupported_error(self):
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+
+        result = await adapter.send_document("chat-123", "/tmp/demo.pdf")
+
+        assert result.success is False
+        assert result.error and "do not support local file attachments" in result.error
+
 
 # ---------------------------------------------------------------------------
 # Connect / disconnect
@@ -233,7 +316,7 @@ class TestConnect:
 
     @pytest.mark.asyncio
     async def test_disconnect_closes_session_websocket(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
 
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         websocket = AsyncMock()
@@ -257,16 +340,16 @@ class TestConnect:
     @pytest.mark.asyncio
     async def test_connect_fails_without_sdk(self, monkeypatch):
         monkeypatch.setattr(
-            "gateway.platforms.dingtalk.DINGTALK_STREAM_AVAILABLE", False
+            "plugins.platforms.dingtalk.adapter.DINGTALK_STREAM_AVAILABLE", False
         )
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         result = await adapter.connect()
         assert result is False
 
     @pytest.mark.asyncio
     async def test_connect_fails_without_credentials(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._client_id = ""
         adapter._client_secret = ""
@@ -275,7 +358,7 @@ class TestConnect:
 
     @pytest.mark.asyncio
     async def test_disconnect_cleans_up(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._session_webhooks["a"] = "http://x"
         adapter._dedup._seen["b"] = 1.0
@@ -285,6 +368,36 @@ class TestConnect:
         await adapter.disconnect()
         assert len(adapter._session_webhooks) == 0
         assert len(adapter._dedup._seen) == 0
+        assert adapter._http_client is None
+
+    @pytest.mark.asyncio
+    async def test_disconnect_finalizes_open_streaming_cards(self):
+        """Streaming cards must be finalized before HTTP client closes."""
+        from unittest.mock import AsyncMock, patch
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        adapter = DingTalkAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = AsyncMock()
+        adapter._stream_task = None
+        adapter._streaming_cards = {
+            "chat-1": {"track-a": "last content"},
+            "chat-2": {"track-b": "other"},
+        }
+
+        close_calls = []
+
+        async def fake_close_siblings(chat_id):
+            # HTTP client must still be alive at call time.
+            assert adapter._http_client is not None, (
+                "HTTP client was already closed before card finalization"
+            )
+            close_calls.append(chat_id)
+            adapter._streaming_cards.pop(chat_id, None)
+
+        with patch.object(adapter, "_close_streaming_siblings", side_effect=fake_close_siblings):
+            await adapter.disconnect()
+
+        assert set(close_calls) == {"chat-1", "chat-2"}
+        assert adapter._streaming_cards == {}
         assert adapter._http_client is None
 
 
@@ -307,29 +420,29 @@ class TestWebhookDomainAllowlist:
     """
 
     def test_api_domain_accepted(self):
-        from gateway.platforms.dingtalk import _DINGTALK_WEBHOOK_RE
+        from plugins.platforms.dingtalk.adapter import _DINGTALK_WEBHOOK_RE
         assert _DINGTALK_WEBHOOK_RE.match(
             "https://api.dingtalk.com/robot/send?access_token=x"
         )
 
     def test_oapi_domain_accepted(self):
-        from gateway.platforms.dingtalk import _DINGTALK_WEBHOOK_RE
+        from plugins.platforms.dingtalk.adapter import _DINGTALK_WEBHOOK_RE
         assert _DINGTALK_WEBHOOK_RE.match(
             "https://oapi.dingtalk.com/robot/send?access_token=x"
         )
 
     def test_http_rejected(self):
-        from gateway.platforms.dingtalk import _DINGTALK_WEBHOOK_RE
+        from plugins.platforms.dingtalk.adapter import _DINGTALK_WEBHOOK_RE
         assert not _DINGTALK_WEBHOOK_RE.match("http://api.dingtalk.com/robot/send")
 
     def test_suffix_attack_rejected(self):
-        from gateway.platforms.dingtalk import _DINGTALK_WEBHOOK_RE
+        from plugins.platforms.dingtalk.adapter import _DINGTALK_WEBHOOK_RE
         assert not _DINGTALK_WEBHOOK_RE.match(
             "https://api.dingtalk.com.evil.example/"
         )
 
     def test_unsanctioned_subdomain_rejected(self):
-        from gateway.platforms.dingtalk import _DINGTALK_WEBHOOK_RE
+        from plugins.platforms.dingtalk.adapter import _DINGTALK_WEBHOOK_RE
         # Only api.* and oapi.* are allowed — e.g. eapi.dingtalk.com must not slip through
         assert not _DINGTALK_WEBHOOK_RE.match("https://eapi.dingtalk.com/robot/send")
 
@@ -338,7 +451,7 @@ class TestHandlerProcessIsAsync:
     """dingtalk-stream >= 0.20 requires ``process`` to be a coroutine."""
 
     def test_process_is_coroutine_function(self):
-        from gateway.platforms.dingtalk import _IncomingHandler
+        from plugins.platforms.dingtalk.adapter import _IncomingHandler
         assert asyncio.iscoroutinefunction(_IncomingHandler.process)
 
 
@@ -352,7 +465,7 @@ class TestExtractText:
     """
 
     def test_text_as_dict_legacy(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         msg = MagicMock()
         msg.text = {"content": "hello world"}
         msg.rich_text_content = None
@@ -361,7 +474,7 @@ class TestExtractText:
 
     def test_text_as_textcontent_object(self):
         """SDK >= 0.20 shape: object with ``.content`` attribute."""
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
 
         class FakeTextContent:
             content = "hello from new sdk"
@@ -378,7 +491,7 @@ class TestExtractText:
         assert "TextContent(" not in result
 
     def test_text_content_attr_with_empty_string(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
 
         class FakeTextContent:
             content = ""
@@ -391,7 +504,7 @@ class TestExtractText:
 
     def test_rich_text_content_new_shape(self):
         """SDK >= 0.20 exposes rich text as ``message.rich_text_content.rich_text_list``."""
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
 
         class FakeRichText:
             rich_text_list = [{"text": "hello "}, {"text": "world"}]
@@ -405,7 +518,7 @@ class TestExtractText:
 
     def test_rich_text_legacy_shape(self):
         """Legacy ``message.rich_text`` list remains supported."""
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         msg = MagicMock()
         msg.text = None
         msg.rich_text_content = None
@@ -414,12 +527,328 @@ class TestExtractText:
         assert "legacy" in result and "rich" in result
 
     def test_empty_message(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         msg = MagicMock()
         msg.text = None
         msg.rich_text_content = None
         msg.rich_text = None
         assert DingTalkAdapter._extract_text(msg) == ""
+
+    # --- Card / interactiveCard message handling (文档分享卡片) ---
+
+    def test_card_with_dict_content_and_url(self):
+        """card msgtype with extensions.card.content as dict with url key."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "card"
+        msg.extensions = {
+            "card": {
+                "title": "Q3经营分析报告",
+                "content": {"url": "https://dingtalk.com/doc/abc123"},
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "[文档] Q3经营分析报告 https://dingtalk.com/doc/abc123"
+
+    def test_card_with_dict_content_docurl(self):
+        """card msgtype with extensions.card.content as dict with docUrl key."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "card"
+        msg.extensions = {
+            "card": {
+                "title": "周报模板",
+                "content": {"docUrl": "https://docs.dingtalk.com/xyz"},
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "[文档] 周报模板 https://docs.dingtalk.com/xyz"
+
+    def test_card_with_json_string_content(self):
+        """card msgtype with extensions.card.content as JSON string."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "card"
+        msg.extensions = {
+            "card": {
+                "title": "数据看板",
+                "content": '{"url": "https://dingtalk.com/doc/def456"}',
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "[文档] 数据看板 https://dingtalk.com/doc/def456"
+
+    def test_card_with_plain_string_content(self):
+        """card msgtype with extensions.card.content as plain string (used as url)."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "card"
+        msg.extensions = {
+            "card": {
+                "title": "分享链接",
+                "content": "https://dingtalk.com/doc/plain",
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "[文档] 分享链接 https://dingtalk.com/doc/plain"
+
+    def test_card_no_title_only_url(self):
+        """card msgtype with url but no title."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "card"
+        msg.extensions = {
+            "card": {
+                "content": {"url": "https://dingtalk.com/doc/onlyurl"},
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "https://dingtalk.com/doc/onlyurl"
+
+    def test_card_fallback_to_extensions_text(self):
+        """card msgtype with no usable card data → fallback to extensions.text.content."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "card"
+        msg.extensions = {
+            "card": {},
+            "text": {"content": "fallback-text"},
+        }
+        assert DingTalkAdapter._extract_text(msg) == "fallback-text"
+
+    def test_card_content_none_is_handled(self):
+        """card msgtype with content: None → no crash, empty doc_url."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "card"
+        msg.extensions = {
+            "card": {
+                "title": "某文档",
+                "content": None,
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "[文档] 某文档"
+
+    def test_card_content_empty_string_is_handled(self):
+        """card msgtype with content: "" → no crash, empty doc_url."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "card"
+        msg.extensions = {
+            "card": {
+                "title": "空内容文档",
+                "content": "",
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "[文档] 空内容文档"
+
+    def test_interactive_card_extracts_biz_custom_action_url(self):
+        """interactiveCard msgtype with biz_custom_action_url."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "interactiveCard"
+        msg.extensions = {
+            "content": {
+                "biz_custom_action_url": "https://dingtalk.com/doc/interactive",
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "[文档卡片] https://dingtalk.com/doc/interactive"
+
+    def test_interactive_card_no_url_returns_empty(self):
+        """interactiveCard msgtype with no biz_custom_action_url → empty string."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "interactiveCard"
+        msg.extensions = {"content": {}}
+        assert DingTalkAdapter._extract_text(msg) == ""
+
+    def test_interactive_card_with_title_and_url(self):
+        """interactiveCard msgtype with both title and biz_custom_action_url."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "interactiveCard"
+        msg.extensions = {
+            "content": {
+                "title": "项目看板",
+                "biz_custom_action_url": "https://dingtalk.com/doc/kanban",
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "[文档卡片] 项目看板 https://dingtalk.com/doc/kanban"
+
+    def test_interactive_card_title_only(self):
+        """interactiveCard msgtype with title but no URL."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        msg = MagicMock()
+        msg.text = None
+        msg.rich_text = None
+        msg.message_type = "interactiveCard"
+        msg.extensions = {
+            "content": {
+                "title": "仅标题",
+            }
+        }
+        assert DingTalkAdapter._extract_text(msg) == "[文档卡片] 仅标题"
+
+
+class TestExtractMedia:
+    """_extract_media must split native voice rich-text items (auto-STT)
+    from generic audio file uploads (kept as attachments, no STT)."""
+
+    def _msg_with_rich_text(self, items):
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = items
+        return msg
+
+    def test_voice_rich_text_item_classified_as_voice(self):
+        """Native DingTalk voice notes (type=voice) must enter the auto-STT
+        path via MessageType.VOICE — the gateway skips STT for AUDIO."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = self._msg_with_rich_text(
+            [{"type": "voice", "downloadCode": "dl_voice_abc"}]
+        )
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.VOICE
+        assert urls == ["dl_voice_abc"]
+        assert mtypes == ["audio"]
+
+    def test_richtext_reset_does_not_clobber_voice(self):
+        """A richText envelope containing a native voice item must stay
+        VOICE — the ``msg_type_str == "richText"`` re-derivation used to
+        reset it to TEXT, dropping the voice note from the STT path
+        (#38211, #38219)."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = self._msg_with_rich_text(
+            [{"type": "voice", "downloadCode": "dl_voice_rt"}]
+        )
+        msg.message_type = "richText"
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.VOICE
+        assert urls == ["dl_voice_rt"]
+        assert mtypes == ["audio"]
+
+    def test_richtext_with_image_still_photo(self):
+        """richText with only an embedded image keeps the PHOTO promotion."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = self._msg_with_rich_text(
+            [{"type": "picture", "downloadCode": "dl_img_rt"}]
+        )
+        msg.message_type = "richText"
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.PHOTO
+        assert urls == ["dl_img_rt"]
+
+    def test_audio_rich_text_item_stays_audio(self):
+        """Generic audio uploads (e.g. an mp3 the user attached) must NOT
+        be auto-transcribed — they stay MessageType.AUDIO."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter, DINGTALK_TYPE_MAPPING
+        from gateway.platforms.base import MessageType
+
+        # Simulate a future/non-voice audio rich-text item by extending the
+        # mapping so item_type != "voice" but still routes through the
+        # ``mapped == "audio"`` branch.
+        DINGTALK_TYPE_MAPPING["audio"] = "audio"
+        try:
+            msg = self._msg_with_rich_text(
+                [{"type": "audio", "downloadCode": "dl_audio_xyz"}]
+            )
+            msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+                DingTalkAdapter, msg
+            )
+            assert msg_type == MessageType.AUDIO
+            assert urls == ["dl_audio_xyz"]
+            assert mtypes == ["audio"]
+        finally:
+            del DINGTALK_TYPE_MAPPING["audio"]
+
+    def test_file_extensions_content_downloadcode_resolved(self):
+        """msgtype='file' with extensions.content.downloadCode → DOCUMENT."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = None
+        msg.message_type = "file"
+        msg.extensions = {"content": {"downloadCode": "dl_file_123", "fileName": "report.pdf"}}
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.DOCUMENT
+        assert urls == ["dl_file_123"]
+        assert mtypes == ["application/pdf"]
+
+    def test_image_extensions_content_classified_as_photo(self):
+        """msgtype='image' with extensions.content → PHOTO (not DOCUMENT)."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = None
+        msg.message_type = "image"
+        msg.extensions = {"content": {"downloadCode": "dl_img_abc", "fileName": "photo.png"}}
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.PHOTO
+        assert urls == ["dl_img_abc"]
+        assert mtypes == ["image/png"]
+
+    def test_image_no_filename_still_photo(self):
+        """msgtype='image' without fileName → still PHOTO (MIME heuristic)."""
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
+        from gateway.platforms.base import MessageType
+
+        msg = MagicMock()
+        msg.text = None
+        msg.image_content = None
+        msg.rich_text_content = None
+        msg.rich_text = None
+        msg.message_type = "image"
+        msg.extensions = {"content": {"downloadCode": "dl_img_noext"}}
+        msg_type, urls, mtypes = DingTalkAdapter._extract_media(
+            DingTalkAdapter, msg
+        )
+        assert msg_type == MessageType.PHOTO
+        assert urls == ["dl_img_noext"]
+        # Without fileName, mime defaults to octet-stream but msg_type_str=="image" still wins
+        assert mtypes == ["application/octet-stream"]
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +871,7 @@ def _make_gating_adapter(monkeypatch, *, extra=None, env=None):
         monkeypatch.delenv(key, raising=False)
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
-    from gateway.platforms.dingtalk import DingTalkAdapter
+    from plugins.platforms.dingtalk.adapter import DingTalkAdapter
     return DingTalkAdapter(PlatformConfig(enabled=True, extra=extra or {}))
 
 
@@ -589,7 +1018,7 @@ class TestIncomingHandlerProcess:
     @pytest.mark.asyncio
     async def test_process_extracts_session_webhook(self):
         """session_webhook must be populated from callback data."""
-        from gateway.platforms.dingtalk import _IncomingHandler, DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import _IncomingHandler, DingTalkAdapter
 
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._on_message = AsyncMock()
@@ -622,7 +1051,7 @@ class TestIncomingHandlerProcess:
         """If ChatbotMessage.from_dict does not map sessionWebhook (e.g. SDK
         version mismatch), the handler should fall back to extracting it
         directly from the raw data dict."""
-        from gateway.platforms.dingtalk import _IncomingHandler, DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import _IncomingHandler, DingTalkAdapter
 
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
         adapter._on_message = AsyncMock()
@@ -650,7 +1079,7 @@ class TestIncomingHandlerProcess:
     async def test_process_returns_ack_immediately(self):
         """process() must not block on _on_message — it should return
         the ACK tuple before the message is fully processed."""
-        from gateway.platforms.dingtalk import _IncomingHandler, DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import _IncomingHandler, DingTalkAdapter
 
         processing_started = asyncio.Event()
         processing_gate = asyncio.Event()
@@ -694,7 +1123,7 @@ class TestExtractTextMentions:
         Stripping all @handles collateral-damages emails, SSH URLs, and
         literal references the user wrote.
         """
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         cases = [
             ("@bot hello", "@bot hello"),
             ("contact alice@example.com", "contact alice@example.com"),
@@ -727,7 +1156,7 @@ class TestMessageContextIsolation:
 
     def test_contexts_keyed_by_chat_id(self):
         """Two concurrent chats must not clobber each other's context."""
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         adapter = DingTalkAdapter(PlatformConfig(enabled=True))
 
         msg_a = MagicMock(conversation_id="chat-A", sender_staff_id="user-A")
@@ -752,7 +1181,7 @@ class TestCardLifecycle:
 
     @pytest.fixture
     def adapter_with_card(self):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         a = DingTalkAdapter(PlatformConfig(
             enabled=True,
             extra={"card_template_id": "tmpl-1"},
@@ -943,7 +1372,7 @@ class TestDingTalkAdapterAICards:
 
     @pytest.mark.asyncio
     async def test_send_uses_ai_card_if_configured(self, config, mock_stream_client, mock_http_client, mock_message):
-        from gateway.platforms.dingtalk import DingTalkAdapter
+        from plugins.platforms.dingtalk.adapter import DingTalkAdapter
 
         adapter = DingTalkAdapter(config)
         adapter._stream_client = mock_stream_client

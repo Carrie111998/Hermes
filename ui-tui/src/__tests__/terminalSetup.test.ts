@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   configureDetectedTerminalKeybindings,
@@ -8,6 +8,19 @@ import {
   shouldPromptForTerminalSetup,
   stripJsonComments
 } from '../lib/terminalSetup.js'
+
+// Tests run from developer shells as well as CI. An inherited SSH_* variable
+// must not silently force every configure call down the remote-session reject
+// path; remote behavior is tested explicitly with per-call env objects below.
+beforeEach(() => {
+  vi.stubEnv('SSH_CONNECTION', '')
+  vi.stubEnv('SSH_TTY', '')
+  vi.stubEnv('SSH_CLIENT', '')
+})
+
+afterEach(() => {
+  vi.unstubAllEnvs()
+})
 
 describe('terminalSetup helpers', () => {
   it('detects VS Code family terminals from environment', () => {
@@ -141,6 +154,7 @@ describe('configureTerminalKeybindings', () => {
     // it overlaps any context, including our terminal scope. We must NOT
     // silently add a terminal-scoped cmd+c that would shadow it.
     const mkdir = vi.fn().mockResolvedValue(undefined)
+
     const readFile = vi.fn().mockResolvedValue(
       JSON.stringify([
         {
@@ -149,6 +163,7 @@ describe('configureTerminalKeybindings', () => {
         }
       ])
     )
+
     const writeFile = vi.fn().mockResolvedValue(undefined)
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
@@ -170,6 +185,7 @@ describe('configureTerminalKeybindings', () => {
     // would shadow ours. Treat as a conflict even though the strings
     // aren't identical.
     const mkdir = vi.fn().mockResolvedValue(undefined)
+
     const readFile = vi.fn().mockResolvedValue(
       JSON.stringify([
         {
@@ -179,6 +195,7 @@ describe('configureTerminalKeybindings', () => {
         }
       ])
     )
+
     const writeFile = vi.fn().mockResolvedValue(undefined)
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
@@ -198,6 +215,7 @@ describe('configureTerminalKeybindings', () => {
     // logically disjoint from our copy-forwarding binding, which requires
     // terminalTextSelected.
     const mkdir = vi.fn().mockResolvedValue(undefined)
+
     const readFile = vi.fn().mockResolvedValue(
       JSON.stringify([
         {
@@ -208,6 +226,7 @@ describe('configureTerminalKeybindings', () => {
         }
       ])
     )
+
     const writeFile = vi.fn().mockResolvedValue(undefined)
     const copyFile = vi.fn().mockResolvedValue(undefined)
 
@@ -226,6 +245,7 @@ describe('configureTerminalKeybindings', () => {
     // clauses don't overlap. A user's pre-existing cmd+c binding scoped to
     // editor focus should NOT block our terminal-scoped cmd+c binding.
     const mkdir = vi.fn().mockResolvedValue(undefined)
+
     const readFile = vi.fn().mockResolvedValue(
       JSON.stringify([
         {
@@ -235,6 +255,7 @@ describe('configureTerminalKeybindings', () => {
         }
       ])
     )
+
     const writeFile = vi.fn().mockResolvedValue(undefined)
     const copyFile = vi.fn().mockResolvedValue(undefined)
 

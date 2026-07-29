@@ -66,6 +66,7 @@ declare module '@hermes/ink' {
     readonly exitOnCtrlC?: boolean
     readonly patchConsole?: boolean
     readonly onFrame?: (event: FrameEvent) => void
+    readonly onHyperlinkClick?: (url: string) => void
   }
 
   export type Instance = {
@@ -83,6 +84,7 @@ declare module '@hermes/ink' {
     readonly getScrollTop: () => number
     readonly getPendingDelta: () => number
     readonly getScrollHeight: () => number
+    readonly getFreshScrollHeight: () => number
     readonly getViewportHeight: () => number
     readonly getViewportTop: () => number
     readonly getLastManualScrollAt: () => number
@@ -102,9 +104,15 @@ declare module '@hermes/ink' {
   export const NoSelect: React.ComponentType<any>
   export const ScrollBox: React.ComponentType<any>
   export const Text: React.ComponentType<any>
+  export function setDimFallbackColor(color: string | undefined): void
   export const TextInput: React.ComponentType<any>
   export const stringWidth: (s: string) => number
   export function isXtermJs(): boolean
+  export function onTerminalBackground(listener: (hex: string) => void): void
+  export function terminalBackgroundHex(): string | undefined
+  export function onTerminalForeground(listener: (hex: string) => void): void
+  export function terminalForegroundHex(): string | undefined
+  export function parseOscColor(data: string): string | undefined
 
   export type ScrollFastPathStats = {
     captured: number
@@ -154,7 +162,10 @@ declare module '@hermes/ink' {
     readonly setSelectionBgColor: (color: string) => void
   }
   export function useHasSelection(): boolean
-  export function useStdout(): { readonly stdout?: NodeJS.WriteStream }
+  export function useStdout(): {
+    readonly stdout?: NodeJS.WriteStream
+    readonly write: (data: string) => boolean
+  }
   export function useTerminalFocus(): boolean
   export function useTerminalTitle(title: string | null): void
   export function useDeclaredCursor(args: {
@@ -162,6 +173,7 @@ declare module '@hermes/ink' {
     readonly column: number
     readonly active: boolean
   }): (el: unknown) => void
+  export function useCursorAdvance(): (dx: number, dy?: number) => void
   export function useStdin(): {
     readonly stdin: NodeJS.ReadStream
     readonly setRawMode: (value: boolean) => void

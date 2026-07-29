@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# cua-driver's manifest may name its in-container absolute binary. Returning an
+# indeterminate manifest makes Hermes use its supported "<driver> mcp"
+# fallback, keeping every invocation routed through this wrapper.
+if [ "${1:-}" = "manifest" ]; then
+  exit 1
+fi
+
+desktop_dir="$(cd "$(dirname "$0")" && pwd)"
+exec docker compose \
+  --project-directory "$desktop_dir" \
+  -f "$desktop_dir/docker-compose.yml" \
+  exec -T --user hermes desktop cua-driver-desktop "$@"

@@ -1,14 +1,14 @@
 ---
-title: "Stable Diffusion Image Generation"
+title: "Stable Diffusion Image Generation — Text-to-image generation, inpainting, and img2img"
 sidebar_label: "Stable Diffusion Image Generation"
-description: "State-of-the-art text-to-image generation with Stable Diffusion models via HuggingFace Diffusers"
+description: "Text-to-image generation, inpainting, and img2img"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Stable Diffusion Image Generation
 
-State-of-the-art text-to-image generation with Stable Diffusion models via HuggingFace Diffusers. Use when generating images from text prompts, performing image-to-image translation, inpainting, or building custom diffusion pipelines.
+Text-to-image generation, inpainting, and img2img.
 
 ## Skill metadata
 
@@ -20,6 +20,7 @@ State-of-the-art text-to-image generation with Stable Diffusion models via Huggi
 | Author | Orchestra Research |
 | License | MIT |
 | Dependencies | `diffusers>=0.30.0`, `transformers>=4.41.0`, `accelerate>=0.31.0`, `torch>=2.0.0` |
+| Platforms | linux, macos, windows |
 | Tags | `Image Generation`, `Stable Diffusion`, `Diffusers`, `Text-to-Image`, `Multimodal`, `Computer Vision` |
 
 ## Reference: full SKILL.md
@@ -118,6 +119,7 @@ image = pipe(
 
 Diffusers is built around three core components:
 
+<!-- ascii-guard-ignore -->
 ```
 Pipeline (orchestration)
 ├── Model (neural networks)
@@ -126,6 +128,7 @@ Pipeline (orchestration)
 │   └── Text Encoder (CLIP/T5)
 └── Scheduler (denoising algorithm)
 ```
+<!-- ascii-guard-ignore-end -->
 
 ### Pipeline inference flow
 

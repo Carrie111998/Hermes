@@ -28,7 +28,6 @@ cd "$(dirname "$0")"
 
 container="hermes-desktop"
 novnc_port="${NOVNC_PORT:-6080}"
-ssh_port="${TERMINAL_SSH_PORT:-2222}"
 
 if ! command -v docker >/dev/null 2>&1; then
   fail_check "Docker is not installed. Install Docker first."
@@ -102,31 +101,10 @@ if docker ps --format '{{.Names}}' | grep -qx "$container"; then
   fi
 fi
 
-if command -v ssh >/dev/null 2>&1; then
-  if ssh -p "$ssh_port" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=3 hermes@localhost 'echo connected' >/dev/null 2>&1; then
-    pass "SSH key auth works for hermes@localhost:${ssh_port}"
-  else
-    warn "SSH key auth did not succeed. Password auth may still work. For automation, set AUTHORIZED_KEYS in .env and recreate the container."
-  fi
+if docker compose exec -T --user hermes desktop cua-driver-desktop --version >/dev/null 2>&1; then
+  pass "The official cua-driver is installed in the desktop container"
 else
-  warn "ssh client is not installed; skipping SSH check"
-fi
-
-repo_root="$(cd .. && pwd)"
-if command -v python3 >/dev/null 2>&1 && [ -f "${repo_root}/tools/computer_use_tool.py" ]; then
-  if COMPUTER_USE_ENABLED=true python3 -c 'import sys; sys.path.insert(0, "'"${repo_root}"'"); from tools.registry import discover_builtin_tools, registry; discover_builtin_tools(); raise SystemExit(0 if "computer_use" in registry.get_all_tool_names() else 1)' >/dev/null 2>&1; then
-    pass "Hermes registry discovers computer_use when COMPUTER_USE_ENABLED=true"
-  else
-    warn "Hermes registry did not discover computer_use. Fix: check tools/computer_use_tool.py imports and COMPUTER_USE_ENABLED."
-  fi
-elif command -v hermes >/dev/null 2>&1; then
-  if COMPUTER_USE_ENABLED=true hermes tools 2>/dev/null | grep -q 'computer_use'; then
-    pass "Hermes lists the computer_use tool when COMPUTER_USE_ENABLED=true"
-  else
-    warn "Hermes did not list computer_use. Fix: ensure tools/computer_use_tool.py exists, set COMPUTER_USE_ENABLED=true, then restart Hermes."
-  fi
-else
-  warn "Hermes CLI not found on PATH; skipping tool registration check"
+  fail_check "cua-driver is unavailable. Fix: docker compose build --no-cache desktop"
 fi
 
 if [ "$QUIET" -eq 0 ]; then

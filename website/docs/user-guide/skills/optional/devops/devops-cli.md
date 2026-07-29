@@ -1,14 +1,14 @@
 ---
-title: "Inference Sh Cli — Run 150+ AI apps via inference"
+title: "Inference Sh Cli — Run 150+ AI apps (image, video, LLM) via inference.sh CLI"
 sidebar_label: "Inference Sh Cli"
-description: "Run 150+ AI apps via inference"
+description: "Run 150+ AI apps (image, video, LLM) via inference.sh CLI"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Inference Sh Cli
 
-Run 150+ AI apps via inference.sh CLI (infsh) — image generation, video creation, LLMs, search, 3D, social automation. Uses the terminal tool. Triggers: inference.sh, infsh, ai apps, flux, veo, image generation, video generation, seedream, seedance, tavily
+Run 150+ AI apps (image, video, LLM) via inference.sh CLI.
 
 ## Skill metadata
 
@@ -19,6 +19,7 @@ Run 150+ AI apps via inference.sh CLI (infsh) — image generation, video creati
 | Version | `1.0.0` |
 | Author | okaris |
 | License | MIT |
+| Platforms | linux, macos, windows |
 | Tags | `AI`, `image-generation`, `video`, `LLM`, `search`, `inference`, `FLUX`, `Veo`, `Claude` |
 
 ## Reference: full SKILL.md

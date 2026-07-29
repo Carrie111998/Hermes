@@ -117,7 +117,7 @@ def record_nous_rate_limit(
         # Atomic write: write to temp file + rename
         fd, tmp_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
         try:
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(state, f)
             atomic_replace(tmp_path, path)
         except Exception:
@@ -144,7 +144,7 @@ def nous_rate_limit_remaining() -> Optional[float]:
     """
     path = _state_path()
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             state = json.load(f)
         reset_at = state.get("reset_at", 0)
         remaining = reset_at - time.time()
