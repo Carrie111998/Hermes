@@ -744,10 +744,20 @@ fn update_child_env(install_root: &Path) -> Vec<(String, OsString)> {
     // a frozen stage, and users cancel a healthy update. Force line-by-line
     // output instead.
     envs.push(("PYTHONUNBUFFERED".to_string(), OsString::from("1")));
-    if let Some(path) = path_with_prepended_entries(&[
+    // On macOS, Electron -> Rust child processes inherit a stripped PATH
+    // that typically lacks /usr/local/bin and /opt/homebrew/bin, so
+    // `hermes desktop --build-only` (run in the rebuild stage) cannot find
+    // npm. Prepend those paths so the desktop rebuild always has access to
+    // a system Node.js runtime, regardless of how the updater was launched.
+    let mut extra_paths = vec![
         hermes_home.join("node").join("bin"),
         venv_bin_dir(install_root),
-    ]) {
+    ];
+    if cfg!(target_os = "macos") {
+        extra_paths.push(PathBuf::from("/usr/local/bin"));
+        extra_paths.push(PathBuf::from("/opt/homebrew/bin"));
+    }
+    if let Some(path) = path_with_prepended_entries(&extra_paths) {
         envs.push(("PATH".to_string(), path));
     }
     envs

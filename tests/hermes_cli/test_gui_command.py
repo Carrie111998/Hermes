@@ -159,7 +159,7 @@ def test_gui_exits_when_npm_missing(tmp_path, monkeypatch, capsys):
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
 
-    with patch("hermes_cli.main.shutil.which", return_value=None), \
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value=None), \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns())
 
