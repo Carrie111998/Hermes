@@ -8729,6 +8729,196 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
+    """True if the bundled ``kanban-worker`` skill resolves for the home the
+    spawned worker will run under.
+
+    The dispatcher injects ``--skills kanban-worker`` into every worker. When
+    the worker activates a profile (``hermes -p <name>``), its ``SKILLS_DIR``
+    becomes ``<profile_home>/skills`` — which on many profiles does NOT contain
+    the bundled skill (it ships in the *default* root home, not every
+    profile-scoped skills dir). Preloading a missing skill is fatal at CLI
+    startup (``ValueError: Unknown skill(s): kanban-worker``), aborting the
+    worker before the agent loop runs. Gate the flag on actual resolvability;
+    the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
+    omitting the flag only drops the supplementary pattern library.
+    """
+    from pathlib import Path as _Path
+
+    # An unset HERMES_HOME means the worker falls back to the default root
+    # home (``~/.hermes``), which ships the bundled skill.
+    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+    skills_root = base / "skills"
+    if not skills_root.is_dir():
+        return False
+    # Canonical bundled location first (cheap), then a bounded scan for
+    # profiles that have it nested elsewhere.
+    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
+        return True
+    try:
+        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
+            if skill_md.is_file():
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _skill_search_roots(hermes_home: Optional[str]) -> list:
+    """Skill directories a worker spawned under *hermes_home* would search.
+
+    Mirrors the roots ``skill_view()`` scans: ``<home>/skills`` plus any
+    ``skills.external_dirs`` from that home's ``config.yaml``. The config is
+    read directly (not via the in-process loader) because the validating CLI
+    may be running under a *different* HERMES_HOME than the worker will.
+    """
+    from pathlib import Path as _Path
+
+    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+    roots = []
+    skills_root = base / "skills"
+    if skills_root.is_dir():
+        roots.append(skills_root)
+    config_path = base / "config.yaml"
+    if config_path.is_file():
+        try:
+            import yaml
+
+            with open(config_path, "r", encoding="utf-8") as fh:
+                cfg = yaml.safe_load(fh) or {}
+            external = (cfg.get("skills") or {}).get("external_dirs") or []
+            for raw in external:
+                if not isinstance(raw, str) or not raw.strip():
+                    continue
+                ext = _Path(os.path.expandvars(raw)).expanduser()
+                # Resolve relative paths against HERMES_HOME (not cwd),
+                # matching get_external_skills_dirs() in agent/skill_utils.py.
+                if not ext.is_absolute():
+                    ext = (base / ext).resolve()
+                else:
+                    ext = ext.resolve()
+                if ext.is_dir():
+                    roots.append(ext)
+        except Exception:
+            # Unreadable/malformed config — validate against <home>/skills
+            # only rather than failing the create.
+            pass
+    return roots
+
+
+_SKILL_FRONTMATTER_NAME = re.compile(r"^name:\s*['\"]?([^'\"\n]+?)['\"]?\s*$", re.MULTILINE)
+
+
+def unresolvable_task_skills(
+    skills: Iterable[str],
+    hermes_home: Optional[str] = None,
+) -> list:
+    """Return the subset of *skills* that won't resolve for a worker under
+    *hermes_home* (``None`` → the default root home).
+
+    Best-effort mirror of ``skill_view()``'s lookup so ``kanban create`` can
+    reject tasks whose force-loaded skills would crash the worker at startup
+    (``ValueError: Unknown skill(s): ...``) and burn the retry budget (#44072).
+
+    Deliberately conservative — a name is only reported when *every* cheap
+    strategy misses: directory named ``<name>`` containing ``SKILL.md`` (at
+    the root or nested), relative-path form ``cat/name``, legacy flat
+    ``<name>.md``, and frontmatter ``name:`` aliases. Names this function
+    can't reliably check cross-profile are given the benefit of the doubt:
+    plugin-qualified ``namespace:skill`` names (plugin registries are
+    per-home state) and the built-in ``kanban-worker`` (the dispatcher
+    already gates it on resolvability and drops it when absent).
+    """
+    roots = _skill_search_roots(hermes_home)
+    missing = []
+    seen = set()
+    for raw in skills or ():
+        name = (raw or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        if name == "kanban-worker" or ":" in name:
+            continue
+        if not roots:
+            # No skills dir at all — every concrete name is unresolvable.
+            missing.append(name)
+            continue
+        if not _skill_resolves(name, roots):
+            missing.append(name)
+    return missing
+
+
+def _skill_resolves(name: str, roots: list) -> bool:
+    """True if *name* matches exactly one skill across all *roots*.
+
+    Uses ``iter_skill_index_files`` (the same walk ``skill_view()`` uses)
+    so excluded paths (VCS, venv, node_modules, cache dirs, skill support
+    dirs) are not counted. Returns False when multiple candidates match
+    the same name across different roots — matching ``skill_view()``'s
+    ambiguity rejection.
+    """
+    # Lazy imports — these are profile-aware lookups that may pull in
+    # a large module chain, and the validating CLI may be running under
+    # a different HERMES_HOME than the worker will.
+    from agent.skill_utils import (
+        is_skill_support_path as _is_skill_support_path,
+        iter_skill_index_files as _iter_skill_index_files,
+    )
+
+    candidates: list[str] = []
+
+    for root in roots:
+        direct = root / name
+        try:
+            if (direct / "SKILL.md").is_file():
+                candidates.append(str(direct))
+                if len(candidates) > 1:
+                    return False
+                continue
+            if direct.with_suffix(".md").is_file():
+                candidates.append(str(direct))
+                if len(candidates) > 1:
+                    return False
+                continue
+        except (OSError, ValueError):
+            continue
+
+        # Bare-name lookups: nested dir name, frontmatter alias, flat .md.
+        if "/" in name or "\\" in name:
+            continue
+        try:
+            for skill_md in _iter_skill_index_files(root, "SKILL.md"):
+                if skill_md.parent.name == name:
+                    candidates.append(str(skill_md))
+                    if len(candidates) > 1:
+                        return False
+                    continue
+                try:
+                    head = skill_md.read_text(
+                        encoding="utf-8", errors="replace"
+                    )[:4096]
+                except OSError:
+                    continue
+                match = _SKILL_FRONTMATTER_NAME.search(head)
+                if match and match.group(1).strip() == name:
+                    candidates.append(str(skill_md))
+                    if len(candidates) > 1:
+                        return False
+            for flat_md in root.rglob(f"{name}.md"):
+                if (
+                    flat_md.name != "SKILL.md"
+                    and flat_md.is_file()
+                    and not _is_skill_support_path(flat_md)
+                ):
+                    candidates.append(str(flat_md))
+                    if len(candidates) > 1:
+                        return False
+        except OSError:
+            continue
+
+    return len(candidates) == 1
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
