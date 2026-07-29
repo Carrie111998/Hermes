@@ -14,12 +14,12 @@ roles. The PEP 517 ``build_wheel`` / ``build_sdist`` hooks in
 fires for ``uv build``, ``pip wheel``, ``python -m build``, and direct
 ``setup.py`` invocations alike.
 
-The two in-tree consumers of ``build_wheel`` are uv2nix and the sealed,
-revision-bound production-owner runtime builder. The former runs inside a Nix
-build sandbox and sets ``HERMES_NIX_BUILD=1``. The latter builds one
-hash-constrained source snapshot, then seals and attests the complete runtime
-tree; it sets the exact internal wheel-only role
-``HERMES_SEALED_RELEASE_BUILD=owner-runtime-v1`` around that fixed build step.
+The three in-tree consumers of ``build_wheel`` are uv2nix and the sealed,
+revision-bound Canonical Writer and production-owner runtime builders. The
+former runs inside a Nix build sandbox and sets ``HERMES_NIX_BUILD=1``. The
+two release builders use hash-constrained source snapshots, then seal and
+attest their complete runtime trees; each sets its exact internal wheel-only
+role around only that fixed build step.
 
 Editable installs (``uv sync``, ``pip install -e .``, ``nix develop``)
 use ``build_editable``, which does NOT call ``bdist_wheel`` — it calls
@@ -63,7 +63,10 @@ def _load_selective_build_py():
 SelectiveBuildPy = _load_selective_build_py()
 
 _IN_NIX_BUILD = os.environ.get("HERMES_NIX_BUILD") == "1"
-_SEALED_WHEEL_BUILD_ROLES = frozenset({"owner-runtime-v1"})
+_SEALED_WHEEL_BUILD_ROLES = frozenset({
+    "canonical-writer-release-v1",
+    "owner-runtime-v1",
+})
 _IN_SEALED_WHEEL_BUILD = (
     os.environ.get("HERMES_SEALED_RELEASE_BUILD") in _SEALED_WHEEL_BUILD_ROLES
 )

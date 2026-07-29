@@ -609,6 +609,14 @@ def install_commands(
         spec,
         project_environment=spec.venv_root,
     )
+    wheel_build_environment = tuple(
+        sorted(
+            {
+                **dict(clean),
+                "HERMES_SEALED_RELEASE_BUILD": "canonical-writer-release-v1",
+            }.items()
+        )
+    )
     return (
         BuildCommand(
             (
@@ -675,7 +683,7 @@ def install_commands(
                 "--no-config",
                 project,
             ),
-            env=clean,
+            env=wheel_build_environment,
         ),
     )
 
