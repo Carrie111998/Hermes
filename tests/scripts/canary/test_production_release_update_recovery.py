@@ -166,6 +166,7 @@ def test_public_recovery_boundary_is_fixed_and_minimal() -> None:
         "ProductionReleaseUpdateRecoveryError",
         "recover_active_release_transaction",
     ]
+    assert not hasattr(recovery, "main")
     assert not hasattr(recovery, "execute_active_release_transaction")
 
 
@@ -746,6 +747,59 @@ def test_real_existing_journal_recovers_and_retires_only_active_marker(
     )
     assert persisted == state
     assert actions.calls[-1] == "completed_revalidated"
+
+
+def test_real_terminal_revalidation_failure_retains_marker_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    registry_root, transaction = _filesystem_paths(tmp_path)
+    writer = journal_module.ReleaseUpdateJournal._for_test(
+        transaction,
+        authority_record=_authority_record(),
+    )
+    with patch.object(runtime.time, "time", return_value=NOW):
+        completed = runtime._execute_update_for_test(
+            authority_record=_authority_record(),
+            actions=FakeActions(),
+            journal=writer,
+            lock_factory=nullcontext,
+        )
+    assert completed.terminal_phase == "completed"
+    expected = active._create_or_replay_for_test(
+        registry_root,
+        authority_record=_authority_record(),
+    )
+    _install_filesystem_recovery(
+        monkeypatch,
+        registry_root=registry_root,
+        transaction=transaction,
+        actions=FakeActions(fail_always="completed_revalidated"),
+    )
+
+    with pytest.raises(
+        recovery.ProductionReleaseUpdateRecoveryError,
+        match=r"^release_update_recovery_runtime_failed$",
+    ):
+        recovery.recover_active_release_transaction()
+
+    assert active._read_for_test(registry_root) == expected
+    assert (registry_root / active.ACTIVE_MARKER_NAME).is_file()
+
+    retry_actions = FakeActions()
+    _install_filesystem_recovery(
+        monkeypatch,
+        registry_root=registry_root,
+        transaction=transaction,
+        actions=retry_actions,
+    )
+    recovered = recovery.recover_active_release_transaction()
+
+    assert recovered is not None
+    assert recovered.terminal_phase == "completed"
+    assert retry_actions.calls == ["completed_revalidated"]
+    assert not (registry_root / active.ACTIVE_MARKER_NAME).exists()
+    assert transaction.is_dir()
 
 
 def test_missing_real_journal_retains_existing_active_marker(
