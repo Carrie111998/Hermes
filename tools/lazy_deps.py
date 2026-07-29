@@ -79,6 +79,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from hermes_cli._subprocess_compat import windows_hide_flags
+
 logger = logging.getLogger(__name__)
 
 
@@ -237,6 +239,13 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "tool.computer_use": (
         "mcp==1.26.0",
         "starlette==1.0.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
+    ),
+    # Task-scoped lifecycle bridge used by the optional Codex app-server
+    # runtime. Keep this lazy: ordinary Hermes sessions never start an MCP
+    # child, while a Kanban Codex worker cannot safely begin without it.
+    "tool.codex_app_server": (
+        "mcp==1.26.0",
+        "starlette==1.0.1",  # keep in sync with pyproject [mcp]
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
     "tool.trace_upload": ("huggingface-hub==1.2.3",),
@@ -668,6 +677,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                     [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
                     capture_output=True, text=True, timeout=timeout, env=uv_env,
                     stdin=subprocess.DEVNULL,
+                    creationflags=windows_hide_flags(),
                 )
                 if r.returncode == 0:
                     if target is not None:
@@ -684,6 +694,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 pip_cmd + ["--version"],
                 capture_output=True, text=True, timeout=15,
                 stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
             if probe.returncode != 0:
                 raise FileNotFoundError("pip not in venv")
@@ -693,6 +704,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                     [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
                     capture_output=True, text=True, timeout=120, check=True,
                     stdin=subprocess.DEVNULL,
+                    creationflags=windows_hide_flags(),
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 return _InstallResult(False, "",
@@ -703,6 +715,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 pip_cmd + ["install", *target_args, *constraint_args, *specs],
                 capture_output=True, text=True, timeout=timeout,
                 stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
             if r.returncode == 0 and target is not None:
                 _activate_target_on_syspath(target)

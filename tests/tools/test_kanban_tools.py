@@ -2075,6 +2075,8 @@ def test_board_param_in_all_schemas():
 
     schemas = [
         kt.KANBAN_SHOW_SCHEMA,
+        kt.KANBAN_CONTEXT_SCHEMA,
+        kt.KANBAN_ADMIT_SCHEMA,
         kt.KANBAN_LIST_SCHEMA,
         kt.KANBAN_COMPLETE_SCHEMA,
         kt.KANBAN_BLOCK_SCHEMA,

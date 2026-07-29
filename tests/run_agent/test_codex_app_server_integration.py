@@ -12,6 +12,7 @@ Verifies that:
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -73,6 +74,141 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_kanban_bridge_failure_blocks_before_starting_codex(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli import kanban_db as kb
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        db_path = kb.init_db()
+        with kb.connect_closing(db_path=db_path) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Implementation must retain mobile steering",
+                assignee="forge",
+                initial_status="blocked",
+            )
+            assert kb.unblock_task(conn, task_id)
+            task = kb.claim_task(conn, task_id, claimer="bridge-failure-test")
+            assert task is not None and task.current_run_id is not None
+            run_id = task.current_run_id
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+        run_turn = MagicMock()
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", run_turn)
+        with patch(
+            "hermes_cli.kanban_codex_bridge.prepare_execution",
+            side_effect=RuntimeError("executor state unavailable"),
+        ):
+            agent = _make_codex_agent()
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                result = agent.run_conversation("work kanban task")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert "executor state unavailable" in result["error"]
+        run_turn.assert_not_called()
+        with kb.connect_closing(db_path=db_path) as conn:
+            task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+
+    def test_kanban_worker_resumes_and_closes_durable_codex_execution(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_codex_bridge import (
+            finish_execution,
+            prepare_execution,
+            record_active_runtime,
+        )
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        db_path = kb.init_db()
+        with kb.connect_closing(db_path=db_path) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="Implement accepted card",
+                assignee="forge",
+                initial_status="blocked",
+            )
+            assert kb.unblock_task(conn, task_id)
+            first = kb.claim_task(conn, task_id, claimer="first-worker")
+            assert first is not None and first.current_run_id is not None
+            first_run_id = first.current_run_id
+            with kb.write_txn(conn):
+                prepare_execution(
+                    conn,
+                    task_id=task_id,
+                    run_id=first_run_id,
+                    initial_comment_id=0,
+                )
+                record_active_runtime(
+                    conn,
+                    task_id=task_id,
+                    run_id=first_run_id,
+                    thread_id="thread-existing",
+                    turn_id="turn-old",
+                )
+            assert kb.reclaim_task(conn, task_id, reason="worker crashed")
+            second = kb.claim_task(conn, task_id, claimer="second-worker")
+            assert second is not None and second.current_run_id is not None
+            second_run_id = second.current_run_id
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(second_run_id))
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+
+        def fake_ensure_started(session):
+            session._thread_id = session._resume_thread_id or "thread-new"
+            if session._on_thread_ready is not None:
+                session._on_thread_ready(session._thread_id)
+            return session._thread_id
+
+        def fake_run_turn(session, user_input: str, **kwargs):
+            assert "# Kanban task" in user_input
+            assert "Stored governance semantics" in user_input
+            with kb.connect_closing(db_path=db_path) as conn:
+                assert kb.complete_task(conn, task_id, result="implemented")
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-resumed",
+                thread_id=session._thread_id,
+            )
+
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", fake_ensure_started
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("work kanban task")
+
+        assert result["completed"] is True
+        assert agent._codex_session._resume_thread_id == "thread-existing"
+        with kb.connect_closing(db_path=db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT thread_id, state
+                 FROM task_executor_sessions
+                 WHERE task_id = ? AND run_id = ?
+                """,
+                (task_id, second_run_id),
+            ).fetchone()
+        assert dict(row) == {
+            "thread_id": "thread-existing",
+            "state": "closed",
+        }
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests
@@ -786,4 +922,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

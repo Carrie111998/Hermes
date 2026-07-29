@@ -1918,15 +1918,52 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+    """A current-assignee PR comment triggers active_pr."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_is_bypassed_by_later_manual_promotion(
+    kanban_home,
+):
+    """An operator can resume the same blocked writer after its PR handoff."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="resume-pr-writer", assignee="alice")
+        kb.add_comment(
+            conn, t, "alice",
+            "PR created: https://github.com/example/product/pull/42",
+        )
+        assert kb.check_respawn_guard(conn, t) == "active_pr"
+
+        assert kb.block_task(
+            conn, t, reason="persisted lifecycle evidence failed",
+            kind="capability",
+        )
+        promoted, reason = kb.promote_task(
+            conn, t, actor="operator", reason="capability repaired",
+        )
+
+        assert promoted is True
+        assert reason is None
+        assert kb.check_respawn_guard(conn, t) is None
+
+
+def test_respawn_guard_cross_assignee_pr_comment_not_guarded(kanban_home):
+    """A dependency worker's PR handoff must not strand another assignee."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="independent-qa", assignee="tess")
+        kb.add_comment(
+            conn, t, "forge",
+            "Fixture PR: https://github.com/example/product/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
@@ -1936,7 +1973,7 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
         old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, 'worker', "
+            "VALUES (?, 'alice', "
             "'PR: https://github.com/totemx-AI/subsidysmart/pull/10', ?)",
             (t, old_ts),
         )
@@ -2027,7 +2064,7 @@ def test_dispatch_respawn_guard_skips_active_pr(
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
-            conn, t, "worker",
+            conn, t, "alice",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
@@ -3448,6 +3485,7 @@ def test_resolve_hermes_argv_prefers_path_shim(monkeypatch):
     import shutil
     import hermes_cli.kanban_db as kb
 
+    monkeypatch.setattr(kb, "_IS_WINDOWS", False)
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/hermes")
     argv = kb._resolve_hermes_argv()
@@ -3478,7 +3516,7 @@ def test_resolve_hermes_argv_avoids_implicit_windows_batch_shim(monkeypatch, tmp
     monkeypatch.setenv("PATHEXT", ".CMD")
     monkeypatch.setattr(kb, "_IS_WINDOWS", True)
 
-    assert kb._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kb._resolve_hermes_argv() == kb._module_hermes_argv()
 
 
 def test_resolve_hermes_argv_honors_hermes_bin_path_override(monkeypatch, tmp_path):
@@ -3500,6 +3538,7 @@ def test_resolve_hermes_argv_hermes_bin_bare_name_uses_path(monkeypatch, tmp_pat
     import stat
     import hermes_cli.kanban_db as kb
 
+    monkeypatch.setattr(kb, "_IS_WINDOWS", False)
     cwd_hermes = tmp_path / "hermes"
     cwd_hermes.write_text("wrong\n", encoding="utf-8")
     cwd_hermes.chmod(cwd_hermes.stat().st_mode | stat.S_IXUSR)
@@ -3525,7 +3564,7 @@ def test_resolve_hermes_argv_hermes_bin_bare_name_ignores_cwd(monkeypatch, tmp_p
     monkeypatch.setenv("HERMES_BIN", "hermes")
     monkeypatch.setattr(kb, "_IS_WINDOWS", True)
 
-    assert kb._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kb._resolve_hermes_argv() == kb._module_hermes_argv()
 
 
 def test_resolve_hermes_argv_hermes_bin_bare_cmd_uses_module_fallback(monkeypatch, tmp_path):
@@ -3541,7 +3580,7 @@ def test_resolve_hermes_argv_hermes_bin_bare_cmd_uses_module_fallback(monkeypatc
     monkeypatch.setenv("HERMES_BIN", "hermes")
     monkeypatch.setattr(kb, "_IS_WINDOWS", True)
 
-    assert kb._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kb._resolve_hermes_argv() == kb._module_hermes_argv()
 
 
 def test_resolve_hermes_argv_hermes_bin_unresolved_bare_name_falls_back(monkeypatch):
@@ -3552,7 +3591,7 @@ def test_resolve_hermes_argv_hermes_bin_unresolved_bare_name_falls_back(monkeypa
     monkeypatch.setenv("PATH", "")
     monkeypatch.setenv("HERMES_BIN", "hermes")
 
-    assert kb._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    assert kb._resolve_hermes_argv() == kb._module_hermes_argv()
 
 
 def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeypatch):
@@ -3570,7 +3609,45 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
     argv = kb._resolve_hermes_argv()
-    assert argv == [sys.executable, "-m", "hermes_cli.main"]
+    assert argv == kb._module_hermes_argv()
+
+
+def test_module_hermes_argv_uses_physical_python_for_uv_trampoline(monkeypatch, tmp_path):
+    """A broken Windows uv venv launcher must not be reused for workers."""
+    import sys
+    import hermes_cli.kanban_db as kb
+
+    trampoline = tmp_path / "venv" / "Scripts" / "python.exe"
+    trampoline.parent.mkdir(parents=True)
+    trampoline.write_bytes(b"MZ\x00uv trampoline failed to spawn Python child process")
+    physical = tmp_path / "managed-python" / "python.exe"
+    physical.parent.mkdir(parents=True)
+    physical.write_bytes(b"MZ\x00physical python")
+    prefix = tmp_path / "venv"
+
+    monkeypatch.setattr(kb, "_IS_WINDOWS", True)
+    monkeypatch.setattr(sys, "executable", str(trampoline))
+    monkeypatch.setattr(sys, "_base_executable", str(physical))
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+
+    argv = kb._module_hermes_argv()
+
+    assert argv[:2] == [str(physical), "-c"]
+    assert "from hermes_cli.main import main; main()" in argv[2]
+    assert repr(str(prefix / "Lib" / "site-packages")) in argv[2]
+
+
+def test_module_hermes_argv_keeps_working_interpreter(monkeypatch, tmp_path):
+    """A normal Windows interpreter retains the standard module invocation."""
+    import sys
+    import hermes_cli.kanban_db as kb
+
+    interpreter = tmp_path / "python.exe"
+    interpreter.write_bytes(b"MZ\x00ordinary python")
+    monkeypatch.setattr(kb, "_IS_WINDOWS", True)
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+
+    assert kb._module_hermes_argv() == [str(interpreter), "-m", "hermes_cli.main"]
 
 
 def test_resolve_hermes_argv_module_actually_runs():

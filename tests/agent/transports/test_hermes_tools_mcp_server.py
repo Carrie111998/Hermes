@@ -216,6 +216,39 @@ class TestModuleSurface:
                 f"{orch_tool!r} missing from codex callback"
             )
 
+    def test_background_worker_surface_excludes_external_and_orchestrator_tools(
+        self, monkeypatch
+    ):
+        from agent.transports.hermes_tools_mcp_server import (
+            _effective_exposed_tools,
+        )
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        tools = set(_effective_exposed_tools())
+        assert {"kanban_show", "kanban_complete", "kanban_block"} <= tools
+        assert {"github_broker_gh", "github_broker_git"} <= tools
+        assert not {
+            "web_search",
+            "browser_navigate",
+            "kanban_create",
+            "kanban_unblock",
+            "kanban_link",
+        } & tools
+
+    def test_background_worker_server_describes_lifecycle_surface(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        from agent.transports.hermes_tools_mcp_server import _build_server
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        server = _build_server()
+        assert "Kanban worker lifecycle" in server.instructions
+        registered = {tool.name for tool in asyncio.run(server.list_tools())}
+        assert {"kanban_complete", "kanban_block", "kanban_show"} <= registered
+        assert "browser_navigate" not in registered
+
 
 class TestMain:
     def test_main_returns_2_when_mcp_unavailable(self, monkeypatch):

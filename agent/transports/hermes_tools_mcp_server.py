@@ -138,6 +138,8 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_comment",
     "kanban_heartbeat",
     "kanban_show",
+    "kanban_context",
+    "kanban_admit",
     "kanban_list",
     # NOTE: kanban_create / kanban_unblock / kanban_link are orchestrator-
     # only — the kanban tool gates them on HERMES_KANBAN_TASK being unset.
@@ -146,7 +148,30 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_create",
     "kanban_unblock",
     "kanban_link",
+    "github_broker_gh",
+    "github_broker_git",
 )
+
+_KANBAN_WORKER_TOOLS = frozenset(
+    {
+        "skill_view",
+        "skills_list",
+        "kanban_complete",
+        "kanban_block",
+        "kanban_comment",
+        "kanban_heartbeat",
+        "kanban_show",
+        "github_broker_gh",
+        "github_broker_git",
+    }
+)
+
+
+def _effective_exposed_tools() -> tuple[str, ...]:
+    """Narrow background workers to their task-scoped lifecycle surface."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return EXPOSED_TOOLS
+    return tuple(name for name in EXPOSED_TOOLS if name in _KANBAN_WORKER_TOOLS)
 
 
 def _build_server() -> Any:
@@ -166,16 +191,20 @@ def _build_server() -> Any:
         handle_function_call,
     )
 
-    mcp = FastMCP(
-        "hermes-tools",
-        instructions=(
-            "Hermes Agent's tool surface, exposed for use inside a Codex "
-            "session. Use these for capabilities Codex's built-in toolset "
-            "doesn't cover: web search/extract, browser automation, "
-            "subagent delegation, vision, image generation, persistent "
-            "memory, skills, and cross-session search."
-        ),
-    )
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        server_instructions = (
+            "Hermes Kanban worker lifecycle tools. Use kanban_show to inspect "
+            "the assigned card, kanban_comment for progress, kanban_heartbeat "
+            "while working, and exactly one of kanban_complete or kanban_block "
+            "to end the current claimed run. These tools are task-scoped."
+        )
+    else:
+        server_instructions = (
+            "Hermes Agent's stateless tool surface for use inside a Codex "
+            "session. Use it only for capabilities not supplied by Codex."
+        )
+
+    mcp = FastMCP("hermes-tools", instructions=server_instructions)
 
     # Pull authoritative Hermes tool schemas for the ones we expose, so
     # MCP clients see the same parameter docs Hermes gives the model.
@@ -187,7 +216,8 @@ def _build_server() -> Any:
 
     exposed_count = 0
 
-    for name in EXPOSED_TOOLS:
+    effective_tools = _effective_exposed_tools()
+    for name in effective_tools:
         spec = all_defs.get(name)
         if spec is None:
             logger.debug(
@@ -240,7 +270,7 @@ def _build_server() -> Any:
     logger.info(
         "hermes-tools MCP server registered %d/%d tools",
         exposed_count,
-        len(EXPOSED_TOOLS),
+        len(effective_tools),
     )
     return mcp
 

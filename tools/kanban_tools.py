@@ -384,6 +384,8 @@ def _handle_show(args: dict, **kw) -> str:
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
+            task_semantics = kb.get_task_semantics(conn, tid)
+            dispatch_readback = kb.dispatch_readback(conn, tid)
 
             def _task_dict(t):
                 return {
@@ -424,6 +426,13 @@ def _handle_show(args: dict, **kw) -> str:
                     for e in events[-50:]   # cap; full log via CLI
                 ],
                 "runs": [_run_dict(r) for r in runs],
+                "task_semantics": task_semantics,
+                "governance_contract": (
+                    task_semantics.get("contract")
+                    if isinstance(task_semantics, dict)
+                    else None
+                ),
+                "dispatch_readback": dispatch_readback,
                 # Also surface the worker's own context block so the
                 # agent can include it directly if it wants. This is
                 # the same string build_worker_context returns to the
@@ -438,6 +447,47 @@ def _handle_show(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_show failed")
         return tool_error(f"kanban_show: {e}")
+
+
+def _handle_context(args: dict, **kw) -> str:
+    """Read back the persisted governed card contract for an orchestrator."""
+    guard = _require_orchestrator_tool("kanban_context")
+    if guard:
+        return guard
+    return _handle_show(args, **kw)
+
+
+def _handle_admit(args: dict, **kw) -> str:
+    """Release a governed card only after a separate context readback."""
+    guard = _require_orchestrator_tool("kanban_admit")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    digest = args.get("readback_digest")
+    if not tid:
+        return tool_error("task_id is required")
+    if not digest:
+        return tool_error(
+            "readback_digest is required; call kanban_context first"
+        )
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            admitted = kb.admit_dispatch_readback(
+                conn,
+                str(tid),
+                expected_digest=str(digest),
+                actor=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            )
+            return _ok(task_id=str(tid), **admitted)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_admit: {e}")
+    except Exception as e:
+        logger.exception("kanban_admit failed")
+        return tool_error(f"kanban_admit: {e}")
 
 
 def _handle_list(args: dict, **kw) -> str:
@@ -513,6 +563,9 @@ def _handle_complete(args: dict, **kw) -> str:
         return ownership_err
     summary = args.get("summary")
     metadata = args.get("metadata")
+    semantic_evidence = args.get("semantic_evidence")
+    if semantic_evidence is not None and not isinstance(semantic_evidence, dict):
+        return tool_error("semantic_evidence must be an object/dict")
     result = args.get("result")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
@@ -634,6 +687,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    semantic_evidence=semantic_evidence,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1078,6 +1132,9 @@ def _handle_create(args: dict, **kw) -> str:
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
+    governance_contract = args.get("governance_contract")
+    if governance_contract is not None and not isinstance(governance_contract, dict):
+        return tool_error("governance_contract must be an object/dict")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
@@ -1164,6 +1221,8 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                board=board,
+                governance_contract=governance_contract,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1319,7 +1378,15 @@ def _handle_link(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+            kb.link_tasks(
+                conn,
+                parent_id=parent_id,
+                child_id=child_id,
+                link_kind=args.get("link_kind") or "completion",
+                required_phase=args.get("required_phase"),
+                required_verdict=args.get("required_verdict"),
+                require_candidate_match=bool(args.get("require_candidate_match", False)),
+            )
             return _ok(parent_id=parent_id, child_id=child_id)
         finally:
             conn.close()
@@ -1378,6 +1445,55 @@ KANBAN_SHOW_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": [],
+    },
+}
+
+KANBAN_CONTEXT_SCHEMA = {
+    "name": "kanban_context",
+    "description": (
+        "Read back a task after creation, including its persisted "
+        "task_semantics and governance_contract as well as task, links, "
+        "comments, runs and worker context. Orchestrator-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Task id whose stored contract must be verified.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
+KANBAN_ADMIT_SCHEMA = {
+    "name": "kanban_admit",
+    "description": (
+        "Admit a staged governed task for dispatch after an independent "
+        "kanban_context readback. Pass the exact dispatch_readback.digest "
+        "returned by kanban_context. The digest binds the persisted task, "
+        "contract, workspace and parent links; any subsequent change requires "
+        "a fresh context readback. Orchestrator-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Governed task id returned by kanban_create.",
+            },
+            "readback_digest": {
+                "type": "string",
+                "description": (
+                    "Exact dispatch_readback.digest from a separate "
+                    "kanban_context call."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "readback_digest"],
     },
 }
 
@@ -1514,6 +1630,146 @@ KANBAN_COMPLETE_SCHEMA = {
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
                 ),
+            },
+            "semantic_evidence": {
+                "type": "object",
+                "description": (
+                    "Kwilo governed semantic verdict evidence. Required for "
+                    "verdict-bearing phases; lifecycle done remains distinct "
+                    "from PASS. Pass this fixed-shape object directly here; "
+                    "do not nest it under a phase name or metadata. Evidence "
+                    "is bound to the exact task candidate. candidate_identity "
+                    "is required for revision-bound phases. PASS requires at "
+                    "least one host-attested passing check, zero failed or "
+                    "required-skipped checks, empty blockers and unresolved "
+                    "acceptance rows, and at least one canonical HTTP(S) link."
+                ),
+                "additionalProperties": False,
+                "properties": {
+                    "phase": {
+                        "type": "string",
+                        "description": (
+                            "Exact governed phase from kanban_show, for example "
+                            "'sentinel-review'."
+                        ),
+                    },
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["pass", "fail", "changes-requested", "blocked"],
+                    },
+                    "candidate_identity": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "value": {"type": "string"},
+                            "path_set_digest": {
+                                "type": ["string", "null"],
+                            },
+                        },
+                        "required": ["kind", "value"],
+                        "description": (
+                            "Copy the exact kind, value and optional "
+                            "path_set_digest from the task governance contract."
+                        ),
+                    },
+                    "environment": {
+                        "type": ["object", "null"],
+                        "description": (
+                            "Optional finite JSON execution/review context. "
+                            "High-risk Sentinel PASS must include the required "
+                            "review-depth and adversarial-review attestations."
+                        ),
+                    },
+                    "checks": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "executed": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 256,
+                            },
+                            "passed_count": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 256,
+                            },
+                            "failed_count": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 256,
+                            },
+                            "skipped_count": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 256,
+                            },
+                            "skipped_required_count": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 256,
+                                "description": (
+                                    "Defaults to skipped_count when omitted."
+                                ),
+                            },
+                            "skipped_policy_safe": {
+                                "type": "boolean",
+                                "description": (
+                                    "True only when every skipped check is "
+                                    "explicitly optional under policy."
+                                ),
+                            },
+                            "host_attested": {"type": "boolean"},
+                            "canonical_check_links": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "uri"},
+                                "maxItems": 256,
+                            },
+                        },
+                        "required": [
+                            "executed",
+                            "passed_count",
+                            "failed_count",
+                            "skipped_count",
+                            "host_attested",
+                            "canonical_check_links",
+                        ],
+                    },
+                    "blockers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 256,
+                    },
+                    "unresolved_acceptance_rows": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 256,
+                    },
+                    "canonical_links": {
+                        "type": "array",
+                        "items": {"type": "string", "format": "uri"},
+                        "maxItems": 256,
+                    },
+                    "supersedes_evidence_ids": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 1},
+                        "maxItems": 256,
+                    },
+                    "invalidates_evidence_ids": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 1},
+                        "maxItems": 256,
+                    },
+                },
+                "required": [
+                    "phase",
+                    "verdict",
+                    "checks",
+                    "blockers",
+                    "unresolved_acceptance_rows",
+                    "canonical_links",
+                ],
             },
             "board": _board_schema_prop(),
         },
@@ -1725,7 +1981,11 @@ KANBAN_CREATE_SCHEMA = {
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks on its next tick and spawns the assigned profiles. Strict "
+        "governed tasks are created in a staged 'todo' state: after this "
+        "call, invoke kanban_context in a separate call, verify the persisted "
+        "contract/workspace/links, then pass its dispatch_readback.digest to "
+        "kanban_admit. The dispatcher cannot claim the task before admission."
     ),
     "parameters": {
         "type": "object",
@@ -1871,6 +2131,14 @@ KANBAN_CREATE_SCHEMA = {
                     "true. Defaults to the goal-engine default (20)."
                 ),
             },
+            "governance_contract": {
+                "type": "object",
+                "description": (
+                    "Capability, authority, repository, workspace, phase and "
+                    "candidate contract for a new governed Kwilo task. Ignored "
+                    "by ordinary boards; mandatory on post-activation Kwilo cards."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["title", "assignee"],
@@ -1910,6 +2178,17 @@ KANBAN_LINK_SCHEMA = {
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
             "child_id":  {"type": "string", "description": "Child task id."},
+            "link_kind": {
+                "type": "string",
+                "enum": ["completion", "evidence-gate", "supervision", "informational"],
+                "description": "Dependency semantics; defaults to legacy completion.",
+            },
+            "required_phase": {"type": "string"},
+            "required_verdict": {"type": "string"},
+            "require_candidate_match": {
+                "type": "boolean",
+                "description": "Require evidence candidate identity to exactly match the child candidate.",
+            },
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],
@@ -1928,6 +2207,24 @@ registry.register(
     handler=_handle_show,
     check_fn=_check_kanban_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_context",
+    toolset="kanban",
+    schema=KANBAN_CONTEXT_SCHEMA,
+    handler=_handle_context,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="📋",
+)
+
+registry.register(
+    name="kanban_admit",
+    toolset="kanban",
+    schema=KANBAN_ADMIT_SCHEMA,
+    handler=_handle_admit,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="✅",
 )
 
 registry.register(

@@ -90,6 +90,8 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli import kwilo_governance as _kwilo
+from hermes_cli import kanban_codex_bridge as _codex_bridge
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -2112,6 +2114,8 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _kwilo.ensure_schema(conn)
+                    _codex_bridge.ensure_schema(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -2742,6 +2746,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    governance_contract: Optional[dict] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2871,11 +2876,18 @@ def create_task(
             )
         skills_list = cleaned
 
+    now = int(time.time())
+    governed_contract: Optional[dict] = None
+    if _kwilo.governance_required(conn, board=board, created_at=now):
+        governed_contract = _kwilo.validate_contract(assignee, governance_contract)
+    governed_requires_readback = bool(
+        governed_contract is not None
+        and _kwilo.dispatch_readback_required(assignee, governed_contract)
+    )
+
     # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # duplicate. Governed requests deliberately validate before this fast path:
+    # a retry must not resolve to a historical or differently governed card.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -2884,9 +2896,47 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            if governed_contract is not None:
+                missing = _find_missing_parents(conn, parents)
+                if missing:
+                    raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                requested_gate_specs = _kwilo.readiness_parent_link_specs(
+                    conn, governed_contract, parents
+                )
+                existing_semantics = _kwilo.get_task_semantics(conn, row["id"])
+                if existing_semantics is None:
+                    raise ValueError(
+                        "governed idempotency key resolves to a historical task without governance"
+                    )
+                if existing_semantics["contract"] != governed_contract:
+                    raise ValueError(
+                        "governed idempotency key resolves to a task with a different contract"
+                    )
+                if requested_gate_specs:
+                    existing_gate_parents = {
+                        link["parent_id"]
+                        for link in conn.execute(
+                            "SELECT parent_id FROM task_links WHERE child_id = ?",
+                            (row["id"],),
+                        ).fetchall()
+                        if _kwilo.mandatory_readiness_link_spec(
+                            conn, link["parent_id"], row["id"]
+                        ) is not None
+                    }
+                    if existing_gate_parents != set(requested_gate_specs):
+                        raise ValueError(
+                            "governed idempotency key resolves to a task with different mandatory parents"
+                        )
+                existing_error = _kwilo.admission_error(conn, row["id"])
+                if (
+                    existing_error
+                    and existing_error != "dispatch readback has not been admitted"
+                ):
+                    raise ValueError(
+                        "governed idempotency key resolves to an ineligible task: "
+                        + existing_error
+                    )
             return row["id"]
-
-    now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
@@ -2938,12 +2988,21 @@ def create_task(
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
                             task_status = "todo"
+                    if governed_requires_readback:
+                        # Strict governed cards are deliberately staged. A
+                        # separate readback/admit transaction releases them.
+                        task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
                     missing = _find_missing_parents(conn, parents)
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+
+                governed_link_specs = (
+                    _kwilo.readiness_parent_link_specs(conn, governed_contract, parents)
+                    if governed_contract is not None else {}
+                )
 
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
@@ -2996,11 +3055,25 @@ def create_task(
                         session_id,
                     ),
                 )
-                for pid in parents:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
+                if governed_contract is not None:
+                    _kwilo.insert_task_semantics(
+                        conn, task_id, governed_contract, now=now,
                     )
+                for pid in parents:
+                    spec = governed_link_specs.get(pid)
+                    if spec is None:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                            (pid, task_id),
+                        )
+                    else:
+                        kind, phase, verdict, candidate_match = spec
+                        conn.execute(
+                            "INSERT INTO task_links "
+                            "(parent_id, child_id, link_kind, required_phase, required_verdict, "
+                            " require_candidate_match) VALUES (?, ?, ?, ?, ?, ?)",
+                            (pid, task_id, kind, phase, verdict, 1 if candidate_match else 0),
+                        )
                 _append_event(
                     conn,
                     task_id,
@@ -3126,6 +3199,14 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        semantics = _kwilo.get_task_semantics(conn, task_id)
+        if semantics is not None:
+            # Reassignment is a fresh capability/authority decision.  Validate
+            # the persisted contract against the proposed producer before any
+            # mutable assignee state changes.
+            _kwilo.validate_contract(
+                profile, semantics["contract"], allow_legacy=True
+            )
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
@@ -3145,7 +3226,71 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+# Public read APIs for first-class governance state. Keeping the board-specific
+# implementation in ``kwilo_governance`` avoids turning this already-large
+# generic kernel into a second policy engine.
+get_task_semantics = _kwilo.get_task_semantics
+list_task_evidence = _kwilo.list_task_evidence
+dependency_satisfied = _kwilo.dependency_satisfied
+dispatch_readback = _kwilo.dispatch_readback
+
+
+def admit_dispatch_readback(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_digest: str,
+    actor: str,
+) -> dict[str, Any]:
+    """Admit a governed card after a separate persisted-state readback."""
+    now = int(time.time())
+    with write_txn(conn):
+        admitted = _kwilo.persist_dispatch_readback(
+            conn,
+            task_id,
+            expected_digest=expected_digest,
+            actor=actor,
+            now=now,
+        )
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        new_status = row["status"] if row else None
+        if (
+            row is not None
+            and row["status"] == "todo"
+            and _kwilo.all_dependencies_satisfied(conn, task_id)
+        ):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                (task_id,),
+            )
+            new_status = "ready"
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_readback_admitted",
+            {
+                "actor": actor,
+                "digest": admitted["digest"],
+                "status": new_status,
+            },
+        )
+    admitted["status"] = new_status
+    return admitted
+
+
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    link_kind: str = "completion",
+    required_phase: Optional[str] = None,
+    required_verdict: Optional[str] = None,
+    require_candidate_match: bool = False,
+) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -3156,22 +3301,41 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
-        conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-            (parent_id, child_id),
+        kind, phase, verdict, candidate_match = _kwilo.validate_link(
+            conn,
+            parent_id,
+            child_id,
+            link_kind=link_kind,
+            required_phase=required_phase,
+            required_verdict=required_verdict,
+            require_candidate_match=require_candidate_match,
         )
-        # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
+        mandatory_spec = _kwilo.mandatory_readiness_link_spec(conn, parent_id, child_id)
+        if mandatory_spec is not None and (kind, phase, verdict, candidate_match) != mandatory_spec:
+            raise ValueError("mandatory readiness evidence gate cannot be downgraded")
+        conn.execute(
+            "INSERT OR REPLACE INTO task_links "
+            "(parent_id, child_id, link_kind, required_phase, required_verdict, "
+            " require_candidate_match) VALUES (?, ?, ?, ?, ?, ?)",
+            (parent_id, child_id, kind, phase, verdict, 1 if candidate_match else 0),
+        )
+        if not _kwilo.dependency_satisfied(conn, parent_id, child_id)[0]:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
         _append_event(
-            conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
+            conn,
+            child_id,
+            "linked",
+            {
+                "parent": parent_id,
+                "child": child_id,
+                "link_kind": kind,
+                "required_phase": phase,
+                "required_verdict": verdict,
+                "require_candidate_match": candidate_match,
+            },
         )
 
 
@@ -3200,6 +3364,8 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        if _kwilo.mandatory_readiness_link_spec(conn, parent_id, child_id) is not None:
+            raise ValueError("mandatory readiness evidence gate cannot be removed")
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
@@ -3717,11 +3883,12 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN "
+        "('blocked', 'unblocked', 'capability_admission_failed') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "capability_admission_failed"}
 
 
 def recompute_ready(
@@ -3772,13 +3939,14 @@ def recompute_ready(
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            try:
+                readback = _kwilo.dispatch_readback(conn, task_id)
+            except ValueError:
+                # Live governance becoming unreadable may never release work.
+                continue
+            if readback["required"] and not readback["admitted"]:
+                continue
+            if _kwilo.all_dependencies_satisfied(conn, task_id):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -3831,21 +3999,28 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Kwilo governance is checked immediately before dispatch, not merely
+        # when the card was created: capability manifests can be tightened
+        # while work is queued. Pre-activation and non-Kwilo rows return no
+        # admission error and retain the legacy claim path.
+        admission_error = _kwilo.admission_error(conn, task_id)
+        if admission_error:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "capability_admission_failed",
+                {"reason": admission_error},
+            )
+            return None
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
-        # regardless of which writer (create_task, link_tasks, unblock_task,
-        # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
+        # gating dependency is unsatisfied. Both this final claim boundary and
+        # recompute_ready use the exact same predicate.
+        if not _kwilo.all_dependencies_satisfied(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -3949,17 +4124,41 @@ def claim_review_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``review`` status).
 
-    Unlike ``claim_task`` (which handles ``ready -> running``), this
-    does NOT check parent dependencies — the task already passed that
-    gate on its original ``todo -> ready -> running`` transition.
-
-    Creates a new run entry so the review agent's lifecycle is tracked
-    independently from the original worker run.
+    Review is a fresh execution boundary. Capability admission and semantic
+    dependencies are rechecked immediately before ``review -> running`` because
+    either may have changed since the original worker execution.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        source = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if source is None or source["status"] != "review" or source["claim_lock"] is not None:
+            return None
+        # Review is a fresh execution boundary. Capabilities and typed semantic
+        # dependencies may have changed since the original worker ran, so both
+        # invariants are rechecked immediately before review dispatch.
+        admission_error = _kwilo.admission_error(conn, task_id)
+        if admission_error:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' WHERE id = ? AND status = 'review'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "capability_admission_failed", {"reason": admission_error},
+            )
+            return None
+        if not _kwilo.all_dependencies_satisfied(conn, task_id):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'review'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected", {"reason": "parents_not_done"},
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4434,6 +4633,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    semantic_evidence: Optional[dict] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4464,6 +4664,29 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    semantics = _kwilo.get_task_semantics(conn, task_id)
+    producer_profile: Optional[str] = None
+    validated_evidence: Optional[dict] = None
+    evidence_candidate: tuple[Optional[str], Optional[str], Optional[str]] = (
+        None, None, None,
+    )
+    if semantics is not None:
+        admission_error = _kwilo.completion_admission_error(conn, task_id)
+        if admission_error:
+            raise ValueError(f"governed completion rejected: {admission_error}")
+        producer = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        producer_profile = str(producer["assignee"] or "").strip().lower() if producer else ""
+        if semantic_evidence is None and semantics["phase"] in _kwilo.VERDICT_REQUIRED_PHASES:
+            raise ValueError(
+                "semantic_evidence is required for this governed phase; "
+                "done records lifecycle completion, not acceptance"
+            )
+        if semantic_evidence is not None:
+            validated_evidence, evidence_candidate = _kwilo.validate_evidence(
+                conn, task_id, semantics, semantic_evidence,
+            )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4562,6 +4785,17 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 metadata=metadata,
             )
+        evidence_id: Optional[int] = None
+        if validated_evidence is not None:
+            evidence_id = _kwilo.insert_evidence(
+                conn,
+                task_id,
+                validated_evidence,
+                evidence_candidate,
+                producer_profile=producer_profile or "",
+                run_id=run_id,
+                now=now,
+            )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
@@ -4572,6 +4806,10 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if evidence_id is not None and validated_evidence is not None:
+            completed_payload["semantic_evidence_id"] = evidence_id
+            completed_payload["semantic_verdict"] = validated_evidence["verdict"]
+            completed_payload["semantic_phase"] = validated_evidence["phase"]
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -5456,6 +5694,9 @@ def promote_task(
         )
 
     if not force:
+        admission_error = _kwilo.admission_error(conn, task_id)
+        if admission_error:
+            return False, f"task is not dispatch-admitted: {admission_error}"
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
@@ -5533,7 +5774,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
             (task_id,),
         ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        admission_error = _kwilo.admission_error(conn, task_id)
+        new_status = "todo" if undone_parents or admission_error else "ready"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -7617,9 +7859,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         arrives AFTER that completion — that's a deliberate re-run request.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        A GitHub PR URL appears in a recent comment authored by the task's
+        current assignee (within ``_RESPAWN_GUARD_PR_WINDOW`` seconds). A
+        prior worker for this task already opened a PR; re-spawning risks a
+        duplicate PR. Comments from dependency workers or reviewers must not
+        suppress the current assignee's independent follow-up work.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7627,7 +7871,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -7694,20 +7938,50 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'promoted_manual', "
+            "'unblocked', 'reclaimed') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. GitHub PR URL in a recent comment by the CURRENT assignee — that
+    #    worker already opened a PR. Cross-profile comments are handoff
+    #    evidence, not proof that this task's assignee has already delivered.
+    #    Without the author check, a Forge comment can strand a dependent
+    #    Sentinel/Tess/Atlas task in ready for the entire PR guard window.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_matching_pr_comment_at: Optional[int] = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT author, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        same_assignee = (
+            bool(row["assignee"])
+            and str(c["author"] or "").strip().lower()
+            == str(row["assignee"]).strip().lower()
+        )
+        if (
+            same_assignee
+            and c["body"]
+            and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+        ):
+            latest_matching_pr_comment_at = max(
+                latest_matching_pr_comment_at or 0,
+                int(c["created_at"] or 0),
+            )
+    if latest_matching_pr_comment_at is not None:
+        explicitly_requeued = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN ('status', 'promoted', 'promoted_manual', "
+            "'unblocked', 'reclaimed') "
+            "LIMIT 1",
+            (task_id, latest_matching_pr_comment_at),
+        ).fetchone()
+        if not explicitly_requeued:
             return "active_pr"
 
     return None
@@ -8087,6 +8361,11 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
+            if (
+                _kwilo.admission_error(conn, row["id"])
+                or not _kwilo.all_dependencies_satisfied(conn, row["id"])
+            ):
+                continue
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
@@ -8187,6 +8466,11 @@ def _dispatch_once_locked(
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
+            if (
+                _kwilo.admission_error(conn, row["id"])
+                or not _kwilo.all_dependencies_satisfied(conn, row["id"])
+            ):
+                continue
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -8324,11 +8608,51 @@ def _rotate_worker_log(
         pass
 
 
+def _is_uv_trampoline(path: str) -> bool:
+    """Return whether *path* is a uv launcher rather than a real interpreter.
+
+    Some native Windows/OpenSSH processes cannot traverse the uv-managed
+    interpreter path embedded in a venv launcher.  The launcher then exists
+    and resolves normally, but exits immediately with ``uv trampoline failed
+    to spawn Python child process``.  Detect the launcher by its embedded
+    diagnostic string instead of treating every venv interpreter as broken.
+    """
+    if not _IS_WINDOWS or not path:
+        return False
+    try:
+        return b"uv trampoline" in Path(path).read_bytes().lower()
+    except OSError:
+        return False
+
+
 def _module_hermes_argv() -> list[str]:
-    """Return the interpreter-bound Hermes CLI invocation."""
+    """Return the interpreter-bound Hermes CLI invocation.
+
+    On Windows, a Hermes process may itself have been bootstrapped through a
+    physical managed Python while ``sys.executable`` still names the broken uv
+    venv trampoline.  In that narrow case, use Python's verified physical
+    ``sys._base_executable`` and explicitly prepend the editable source plus
+    venv site-packages.  Normal working interpreters retain the simpler
+    ``python -m`` form.
+    """
     # ``hermes_cli.main`` is the console-script target declared in
     # pyproject.toml, NOT a top-level ``hermes`` package — there is no
     # ``hermes`` package to import.
+    if _IS_WINDOWS and _is_uv_trampoline(sys.executable):
+        base_executable = str(getattr(sys, "_base_executable", "") or "")
+        if (
+            base_executable
+            and os.path.isfile(base_executable)
+            and os.path.abspath(base_executable) != os.path.abspath(sys.executable)
+        ):
+            source_root = str(Path(__file__).resolve().parents[1])
+            site_packages = str(Path(sys.prefix) / "Lib" / "site-packages")
+            bootstrap = (
+                "import sys; "
+                f"sys.path[:0] = {repr([source_root, site_packages])}; "
+                "from hermes_cli.main import main; main()"
+            )
+            return [base_executable, "-c", bootstrap]
     return [sys.executable, "-m", "hermes_cli.main"]
 
 

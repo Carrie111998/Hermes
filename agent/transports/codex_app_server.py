@@ -19,17 +19,69 @@ from __future__ import annotations
 import json
 import os
 import queue
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
+from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.environments.local import hermes_subprocess_env
 
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+_READ_ONLY_WORKSPACE_CLASSES = frozenset(
+    {"isolated-read-only-worktree", "shared-read-only"}
+)
+
+
+def _kanban_workspace_class(spawn_env: dict[str, str]) -> Optional[str]:
+    """Read the admitted workspace class from the claimed task's board DB.
+
+    The class is governance data, so it must come from the durable task
+    contract rather than a profile-controlled environment variable.  A
+    governed Kwilo task fails closed if its semantic row cannot be read.
+    Non-governed boards retain the legacy workspace-write behaviour.
+    """
+    task_id = spawn_env.get("HERMES_KANBAN_TASK")
+    db_value = spawn_env.get("HERMES_KANBAN_DB")
+    if not task_id or not db_value:
+        return None
+
+    db_path = Path(db_value).expanduser()
+    if not db_path.is_file():
+        if spawn_env.get("HERMES_KANBAN_BOARD") == "kwilo":
+            raise RuntimeError(f"governed Kanban database is unavailable: {db_path}")
+        return None
+
+    try:
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            row = conn.execute(
+                "SELECT workspace_class FROM task_semantics WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        if spawn_env.get("HERMES_KANBAN_BOARD") == "kwilo":
+            raise RuntimeError(
+                f"cannot resolve governed workspace class for {task_id}: {exc}"
+            ) from exc
+        return None
+
+    if row is None:
+        if spawn_env.get("HERMES_KANBAN_BOARD") == "kwilo":
+            raise RuntimeError(
+                f"governed task {task_id} has no admitted workspace class"
+            )
+        return None
+    value = str(row[0] or "").strip()
+    if not value:
+        raise RuntimeError(f"task {task_id} has an empty admitted workspace class")
+    return value
 
 
 @dataclass
@@ -49,6 +101,80 @@ class _Pending:
     queue: queue.Queue
     method: str
     sent_at: float = field(default_factory=time.time)
+
+
+def _hermes_runtime_python(spawn_env: dict[str, str]) -> str:
+    """Return the interpreter that owns the installed Hermes environment.
+
+    Windows launchers can run the gateway with a base ``pythonw.exe`` while
+    exposing the Hermes venv through ``VIRTUAL_ENV`` and ``PYTHONPATH``.
+    ``sys.executable`` is therefore not always the interpreter that owns the
+    dependencies used by task-scoped child processes.
+    """
+    configured = spawn_env.get("HERMES_PYTHON", "").strip()
+    if configured and Path(configured).is_file():
+        return configured
+    venv = spawn_env.get("VIRTUAL_ENV", "").strip()
+    if venv:
+        candidate = (
+            Path(venv) / "Scripts" / "python.exe"
+            if os.name == "nt"
+            else Path(venv) / "bin" / "python"
+        )
+        if candidate.is_file():
+            return str(candidate)
+    return sys.executable
+
+
+def _ensure_codex_mcp_runtime(
+    python_executable: str,
+    *,
+    source_root: Path,
+    spawn_env: dict[str, str],
+) -> None:
+    """Install/check lifecycle dependencies in the exact MCP interpreter."""
+    try:
+        same_interpreter = Path(python_executable).resolve() == Path(
+            sys.executable
+        ).resolve()
+    except OSError:
+        same_interpreter = python_executable == sys.executable
+    if same_interpreter:
+        from tools.lazy_deps import ensure
+
+        ensure("tool.codex_app_server", prompt=False)
+        return
+
+    env = spawn_env.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (str(source_root), existing_pythonpath) if value
+    )
+    result = subprocess.run(
+        [
+            python_executable,
+            "-c",
+            (
+                "from tools.lazy_deps import ensure; "
+                "ensure('tool.codex_app_server', prompt=False)"
+            ),
+        ],
+        cwd=str(source_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+        check=False,
+        creationflags=windows_hide_flags(),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        raise RuntimeError(
+            "failed to prepare the Hermes lifecycle MCP interpreter "
+            f"{python_executable}: {detail[-2000:]}"
+        )
 
 
 class CodexAppServerClient:
@@ -74,8 +200,10 @@ class CodexAppServerClient:
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
+        cwd: Optional[str] = None,
     ) -> None:
         self._codex_bin = codex_bin
+        self._cwd = cwd
         # codex app-server is a model-driving CLI executor: it runs a
         # model-chosen agentic loop that executes shell commands, so it
         # legitimately needs LLM provider credentials (inherit_credentials=True)
@@ -96,10 +224,25 @@ class CodexAppServerClient:
         app_server_args = list(extra_args or [])
         # Kanban workers must be able to write their handoff/status back to
         # the board DB, which lives outside the per-task workspace. Keep the
-        # Codex sandbox on, but add the Kanban root as the only extra writable
-        # root. Without this, codex-runtime workers finish their actual work
-        # but crash/block when kanban_complete/kanban_block writes SQLite.
+        # Codex sandbox on. Implementation workspaces get only the board root
+        # as an extra writable root; governed review workspaces are OS-level
+        # read-only and update the board only through the isolated MCP bridge.
         if spawn_env.get("HERMES_KANBAN_TASK"):
+            source_root = Path(__file__).resolve().parents[2]
+            runtime_env = os.environ.copy()
+            runtime_env.update(spawn_env)
+            mcp_python = _hermes_runtime_python(runtime_env)
+            # The lifecycle MCP child is launched with this exact interpreter.
+            # Ensure its optional dependencies there before spawning Codex; a
+            # base launcher or second sibling venv must never mask a broken
+            # worker environment.
+            _ensure_codex_mcp_runtime(
+                mcp_python,
+                source_root=source_root,
+                spawn_env=spawn_env,
+            )
+            workspace_class = _kanban_workspace_class(spawn_env)
+            read_only_workspace = workspace_class in _READ_ONLY_WORKSPACE_CLASSES
             kanban_db = spawn_env.get("HERMES_KANBAN_DB")
             kanban_root = (
                 os.path.dirname(kanban_db)
@@ -112,14 +255,84 @@ class CodexAppServerClient:
                     ),
                 )
             )
-            app_server_args.extend(
+            # TOML basic strings treat backslashes as escapes. Passing a
+            # native Windows path therefore makes Codex reject the list
+            # override and fall back to treating it as one raw string. Use
+            # forward slashes, which Windows accepts and TOML parses
+            # consistently.
+            writable_roots = json.dumps([kanban_root.replace("\\", "/")])
+            mcp_python = mcp_python.replace("\\", "/")
+            # Codex intentionally starts stdio MCP servers with a constrained
+            # environment. Forward only the non-secret task identity needed by
+            # the lifecycle handlers; relying on ambient inheritance made the
+            # MCP server believe it was an unrestricted orchestrator.
+            mcp_env_args: list[str] = []
+            for env_name in (
+                "HERMES_HOME",
+                "HERMES_KANBAN_TASK",
+                "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_DB",
+                "HERMES_KANBAN_WORKSPACE",
+                "HERMES_KANBAN_BOARD",
+                "HERMES_PROFILE",
+                "HERMES_TENANT",
+            ):
+                env_value = spawn_env.get(env_name)
+                if env_value:
+                    mcp_env_args.extend(
+                        [
+                            "-c",
+                            (
+                                f"mcp_servers.hermes-tools.env.{env_name}="
+                                f"{json.dumps(env_value)}"
+                            ),
+                        ]
+                    )
+            # The app-server itself runs in the assigned task workspace so
+            # Codex's integrated apply_patch resolves against the same root as
+            # thread/start. Give only the Hermes MCP child an import path back
+            # to this source checkout.
+            mcp_env_args.extend(
                 [
+                    "-c",
+                    (
+                        "mcp_servers.hermes-tools.env.PYTHONPATH="
+                        f"{json.dumps(str(source_root))}"
+                    ),
+                ]
+            )
+            sandbox_args = ["-c", 'sandbox_mode="read-only"']
+            if not read_only_workspace:
+                sandbox_args = [
                     "-c",
                     'sandbox_mode="workspace-write"',
                     "-c",
-                    f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
+                    f"sandbox_workspace_write.writable_roots={writable_roots}",
                     "-c",
                     "sandbox_workspace_write.network_access=false",
+                ]
+            app_server_args.extend(
+                [
+                    *sandbox_args,
+                    "-c",
+                    'approval_policy="never"',
+                    # A Kanban worker must not inherit arbitrary user MCP
+                    # servers (networked Proxmox, mail, etc.). Replace that
+                    # table with the one task-scoped Hermes lifecycle bridge.
+                    "-c",
+                    "mcp_servers={}",
+                    "-c",
+                    f'mcp_servers.hermes-tools.command="{mcp_python}"',
+                    "-c",
+                    (
+                        "mcp_servers.hermes-tools.args="
+                        '["-m","agent.transports.hermes_tools_mcp_server"]'
+                    ),
+                    "-c",
+                    "mcp_servers.hermes-tools.startup_timeout_sec=30",
+                    "-c",
+                    "mcp_servers.hermes-tools.tool_timeout_sec=180",
+                    *mcp_env_args,
                 ]
             )
 
@@ -134,10 +347,16 @@ class CodexAppServerClient:
             stderr=subprocess.PIPE,
             bufsize=0,
             env=spawn_env,
+            cwd=self._cwd,
         )
         self._next_id = 1
+        self._id_lock = threading.Lock()
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
+        # Requests may be issued by the turn-driving thread and a Kanban
+        # comment-forwarding thread at the same time. Keep each JSON-RPC
+        # frame (write + flush) atomic so their bytes cannot interleave.
+        self._send_lock = threading.Lock()
         self._notifications: queue.Queue = queue.Queue()
         self._server_requests: queue.Queue = queue.Queue()
         self._stderr_lines: list[str] = []
@@ -182,6 +401,7 @@ class CodexAppServerClient:
         if self._closed:
             return
         self._closed = True
+        self._fail_pending("codex app-server client closed")
         try:
             if self._proc.stdin and not self._proc.stdin.closed:
                 self._proc.stdin.close()
@@ -289,9 +509,10 @@ class CodexAppServerClient:
         # JSON-RPC ids only need to be unique per-connection. A simple
         # monotonically increasing int is the common choice and matches what
         # codex's own clients use.
-        rid = self._next_id
-        self._next_id += 1
-        return rid
+        with self._id_lock:
+            rid = self._next_id
+            self._next_id += 1
+            return rid
 
     def _send(self, obj: dict) -> None:
         if self._closed:
@@ -299,8 +520,9 @@ class CodexAppServerClient:
         if self._proc.stdin is None:
             raise RuntimeError("codex app-server stdin not available")
         try:
-            self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
-            self._proc.stdin.flush()
+            with self._send_lock:
+                self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+                self._proc.stdin.flush()
         except (BrokenPipeError, ValueError) as exc:
             raise RuntimeError(
                 f"codex app-server stdin closed unexpectedly: {exc}"
@@ -330,6 +552,20 @@ class CodexAppServerClient:
         except Exception as exc:
             with self._stderr_lock:
                 self._stderr_lines.append(f"<stdout reader error> {exc}")
+        finally:
+            self._fail_pending("codex app-server stdout closed")
+
+    def _fail_pending(self, message: str) -> None:
+        """Wake every request waiter when the subprocess can no longer reply."""
+        with self._pending_lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        error = {"error": {"code": -32000, "message": message}}
+        for request in pending:
+            try:
+                request.queue.put_nowait(error)
+            except queue.Full:  # pragma: no cover - defensive
+                pass
 
     def _dispatch(self, msg: dict) -> None:
         # Reply (has id + result/error, no method)
