@@ -94,3 +94,104 @@ def test_dump_output_never_contains_raw_fallback_key(monkeypatch, capsys, tmp_pa
     assert "fallback_providers" in out
     assert "sk-l...SHIP" in out
     assert _SK_KEY not in out
+
+
+# --- shapes that reach the same public paste by a different route -----------
+#
+# Masking the documented list-of-dicts shape is not enough: everything the
+# helper does not explicitly recognize still goes through ``str()``, and
+# ``str()`` on an arbitrary object runs its ``__repr__``. Each test below is
+# a config that works at runtime and used to print its credential in full.
+
+
+def test_masks_single_mapping_not_wrapped_in_a_list():
+    # ``fallback_config._iter_fallback_entries`` accepts a bare mapping as a
+    # one-entry chain, and ``resolve_entry_api_key`` reads its inline key — so
+    # this config routes traffic. It must not skip masking for want of a list.
+    out = dump._config_overrides(
+        {"fallback_providers": _fallback_entry(api_key=_SK_KEY)}
+    )
+    assert _SK_KEY not in out["fallback_providers"]
+
+
+def test_masks_secret_fields_outside_the_canonical_name():
+    # Sibling credential names must be caught by the same rule as ``api_key``.
+    for field in ("access_key", "auth_token", "client_secret", "passwd"):
+        out = dump._config_overrides(
+            {"fallback_providers": [_fallback_entry(**{field: _CUSTOM_KEY})]}
+        )
+        assert _CUSTOM_KEY not in out["fallback_providers"], field
+
+
+def test_masks_non_string_values_under_a_secret_field():
+    # A nested mapping and a bytes value both stringify to the key in full.
+    for value in ({"value": _CUSTOM_KEY}, _CUSTOM_KEY.encode()):
+        out = dump._config_overrides(
+            {"fallback_providers": [_fallback_entry(api_key=value)]}
+        )
+        assert _CUSTOM_KEY not in out["fallback_providers"], type(value).__name__
+
+
+def test_omits_entries_that_are_not_mappings():
+    # A stray scalar in the list is not a usable entry, and its contents cannot
+    # be verified — it is described by type rather than printed.
+    out = dump._config_overrides(
+        {"fallback_providers": [f"openai:{_SK_KEY}"]}
+    )
+    assert _SK_KEY not in out["fallback_providers"]
+    assert "<omitted: str>" in out["fallback_providers"]
+
+
+def test_omits_objects_whose_repr_would_print_the_key():
+    class _Provider:
+        def __repr__(self):
+            return f"_Provider(api_key={_SK_KEY!r})"
+
+    out = dump._config_overrides({"fallback_providers": [_Provider()]})
+    assert _SK_KEY not in out["fallback_providers"]
+    assert "<omitted: _Provider>" in out["fallback_providers"]
+
+
+def test_strips_credentials_embedded_in_the_endpoint_url():
+    # base_url stays visible — it is the field operators actually need — but
+    # userinfo and secret query parameters are cleaned out of it.
+    out = dump._config_overrides(
+        {
+            "fallback_providers": [
+                _fallback_entry(base_url=f"https://user:{_SK_KEY}@api.example.com/v1")
+            ]
+        }
+    )
+    rendered = out["fallback_providers"]
+    assert _SK_KEY not in rendered
+    assert "api.example.com" in rendered
+
+    out = dump._config_overrides(
+        {
+            "fallback_providers": [
+                _fallback_entry(base_url=f"https://api.example.com/v1?api_key={_SK_KEY}")
+            ]
+        }
+    )
+    assert _SK_KEY not in out["fallback_providers"]
+    assert "api.example.com" in out["fallback_providers"]
+
+
+def test_numeric_token_budgets_are_not_mistaken_for_secrets():
+    # The name-marker rule fails closed, so the few known-safe fields that
+    # contain a marker word must stay readable or the dump loses diagnostics.
+    out = dump._config_overrides(
+        {"fallback_providers": [_fallback_entry(max_tokens=4096, key_env="MY_KEY_VAR")]}
+    )
+    rendered = out["fallback_providers"]
+    assert "4096" in rendered
+    assert "MY_KEY_VAR" in rendered
+
+
+def test_self_referencing_config_terminates():
+    # A YAML anchor cycle must not turn the dump into a stack overflow.
+    entry = _fallback_entry(api_key=_SK_KEY)
+    entry["extra"] = entry
+    out = dump._config_overrides({"fallback_providers": [entry]})
+    rendered = out["fallback_providers"]
+    assert _SK_KEY not in rendered

@@ -223,36 +223,174 @@ def _get_model_and_provider(config: dict) -> tuple[str, str]:
     return model, provider
 
 
-# Fallback-provider entry fields whose VALUES are secrets. Env-var *names*
-# (``key_env`` / ``api_key_env``) are intentionally excluded — they name a
-# variable, not a secret, and are safe to show.
-_FALLBACK_SECRET_KEYS = frozenset(
-    {"api_key", "apikey", "key", "token", "secret", "password"}
+# Substrings marking a fallback-provider field as carrying a secret VALUE.
+# Matched against the lowercased field name so siblings of ``api_key`` —
+# ``access_key``, ``auth_token``, ``client_secret`` — are covered too.
+_FALLBACK_SECRET_MARKERS = (
+    "key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "auth",
 )
+
+# Fields matching a marker above that are nonetheless safe to show. ``key_env``
+# and ``api_key_env`` NAME an environment variable rather than holding its
+# value, and operators need them to diagnose routing; the ``*_tokens`` limits
+# are numeric budgets. Anything not listed here fails closed: an unrecognized
+# field whose name matches a marker is masked, costing a diagnostic rather
+# than leaking a credential.
+_FALLBACK_SAFE_FIELDS = frozenset(
+    {
+        "key_env",
+        "api_key_env",
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+        "token_limit",
+    }
+)
+
+# Fields whose string values are URLs. Credentials hide in userinfo
+# (``https://user:KEY@host``) and in query parameters (``?api_key=KEY``), so
+# these are cleaned rather than shown verbatim.
+_FALLBACK_URL_MARKERS = ("url", "endpoint")
+
+# Stand-in for a value we cannot render safely. Handing an unknown object to
+# ``str()`` would run its ``__repr__``, which may print the very key we are
+# trying to hide.
+_FALLBACK_OMITTED = "<omitted>"
+
+# Bound on nested-container recursion, so a deep or self-referencing config
+# cannot turn the dump into a stack overflow.
+_FALLBACK_MAX_DEPTH = 6
+
+
+def _is_fallback_secret_field(name) -> bool:
+    """True when a field name marks its value as a credential."""
+    if not isinstance(name, str):
+        return False
+    lowered = name.lower()
+    if lowered in _FALLBACK_SAFE_FIELDS:
+        return False
+    return any(marker in lowered for marker in _FALLBACK_SECRET_MARKERS)
+
+
+def _is_fallback_url_field(name) -> bool:
+    """True when a field name marks its value as a URL."""
+    if not isinstance(name, str):
+        return False
+    lowered = name.lower()
+    return any(marker in lowered for marker in _FALLBACK_URL_MARKERS)
+
+
+def _fallback_placeholder(value) -> str:
+    """Describe a value by type instead of rendering it."""
+    return f"<omitted: {type(value).__name__}>"
+
+
+def _mask_url_credentials(value: str) -> str:
+    """Strip userinfo and redact secret query parameters from a URL."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(value)
+        username = parts.username
+        password = parts.password
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        # Unparseable (e.g. a bad port) — refuse rather than guess.
+        return _FALLBACK_OMITTED
+    if not parts.scheme or not parts.netloc:
+        return value
+
+    netloc = parts.netloc
+    changed = False
+    if username or password:
+        host = hostname or ""
+        if port:
+            host = f"{host}:{port}"
+        netloc = f"***@{host}" if host else "***"
+        changed = True
+
+    query = parts.query
+    if query:
+        pairs = parse_qsl(query, keep_blank_values=True)
+        if any(_is_fallback_secret_field(name) for name, _ in pairs):
+            query = urlencode(
+                [
+                    (name, _redact(val) if val and _is_fallback_secret_field(name) else val)
+                    for name, val in pairs
+                ]
+            )
+            changed = True
+
+    if not changed:
+        return value
+    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+
+
+def _mask_fallback_value(name, value, depth: int):
+    """Return a safely renderable copy of one fallback-provider field value."""
+    if depth > _FALLBACK_MAX_DEPTH:
+        return _FALLBACK_OMITTED
+
+    if _is_fallback_secret_field(name):
+        # Only a non-empty string can be shown in the dump's head/tail form.
+        # Bytes, numbers, nested containers and custom objects are dropped —
+        # each of them still stringifies to the credential in full.
+        if isinstance(value, str):
+            return _redact(value) if value else value
+        if value is None or isinstance(value, bool):
+            return value
+        return _FALLBACK_OMITTED
+
+    if isinstance(value, str):
+        return _mask_url_credentials(value) if _is_fallback_url_field(name) else value
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return _mask_fallback_entry(value, depth + 1)
+    if isinstance(value, (list, tuple)):
+        return [_mask_fallback_value(name, item, depth + 1) for item in value]
+    return _fallback_placeholder(value)
+
+
+def _mask_fallback_entry(entry: dict, depth: int = 0):
+    """Copy one fallback-provider entry with credential values masked."""
+    if depth > _FALLBACK_MAX_DEPTH:
+        return _FALLBACK_OMITTED
+    return {
+        name: _mask_fallback_value(name, value, depth) for name, value in entry.items()
+    }
 
 
 def _mask_fallback_secrets(fallbacks):
-    """Copy the fallback-provider list with inline credential values masked.
+    """Copy the fallback-provider config with inline credential values masked.
 
     ``hermes dump`` output is copy-pasted into public bug reports and uploaded
     verbatim by ``hermes debug share``, so an inline ``api_key`` must never
-    appear in full. Values are masked through :func:`_redact` (head/tail only),
-    matching how the dump shows every other key. Non-dict entries and non-string
-    values pass through unchanged.
+    appear in full. Secret values are masked through :func:`_redact` (head/tail
+    only), matching how the dump shows every other key.
+
+    Both container shapes ``fallback_config._iter_fallback_entries`` accepts are
+    handled: a list of entries, and a single entry given as a bare mapping.
+    Whatever is left cannot be shown safely — ``str()`` on an arbitrary object
+    runs its ``__repr__`` — so it is replaced by a type marker.
     """
-    if not isinstance(fallbacks, list):
-        return fallbacks
-    masked = []
-    for entry in fallbacks:
-        if not isinstance(entry, dict):
-            masked.append(entry)
-            continue
-        safe = dict(entry)
-        for field, value in safe.items():
-            if field.lower() in _FALLBACK_SECRET_KEYS and isinstance(value, str) and value:
-                safe[field] = _redact(value)
-        masked.append(safe)
-    return masked
+    if isinstance(fallbacks, dict):
+        return _mask_fallback_entry(fallbacks)
+    if isinstance(fallbacks, (list, tuple)):
+        return [
+            _mask_fallback_entry(entry)
+            if isinstance(entry, dict)
+            else _fallback_placeholder(entry)
+            for entry in fallbacks
+        ]
+    return _fallback_placeholder(fallbacks)
 
 
 def _config_overrides(config: dict) -> dict[str, str]:
