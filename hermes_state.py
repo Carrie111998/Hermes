@@ -1899,12 +1899,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._conn = _connect_tracked_db(
                     str(self.db_path),
                     check_same_thread=False,
-                    # CPython sqlite's prepared-statement cache has produced
-                    # intermittent InterfaceError("no more rows available")
-                    # when one permitted connection crosses worker threads
-                    # (#118172). This is Hermes's shared writer connection;
-                    # writes are already serialized by self._lock, so disable
-                    # only the unsafe cache rather than creating extra writers.
+                    # Defensive hardening: disable CPython's prepared-statement
+                    # cache. On Python 3.12+ this can produce intermittent
+                    # "no more rows available" when one permitted connection
+                    # crosses worker threads (#118172); harmless on 3.11.
                     cached_statements=0,
                     # Short timeout — application-level retry with random
                     # jitter handles contention instead of sitting in
@@ -2038,10 +2036,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"file:{self.db_path}?mode=ro",
                 tracking_path=self.db_path,
                 uri=True,
-                # Each worker gets its own read-only connection, but a cached
-                # prepared statement can still survive thread-pool reuse. Keep
-                # this defensive path cacheless to avoid CPython's intermittent
-                # "no more rows available" statement-cache failure class.
+                # Defensive hardening: per-thread read connections also
+                # disable the prepared-statement cache (Python 3.12+, harmless
+                # on 3.11) so cached cursors don't survive thread-pool reuse.
                 cached_statements=0,
                 timeout=5.0,
                 isolation_level=None,

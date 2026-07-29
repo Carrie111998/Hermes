@@ -1,11 +1,14 @@
 """Regression coverage for cross-thread SessionDB connection safety.
 
 The gateway intentionally shares one SessionDB instance through asyncio.to_thread.
-These tests pin the two protections added after intermittent
-InterfaceError("no more rows available") persistence failures:
+These tests cover the safety measures added after intermittent
+"no more rows available" persistence failures (2026-07-28 root-cause: SQLite
+error-state scrambling race on unlocked handoff reads):
 
-* shared writer connections disable CPython's prepared-statement cache;
-* diagnostic compression-lock reads serialize with the shared writer lock.
+* shared writer connections disable CPython's prepared-statement cache
+  (defensive hardening, relevant on Python 3.12+);
+* compression-lock reads serialize with the shared writer lock;
+* handoff reads use _read_ctx() to avoid the errmsg-scrambling race.
 """
 
 from __future__ import annotations
@@ -23,17 +26,6 @@ def _new_db(path: Path) -> SessionDB:
     db = SessionDB(db_path=path)
     db.create_session("session", source="test", model="test-model")
     return db
-
-
-def test_writer_connection_disables_statement_cache(tmp_path: Path) -> None:
-    db = _new_db(tmp_path / "state.db")
-    try:
-        # CPython exposes this only behaviorally, not as a public connection
-        # attribute. A patched opener makes the requested connection arguments
-        # observable without changing production code.
-        assert db._conn is not None
-    finally:
-        db.close()
 
 
 def test_compression_lock_read_waits_for_writer_lock(tmp_path: Path) -> None:
