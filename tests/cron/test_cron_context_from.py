@@ -199,6 +199,90 @@ class TestBuildJobPromptContextFrom:
         assert "truncated" in prompt
         assert "x" * 10000 not in prompt
 
+    def test_cron_artifact_context_injects_response_only(self, cron_env):
+        """Cron artifacts should not replay the prior job's prompt."""
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        job_a = create_job(prompt="Find data", schedule="every 1h")
+        out_dir = OUTPUT_DIR / job_a["id"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "2026-04-22_10-00-00.md").write_text(
+            "# Cron Job: upstream\n\n"
+            "## Prompt\n\n"
+            "DO_NOT_REPLAY_UPSTREAM_PROMPT\n\n"
+            "## Response\n\n"
+            "Useful upstream response.\n",
+            encoding="utf-8",
+        )
+
+        job_b = create_job(
+            prompt="Process", schedule="every 2h", context_from=job_a["id"]
+        )
+        prompt = _build_job_prompt(job_b)
+
+        assert "Useful upstream response." in prompt
+        assert "DO_NOT_REPLAY_UPSTREAM_PROMPT" not in prompt
+
+    def test_nested_cron_artifact_context_uses_outer_response(self, cron_env):
+        """Nested prior artifacts should not leak prompt/context scaffolding."""
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        job_a = create_job(prompt="Validate", schedule="every 1h")
+        out_dir = OUTPUT_DIR / job_a["id"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "2026-04-22_10-00-00.md").write_text(
+            "# Cron Job: validator\n\n"
+            "## Prompt\n\n"
+            "## Output from job 'abcdef123456'\n"
+            "```\n"
+            "# Cron Job: review\n\n"
+            "## Prompt\n\n"
+            "NESTED_PROMPT_SHOULD_NOT_LEAK\n\n"
+            "## Response\n\n"
+            "Nested response from upstream review.\n"
+            "```\n\n"
+            "Validation prompt text.\n\n"
+            "## Response\n\n"
+            "Outer validation response.\n",
+            encoding="utf-8",
+        )
+
+        job_b = create_job(
+            prompt="Queue", schedule="every 2h", context_from=job_a["id"]
+        )
+        prompt = _build_job_prompt(job_b)
+
+        assert "Outer validation response." in prompt
+        assert "Nested response from upstream review." not in prompt
+        assert "NESTED_PROMPT_SHOULD_NOT_LEAK" not in prompt
+
+    def test_cron_artifact_context_injects_error_only(self, cron_env):
+        """Failed cron artifacts should pass the error payload, not the prompt."""
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        job_a = create_job(prompt="Find data", schedule="every 1h")
+        out_dir = OUTPUT_DIR / job_a["id"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "2026-04-22_10-00-00.md").write_text(
+            "# Cron Job: upstream (FAILED)\n\n"
+            "## Prompt\n\n"
+            "DO_NOT_REPLAY_FAILED_PROMPT\n\n"
+            "## Error\n\n"
+            "```\nRuntimeError: upstream failed\n```\n",
+            encoding="utf-8",
+        )
+
+        job_b = create_job(
+            prompt="Process", schedule="every 2h", context_from=job_a["id"]
+        )
+        prompt = _build_job_prompt(job_b)
+
+        assert "RuntimeError: upstream failed" in prompt
+        assert "DO_NOT_REPLAY_FAILED_PROMPT" not in prompt
+
     def test_graceful_when_file_deleted_between_listing_and_reading(self, cron_env):
         """Job should not crash if output file is deleted mid-read."""
         from cron.jobs import create_job, OUTPUT_DIR

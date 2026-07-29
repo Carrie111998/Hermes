@@ -51,6 +51,23 @@ from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
+_CRON_ARTIFACT_PAYLOAD_RE = re.compile(
+    r"(?m)^## (?P<section>Response|Error)\s*$"
+)
+
+
+def _extract_cron_artifact_payload(text: str) -> str:
+    """Return only the final response/error payload from a saved cron artifact."""
+    matches = list(_CRON_ARTIFACT_PAYLOAD_RE.finditer(text))
+    if not matches:
+        return text
+    match = matches[-1]
+    section = match.group("section")
+    payload = text[match.end() :].strip()
+    if section == "Error" and payload:
+        return f"## Error\n\n{payload}"
+    return payload
+
 
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
@@ -2508,7 +2525,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 )
                 if not output_files:
                     continue  # silent skip — no output yet
-                latest_output = output_files[0].read_text(encoding="utf-8").strip()
+                latest_output = _extract_cron_artifact_payload(
+                    output_files[0].read_text(encoding="utf-8").strip()
+                )
                 # Truncate to 8K characters to avoid prompt bloat
                 _MAX_CONTEXT_CHARS = 8000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
