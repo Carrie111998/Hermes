@@ -3,6 +3,8 @@ import './styles.css'
 import './store/active-work'
 // Side-effect: applies the persisted window translucency on load.
 import './store/translucency'
+// Side-effect: applies the persisted conversation text size before chat mounts.
+import './store/conversation-font-size'
 // Dev-only render/state churn counters. MUST precede the `react-dom` import
 // below: react-dom captures the devtools hook at module init, so bippy has to
 // install during THIS import's evaluation or every commit goes unseen
