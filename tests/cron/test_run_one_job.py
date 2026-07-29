@@ -10,6 +10,10 @@ The first test characterizes the sequence as driven through `tick()` (proving
 the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
+import asyncio
+
+import pytest
+
 import cron.scheduler as s
 
 
@@ -119,39 +123,60 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
     assert marks == [("j6", False)]
 
 
-def test_run_one_job_base_exception_marks_failure_and_reraises(monkeypatch):
-    """Regression for #73973: KeyboardInterrupt/SystemExit escape the
-    `except Exception` handler by design, but must still persist an outcome
-    before propagating — otherwise a one-shot's pre-run claim_dispatch()
-    commit (#38758) is left with no recorded result once the process dies.
-    """
+# ---------------------------------------------------------------------------
+# BaseException reconciliation (#73973).
+#
+# claim_dispatch() consumes repeat.completed BEFORE the run (#38758's
+# at-most-times contract), so every exit path out of run_one_job() must
+# reconcile that claim via mark_job_run(). CancelledError / KeyboardInterrupt
+# / SystemExit are NOT Exception subclasses (issue #73973 demonstrates this
+# for asyncio.CancelledError as of Python 3.8+), so the `except Exception`
+# handler misses them entirely: a one-shot job is left with completed==times
+# and last_run_at==null, its run_claim blocks re-dispatch until the TTL, and
+# the dispatch-limit guard then discards it with no recorded outcome at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("exc", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+def test_run_one_job_base_exception_marks_failure_and_reraises(monkeypatch, exc):
+    """A cancelled/interrupted run must still reconcile the claim, and the
+    abort must still propagate (shutdown/cancel semantics unchanged)."""
     def interrupted(job, *, defer_agent_teardown=None):
-        raise KeyboardInterrupt()
+        raise exc()
 
     monkeypatch.setattr(s, "run_job", interrupted)
     marks = []
-    finishes = []
     monkeypatch.setattr(
         s, "mark_job_run",
-        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok, err)),
+        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok)),
     )
+
+    with pytest.raises(exc):
+        s.run_one_job({"id": "j11", "name": "t"})
+
+    assert marks == [("j11", False)], (
+        "claim_dispatch() already consumed repeat.completed; the run must be "
+        "marked failed so the job is not wedged and silently dropped"
+    )
+
+
+def test_run_one_job_base_exception_finishes_the_execution_record(monkeypatch):
+    """The execution ledger entry must be closed out too, not left running."""
+    def interrupted(job, *, defer_agent_teardown=None):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(s, "run_job", interrupted)
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
+    finished = []
     monkeypatch.setattr(
         s, "finish_execution",
-        lambda exec_id, *, success, error=None: finishes.append((success, error)),
+        lambda exec_id, *, success, error=None: finished.append((exec_id, success)),
     )
 
-    raised = False
-    try:
-        s.run_one_job({"id": "j11", "name": "t"})
-    except KeyboardInterrupt:
-        raised = True
+    with pytest.raises(asyncio.CancelledError):
+        s.run_one_job({"id": "j12", "name": "t", "execution_id": "e12"})
 
-    assert raised, "KeyboardInterrupt must still propagate, not be swallowed"
-    assert len(marks) == 1
-    jid, ok, err = marks[0]
-    assert (jid, ok) == ("j11", False)
-    assert "KeyboardInterrupt" in err
-    assert finishes and finishes[0][0] is False
+    assert finished == [("e12", False)]
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
