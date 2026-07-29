@@ -574,9 +574,9 @@ def _summarize_tool_result(tool_name: str, tool_args: str, tool_content: str) ->
         name = args.get("name", "?")
         return f"[{tool_name}] name={name} ({content_len:,} chars)"
 
-    if tool_name == "vision_analyze":
+    if tool_name == "image_analyze":
         question = args.get("question", "")[:50]
-        return f"[vision_analyze] '{question}' ({content_len:,} chars)"
+        return f"[{tool_name}] '{question}' ({content_len:,} chars)"
 
     if tool_name == "memory":
         action = args.get("action", "?")

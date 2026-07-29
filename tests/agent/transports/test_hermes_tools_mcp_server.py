@@ -43,7 +43,7 @@ class TestModuleSurface:
             "web_search",
             "web_extract",
             "browser_navigate",
-            "vision_analyze",
+            "image_analyze",
             "image_generate",
             "skill_view",
         ):

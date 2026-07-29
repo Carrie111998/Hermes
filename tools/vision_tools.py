@@ -317,24 +317,8 @@ def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None)
 # provider accepts the image and we reject outright.
 _MAX_BASE64_BYTES = 20 * 1024 * 1024
 
-# Proactive embed cap (4 MB).  This is the size we resize an image DOWN to
-# before embedding it into conversation history, regardless of the 20 MB hard
-# ceiling.  Anthropic's per-image base64 limit is 5 MB; once an oversized image
-# is baked into history (e.g. a vision tool-result), it is re-sent on every
-# subsequent turn and permanently wedges the session with a 400 that retries
-# can't clear (the bad bytes are immutable history).  Capping at embed time —
-# with headroom under 5 MB — is the only durable fix.  Matches the post-failure
-# shrink target in agent.conversation_compression so behaviour is consistent
-# whether we resize proactively or reactively.
-_EMBED_TARGET_BYTES = 4 * 1024 * 1024
-
-# Proactive embed dimension cap (px, longest side).  Anthropic enforces an
-# 8000px per-side ceiling INDEPENDENTLY of the 5 MB byte cap — a tall full-page
-# screenshot can be well under 5 MB yet far over 8000px (e.g. 1200×12000 at
-# 0.06 MB), so the byte-only embed check above lets it slip into immutable
-# history un-resized and the session bricks on a non-retryable 400.  We cap at
-# 7900 (headroom under 8000) so the proactive resize shrinks tall small-byte
-# images before they are embedded.
+# Image dimension cap (px, longest side). Anthropic enforces an 8000px
+# per-side ceiling independently of the byte cap, so keep a little headroom.
 _EMBED_MAX_DIMENSION = 7900
 
 # Target size when auto-resizing on API failure (5 MB).  After a provider
@@ -684,119 +668,6 @@ def _build_native_vision_tool_result(
             "native_vision": True,
         },
     }
-
-
-async def _vision_analyze_native(
-    image_url: str,
-    question: str,
-) -> Any:
-    """Fast path for vision-capable main models.
-
-    Loads the image (local file OR remote URL), base64-encodes it, and
-    returns a multimodal tool-result envelope. The agent loop unwraps it;
-    provider adapters serialize it into the right tool-result-with-image
-    shape for each backend.
-
-    Returns:
-        A ``_multimodal`` envelope dict on success.
-        A JSON error string on failure (matches the existing tool-result
-        contract so the agent loop displays errors normally).
-    """
-    if not isinstance(image_url, str) or not image_url.strip():
-        return tool_error("image_url is required", success=False)
-
-    temp_image_path: Optional[Path] = None
-    should_cleanup = False
-    try:
-        from tools.interrupt import is_interrupted
-        if is_interrupted():
-            return tool_error("Interrupted", success=False)
-
-        # Resolve the image source (mirrors vision_analyze_tool's logic
-        # exactly so behaviour is consistent).
-        resolved_url = image_url
-        if resolved_url.startswith("file://"):
-            resolved_url = resolved_url[len("file://"):]
-        local_path = Path(os.path.expanduser(resolved_url))
-
-        if local_path.is_file():
-            temp_image_path = local_path
-            should_cleanup = False
-        elif await _validate_image_url_async(image_url):
-            blocked = check_website_access(image_url)
-            if blocked:
-                return tool_error(blocked["message"], success=False)
-            temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
-            temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.jpg"
-            await _download_image(image_url, temp_image_path)
-            should_cleanup = True
-        else:
-            return tool_error(
-                "Invalid image source. Provide an HTTP/HTTPS URL or a "
-                "valid local file path.",
-                success=False,
-            )
-
-        image_size_bytes = temp_image_path.stat().st_size
-        detected_mime_type = _detect_image_mime_type(temp_image_path)
-        if not detected_mime_type:
-            return tool_error(
-                "Only real image files are supported for vision analysis.",
-                success=False,
-            )
-
-        image_data_url = _image_to_base64_data_url(
-            temp_image_path, mime_type=detected_mime_type,
-        )
-
-        # Proactive embed cap: this image gets baked into conversation
-        # history and re-sent on every subsequent turn.  Anthropic rejects
-        # any single base64 image over 5 MB OR over 8000px per side with a
-        # 400, and because history is immutable, an oversized embed
-        # permanently wedges the session — retries can't clear bytes (or
-        # pixels) that are already in the request.  Resize DOWN to the embed
-        # target (4 MB / 7900px, headroom under both ceilings) whenever the
-        # payload exceeds either limit, not just at the 20 MB hard ceiling.
-        _over_bytes = len(image_data_url) > _EMBED_TARGET_BYTES
-        _over_dims = _image_exceeds_dimension(temp_image_path, _EMBED_MAX_DIMENSION)
-        if _over_bytes or _over_dims:
-            image_data_url = _resize_image_for_vision(
-                temp_image_path, mime_type=detected_mime_type,
-                max_base64_bytes=_EMBED_TARGET_BYTES,
-                max_dimension=_EMBED_MAX_DIMENSION,
-            )
-            # If even resizing can't get under the absolute hard ceiling,
-            # there's nothing more we can do — reject rather than embed a
-            # session-wedging payload.
-            if len(image_data_url) > _MAX_BASE64_BYTES:
-                return tool_error(
-                    f"Image too large for vision API: base64 payload is "
-                    f"{len(image_data_url) / (1024 * 1024):.1f} MB "
-                    f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
-                    f"even after resizing. Install Pillow "
-                    f"(`pip install Pillow`) for better auto-resize, "
-                    f"or compress the image manually.",
-                    success=False,
-                )
-
-        return _build_native_vision_tool_result(
-            image_url=image_url,
-            question=question,
-            image_data_url=image_data_url,
-            image_size_bytes=image_size_bytes,
-        )
-
-    except Exception as exc:
-        logger.warning("Native vision fast path failed: %s", exc)
-        return tool_error(f"Native vision failed: {exc}", success=False)
-    finally:
-        # Only delete temp files we created — never user-provided paths.
-        if should_cleanup and temp_image_path is not None:
-            try:
-                if temp_image_path.exists():
-                    temp_image_path.unlink()
-            except Exception:
-                pass
 
 
 async def vision_analyze_tool(
@@ -1166,68 +1037,6 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
 
-VISION_ANALYZE_SCHEMA = {
-    "name": "vision_analyze",
-    "description": (
-        "Load an image into the conversation so you can see it. Accepts a "
-        "URL, local file path, or data URL. When your active model has "
-        "native vision, the image is attached to your context directly "
-        "and you read the pixels yourself on the next turn — call this "
-        "any time the user references an image (filepath in their message, "
-        "URL in tool output, screenshot from the browser, etc.). For "
-        "non-vision models, falls back to an auxiliary vision model that "
-        "returns a text description."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "image_url": {
-                "type": "string",
-                "description": "Image URL (http/https), local file path, or data: URL to load."
-            },
-            "question": {
-                "type": "string",
-                "description": "Your specific question or request about the image. Optional context the model uses on the next turn after seeing the image."
-            }
-        },
-        "required": ["image_url", "question"]
-    }
-}
-
-
-def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
-    image_url = args.get("image_url", "")
-    question = args.get("question", "")
-
-    # Fast path: when native image routing is in effect for the active main
-    # model (provider accepts images in tool results, or the user set the
-    # model.supports_vision override), short-circuit the auxiliary LLM and
-    # return the image bytes as a multimodal tool-result envelope. The main
-    # model sees the pixels directly on its next turn — no aux call, no
-    # information loss, no extra latency.
-    if _should_use_native_vision_fast_path():
-        logger.info("vision_analyze: native fast path")
-        return _vision_analyze_native(image_url, question)
-
-    # Legacy path: aux LLM describes the image and we return its text.
-    full_prompt = (
-        "Fully describe and explain everything about this image, then answer the "
-        f"following question:\n\n{question}"
-    )
-    model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return vision_analyze_tool(image_url, full_prompt, model)
-
-
-registry.register(
-    name="vision_analyze",
-    toolset="vision",
-    schema=VISION_ANALYZE_SCHEMA,
-    handler=_handle_vision_analyze,
-    check_fn=check_vision_requirements,
-    is_async=True,
-    emoji="👁️",
-)
-
 
 # ---------------------------------------------------------------------------
 # Video Analysis Tool
@@ -1571,7 +1380,7 @@ VIDEO_ANALYZE_SCHEMA = {
     "description": (
         "Analyze a video from a URL or local file path using a multimodal AI model. "
         "Sends the video to a video-capable model (e.g. Gemini) for understanding. "
-        "Use this for video files — for images, use vision_analyze instead. "
+        "Use this for video files — for images, use image_analyze instead. "
         "Supports mp4, webm, mov, avi, mkv, mpeg formats. "
         "Note: large videos (>20 MB) may be slow; max ~50 MB."
     ),

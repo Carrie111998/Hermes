@@ -9319,7 +9319,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     video_paths.append(path)
 
             if image_paths:
-                # Decide routing: native (attach pixels) vs text (vision_analyze
+                # Decide routing: native (attach pixels) vs text (auxiliary-vision
                 # pre-run + prepend description).  See agent/image_routing.py.
                 _img_mode = self._decide_image_input_mode()
                 if _img_mode == "native":
@@ -9335,7 +9335,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 else:
                     logger.info(
-                        "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
+                        "Image routing: text (mode=%s). Pre-analyzing %d image(s) via the auxiliary vision model.",
                         _img_mode, len(image_paths),
                     )
                     message_text = await self._enrich_message_with_vision(
@@ -10273,7 +10273,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # If the user attached image(s), we run the vision tool eagerly so
         # the conversation model always receives a text description.  The
         # local file path is also included so the model can re-examine the
-        # image later with a more targeted question via vision_analyze.
+        # image later with a more targeted question via image_analyze.
         #
         # We filter to image paths only (by media_type) so that non-image
         # attachments (documents, audio, etc.) are not sent to the vision
@@ -13606,7 +13606,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Resolve the image-input routing for the currently active model.
 
         Returns ``"native"`` (attach pixels on the user turn) or ``"text"``
-        (pre-analyze with vision_analyze and prepend the description). See
+        (pre-analyze with the auxiliary vision model and prepend the description). See
         agent/image_routing.py for the full decision table.
 
         The active provider/model are read from config.yaml so the decision
@@ -13637,7 +13637,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Each image is analyzed with a general-purpose prompt.  The resulting
         description *and* the local cache path are injected so the model can:
           1. Immediately understand what the user sent (no extra tool call).
-          2. Re-examine the image with vision_analyze if it needs more detail.
+          2. Re-examine the image with image_analyze if it needs more detail.
 
         Args:
             user_text:   The user's original caption / message text.
@@ -13669,21 +13669,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     description = sanitize_context(description)
                     enriched_parts.append(
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
-                        f"[If you need a closer look, use vision_analyze with "
+                        f"[If you need a closer look, use image_analyze with "
                         f"image_url: {path} ~]"
                     )
                 else:
                     enriched_parts.append(
                         "[The user sent an image but I couldn't quite see it "
                         "this time (>_<) You can try looking at it yourself "
-                        f"with vision_analyze using image_url: {path}]"
+                        f"with image_analyze using image_url: {path}]"
                     )
             except Exception as e:
                 logger.error("Vision auto-analysis error: %s", e)
                 enriched_parts.append(
                     f"[The user sent an image but something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "
-                    f"with vision_analyze using image_url: {path}]"
+                    f"with image_analyze using image_url: {path}]"
                 )
 
         # Combine: vision descriptions first, then the user's original text

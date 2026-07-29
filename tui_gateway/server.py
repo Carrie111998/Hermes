@@ -4453,7 +4453,7 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
         p = Path(path)
         if not p.exists():
             continue
-        hint = f"[You can examine it with vision_analyze using image_url: {p}]"
+        hint = f"[You can examine it with image_analyze using image_url: {p}]"
         try:
             r = _json.loads(
                 asyncio.run(vision_analyze_tool(image_url=str(p), user_prompt=prompt))
@@ -8449,7 +8449,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # Decide image routing per-turn based on active provider/model.
             # "native" → pass pixels to the main model as OpenAI-style content
             # parts (adapters translate for Anthropic/Gemini/Bedrock/etc.).
-            # "text"   → pre-analyze with vision_analyze and prepend the text.
+            # "text"   → pre-analyze with the auxiliary vision model and prepend the text.
             # See agent/image_routing.py for the full decision table.
             run_message: Any = prompt
             if images:

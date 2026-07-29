@@ -2,16 +2,13 @@
 
 import json
 import logging
-import os
 from pathlib import Path
-from typing import Awaitable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from tools.vision_tools import (
     _validate_image_url,
-    _handle_vision_analyze,
     _determine_mime_type,
     _image_to_base64_data_url,
     _resize_image_for_vision,
@@ -164,99 +161,6 @@ class TestImageToBase64DataUrl:
     def test_file_not_found_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             _image_to_base64_data_url(tmp_path / "nonexistent.png")
-
-
-# ---------------------------------------------------------------------------
-# _handle_vision_analyze — type signature & behavior
-# ---------------------------------------------------------------------------
-
-
-class TestHandleVisionAnalyze:
-    """Verify _handle_vision_analyze returns an Awaitable and builds correct prompt."""
-
-    def test_returns_awaitable(self):
-        """The handler must return an Awaitable (coroutine) since it's registered as async."""
-        with patch(
-            "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-        ) as mock_tool:
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            result = _handle_vision_analyze(
-                {
-                    "image_url": "https://example.com/img.png",
-                    "question": "What is this?",
-                }
-            )
-            # It should be an Awaitable (coroutine)
-            assert isinstance(result, Awaitable)
-            # Clean up the coroutine to avoid RuntimeWarning
-            result.close()
-
-    def test_prompt_contains_question(self):
-        """The full prompt should incorporate the user's question."""
-        with patch(
-            "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-        ) as mock_tool:
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            coro = _handle_vision_analyze(
-                {
-                    "image_url": "https://example.com/img.png",
-                    "question": "Describe the cat",
-                }
-            )
-            # Clean up coroutine
-            coro.close()
-            call_args = mock_tool.call_args
-            full_prompt = call_args[0][1]  # second positional arg
-            assert "Describe the cat" in full_prompt
-            assert "Fully describe and explain" in full_prompt
-
-    def test_uses_auxiliary_vision_model_env(self):
-        """AUXILIARY_VISION_MODEL env var should override DEFAULT_VISION_MODEL."""
-        with (
-            patch(
-                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-            ) as mock_tool,
-            patch.dict(os.environ, {"AUXILIARY_VISION_MODEL": "custom/model-v1"}),
-        ):
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            coro = _handle_vision_analyze(
-                {"image_url": "https://example.com/img.png", "question": "test"}
-            )
-            coro.close()
-            call_args = mock_tool.call_args
-            model = call_args[0][2]  # third positional arg
-            assert model == "custom/model-v1"
-
-    def test_falls_back_to_default_model(self):
-        """Without AUXILIARY_VISION_MODEL, model should be None (let call_llm resolve default)."""
-        with (
-            patch(
-                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-            ) as mock_tool,
-            patch.dict(os.environ, {}, clear=False),
-        ):
-            # Ensure AUXILIARY_VISION_MODEL is not set
-            os.environ.pop("AUXILIARY_VISION_MODEL", None)
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            coro = _handle_vision_analyze(
-                {"image_url": "https://example.com/img.png", "question": "test"}
-            )
-            coro.close()
-            call_args = mock_tool.call_args
-            model = call_args[0][2]
-            # With no AUXILIARY_VISION_MODEL set, model should be None
-            # (the centralized call_llm router picks the default)
-            assert model is None
-
-    def test_empty_args_graceful(self):
-        """Missing keys should default to empty strings, not raise."""
-        with patch(
-            "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
-        ) as mock_tool:
-            mock_tool.return_value = json.dumps({"result": "ok"})
-            result = _handle_vision_analyze({})
-            assert isinstance(result, Awaitable)
-            result.close()
 
 
 # ---------------------------------------------------------------------------
@@ -721,30 +625,11 @@ class TestErrorClassification:
 
 
 class TestVisionRegistration:
-    def test_vision_analyze_registered(self):
+    def test_vision_analyze_not_registered(self):
         from tools.registry import registry
 
         entry = registry._tools.get("vision_analyze")
-        assert entry is not None
-        assert entry.toolset == "vision"
-        assert entry.is_async is True
-
-    def test_schema_has_required_fields(self):
-        from tools.registry import registry
-
-        entry = registry._tools.get("vision_analyze")
-        schema = entry.schema
-        assert schema["name"] == "vision_analyze"
-        params = schema.get("parameters", {})
-        props = params.get("properties", {})
-        assert "image_url" in props
-        assert "question" in props
-
-    def test_handler_is_callable(self):
-        from tools.registry import registry
-
-        entry = registry._tools.get("vision_analyze")
-        assert callable(entry.handler)
+        assert entry is None
 
 
 # ---------------------------------------------------------------------------

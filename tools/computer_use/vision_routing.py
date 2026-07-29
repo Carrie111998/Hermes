@@ -22,8 +22,8 @@ screenshot be returned as multimodal content (main model handles vision
 natively) or pre-analysed via the auxiliary vision pipeline so the main
 model only ever sees text?
 
-Behaviour (mirrors ``vision_analyze`` for consistency)
-------------------------------------------------------
+Behaviour
+---------
 * If the user explicitly configured ``auxiliary.vision`` (any of
   ``provider``, ``model``, or ``base_url`` non-empty / not ``"auto"``),
   the screenshot is routed through the aux vision pipeline. Users who
@@ -145,7 +145,7 @@ def _provider_accepts_multimodal_tool_result(provider: str, model: str) -> Optio
 
     Reuses ``tools.vision_tools._supports_media_in_tool_results`` so the
     capture-routing decision stays in lockstep with the
-    ``vision_analyze`` native fast path. Returns None on import failure
+    native image-result fast path. Returns None on import failure
     so callers fall back to aux routing rather than guessing.
     """
     if not provider:

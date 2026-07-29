@@ -4514,7 +4514,7 @@ class AIAgent:
         note = f"[The {role_label} attached an image. Here's what it contains:\n{description}]"
         if vision_source and not str(image_url or "").startswith("data:"):
             note += (
-                f"\n[If you need a closer look, use vision_analyze with image_url: {vision_source}]"
+                f"\n[If you need a closer look, use image_analyze with image_url: {vision_source}]"
             )
 
         self._anthropic_image_fallback_cache[cache_key] = note
@@ -4642,7 +4642,7 @@ class AIAgent:
             return api_messages
 
         # Non-vision Anthropic model (rare today, but keep the fallback for
-        # compat): replace each image part with a vision_analyze text note.
+        # compat): replace each image part with an auxiliary-vision text note.
         transformed = copy.deepcopy(api_messages)
         for msg in transformed:
             if not isinstance(msg, dict):
@@ -4659,7 +4659,7 @@ class AIAgent:
         Runs on the chat.completions / codex_responses paths. Vision-capable
         models pass through unchanged (provider and any downstream translator
         handle the image parts natively). Non-vision models get each image
-        replaced by a cached vision_analyze text description so the turn
+        replaced by a cached auxiliary-vision text description so the turn
         doesn't fail with "model does not support image input".
         """
         if not any(

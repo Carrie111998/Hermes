@@ -40,7 +40,7 @@ _HERMES_CORE_TOOLS = [
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
     # Vision + image generation
-    "vision_analyze", "image_generate",
+    "image_analyze", "image_generate",
     # Skills
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
@@ -85,7 +85,7 @@ _HERMES_CORE_TOOLS = [
 _HERMES_WEBHOOK_SAFE_TOOLS = [
     "web_search",
     "web_extract",
-    "vision_analyze",
+    "image_analyze",
     "clarify",
 ]
 
@@ -119,7 +119,7 @@ TOOLSETS = {
     
     "vision": {
         "description": "Image analysis and vision tools",
-        "tools": ["vision_analyze"],
+        "tools": ["image_analyze"],
         "includes": []
     },
 
@@ -348,7 +348,7 @@ TOOLSETS = {
             "web_search", "web_extract",
             "terminal", "process", "read_terminal", "close_terminal",
             "read_file", "write_file", "patch", "search_files",
-            "vision_analyze",
+            "image_analyze",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
@@ -380,7 +380,7 @@ TOOLSETS = {
             "web_search", "web_extract",
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
-            "vision_analyze",
+            "image_analyze",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
@@ -403,7 +403,7 @@ TOOLSETS = {
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
             # Vision + image generation
-            "vision_analyze", "image_generate",
+            "image_analyze", "image_generate",
             # Skills
             "skills_list", "skill_view", "skill_manage",
             # Browser automation

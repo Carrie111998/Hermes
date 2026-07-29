@@ -97,9 +97,9 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("def _call(", src)  # infrastructure still present
 
     def test_non_allowed_tools_ignored(self):
-        src = generate_hermes_tools_module(["vision_analyze", "terminal"])
+        src = generate_hermes_tools_module(["image_analyze", "terminal"])
         self.assertIn("def terminal(", src)
-        self.assertNotIn("def vision_analyze(", src)
+        self.assertNotIn("def image_analyze(", src)
 
     def test_rpc_infrastructure_present(self):
         src = generate_hermes_tools_module(["terminal"])
@@ -683,10 +683,10 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
     def test_real_scenario_only_vision_enabled(self):
         """Another real path: user runs `hermes tools code_execution,vision`.
 
-        tools_to_include = {"execute_code", "vision_analyze"}
+        tools_to_include = {"execute_code", "image_analyze"}
         SANDBOX_ALLOWED_TOOLS has neither, so intersection is empty.
         """
-        tools_to_include = {"execute_code", "vision_analyze"}
+        tools_to_include = {"execute_code", "image_analyze"}
         sandbox_enabled = SANDBOX_ALLOWED_TOOLS & tools_to_include
 
         self.assertEqual(sandbox_enabled, set())
@@ -882,7 +882,7 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
                     return_value=json.dumps({"ok": True})):
             result = json.loads(execute_code(
                 code, task_id="test-nonoverlap",
-                enabled_tools=["vision_analyze", "browser_snapshot"],
+                enabled_tools=["image_analyze", "browser_snapshot"],
             ))
         self.assertEqual(result["status"], "success")
         self.assertIn("fallback ok", result["output"])

@@ -6003,7 +6003,7 @@ class TestAnthropicImageFallback:
         assert isinstance(transformed[0]["content"], str)
         assert "A cat sitting on a chair." in transformed[0]["content"]
         assert "Can you see this now?" in transformed[0]["content"]
-        assert "vision_analyze with image_url: https://example.com/cat.png" in transformed[0]["content"]
+        assert "image_analyze with image_url: https://example.com/cat.png" in transformed[0]["content"]
 
     def test_build_api_kwargs_reuses_cached_image_analysis_for_duplicate_images(self, agent):
         agent.api_mode = "anthropic_messages"

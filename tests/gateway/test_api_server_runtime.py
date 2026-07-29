@@ -21,6 +21,7 @@ from gateway.api_server_runtime import (
     _pin_run_model,
     _resume_runtime_history,
     _runtime_attachment_parts,
+    _runtime_image_paths,
     _runtime_video_paths,
     _runtime_tool_middleware,
 )
@@ -75,6 +76,7 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
         assert agent._fallback_model is None
         assert agent.valid_tool_names == {
             "ask_user_question",
+            "image_analyze",
             "skill_view",
             "ultra_media_job_create",
             "web_extract",
@@ -201,7 +203,7 @@ def test_pin_run_model_uses_canonical_switch_and_disables_fallbacks():
     assert agent._fallback_activated is False
 
 
-def test_runtime_attachment_parts_preserve_image_pixels():
+def test_runtime_attachment_parts_preserve_and_materialize_image_pixels(tmp_path):
     image = base64.b64encode(b"png-bytes").decode()
     parts = _runtime_attachment_parts([{
         "role": "product_photo",
@@ -210,14 +212,38 @@ def test_runtime_attachment_parts_preserve_image_pixels():
         "media_type": "image",
         "mime_type": "image/png",
         "data": image,
-    }])
+    }], image_dir=tmp_path)
+    paths = _runtime_image_paths(parts)
+    assert len(paths) == 1
+    image_path = paths[0]
+    assert image_path.parent == tmp_path
+    assert image_path.name == hashlib.sha256(b"asset_image").hexdigest()[:24] + ".png"
+    assert image_path.read_bytes() == b"png-bytes"
     assert parts == [{
         "type": "text",
-        "text": "[Attached image: product.png; role=product_photo; asset_id=asset_image]",
+        "text": (
+            "[Attached image: product.png; role=product_photo; asset_id=asset_image. "
+            "When pixel analysis is required, call image_analyze with "
+            f"image_url={image_path}. Keep this private runtime path out "
+            "of the final answer.]"
+        ),
+        "_runtime_image_path": str(image_path),
     }, {
         "type": "image_url",
         "image_url": {"url": f"data:image/png;base64,{image}"},
     }]
+
+
+def test_runtime_attachment_parts_require_private_image_directory():
+    with pytest.raises(ValueError, match="image materialization directory"):
+        _runtime_attachment_parts([{
+            "role": "user_upload",
+            "asset_id": "asset_image",
+            "filename": "image.png",
+            "media_type": "image",
+            "mime_type": "image/png",
+            "data": base64.b64encode(b"image-bytes").decode(),
+        }])
 
 
 
@@ -303,6 +329,57 @@ def test_runtime_video_tool_is_scoped_to_materialized_attachment(tmp_path):
         session.loop.close()
 
 
+def test_runtime_image_tool_allows_remote_and_scopes_local_sources(tmp_path):
+    allowed = tmp_path / "asset_image.png"
+    allowed.write_bytes(b"image")
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_image",
+        asyncio.new_event_loop(),
+        queue,
+        [],
+        1_000,
+        "agent_image",
+        allowed_image_paths={str(allowed)},
+    )
+    runtime_module._SESSIONS["agent_image"] = session
+    try:
+        seen = []
+        accepted = _runtime_tool_middleware(
+            tool_name="image_analyze",
+            args={
+                "image_url": [str(allowed), "https://example.com/reference.png"],
+                "question": "Compare them",
+            },
+            session_id="agent_image",
+            tool_call_id="image_ok",
+            next_call=lambda args: seen.append(args) or '{"success":true}',
+        )
+        assert accepted == '{"success":true}'
+        assert seen == [{
+            "image_url": [str(allowed), "https://example.com/reference.png"],
+            "question": "Compare them",
+        }]
+
+        denied = _runtime_tool_middleware(
+            tool_name="image_analyze",
+            args={"image_paths": os.devnull, "question": "Read another file"},
+            session_id="agent_image",
+            tool_call_id="image_denied",
+            next_call=lambda _args: pytest.fail("untrusted local path reached image tool"),
+        )
+        assert json.loads(denied) == {
+            "success": False,
+            "error": (
+                "image_analyze may only read HTTP(S) images or local image "
+                "attachments owned by this run."
+            ),
+        }
+    finally:
+        runtime_module._SESSIONS.pop("agent_image", None)
+        session.loop.close()
+
+
 @pytest.mark.asyncio
 async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_content():
     captured = {}
@@ -328,6 +405,23 @@ async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_conte
             kwargs["agent_configurator"](agent)
             captured["force_native_vision"] = agent._runtime_force_native_vision
             captured["user_message"] = kwargs["user_message"]
+            assert agent.valid_tool_names == {"image_analyze"}
+            marker = next(
+                part["text"]
+                for part in kwargs["user_message"]
+                if part.get("type") == "text" and "image_url=" in part.get("text", "")
+            )
+            image_path = marker.split("image_url=", 1)[1].split(". Keep", 1)[0]
+            captured["image_path"] = image_path
+            assert Path(image_path).read_bytes() == b"png-bytes"
+            result = _runtime_tool_middleware(
+                tool_name="image_analyze",
+                args={"image_url": image_path, "question": "Describe it"},
+                session_id=kwargs["session_id"],
+                tool_call_id="image_call",
+                next_call=lambda _args: '{"success":true,"analysis":"visible"}',
+            )
+            assert json.loads(result)["analysis"] == "visible"
             return {"final_response": "seen"}, {"total_tokens": 1}
 
     adapter = AttachmentAdapter()
@@ -371,6 +465,7 @@ async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_conte
         assert content[0] == {"type": "text", "text": "describe it"}
         assert content[-1]["image_url"]["url"] == f"data:image/png;base64,{encoded}"
         assert captured["force_native_vision"] is True
+        assert not Path(captured["image_path"]).exists()
     finally:
         await client.close()
 
@@ -398,7 +493,7 @@ async def test_runtime_bridge_exposes_scoped_video_analysis_and_cleans_source_fi
                 _fallback_activated=False,
             )
             kwargs["agent_configurator"](agent)
-            assert agent.valid_tool_names == {"video_analyze"}
+            assert agent.valid_tool_names == {"image_analyze", "video_analyze"}
             content = kwargs["user_message"]
             assert isinstance(content, list)
             marker = next(

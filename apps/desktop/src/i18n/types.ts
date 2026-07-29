@@ -26,7 +26,7 @@ export type ToolTitleKey =
   | 'session_search_recall'
   | 'terminal'
   | 'todo'
-  | 'vision_analyze'
+  | 'image_analyze'
   | 'web_extract'
   | 'web_search'
   | 'write_file'

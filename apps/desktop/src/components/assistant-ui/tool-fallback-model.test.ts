@@ -16,7 +16,7 @@ const part = (overrides: Partial<ToolPart>): ToolPart => ({
   isError: false,
   result: {},
   toolCallId: 'call_1',
-  toolName: 'vision_analyze',
+  toolName: 'image_analyze',
   type: 'tool-call',
   ...overrides
 })
@@ -26,7 +26,7 @@ afterEach(() => {
 })
 
 describe('buildToolView image handling', () => {
-  // vision_analyze reports the input image as a local path; an <img> pointed at
+  // image_analyze reports the input image as a local path; an <img> pointed at
   // a bare path resolves against the renderer origin and 404s, so we render the
   // tool codicon instead of a broken image.
   it('drops bare filesystem paths', () => {

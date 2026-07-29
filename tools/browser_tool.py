@@ -3714,7 +3714,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # Fast path: when native image routing is in effect for the active main
         # model, attach the screenshot directly instead of describing it through
         # an auxiliary vision LLM. The model inspects the pixels on its next
-        # turn — no aux call, no information loss. Consistent with vision_analyze.
+        # turn — no aux call, no information loss.
         from tools.vision_tools import (
             _build_native_vision_tool_result,
             _should_use_native_vision_fast_path,

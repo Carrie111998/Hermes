@@ -2259,7 +2259,7 @@ export const ja = defineLocale({
         },
         terminal: { done: 'コマンドを実行しました', pending: 'コマンドを実行中', pendingAction: '実行中' },
         todo: { done: 'Todo を更新しました', pending: 'Todo を更新中', pendingAction: '更新中' },
-        vision_analyze: { done: '画像を分析しました', pending: '画像を分析中', pendingAction: '分析中' },
+        image_analyze: { done: '画像を分析しました', pending: '画像を分析中', pendingAction: '分析中' },
         web_extract: {
           done: 'Web ページを読み取りました',
           pending: 'Web ページを読み取り中',

@@ -1050,13 +1050,13 @@ DEFAULT_CONFIG = {
         #   "auto"   — attach natively when the active model reports
         #              supports_vision=True AND the user hasn't explicitly
         #              configured auxiliary.vision.provider.  Otherwise fall
-        #              back to text (vision_analyze pre-analysis).
+        #              back to text (auxiliary vision pre-analysis).
         #   "native" — always attach natively; non-vision models will either
         #              error at the provider or get a last-chance text fallback
         #              (see run_agent._prepare_messages_for_api).
-        #   "text"   — always pre-analyze with vision_analyze and prepend the
+        #   "text"   — always pre-analyze with the auxiliary vision model and prepend the
         #              description as text; the main model never sees pixels.
-        # Affects gateway platforms, the TUI, and CLI /attach.  vision_analyze
+        # Affects gateway platforms, the TUI, and CLI /attach. image_analyze
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
@@ -3053,7 +3053,7 @@ OPTIONAL_ENV_VARS = {
         "prompt": "OpenRouter API key",
         "url": "https://openrouter.ai/keys",
         "password": True,
-        "tools": ["vision_analyze"],
+        "tools": ["image_analyze"],
         "category": "provider",
         "advanced": True,
     },

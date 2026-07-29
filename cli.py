@@ -6129,7 +6129,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         same approach the messaging gateway uses.
 
         The local file path is included so the agent can re-examine the
-        image later with ``vision_analyze`` if needed.
+        image later with ``image_analyze`` if needed.
         """
         import asyncio as _asyncio
         from tools.vision_tools import vision_analyze_tool
@@ -6156,7 +6156,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     description = result.get("analysis", "")
                     enriched_parts.append(
                         f"[The user attached an image. Here's what it contains:\n{description}]\n"
-                        f"[If you need a closer look, use vision_analyze with "
+                        f"[If you need a closer look, use image_analyze with "
                         f"image_url: {img_path}]"
                     )
                     if announce:
@@ -6164,7 +6164,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 else:
                     enriched_parts.append(
                         f"[The user attached an image but it couldn't be analyzed. "
-                        f"You can try examining it with vision_analyze using "
+                        f"You can try examining it with image_analyze using "
                         f"image_url: {img_path}]"
                     )
                     if announce:
@@ -6172,7 +6172,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception as e:
                 enriched_parts.append(
                     f"[The user attached an image but analysis failed ({e}). "
-                    f"You can try examining it with vision_analyze using "
+                    f"You can try examining it with image_analyze using "
                     f"image_url: {img_path}]"
                 )
                 if announce:
@@ -11612,7 +11612,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
         #            translate for Anthropic/Gemini/Bedrock).
-        # "text"   → pre-analyze each image with vision_analyze and prepend the
+        # "text"   → pre-analyze each image with the auxiliary vision model and prepend the
         #            description as text — works with non-vision models.
         # See agent/image_routing.py for the decision table.
         if images:
@@ -15510,7 +15510,7 @@ def main(
                         # custom-provider models declared via
                         # `model.supports_vision: true`), attach images natively
                         # as image_url content parts. Otherwise fall back to the
-                        # text-pipeline (vision_analyze pre-description).
+                        # text-pipeline (auxiliary vision pre-description).
                         _img_mode = "text"
                         _build_parts = None
                         try:

@@ -244,7 +244,7 @@ const TOOL_META: Record<ToolTitleKey, ToolMetaSpec> = {
     tone: 'terminal'
   },
   todo: { icon: 'tools', tone: 'agent' },
-  vision_analyze: {
+  image_analyze: {
     icon: 'eye',
     tone: 'image'
   },
@@ -995,7 +995,7 @@ function toolImageUrl(args: Record<string, unknown>, result: Record<string, unkn
   }
 
   // Only inline-render images the renderer can actually fetch: data URLs or
-  // remote http(s). A bare filesystem path (e.g. vision_analyze's input image)
+  // remote http(s). A bare filesystem path (e.g. image_analyze's input image)
   // resolves against the dev-server origin and 404s — fall back to the tool's
   // codicon instead of a broken <img>.
   const isDataImage = candidate.toLowerCase().startsWith('data:image/')

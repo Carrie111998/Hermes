@@ -1042,7 +1042,7 @@ class TestRunAgentMultimodalHelpers:
         }
 
         with patch.object(agent, "_model_supports_vision", return_value=False):
-            content = agent._tool_result_content_for_active_model("vision_analyze", result)
+            content = agent._tool_result_content_for_active_model("browser_vision", result)
 
         assert content == "analysis summary"
 

@@ -732,7 +732,7 @@ def _route_capture_through_aux_vision(
     cap: CaptureResult,
     summary: str,
 ) -> Optional[str]:
-    """Pre-analyse the captured PNG via ``vision_analyze`` and return a text result.
+    """Pre-analyse the captured PNG with the auxiliary vision model.
 
     The captured base64 PNG is materialised to ``$HERMES_HOME/cache/vision/``
     and handed to ``vision_analyze_tool`` with a generic describe prompt.
@@ -767,7 +767,7 @@ def _route_capture_through_aux_vision(
             logger.debug("computer_use: failed to decode capture base64: %s", exc)
             return None
 
-        # Pick an extension that matches the on-disk bytes so vision_analyze's
+        # Pick an extension that matches the on-disk bytes so the analyzer's
         # MIME sniffing returns the right content-type.
         # Surface 7: prefer the explicit MIME type cua-driver supplied.
         _mime_for_ext = cap.image_mime_type or ""

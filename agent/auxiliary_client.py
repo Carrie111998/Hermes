@@ -1852,8 +1852,8 @@ def _read_main_model() -> str:
     Runtime override: when an AIAgent is active with a CLI/gateway-provided
     model that differs from config.yaml, ``set_runtime_main()`` records the
     override in a process-local global. This is consulted FIRST so tools
-    that gate on "the active main model" (e.g. ``vision_analyze``'s native
-    fast path) see the live runtime, not the persisted config default.
+    that gate on "the active main model" see the live runtime, not the
+    persisted config default.
     """
     override = _RUNTIME_MAIN_MODEL
     if isinstance(override, str) and override.strip():
