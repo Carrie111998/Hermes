@@ -1398,7 +1398,7 @@ class WebhookAdapter(BasePlatformAdapter):
             correlation_id = extra.get(
                 "correlation_id",
                 terminal_delivery["correlation_id"],
-            )
+            ) or terminal_delivery["correlation_id"]
             terminal_delivery = project_terminal_delivery(
                 mark_terminal_delivery(
                     None,

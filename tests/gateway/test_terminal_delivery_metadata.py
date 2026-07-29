@@ -14,6 +14,7 @@ from gateway.delivery_metadata import (
 )
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms.webhook import WebhookAdapter
+from gateway.stream_consumer import GatewayStreamConsumer
 
 
 def _webhook_adapter() -> tuple[WebhookAdapter, AsyncMock]:
@@ -111,6 +112,60 @@ def test_malformed_terminal_metadata_fails_closed(marker) -> None:
     assert project_terminal_delivery({TERMINAL_DELIVERY_METADATA_KEY: marker}) is None
 
 
+def test_stream_metadata_marks_only_final_webhook_text() -> None:
+    adapter = SimpleNamespace(platform=Platform.WEBHOOK)
+    consumer = GatewayStreamConsumer(
+        adapter,
+        "webhook:synthetic:external-1",
+        metadata={"thread_id": "thread-1"},
+        initial_reply_to_id="reply-1",
+    )
+
+    preview = consumer._metadata_for_send(expect_edits=True)
+    progress = consumer._metadata_for_send()
+    final = consumer._metadata_for_send(final=True)
+
+    assert preview == {
+        "thread_id": "thread-1",
+        "reply_to_message_id": "reply-1",
+        "expect_edits": True,
+    }
+    assert progress == {
+        "thread_id": "thread-1",
+        "reply_to_message_id": "reply-1",
+    }
+    assert TERMINAL_DELIVERY_METADATA_KEY not in preview
+    assert TERMINAL_DELIVERY_METADATA_KEY not in progress
+    assert final is not None
+    marker = final[TERMINAL_DELIVERY_METADATA_KEY]
+    assert marker == {
+        "version": 1,
+        "outcome": "success",
+        "correlation_id": "reply-1",
+        "delivery_id": "reply-1",
+    }
+    assert final["notify"] is True
+
+
+def test_non_webhook_final_metadata_remains_backward_compatible() -> None:
+    adapter = SimpleNamespace(platform=Platform.TELEGRAM)
+    consumer = GatewayStreamConsumer(
+        adapter,
+        "chat-1",
+        metadata={"thread_id": "thread-1"},
+        initial_reply_to_id="reply-1",
+    )
+
+    final = consumer._metadata_for_send(final=True)
+
+    assert final == {
+        "thread_id": "thread-1",
+        "reply_to_message_id": "reply-1",
+        "notify": True,
+    }
+    assert TERMINAL_DELIVERY_METADATA_KEY not in final
+
+
 @pytest.mark.asyncio
 async def test_multiple_interim_sends_then_final_project_one_terminal_marker() -> None:
     adapter, target = _webhook_adapter()
@@ -138,6 +193,33 @@ async def test_multiple_interim_sends_then_final_project_one_terminal_marker() -
 
 
 @pytest.mark.asyncio
+async def test_retry_reprojects_same_accepted_turn_identity() -> None:
+    adapter, target = _webhook_adapter()
+    chat_id = _seed_delivery(adapter)
+
+    await adapter.send(
+        chat_id,
+        "complete response",
+        metadata=_terminal_metadata(delivery_id="external-first"),
+    )
+    await adapter.send(
+        chat_id,
+        "complete response retry",
+        metadata=_terminal_metadata(delivery_id="external-retry"),
+    )
+
+    first, retry = target.send.await_args_list
+    first_marker = first.kwargs["metadata"][TERMINAL_DELIVERY_METADATA_KEY]
+    retry_marker = retry.kwargs["metadata"][TERMINAL_DELIVERY_METADATA_KEY]
+    assert first_marker == retry_marker == {
+        "version": 1,
+        "outcome": "success",
+        "correlation_id": "correlation-1",
+        "delivery_id": "server-turn-1",
+    }
+
+
+@pytest.mark.asyncio
 async def test_missing_server_delivery_identity_drops_terminal_marker() -> None:
     adapter, target = _webhook_adapter()
     chat_id = _seed_delivery(adapter)
@@ -147,6 +229,66 @@ async def test_missing_server_delivery_identity_drops_terminal_marker() -> None:
         chat_id,
         "complete response",
         metadata=_terminal_metadata(),
+    )
+
+    assert target.send.await_args.kwargs["metadata"] is None
+
+
+@pytest.mark.asyncio
+async def test_blank_external_correlation_falls_back_to_terminal_source() -> None:
+    adapter, target = _webhook_adapter()
+    chat_id = _seed_delivery(adapter, correlation_id="")
+
+    await adapter.send(
+        chat_id,
+        "complete response",
+        metadata=_terminal_metadata(correlation_id="source-correlation"),
+    )
+
+    marker = target.send.await_args.kwargs["metadata"][TERMINAL_DELIVERY_METADATA_KEY]
+    assert marker["correlation_id"] == "source-correlation"
+    assert marker["delivery_id"] == "server-turn-1"
+
+
+@pytest.mark.asyncio
+async def test_cross_platform_delivery_strips_untrusted_source_metadata() -> None:
+    adapter, target = _webhook_adapter()
+    chat_id = _seed_delivery(adapter)
+
+    source_metadata = _terminal_metadata()
+    source_metadata["api_key"] = "sk-should-not-cross-platform"
+    source_metadata["tool_calls"] = [{"name": "read_secret"}]
+
+    await adapter.send(
+        chat_id,
+        "complete response",
+        metadata=source_metadata,
+    )
+
+    delivered_metadata = target.send.await_args.kwargs["metadata"]
+    assert set(delivered_metadata) == {TERMINAL_DELIVERY_METADATA_KEY}
+    marker = delivered_metadata[TERMINAL_DELIVERY_METADATA_KEY]
+    assert marker["correlation_id"] == "correlation-1"
+    assert marker["delivery_id"] == "server-turn-1"
+
+
+@pytest.mark.asyncio
+async def test_untrusted_terminal_marker_with_extra_fields_fails_closed() -> None:
+    adapter, target = _webhook_adapter()
+    chat_id = _seed_delivery(adapter)
+
+    await adapter.send(
+        chat_id,
+        "complete response",
+        metadata={
+            TERMINAL_DELIVERY_METADATA_KEY: {
+                "version": 1,
+                "outcome": "success",
+                "correlation_id": "source-correlation",
+                "delivery_id": "source-delivery",
+                "tool_calls": [{"name": "read_secret"}],
+            }
+        },
     )
 
     assert target.send.await_args.kwargs["metadata"] is None
@@ -223,6 +365,15 @@ async def test_terminal_handler_error_is_marked_once() -> None:
 async def test_distinct_accepted_turns_get_distinct_internal_delivery_ids(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        "gateway.platforms.webhook.web",
+        SimpleNamespace(
+            json_response=lambda payload, status=200: SimpleNamespace(
+                status=status,
+                payload=payload,
+            )
+        ),
+    )
     generated = iter([
         SimpleNamespace(hex="server-turn-1"),
         SimpleNamespace(hex="server-turn-2"),
