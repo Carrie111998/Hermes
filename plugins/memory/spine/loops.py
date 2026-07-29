@@ -1,0 +1,614 @@
+"""Spine loops — spec §5.
+
+Three loops:
+1. Observer — on_session_end → extract durable observations → remember()
+2. Consolidation — nightly cron → merge, contradict, promote, demote, decay
+3. Activation manifest — on_session_start → manifest + recall top-6
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from .config import SpineConfig
+from .embedder import embedder_available, embed_single
+from .index import MemoryIndex, _cosine_similarity, _deserialize_vector
+
+logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Loop 1: Observer (on_session_end)
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_observer(messages: List[Dict[str, Any]], config: SpineConfig) -> None:
+    """Extract durable observations from a completed session.
+
+    Called by on_session_end hook. Calls LLM to extract observations,
+    then routes each through the remember() gate — no privileged write path.
+    Writes one episode summary per session.
+    """
+    if not messages:
+        return
+
+    from .jsonl_writer import JSONLWriter
+    from .tools import _generate_id, handle_remember
+    from .llm_client import extract_observations
+    import os
+
+    # Extract session_id from messages if available
+    session_id = "unknown"
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("session_id"):
+            session_id = msg["session_id"]
+            break
+
+    # Count user + assistant turns
+    user_turns = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "user")
+    asst_turns = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant")
+
+    # Build compact transcript for LLM (last N turns to stay within context)
+    transcript_lines = []
+    for m in messages[-40:]:  # last 40 messages
+        if isinstance(m, dict):
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            if isinstance(content, str) and content.strip():
+                # Truncate long messages
+                content = content[:500]
+                transcript_lines.append(f"[{role}] {content}")
+    transcript = "\n".join(transcript_lines)
+
+    # LLM extraction
+    observations = []
+    try:
+        model = getattr(config, "loop_model", "deepseek-v4-pro")
+        observations = extract_observations(transcript, model=model)
+        logger.info("Observer: extracted %d observations from session %s", len(observations), session_id)
+    except Exception as e:
+        logger.warning("Observer LLM extraction failed: %s", e)
+
+    # Route each observation through remember() gate
+    stored = 0
+    for obs in observations:
+        try:
+            result = handle_remember({
+                "content": obs.get("content", ""),
+                "type": obs.get("type", "fact"),
+                "epistemic": obs.get("epistemic", "extracted"),
+                "confidence": obs.get("confidence", 0.5),
+                "topics": obs.get("entities", []),
+            }, config)
+            resp = json.loads(result)
+            if resp.get("success") or resp.get("deduplicated"):
+                stored += 1
+        except Exception as e:
+            logger.warning("Observer remember() failed for obs: %s", e)
+
+    # Write episode record
+    now = _now_iso()
+    episode_id = _generate_id()
+    episode = {
+        "id": episode_id,
+        "profile": "agent:main",
+        "session_id": session_id,
+        "summary": f"Session with {user_turns} user turns, {asst_turns} assistant turns. Observer extracted {len(observations)} observations, stored {stored}.",
+        "outcomes": [obs.get("content", "")[:100] for obs in observations[:5]],
+        "started_at": now,
+        "ended_at": now,
+        "compacted": False,
+    }
+
+    ep_dir = os.path.join(config.canonical_root, "episodes")
+    writer = JSONLWriter(os.path.join(ep_dir, "agent_main.jsonl"))
+    writer.append(episode)
+
+    try:
+        idx = MemoryIndex(config.db)
+        idx.open()
+        idx.upsert_episode(episode)
+        idx.conn.commit()
+        idx.close()
+    except Exception as e:
+        logger.warning("Observer: episode DB upsert failed for %s: %s", episode_id, e)
+
+    logger.info("Observer: wrote episode %s (session=%s, %d obs, %d stored, %d turns)",
+                episode_id, session_id, len(observations), stored, user_turns + asst_turns)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Loop 2: Consolidation (nightly cron)
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_consolidation(config: SpineConfig) -> Dict[str, Any]:
+    """Run all five consolidation passes and return a report.
+
+    Called by nightly cron. Passes:
+    1. Decay — age observations, archive those below threshold
+    2. Merge — cluster near-duplicates by exact content match
+    3. Contradict — detect semantic conflicts, keep both
+    4. Promote — auto-promote extracted+high-confidence or type=correction
+    5. Demote — push stale hot-core entries back to spine
+    """
+    from .index import MemoryIndex
+    from .jsonl_writer import JSONLWriter
+    import os
+
+    report = {
+        "timestamp": _now_iso(),
+        "passes": {},
+        "notes": [],
+    }
+
+    idx = MemoryIndex(config.db)
+    idx.open()
+    now = _now_iso()
+
+    # ── Pass 1: Decay ───────────────────────────────────────────────
+    decayed = 0
+    archived = 0
+    rows = idx.conn.execute(
+        "SELECT id, confidence, last_confirmed, last_retrieved FROM observations WHERE status='active'"
+    ).fetchall()
+    for row in rows:
+        obs_id, conf, last_confirmed, last_retrieved = row
+        if conf is None:
+            continue
+        # Decay: confidence −0.05 per 30 idle days
+        # Use last_confirmed (or last_retrieved as fallback) to compute idle days
+        ref_date = last_confirmed or last_retrieved
+        if ref_date:
+            try:
+                from datetime import datetime, timezone as _tz
+                ref_dt = datetime.fromisoformat(ref_date)
+                days_idle = (datetime.now(_tz.utc) - ref_dt).days
+                if days_idle > 0:
+                    decay_units = days_idle / 30.0
+                    conf = conf - (decay_units * config.decay_per_30d)
+                    if conf < 0:
+                        conf = 0.0
+                    idx.conn.execute(
+                        "UPDATE observations SET confidence=? WHERE id=?",
+                        (round(conf, 4), obs_id),
+                    )
+            except (ValueError, TypeError):
+                pass
+        # Simple check: if below archive threshold, archive it
+        if conf < config.archive_threshold:
+            idx.update_status(obs_id, "archived")
+            archived += 1
+            decayed += 1
+    report["passes"]["decay"] = f"archived {archived} observations below threshold {config.archive_threshold}"
+
+    # ── Pass 2: Merge near-duplicates ────────────────────────────────
+    active_rows = idx.conn.execute(
+        "SELECT id, profile, type, content, confirmations FROM observations WHERE status='active' ORDER BY profile, type"
+    ).fetchall()
+
+    merged = 0
+    seen: Dict[Any, str] = {}  # key=(profile,type,content_lower) -> canonical_id
+    for row in active_rows:
+        obs_id, profile, obs_type, content, confirmations = row
+        key = (profile, obs_type, content.lower().strip())
+        if key in seen:
+            canonical_id = seen[key]
+            # Mark this one as superseded
+            idx.update_status(obs_id, "superseded")
+            # Increment confirmations on canonical
+            idx.conn.execute(
+                "UPDATE observations SET confirmations = confirmations + ? WHERE id=?",
+                (confirmations, canonical_id),
+            )
+            merged += 1
+        else:
+            seen[key] = obs_id
+    report["passes"]["merge"] = f"merged {merged} near-duplicates into {len(seen)} canonical entries"
+
+    # ── Pass 2.5: Semantic merge (cosine >0.88 clustering — spec §5.2.1) ────
+    if embedder_available():
+        try:
+            semantic_merged = _semantic_merge(idx, config)
+            merged += semantic_merged
+            report["passes"]["semantic_merge"] = f"semantically merged {semantic_merged} near-duplicates (cosine >0.88)"
+        except Exception as e:
+            report["passes"]["semantic_merge"] = f"semantic merge skipped: {e}"
+    else:
+        report["passes"]["semantic_merge"] = "skipped — embedder unavailable"
+
+    # ── Pass 2.6: Contradict detection — flag, never resolve (spec §5.2.2) ────
+    contradictions = _detect_contradictions(idx)
+    report["passes"]["contradict"] = (
+        f"detected {len(contradictions)} potential contradictions"
+        if contradictions else "no contradictions detected"
+    )
+    if contradictions:
+        report["contradictions"] = contradictions
+
+    # ── Pass 3: Promote (pure soft gate — D10 Chin: all ≥0.9 auto-promote + notify + revert) ────
+    promoted = 0
+    notified: List[str] = []
+
+    # Pure soft: all observations ≥ 0.9 auto-promote (extracted + inferred + correction)
+    auto_candidates = idx.conn.execute(
+        """SELECT id, content, type, epistemic, confidence
+           FROM observations WHERE status='active'
+           AND confidence >= ?
+           ORDER BY confidence DESC""",
+        (config.promote_auto_min_confidence,),
+    ).fetchall()
+
+    for row in auto_candidates:
+        obs_id, content, obs_type, epistemic, confidence = row
+        _promote_to_hotcore(obs_id, content, obs_type, config)
+        idx.update_status(obs_id, "promoted")
+        promoted += 1
+        notified.append(f"[{obs_id[:8]}] ({obs_type}, {epistemic}, conf={confidence:.2f}) {content[:100]}")
+
+    # Correction fast-path: promote even below 0.9 bar
+    correction_candidates = idx.conn.execute(
+        """SELECT id, content, type, epistemic, confidence
+           FROM observations WHERE status='active'
+           AND type = 'correction'
+           AND confidence < ?
+           AND id NOT IN (SELECT id FROM observations WHERE status='promoted')""",
+        (config.promote_auto_min_confidence,),
+    ).fetchall()
+
+    for row in correction_candidates:
+        obs_id, content, obs_type, epistemic, confidence = row
+        _promote_to_hotcore(obs_id, content, obs_type, config)
+        idx.update_status(obs_id, "promoted")
+        promoted += 1
+        notified.append(f"[{obs_id[:8]}] (correction fast-path, conf={confidence:.2f}) {content[:100]}")
+
+    report["passes"]["promote"] = (
+        f"promoted {promoted} (pure soft gate — all ≥0.9, notify + revert)"
+    )
+    report["promoted_items"] = notified
+
+    # Notification: build text for Telegram delivery
+    if promoted > 0:
+        report["promotion_notice"] = (
+            f"🧠 **{promoted} observation(s) promoted to MEMORY.md**\n\n"
+            + "\n".join(f"• {n}" for n in notified)
+            + f"\n\n_To revert: use forget() with the content shown above. "
+            f"Reverted observations get status=rejected and never re-promote._"
+        )
+
+    # ── Pass 4: Demote stale hot-core ────────────────────────────────
+    demoted = 0
+    # Check if MEMORY.md is over budget
+    mem_path = os.path.expanduser("~/.hermes/memories/MEMORY.md")
+    mem_size = 0
+    if os.path.exists(mem_path):
+        mem_size = os.path.getsize(mem_path)
+    if mem_size > 20000:
+        # Find promoted entries with no recent evidence → demote
+        stale = idx.conn.execute(
+            """SELECT id FROM observations WHERE status='promoted'
+               ORDER BY last_confirmed ASC LIMIT 5"""
+        ).fetchall()
+        for (obs_id,) in stale:
+            idx.update_status(obs_id, "active")  # demote back to active
+            demoted += 1
+    report["passes"]["demote"] = f"demoted {demoted} stale entries (MEMORY.md: {mem_size:,} bytes)"
+
+    report["active_count"] = idx.count_active()
+    idx.conn.commit()
+    idx.close()
+
+    return report
+
+
+def _promote_to_hotcore(obs_id: str, content: str, obs_type: str, config: SpineConfig) -> None:
+    """Write an observation to MEMORY.md hot core with appropriate tag.
+
+    Tags per spec: [R] rule, [C] correction, [F] fact, [W] workflow, [ID] identity.
+    """
+    import os as _os
+
+    tag_map = {
+        "correction": "[C]",
+        "preference": "[W]",
+        "pattern": "[W]",
+        "fact": "[F]",
+        "identity": "[ID]",
+    }
+    tag = tag_map.get(obs_type, "[F]")
+
+    mem_path = _os.path.expanduser("~/.hermes/memories/MEMORY.md")
+    entry = f"\n§\n{tag} {content}\n"
+
+    try:
+        with open(mem_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+        logger.info("Promoted %s to MEMORY.md: %s", obs_id, content[:80])
+    except Exception as e:
+        logger.error("Failed to promote %s to MEMORY.md: %s", obs_id, e)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Loop 3: Activation Manifest (on_session_start)
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_activation_manifest(config: SpineConfig) -> Dict[str, Any]:
+    """Build the session-start activation manifest (spec §5.3).
+
+    Returns a dict with:
+    - active_profile
+    - relevant_skills
+    - cross_topic_reminder
+    - rule_checklist
+    - recalled_top_6 (if index has observations)
+    """
+    manifest: Dict[str, Any] = {
+        "active_profile": "agent:main",
+        "cross_topic_reminder": "You have cross-topic context access across this Telegram group.",
+        "rule_checklist": [
+            "[R] Verify before asserting — tool calls before claims",
+            "[R] Sweep after every fix — find all instances of the same bug",
+            "[R] Never offer options when path is clear",
+            "[R] Private stays private — never expose secrets",
+        ],
+        "recalled": [],
+    }
+
+    # Attempt recall of top-6 relevant observations
+    try:
+        from .index import MemoryIndex
+        from .embedder import embedder_available, embed_single
+
+        idx = MemoryIndex(config.db)
+        idx.open()
+        count = idx.count_active()
+
+        if count > 0:
+            # Recall observations relevant to the default profile
+            query = "user preferences communication style workflow habits"
+            query_embedding = None
+            if embedder_available():
+                try:
+                    query_embedding = embed_single(query)
+                except Exception:
+                    pass
+
+            results = idx.search_hybrid(query, query_embedding, k=6)
+            manifest["recalled"] = [
+                f"[{r['id'][:8]}] ({r['type']}, {r['epistemic']}) {r['content']}"
+                for r in results
+            ]
+            manifest["note"] = f"{count} observations available, {len(results)} recalled"
+
+        idx.close()
+    except Exception:
+        pass
+
+    return manifest
+
+
+def _semantic_merge(idx: MemoryIndex, config: SpineConfig) -> int:
+    """Semantic near-duplicate merge via cosine clustering + LLM.
+
+    Clusters active observations by profile, merging paraphrases
+    where cosine similarity >0.88 (spec §5.2.1). Uses LLM to produce
+    a single canonical entry per cluster. Falls back to keep-both on
+    LLM failure.
+
+    Returns number of observations merged (superseded).
+    """
+    from .llm_client import call_llm
+
+    # Fetch all active observations with embeddings
+    rows = idx.conn.execute(
+        """SELECT id, profile, type, content, confidence, confirmations,
+                  epistemic, evidence, embedding
+           FROM observations WHERE status='active' AND embedding IS NOT NULL"""
+    ).fetchall()
+
+    if len(rows) < 2:
+        return 0
+
+    # Group by profile
+    by_profile: Dict[str, List[tuple]] = {}
+    for row in rows:
+        profile = row[1]
+        by_profile.setdefault(profile, []).append(row)
+
+    merged = 0
+    for profile, profile_rows in by_profile.items():
+        if len(profile_rows) < 2:
+            continue
+
+        # Build clusters via greedy clustering (cosine >0.88)
+        clusters: List[List[int]] = []  # indices into profile_rows
+        used: set = set()
+
+        for i in range(len(profile_rows)):
+            if i in used:
+                continue
+            emb_i = _deserialize_vector(profile_rows[i][8])
+            if emb_i is None:
+                continue
+            cluster = [i]
+            used.add(i)
+            for j in range(i + 1, len(profile_rows)):
+                if j in used:
+                    continue
+                emb_j = _deserialize_vector(profile_rows[j][8])
+                if emb_j is None:
+                    continue
+                sim = _cosine_similarity(emb_i, emb_j)
+                if sim > 0.88:
+                    cluster.append(j)
+                    used.add(j)
+            if len(cluster) > 1:
+                clusters.append(cluster)
+
+        # Merge each cluster
+        for cluster in clusters:
+            members = [profile_rows[i] for i in cluster]
+            canonical_idx = max(range(len(members)),
+                                key=lambda i: members[i][4])  # highest confidence
+            canonical = members[canonical_idx]
+
+            # LLM merge for 3+ members; for pairs, just pick canonical
+            if len(members) >= 3:
+                obs_text = "\n".join(
+                    f"[{m[0][:8]}] conf={m[4]:.2f} {m[3]}" for m in members
+                )
+                prompt = (
+                    "Merge these near-duplicate observations into one concise, "
+                    "present-tense atomic claim ≤500 chars. Preserve the most "
+                    "precise version and combine confirmations.\n\n"
+                    f"{obs_text}\n\nMerged claim:"
+                )
+                try:
+                    merged_content = call_llm(
+                        [{"role": "user", "content": prompt}],
+                        model=getattr(config, "loop_model", "deepseek-v4-pro"),
+                        max_tokens=200, temperature=0.2,
+                    )
+                    if merged_content and len(merged_content.strip()) > 10:
+                        canonical = list(canonical)
+                        canonical[3] = merged_content.strip()[:500]
+                except Exception:
+                    pass  # Keep original canonical content
+
+            # Sum confirmations from all members
+            total_confirmations = sum(m[5] for m in members)
+
+            # Update canonical
+            idx.conn.execute(
+                "UPDATE observations SET confirmations=? WHERE id=?",
+                (total_confirmations, canonical[0]),
+            )
+
+            # Supersede non-canonical members
+            for i, m in enumerate(members):
+                if i != canonical_idx:
+                    idx.update_status(m[0], "superseded")
+                    merged += 1
+
+    return merged
+
+
+_CONTRADICTION_CONFIDENCE_PENALTY = 0.15  # applied to the older/weaker side of a contradiction
+_CONTRADICTION_CONFIDENCE_BOOST = 0.05     # applied to the more-recently-confirmed side
+
+
+def _word_in(term: str, text: str) -> bool:
+    """Whole-word match — avoids false positives like 'am' matching inside 'telegram'
+    or 'pm' matching inside 'equipment'."""
+    return re.search(r"\b" + re.escape(term) + r"\b", text) is not None
+
+
+def _detect_contradictions(idx: MemoryIndex) -> List[Dict[str, Any]]:
+    """Detect potential contradictions between active observations (spec §5.2.2).
+
+    Lightweight keyword-based detection — flags opposition pairs (e.g., "prefers"
+    vs "hates", "morning" vs "evening") using whole-word matching. Never deletes
+    or hides either side — instead applies a conservative, reversible confidence
+    adjustment: the more recently-confirmed observation gets a small confidence
+    boost, the other a larger penalty. Both sides remain visible via recall();
+    a fully-decayed one only leaves MEMORY.md/active status through the normal
+    decay pass, never immediately. This is a proportional nudge, not a Bayesian
+    belief engine — full auto-resolution stays out of scope for a single-user system.
+
+    Returns list of {a_id, a_content, b_id, b_content, reason, resolution}.
+    """
+    opposition_pairs = [
+        (["prefer", "prefers", "like", "love"], ["hate", "dislike", "avoid", "never"]),
+        (["morning", "early"], ["evening", "night", "late"]),
+        (["always", "must", "require"], ["never", "optional", "flexible"]),
+        (["concise", "short", "brief"], ["detailed", "long", "verbose", "comprehensive"]),
+        (["yes", "approved", "accept"], ["no", "reject", "refuse", "deny"]),
+    ]
+
+    rows = idx.conn.execute(
+        """SELECT id, type, content, confidence, last_confirmed FROM observations
+           WHERE status='active' ORDER BY type"""
+    ).fetchall()
+
+    if len(rows) < 2:
+        return []
+
+    contradictions: List[Dict[str, Any]] = []
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            a_id, a_type, a_content, a_conf, a_last = rows[i]
+            b_id, b_type, b_content, b_conf, b_last = rows[j]
+            if a_type != b_type:
+                continue
+            a_lower = a_content.lower()
+            b_lower = b_content.lower()
+            for pos_terms, neg_terms in opposition_pairs:
+                a_pos = any(_word_in(t, a_lower) for t in pos_terms)
+                a_neg = any(_word_in(t, a_lower) for t in neg_terms)
+                b_pos = any(_word_in(t, b_lower) for t in pos_terms)
+                b_neg = any(_word_in(t, b_lower) for t in neg_terms)
+                if (a_pos and b_neg) or (a_neg and b_pos):
+                    # Winner = more recently confirmed (tie-break: higher current confidence)
+                    a_key = (a_last or "", a_conf or 0)
+                    b_key = (b_last or "", b_conf or 0)
+                    if a_key >= b_key:
+                        winner_id, winner_conf = a_id, a_conf
+                        loser_id, loser_conf = b_id, b_conf
+                    else:
+                        winner_id, winner_conf = b_id, b_conf
+                        loser_id, loser_conf = a_id, a_conf
+
+                    new_winner_conf = min(1.0, round((winner_conf or 0.5) + _CONTRADICTION_CONFIDENCE_BOOST, 4))
+                    new_loser_conf = max(0.0, round((loser_conf or 0.5) - _CONTRADICTION_CONFIDENCE_PENALTY, 4))
+                    idx.conn.execute("UPDATE observations SET confidence=? WHERE id=?", (new_winner_conf, winner_id))
+                    idx.conn.execute("UPDATE observations SET confidence=? WHERE id=?", (new_loser_conf, loser_id))
+
+                    contradictions.append({
+                        "a_id": a_id[:8],
+                        "a_content": a_content[:150],
+                        "b_id": b_id[:8],
+                        "b_content": b_content[:150],
+                        "reason": f"Opposing keywords in {a_type} observations",
+                        "resolution": (
+                            f"{winner_id[:8]} confidence {winner_conf:.2f}->{new_winner_conf:.2f} (more recently confirmed), "
+                            f"{loser_id[:8]} confidence {loser_conf:.2f}->{new_loser_conf:.2f} (unresolved — "
+                            f"revert via forget() if wrong; neither side is deleted)"
+                        ),
+                    })
+                    # Set contradicts[] on both — read-modify-write per row, JSON list.
+                    # (Not string-concat against the schema's '' default: every real
+                    # row is actually seeded "[]" by upsert_observation(), so a naive
+                    # CASE WHEN contradicts='' never hits its clean-init branch, and a
+                    # single shared-param UPDATE across both ids would wrongly write
+                    # the same value to both rows instead of each other's id.)
+                    for owner_id, other_id in ((a_id, b_id), (b_id, a_id)):
+                        raw = idx.conn.execute(
+                            "SELECT contradicts FROM observations WHERE id=?", (owner_id,)
+                        ).fetchone()[0]
+                        try:
+                            current = json.loads(raw) if raw else []
+                            if not isinstance(current, list):
+                                current = []
+                        except (json.JSONDecodeError, TypeError):
+                            current = []
+                        other_short = other_id[:8]
+                        if other_short not in current:
+                            current.append(other_short)
+                        idx.conn.execute(
+                            "UPDATE observations SET contradicts=? WHERE id=?",
+                            (json.dumps(current), owner_id),
+                        )
+                    break
+            if len(contradictions) >= 10:
+                break
+        if len(contradictions) >= 10:
+            break
+
+    return contradictions
