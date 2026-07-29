@@ -1,4 +1,6 @@
 import type { DetailsMode, SectionName, SectionVisibility } from '../types.js'
+import type { WelcomeBannerConfig, WelcomeBannerPluginSection, WelcomeBannerSectionConfig } from '../types.js'
+import { WELCOME_BANNER_DEFAULTS } from '../types.js'
 
 const MODES = ['hidden', 'collapsed', 'expanded'] as const
 
@@ -73,4 +75,50 @@ export const sectionMode = (
   commandOverride = false
 ): DetailsMode => sections?.[name] ?? (commandOverride ? global : (SECTION_DEFAULTS[name] ?? global))
 
-export const nextDetailsMode = (m: DetailsMode): DetailsMode => MODES[(MODES.indexOf(m) + 1) % MODES.length]!
+export const nextDetailsMode = (m: DetailsMode): DetailsMode => MODES[(MODES.indexOf(m) + 1) % MODES.length]
+
+/**
+ * Build a WelcomeBannerConfig from the raw display.welcome_banner blob.
+ * Merges user overrides atop the built-in defaults, dropping unknown keys.
+ * Plugin sections are validated for required fields.
+ */
+export const resolveWelcomeBanner = (raw: unknown): WelcomeBannerConfig => {
+  const sections: Record<string, WelcomeBannerSectionConfig> = { ...WELCOME_BANNER_DEFAULTS }
+  const plugin_sections: WelcomeBannerPluginSection[] = []
+
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { sections, plugin_sections }
+  }
+
+  const cfg = raw as Record<string, unknown>
+
+  // Merge user section overrides
+  if (cfg.sections && typeof cfg.sections === 'object' && !Array.isArray(cfg.sections)) {
+    for (const [key, val] of Object.entries(cfg.sections as Record<string, unknown>)) {
+      if (!sections[key]) continue
+      if (val && typeof val === 'object' && !Array.isArray(val)) {
+        const entry = val as Record<string, unknown>
+        if (typeof entry.default_open === 'boolean') {
+          sections[key] = { ...sections[key], default_open: entry.default_open }
+        }
+        if (typeof entry.enabled === 'boolean') {
+          sections[key] = { ...sections[key], enabled: entry.enabled }
+        }
+      }
+    }
+  }
+
+  if (cfg.plugin_sections && Array.isArray(cfg.plugin_sections)) {
+    for (const item of cfg.plugin_sections) {
+      if (item && typeof item === 'object' && typeof item.id === 'string' && typeof item.title === 'string') {
+        plugin_sections.push({
+          id: item.id,
+          title: item.title,
+          default_open: typeof item.default_open === 'boolean' ? item.default_open : false
+        })
+      }
+    }
+  }
+
+  return { sections, plugin_sections }
+}

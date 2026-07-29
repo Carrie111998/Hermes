@@ -81,6 +81,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://portal.qwen.ai/v1",
         base_url_env_var="HERMES_QWEN_BASE_URL",
     ),
+    "kimi-oauth": HermesOverlay(
+        transport="openai_chat",
+        auth_type="oauth_external",
+        base_url_override="https://api.kimi.com/coding/v1",
+        base_url_env_var="KIMI_BASE_URL",
+    ),
     "lmstudio": HermesOverlay(
         transport="openai_chat",
         auth_type="api_key",
@@ -291,6 +297,11 @@ ALIASES: Dict[str, str] = {
     "kimi-coding": "kimi-for-coding",
     "kimi-coding-cn": "kimi-for-coding",
     "moonshot": "kimi-for-coding",
+    # kimi-oauth aliases
+    "kimi-oauth": "kimi-oauth",
+    "kimi-oauth-code": "kimi-oauth",
+    "kimi-oauth-cli": "kimi-oauth",
+    "kimi-code-oauth": "kimi-oauth",
 
     # stepfun
     "step": "stepfun",
@@ -406,6 +417,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "vertex": "Google Vertex AI",
     "ollama-cloud": "Ollama Cloud",
     "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)",
+    "kimi-oauth": "Kimi Code (OAuth)",
 }
 
 

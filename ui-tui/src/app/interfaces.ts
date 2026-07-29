@@ -29,7 +29,8 @@ import type {
   SessionInfo,
   SlashCatalog,
   SudoReq,
-  Usage
+  Usage,
+  WelcomeBannerConfig
 } from '../types.js'
 
 export interface StateSetter<T> {
@@ -344,6 +345,9 @@ export interface UiState {
   statusBar: StatusBarMode
   streaming: boolean
   theme: Theme
+
+  /** Resolved welcome banner section configuration. */
+  welcomeBanner: WelcomeBannerConfig
   usage: Usage
 }
 

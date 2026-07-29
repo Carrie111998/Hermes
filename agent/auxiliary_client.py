@@ -6885,6 +6885,7 @@ def _resolve_task_provider_model(
                 "nous",
                 "openai-codex",
                 "qwen-oauth",
+                "kimi-oauth",
                 "xai-oauth",
             }
 

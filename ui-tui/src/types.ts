@@ -228,6 +228,40 @@ export interface SlashCatalog {
   sub: Record<string, string[]>
 }
 
+/**
+ * Welcome banner section config as resolved from display.welcome_banner.
+ * Each built-in section (tools, skills, system_prompt, mcp_servers) can be
+ * independently enabled/disabled and default-open/closed.
+ *
+ * Plugin sections render custom Accordion entries after built-in sections.
+ */
+export interface WelcomeBannerSectionConfig {
+  default_open: boolean
+  enabled: boolean
+}
+
+export interface WelcomeBannerPluginSection {
+  id: string
+  title: string
+  default_open: boolean
+}
+
+export interface WelcomeBannerConfig {
+  sections: Record<string, WelcomeBannerSectionConfig>
+  plugin_sections: WelcomeBannerPluginSection[]
+}
+
+/**
+ * Welcome banner section default defaults for each built-in section.
+ * These match the hardcoded values in branding.tsx before this feature.
+ */
+export const WELCOME_BANNER_DEFAULTS: Record<string, WelcomeBannerSectionConfig> = {
+  tools: { default_open: true, enabled: true },
+  skills: { default_open: false, enabled: true },
+  system_prompt: { default_open: false, enabled: true },
+  mcp_servers: { default_open: false, enabled: true }
+}
+
 export interface SlashCategory {
   name: string
   pairs: [string, string][]
