@@ -125,6 +125,191 @@ def test_failed_resolution_does_not_write_config(monkeypatch):
         subagent_model.set_subagent_model("private-model", provider="missing")
 
 
+def test_interactive_picker_uses_core_curses_without_inquirer(monkeypatch):
+    import builtins
+
+    inherited = subagent_model.SubagentModelStatus(
+        model=None,
+        provider=None,
+        inherits_parent=True,
+    )
+    pinned = subagent_model.SubagentModelStatus(
+        model="model-b",
+        provider="provider-a",
+        inherits_parent=False,
+    )
+    answers = iter([1, 1])
+    picker_calls = []
+    set_calls = []
+
+    monkeypatch.setattr(
+        subagent_model,
+        "list_subagent_picker_providers",
+        lambda **_kwargs: [
+            {
+                "slug": "provider-a",
+                "name": "Provider A",
+                "models": ["model-a", "model-b"],
+            }
+        ],
+    )
+    monkeypatch.setattr(subagent_model, "get_subagent_model_status", lambda: inherited)
+    monkeypatch.setattr(
+        subagent_model,
+        "set_subagent_model",
+        lambda model, provider=None: set_calls.append((model, provider)) or pinned,
+    )
+
+    def fake_picker(title, items, **kwargs):
+        picker_calls.append((title, items, kwargs))
+        return next(answers)
+
+    monkeypatch.setattr("hermes_cli.curses_ui.curses_radiolist", fake_picker)
+    real_import = builtins.__import__
+
+    def reject_undeclared_picker(name, *args, **kwargs):
+        if name == "InquirerPy":
+            raise AssertionError("interactive picker must not import undeclared InquirerPy")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_undeclared_picker)
+
+    assert subagent_model.select_subagent_model_interactively() == pinned
+    assert set_calls == [("model-b", "provider-a")]
+    assert [call[0] for call in picker_calls] == [
+        "Select subagent provider:",
+        "Select subagent model:",
+    ]
+    assert all(call[2]["searchable"] is True for call in picker_calls)
+
+
+def test_interactive_picker_first_choice_resets_to_parent(monkeypatch):
+    pinned = subagent_model.SubagentModelStatus(
+        model="model-a",
+        provider="provider-a",
+        inherits_parent=False,
+    )
+    inherited = subagent_model.SubagentModelStatus(None, None, True)
+    reset_calls = []
+
+    monkeypatch.setattr(
+        subagent_model,
+        "list_subagent_picker_providers",
+        lambda **_kwargs: [
+            {"slug": "provider-a", "name": "Provider A", "models": ["model-a"]}
+        ],
+    )
+    monkeypatch.setattr(subagent_model, "get_subagent_model_status", lambda: pinned)
+    monkeypatch.setattr(
+        subagent_model,
+        "reset_subagent_model",
+        lambda: reset_calls.append(True) or inherited,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.curses_ui.curses_radiolist",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        subagent_model,
+        "set_subagent_model",
+        lambda *_args, **_kwargs: pytest.fail("reset must not select a model"),
+    )
+
+    assert subagent_model.select_subagent_model_interactively() == inherited
+    assert reset_calls == [True]
+
+
+def test_interactive_picker_cancel_returns_none_without_writing(monkeypatch):
+    pinned = subagent_model.SubagentModelStatus(
+        model="model-a",
+        provider="provider-a",
+        inherits_parent=False,
+    )
+    monkeypatch.setattr(
+        subagent_model,
+        "list_subagent_picker_providers",
+        lambda **_kwargs: [
+            {"slug": "provider-a", "name": "Provider A", "models": ["model-a"]}
+        ],
+    )
+    monkeypatch.setattr(subagent_model, "get_subagent_model_status", lambda: pinned)
+    monkeypatch.setattr(
+        "hermes_cli.curses_ui.curses_radiolist",
+        lambda *_args, **_kwargs: -1,
+    )
+    monkeypatch.setattr(
+        subagent_model,
+        "reset_subagent_model",
+        lambda: pytest.fail("cancel must not reset the override"),
+    )
+    monkeypatch.setattr(
+        subagent_model,
+        "set_subagent_model",
+        lambda *_args, **_kwargs: pytest.fail("cancel must not select a model"),
+    )
+
+    assert subagent_model.select_subagent_model_interactively() is None
+
+
+def test_shell_interactive_cancel_reports_cancelled(monkeypatch, capsys):
+    from hermes_cli import main as hermes_main
+
+    monkeypatch.setattr(hermes_main, "_require_tty", lambda _command: None)
+    monkeypatch.setattr(
+        subagent_model,
+        "select_subagent_model_interactively",
+        lambda **_kwargs: None,
+    )
+
+    hermes_main.cmd_subagent(
+        SimpleNamespace(
+            subagent_command="model",
+            model=None,
+            provider=None,
+            reset=False,
+            refresh=False,
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "selection cancelled" in output
+    assert "Selected subagent model" not in output
+
+
+def test_shell_positional_reset_restores_parent_inheritance(monkeypatch, capsys):
+    from hermes_cli import main as hermes_main
+
+    inherited = subagent_model.SubagentModelStatus(
+        model=None,
+        provider=None,
+        inherits_parent=True,
+    )
+    reset_calls = []
+    monkeypatch.setattr(
+        subagent_model,
+        "reset_subagent_model",
+        lambda: reset_calls.append(True) or inherited,
+    )
+    monkeypatch.setattr(
+        subagent_model,
+        "set_subagent_model",
+        lambda *_args, **_kwargs: pytest.fail("'reset' must not be pinned as a model"),
+    )
+
+    hermes_main.cmd_subagent(
+        SimpleNamespace(
+            subagent_command="model",
+            model="reset",
+            provider=None,
+            reset=False,
+            refresh=False,
+        )
+    )
+
+    assert reset_calls == [True]
+    assert "inherits parent" in capsys.readouterr().out
+
+
 def test_tui_gateway_rpc_uses_shared_subagent_core(monkeypatch):
     from tui_gateway import server
 

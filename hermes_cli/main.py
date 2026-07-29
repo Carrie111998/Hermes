@@ -4542,7 +4542,8 @@ def cmd_subagent(args):
         hermes subagent                     # status
         hermes subagent model               # interactive picker
         hermes subagent model <model>       # validated direct selection
-        hermes subagent model --reset       # inherit parent
+        hermes subagent model reset         # inherit parent
+        hermes subagent model --reset       # inherit parent (flag form)
     """
     from hermes_cli.subagent_model import (
         get_subagent_model_status,
@@ -4556,10 +4557,13 @@ def cmd_subagent(args):
         _print_subagent_status(get_subagent_model_status())
         return
     if sub == "model":
-        if getattr(args, "reset", False):
+        model_arg = getattr(args, "model", None)
+        positional_reset = (
+            isinstance(model_arg, str) and model_arg.strip().lower() == "reset"
+        )
+        if getattr(args, "reset", False) or positional_reset:
             _print_subagent_status(reset_subagent_model(), action="Reset")
             return
-        model_arg = getattr(args, "model", None)
         if model_arg:
             status = set_subagent_model(
                 model_arg,
@@ -4571,6 +4575,9 @@ def cmd_subagent(args):
         status = select_subagent_model_interactively(
             refresh=bool(getattr(args, "refresh", False))
         )
+        if status is None:
+            print("  Subagent model selection cancelled.")
+            return
         _print_subagent_status(status, action="Selected")
         return
 

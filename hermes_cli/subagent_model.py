@@ -149,42 +149,65 @@ def list_subagent_picker_providers(*, refresh: bool = False) -> list[dict[str, A
     )
 
 
-def select_subagent_model_interactively(*, refresh: bool = False) -> SubagentModelStatus:
-    """Run the shell CLI picker using the shared authenticated inventory."""
+def select_subagent_model_interactively(
+    *, refresh: bool = False
+) -> Optional[SubagentModelStatus]:
+    """Run the shell CLI picker using Hermes' dependency-free curses UI."""
 
-    providers = list_subagent_picker_providers(refresh=refresh)
-    try:
-        from InquirerPy import inquirer
-    except ImportError as exc:  # pragma: no cover - installation invariant
-        raise RuntimeError("Interactive model picker requires InquirerPy") from exc
+    from hermes_cli.curses_ui import curses_radiolist
 
-    inherit = "__inherit_parent__"
-    provider_choices = [
-        {"name": "Inherit parent model (reset override)", "value": inherit},
+    providers = [
+        row for row in list_subagent_picker_providers(refresh=refresh) if row.get("slug")
+    ]
+    status = get_subagent_model_status()
+    provider_labels = [
+        "Inherit parent model (reset override)",
         *[
-            {
-                "name": f"{row.get('name') or row.get('slug')} ({len(row.get('models') or [])} models)",
-                "value": str(row.get("slug") or ""),
-            }
+            f"{row.get('name') or row.get('slug')} ({len(row.get('models') or [])} models)"
             for row in providers
-            if row.get("slug")
         ],
     ]
-    selected_provider = inquirer.select(
-        message="Subagent provider:",
-        choices=provider_choices,
-        default=inherit if get_subagent_model_status().inherits_parent else None,
-    ).execute()
-    if selected_provider == inherit:
+    selected_provider_index = 0
+    if not status.inherits_parent:
+        selected_provider_index = next(
+            (
+                index
+                for index, row in enumerate(providers, start=1)
+                if str(row.get("slug") or "") == status.provider
+            ),
+            0,
+        )
+
+    provider_index = curses_radiolist(
+        "Select subagent provider:",
+        provider_labels,
+        selected=selected_provider_index,
+        cancel_returns=-1,
+        searchable=True,
+        search_labels=provider_labels,
+    )
+    if provider_index < 0:
+        return None
+    if provider_index == 0:
         return reset_subagent_model()
 
-    row = next((item for item in providers if item.get("slug") == selected_provider), None)
-    models = list((row or {}).get("models") or [])
+    row = providers[provider_index - 1]
+    selected_provider = str(row.get("slug") or "")
+    models = [str(model) for model in row.get("models") or [] if str(model).strip()]
     if not models:
         raise ValueError(f"No authenticated models available for provider '{selected_provider}'")
-    selected_model = inquirer.fuzzy(
-        message="Subagent model:",
-        choices=models,
-        match_exact=True,
-    ).execute()
-    return set_subagent_model(str(selected_model), provider=str(selected_provider))
+
+    selected_model_index = 0
+    if status.provider == selected_provider and status.model in models:
+        selected_model_index = models.index(status.model)
+    model_index = curses_radiolist(
+        "Select subagent model:",
+        models,
+        selected=selected_model_index,
+        cancel_returns=-1,
+        searchable=True,
+        search_labels=models,
+    )
+    if model_index < 0:
+        return None
+    return set_subagent_model(models[model_index], provider=selected_provider)

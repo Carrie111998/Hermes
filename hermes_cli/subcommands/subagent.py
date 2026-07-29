@@ -6,7 +6,8 @@ for subagent model selection:
     hermes subagent                       # status
     hermes subagent model                 # interactive picker
     hermes subagent model <model>         # validated direct selection
-    hermes subagent model --reset         # inherit parent
+    hermes subagent model reset           # inherit parent
+    hermes subagent model --reset         # inherit parent (flag form)
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ def build_subagent_parser(subparsers, *, cmd_subagent: Callable) -> None:
     model_parser.add_argument(
         "model",
         nargs="?",
-        help="Model to pin subagents to (e.g. 'sonnet', 'gpt-5', 'claude-4-7-opus')",
+        help="Model to pin, or 'reset' to inherit the parent model",
     )
     model_parser.add_argument(
         "--provider",
