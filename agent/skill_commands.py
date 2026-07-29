@@ -747,6 +747,7 @@ def build_stacked_skill_invocation_message(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
+    excluded_loaded_names: set[str] | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Load one or more skills for session-wide CLI/TUI preloading.
 
@@ -769,12 +770,13 @@ def build_preloaded_skills_prompt(
     except Exception:
         disabled_names = set()
 
-    seen: set[str] = set()
+    seen_identifiers: set[str] = set()
+    seen_loaded_names = set(excluded_loaded_names or ())
     for raw_identifier in skill_identifiers:
         identifier = (raw_identifier or "").strip()
-        if not identifier or identifier in seen:
+        if not identifier or identifier in seen_identifiers:
             continue
-        seen.add(identifier)
+        seen_identifiers.add(identifier)
 
         loaded = _load_skill_payload(identifier, task_id=task_id)
         if not loaded:
@@ -786,6 +788,12 @@ def build_preloaded_skills_prompt(
         if skill_name in disabled_names or identifier in disabled_names:
             missing.append(identifier)
             continue
+
+        # Deduplicate only after a successful, enabled load. The canonical
+        # name returned by skill_view() is shared by aliases and path forms.
+        if skill_name in seen_loaded_names:
+            continue
+        seen_loaded_names.add(skill_name)
 
         # Track active usage for Curator lifecycle management (#17782)
         try:
@@ -819,7 +827,7 @@ def resolve_auto_load_skills(user_config: dict | None = None) -> list[str]:
     """
     if user_config is None:
         try:
-            from hermes_cli.config import load_cli_config as _load_hermes_config
+            from hermes_cli.config import load_config as _load_hermes_config
             user_config = _load_hermes_config()
         except Exception:
             return []
@@ -876,12 +884,13 @@ def build_auto_load_prompt(
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
     missing: list[str] = []
-    seen: set[str] = set()
+    seen_identifiers: set[str] = set()
+    seen_loaded_names: set[str] = set()
 
     for identifier in auto_skills:
-        if identifier in seen:
+        if identifier in seen_identifiers:
             continue
-        seen.add(identifier)
+        seen_identifiers.add(identifier)
 
         loaded = _load_skill_payload(identifier, task_id=task_id)
         if not loaded:
@@ -893,6 +902,10 @@ def build_auto_load_prompt(
         if skill_name in disabled_names or identifier in disabled_names:
             missing.append(identifier)
             continue
+
+        if skill_name in seen_loaded_names:
+            continue
+        seen_loaded_names.add(skill_name)
 
         # Track active usage for Curator lifecycle management (#17782)
         try:

@@ -4676,6 +4676,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._attached_images: list[Path] = []
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
+        self._auto_load_skills_result: tuple[str, list[str], list[str]] | None = None
         self._startup_skills_line_shown = False
         self._active_session_lease = None
 
@@ -17596,17 +17597,22 @@ def main(
     
     parsed_skills = _parse_skills_argument(skills)
 
-    # Resolve skills.auto_load for dedup. The actual injection of auto_load
-    # skills happens once in AIAgent._build_system_prompt_parts (gated on
-    # new-session). Here we only need the list so we can avoid injecting the
-    # same skill twice when --skills overlaps with auto_load, and so the
-    # "Activated skills" display reflects both sources.
+    # Resolve and build skills.auto_load now so CLI dedup is based on successful
+    # canonical loads, not raw config text. The result is handed to the lazily
+    # created AIAgent, whose shared system-prompt path injects and reuses it.
     # --ignore-rules suppresses all auto-injection (AGENTS.md, SOUL.md,
-    # memory, skills), so auto_load is skipped in that mode.
-    from agent.skill_commands import resolve_auto_load_skills
-    auto_load_skills = resolve_auto_load_skills(CLI_CONFIG) if not ignore_rules else []
+    # memory, skills), including when enabled through HERMES_IGNORE_RULES.
+    from agent.skill_commands import build_auto_load_prompt
+
+    effective_ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
+    auto_load_result = (
+        ("", [], [])
+        if effective_ignore_rules
+        else build_auto_load_prompt(user_config=CLI_CONFIG)
+    )
+    _auto_prompt, auto_load_skills, auto_load_missing = auto_load_result
     auto_load_set = set(auto_load_skills)
-    cli_only_skills = [s for s in parsed_skills if s not in auto_load_set]
+    loaded_skills: list[str] = []
 
     # Create CLI instance
     cli = HermesCLI(
@@ -17623,11 +17629,18 @@ def main(
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
     )
+    cli._auto_load_skills_result = auto_load_result
+    if auto_load_missing:
+        logger.warning(
+            "Auto-load skill(s) not found or disabled: %s",
+            ", ".join(auto_load_missing),
+        )
 
-    if cli_only_skills:
+    if parsed_skills:
         skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
-            cli_only_skills,
+            parsed_skills,
             task_id=cli.session_id,
+            excluded_loaded_names=auto_load_set,
         )
         if missing_skills:
             missing_display = ", ".join(missing_skills)
@@ -17651,12 +17664,10 @@ def main(
                 part for part in (cli.system_prompt, skills_prompt) if part
             ).strip()
 
-    # Display includes both CLI --skills and auto_load (deduped, auto_load first).
-    # Functional injection of auto_load happens in AIAgent; CLI just shows the
-    # combined activated set so users see what's loaded.
-    if auto_load_skills or parsed_skills:
+    # Display only canonical names that loaded successfully, auto_load first.
+    if auto_load_skills or loaded_skills:
         display = list(auto_load_skills)
-        for s in parsed_skills:
+        for s in loaded_skills:
             if s not in auto_load_set:
                 display.append(s)
         cli.preloaded_skills = display

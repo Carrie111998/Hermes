@@ -8,6 +8,12 @@ Tests cover:
 - AIAgent._build_system_prompt injects auto_load
 """
 
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -47,10 +53,11 @@ def test_resolve_auto_load_skills_missing_key():
 
 
 def test_resolve_auto_load_skills_no_config():
-    """Returns empty list when config is None."""
+    """Loads the active config and returns empty when auto_load is absent."""
     from agent.skill_commands import resolve_auto_load_skills
 
-    result = resolve_auto_load_skills(None)
+    with patch("hermes_cli.config.load_config", return_value={}):
+        result = resolve_auto_load_skills(None)
     assert result == []
 
 
@@ -192,11 +199,15 @@ def test_cli_merges_auto_load_with_cli_skills(monkeypatch):
     monkeypatch.setattr(cli_mod, "CLI_CONFIG", {})
 
     import agent.skill_commands as sc_mod
-    monkeypatch.setattr(sc_mod, "resolve_auto_load_skills", lambda config: list(auto_load))
+    monkeypatch.setattr(
+        sc_mod,
+        "build_auto_load_prompt",
+        lambda **kwargs: ("auto prompt", list(auto_load), []),
+    )
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: (
+        lambda skills, task_id=None, excluded_loaded_names=None: (
             "prompt", sorted(skills), [],
         ),
     )
@@ -232,12 +243,16 @@ def test_cli_deduplicates_overlapping_skills(monkeypatch):
     monkeypatch.setattr(cli_mod, "CLI_CONFIG", {})
 
     import agent.skill_commands as sc_mod
-    monkeypatch.setattr(sc_mod, "resolve_auto_load_skills", lambda config: ["shared-skill"])
+    monkeypatch.setattr(
+        sc_mod,
+        "build_auto_load_prompt",
+        lambda **kwargs: ("auto prompt", ["shared-skill"], []),
+    )
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: (
-            "prompt", skills, [],
+        lambda skills, task_id=None, excluded_loaded_names=None: (
+            "", [], [],
         ),
     )
 
@@ -278,12 +293,18 @@ def test_cli_does_not_error_on_missing_auto_load_skills(monkeypatch):
     monkeypatch.setattr(cli_mod, "CLI_CONFIG", {})
 
     import agent.skill_commands as sc_mod
-    monkeypatch.setattr(sc_mod, "resolve_auto_load_skills", lambda config: ["missing-auto"])
+    monkeypatch.setattr(
+        sc_mod,
+        "build_auto_load_prompt",
+        lambda **kwargs: ("", [], ["valid-cli-skill"]),
+    )
     # CLI should only build prompts for --skills entries, not auto_load.
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: ("prompt", list(skills), []),
+        lambda skills, task_id=None, excluded_loaded_names=None: (
+            "prompt", list(skills), []
+        ),
     )
 
     # Should NOT raise ValueError — missing auto_load is handled in AIAgent layer
@@ -291,8 +312,7 @@ def test_cli_does_not_error_on_missing_auto_load_skills(monkeypatch):
         cli_mod.main(skills="valid-cli-skill", list_tools=True)
 
     cli_obj = created["cli"]
-    # Both still appear in display
-    assert "missing-auto" in cli_obj.preloaded_skills
+    # Only successfully loaded canonical names appear in the display.
     assert "valid-cli-skill" in cli_obj.preloaded_skills
 
 
@@ -316,11 +336,15 @@ def test_cli_still_errors_for_missing_cli_skills(monkeypatch):
     monkeypatch.setattr(cli_mod, "CLI_CONFIG", {})
 
     import agent.skill_commands as sc_mod
-    monkeypatch.setattr(sc_mod, "resolve_auto_load_skills", lambda config: [])
+    monkeypatch.setattr(
+        sc_mod, "build_auto_load_prompt", lambda **kwargs: ("", [], [])
+    )
     monkeypatch.setattr(
         cli_mod,
         "build_preloaded_skills_prompt",
-        lambda skills, task_id=None: ("", [], ["missing-cli"]),
+        lambda skills, task_id=None, excluded_loaded_names=None: (
+            "", [], ["missing-cli"]
+        ),
     )
 
     with pytest.raises(ValueError, match=r"Unknown skill\(s\): missing-cli"):
@@ -430,3 +454,194 @@ def test_aiagent_build_system_prompt_survives_config_errors(tmp_path):
         prompt = agent._build_system_prompt()
 
     assert "auto-loaded" not in prompt
+
+
+def test_auto_load_disabled_skill_is_reported_not_loaded(tmp_path, monkeypatch):
+    """Disabled auto-load entries use the same gate as explicit preloads."""
+    from agent.skill_commands import build_auto_load_prompt
+    import agent.skill_utils as skill_utils
+
+    skill_dir = tmp_path / "disabled-auto"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: disabled-auto\ndescription: Disabled.\n---\n\nSECRET BODY\n"
+    )
+    monkeypatch.setattr(
+        skill_utils, "get_disabled_skill_names", lambda platform=None: {"disabled-auto"}
+    )
+
+    with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+        prompt, loaded, missing = build_auto_load_prompt(
+            user_config={"skills": {"auto_load": ["disabled-auto"]}}
+        )
+
+    assert (prompt, loaded, missing) == ("", [], ["disabled-auto"])
+
+
+def test_auto_load_deduplicates_successful_canonical_names(monkeypatch):
+    """Different lookup forms resolving to one skill produce one prompt block."""
+    from pathlib import Path
+    import agent.skill_commands as skill_commands
+    import agent.skill_utils as skill_utils
+
+    payload = {"success": True, "name": "canonical", "content": "BODY"}
+    monkeypatch.setattr(
+        skill_commands,
+        "_load_skill_payload",
+        lambda identifier, task_id=None: (payload, Path("/tmp/canonical"), "canonical"),
+    )
+    monkeypatch.setattr(
+        skill_utils, "get_disabled_skill_names", lambda platform=None: set()
+    )
+
+    prompt, loaded, missing = skill_commands.build_auto_load_prompt(
+        user_config={"skills": {"auto_load": ["alias", "/absolute/alias"]}}
+    )
+
+    assert loaded == ["canonical"]
+    assert missing == []
+    assert prompt.count('The "canonical" skill is auto-loaded') == 1
+
+
+def test_real_profile_config_and_shared_prompt_are_lifecycle_stable(tmp_path):
+    """Exercise canonical config + skill I/O through the gateway/TUI prompt path.
+
+    A subprocess gives imports a genuinely isolated HERMES_HOME, avoiding module
+    constant/config-cache monkeypatches that previously hid the broken loader.
+    """
+    script = textwrap.dedent(
+        r"""
+        import json
+        import os
+        from pathlib import Path
+        from run_agent import AIAgent
+
+        home = Path(os.environ["HERMES_HOME"])
+        skills = home / "skills"
+        skills.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("skills:\n  auto_load:\n    - stable-skill\n")
+        skill_dir = skills / "stable-skill"
+        skill_dir.mkdir()
+        skill_file = skill_dir / "SKILL.md"
+        skill_file.write_text(
+            "---\nname: stable-skill\ndescription: Stable.\n---\n\nORIGINAL SKILL BYTES\n"
+        )
+
+        def make_agent(platform):
+            agent = AIAgent.__new__(AIAgent)
+            agent.valid_tool_names = {"skills_list", "skill_view", "skill_manage"}
+            agent.model = "before-model"
+            agent.provider = "test"
+            agent.pass_session_id = False
+            agent.skip_context_files = True
+            agent.load_soul_identity = False
+            agent._memory_enabled = False
+            agent._user_profile_enabled = False
+            agent._memory_manager = None
+            agent._memory_store = None
+            agent.session_id = "shared-" + platform
+            agent.platform = platform
+            agent._tool_use_enforcement = False
+            agent.ephemeral_system_prompt = None
+            agent._cached_system_prompt = None
+            agent._auto_load_skills_resolved = False
+            agent._auto_load_skills_result = ("", [], [])
+            return agent
+
+        outputs = {}
+        for platform in ("telegram", "tui"):
+            agent = make_agent(platform)
+            first = agent._build_system_prompt()
+            outputs[platform] = {
+                "loaded": agent._auto_load_skills_result[1],
+                "has_original": "ORIGINAL SKILL BYTES" in first,
+            }
+            if platform == "telegram":
+                # Simulate both file/config mutation and model-switch cache
+                # invalidation. Rebuild must retain the first resolved bytes.
+                cached_auto_prompt = agent._auto_load_skills_result[0]
+                skill_file.write_text(
+                    "---\nname: stable-skill\ndescription: Stable.\n---\n\nMUTATED BYTES\n"
+                )
+                (home / "config.yaml").write_text("skills:\n  auto_load: []\n")
+                agent.model = "after-model"
+                agent._cached_system_prompt = None
+                rebuilt = agent._build_system_prompt()
+                outputs[platform].update({
+                    "stable": (
+                        agent._auto_load_skills_result[0] == cached_auto_prompt
+                        and "ORIGINAL SKILL BYTES" in rebuilt
+                        and "MUTATED BYTES" not in rebuilt
+                    ),
+                    "resolved": agent._auto_load_skills_resolved,
+                })
+                # Restore disk for the separate TUI agent, proving each agent
+                # resolves independently through the same shared path.
+                (home / "config.yaml").write_text(
+                    "skills:\n  auto_load:\n    - stable-skill\n"
+                )
+                skill_file.write_text(
+                    "---\nname: stable-skill\ndescription: Stable.\n---\n\nORIGINAL SKILL BYTES\n"
+                )
+
+        print(json.dumps(outputs))
+        """
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path / "profile-home")
+    env.pop("HERMES_IGNORE_RULES", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert data["telegram"] == {
+        "loaded": ["stable-skill"],
+        "has_original": True,
+        "stable": True,
+        "resolved": True,
+    }
+    assert data["tui"] == {
+        "loaded": ["stable-skill"],
+        "has_original": True,
+    }
+
+
+def test_ignore_rules_is_stable_for_agent_lifetime(monkeypatch):
+    """Ignoring rules resolves to an empty immutable lifecycle result."""
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent._auto_load_skills_resolved = False
+    agent._auto_load_skills_result = ("", [], [])
+    agent.valid_tool_names = set()
+    agent.model = "test"
+    agent.provider = "test"
+    agent.pass_session_id = False
+    agent.skip_context_files = True
+    agent.load_soul_identity = False
+    agent._memory_enabled = False
+    agent._user_profile_enabled = False
+    agent._memory_manager = None
+    agent._memory_store = None
+    agent.session_id = "ignore-rules"
+    agent.platform = "gateway"
+    agent._tool_use_enforcement = False
+    agent.ephemeral_system_prompt = None
+    agent._cached_system_prompt = None
+    monkeypatch.setenv("HERMES_IGNORE_RULES", "1")
+
+    first = agent._build_system_prompt()
+    monkeypatch.delenv("HERMES_IGNORE_RULES")
+    agent._cached_system_prompt = None
+    rebuilt = agent._build_system_prompt()
+
+    assert agent._auto_load_skills_resolved is True
+    assert agent._auto_load_skills_result == ("", [], [])
+    assert rebuilt == first

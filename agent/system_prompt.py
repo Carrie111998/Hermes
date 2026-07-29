@@ -330,29 +330,35 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
 
     # ── Auto-load skills from skills.auto_load config ──
-    # Covers programmatic AIAgent users who don't pass --skills or
-    # system_message.  Only injected on the FIRST system prompt build
-    # (new session); resumed sessions already have the auto_load block
-    # in their conversation history.
-    # Respects HERMES_IGNORE_RULES — users who opt out of auto-injection
-    # should not get auto-injected skills.
-    _is_new_session = getattr(agent, "_cached_system_prompt", None) is None
-    _ignore_rules = os.environ.get("HERMES_IGNORE_RULES") == "1"
-    if _is_new_session and not _ignore_rules:
-        from agent.skill_commands import build_auto_load_prompt as _build_auto
+    # Covers every AIAgent surface (CLI, gateway, TUI, cron, API). Resolve and
+    # render once per agent lifecycle, then reuse the exact bytes whenever a
+    # model switch, compression, or static-prefix restoration rebuilds this
+    # prompt. `_cached_system_prompt is None` is not a new-session signal.
+    # HERMES_IGNORE_RULES is captured on first resolution so the result itself
+    # remains stable for the lifetime of the agent.
+    if not getattr(agent, "_auto_load_skills_resolved", False):
+        agent._auto_load_skills_result = ("", [], [])
         try:
-            _auto_prompt, _auto_loaded, _auto_missing = _build_auto(
-                task_id=getattr(agent, "session_id", None),
-            )
+            if os.environ.get("HERMES_IGNORE_RULES") != "1":
+                from agent.skill_commands import build_auto_load_prompt as _build_auto
+
+                agent._auto_load_skills_result = _build_auto(
+                    task_id=getattr(agent, "session_id", None),
+                )
+            _auto_missing = agent._auto_load_skills_result[2]
             if _auto_missing:
-                from hermes_logging import get_logger
-                get_logger().warning(
+                logger.warning(
                     "Auto-load skill(s) not found: %s", ", ".join(_auto_missing)
                 )
-            if _auto_prompt:
-                stable_parts.append(_auto_prompt)
         except Exception:
-            logger.debug("skills.auto_load: injection skipped", exc_info=True)  # Non-fatal — config read errors must not break session start
+            # Non-fatal — config/skill errors must not break session start.
+            logger.debug("skills.auto_load: injection skipped", exc_info=True)
+        finally:
+            agent._auto_load_skills_resolved = True
+
+    _auto_prompt = agent._auto_load_skills_result[0]
+    if _auto_prompt:
+        stable_parts.append(_auto_prompt)
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
     # so the agent can correctly report which model it is (workaround for API bug).
