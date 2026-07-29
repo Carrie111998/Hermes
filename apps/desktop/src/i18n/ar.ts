@@ -251,6 +251,8 @@ export const ar = defineLocale({
       'view.closeTab': 'إغلاق علامة التبويب',
       'view.reopenTab': 'إعادة فتح علامة التبويب المغلقة',
       'view.terminalSelection': 'إرسال تحديد الطرفية إلى المحرّر',
+      'view.terminalCopy': 'نسخ تحديد الطرفية',
+      'view.terminalPaste': 'لصق في الطرفية',
       'view.flipPanes': 'تبديل جانبي الشريط الجانبي',
       'appearance.toggleMode': 'تبديل الفاتح / الداكن',
       'profile.default': 'الانتقال إلى الملف الشخصي الافتراضي',

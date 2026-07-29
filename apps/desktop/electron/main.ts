@@ -115,11 +115,13 @@ import {
   switchBranch
 } from './git-worktree-ops'
 import {
+  ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
   DATA_URL_READ_DEFAULT_MAX_MB,
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret as encryptDesktopSecretStrict,
+  readFileDataUrlForIpc,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
@@ -177,6 +179,7 @@ import {
 } from './ssh-connection'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
+import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
 import {
@@ -190,6 +193,7 @@ import {
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
+import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import {
   computeWindowOptions,
@@ -1727,30 +1731,48 @@ const UPDATE_WAIT_POLL_MS = 1000
 // updater's own progress window appears. (#50419)
 const UPDATE_HANDOFF_DWELL_MS = 2500
 
+// Gate deps shared by the primary-window boot path and the pool-backend
+// spawn path. Consulting BOTH the on-disk marker and the in-process
+// updateInFlight flag is load-bearing (#73822): applyUpdates kills its own
+// backend BEFORE the Windows venv-blocker scan but only writes the marker
+// AFTER it, so a marker-only gate lets the renderer's ~1s reconnect respawn
+// a backend inside the update's own critical section — which the scan then
+// reports as a blocker, aborting every update attempt.
+function updateGateDeps() {
+  return {
+    hasLiveMarker: () => Boolean(readLiveUpdateMarker(HERMES_HOME)),
+    isUpdateInFlight: () => updateInFlight
+  }
+}
+
 // Block until no live update is in progress (or we hit the wait timeout).
 // Emits a boot-progress phase so the renderer shows "Update in progress…"
 // rather than a frozen splash. Returns true if it parked at all.
 async function waitForUpdateToFinish() {
-  let marker = readLiveUpdateMarker(HERMES_HOME)
+  let announced = false
 
-  if (!marker) {
+  const outcome = await waitForUpdateClearance(updateGateDeps(), {
+    onWaitTick: async reason => {
+      if (!announced) {
+        announced = true
+        rememberLog(`[updates] update in progress (${reason}); deferring backend start until it finishes`)
+      }
+
+      await advanceBootProgress(
+        'backend.update-wait',
+        'An update is finishing — Hermes will start automatically when it completes…',
+        12
+      )
+    },
+    pollMs: UPDATE_WAIT_POLL_MS,
+    timeoutMs: UPDATE_WAIT_TIMEOUT_MS
+  })
+
+  if (outcome === 'clear') {
     return false
   }
 
-  rememberLog(`[updates] update in progress (pid=${marker.pid}); deferring backend start until it finishes`)
-  const deadline = Date.now() + UPDATE_WAIT_TIMEOUT_MS
-
-  while (marker && Date.now() < deadline) {
-    await advanceBootProgress(
-      'backend.update-wait',
-      'An update is finishing — Hermes will start automatically when it completes…',
-      12
-    )
-    await new Promise(r => setTimeout(r, UPDATE_WAIT_POLL_MS))
-    marker = readLiveUpdateMarker(HERMES_HOME)
-  }
-
-  if (marker) {
+  if (outcome === 'timeout') {
     rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
   } else {
     rememberLog('[updates] update finished; proceeding with backend start')
@@ -2874,6 +2896,39 @@ async function applyUpdates(opts = {}) {
       startHermes().catch(() => {})
 
       return { ok: false, error: message }
+    }
+
+    // Preflight: after releasing our own backends, check for remaining
+    // Hermes processes running from this venv.  The updater normally refuses
+    // when it detects a holder, but because the updater is spawned detached
+    // with stdio:ignore, the user never sees that refusal and the update
+    // silently fails.  This preflight detects holders early and gives the
+    // user an actionable error.  Windows-only; the .pyd lock hazard is a
+    // Windows phenomenon.  ALL failures (blocked, missing python, timeout,
+    // malformed output, missing psutil) abort the handoff — never proceed
+    // to the detached updater when the venv state is unknown.
+    if (IS_WINDOWS) {
+      const scanOutcome = await scanVenvBlockers(updateRoot)
+
+      if (scanOutcome.kind === 'blocked') {
+        const message = formatBlockerMessage(scanOutcome.result)
+
+        rememberLog(`[updates] venv-blocked: ${scanOutcome.result.processes.length} process(es) hold the install`)
+        emitUpdateProgress({ stage: 'error', message, percent: null })
+        startHermes().catch(() => {})
+
+        return { ok: false, error: 'venv-blocked', message }
+      }
+
+      if (scanOutcome.kind === 'probe-failure') {
+        const message = formatProbeFailedMessage()
+
+        rememberLog(`[updates] venv-blocker probe failed: ${scanOutcome.error}`)
+        emitUpdateProgress({ stage: 'error', message, percent: null })
+        startHermes().catch(() => {})
+
+        return { ok: false, error: 'venv-probe-failed', message }
+      }
     }
 
     // Detached so the updater outlives this process — it needs us GONE before
@@ -4891,6 +4946,45 @@ function closePreviewWatchers() {
   for (const id of previewWatchers.keys()) {
     stopPreviewFileWatch(id)
   }
+}
+
+/** Watch a DIRECTORY for entry churn (folders appearing/vanishing) — the
+ *  disk-plugin door's "new plugin folder" signal, replacing the renderer's 5s
+ *  readdir poll. Same registry + change channel as the preview file watchers
+ *  (the renderer reconciles on any tick; per-file edits stay on their own
+ *  watches), so stopPreviewFileWatch/closePreviewWatchers manage these too. */
+function watchDirectory(rawDir) {
+  const watchDir = path.resolve(String(rawDir || ''))
+
+  if (!fs.existsSync(watchDir) || !fs.statSync(watchDir).isDirectory()) {
+    throw new Error(`Not a directory: ${watchDir}`)
+  }
+
+  const id = crypto.randomBytes(12).toString('base64url')
+  let timer = null
+
+  const watcher = fs.watch(watchDir, () => {
+    if (timer) {
+      clearTimeout(timer)
+    }
+
+    timer = setTimeout(() => {
+      timer = null
+      sendPreviewFileChanged({ id, path: watchDir, url: pathToFileURL(watchDir).toString() })
+    }, PREVIEW_WATCH_DEBOUNCE_MS)
+  })
+
+  previewWatchers.set(id, {
+    close: () => {
+      if (timer) {
+        clearTimeout(timer)
+      }
+
+      watcher.close()
+    }
+  })
+
+  return { id, path: watchDir }
 }
 
 // Best-effort read of a gateway's advertised auth providers, cached per base
@@ -7932,6 +8026,27 @@ async function spawnPoolBackend(profile, entry) {
   }
 
   const token = crypto.randomBytes(32).toString('base64url')
+
+  // Same update mutual exclusion as the primary window's waitForLocalStart
+  // (#73822): pool backends spawn from the same venv, so an ungated respawn
+  // during applyUpdates' critical section re-locks the venv and trips the
+  // venv-blocker preflight. No boot-progress UI here — pool backends boot
+  // silently for background profiles — so we only log while parked.
+  {
+    let poolAnnounced = false
+
+    await waitForUpdateClearance(updateGateDeps(), {
+      onWaitTick: reason => {
+        if (!poolAnnounced) {
+          poolAnnounced = true
+          rememberLog(`[updates] update in progress (${reason}); deferring pool backend start for profile "${profile}"`)
+        }
+      },
+      pollMs: UPDATE_WAIT_POLL_MS,
+      timeoutMs: UPDATE_WAIT_TIMEOUT_MS
+    })
+  }
+
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
@@ -10120,14 +10235,23 @@ ipcMain.handle('hermes:data-url-read-max:set', (_event, maxMb) => {
 })
 
 ipcMain.handle('hermes:readFileDataUrl', async (_event, filePath) => {
-  const { resolvedPath } = await resolveReadableFileForIpc(filePath, {
+  return readFileDataUrlForIpc(filePath, {
     maxBytes: dataUrlReadMaxBytesFromMb(dataUrlReadMaxMb),
+    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'File preview' })),
     purpose: 'File preview'
   })
+})
 
-  const data = await fs.promises.readFile(resolvedPath)
-
-  return `data:${mimeTypeForPath(resolvedPath)};base64,${data.toString('base64')}`
+// Remote attachment transfer is independent of the preview / Settings path.
+// Keep a finite cap so Electron + base64 memory stays bounded while archives
+// can exceed the default 16 MiB preview ceiling (and still fit the gateway
+// WebSocket frame limit after base64 expansion).
+ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
+  return readFileDataUrlForIpc(filePath, {
+    maxBytes: ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
+    mimeType: mimeTypeForPath(resolveRequestedPathForIpc(filePath, { purpose: 'Attachment upload' })),
+    purpose: 'Attachment upload'
+  })
 })
 
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
@@ -10198,6 +10322,12 @@ ipcMain.handle('hermes:writeClipboard', (_event, text) => {
   return true
 })
 
+// Paired reader for the GUI terminal's paste chord: the renderer's
+// navigator.clipboard.readText() throws "Document is not focused" whenever a
+// portaled overlay has focus, and there's no way to route a read through the
+// canvas. The main process has no such gate.
+ipcMain.handle('hermes:readClipboard', () => clipboard.readText())
+
 ipcMain.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
 
 ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
@@ -10238,6 +10368,8 @@ ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
 )
 
 ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(String(url || '')))
+
+ipcMain.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(dir || '')))
 
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 
@@ -10766,6 +10898,31 @@ ipcMain.handle('hermes:fs:openDir', async (_event, dirPath) => {
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }
   }
+})
+
+// The LOCAL Desktop runtime-plugin root: `<HERMES_HOME>/desktop-plugins`,
+// resolved from the main-process HERMES_HOME (see resolveHermesHome) — NOT from
+// the connected backend. A remote backend reports its own `hermes_home` over
+// the gateway, which is a path on the REMOTE box; deriving the plugin dir from
+// it yields `undefined/desktop-plugins` (or a non-existent remote path) and the
+// on-disk plugin door silently breaks (#66899). Electron owns this resolution
+// so it stays valid in every connection mode. Created on demand, like openDir.
+ipcMain.handle('hermes:fs:desktopPluginsRoot', async () => {
+  // Profile-aware: a named Desktop profile gets its own plugin root under
+  // profiles/<name>/, matching the profile-scoped hermes_home the backend
+  // reported before this resolver existed. 'default'/unset pins the global root.
+  const profile = readActiveDesktopProfile()
+  const base = profile && profile !== 'default' ? path.join(HERMES_HOME, 'profiles', profile) : HERMES_HOME
+  const dir = path.join(base, 'desktop-plugins')
+
+  try {
+    await fs.promises.mkdir(dir, { recursive: true })
+  } catch {
+    // Best-effort create; return the path regardless so the reveal action can
+    // still surface a real openPath error and the scanner can retry later.
+  }
+
+  return dir
 })
 
 // Rename a file/folder in place. The renderer passes the existing path + a new
