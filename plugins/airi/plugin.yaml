@@ -1,0 +1,43 @@
+name: airi
+version: 0.3.0
+description: "AIRI Electron VRM/TTS process worker under Hermes — concurrent with Hermes Desktop; api_server is the shared AI core."
+author: zapabob
+kind: standalone
+platforms:
+  - windows
+  - linux
+  - macos
+config:
+  repo_root:
+    type: string
+    default: "vendor/airi"
+  hermes_base_url:
+    type: string
+    default: "http://127.0.0.1:8642/v1/"
+  hermes_model:
+    type: string
+    default: "hermes-agent"
+  cdp_port:
+    type: integer
+    default: 9455
+  airi_server_url:
+    type: string
+    default: "http://127.0.0.1:6121"
+  vrchat_osc_host:
+    type: string
+    default: "127.0.0.1"
+  vrchat_osc_port:
+    type: integer
+    default: 9000
+provides_tools:
+  - airi_status
+  - airi_sync
+  - airi_configure_hermes
+  - airi_start
+  - airi_stop
+  - airi_restart
+  - airi_vrchat_chatbox
+  - airi_vrchat_parameter
+  - airi_vrchat_autonomy
+provides_cli:
+  - airi

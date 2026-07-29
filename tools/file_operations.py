@@ -1465,6 +1465,9 @@ class ShellFileOperations(FileOperations):
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
+        # Report the logical UTF-8 payload supplied by the caller. The
+        # on-disk representation may differ when preserving CRLF or a BOM.
+        requested_bytes = len(content.encode("utf-8"))
 
         # Block writes to sensitive paths
         denied = _write_denied_error(path, verb="Write")
@@ -1596,14 +1599,9 @@ class ShellFileOperations(FileOperations):
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
 
-        # Get bytes written (wc -c is POSIX, works on Linux + macOS)
-        stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
-        stat_result = self._exec(stat_cmd)
-
-        try:
-            bytes_written = int(stat_result.stdout.strip())
-        except ValueError:
-            bytes_written = len(content.encode('utf-8'))
+        # Get logical bytes requested by the caller. CRLF/BOM preservation can
+        # make the on-disk representation larger on Windows.
+        bytes_written = requested_bytes
 
         # Post-write lint with delta refinement.
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)

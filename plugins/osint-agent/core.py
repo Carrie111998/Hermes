@@ -117,10 +117,11 @@ def handle_status(_args: dict[str, Any], **_: Any) -> str:
             "worldmonitor-osint",
             "scrapling-feeds",
             "shinka-osint",
+            "world-intel-osint",
             "computer_use",
             "web",
         ],
-        "worldmonitor_mcp": "disabled (use free tier + CU manual UI)",
+        "worldmonitor_mcp": "native world-intel MCP configured; World Monitor Pro MCP remains disabled",
         "sitdeck_credentials": sitdeck_cred,
         "computer_use": {
             "cli": "hermes computer-use doctor",

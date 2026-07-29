@@ -51,8 +51,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV=""
 SKIPPED_VENVS=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
-    if "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
+  candidate_python=""
+  if [ -f "$candidate/bin/activate" ] && [ -f "$candidate/bin/python" ]; then
+    candidate_python="$candidate/bin/python"
+  elif [ -f "$candidate/Scripts/Activate.ps1" ] && [ -f "$candidate/Scripts/python.exe" ]; then
+    # Windows virtualenvs use Scripts/ rather than bin/.  Git Bash can invoke
+    # the native interpreter directly, so activation is not required here.
+    candidate_python="$candidate/Scripts/python.exe"
+  fi
+  if [ -n "$candidate_python" ]; then
+    if "$candidate_python" -c 'import pytest' 2>/dev/null; then
       VENV="$candidate"
       break
     fi
@@ -75,7 +83,7 @@ if [ -n "$VENV" ]; then
     echo "error: virtualenv found at $VENV but no usable Python executable exists" >&2
     exit 1
   fi
-elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
+elif [ -n "${HERMES_PYTHON:-}" ] && [ -f "$HERMES_PYTHON" ] \
     && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
   # Guard with an import check: HERMES_PYTHON may point at the RELEASE
   # venv (no pytest) when inherited from a wrapped `hermes` binary rather

@@ -1,0 +1,1092 @@
+"""Configuration, sync, lifecycle, and local VRChat OSC for the AIRI plugin.
+
+Architecture (intentionally narrow):
+  AIRI  = VRM / TTS / desktop shell (Hermes-managed process worker)
+  Hermes gateway `api_server` (:8642/v1) = OpenAI-compatible AI core
+  Desktop `hermes serve` (:9119) = session backend (not AIRI's LLM endpoint)
+  This plugin = worker supervisor + auth sync + CDP seed + local OSC
+
+Worker contract (unsloth_studio / hyperframes-style):
+  - State under ``~/.hermes/airi/worker-state.json`` (not TEMP)
+  - start / stop / status / sync / restart via CLI + tools
+  - Auth injects ``API_SERVER_KEY`` into AIRI openai-compatible credentials
+  - CDP seed + renderer reload so Pinia picks up localStorage
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+PLUGIN = "airi"
+REPO_DEFAULT = Path(__file__).resolve().parents[2] / "vendor" / "airi"
+PLUGIN_DIR = Path(__file__).resolve().parent
+PLUGIN_ICON = PLUGIN_DIR / "assets" / "icon.png"
+LEGACY_STATE_FILE = Path(os.environ.get("TEMP", ".")) / "hermes-airi-process.json"
+# Distinct from Hermes Desktop perf CDP (:9222 / :9333) so both Electrons can run together.
+DEFAULT_CDP_PORT = 9455
+WORKER_ROLE = "airi-desktop-shell"
+# Hermes Desktop app id is com.nousresearch.hermes — keep AIRI on its own id + userdata.
+CONCURRENT_WITH_DESKTOP = True
+
+
+def _hermes_airi_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "airi"
+    except Exception:
+        return Path.home() / ".hermes" / "airi"
+
+
+HERMES_AIRI_HOME = _hermes_airi_home()
+
+
+def _state_file() -> Path:
+    return HERMES_AIRI_HOME / "worker-state.json"
+
+
+def _cfg() -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        data = load_config_readonly()
+        return dict(((data.get("plugins") or {}).get("entries") or {}).get(PLUGIN) or {})
+    except Exception:
+        return {}
+
+
+def _repo(values: dict[str, Any] | None = None) -> Path:
+    values = values or {}
+    value = values.get("repo_root") or _cfg().get("repo_root")
+    path = Path(str(value)).expanduser() if value else REPO_DEFAULT
+    if not path.is_absolute():
+        path = REPO_DEFAULT.parents[1] / path
+    return path
+
+
+def _normalize_base_url(raw: str) -> str:
+    """AIRI requires a trailing slash on OpenAI-compatible baseUrl."""
+    return str(raw or "").strip().rstrip("/") + "/"
+
+
+def _candidate_base_urls(values: dict[str, Any] | None = None) -> list[str]:
+    """Prefer explicit config, then Hermes gateway API server (:8642), then Desktop serve."""
+    values = values or {}
+    ordered: list[str] = []
+    for raw in (
+        values.get("hermes_base_url"),
+        _cfg().get("hermes_base_url"),
+        os.environ.get("HERMES_AIRI_BASE_URL"),
+        "http://127.0.0.1:8642/v1/",
+        "http://127.0.0.1:9119/v1/",
+    ):
+        if not raw:
+            continue
+        url = _normalize_base_url(str(raw))
+        if url not in ordered:
+            ordered.append(url)
+    return ordered
+
+
+def _base_url(values: dict[str, Any] | None = None) -> str:
+    values = values or {}
+    return _candidate_base_urls(values)[0]
+
+
+def _model(values: dict[str, Any] | None = None) -> str:
+    values = values or {}
+    return str(
+        values.get("hermes_model")
+        or _cfg().get("hermes_model")
+        or os.environ.get("API_SERVER_MODEL_NAME")
+        or "hermes-agent"
+    )
+
+
+def _load_hermes_dotenv() -> None:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(Path.home() / ".hermes" / ".env", override=False)
+    except Exception:
+        pass
+
+
+def _api_key_info(values: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve API key + source label. Never invent secrets; never return raw key in status."""
+    values = values or {}
+    _load_hermes_dotenv()
+    candidates = (
+        ("values.api_key", values.get("api_key")),
+        ("HERMES_AIRI_API_KEY", os.environ.get("HERMES_AIRI_API_KEY")),
+        ("API_SERVER_KEY", os.environ.get("API_SERVER_KEY")),
+        ("HERMES_API_TOKEN", os.environ.get("HERMES_API_TOKEN")),
+    )
+    for source, key in candidates:
+        if key and str(key).strip():
+            token = str(key).strip()
+            return {
+                "api_key": token,
+                "source": source,
+                "configured": True,
+                "is_placeholder": False,
+            }
+    return {
+        "api_key": "hermes-local",
+        "source": "placeholder",
+        "configured": False,
+        "is_placeholder": True,
+    }
+
+
+def _api_key(values: dict[str, Any] | None = None) -> str:
+    return str(_api_key_info(values)["api_key"])
+
+
+def _write_state(data: dict[str, Any]) -> None:
+    HERMES_AIRI_HOME.mkdir(parents=True, exist_ok=True)
+    path = _state_file()
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_state() -> dict[str, Any]:
+    for path in (_state_file(), LEGACY_STATE_FILE):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data:
+                if path == LEGACY_STATE_FILE and not _state_file().exists():
+                    try:
+                        _write_state(data)
+                    except OSError:
+                        pass
+                return data
+        except (OSError, json.JSONDecodeError):
+            continue
+    return {}
+
+
+def _clear_state() -> None:
+    for path in (_state_file(), LEGACY_STATE_FILE):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        import psutil
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        return False
+
+
+def _json(data: dict[str, Any]) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+
+
+def _probe_hermes(base_url: str, timeout: float = 3.0, api_key: str | None = None) -> dict[str, Any]:
+    """Probe OpenAI-compatible /models.
+
+    ``live``  — endpoint reachable (incl. 401/403 auth gate)
+    ``auth_ok`` — Bearer accepted (2xx)
+    ``ok`` — live (used by core discovery); check ``auth_ok`` for chat readiness
+    """
+    models_url = base_url.rstrip("/") + "/models"
+    headers: dict[str, str] = {}
+    key = (api_key or "").strip()
+    if key and key != "hermes-local":
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        req = urllib.request.Request(models_url, method="GET", headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(4096).decode("utf-8", errors="replace")
+            status = int(resp.status)
+            auth_ok = 200 <= status < 300
+            return {
+                "ok": True,
+                "live": True,
+                "auth_ok": auth_ok,
+                "status": status,
+                "url": models_url,
+                "preview": body[:200] if auth_ok else "",
+            }
+    except urllib.error.HTTPError as exc:
+        gated = exc.code in {401, 403}
+        return {
+            "ok": gated,  # core is up but auth failed / required
+            "live": gated or exc.code < 500,
+            "auth_ok": False,
+            "status": int(exc.code),
+            "url": models_url,
+            "auth_required": gated,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "live": False,
+            "auth_ok": False,
+            "url": models_url,
+            "error": str(exc),
+        }
+
+
+def _auth_status(values: dict[str, Any] | None = None, probe: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Auth readiness for status/sync — never echoes the secret."""
+    values = values or {}
+    info = _api_key_info(values)
+    probe = probe or _probe_hermes(_base_url(values), api_key=info["api_key"])
+    ready = bool(info["configured"] and probe.get("auth_ok"))
+    return {
+        "ready": ready,
+        "api_key_configured": bool(info["configured"]),
+        "api_key_source": info["source"],
+        "probe_live": bool(probe.get("live") or probe.get("ok")),
+        "probe_auth_ok": bool(probe.get("auth_ok")),
+        "probe_status": probe.get("status"),
+        "hint": (
+            None
+            if ready
+            else (
+                "Set API_SERVER_KEY in ~/.hermes/.env and restart gateway"
+                if not info["configured"]
+                else "Hermes /v1/models rejected Bearer — check API_SERVER_KEY / api_server"
+            )
+        ),
+    }
+
+
+def _resolve_live_core(values: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Pick the first live Hermes OpenAI-compatible base URL."""
+    values = values or {}
+    key = _api_key(values)
+    probes = []
+    for base in _candidate_base_urls(values):
+        probe = _probe_hermes(base, api_key=key)
+        probes.append({"base_url": base, **probe})
+        if probe.get("live") or probe.get("ok"):
+            return {"ok": True, "base_url": base, "probe": probe, "probes": probes}
+    return {"ok": False, "base_url": _candidate_base_urls(values)[0], "probes": probes}
+
+
+def provider_payload(values: dict[str, Any] | None = None) -> dict[str, Any]:
+    values = values or {}
+    return {
+        "definitionId": "openai-compatible",
+        "name": "Hermes Agent",
+        "config": {
+            "apiKey": _api_key(values),
+            "baseUrl": _base_url(values),
+            "model": _model(values),
+        },
+        "notes": (
+            "Synced by hermes airi sync/start. AIRI chat core = Hermes Agent "
+            "OpenAI-compatible /v1. Secrets stay in ~/.hermes/.env."
+        ),
+    }
+
+
+def configure_hermes(values: dict[str, Any] | None = None, **_: Any) -> str:
+    values = values or {}
+    repo = _repo(values)
+    if not repo.is_dir() or not (repo / "package.json").exists():
+        return _json(
+            {
+                "ok": False,
+                "error": "AIRI submodule is not initialized",
+                "repo_root": str(repo),
+                "hint": "git submodule update --init --recursive vendor/airi",
+            }
+        )
+
+    HERMES_AIRI_HOME.mkdir(parents=True, exist_ok=True)
+    provider = provider_payload(values)
+    # Never persist the raw API key on disk; CDP seed keeps it in-memory only.
+    disk = json.loads(json.dumps(provider))
+    disk["config"].pop("apiKey", None)
+    disk["config"]["apiKeyEnv"] = "API_SERVER_KEY"
+    path = HERMES_AIRI_HOME / "hermes-provider.json"
+    path.write_text(json.dumps(disk, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return _json(
+        {
+            "ok": True,
+            "provider_file": str(path),
+            "provider": disk,
+            "localstorage_seed": {
+                k: ("<redacted>" if "credentials" in k else v)
+                for k, v in _localstorage_seed(provider).items()
+            },
+            "auth": _auth_status(values),
+        }
+    )
+
+
+def _localstorage_seed(provider: dict[str, Any]) -> dict[str, str]:
+    """Keys consumed by AIRI stage-ui Pinia (legacy credentials + consciousness)."""
+    cfg = provider.get("config") or {}
+    base = str(cfg.get("baseUrl") or "").rstrip("/") + "/"
+    model = str(cfg.get("model") or "hermes")
+    api_key = str(cfg.get("apiKey") or "hermes-local")
+    # Stable instance id so re-seeds update the same catalog row.
+    instance_id = "hermes-agent-openai-compatible"
+    catalog = {
+        instance_id: {
+            "id": instance_id,
+            "definitionId": "openai-compatible",
+            "name": "Hermes Agent",
+            "config": {"apiKey": api_key, "baseUrl": base},
+            "validated": True,
+            "validationBypassed": True,
+        }
+    }
+    return {
+        "settings/credentials/providers": json.dumps(
+            {"openai-compatible": {"apiKey": api_key, "baseUrl": base}},
+            ensure_ascii=False,
+        ),
+        "settings/providers/added": json.dumps({"openai-compatible": True}),
+        "settings/consciousness/active-provider": "openai-compatible",
+        "settings/consciousness/active-model": model,
+        "onboarding/completed": "true",
+        # Hint for newer catalog UIs; IndexedDB remains authoritative for that path.
+        "hermes/airi/inference-providers-hint": json.dumps(catalog, ensure_ascii=False),
+    }
+
+
+def _cdp_targets(port: int, timeout: float = 2.0) -> list[dict[str, Any]]:
+    url = f"http://127.0.0.1:{port}/json/list"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _cdp_pick_page(targets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Prefer the AIRI renderer page; skip blank/devtools origins that deny localStorage."""
+    pages = [
+        t
+        for t in targets
+        if t.get("type") == "page" and t.get("webSocketDebuggerUrl")
+    ]
+    if not pages:
+        return None
+
+    def score(page: dict[str, Any]) -> tuple[int, str]:
+        url = str(page.get("url") or "")
+        low = url.lower()
+        if not url or low in {"about:blank", "about:srcdoc"}:
+            return (0, url)
+        if low.startswith("devtools://") or low.startswith("chrome-extension://"):
+            return (0, url)
+        if "localhost:5173" in low or "127.0.0.1:5173" in low:
+            # Prefer the chat surface over beat-sync helper windows.
+            if "#/chat" in low:
+                return (100, url)
+            if low.rstrip("/").endswith(":5173") or low.endswith(":5173/#/") or "#/" in low:
+                return (90, url)
+            return (80, url)
+        if low.startswith("http://") or low.startswith("https://") or low.startswith("app://"):
+            return (50, url)
+        return (10, url)
+
+    pages.sort(key=score, reverse=True)
+    best = pages[0]
+    if score(best)[0] <= 0:
+        return None
+    return best
+
+
+def _cdp_call(ws: Any, msg_id: int, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = {"id": msg_id, "method": method, "params": params or {}}
+    ws.send(json.dumps(payload))
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        raw = ws.recv()
+        reply = json.loads(raw)
+        if reply.get("id") == msg_id:
+            return reply
+    return {"error": {"message": f"timeout waiting for CDP id={msg_id}"}}
+
+
+def _cdp_seed_localstorage(port: int, seed: dict[str, str], wait_s: float = 45.0) -> dict[str, Any]:
+    """Seed AIRI renderer localStorage through Electron remote debugging, then reload.
+
+    Same-document ``localStorage.setItem`` does not update VueUse/Pinia bindings,
+    so a reload is required for consciousness + credentials to take effect.
+    """
+    deadline = time.time() + wait_s
+    page = None
+    while time.time() < deadline:
+        page = _cdp_pick_page(_cdp_targets(port))
+        if page:
+            break
+        time.sleep(0.5)
+    if not page:
+        return {"ok": False, "error": "CDP page target not found", "port": port}
+
+    try:
+        import websocket  # websocket-client
+    except ImportError:
+        return {
+            "ok": False,
+            "error": "websocket-client not installed",
+            "hint": "uv pip install websocket-client",
+        }
+
+    ws_url = str(page["webSocketDebuggerUrl"])
+    # Navigate to chat first so origin allows localStorage, then seed, then reload.
+    nav_expr = (
+        "(() => { try { if (!String(location.hash||'').includes('/chat')) "
+        "{ location.hash = '#/chat'; } return location.href; } catch (e) "
+        "{ return String(e); } })()"
+    )
+    seed_parts = [f"localStorage.setItem({json.dumps(k)}, {json.dumps(v)});" for k, v in seed.items()]
+    # Also mirror into IndexedDB for unstorage `local:providers` when available.
+    catalog_hint = seed.get("hermes/airi/inference-providers-hint") or "{}"
+    idb_expr = f"""
+(() => {{
+  const catalog = {catalog_hint};
+  return new Promise((resolve) => {{
+    try {{
+      const req = indexedDB.open('keyval-store');
+      req.onerror = () => resolve({{idb: 'open-failed'}});
+      req.onsuccess = () => {{
+        try {{
+          const db = req.result;
+          // unstorage indexeddb driver may use different DB names; best-effort only.
+          resolve({{idb: 'opened', stores: Array.from(db.objectStoreNames||[])}});
+        }} catch (e) {{ resolve({{idb: String(e)}}); }}
+      }};
+    }} catch (e) {{ resolve({{idb: String(e)}}); }}
+  }});
+}})()
+"""
+    seed_expr = (
+        "(() => {"
+        + "".join(seed_parts)
+        + " return { keys: Object.keys(localStorage).filter(k => "
+        "k.startsWith('settings/') || k.startsWith('onboarding/') || k.startsWith('hermes/')), "
+        "activeProvider: localStorage.getItem('settings/consciousness/active-provider'), "
+        "hasCreds: !!localStorage.getItem('settings/credentials/providers') }; })()"
+    )
+    try:
+        ws = websocket.create_connection(ws_url, timeout=8)
+        try:
+            msg_id = 1
+            nav = _cdp_call(
+                ws,
+                msg_id,
+                "Runtime.evaluate",
+                {"expression": nav_expr, "returnByValue": True},
+            )
+            msg_id += 1
+            time.sleep(0.4)
+            seeded = _cdp_call(
+                ws,
+                msg_id,
+                "Runtime.evaluate",
+                {"expression": seed_expr, "returnByValue": True},
+            )
+            msg_id += 1
+            idb = _cdp_call(
+                ws,
+                msg_id,
+                "Runtime.evaluate",
+                {"expression": idb_expr, "awaitPromise": True, "returnByValue": True},
+            )
+            msg_id += 1
+            # Reload so Pinia/useLocalStorage rehydrates from the seeded keys.
+            reloaded = _cdp_call(
+                ws,
+                msg_id,
+                "Runtime.evaluate",
+                {"expression": "location.reload()", "returnByValue": True},
+            )
+        finally:
+            ws.close()
+        seed_result = (seeded.get("result") or {})
+        ok = not bool(seed_result.get("exceptionDetails"))
+        return {
+            "ok": ok,
+            "port": port,
+            "target": page.get("url"),
+            "keys": list(seed.keys()),
+            "reloaded": not bool((reloaded.get("result") or {}).get("exceptionDetails")),
+            "nav": (nav.get("result") or {}).get("result"),
+            "seed": (seed_result.get("result") if ok else seeded),
+            "idb_probe": (idb.get("result") or {}).get("result"),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "port": port, "target": page.get("url")}
+
+
+def _png_color_type(path: Path) -> int | None:
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    return raw[25] if len(raw) > 25 else None
+
+
+def _icon_status(repo: Path) -> dict[str, Any]:
+    """Read-only icon health (no mutation)."""
+    resources_icon = repo / "apps" / "stage-tamagotchi" / "resources" / "icon.png"
+    if not resources_icon.is_file():
+        return {"path": str(resources_icon), "ok": False, "error": "missing"}
+    color_type = _png_color_type(resources_icon)
+    # PNG colour type 3 = indexed/palette (Electron nativeImage may invert on Windows).
+    palette = color_type == 3
+    return {
+        "path": str(resources_icon),
+        "ok": not palette,
+        "png_color_type": color_type,
+        "palette": palette,
+        "hint": (
+            "Indexed PNG — run hermes airi start to repair RGBA icon"
+            if palette
+            else None
+        ),
+    }
+
+
+def _ensure_rgba_icon(repo: Path) -> dict[str, Any]:
+    """Repair Electron tray/window icon if resources/icon.png is indexed (palette).
+
+    Indexed PNGs can render as colour-inverted on Windows Electron nativeImage.
+    Prefer plugin RGBA asset, then build/icon.png.
+    """
+    resources_icon = repo / "apps" / "stage-tamagotchi" / "resources" / "icon.png"
+    build_icon = repo / "apps" / "stage-tamagotchi" / "build" / "icon.png"
+    result: dict[str, Any] = {"path": str(resources_icon), "repaired": False}
+    if not resources_icon.is_file():
+        result["error"] = "resources/icon.png missing"
+        return result
+
+    color_type = _png_color_type(resources_icon)
+    result["png_color_type_before"] = color_type
+    if color_type != 3:
+        result["mode_after"] = "ok"
+        return result
+
+    src = PLUGIN_ICON if PLUGIN_ICON.is_file() else build_icon
+    if not src.is_file():
+        result["error"] = "no RGBA source icon available"
+        return result
+
+    try:
+        from PIL import Image
+
+        fixed = Image.open(src).convert("RGBA")
+        resources_icon.parent.mkdir(parents=True, exist_ok=True)
+        fixed.save(resources_icon, format="PNG", optimize=True)
+    except Exception:
+        shutil.copy2(src, resources_icon)
+
+    result["repaired"] = True
+    result["source"] = str(src)
+    result["reason"] = "palette-png-electron-nativeimage"
+    result["png_color_type_after"] = _png_color_type(resources_icon)
+    return result
+
+
+def sync(values: dict[str, Any] | None = None, **_: Any) -> str:
+    """One-shot: resolve live Hermes OpenAI core + write provider template."""
+    values = dict(values or {})
+    resolved = _resolve_live_core(values)
+    values["hermes_base_url"] = resolved["base_url"]
+    cfg_result = json.loads(configure_hermes(values))
+    if not cfg_result.get("ok"):
+        return _json(cfg_result)
+    probe = resolved.get("probe") or (resolved.get("probes") or [None])[-1] or {}
+    auth = _auth_status(values, probe=probe)
+    # If worker already running, push credentials again.
+    reseed: dict[str, Any] | None = None
+    state = _read_state()
+    if _pid_alive(int(state.get("pid") or 0)):
+        cdp_port = int(state.get("cdp_port") or DEFAULT_CDP_PORT)
+        provider = provider_payload(values)
+        reseed = _cdp_seed_localstorage(cdp_port, _localstorage_seed(provider), wait_s=10.0)
+        updated = {**state, "cdp_seed": reseed, "hermes_base_url": values["hermes_base_url"], "auth": auth}
+        _write_state(updated)
+    return _json(
+        {
+            "ok": True,
+            "synced": True,
+            "worker_role": WORKER_ROLE,
+            "provider_file": cfg_result.get("provider_file"),
+            "hermes_base_url": resolved["base_url"],
+            "hermes_model": _model(values),
+            "hermes_probe": probe,
+            "hermes_probes": resolved.get("probes"),
+            "auth": auth,
+            "cdp_reseed": reseed,
+            "architecture": (
+                "AIRI=Hermes process worker (VRM/TTS/UI); "
+                "Hermes api_server=AI core; plugin=supervisor+auth+OSC"
+            ),
+            "next": (
+                ["hermes airi start"]
+                if resolved.get("ok") and auth.get("ready")
+                else _sync_next_hints(resolved, auth)
+            ),
+        }
+    )
+
+
+def _sync_next_hints(resolved: dict[str, Any], auth: dict[str, Any] | None = None) -> list[str]:
+    probes = list(resolved.get("probes") or [])
+    refused = any("10061" in str((p or {}).get("error") or "") for p in probes)
+    auth = auth or {}
+    if refused:
+        return [
+            "Gateway api_server not listening — run: hermes gateway restart",
+            "Confirm API_SERVER_KEY in ~/.hermes/.env (OpenAI core on :8642)",
+            "hermes airi start",
+        ]
+    if not auth.get("api_key_configured"):
+        return [
+            "Set API_SERVER_KEY in ~/.hermes/.env and restart gateway (OpenAI core on :8642)",
+            "hermes airi start",
+        ]
+    if auth.get("probe_live") and not auth.get("probe_auth_ok"):
+        return [
+            "API_SERVER_KEY present but /v1/models auth failed — rotate key or restart gateway",
+            "hermes airi sync",
+        ]
+    return [
+        "Probe Hermes /v1/models failed — check gateway api_server on :8642",
+        "hermes airi start",
+    ]
+
+
+def _worker_health(state: dict[str, Any], values: dict[str, Any] | None = None) -> dict[str, Any]:
+    values = values or {}
+    pid = int(state.get("pid") or 0)
+    running = _pid_alive(pid)
+    cdp_port = int(state.get("cdp_port") or DEFAULT_CDP_PORT)
+    cdp_pages = _cdp_targets(cdp_port) if running else []
+    page = _cdp_pick_page(cdp_pages) if cdp_pages else None
+    probe = _probe_hermes(_base_url(values), api_key=_api_key(values))
+    auth = _auth_status(values, probe=probe)
+    seed = state.get("cdp_seed") if isinstance(state.get("cdp_seed"), dict) else {}
+    healthy = bool(
+        running
+        and page
+        and auth.get("ready")
+        and seed.get("ok", True)
+    )
+    return {
+        "role": WORKER_ROLE,
+        "healthy": healthy,
+        "running": running,
+        "pid": pid or None,
+        "cdp_port": cdp_port,
+        "cdp_page": (page or {}).get("url"),
+        "cdp_targets": len(cdp_pages),
+        "auth": auth,
+        "hermes_probe": {
+            "live": probe.get("live") or probe.get("ok"),
+            "auth_ok": probe.get("auth_ok"),
+            "status": probe.get("status"),
+            "url": probe.get("url"),
+            "error": probe.get("error"),
+        },
+        "last_cdp_seed_ok": seed.get("ok"),
+        "state_file": str(_state_file()),
+        "concurrent_with_hermes_desktop": CONCURRENT_WITH_DESKTOP,
+        "isolation": {
+            "userdata": str(HERMES_AIRI_HOME / "userdata"),
+            "app_user_model_id": "ai.moeru.airi",
+            "hermes_desktop_app_user_model_id": "com.nousresearch.hermes",
+            "cdp_port": cdp_port,
+            "note": (
+                "AIRI and Hermes Desktop are both Electron; isolated userData + "
+                "distinct app ids + CDP :9455 allow side-by-side launch."
+            ),
+        },
+    }
+
+
+def status(values: dict[str, Any] | None = None, **_: Any) -> str:
+    values = values or {}
+    repo = _repo(values)
+    state = _read_state()
+    health = _worker_health(state, values)
+    return _json(
+        {
+            "ok": True,
+            "plugin": PLUGIN,
+            "worker": health,
+            "repo_root": str(repo),
+            "submodule": (repo / ".git").exists() or (repo / "package.json").exists(),
+            "airi_package": str(repo / "package.json"),
+            "hermes_openai_base_url": _base_url(values),
+            "hermes_model": _model(values),
+            "hermes_probe": health.get("hermes_probe"),
+            "auth": health.get("auth"),
+            "provider_file": str(HERMES_AIRI_HOME / "hermes-provider.json"),
+            "provider_file_exists": (HERMES_AIRI_HOME / "hermes-provider.json").is_file(),
+            "airi_pid": health.get("pid"),
+            "airi_running": health.get("running"),
+            "cdp_port": health.get("cdp_port"),
+            "icon": _icon_status(repo) if repo.is_dir() else {"skipped": True},
+            "vrchat_osc": {
+                "host": str(
+                    values.get("vrchat_osc_host")
+                    or _cfg().get("vrchat_osc_host")
+                    or "127.0.0.1"
+                ),
+                "port": int(
+                    values.get("vrchat_osc_port")
+                    or _cfg().get("vrchat_osc_port")
+                    or 9000
+                ),
+            },
+            "architecture": (
+                "AIRI=Hermes process worker; Hermes api_server=AI core; "
+                "plugin=supervisor+auth sync+local OSC"
+            ),
+        }
+    )
+
+
+def _seed_running_worker(values: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    cdp_port = int(state.get("cdp_port") or DEFAULT_CDP_PORT)
+    provider = provider_payload(values)
+    seed = _cdp_seed_localstorage(cdp_port, _localstorage_seed(provider), wait_s=8.0)
+    auth = _auth_status(values)
+    updated = {
+        **state,
+        "cdp_seed": seed,
+        "hermes_base_url": _base_url(values),
+        "auth": auth,
+        "worker_role": WORKER_ROLE,
+        "last_sync_at": time.time(),
+    }
+    _write_state(updated)
+    return updated
+
+
+def start(values: dict[str, Any] | None = None, **_: Any) -> str:
+    values = values or {}
+    repo = _repo(values)
+    package = repo / "package.json"
+    if not package.exists():
+        return _json({"ok": False, "error": "AIRI checkout/package.json not found", "repo_root": str(repo)})
+
+    icon_fix = _ensure_rgba_icon(repo)
+    sync_payload = json.loads(sync(values))
+    if not sync_payload.get("ok"):
+        return _json(sync_payload)
+
+    state = _read_state()
+    if _pid_alive(int(state.get("pid") or 0)):
+        updated = _seed_running_worker(values, state)
+        return _json(
+            {
+                "ok": True,
+                "already_running": True,
+                "worker_role": WORKER_ROLE,
+                "concurrent_with_hermes_desktop": CONCURRENT_WITH_DESKTOP,
+                "sync": sync_payload,
+                "icon": icon_fix,
+                "worker": _worker_health(updated, values),
+                **updated,
+            }
+        )
+
+    cdp_port = int(values.get("cdp_port") or _cfg().get("cdp_port") or DEFAULT_CDP_PORT)
+    userdata = HERMES_AIRI_HOME / "userdata"
+    userdata.mkdir(parents=True, exist_ok=True)
+
+    pnpm = shutil.which("pnpm.cmd") or shutil.which("pnpm") or "pnpm.cmd"
+    # electron-vite forwards args after `--` to Electron.
+    # Chromium 111+ rejects CDP websockets without an explicit allow-origins.
+    # Do NOT pass Desktop flags or kill Hermes.exe — concurrent Electrons are supported.
+    command = [
+        pnpm,
+        "dev:tamagotchi",
+        "--",
+        f"--remote-debugging-port={cdp_port}",
+        "--remote-allow-origins=*",
+    ]
+    env = os.environ.copy()
+    # Isolate AIRI Electron userData from Hermes Desktop (and from stock AIRI installs).
+    # Electron single-instance lock is scoped to userData → Desktop + AIRI can coexist.
+    env["APP_USER_DATA_PATH"] = str(userdata)
+    env["HERMES_AIRI_BASE_URL"] = _base_url(values)
+    env["HERMES_AIRI_MODEL"] = _model(values)
+    # Pass key via env for any AIRI-side readers; CDP remains the Pinia path.
+    key_info = _api_key_info(values)
+    if key_info["configured"]:
+        env.setdefault("API_SERVER_KEY", key_info["api_key"])
+        env["HERMES_AIRI_API_KEY"] = key_info["api_key"]
+
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(repo),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        return _json(
+            {
+                "ok": False,
+                "error": str(exc),
+                "hint": "Install Node.js 24 and pnpm 10, then run pnpm install in vendor/airi",
+            }
+        )
+
+    provider = provider_payload(values)
+    seed = _cdp_seed_localstorage(cdp_port, _localstorage_seed(provider), wait_s=60.0)
+    auth = _auth_status(values)
+    state = {
+        "pid": proc.pid,
+        "command": command,
+        "repo_root": str(repo),
+        "started_at": time.time(),
+        "cdp_port": cdp_port,
+        "userdata": str(userdata),
+        "hermes_base_url": _base_url(values),
+        "cdp_seed": seed,
+        "auth": auth,
+        "worker_role": WORKER_ROLE,
+        "icon": icon_fix,
+        "last_sync_at": time.time(),
+    }
+    _write_state(state)
+    return _json(
+        {
+            "ok": True,
+            "worker_role": WORKER_ROLE,
+            "concurrent_with_hermes_desktop": CONCURRENT_WITH_DESKTOP,
+            "sync": sync_payload,
+            "worker": _worker_health(state, values),
+            **state,
+        }
+    )
+
+
+def stop(values: dict[str, Any] | None = None, **_: Any) -> str:
+    state = _read_state()
+    pid = int((values or {}).get("pid") or state.get("pid") or 0)
+    if not _pid_alive(pid):
+        _clear_state()
+        return _json({"ok": True, "stopped": False, "reason": "not running", "pid": pid})
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+            )
+        else:
+            os.kill(pid, 15)
+        _clear_state()
+        return _json({"ok": True, "stopped": True, "pid": pid, "worker_role": WORKER_ROLE})
+    except OSError as exc:
+        return _json({"ok": False, "error": str(exc), "pid": pid})
+
+
+def restart(values: dict[str, Any] | None = None, **_: Any) -> str:
+    """Stop then start the AIRI process worker (re-syncs Hermes auth)."""
+    values = values or {}
+    stopped = json.loads(stop(values))
+    started = json.loads(start(values))
+    return _json(
+        {
+            "ok": bool(started.get("ok")),
+            "worker_role": WORKER_ROLE,
+            "stopped": stopped,
+            "started": started,
+        }
+    )
+
+
+def _osc_string(value: str) -> bytes:
+    data = value.encode("utf-8") + b"\0"
+    return data + b"\0" * ((4 - len(data) % 4) % 4)
+
+
+def _osc_message(address: str, value: str | float | bool) -> bytes:
+    if isinstance(value, bool):
+        tags, payload = (",T" if value else ",F"), b""
+    elif isinstance(value, float):
+        import struct
+
+        tags, payload = ",f", struct.pack(">f", value)
+    else:
+        tags, payload = ",s", _osc_string(str(value))
+    return _osc_string(address) + _osc_string(tags) + payload
+
+
+def _send(address: str, value: str | float | bool, values: dict[str, Any]) -> dict[str, Any]:
+    host = str(values.get("vrchat_osc_host") or _cfg().get("vrchat_osc_host") or "127.0.0.1")
+    port = int(values.get("vrchat_osc_port") or _cfg().get("vrchat_osc_port") or 9000)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(_osc_message(address, value), (host, port))
+        return {"ok": True, "address": address, "host": host, "port": port}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc), "address": address, "host": host, "port": port}
+
+
+def vrchat_chatbox(values: dict[str, Any] | None = None, **_: Any) -> str:
+    values = values or {}
+    text = str(values.get("text") or "").strip()
+    if not text:
+        return _json({"ok": False, "error": "text is required"})
+    if len(text) > 144:
+        return _json({"ok": False, "error": "VRChat chatbox text must be <= 144 characters"})
+    result = _send("/chatbox/input", text, values)
+    if result.get("ok"):
+        result["value"] = bool(values.get("send", True))
+    return _json(result)
+
+
+def vrchat_parameter(values: dict[str, Any] | None = None, **_: Any) -> str:
+    values = values or {}
+    name = str(values.get("name") or "").strip()
+    if not name:
+        return _json({"ok": False, "error": "name is required"})
+    value = values.get("value")
+    if not isinstance(value, (str, float, bool)):
+        return _json({"ok": False, "error": "value must be string, number, or boolean"})
+    return _json(_send(f"/avatar/parameters/{name}", value, values))
+
+
+def vrchat_autonomy(values: dict[str, Any] | None = None, **_: Any) -> str:
+    values = values or {}
+    enabled = bool(values.get("enabled"))
+    return _json(
+        {
+            "ok": True,
+            "enabled": enabled,
+            "mode": "explicit-local-osc",
+            "note": (
+                "AIRI is a Hermes-managed process worker for VRM/TTS. "
+                "Hermes api_server remains the AI core (synced via airi_start). "
+                "Avatar actions stay on this local OSC plane."
+            ),
+        }
+    )
+
+
+AIRI_SCHEMAS = {
+    "airi_status": {
+        "name": "airi_status",
+        "description": "Show AIRI worker health, Hermes AI-core auth readiness, and OSC status.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    "airi_sync": {
+        "name": "airi_sync",
+        "description": "Sync Hermes Agent auth into AIRI (provider file + optional live CDP reseed).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo_root": {"type": "string"},
+                "hermes_base_url": {"type": "string"},
+                "hermes_model": {"type": "string"},
+            },
+        },
+    },
+    "airi_configure_hermes": {
+        "name": "airi_configure_hermes",
+        "description": "Write AIRI OpenAI Compatible provider settings pointing to Hermes Agent (alias of sync write step).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo_root": {"type": "string"},
+                "hermes_base_url": {"type": "string"},
+                "hermes_model": {"type": "string"},
+            },
+        },
+    },
+    "airi_start": {
+        "name": "airi_start",
+        "description": "Start AIRI as a Hermes process worker: sync auth, launch tamagotchi, CDP seed+reload.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo_root": {"type": "string"},
+                "hermes_base_url": {"type": "string"},
+                "hermes_model": {"type": "string"},
+                "cdp_port": {"type": "integer"},
+            },
+        },
+    },
+    "airi_stop": {
+        "name": "airi_stop",
+        "description": "Stop the Hermes-managed AIRI process worker.",
+        "parameters": {"type": "object", "properties": {"pid": {"type": "integer"}}},
+    },
+    "airi_restart": {
+        "name": "airi_restart",
+        "description": "Restart the AIRI process worker and re-sync Hermes API_SERVER_KEY credentials.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repo_root": {"type": "string"},
+                "hermes_base_url": {"type": "string"},
+                "hermes_model": {"type": "string"},
+                "cdp_port": {"type": "integer"},
+            },
+        },
+    },
+    "airi_vrchat_chatbox": {
+        "name": "airi_vrchat_chatbox",
+        "description": "Send an explicit local OSC message to the VRChat chatbox.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "send": {"type": "boolean"},
+                "vrchat_osc_host": {"type": "string"},
+                "vrchat_osc_port": {"type": "integer"},
+            },
+            "required": ["text"],
+        },
+    },
+    "airi_vrchat_parameter": {
+        "name": "airi_vrchat_parameter",
+        "description": "Set an explicit local VRChat avatar OSC parameter.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "value": {},
+                "vrchat_osc_host": {"type": "string"},
+                "vrchat_osc_port": {"type": "integer"},
+            },
+            "required": ["name", "value"],
+        },
+    },
+    "airi_vrchat_autonomy": {
+        "name": "airi_vrchat_autonomy",
+        "description": "Enable or disable the explicit AIRI/VRChat autonomy control-plane state.",
+        "parameters": {
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean"}},
+            "required": ["enabled"],
+        },
+    },
+}

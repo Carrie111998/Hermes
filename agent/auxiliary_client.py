@@ -5543,6 +5543,10 @@ def resolve_provider_client(
             if _main_base and _main_key:
                 custom_base = _main_base
                 custom_key = _main_key
+            elif _main_base or _main_key:
+                # A partially specified explicit runtime must not silently
+                # fall through to unrelated globally configured providers.
+                return None, None
         if custom_base and custom_key:
             final_model = _normalize_resolved_model(
                 model

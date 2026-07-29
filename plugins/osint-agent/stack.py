@@ -13,6 +13,7 @@ SIBLING_PLUGINS = (
     "worldmonitor-osint",
     "scrapling-feeds",
     "shinka-osint",
+    "world-intel-osint",
 )
 TOOLSETS = frozenset(
     {
@@ -21,6 +22,8 @@ TOOLSETS = frozenset(
         "worldmonitor_osint",
         "scrapling_feeds",
         "shinka_osint",
+        "world_intel_osint",
+        "world_intel",
         "web",
         "search",
         "computer_use",

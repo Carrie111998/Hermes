@@ -1,0 +1,16 @@
+name: world-intel-osint
+version: 0.1.0
+description: "World Intel MCP façade for bounded OSINT queries and situation briefs."
+author: "Hermes Agent"
+kind: standalone
+platforms:
+  - windows
+  - linux
+  - macos
+requires_env: []
+provides_tools:
+  - world_intel_status
+  - world_intel_query
+  - world_intel_brief
+provides_cli:
+  - world-intel-osint

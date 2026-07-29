@@ -242,6 +242,9 @@ nul
 
 .venv312/
 vendor/
+!vendor/
+!vendor/airi/
+!vendor/airi/**
 
 # Local scratch / misgenerated Electron bundle (never publish)
 _tmp/

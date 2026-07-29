@@ -32,3 +32,6 @@
 [submodule "vendor/cloakbrowser"]
 	path = vendor/cloakbrowser
 	url = https://github.com/CloakHQ/cloakbrowser.git
+[submodule "vendor/airi"]
+	path = vendor/airi
+	url = https://github.com/zapabob/airi.git
