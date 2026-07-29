@@ -218,3 +218,37 @@ class TestSwitchModelReasoningOverride:
         # No override for gpt-5 → global fallback with raw False
         assert agent.reasoning_config is not None
         assert agent.reasoning_config.get("enabled") is False
+
+    def test_session_override_survives_no_config_switch(self):
+        """Session reasoning override is preserved when config has no value.
+
+        Regression (#72856): switch_model resolves to None when
+        agent.reasoning_effort is unset and no per-model override exists.
+        The None result unconditionally overwrote agent.reasoning_config,
+        silently dropping any active /reasoning <level> override.
+        """
+        from agent.agent_runtime_helpers import switch_model
+
+        agent = self._make_fake_agent()
+        # Simulate /reasoning high — a session-level override
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+
+        # Config has no reasoning_effort and no per-model overrides
+        fake_cfg = {
+            "model": {"default": "gpt-5"},
+            "agent": {},
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=fake_cfg):
+            try:
+                switch_model(
+                    agent,
+                    new_model="gpt-5",
+                    new_provider="openai",
+                    api_mode="openai",
+                )
+            except Exception:
+                pass
+
+        # Session override must survive — not be reset to None
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
