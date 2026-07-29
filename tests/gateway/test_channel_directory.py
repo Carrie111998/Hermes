@@ -568,29 +568,62 @@ class TestBuildSlack:
 
         assert {e["id"] for e in entries} == {"C001"}
 
-    def test_response_not_ok_missing_scope_falls_back_quietly(self, tmp_path, caplog):
+    def test_response_missing_private_scope_retries_public_channels(self, tmp_path, caplog):
         client = _make_slack_client([
             {"ok": False, "error": "missing_scope"},
+            {
+                "ok": True,
+                "channels": [
+                    {"id": "C001", "name": "public-only", "is_private": False},
+                ],
+                "response_metadata": {},
+            },
         ])
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), caplog.at_level("WARNING"):
             entries = asyncio.run(_build_slack(_make_slack_adapter({"T1": client})))
 
-        assert entries == []
+        assert {entry["id"] for entry in entries} == {"C001"}
+        assert client.users_conversations.await_args_list[0].kwargs["types"] == (
+            "public_channel,private_channel"
+        )
+        assert client.users_conversations.await_args_list[1].kwargs["types"] == "public_channel"
         assert "missing_scope" not in caplog.text
 
-    def test_missing_scope_exception_falls_back_quietly(self, tmp_path, caplog):
+    def test_missing_scope_exception_retries_public_channels(self, tmp_path, caplog):
         class SlackLikeError(Exception):
             def __init__(self):
                 super().__init__("The request to the Slack API failed")
                 self.response = {"ok": False, "error": "missing_scope"}
 
         client = MagicMock()
-        client.users_conversations = AsyncMock(side_effect=SlackLikeError())
+        client.users_conversations = AsyncMock(side_effect=[
+            SlackLikeError(),
+            {
+                "ok": True,
+                "channels": [
+                    {"id": "C002", "name": "public-after-error", "is_private": False},
+                ],
+                "response_metadata": {},
+            },
+        ])
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), caplog.at_level("WARNING"):
             entries = asyncio.run(_build_slack(_make_slack_adapter({"T1": client})))
 
+        assert {entry["id"] for entry in entries} == {"C002"}
+        assert client.users_conversations.await_args_list[1].kwargs["types"] == "public_channel"
+        assert "missing_scope" not in caplog.text
+
+    def test_missing_all_channel_scopes_falls_back_quietly(self, tmp_path, caplog):
+        client = _make_slack_client([
+            {"ok": False, "error": "missing_scope"},
+            {"ok": False, "error": "missing_scope"},
+        ])
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), caplog.at_level("WARNING"):
+            entries = asyncio.run(_build_slack(_make_slack_adapter({"T1": client})))
+
         assert entries == []
+        assert client.users_conversations.await_count == 2
         assert "missing_scope" not in caplog.text
 
     def test_repeated_workspace_errors_are_warning_throttled(
