@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.delivery_outcome import (
+    discard_delivery_outcome,
     get_delivery_outcome,
     record_delivery_outcome,
     reset_delivery_outcome_turn,
@@ -79,6 +80,43 @@ def test_later_model_choice_in_same_turn_replaces_earlier_choice():
     )
 
     assert get_delivery_outcome(agent, "turn-1")["action"] == "deliver"
+
+
+def test_discard_removes_only_matching_current_turn_action():
+    agent = _agent()
+    reset_delivery_outcome_turn(agent, "turn-1")
+    record_delivery_outcome(
+        agent,
+        {"action": "suppress", "reason": "premature mixed batch"},
+        originating_turn_id="turn-1",
+    )
+
+    assert (
+        discard_delivery_outcome(
+            agent,
+            "turn-1",
+            expected_action="deliver",
+        )
+        is False
+    )
+    assert get_delivery_outcome(agent, "turn-1")["action"] == "suppress"
+    assert (
+        discard_delivery_outcome(
+            agent,
+            "turn-2",
+            expected_action="suppress",
+        )
+        is False
+    )
+    assert (
+        discard_delivery_outcome(
+            agent,
+            "turn-1",
+            expected_action="suppress",
+        )
+        is True
+    )
+    assert get_delivery_outcome(agent, "turn-1") is None
 
 
 @pytest.mark.parametrize(

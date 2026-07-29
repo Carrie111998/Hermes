@@ -6267,6 +6267,13 @@ def run_conversation(
                 agent._invalid_json_retries = 0
 
                 # ── Post-call guardrails ──────────────────────────
+                # Preserve the exact model-authored batch width before
+                # capping/deduplication. Structured suppression may only use
+                # its no-follow-up fast path when the model emitted one
+                # isolated todo call; a sibling call (including one later
+                # rejected by a guardrail) must return to the model so its
+                # result cannot be hidden.
+                _model_tool_call_count = len(assistant_message.tool_calls)
                 assistant_message.tool_calls = agent._cap_delegate_task_calls(
                     assistant_message.tool_calls
                 )
@@ -6368,6 +6375,110 @@ def run_conversation(
                         if tc.function.name in agent.valid_tool_names
                     ]
 
+                # Delivery suppression is terminal authority, so it must be
+                # isolated before any side effect can run. In a mixed batch
+                # the model has not observed sibling results yet; executing
+                # todo(suppress) first would create a crash-persisted
+                # ``recorded:true`` receipt that a process-exiting sibling
+                # could make impossible to revoke. Reject such calls up front,
+                # pair them with truthful tool results, and execute only the
+                # siblings. The model may reissue suppression alone after it
+                # has evaluated every result.
+                _suppression_calls = []
+                for _candidate_call in assistant_message.tool_calls:
+                    if _candidate_call.function.name != "todo":
+                        continue
+                    try:
+                        _candidate_args = json.loads(
+                            _candidate_call.function.arguments
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    _candidate_outcome = (
+                        _candidate_args.get("delivery_outcome")
+                        if isinstance(_candidate_args, dict)
+                        else None
+                    )
+                    if (
+                        isinstance(_candidate_outcome, dict)
+                        and _candidate_outcome.get("action") == "suppress"
+                    ):
+                        _suppression_calls.append(_candidate_call)
+
+                _isolated_suppression_call = (
+                    _suppression_calls[0]
+                    if (
+                        len(_suppression_calls) == 1
+                        and _model_tool_call_count == 1
+                        and not _invalid_batch_calls
+                        and len(assistant_message.tool_calls) == 1
+                    )
+                    else None
+                )
+                if (
+                    _suppression_calls
+                    and _isolated_suppression_call is None
+                ):
+                    from agent.delivery_outcome import (
+                        discard_delivery_outcome,
+                    )
+
+                    discard_delivery_outcome(
+                        agent,
+                        turn_id,
+                        expected_action="suppress",
+                    )
+                    _rejected_suppression_ids = {
+                        call.id for call in _suppression_calls
+                    }
+                    for _suppression_call in _suppression_calls:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "name": "todo",
+                                "tool_call_id": _suppression_call.id,
+                                "content": json.dumps(
+                                    {
+                                        "success": False,
+                                        "error": (
+                                            "delivery suppression was not "
+                                            "recorded: suppression requires "
+                                            "an isolated todo call"
+                                        ),
+                                        "todo_update_applied": False,
+                                        "todo_preserved": True,
+                                        "delivery_outcome": {
+                                            "recorded": False,
+                                            "action": "suppress",
+                                            "turn_id": turn_id,
+                                            "error": (
+                                                "observe sibling tool results "
+                                                "and reissue suppression alone "
+                                                "if silence is still appropriate"
+                                            ),
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                            }
+                        )
+                    assistant_message.tool_calls = [
+                        call
+                        for call in assistant_message.tool_calls
+                        if call.id not in _rejected_suppression_ids
+                    ]
+                    logger.info(
+                        "mixed-batch delivery suppression rejected before "
+                        "tool execution "
+                        "(session=%s turn=%s model_calls=%d executable_calls=%d)",
+                        getattr(agent, "session_id", None) or "-",
+                        turn_id,
+                        _model_tool_call_count,
+                        len(assistant_message.tool_calls),
+                    )
+
                 try:
                     # Persist the assistant tool-call turn before any tool
                     # side effects run. If a destructive tool restarts or
@@ -6419,6 +6530,111 @@ def run_conversation(
                             except Exception:
                                 pass
                     break
+
+                # A successfully recorded isolated suppression is a terminal
+                # model decision for this exact turn. Close the tool sequence
+                # with the shared silence token instead of spending another
+                # provider call that commonly returns intentionally empty
+                # prose and enters generic retry recovery.
+                _isolated_suppression_receipt = False
+                if _isolated_suppression_call is not None:
+                    _receipt_message = next(
+                        (
+                            message
+                            for message in reversed(messages)
+                            if (
+                                isinstance(message, dict)
+                                and message.get("role") == "tool"
+                                and message.get("tool_call_id")
+                                == _isolated_suppression_call.id
+                            )
+                        ),
+                        None,
+                    )
+                    try:
+                        _receipt_payload = json.loads(
+                            _receipt_message.get("content", "")
+                        )
+                    except (AttributeError, json.JSONDecodeError, TypeError):
+                        _receipt_payload = None
+                    _isolated_suppression_receipt = (
+                        isinstance(_receipt_payload, dict)
+                        and _receipt_payload.get("delivery_outcome")
+                        == {
+                            "recorded": True,
+                            "action": "suppress",
+                            "turn_id": turn_id,
+                        }
+                    )
+
+                if _isolated_suppression_receipt:
+                    from agent.delivery_outcome import (
+                        DELIVERY_SUPPRESSION_TOKEN,
+                        get_delivery_outcome,
+                    )
+
+                    _delivery_outcome = get_delivery_outcome(agent, turn_id)
+                    if (
+                        _delivery_outcome is None
+                        or _delivery_outcome["action"] != "suppress"
+                    ):
+                        _isolated_suppression_receipt = False
+
+                if _isolated_suppression_receipt:
+                    _suppression_proof_instruction = (
+                        _bounded_proof_gate_instruction(agent)
+                    )
+                    if _suppression_proof_instruction:
+                        if (
+                            _proof_gate_used
+                            and (
+                                _proof_gate_continuation_dispatched
+                                or _proof_gate_instruction is None
+                            )
+                        ):
+                            final_response = (
+                                _record_bounded_proof_gate_failure(
+                                    agent, messages
+                                )
+                            )
+                            failed = True
+                            _turn_exit_reason = (
+                                "bounded_proof_gate_unverified"
+                            )
+                            break
+                        if not _proof_gate_used:
+                            _proof_gate_used = True
+                            _proof_gate_instruction = (
+                                _suppression_proof_instruction
+                            )
+                            logger.info(
+                                "structured delivery suppression deferred "
+                                "for one bounded proof continuation "
+                                "(session=%s turn=%s)",
+                                getattr(agent, "session_id", None) or "-",
+                                turn_id,
+                            )
+                            agent._emit_wait_notice(
+                                "↻ Code changed without fresh passing "
+                                "verification — running one bounded proof "
+                                "continuation"
+                            )
+                    else:
+                        final_response = DELIVERY_SUPPRESSION_TOKEN
+                        _turn_exit_reason = (
+                            "text_response(structured_delivery_suppression)"
+                        )
+                        messages.append(
+                            {"role": "assistant", "content": final_response}
+                        )
+                        logger.info(
+                            "structured delivery suppression completed turn "
+                            "without a follow-up provider call "
+                            "(session=%s turn=%s)",
+                            getattr(agent, "session_id", None) or "-",
+                            turn_id,
+                        )
+                        break
 
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the

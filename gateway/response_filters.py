@@ -13,6 +13,7 @@ from typing import Any, Mapping
 
 from agent.delivery_outcome import (
     DELIVERY_ACTIONS,
+    DELIVERY_SUPPRESSION_TOKEN,
     MAX_DELIVERY_REASON_CHARS,
 )
 
@@ -20,7 +21,7 @@ from agent.delivery_outcome import (
 _OUTCOME_KEYS = frozenset({"action", "reason", "turn_id"})
 
 # Canonical model-emitted control token for intentional silence.
-SILENT_REPLY_TOKEN = "NO_REPLY"
+SILENT_REPLY_TOKEN = DELIVERY_SUPPRESSION_TOKEN
 
 # Keep the exact whole-response marker set small and explicit. Blank output
 # remains an error/empty-response path rather than intentional silence.

@@ -3194,14 +3194,24 @@ class TestStructuredDeliveryOutcome:
 
     def test_structured_suppress_skips_delivery(self, caplog):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=self._run_result()), \
+             patch(
+                 "cron.scheduler.run_job",
+                 return_value=self._run_result(response="NO_REPLY"),
+             ), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
-             patch("cron.scheduler.mark_job_run"):
+             patch("cron.scheduler.mark_job_run") as mark_mock:
             from cron.scheduler import tick
             with caplog.at_level(logging.INFO, logger="cron.scheduler"):
                 tick(verbose=False)
         deliver_mock.assert_not_called()
+        mark_mock.assert_called_once_with(
+            "monitor-job",
+            True,
+            None,
+            delivery_error=None,
+            delivery_status="none",
+        )
         assert any("structured delivery outcome" in r.message for r in caplog.records)
 
     def test_structured_deliver_sends_content(self):

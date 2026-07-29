@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 
 DELIVERY_ACTIONS = frozenset({"deliver", "suppress"})
+DELIVERY_SUPPRESSION_TOKEN = "NO_REPLY"
 MAX_DELIVERY_REASON_CHARS = 2000
 _DIRECTIVE_KEYS = frozenset({"action", "reason"})
 _OUTCOME_KEYS = frozenset({"action", "reason", "turn_id"})
@@ -116,9 +117,40 @@ def get_delivery_outcome(agent: Any, turn_id: str) -> dict[str, str] | None:
         return copy.deepcopy(outcome)
 
 
+def discard_delivery_outcome(
+    agent: Any,
+    turn_id: str,
+    *,
+    expected_action: str | None = None,
+) -> bool:
+    """Discard one current-turn outcome when its batch is not authoritative."""
+
+    expected = str(turn_id or "")
+    if not expected:
+        return False
+    if expected_action is not None and expected_action not in DELIVERY_ACTIONS:
+        raise ValueError("expected_action must be deliver, suppress, or None")
+    with _state_lock(agent):
+        state = getattr(agent, "_delivery_outcome_state", None)
+        if not isinstance(state, dict) or state.get("turn_id") != expected:
+            return False
+        outcome = state.get("outcome")
+        if not isinstance(outcome, dict):
+            return False
+        if (
+            expected_action is not None
+            and outcome.get("action") != expected_action
+        ):
+            return False
+        state["outcome"] = None
+        return True
+
+
 __all__ = [
     "DELIVERY_ACTIONS",
+    "DELIVERY_SUPPRESSION_TOKEN",
     "MAX_DELIVERY_REASON_CHARS",
+    "discard_delivery_outcome",
     "get_delivery_outcome",
     "record_delivery_outcome",
     "reset_delivery_outcome_turn",
