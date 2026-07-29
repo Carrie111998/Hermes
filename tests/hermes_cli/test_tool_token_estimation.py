@@ -137,7 +137,7 @@ def test_status_fn_returns_formatted_token_count(monkeypatch):
 
 
 def test_status_fn_deduplicates_overlapping_tools(monkeypatch):
-    """When toolsets overlap (browser includes web_search), tokens should not double-count."""
+    """When toolsets overlap should not double-count."""
     import hermes_cli.tools_config as tc
     from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS
 
@@ -159,7 +159,7 @@ def test_status_fn_deduplicates_overlapping_tools(monkeypatch):
 
     # web alone
     web_only = status_fn({idx_map["web"]})
-    # browser includes web_search, so browser + web should not double-count web_search
+    # browser no longer includes web_search, so browser + web should not have overlap
     browser_only = status_fn({idx_map["browser"]})
     both = status_fn({idx_map["web"], idx_map["browser"]})
 
