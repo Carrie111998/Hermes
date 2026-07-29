@@ -669,7 +669,11 @@ class EmailAdapter(BasePlatformAdapter):
                     if len(self._seen_uids) > self._seen_uids_max:
                         self._trim_seen_uids()
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    # Use BODY.PEEK[] so polling the inbox does not set the
+                    # IMAP \Seen flag. RFC822 fetches mark unread mail as read on
+                    # Gmail and many other providers, which is surprising for a
+                    # passive gateway poller.
+                    status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
                     if status != "OK":
                         continue
 

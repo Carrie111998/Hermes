@@ -1098,6 +1098,9 @@ class TestFetchNewMessages(unittest.TestCase):
         self.assertEqual(results[0]["sender_addr"], "user@test.com")
         self.assertIn(b"3", adapter._seen_uids)
 
+        # Fetch must use BODY.PEEK[] so polling does not mark unread mail read.
+        mock_imap.uid.assert_any_call("fetch", b"3", "(BODY.PEEK[])")
+
     def test_fetch_no_unseen_messages(self):
         """No unseen messages returns empty list."""
         adapter = self._make_adapter()
