@@ -4665,6 +4665,30 @@ def _try_configured_fallback_chain(
         label = f"fallback_chain[{i}]({fb_provider})"
 
         try:
+            from agent.provider_route_policy import (
+                Capability,
+                RouteRole,
+                SubscriptionRoutePolicy,
+            )
+
+            decision = SubscriptionRoutePolicy(load_config()).evaluate(
+                entry,
+                role=RouteRole.BUILDER,
+                capability=Capability.WRITE,
+            )
+            if not decision.allowed:
+                logger.info(
+                    "Auxiliary %s: skipping %s blocked by orchestrator route policy (%s)",
+                    task,
+                    label,
+                    decision.reason,
+                )
+                tried.append(f"{label} (orchestrator policy)")
+                continue
+        except Exception:
+            pass
+
+        try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception:
             fb_client, resolved_model = None, None

@@ -4124,6 +4124,86 @@ def _probe_codex_quota_restored(
     return result
 
 
+_codex_credential_health_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+
+
+def probe_codex_credential_health(
+    access_token: Any,
+    *,
+    base_url: Optional[str] = None,
+    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """Assignment-time Codex auth/quota ping with explicit 401/429 classes.
+
+    Unlike ``_probe_codex_quota_restored`` this preserves the HTTP status so
+    the credential pool can reload disk/source state on 401 and park quota on
+    429 without mislabelling either as missing credentials. Results are cached
+    per access token to avoid turning frequent worker assignment into proactive
+    usage monitoring.
+    """
+    token = str(access_token or "").strip()
+    if not token or not _decode_jwt_claims(token):
+        return {"status_code": 401, "reason": "invalid_token"}
+    cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    now = time.monotonic()
+    with _codex_quota_probe_lock:
+        cached = _codex_credential_health_cache.get(cache_key)
+        if cached is not None and (now - cached[0]) < min_interval_seconds:
+            return dict(cached[1]) if isinstance(cached[1], dict) else None
+
+    result: Optional[Dict[str, Any]] = None
+    try:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "codex-cli",
+        }
+        claims = _decode_jwt_claims(token)
+        auth_claim = claims.get("https://api.openai.com/auth")
+        account_id = (
+            auth_claim.get("chatgpt_account_id")
+            if isinstance(auth_claim, dict)
+            else None
+        )
+        if isinstance(account_id, str) and account_id.strip():
+            headers["ChatGPT-Account-Id"] = account_id.strip()
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(_codex_usage_probe_url(base_url), headers=headers)
+        if response.status_code == 200:
+            payload = response.json() or {}
+            rate_limit = payload.get("rate_limit") or {}
+            windows = [rate_limit.get(key) or {} for key in ("primary_window", "secondary_window")]
+            used_values = [
+                float(window["used_percent"])
+                for window in windows
+                if isinstance(window.get("used_percent"), (int, float))
+            ]
+            if used_values and max(used_values) >= 100.0:
+                reset_candidates = [
+                    window.get("reset_at") or window.get("resets_at")
+                    for window in windows
+                    if window.get("reset_at") or window.get("resets_at")
+                ]
+                result = {
+                    "status_code": 429,
+                    "reason": "usage_limit_reached",
+                    "reset_at": reset_candidates[0] if reset_candidates else None,
+                }
+            elif used_values:
+                result = {"status_code": 200}
+        elif response.status_code == 401:
+            result = {"status_code": 401, "reason": "invalid_token"}
+        elif response.status_code == 429:
+            result = {"status_code": 429, "reason": "usage_limit_reached"}
+    except Exception:
+        logger.debug("Codex credential health probe failed", exc_info=True)
+        result = None
+
+    with _codex_quota_probe_lock:
+        _codex_credential_health_cache[cache_key] = (now, result)
+    return dict(result) if isinstance(result, dict) else None
+
+
 def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
     """Clear rate-limit cooldowns on persisted openai-codex pool entries.
 

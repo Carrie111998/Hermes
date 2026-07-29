@@ -1697,6 +1697,30 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
 
+    try:
+        from agent.provider_route_policy import (
+            Capability,
+            RouteRole,
+            SubscriptionRoutePolicy,
+        )
+        from hermes_cli.config import load_config_readonly
+
+        route_decision = SubscriptionRoutePolicy(load_config_readonly()).evaluate(
+            fb,
+            role=RouteRole.BUILDER,
+            capability=Capability.WRITE,
+        )
+        if not route_decision.allowed:
+            logger.warning(
+                "Fallback skip: %s/%s blocked by orchestrator route policy (%s)",
+                fb_provider,
+                fb_model,
+                route_decision.reason,
+            )
+            return agent._try_activate_fallback(reason)
+    except Exception:
+        pass
+
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
         unavailable.add(fb_key)
@@ -1764,6 +1788,64 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_provider)
             unavailable.add(fb_key)
             return agent._try_activate_fallback(reason)  # try next in chain
+
+        # Config fallback entries normally carry only provider+model. Verify
+        # the exact resolved pooled credential before assigning this turn so
+        # Claude subscription OAuth is allowed but Anthropic API/Console keys
+        # remain forbidden under subscription-only policy.
+        try:
+            from agent.credential_pool import load_pool
+            from agent.provider_route_policy import (
+                Capability,
+                RouteRole,
+                SubscriptionRoutePolicy,
+            )
+            from hermes_cli.config import load_config_readonly
+
+            resolved_route = dict(fb)
+            runtime_policy = SubscriptionRoutePolicy(load_config_readonly())
+            if not runtime_policy.enabled:
+                runtime_decision = runtime_policy.evaluate(
+                    resolved_route,
+                    role=RouteRole.BUILDER,
+                    capability=Capability.WRITE,
+                )
+            else:
+                resolved_pool = load_pool(fb_provider)
+                resolved_entry = (
+                    resolved_pool.current()
+                    or resolved_pool.peek()
+                    or resolved_pool.select()
+                )
+                if resolved_entry is not None:
+                    resolved_route["auth_type"] = resolved_entry.auth_type
+                    resolved_route["source"] = resolved_entry.source
+                runtime_decision = runtime_policy.evaluate(
+                    resolved_route,
+                    role=RouteRole.BUILDER,
+                    capability=Capability.WRITE,
+                )
+            if (
+                not runtime_decision.allowed
+                or runtime_decision.reason == "runtime_subscription_check_required"
+            ):
+                unavailable.add(fb_key)
+                logger.warning(
+                    "Fallback skip: resolved %s/%s credential failed subscription policy (%s)",
+                    fb_provider,
+                    fb_model,
+                    runtime_decision.reason,
+                )
+                return agent._try_activate_fallback(reason)
+        except Exception as policy_exc:
+            logger.warning(
+                "Fallback skip: could not verify resolved credential provenance for %s/%s: %s",
+                fb_provider,
+                fb_model,
+                policy_exc,
+            )
+            unavailable.add(fb_key)
+            return agent._try_activate_fallback(reason)
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 

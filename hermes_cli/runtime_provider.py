@@ -1830,7 +1830,21 @@ def resolve_runtime_provider(
     except Exception:
         pool = None
     if pool and pool.has_credentials():
-        entry = pool.select()
+        if provider == "openai-codex":
+            try:
+                from agent.provider_route_policy import orchestrator_subscription_only
+                from hermes_cli.config import load_config_readonly
+
+                health_gate_enabled = orchestrator_subscription_only(load_config_readonly())
+            except Exception:
+                health_gate_enabled = False
+            entry = (
+                pool.select_health_checked()
+                if health_gate_enabled
+                else pool.select()
+            )
+        else:
+            entry = pool.select()
         pool_api_key = ""
         if entry is not None:
             pool_api_key = (

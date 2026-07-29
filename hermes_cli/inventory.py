@@ -273,11 +273,37 @@ def build_models_payload(
     if featured:
         _apply_featured(rows)
 
-    return {
+    payload = {
         "providers": rows,
         "model": ctx.current_model,
         "provider": ctx.current_provider,
     }
+    try:
+        from agent.provider_route_policy import (
+            orchestrator_subscription_only,
+            sanitized_startup_summary,
+        )
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        if orchestrator_subscription_only(cfg):
+            payload["orchestrator"] = {
+                "billing_policy": "subscription_only",
+                "route_health": sanitized_startup_summary(
+                    {
+                        "provider": row.get("slug") or row.get("provider") or "",
+                        "model": (row.get("model") or row.get("current_model") or ""),
+                        "status": row.get("last_status") or row.get("status") or ("ok" if row.get("authenticated") else "unavailable_cli"),
+                        "auth_type": row.get("auth_type"),
+                        "source": row.get("source") or row.get("credential_source"),
+                        "has_refresh_token": bool(row.get("has_refresh_token")),
+                    }
+                    for row in rows
+                ),
+            }
+    except Exception:
+        pass
+    return payload
 
 
 def build_model_options_payload(

@@ -2182,6 +2182,11 @@ def compress_context(
                         migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
                     except Exception as _goal_err:
                         logger.debug("Could not migrate goal on compression: %s", _goal_err)
+                    try:
+                        from hermes_cli.orchestrator_state import migrate_orchestrator_state_to_session
+                        migrate_orchestrator_state_to_session(old_session_id, agent.session_id, reason="compression")
+                    except Exception as _orch_err:
+                        logger.debug("Could not migrate orchestrator state on compression: %s", _orch_err)
                     # Auto-number the title for the continuation session
                     if old_title:
                         try:

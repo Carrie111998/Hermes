@@ -21,6 +21,7 @@ from hermes_cli.auth import (
     _is_codex_rate_limit_shaped,
     _probe_codex_quota_restored,
     clear_codex_pool_quota_cooldowns,
+    probe_codex_credential_health,
     resolve_codex_runtime_credentials,
 )
 
@@ -28,8 +29,10 @@ from hermes_cli.auth import (
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():
     auth_mod._codex_quota_probe_cache.clear()
+    auth_mod._codex_credential_health_cache.clear()
     yield
     auth_mod._codex_quota_probe_cache.clear()
+    auth_mod._codex_credential_health_cache.clear()
 
 
 def _jwt(claims: dict) -> str:
@@ -166,6 +169,47 @@ def test_probe_throttles_repeat_calls(monkeypatch):
     assert _probe_codex_quota_restored(token) is True
     assert _probe_codex_quota_restored(token) is True  # cached
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "status,payload,expected",
+    [
+        (200, _usage_payload(12.0, 34.0), 200),
+        (200, _usage_payload(100.0, 34.0), 429),
+        (401, {}, 401),
+        (429, {}, 429),
+    ],
+)
+def test_assignment_health_probe_preserves_auth_vs_quota_class(
+    monkeypatch, status, payload, expected
+):
+    _patch_httpx(monkeypatch, _StubResponse(status, payload))
+    token = _jwt({"exp": time.time() + 3600})
+
+    result = probe_codex_credential_health(token)
+
+    assert result is not None
+    assert result["status_code"] == expected
+
+
+def test_assignment_health_probe_is_cached_per_token(monkeypatch):
+    calls = _patch_httpx(monkeypatch, _StubResponse(200, _usage_payload(1.0, 2.0)))
+    token = _jwt({"exp": time.time() + 3600})
+
+    first = probe_codex_credential_health(token)
+    second = probe_codex_credential_health(token)
+    assert first is not None and first["status_code"] == 200
+    assert second is not None and second["status_code"] == 200
+    assert len(calls) == 1
+
+
+def test_assignment_health_probe_classifies_corrupt_token_as_401(monkeypatch):
+    calls = _patch_httpx(monkeypatch, _StubResponse(200, _usage_payload(1.0, 2.0)))
+
+    result = probe_codex_credential_health("not-a-jwt")
+
+    assert result == {"status_code": 401, "reason": "invalid_token"}
+    assert calls == []
 
 
 def test_probe_sends_chatgpt_account_id_from_jwt(monkeypatch):

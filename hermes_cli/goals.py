@@ -491,6 +491,31 @@ class GoalState:
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
 
+@dataclass
+class QueuedGoal:
+    goal: str
+    max_turns: int = DEFAULT_MAX_TURNS
+    created_at: float = 0.0
+    contract: GoalContract = field(default_factory=GoalContract)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "goal": self.goal,
+            "max_turns": self.max_turns,
+            "created_at": self.created_at,
+            "contract": asdict(self.contract),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "QueuedGoal":
+        return cls(
+            goal=str(data.get("goal") or ""),
+            max_turns=int(data.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS),
+            created_at=float(data.get("created_at", 0.0) or 0.0),
+            contract=GoalContract.from_dict(data.get("contract")),
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Persistence (SessionDB state_meta)
 # ──────────────────────────────────────────────────────────────────────
@@ -498,6 +523,10 @@ class GoalState:
 
 def _meta_key(session_id: str) -> str:
     return f"goal:{session_id}"
+
+
+def _queue_meta_key(session_id: str) -> str:
+    return f"goal_queue:{session_id}"
 
 
 _DB_CACHE: Dict[str, Any] = {}
@@ -576,6 +605,66 @@ def clear_goal(session_id: str) -> None:
     save_goal(session_id, state)
 
 
+def load_goal_queue(session_id: str) -> List[QueuedGoal]:
+    if not session_id:
+        return []
+    db = _get_session_db()
+    if db is None:
+        return []
+    try:
+        raw = db.get_meta(_queue_meta_key(session_id))
+    except Exception as exc:
+        logger.debug("GoalManager: get queue meta failed: %s", exc)
+        return []
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.warning("GoalManager: could not parse stored goal queue for %s: %s", session_id, exc)
+        return []
+    if not isinstance(data, list):
+        return []
+    queue = [QueuedGoal.from_dict(item) for item in data if isinstance(item, dict)]
+    return [item for item in queue if item.goal.strip()]
+
+
+def save_goal_queue(session_id: str, queue: List[QueuedGoal]) -> None:
+    if not session_id:
+        return
+    db = _get_session_db()
+    if db is None:
+        return
+    raw = json.dumps([item.to_dict() for item in queue], ensure_ascii=False)
+    try:
+        db.set_meta(_queue_meta_key(session_id), raw)
+    except Exception as exc:
+        logger.debug("GoalManager: set queue meta failed: %s", exc)
+
+
+def enqueue_goal(session_id: str, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> int:
+    queue = load_goal_queue(session_id)
+    queue.append(
+        QueuedGoal(
+            goal=(goal or "").strip(),
+            max_turns=int(max_turns) if max_turns else DEFAULT_MAX_TURNS,
+            created_at=time.time(),
+            contract=contract if contract is not None else GoalContract(),
+        )
+    )
+    save_goal_queue(session_id, queue)
+    return len(queue)
+
+
+def pop_next_goal(session_id: str) -> Optional[QueuedGoal]:
+    queue = load_goal_queue(session_id)
+    if not queue:
+        return None
+    item = queue.pop(0)
+    save_goal_queue(session_id, queue)
+    return item
+
+
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
     """Carry a persistent /goal from a parent session to its continuation.
 
@@ -602,6 +691,8 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         if load_goal(new_session_id) is not None:
             return False
         save_goal(new_session_id, state)
+        save_goal_queue(new_session_id, load_goal_queue(old_session_id))
+        save_goal_queue(old_session_id, [])
         # Archive the parent's row so it isn't double-counted as active.
         clear_goal(old_session_id)
         logger.debug(
@@ -1115,8 +1206,9 @@ class GoalManager:
 
     def status_line(self) -> str:
         s = self._state
+        queue_suffix = f" (queue: {self.queue_depth()})" if self.queue_depth() else ""
         if s is None or s.status in {"cleared",}:
-            return "No active goal. Set one with /goal <text>."
+            return f"No active goal. Set one with /goal <text>.{queue_suffix}"
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
@@ -1124,21 +1216,21 @@ class GoalManager:
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
                 wr = s.waiting_reason or f"session {s.waiting_on_session}"
-                return f"⏳ Goal (parked on {wr}, {meta}): {s.goal}"
+                return f"⏳ Goal (parked on {wr}, {meta}): {s.goal}{queue_suffix}"
             if s.waiting_on_pid and _pid_alive(s.waiting_on_pid):
                 wr = s.waiting_reason or f"pid {s.waiting_on_pid}"
-                return f"⏳ Goal (parked on {wr}, {meta}): {s.goal}"
+                return f"⏳ Goal (parked on {wr}, {meta}): {s.goal}{queue_suffix}"
             if s.waiting_until and time.time() < s.waiting_until:
                 remaining = int(s.waiting_until - time.time())
                 wr = s.waiting_reason or f"{remaining}s"
-                return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}"
-            return f"⊙ Goal (active, {meta}): {s.goal}"
+                return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}{queue_suffix}"
+            return f"⊙ Goal (active, {meta}): {s.goal}{queue_suffix}"
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
-            return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
+            return f"⏸ Goal (paused, {meta}{extra}): {s.goal}{queue_suffix}"
         if s.status == "done":
-            return f"✓ Goal done ({meta}): {s.goal}"
-        return f"Goal ({s.status}, {meta}): {s.goal}"
+            return f"✓ Goal done ({meta}): {s.goal}{queue_suffix}"
+        return f"Goal ({s.status}, {meta}): {s.goal}{queue_suffix}"
 
     # --- mutation -----------------------------------------------------
 
@@ -1146,6 +1238,14 @@ class GoalManager:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
+        if self._state is not None and self._state.status in {"active", "paused"}:
+            enqueue_goal(
+                self.session_id,
+                goal,
+                max_turns=int(max_turns) if max_turns else self.default_max_turns,
+                contract=contract,
+            )
+            return self._state
         state = GoalState(
             goal=goal,
             status="active",
@@ -1158,6 +1258,26 @@ class GoalManager:
         self._state = state
         save_goal(self.session_id, state)
         return state
+
+    def queue_depth(self) -> int:
+        return len(load_goal_queue(self.session_id))
+
+    def _promote_next_queued_goal(self) -> bool:
+        item = pop_next_goal(self.session_id)
+        if item is None:
+            return False
+        state = GoalState(
+            goal=item.goal,
+            status="active",
+            turns_used=0,
+            max_turns=item.max_turns,
+            created_at=time.time(),
+            last_turn_at=0.0,
+            contract=item.contract,
+        )
+        self._state = state
+        save_goal(self.session_id, state)
+        return True
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal.
@@ -1206,6 +1326,7 @@ class GoalManager:
         self._state.status = "cleared"
         save_goal(self.session_id, self._state)
         self._state = None
+        self._promote_next_queued_goal()
 
     def mark_done(self, reason: str) -> None:
         if not self._state:
@@ -1214,6 +1335,7 @@ class GoalManager:
         self._state.last_verdict = "done"
         self._state.last_reason = reason
         save_goal(self.session_id, self._state)
+        self._promote_next_queued_goal()
 
     # --- /subgoal user controls ---------------------------------------
 
