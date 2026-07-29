@@ -484,6 +484,18 @@ class EmailAdapter(BasePlatformAdapter):
         # Map chat_id (sender email) -> last subject + message-id for threading
         self._thread_context: Dict[str, Dict[str, str]] = {}
 
+        # Pending text buffer: text content from send() is buffered and
+        # combined with the next send_document() / send_multiple_images()
+        # call so that body text and attachments arrive in a single email
+        # instead of two separate ones (#74321).
+        self._pending_text: Dict[str, str] = {}
+        self._pending_reply_to: Dict[str, Optional[str]] = {}
+        self._pending_metadata: Dict[str, Any] = {}
+
+        # Flush timers per chat_id — a short-lived asyncio task that sends
+        # the pending text if no attachment follows within ~2 seconds.
+        self._flush_tasks: Dict[str, asyncio.Task] = {}
+
         logger.info("[Email] Adapter initialized for %s", self._address)
 
     def _trim_seen_uids(self) -> None:
@@ -617,7 +629,10 @@ class EmailAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        """Stop polling and disconnect."""
+        """Stop polling and disconnect. Flush any buffered text first."""
+        # Flush all pending text so text-only replies are not lost (#74321)
+        for chat_id in list(self._pending_text.keys()):
+            self._flush_pending(chat_id)
         self._running = False
         if self._poll_task:
             self._poll_task.cancel()
@@ -640,9 +655,15 @@ class EmailAdapter(BasePlatformAdapter):
             await asyncio.sleep(self._poll_interval)
 
     async def _check_inbox(self) -> None:
-        """Check INBOX for unseen messages and dispatch them."""
+        """Check INBOX for unseen messages and dispatch them.
+
+        Flush any buffered pending text first so text-only replies are
+        not delayed until the next poll cycle (#74321).
+        """
         # Run IMAP operations in a thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
+        for chat_id in list(self._pending_text.keys()):
+            await asyncio.to_thread(self._flush_pending, chat_id)
         messages = await loop.run_in_executor(None, self._fetch_new_messages)
         for msg_data in messages:
             await self._dispatch_message(msg_data)
@@ -897,16 +918,39 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an email reply to the given address."""
-        try:
-            loop = asyncio.get_running_loop()
-            message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
-            )
-            return SendResult(success=True, message_id=message_id)
-        except Exception as e:
-            logger.error("[Email] Send failed to %s: %s", chat_id, e)
-            return SendResult(success=False, error=str(e))
+        """Send an email reply to the given address.
+
+        Buffers the text content and waits briefly for a potential
+        attachment (send_document / send_multiple_images). If an
+        attachment follows within ~2 seconds, both text and attachment
+        are combined into a single email. Otherwise the text is sent
+        on its own (#74321).
+        """
+        # Flush any previous pending text for a different chat — prevents
+        # memory leaks and ensures previous text-only replies eventually
+        # go out even when the flush timer is delayed.
+        other_chats = [k for k in self._pending_text if k != chat_id]
+        for other in other_chats:
+            self._flush_pending(other)
+
+        self._pending_text[chat_id] = content
+        self._pending_reply_to[chat_id] = reply_to
+        self._pending_metadata[chat_id] = metadata
+
+        # Cancel any existing flush task for this chat
+        existing = self._flush_tasks.pop(chat_id, None)
+        if existing and not existing.done():
+            existing.cancel()
+
+        # Schedule a flush after a short delay — if send_document or
+        # send_multiple_images fires for the same chat before it
+        # triggers, the task is cancelled and text + attachment are
+        # combined into one email.
+        self._flush_tasks[chat_id] = asyncio.create_task(
+            self._delayed_flush(chat_id, delay=2.0)
+        )
+
+        return SendResult(success=True, message_id="buffered")
 
     def _message_id_domain(self) -> str:
         """Domain part for generated Message-IDs.
@@ -917,6 +961,38 @@ class EmailAdapter(BasePlatformAdapter):
         if "@" in self._address:
             return self._address.rsplit("@", 1)[-1] or "localhost"
         return "localhost"
+
+    async def _delayed_flush(self, chat_id: str, delay: float) -> None:
+        """After *delay* seconds, send the buffered text for *chat_id*
+        if no attachment followed to combine with it."""
+        try:
+            await asyncio.sleep(delay)
+            await asyncio.to_thread(self._flush_pending, chat_id)
+        except asyncio.CancelledError:
+            pass
+
+    def _flush_pending(self, chat_id: str) -> Optional[str]:
+        """Send any buffered text for *chat_id* now.
+
+        Removes the pending text from the buffer and sends it via
+        ``_send_email``.  Returns the message ID or ``None`` if there
+        was nothing pending.
+        """
+        content = self._pending_text.pop(chat_id, None)
+        if content is None:
+            return None
+        reply_to = self._pending_reply_to.pop(chat_id, None)
+        self._pending_metadata.pop(chat_id, None)
+        # Clean up any lingering flush task
+        task = self._flush_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+        try:
+            message_id = self._send_email(chat_id, content, reply_to)
+            return message_id
+        except Exception as e:
+            logger.error("[Email] Flush send failed to %s: %s", chat_id, e)
+            return None
 
     def _send_email(
         self,
@@ -994,14 +1070,38 @@ class EmailAdapter(BasePlatformAdapter):
         appended to the body (email adapter does not download remote
         images). No hard cap — email clients handle dozens of
         attachments fine, subject to SMTP message size limits.
+
+        When there is buffered text from a preceding ``send()`` call,
+        both the text and the images are combined into a single
+        email instead of being sent separately (#74321).
         """
+        # Cancel any pending flush timer — we will combine text +
+        # images into one email.
+        task = self._flush_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
+        # Consume the buffered text (if any).
+        pending_text = self._pending_text.pop(chat_id, None) or ""
+        self._pending_reply_to.pop(chat_id, None)
+        self._pending_metadata.pop(chat_id, None)
+
         if not images:
+            # If there were no images, the pending text was consumed for
+            # nothing — re-buffer it so the flush timer can still fire.
+            if pending_text:
+                self._pending_text[chat_id] = pending_text
+                self._flush_tasks[chat_id] = asyncio.create_task(
+                    self._delayed_flush(chat_id, delay=0.5)
+                )
             return
 
         from urllib.parse import unquote as _unquote
 
         body_parts: List[str] = []
         local_paths: List[str] = []
+        if pending_text:
+            body_parts.append(pending_text)
         for image_url, alt_text in images:
             if alt_text:
                 body_parts.append(alt_text)
@@ -1096,14 +1196,32 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
-        """Send a file as an email attachment."""
+        """Send a file as an email attachment.
+
+        When there is buffered text from a preceding ``send()`` call,
+        both the text and the attachment are combined into a single
+        email instead of being sent separately (#74321).
+        """
+        # Cancel any pending flush timer — we will combine text +
+        # attachment into one email.
+        task = self._flush_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
+        # Consume the buffered text (if any) so it is not sent separately.
+        pending_text = self._pending_text.pop(chat_id, None) or ""
+        self._pending_reply_to.pop(chat_id, None)
+        self._pending_metadata.pop(chat_id, None)
+
+        body = caption or pending_text
+
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
                 None,
                 self._send_email_with_attachment,
                 chat_id,
-                caption or "",
+                body,
                 file_path,
                 file_name,
             )
