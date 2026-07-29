@@ -347,6 +347,8 @@ export interface Translations {
       toolViewDesc: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
+      terminalNerdFontTitle: string
+      terminalNerdFontDesc: string
       translucencyTitle: string
       translucencyDesc: string
       backdropTitle: string

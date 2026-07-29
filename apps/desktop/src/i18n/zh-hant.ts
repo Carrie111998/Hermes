@@ -306,6 +306,8 @@ export const zhHant = defineLocale({
       uiScaleTitle: '介面縮放',
       uiScaleDesc: (percent: number) =>
         `縮放整個應用程式的文字與介面。也可使用 Cmd/Ctrl 加 +、- 或 0 調整。目前：${percent}%`,
+      terminalNerdFontTitle: '終端機 Nerd Font',
+      terminalNerdFontDesc: '在內建終端機中使用已安裝的 Nerd Font 顯示 Powerline 與圖示字形。無法使用時會改用內建字型。',
       translucencyTitle: '視窗透明',
       translucencyDesc: '讓整個視窗透出桌面。僅支援 macOS 與 Windows。',
       backdropTitle: '聊天背景',

@@ -437,6 +437,9 @@ export const en: Translations = {
       uiScaleTitle: 'UI Scale',
       uiScaleDesc: (percent: number) =>
         `Scales text and controls across the whole app. Cmd/Ctrl with +, - and 0 also works. Current: ${percent}%.`,
+      terminalNerdFontTitle: 'Terminal Nerd Font',
+      terminalNerdFontDesc:
+        'Use an installed Nerd Font in the embedded terminal for Powerline and icon glyphs. Falls back to the bundled font when unavailable.',
       translucencyTitle: 'Window Translucency',
       translucencyDesc: 'See your desktop through the whole window. macOS and Windows only.',
       backdropTitle: 'Chat Backdrop',

@@ -314,6 +314,9 @@ export const ja = defineLocale({
       uiScaleTitle: 'UI スケール',
       uiScaleDesc: (percent: number) =>
         `アプリ全体の文字と UI を拡大縮小します。Cmd/Ctrl と +、-、0 でも変更できます。現在: ${percent}%`,
+      terminalNerdFontTitle: 'ターミナル Nerd Font',
+      terminalNerdFontDesc:
+        '埋め込みターミナルでインストール済みの Nerd Font を使用します。見つからない場合は内蔵フォントに戻ります。',
       translucencyTitle: 'ウィンドウの透過',
       translucencyDesc: 'ウィンドウ全体を透過させてデスクトップを表示します。macOS と Windows のみ。',
       backdropTitle: 'チャット背景',

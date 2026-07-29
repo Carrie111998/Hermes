@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils'
 import { $backdrop, setBackdrop } from '@/store/backdrop'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
+import { $terminalNerdFontEnabled, setTerminalNerdFontEnabled } from '@/store/terminal-font'
 import { $toolViewMode, setToolViewMode } from '@/store/tool-view'
 import { $translucency, setTranslucency } from '@/store/translucency'
 import { $zoomPercent, setZoomPercent } from '@/store/zoom'
@@ -245,6 +246,7 @@ function MarketplaceThemeResults({
 export function AppearanceSettings() {
   const { t, isSavingLocale } = useI18n()
   const { themeName, mode, resolvedMode, availableThemes, setTheme, setMode } = useTheme()
+  const terminalNerdFontEnabled = useStore($terminalNerdFontEnabled)
   const toolViewMode = useStore($toolViewMode)
   const zoomPercent = useStore($zoomPercent)
   const embedMode = useStore($embedMode)
@@ -426,6 +428,24 @@ export function AppearanceSettings() {
             }
             description={a.uiScaleDesc(zoomPercent)}
             title={a.uiScaleTitle}
+          />
+
+          <ListRow
+            action={
+              <SegmentedControl
+                onChange={id => {
+                  triggerHaptic('selection')
+                  setTerminalNerdFontEnabled(id === 'on')
+                }}
+                options={[
+                  { id: 'off', label: t.common.off },
+                  { id: 'on', label: t.common.on }
+                ]}
+                value={terminalNerdFontEnabled ? 'on' : 'off'}
+              />
+            }
+            description={a.terminalNerdFontDesc}
+            title={a.terminalNerdFontTitle}
           />
 
           <ListRow

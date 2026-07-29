@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { FitAddon } from '@xterm/addon-fit'
 import { SerializeAddon } from '@xterm/addon-serialize'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
@@ -10,6 +11,7 @@ import type { CSSProperties } from 'react'
 import { writeClipboardText } from '@/components/ui/copy-button'
 import { triggerHaptic } from '@/lib/haptics'
 import { $previewTarget } from '@/store/preview'
+import { $terminalNerdFontEnabled, terminalFontFamily } from '@/store/terminal-font'
 import { useTheme } from '@/themes/context'
 
 import { $terminalInjection } from '../store'
@@ -383,6 +385,7 @@ export function useTerminalSession({
   reviveBuffer,
   onShell
 }: UseTerminalSessionOptions) {
+  const terminalNerdFontEnabled = useStore($terminalNerdFontEnabled)
   // Key off renderedMode (the painted surface type), not resolvedMode (the
   // clicked switch) — a skin can keep a light surface in "dark" mode, and we
   // must match the surface or the ANSI palette inverts against it. themeName
@@ -506,7 +509,7 @@ export function useTerminalSession({
       allowTransparency: false,
       convertEol: true,
       cursorBlink: true,
-      fontFamily: "'JetBrains Mono', 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace",
+      fontFamily: terminalFontFamily(terminalNerdFontEnabled),
       fontSize: 11,
       // VS Code's terminal renders 'normal'/'bold' (400/700); we were using Medium
       // (500) as the base, which reads a touch heavy at this size.
@@ -974,15 +977,18 @@ export function useTerminalSession({
     // CSS vars in a sibling effect that runs after this one, so reading now
     // would lag a mode behind. By the next frame the vars are current.
     const raf = requestAnimationFrame(() => {
+      term.options.fontFamily = terminalFontFamily(terminalNerdFontEnabled)
       term.options.theme = withSurface(activeTheme)
+      fitRef.current?.()
       // The WebGL renderer caches glyph colors in a texture atlas, so a
       // light/dark switch leaves already-drawn cells stale until the atlas is
       // cleared. No-op for the DOM fallback.
       webglRef.current?.clearTextureAtlas()
+      term.refresh(0, term.rows - 1)
     })
 
     return () => cancelAnimationFrame(raf)
-  }, [activeTheme, themeName])
+  }, [activeTheme, terminalNerdFontEnabled, themeName])
 
   // Expose this terminal's buffer to the agent's `read_terminal` tool, keyed by
   // id. The tab selection (setActiveTerminalId) decides which one it reads, so

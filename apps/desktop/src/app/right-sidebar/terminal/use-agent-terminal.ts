@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebLinksAddon } from '@xterm/addon-web-links'
@@ -7,6 +8,7 @@ import { useEffect, useRef } from 'react'
 
 import { writeClipboardText } from '@/components/ui/copy-button'
 import { triggerHaptic } from '@/lib/haptics'
+import { $terminalNerdFontEnabled, terminalFontFamily } from '@/store/terminal-font'
 import { useTheme } from '@/themes/context'
 
 import { registerAgentTerminalWriter } from './agent-terminal-stream'
@@ -19,6 +21,7 @@ import { isMacPlatform, resolveSurfaceColor, terminalTheme } from './selection'
 // the user terminal's look so the two read as one surface.
 export function useAgentTerminal({ active, id, procId }: { active: boolean; id: string; procId: string }) {
   const { renderedMode, theme, themeName } = useTheme()
+  const terminalNerdFontEnabled = useStore($terminalNerdFontEnabled)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
   const webglRef = useRef<WebglAddon | null>(null)
@@ -45,7 +48,7 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
       convertEol: true,
       cursorBlink: false,
       disableStdin: true,
-      fontFamily: "'JetBrains Mono', 'Cascadia Code', 'SF Mono', Menlo, Consolas, monospace",
+      fontFamily: terminalFontFamily(terminalNerdFontEnabled),
       fontSize: 11,
       fontWeight: 'normal',
       fontWeightBold: 'bold',
@@ -138,13 +141,16 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
     }
 
     const raf = requestAnimationFrame(() => {
+      term.options.fontFamily = terminalFontFamily(terminalNerdFontEnabled)
       term.options.theme = surfaceTheme()
+      fitRef.current?.()
       webglRef.current?.clearTextureAtlas()
+      term.refresh(0, term.rows - 1)
     })
 
     return () => cancelAnimationFrame(raf)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [renderedMode, themeName])
+  }, [renderedMode, terminalNerdFontEnabled, themeName])
 
   // A visibility:hidden xterm doesn't paint — refit + redraw on re-activation.
   useEffect(() => {
