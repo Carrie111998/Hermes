@@ -8197,7 +8197,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait({"session_id": sid}, rid)
     if err:
         return err
-    assert session is not None
+    if session is None:
+        return _error(rid, -32602, "session not found")
 
     return _ok(
         rid,
@@ -10307,7 +10308,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    assert session is not None
+    if session is None:
+        return _error(rid, -32602, "session not found")
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
         focus_topic = str(params.get("focus_topic", "") or "").strip()
