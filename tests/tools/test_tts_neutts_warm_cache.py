@@ -144,9 +144,11 @@ def test_neutts_subprocess_passes_custom_codec_repo(tmp_path, monkeypatch):
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
         return types.SimpleNamespace(returncode=0, stderr="")
 
     monkeypatch.setattr(tts_tool.subprocess, "run", fake_run)
+    monkeypatch.setattr(tts_tool, "windows_hide_flags", lambda: 0x08000000)
     monkeypatch.setattr(
         tts_tool,
         "_convert_neutts_wav",
@@ -163,6 +165,8 @@ def test_neutts_subprocess_passes_custom_codec_repo(tmp_path, monkeypatch):
     assert result == output_path
     codec_index = captured["cmd"].index("--codec-repo")
     assert captured["cmd"][codec_index + 1] == "custom/codec"
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["creationflags"] == 0x08000000
 
 
 def test_neutts_warm_cache_reuses_model_and_reference(tmp_path, monkeypatch):
@@ -222,6 +226,32 @@ def test_neutts_warm_cache_translates_cuda_for_backbone(tmp_path, monkeypatch):
     _reset_neutts_cache()
 
 
+def test_neutts_warm_cache_clears_after_conversion_failure(tmp_path, monkeypatch):
+    _reset_neutts_cache()
+    _install_fake_neutts(monkeypatch)
+    ref_audio, ref_text = _write_ref_files(tmp_path)
+    cfg = {
+        "neutts": {
+            "warm_cache": True,
+            "idle_unload_seconds": 60,
+            "ref_audio": str(ref_audio),
+            "ref_text": str(ref_text),
+        }
+    }
+
+    def fail_conversion(wav_path, output_path):
+        raise RuntimeError("synthetic conversion failure")
+
+    monkeypatch.setattr(tts_tool, "_convert_neutts_wav", fail_conversion)
+
+    with pytest.raises(RuntimeError, match="synthetic conversion failure"):
+        tts_tool._generate_neutts("hello", str(tmp_path / "out.mp3"), cfg)
+
+    assert not tts_tool._neutts_cache
+    assert tts_tool._neutts_idle_timer is None
+    assert not (tmp_path / "out.wav").exists()
+
+
 def test_neutts_warm_cache_key_changes_on_model(tmp_path, monkeypatch):
     _reset_neutts_cache()
     calls = _install_fake_neutts(monkeypatch)
@@ -241,6 +271,51 @@ def test_neutts_warm_cache_key_changes_on_model(tmp_path, monkeypatch):
     assert calls["encode"] == 2
     assert calls["infer"] == 2
     _reset_neutts_cache()
+
+
+def test_failed_cache_key_transition_releases_stale_model(tmp_path, monkeypatch):
+    _reset_neutts_cache()
+    _install_fake_neutts(monkeypatch)
+    ref_audio, ref_text = _write_ref_files(tmp_path)
+    base = {
+        "warm_cache": True,
+        "idle_unload_seconds": 60,
+        "ref_audio": str(ref_audio),
+        "ref_text": str(ref_text),
+        "device": "cpu",
+    }
+
+    tts_tool._generate_neutts(
+        "hello",
+        str(tmp_path / "first.wav"),
+        {"neutts": {**base, "model": "fake/first"}},
+    )
+    assert tts_tool._neutts_cache
+    assert tts_tool._neutts_idle_timer is not None
+
+    class FailingReplacementNeuTTS:
+        def __init__(self, **kwargs):
+            pass
+
+        def encode_reference(self, path):
+            raise RuntimeError("synthetic replacement failure")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "neutts",
+        types.SimpleNamespace(NeuTTS=FailingReplacementNeuTTS),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic replacement failure"):
+        tts_tool._generate_neutts(
+            "again",
+            str(tmp_path / "second.wav"),
+            {"neutts": {**base, "model": "fake/replacement"}},
+        )
+
+    assert not tts_tool._neutts_cache
+    assert tts_tool._neutts_idle_timer is None
+    assert not (tmp_path / "second.wav").exists()
 
 
 def test_neutts_idle_unload_clears_cache(tmp_path, monkeypatch):

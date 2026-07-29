@@ -2634,60 +2634,81 @@ def _clear_neutts_cache(reason: str = "manual") -> None:
     gc.collect()
 
 
+def _remove_neutts_partial_output(path: str) -> None:
+    """Best-effort cleanup for WAV files left by failed warm synthesis."""
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.debug("[NeuTTS] failed to remove partial output: %s", path, exc_info=True)
+
+
 def _generate_neutts_warm(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """Generate speech with a cached in-process NeuTTS model/reference."""
     neutts_config = (tts_config.get("neutts") or {}) if isinstance(tts_config, dict) else {}
     resolved = _neutts_resolved_config(tts_config)
     ref_audio = Path(resolved["ref_audio"])
     ref_text_path = Path(resolved["ref_text"])
-    if not ref_audio.exists():
-        raise RuntimeError(f"NeuTTS reference audio not found: {ref_audio}")
-    if not ref_text_path.exists():
-        raise RuntimeError(f"NeuTTS reference text not found: {ref_text_path}")
-
     key = _neutts_cache_key(resolved)
     wav_path = output_path if output_path.endswith(".wav") else str(Path(output_path).with_suffix(".wav"))
     Path(wav_path).parent.mkdir(parents=True, exist_ok=True)
 
     with _neutts_cache_lock:
-        entry = _neutts_cache.get(key)
-        if entry is None:
-            from neutts import NeuTTS
-            from tools.neutts_synth import resolve_neutts_devices
-
-            backbone_device, codec_device = resolve_neutts_devices(resolved["device"])
-            tts = NeuTTS(
-                backbone_repo=resolved["model"],
-                backbone_device=backbone_device,
-                codec_repo=resolved["codec_repo"],
-                codec_device=codec_device,
-            )
-            ref_codes = tts.encode_reference(str(ref_audio))
-            ref_text = ref_text_path.read_text(encoding="utf-8").strip()
-            entry = {
-                "tts": tts,
-                "ref_codes": ref_codes,
-                "ref_text": ref_text,
-                "loaded_at": time.monotonic(),
-                "last_used_at": time.monotonic(),
-                "resolved": resolved,
-            }
-            _neutts_cache.clear()
-            _neutts_cache[key] = entry
-            logger.info("[NeuTTS] warm cache loaded: model=%s device=%s", resolved["model"], resolved["device"])
-        else:
-            entry["last_used_at"] = time.monotonic()
-
         try:
+            entry = _neutts_cache.get(key)
+            if entry is None:
+                # A new configuration supersedes the old model immediately. If
+                # loading the replacement fails, retaining the stale ~500 MB
+                # model would violate the requested configuration and leak
+                # resources until the old idle timer fires.
+                if _neutts_cache or _neutts_idle_timer is not None:
+                    _clear_neutts_cache("config_changed")
+                if not ref_audio.exists():
+                    raise RuntimeError(f"NeuTTS reference audio not found: {ref_audio}")
+                if not ref_text_path.exists():
+                    raise RuntimeError(f"NeuTTS reference text not found: {ref_text_path}")
+
+                from neutts import NeuTTS
+                from tools.neutts_synth import resolve_neutts_devices
+
+                backbone_device, codec_device = resolve_neutts_devices(resolved["device"])
+                tts = NeuTTS(
+                    backbone_repo=resolved["model"],
+                    backbone_device=backbone_device,
+                    codec_repo=resolved["codec_repo"],
+                    codec_device=codec_device,
+                )
+                ref_codes = tts.encode_reference(str(ref_audio))
+                ref_text = ref_text_path.read_text(encoding="utf-8").strip()
+                entry = {
+                    "tts": tts,
+                    "ref_codes": ref_codes,
+                    "ref_text": ref_text,
+                    "loaded_at": time.monotonic(),
+                    "last_used_at": time.monotonic(),
+                    "resolved": resolved,
+                }
+                _neutts_cache[key] = entry
+                logger.info("[NeuTTS] warm cache loaded: model=%s device=%s", resolved["model"], resolved["device"])
+            else:
+                entry["last_used_at"] = time.monotonic()
+
             wav = entry["tts"].infer(text, entry["ref_codes"], entry["ref_text"])
             entry["last_used_at"] = time.monotonic()
             _write_neutts_wav(wav_path, wav, 24000)
+            _schedule_neutts_idle_unload(_neutts_idle_unload_seconds(neutts_config))
         except Exception:
             _clear_neutts_cache("synthesis_error")
+            _remove_neutts_partial_output(wav_path)
             raise
-        _schedule_neutts_idle_unload(_neutts_idle_unload_seconds(neutts_config))
 
-    return _convert_neutts_wav(wav_path, output_path)
+    try:
+        return _convert_neutts_wav(wav_path, output_path)
+    except Exception:
+        _clear_neutts_cache("conversion_error")
+        _remove_neutts_partial_output(wav_path)
+        raise
 
 
 def _generate_neutts_subprocess(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
@@ -2712,7 +2733,16 @@ def _generate_neutts_subprocess(text: str, output_path: str, tts_config: Dict[st
         "--device", resolved["device"],
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, stdin=subprocess.DEVNULL)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        stdin=subprocess.DEVNULL,
+        creationflags=windows_hide_flags(),
+    )
     if result.returncode != 0:
         stderr = result.stderr.strip()
         error_lines = [line for line in stderr.splitlines() if not line.startswith("OK:")]
