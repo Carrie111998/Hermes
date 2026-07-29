@@ -63,7 +63,7 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
 )
-from gateway.platforms.helpers import strip_markdown
+from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
 
 from .auth import load_project_credentials
 
@@ -184,9 +184,37 @@ _DEDUP_WINDOW_SECONDS = 48 * 3600
 
 _FFFC_WAIT_SECONDS = 15.0  # Timeout for waiting on an attachment after a U+FFFC placeholder.
 
-_SIDECAR_DIR = Path(__file__).parent / "sidecar"
-_NPM_ERROR_LOG = _SIDECAR_DIR / ".photon-npm-error.log"
+# Resolved lazily on first use: the installed plugin tree when writable (dev
+# installs), or a mirror on the durable data volume when the install tree
+# is immutable and the baked deps are missing/stale (hosted images, NS-606).
+# See sidecar_paths.resolve_sidecar_dir for the full decision table.
+#
+# Resolution is deliberately NOT done at import time: resolve_sidecar_dir()
+# probes the filesystem (touch/unlink) and may mirror files to the data
+# volume — side effects that must not fire just because something imported
+# this module (hermes status, test collection, plugin discovery).
+from .sidecar_paths import dir_writable as _dir_writable, resolve_sidecar_dir
+
+# Tests monkeypatch these module globals directly; the accessors below
+# honor a non-None value and only resolve/derive when unset.
+_SIDECAR_DIR: Optional[Path] = None
+_NPM_ERROR_LOG: Optional[Path] = None
 _NPM_ERROR_LOG_MAX_CHARS = 300
+
+
+def _sidecar_dir() -> Path:
+    """Sidecar runtime dir, resolved once on first use (never at import)."""
+    global _SIDECAR_DIR
+    if _SIDECAR_DIR is None:
+        _SIDECAR_DIR = resolve_sidecar_dir()
+    return _SIDECAR_DIR
+
+
+def _npm_error_log() -> Path:
+    """Path of the persisted npm-failure log (derived from the sidecar dir)."""
+    if _NPM_ERROR_LOG is not None:
+        return _NPM_ERROR_LOG
+    return _sidecar_dir() / ".photon-npm-error.log"
 
 # Cap on a self-heal `npm ci`/`npm install` of the sidecar deps. A cold
 # install of the pinned spectrum-ts tree normally takes well under a minute;
@@ -308,7 +336,45 @@ def sidecar_deps_installed() -> bool:
     _start_sidecar(), and `hermes photon status` so all three agree on
     what "installed" means.
     """
-    return (_SIDECAR_DIR / "node_modules" / "spectrum-ts").exists()
+    return (_sidecar_dir() / "node_modules" / "spectrum-ts").exists()
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _first_set(*values: Any) -> Any:
+    """Return the first value that is not None.
+
+    Unlike ``a or b``, this preserves an explicit falsy value (e.g. ``0`` or
+    ``""``) so config can intentionally set a zero/empty without it silently
+    falling through to a later source or a default.
+    """
+    for v in values:
+        if v is not None:
+            return v
+    return None
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """True when *exc* indicates the request timed out (call hung)."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    if HTTPX_AVAILABLE:
+        timeout_exc = getattr(httpx, "TimeoutException", None)
+        if timeout_exc is not None and isinstance(exc, timeout_exc):
+            return True
+    return "timeout" in type(exc).__name__.lower()
 
 
 def check_requirements() -> bool:
@@ -329,27 +395,37 @@ def check_requirements() -> bool:
         # prevents a false positive where an empty/broken node_modules/ dir
         # causes check_requirements() to return True while the sidecar crashes
         # at runtime with an unrelated-looking missing-module error.
+        #
+        # NS-606: if we can self-install at connect time — npm on PATH and
+        # the (resolved, possibly mirrored) sidecar dir is writable — report
+        # available so the gateway creates the adapter and ``_start_sidecar``
+        # cold-installs from the committed lockfile (on hosted images the
+        # user has no CLI to run `hermes photon setup`, so the connect path
+        # must self-heal). Otherwise keep returning False so
+        # `hermes setup` / status surface the missing-deps state.
+        if bool(shutil.which("npm")) and _dir_writable(_sidecar_dir()):
+            return True
         # DEBUG (not WARNING): this is the normal pre-setup state.
         # check_fn() is called from multiple hot paths in the core
         # (load_gateway_config, hermes status, GET /api/status polling) —
         # WARNING here would spam logs on every probe for unconfigured photon.
         npm_error = ""
         try:
-            if _NPM_ERROR_LOG.exists():
-                npm_error = _NPM_ERROR_LOG.read_text(encoding="utf-8").strip()[:_NPM_ERROR_LOG_MAX_CHARS]
+            if _npm_error_log().exists():
+                npm_error = _npm_error_log().read_text(encoding="utf-8").strip()[:_NPM_ERROR_LOG_MAX_CHARS]
         except OSError:
             pass
         if npm_error:
             logger.debug(
                 "photon: spectrum-ts not installed at %s "
                 "(last npm error: %s) — run: hermes photon setup",
-                _SIDECAR_DIR,
+                _sidecar_dir(),
                 npm_error,
             )
         else:
             logger.debug(
                 "photon: spectrum-ts not installed at %s — run: hermes photon setup",
-                _SIDECAR_DIR,
+                _sidecar_dir(),
             )
         return False
     return True
@@ -365,8 +441,8 @@ def _sidecar_deps_stale() -> bool:
     same signal ``npm ci`` uses. Returns False (do nothing) if either file is
     missing or unreadable, so a first-run or odd filesystem never blocks start.
     """
-    lockfile = _SIDECAR_DIR / "package-lock.json"
-    marker = _SIDECAR_DIR / "node_modules" / ".package-lock.json"
+    lockfile = _sidecar_dir() / "package-lock.json"
+    marker = _sidecar_dir() / "node_modules" / ".package-lock.json"
     try:
         return lockfile.stat().st_mtime > marker.stat().st_mtime
     except OSError:
@@ -393,7 +469,7 @@ def _reinstall_sidecar_deps() -> None:
     try:
         result = subprocess.run(  # noqa: S603
             [npm, "ci"],
-            cwd=str(_SIDECAR_DIR),
+            cwd=str(_sidecar_dir()),
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             check=False,
@@ -406,7 +482,7 @@ def _reinstall_sidecar_deps() -> None:
             )
             result = subprocess.run(  # noqa: S603
                 [npm, "install"],
-                cwd=str(_SIDECAR_DIR),
+                cwd=str(_sidecar_dir()),
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 check=False,
@@ -638,6 +714,48 @@ class PhotonAdapter(BasePlatformAdapter):
         ).lower() not in ("0", "false", "no")
         self._node_bin = os.getenv("PHOTON_NODE_BIN") or shutil.which("node") or "node"
 
+        # Presence watchdog. spectrum-ts only reconnects when its inbound
+        # iterator throws or ends; a half-open ("zombie") gRPC socket makes the
+        # iterator hang forever (no error, no end), so inbound silently dies
+        # until the sidecar is restarted. The sidecar owns primary zombie
+        # detection (stream-staleness + upstream probe -> degraded -> exit 75;
+        # surfaced here via /healthz in _monitor_sidecar_health). This adapter-
+        # side watchdog is a conservative second layer that only respawns the
+        # sidecar when the sidecar's own HTTP loop stops responding (probe
+        # HTTP call hangs) — an "inconclusive" probe (sidecar answered but
+        # could not prove upstream liveness) NEVER counts toward a respawn:
+        # the network may simply be down, and restarting cannot fix that.
+        # Thresholds are deliberately conservative (10 min interval) — shared
+        # lines can be legitimately quiet for hours, so we never restart on
+        # silence alone.
+        # Behavioural settings -> config.yaml (extra), bridged to env.
+        # Use _first_set (not ``or``) so an explicit 0 is honored — ``0 or X``
+        # would silently fall through to the default and you could never
+        # disable the watchdog with probe_interval_seconds: 0.
+        self._probe_interval = _coerce_float(
+            _first_set(
+                extra.get("probe_interval_seconds"),
+                os.getenv("PHOTON_PROBE_INTERVAL_SECONDS"),
+            ),
+            600.0,
+        )
+        self._probe_timeout = _coerce_float(
+            _first_set(
+                extra.get("probe_timeout_seconds"),
+                os.getenv("PHOTON_PROBE_TIMEOUT_SECONDS"),
+            ),
+            10.0,
+        )
+        self._probe_max_failures = _coerce_int(
+            _first_set(
+                extra.get("probe_max_failures"),
+                os.getenv("PHOTON_PROBE_MAX_FAILURES"),
+            ),
+            3,
+        )
+        # A non-positive interval disables the watchdog entirely (escape hatch).
+        self._probe_enabled = self._probe_interval > 0
+
         # With markdown on, format_message preserves fences and the sidecar's
         # markdown() builder renders them (or degrades them readably).
         self.supports_code_blocks = _markdown_enabled()
@@ -650,6 +768,15 @@ class PhotonAdapter(BasePlatformAdapter):
         self._inbound_running = False
         self._http_client: Optional["httpx.AsyncClient"] = None
         self._sidecar_health_interval = 15.0
+        # Presence-watchdog runtime state.
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._watchdog_running = False
+        self._probe_failures = 0
+        # Monotonic timestamp of the last real upstream activity (inbound
+        # message or a successful probe). The watchdog skips its own probe when
+        # natural traffic already proved the channel live within the interval.
+        self._last_upstream_activity = 0.0
+        self._respawn_lock: Optional[asyncio.Lock] = None
         # Lightweight in-memory dedup. The gRPC stream is at-least-once, so we
         # may see the same messageId more than once (e.g. after a reconnect).
         self._seen_messages: Dict[str, float] = {}
@@ -696,34 +823,12 @@ class PhotonAdapter(BasePlatformAdapter):
         Mirrors the BlueBubbles implementation so both iMessage channels
         accept the same configuration shapes.
         """
-        if raw is None:
-            patterns = list(_DEFAULT_MENTION_PATTERNS)
-        elif isinstance(raw, str):
-            text = raw.strip()
-            try:
-                loaded = json.loads(text) if text else []
-            except Exception:
-                loaded = None
-            patterns = loaded if isinstance(loaded, list) else [
-                part.strip()
-                for line in text.splitlines()
-                for part in line.split(",")
-            ]
-        elif isinstance(raw, list):
-            patterns = raw
-        else:
-            patterns = [raw]
-
-        compiled: "list[re.Pattern]" = []
-        for pattern in patterns:
-            text = str(pattern).strip()
-            if not text:
-                continue
-            try:
-                compiled.append(re.compile(text, re.IGNORECASE))
-            except re.error as exc:
-                logger.warning("[photon] Invalid mention pattern %r: %s", text, exc)
-        return compiled
+        return compile_mention_patterns(
+            raw,
+            log_prefix="photon",
+            defaults=_DEFAULT_MENTION_PATTERNS,
+            logger_=logger,
+        )
 
     def _message_matches_mention_patterns(self, text: str) -> bool:
         if not text or not self._mention_patterns:
@@ -796,6 +901,16 @@ class PhotonAdapter(BasePlatformAdapter):
             self._monitor_sidecar_health()
         )
 
+        # Start the presence watchdog (detects a half-open/zombie gRPC stream
+        # the SDK can't see and respawns the sidecar to recover inbound).
+        self._last_upstream_activity = time.monotonic()
+        if self._probe_enabled and self._autostart_sidecar:
+            self._respawn_lock = asyncio.Lock()
+            self._watchdog_running = True
+            self._watchdog_task = asyncio.get_event_loop().create_task(
+                self._presence_watchdog()
+            )
+
         self._mark_connected()
         logger.info(
             "[photon] connected — sidecar on %s:%d, streaming inbound over gRPC",
@@ -805,6 +920,9 @@ class PhotonAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._inbound_running = False
+        # Stop the watchdog first so it can't trigger a respawn while we tear
+        # the sidecar down.
+        await self._stop_watchdog()
         if self._sidecar_health_task is not None:
             task = self._sidecar_health_task
             self._sidecar_health_task = None
@@ -944,7 +1062,26 @@ class PhotonAdapter(BasePlatformAdapter):
                 continue
 
             stream = data.get("stream") if isinstance(data, dict) else None
-            if not isinstance(stream, dict) or stream.get("ok") is not False:
+            if not isinstance(stream, dict):
+                continue
+
+            # Surface the sidecar's zombie-stream staleness state early: a
+            # suspected half-open stream (silence past threshold + probe-proven
+            # connectivity) is worth a loud log line even before the sidecar's
+            # degraded->exit-75 path fires.
+            staleness = stream.get("staleness")
+            if (
+                isinstance(staleness, dict)
+                and staleness.get("zombieSuspected") is True
+            ):
+                logger.warning(
+                    "[photon] sidecar reports suspected zombie stream"
+                    " (silentForMs=%s, lastProbeOutcome=%s)",
+                    staleness.get("silentForMs"),
+                    staleness.get("lastProbeOutcome"),
+                )
+
+            if stream.get("ok") is not False:
                 continue
 
             state = str(stream.get("state") or "unknown")
@@ -965,6 +1102,12 @@ class PhotonAdapter(BasePlatformAdapter):
             break
 
     async def _on_inbound_line(self, line: str) -> None:
+        # Any line on the inbound stream — message OR heartbeat — proves the
+        # upstream gRPC channel is live, so reset the watchdog's failure count
+        # and activity clock. (Heartbeats arrive as blank lines, already
+        # filtered before this method, but a real message is the strongest
+        # liveness signal we have.)
+        self._note_upstream_activity()
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -1392,10 +1535,27 @@ class PhotonAdapter(BasePlatformAdapter):
 
     async def _start_sidecar(self) -> None:
         if not sidecar_deps_installed():
-            raise RuntimeError(
-                f"Photon sidecar deps not installed. Run: "
-                f"cd {_SIDECAR_DIR} && npm install   (or `hermes photon setup`)"
+            # Cold install (NS-606): on hosted/managed images the install
+            # tree is immutable and the user has no CLI to run
+            # `hermes photon setup`, so the connect path must be able to
+            # bootstrap the deps itself. _sidecar_dir() has already been
+            # resolved to a writable location (or mirrored to the data
+            # volume) by sidecar_paths.resolve_sidecar_dir; `npm ci` off
+            # the committed lockfile is deterministic and bounded by
+            # _NPM_REINSTALL_TIMEOUT. Uses sidecar_deps_installed() — not a
+            # bare node_modules/ existence check — so a partial/aborted npm
+            # install (empty node_modules/) also triggers the reinstall.
+            logger.info(
+                "[photon] sidecar deps not installed; installing into %s",
+                _sidecar_dir(),
             )
+            await asyncio.to_thread(_reinstall_sidecar_deps)
+            if not sidecar_deps_installed():
+                raise RuntimeError(
+                    f"Photon sidecar deps could not be installed into "
+                    f"{_sidecar_dir()} (see log for the npm error). "
+                    f"Run: cd {_sidecar_dir()} && npm ci   (or `hermes photon setup`)"
+                )
         # A `hermes update` that bumps the spectrum-ts pin rewrites
         # package-lock.json but never reinstalls node_modules, so the sidecar
         # spawns against stale deps and dies on every reconnect (the v8 patch
@@ -1437,8 +1597,8 @@ class PhotonAdapter(BasePlatformAdapter):
                 subprocess.run,  # noqa: S603
                 [
                     self._node_bin,
-                    str(_SIDECAR_DIR / "patch-spectrum-mixed-attachments.mjs"),
-                    str(_SIDECAR_DIR),
+                    str(_sidecar_dir() / "patch-spectrum-mixed-attachments.mjs"),
+                    str(_sidecar_dir()),
                 ],
                 capture_output=True,
                 text=True, encoding='utf-8', errors='replace',
@@ -1459,7 +1619,7 @@ class PhotonAdapter(BasePlatformAdapter):
             )
 
         self._sidecar_proc = subprocess.Popen(  # noqa: S603
-            [self._node_bin, str(_SIDECAR_DIR / "index.mjs")],
+            [self._node_bin, str(_sidecar_dir() / "index.mjs")],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1610,6 +1770,151 @@ class PhotonAdapter(BasePlatformAdapter):
                 if self._sidecar_supervisor_task is not current_task:
                     self._sidecar_supervisor_task.cancel()
                 self._sidecar_supervisor_task = None
+
+    # -- Presence watchdog -------------------------------------------------
+
+    def _note_upstream_activity(self) -> None:
+        """Record proof the upstream gRPC channel is live, and clear failures.
+
+        Called on every inbound line and after every successful probe.
+        """
+        self._last_upstream_activity = time.monotonic()
+        self._probe_failures = 0
+
+    async def _probe_once(self) -> str:
+        """Drive one liveness probe via the sidecar's ``/probe``.
+
+        Returns a strict tri-state verdict:
+
+        - ``"alive"``        — the sidecar completed a real upstream gRPC
+          round-trip (HTTP 200). Only this counts as proof of liveness.
+        - ``"hung"``         — the probe HTTP call itself timed out: the
+          sidecar's event loop is unresponsive. Counts toward respawn.
+        - ``"inconclusive"`` — anything else (503 from the sidecar's strict
+          probe, connection refused, transport error). NEVER counts as alive
+          and NEVER counts toward a respawn: a rejected upstream probe may
+          just mean the network is down, and a dead sidecar process is the
+          supervisor's job, not ours.
+        """
+        client = self._http_client
+        if client is None:
+            return "inconclusive"
+        url = f"http://{self._sidecar_bind}:{self._sidecar_port}/probe"
+        try:
+            resp = await client.post(
+                url,
+                headers={"X-Hermes-Sidecar-Token": self._sidecar_token},
+                timeout=self._probe_timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if _is_timeout_error(e):
+                logger.debug("[photon] probe HTTP call hung: %s", e)
+                return "hung"
+            logger.debug("[photon] probe transport error (inconclusive): %s", e)
+            return "inconclusive"
+        return "alive" if resp.status_code == 200 else "inconclusive"
+
+    async def _respawn_sidecar(self, reason: str) -> None:
+        """Tear down and restart the sidecar to recover a dead gRPC stream.
+
+        A fresh ``Spectrum()`` re-subscribes the inbound stream and
+        re-registers presence with Photon cloud. The inbound loop's existing
+        reconnect logic re-opens the loopback NDJSON stream automatically once
+        the new sidecar's ``/inbound`` is up. Guarded by a lock so overlapping
+        triggers (watchdog + a manual call) can't double-spawn.
+        """
+        lock = self._respawn_lock
+        if lock is None:
+            lock = self._respawn_lock = asyncio.Lock()
+        if lock.locked():
+            logger.info("[photon] respawn already in progress; skipping")
+            return
+        async with lock:
+            logger.warning(
+                "[photon] presence watchdog: %s — respawning sidecar", reason
+            )
+            try:
+                await self._stop_sidecar()
+            except Exception:
+                logger.exception("[photon] error stopping sidecar during respawn")
+            try:
+                await self._start_sidecar()
+            except Exception:
+                logger.exception(
+                    "[photon] failed to respawn sidecar; watchdog will retry"
+                )
+                return
+            # Fresh sidecar -> fresh stream. Reset the activity clock so we give
+            # it a full interval before probing again, and clear failures.
+            self._note_upstream_activity()
+            logger.info("[photon] presence watchdog: sidecar respawned, gRPC stream renewed")
+
+    async def _presence_watchdog(self) -> None:
+        """Periodically confirm the sidecar (and its stream) is responsive.
+
+        The sidecar owns primary zombie-stream detection (silence tracking +
+        upstream probe -> degraded /healthz -> exit 75). This loop is the
+        adapter's conservative second layer: it probes on a long interval,
+        skips the probe when natural inbound traffic already proved liveness,
+        and only counts a *hung* probe (the sidecar HTTP call itself timing
+        out) toward a respawn. Inconclusive probes — the sidecar answered but
+        couldn't prove upstream liveness — reset nothing and trigger nothing:
+        the network may just be down, and restarting can't fix that. After
+        ``_probe_max_failures`` consecutive hung probes we respawn the sidecar
+        to force a fresh stream.
+        """
+        # Stagger the first probe so a fleet of restarts doesn't synchronize,
+        # and so a freshly-started sidecar isn't probed before it's warm.
+        await asyncio.sleep(self._probe_interval)
+        while self._watchdog_running:
+            try:
+                # Skip our own probe if inbound traffic already proved the
+                # channel live within the last interval (cheaper, and avoids
+                # piling synthetic reads on a busy line).
+                idle = time.monotonic() - self._last_upstream_activity
+                if idle < self._probe_interval:
+                    await asyncio.sleep(self._probe_interval - idle)
+                    continue
+
+                verdict = await self._probe_once()
+                if verdict == "alive":
+                    self._note_upstream_activity()
+                elif verdict == "hung":
+                    # Only a hung sidecar HTTP loop counts toward respawn —
+                    # strict success-only-on-probe-OK semantics mean an
+                    # inconclusive probe is never evidence in either direction.
+                    self._probe_failures += 1
+                    logger.warning(
+                        "[photon] presence probe hung (%d/%d)",
+                        self._probe_failures, self._probe_max_failures,
+                    )
+                    if self._probe_failures >= self._probe_max_failures:
+                        await self._respawn_sidecar(
+                            f"{self._probe_failures} consecutive hung probes"
+                        )
+                else:
+                    logger.debug(
+                        "[photon] presence probe inconclusive; taking no action"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[photon] presence watchdog iteration failed")
+            await asyncio.sleep(self._probe_interval)
+
+    async def _stop_watchdog(self) -> None:
+        self._watchdog_running = False
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._watchdog_task = None
 
     # -- Outbound ----------------------------------------------------------
 
@@ -1990,27 +2295,13 @@ class PhotonAdapter(BasePlatformAdapter):
         if chat_id and message_id:
             await self._add_reaction(chat_id, message_id, "\U0001f440")
 
-    async def on_processing_complete(
-        self, event: MessageEvent, outcome: ProcessingOutcome
-    ) -> None:
-        """Swap the 👀 progress tapback for a 👍/👎 result.
-
-        Remove-then-add rather than a bare replace: deterministic whether the
-        platform replaces a sender's previous tapback or stacks them, and it
-        keeps the sidecar's reaction-handle slot coherent.
-        """
-        if not self._reactions_enabled():
-            return
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
-        if not chat_id or not message_id:
-            return
-        await self._remove_reaction(chat_id, message_id)
-        if outcome == ProcessingOutcome.SUCCESS:
-            await self._add_reaction(chat_id, message_id, "\U0001f44d")
-        elif outcome == ProcessingOutcome.FAILURE:
-            await self._add_reaction(chat_id, message_id, "\U0001f44e")
-        # CANCELLED: leave the message unreacted.
+    # Shared reaction-ack flow (base.on_processing_complete): swap the 👀
+    # progress tapback for a 👍/👎 result. Remove-then-add rather than a bare
+    # replace: deterministic whether the platform replaces a sender's previous
+    # tapback or stacks them, and it keeps the sidecar's reaction-handle slot
+    # coherent. CANCELLED: leave the message unreacted.
+    _OK_EMOJI = "\U0001f44d"
+    _FAIL_EMOJI = "\U0001f44e"
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return whatever we know about a Spectrum space id.

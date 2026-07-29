@@ -243,10 +243,13 @@ delegated work needs additional capabilities; canonical named profiles cannot be
 extended.
 
 Certain tools are blocked for subagents even when the parent has them:
-- `delegation` — blocked for leaf subagents (the default). Retained for `role="orchestrator"` children, bounded by `max_spawn_depth` — see [Depth Limit and Nested Orchestration](#depth-limit-and-nested-orchestration) below.
+- `delegate_task` — blocked for leaf subagents (the default). Retained for `role="orchestrator"` children, bounded by `max_spawn_depth` — see [Depth Limit and Nested Orchestration](#depth-limit-and-nested-orchestration) below.
 - `clarify` — subagents cannot interact with the user
 - `memory` — no writes to shared persistent memory
-- `code_execution` — children should reason step-by-step
+- `send_message` — no cross-platform side effects
+- `cronjob` — no scheduling more work in the parent's name
+
+Both roles retain `execute_code` (programmatic tool calling) so children can batch mechanical work.
 
 ## Max Iterations
 
