@@ -28,8 +28,10 @@ from hermes_cli.auth import (
 @pytest.fixture(autouse=True)
 def _clear_probe_cache():
     auth_mod._codex_quota_probe_cache.clear()
+    auth_mod._codex_quota_refresh_failure_cache.clear()
     yield
     auth_mod._codex_quota_probe_cache.clear()
+    auth_mod._codex_quota_refresh_failure_cache.clear()
 
 
 def _jwt(claims: dict) -> str:
@@ -187,7 +189,9 @@ def test_probe_sends_chatgpt_account_id_from_jwt(monkeypatch):
 
 def _write_auth_store(hermes_home, payload):
     hermes_home.mkdir(parents=True, exist_ok=True)
-    (hermes_home / "auth.json").write_text(json.dumps(payload, indent=2))
+    (hermes_home / "auth.json").write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
 
 
 def _exhausted_pool_store(now=None):
@@ -247,7 +251,7 @@ def test_clear_cooldowns_only_touches_quota_shaped_entries(tmp_path, monkeypatch
 
     assert clear_codex_pool_quota_cooldowns() == 1
 
-    store = json.loads((hermes_home / "auth.json").read_text())
+    store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     entries = {e["id"]: e for e in store["credential_pool"]["openai-codex"]}
     assert entries["cred-quota"]["last_status"] is None
     assert entries["cred-quota"]["last_error_reset_at"] is None
@@ -279,7 +283,7 @@ def test_clear_cooldowns_scoped_to_access_token(tmp_path, monkeypatch):
 
     assert clear_codex_pool_quota_cooldowns("tok-other") == 1
 
-    persisted = json.loads((hermes_home / "auth.json").read_text())
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     entries = {e["id"]: e for e in persisted["credential_pool"]["openai-codex"]}
     assert entries["cred-quota-2"]["last_status"] is None
     assert entries["cred-quota"]["last_status"] == "exhausted"
@@ -339,10 +343,64 @@ def test_resolver_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
     assert resolved["api_key"] == "tok-quota"
     assert resolved["source"] == "credential_pool"
 
-    store = json.loads((hermes_home / "auth.json").read_text())
+    store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     entry = store["credential_pool"]["openai-codex"][0]
     assert entry["last_status"] is None
     assert entry["last_error_reset_at"] is None
+
+
+def test_resolver_refreshes_expired_token_before_quota_reset_probe(
+    tmp_path, monkeypatch
+):
+    """A stale 429 cooldown must not become permanent when its probe token expires."""
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    fresh_token = _jwt({"exp": now + 3600})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    _write_auth_store(hermes_home, store)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        }
+
+    probe_tokens = []
+
+    def _probe(token, **kwargs):
+        probe_tokens.append(token)
+        return token == fresh_token
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _refresh)
+    monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", _probe)
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == fresh_token
+    assert resolved["source"] == "credential_pool"
+    assert refresh_calls == [(expired_token, "refresh-old")]
+    assert probe_tokens == [fresh_token]
+
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == fresh_token
+    assert persisted_entry["refresh_token"] == "refresh-new"
+    assert persisted_entry["last_status"] is None
+    assert persisted_entry["last_error_reset_at"] is None
 
 
 def test_resolver_keeps_cooldown_when_probe_negative(tmp_path, monkeypatch):
@@ -358,6 +416,60 @@ def test_resolver_keeps_cooldown_when_probe_negative(tmp_path, monkeypatch):
         resolve_codex_runtime_credentials()
     assert exc.value.code == auth_mod.CODEX_RATE_LIMITED_CODE
     assert "retry after" in str(exc.value)
+
+
+def test_resolver_keeps_cooldown_after_refresh_when_probe_negative(
+    tmp_path, monkeypatch
+):
+    """A fresh probe token is persisted, but refresh alone must not lift quota."""
+    now = time.time()
+    reset_at = now + 3 * 24 * 3600
+    expired_token = _jwt({"exp": now - 60})
+    fresh_token = _jwt({"exp": now + 3600})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+            "last_error_reset_at": reset_at,
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    _write_auth_store(hermes_home, store)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_codex_oauth_pure",
+        lambda *args, **kwargs: {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        },
+    )
+    probe_tokens = []
+
+    def _probe(token, **kwargs):
+        probe_tokens.append(token)
+        return False
+
+    monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", _probe)
+
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == auth_mod.CODEX_RATE_LIMITED_CODE
+    assert probe_tokens == [fresh_token]
+
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == fresh_token
+    assert persisted_entry["refresh_token"] == "refresh-new"
+    assert persisted_entry["last_status"] == "exhausted"
+    assert persisted_entry["last_error_code"] == 429
+    assert persisted_entry["last_error_reason"] == "usage_limit_reached"
+    assert persisted_entry["last_error_reset_at"] == reset_at
 
 
 def test_resolver_keeps_cooldown_when_probe_indeterminate(tmp_path, monkeypatch):
@@ -394,6 +506,1018 @@ def test_pool_entry_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
     assert len(available) == 1
     assert available[0].last_status == "ok"
     assert available[0].last_error_reset_at is None
+
+
+def test_pool_refreshes_expired_token_before_quota_reset_probe(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    fresh_token = _jwt({"exp": now + 3600})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        }
+
+    probe_tokens = []
+
+    def _probe(token, **kwargs):
+        probe_tokens.append(token)
+        return token == fresh_token
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _refresh)
+    monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", _probe)
+
+    available = pool._available_entries(clear_expired=True, refresh=True)
+
+    assert len(available) == 1
+    assert available[0].access_token == fresh_token
+    assert available[0].refresh_token == "refresh-new"
+    assert available[0].last_status == "ok"
+    assert refresh_calls == [(expired_token, "refresh-old")]
+    assert probe_tokens == [fresh_token]
+
+
+@pytest.mark.parametrize("probe_restored", [False, True])
+def test_device_code_probe_refresh_syncs_pool_and_singleton_with_probe_owned_cooldown(
+    tmp_path, monkeypatch, probe_restored
+):
+    now = time.time()
+    reset_at = now + 3 * 24 * 3600
+    expired_token = _jwt({"exp": now - 60})
+    fresh_token = _jwt({"exp": now + 3600})
+    store = _pool_only_rate_limited_store(now)
+    store["providers"]["openai-codex"] = {
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+        },
+        "last_refresh": "2026-07-27T07:00:00Z",
+    }
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+            "last_refresh": "2026-07-27T07:00:00Z",
+            "last_error_reset_at": reset_at,
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_codex_oauth_pure",
+        lambda *args, **kwargs: {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_probe_codex_quota_restored",
+        lambda token, **kwargs: probe_restored,
+    )
+
+    available = pool._available_entries(clear_expired=True, refresh=False)
+
+    assert [item.access_token for item in available] == (
+        [fresh_token] if probe_restored else []
+    )
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    singleton = persisted["providers"]["openai-codex"]
+    assert persisted_entry["access_token"] == fresh_token
+    assert persisted_entry["refresh_token"] == "refresh-new"
+    assert persisted_entry["last_refresh"] == "2026-07-27T08:00:00Z"
+    assert singleton["tokens"]["access_token"] == fresh_token
+    assert singleton["tokens"]["refresh_token"] == "refresh-new"
+    assert singleton["last_refresh"] == "2026-07-27T08:00:00Z"
+    if probe_restored:
+        assert persisted_entry["last_status"] is None
+        assert persisted_entry["last_error_reset_at"] is None
+    else:
+        assert persisted_entry["last_status"] == "exhausted"
+        assert persisted_entry["last_error_code"] == 429
+        assert persisted_entry["last_error_reset_at"] == reset_at
+
+
+def test_pool_quota_refresh_rereads_latest_canonical_chain_under_lock(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    old_expired_token = _jwt({"exp": now - 120, "jti": "old"})
+    latest_expired_token = _jwt({"exp": now - 60, "jti": "latest"})
+    fresh_token = _jwt({"exp": now + 3600, "jti": "fresh"})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "device_code",
+            "access_token": old_expired_token,
+            "refresh_token": "refresh-old",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    store["providers"]["openai-codex"] = {
+        "auth_mode": "chatgpt",
+        "label": entry["label"],
+        "tokens": {
+            "access_token": old_expired_token,
+            "refresh_token": "refresh-old",
+        },
+        "last_refresh": "2026-07-27T07:00:00Z",
+    }
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    def _reauth_after_preliminary_sync(item):
+        latest = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+        singleton = latest["providers"]["openai-codex"]
+        singleton["tokens"] = {
+            "access_token": latest_expired_token,
+            "refresh_token": "refresh-latest",
+        }
+        singleton["last_refresh"] = "2026-07-27T08:00:00Z"
+        (hermes_home / "auth.json").write_text(
+            json.dumps(latest), encoding="utf-8"
+        )
+        return item
+
+    monkeypatch.setattr(
+        pool, "_sync_codex_entry_from_auth_store", _reauth_after_preliminary_sync
+    )
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-fresh",
+            "last_refresh": "2026-07-27T09:00:00Z",
+        }
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _refresh)
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", lambda token, **kwargs: False
+    )
+
+    assert pool._available_entries(clear_expired=True, refresh=False) == []
+    assert refresh_calls == [(latest_expired_token, "refresh-latest")]
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == fresh_token
+    assert persisted_entry["refresh_token"] == "refresh-fresh"
+    assert persisted["providers"]["openai-codex"]["tokens"] == {
+        "access_token": fresh_token,
+        "refresh_token": "refresh-fresh",
+    }
+
+
+def test_pool_singleton_rotation_preserves_quota_cooldown_until_positive_probe(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    old_expired_token = _jwt({"exp": now - 60, "jti": "old"})
+    rotated_token = _jwt({"exp": now + 3600, "jti": "rotated"})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "device_code",
+            "access_token": old_expired_token,
+            "refresh_token": "refresh-old",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    store["providers"]["openai-codex"] = {
+        "auth_mode": "chatgpt",
+        "label": entry["label"],
+        "tokens": {
+            "access_token": old_expired_token,
+            "refresh_token": "refresh-old",
+        },
+        "last_refresh": "2026-07-27T07:00:00Z",
+    }
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    rotated_store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    rotated_singleton = rotated_store["providers"]["openai-codex"]
+    rotated_singleton["tokens"] = {
+        "access_token": rotated_token,
+        "refresh_token": "refresh-rotated",
+    }
+    rotated_singleton["last_refresh"] = "2026-07-27T08:00:00Z"
+    (hermes_home / "auth.json").write_text(
+        json.dumps(rotated_store), encoding="utf-8"
+    )
+    probe_tokens = []
+
+    def _probe(token, **kwargs):
+        probe_tokens.append(token)
+        return False
+
+    monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", _probe)
+
+    assert pool._available_entries(clear_expired=True, refresh=False) == []
+    assert probe_tokens == [rotated_token]
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == rotated_token
+    assert persisted_entry["refresh_token"] == "refresh-rotated"
+    assert persisted_entry["last_status"] == "exhausted"
+    assert persisted_entry["last_error_code"] == 429
+
+
+def test_pool_probe_does_not_overwrite_concurrent_reauthentication(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    probe_token = _jwt({"exp": now + 3600, "jti": "probe"})
+    newer_token = _jwt({"exp": now + 7200, "jti": "reauth"})
+    store = _pool_only_rate_limited_store(now)
+    store["providers"]["openai-codex"] = {
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+        },
+        "last_refresh": "2026-07-27T07:00:00Z",
+    }
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_codex_oauth_pure",
+        lambda *args, **kwargs: {
+            "access_token": probe_token,
+            "refresh_token": "refresh-probe",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        },
+    )
+
+    def _probe_with_concurrent_reauth(token, **kwargs):
+        assert token == probe_token
+        auth_mod._save_codex_tokens(
+            {
+                "access_token": newer_token,
+                "refresh_token": "refresh-newer",
+            },
+            last_refresh="2026-07-27T09:00:00Z",
+        )
+        return True
+
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", _probe_with_concurrent_reauth
+    )
+
+    available = pool._available_entries(clear_expired=True, refresh=False)
+
+    assert [item.access_token for item in available] == [newer_token]
+    assert available[0].refresh_token == "refresh-newer"
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    singleton = persisted["providers"]["openai-codex"]
+    assert persisted_entry["access_token"] == newer_token
+    assert persisted_entry["refresh_token"] == "refresh-newer"
+    assert singleton["tokens"]["access_token"] == newer_token
+    assert singleton["tokens"]["refresh_token"] == "refresh-newer"
+
+
+def test_pool_final_persist_does_not_rollback_reauth_after_owner_clear(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60, "jti": "expired"})
+    probe_token = _jwt({"exp": now + 3600, "jti": "probe"})
+    newer_token = _jwt({"exp": now + 7200, "jti": "reauth-after-clear"})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    store["providers"]["openai-codex"] = {
+        "auth_mode": "chatgpt",
+        "label": entry["label"],
+        "tokens": {
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+        },
+        "last_refresh": "2026-07-27T07:00:00Z",
+    }
+    store["credential_pool"]["openai-codex"].append(
+        {
+            "id": "cred-expired-window",
+            "label": "other-account",
+            "auth_type": "oauth",
+            "priority": 1,
+            "source": "manual:device_code",
+            "access_token": _jwt({"exp": now + 3600, "jti": "other"}),
+            "refresh_token": "refresh-other",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "last_status": "exhausted",
+            "last_status_at": now - 120,
+            "last_error_code": 429,
+            "last_error_reason": "usage_limit_reached",
+            "last_error_reset_at": now - 60,
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_codex_oauth_pure",
+        lambda *args, **kwargs: {
+            "access_token": probe_token,
+            "refresh_token": "refresh-probe",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", lambda token, **kwargs: True
+    )
+    real_clear = auth_mod.clear_codex_pool_quota_cooldowns
+
+    def _clear_then_reauth(*args, **kwargs):
+        cleared = real_clear(*args, **kwargs)
+        auth_mod._save_codex_tokens(
+            {
+                "access_token": newer_token,
+                "refresh_token": "refresh-newer",
+            },
+            last_refresh="2026-07-27T09:00:00Z",
+        )
+        return cleared
+
+    monkeypatch.setattr(
+        auth_mod, "clear_codex_pool_quota_cooldowns", _clear_then_reauth
+    )
+
+    pool._available_entries(clear_expired=True, refresh=False)
+
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = next(
+        item
+        for item in persisted["credential_pool"]["openai-codex"]
+        if item["id"] == "cred-quota"
+    )
+    singleton = persisted["providers"]["openai-codex"]
+    assert persisted_entry["access_token"] == newer_token
+    assert persisted_entry["refresh_token"] == "refresh-newer"
+    assert persisted_entry["last_refresh"] == "2026-07-27T09:00:00Z"
+    assert singleton["tokens"]["access_token"] == newer_token
+    assert singleton["tokens"]["refresh_token"] == "refresh-newer"
+
+
+def test_stale_pool_write_preserves_newer_manual_device_code_chain(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    stale_token = _jwt({"exp": now + 1800, "jti": "stale-manual"})
+    newer_token = _jwt({"exp": now + 3600, "jti": "newer-manual"})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": stale_token,
+            "refresh_token": "refresh-stale-manual",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+    stale_snapshot = dict(entry)
+
+    newer_store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    newer_entry = newer_store["credential_pool"]["openai-codex"][0]
+    newer_entry.update(
+        {
+            "access_token": newer_token,
+            "refresh_token": "refresh-newer-manual",
+            "last_refresh": "2026-07-27T09:00:00Z",
+        }
+    )
+    _write_auth_store(hermes_home, newer_store)
+
+    auth_mod.write_credential_pool("openai-codex", [stale_snapshot])
+
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == newer_token
+    assert persisted_entry["refresh_token"] == "refresh-newer-manual"
+    assert persisted_entry["last_refresh"] == "2026-07-27T09:00:00Z"
+
+
+def test_stale_pool_write_does_not_refreeze_newer_reauthentication(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    stale_token = _jwt({"exp": now + 1800, "jti": "stale-reauth"})
+    newer_token = _jwt({"exp": now + 3600, "jti": "newer-reauth"})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "device_code",
+            "access_token": stale_token,
+            "refresh_token": "refresh-stale-reauth",
+            "last_refresh": "2026-07-27T07:00:00Z",
+            "last_status": "exhausted",
+            "last_status_at": now - 60,
+            "last_error_code": 429,
+            "last_error_reason": "usage_limit_reached",
+            "last_error_reset_at": now + 3600,
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+    stale_snapshot = dict(entry)
+
+    newer_store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    newer_entry = newer_store["credential_pool"]["openai-codex"][0]
+    newer_entry.update(
+        {
+            "access_token": newer_token,
+            "refresh_token": "refresh-newer-reauth",
+            "last_refresh": "2026-07-27T09:00:00Z",
+        }
+    )
+    for status_field in auth_mod._POOL_STATUS_FIELDS:
+        newer_entry[status_field] = None
+    _write_auth_store(hermes_home, newer_store)
+
+    auth_mod.write_credential_pool("openai-codex", [stale_snapshot])
+
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == newer_token
+    assert persisted_entry["refresh_token"] == "refresh-newer-reauth"
+    assert persisted_entry["last_refresh"] == "2026-07-27T09:00:00Z"
+    assert persisted_entry["last_status"] is None
+    assert persisted_entry["last_status_at"] is None
+    assert persisted_entry["last_error_code"] is None
+    assert persisted_entry["last_error_reason"] is None
+    assert persisted_entry["last_error_reset_at"] is None
+
+
+def test_resolver_surfaces_terminal_probe_refresh_failure(tmp_path, monkeypatch):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-dead",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    def _terminal_refresh(*args, **kwargs):
+        raise AuthError(
+            "refresh grant is no longer valid",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _terminal_refresh)
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", lambda token, **kwargs: False
+    )
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_codex_runtime_credentials()
+
+    assert exc_info.value.code == "invalid_grant"
+    assert exc_info.value.relogin_required is True
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    persisted_entry = persisted["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["last_status"] == "dead"
+    assert persisted_entry["last_error_code"] == 401
+    assert persisted_entry["last_error_reason"] == "invalid_grant"
+    assert persisted_entry["last_error_reset_at"] is None
+
+    with pytest.raises(AuthError) as retry_info:
+        auth_mod.resolve_codex_runtime_credentials()
+    assert retry_info.value.relogin_required is True
+
+
+def test_pool_adopts_terminal_probe_refresh_failure_as_dead(tmp_path, monkeypatch):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-dead",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    store["providers"]["openai-codex"] = {
+        "auth_mode": "chatgpt",
+        "label": entry["label"],
+        "tokens": {
+            "access_token": expired_token,
+            "refresh_token": "refresh-dead",
+        },
+        "last_refresh": entry["last_refresh"],
+    }
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+
+    def _terminal_refresh(*args, **kwargs):
+        raise AuthError(
+            "refresh grant is no longer valid",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _terminal_refresh)
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", lambda token, **kwargs: False
+    )
+
+    assert pool._available_entries(clear_expired=True, refresh=False) == []
+    adopted = pool.entries()[0]
+    assert adopted.last_status == "dead"
+    assert adopted.last_error_code == 401
+    assert adopted.last_error_reason == "invalid_grant"
+    assert adopted.last_error_reset_at is None
+    persisted = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    singleton = persisted["providers"]["openai-codex"]
+    assert "access_token" not in singleton["tokens"]
+    assert "refresh_token" not in singleton["tokens"]
+    assert singleton["last_auth_error"]["code"] == "invalid_grant"
+    assert singleton["last_auth_error"]["relogin_required"] is True
+
+
+def test_pool_throttles_repeated_quota_probe_refresh_failures(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        raise RuntimeError("temporary token endpoint failure")
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _refresh)
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", lambda token, **kwargs: False
+    )
+
+    assert pool._available_entries(clear_expired=True, refresh=False) == []
+    assert pool._available_entries(clear_expired=True, refresh=False) == []
+    # Simulate another process persisting a stale whole-pool snapshot that was
+    # loaded before the failure marker existed.
+    auth_mod.write_credential_pool("openai-codex", [dict(entry)])
+    # A second process has a fresh module-local cache but reads the same
+    # persisted auth-store row. The failure throttle must survive that boundary.
+    getattr(auth_mod, "_codex_quota_refresh_failure_cache").clear()
+    reloaded_pool = load_pool("openai-codex")
+    assert reloaded_pool._available_entries(clear_expired=True, refresh=False) == []
+    assert refresh_calls == [(expired_token, "refresh-old")]
+
+    rotated_store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
+    rotated_entry = rotated_store["credential_pool"]["openai-codex"][0]
+    rotated_entry["refresh_token"] = "refresh-new-chain"
+    (hermes_home / "auth.json").write_text(
+        json.dumps(rotated_store), encoding="utf-8"
+    )
+    getattr(auth_mod, "_codex_quota_refresh_failure_cache").clear()
+    rotated_pool = load_pool("openai-codex")
+    assert rotated_pool._available_entries(clear_expired=True, refresh=False) == []
+    assert refresh_calls == [
+        (expired_token, "refresh-old"),
+        (expired_token, "refresh-new-chain"),
+    ]
+
+
+def test_profile_load_keeps_canonical_global_codex_fallback_read_only(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    global_path = tmp_path / "root" / "auth.json"
+    profile_store = {"version": 1, "providers": {}, "credential_pool": {}}
+    global_store = _pool_only_rate_limited_store(now)
+    global_entry = global_store["credential_pool"]["openai-codex"][0]
+    global_entry.update(
+        {
+            "source": "device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-global-old",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    global_store["providers"]["openai-codex"] = {
+        "auth_mode": "chatgpt",
+        "label": global_entry["label"],
+        "tokens": {
+            "access_token": expired_token,
+            "refresh_token": "refresh-global-old",
+        },
+        "last_refresh": "2026-07-27T07:00:00Z",
+    }
+    _write_auth_store(profile_path.parent, profile_store)
+    _write_auth_store(global_path.parent, global_store)
+    monkeypatch.setattr(auth_mod, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    from agent.credential_pool import load_pool
+
+    loaded = load_pool("openai-codex")
+
+    assert [entry.id for entry in loaded.entries()] == ["cred-quota"]
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert not profile_after["credential_pool"].get("openai-codex")
+    assert "openai-codex" not in profile_after["providers"]
+
+    rotated_token = _jwt({"exp": now + 3600, "jti": "rotated-global"})
+    rotated_global = json.loads(global_path.read_text(encoding="utf-8"))
+    singleton = rotated_global["providers"]["openai-codex"]
+    singleton["tokens"] = {
+        "access_token": rotated_token,
+        "refresh_token": "refresh-global-rotated",
+    }
+    singleton["last_refresh"] = "2026-07-27T08:00:00Z"
+    global_path.write_text(json.dumps(rotated_global), encoding="utf-8")
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", lambda token, **kwargs: False
+    )
+
+    assert loaded._available_entries(clear_expired=True, refresh=False) == []
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert not profile_after["credential_pool"].get("openai-codex")
+    global_after = json.loads(global_path.read_text(encoding="utf-8"))
+    global_entry = global_after["credential_pool"]["openai-codex"][0]
+    assert global_entry["access_token"] == rotated_token
+    assert global_entry["refresh_token"] == "refresh-global-rotated"
+    assert global_entry["last_status"] == "exhausted"
+
+    local_token = _jwt({"exp": now + 7200, "jti": "local-login"})
+    local_store = json.loads(profile_path.read_text(encoding="utf-8"))
+    local_store["providers"]["openai-codex"] = {
+        "auth_mode": "chatgpt",
+        "label": "local-login",
+        "tokens": {
+            "access_token": local_token,
+            "refresh_token": "refresh-local",
+        },
+        "last_refresh": "2026-07-27T09:00:00Z",
+    }
+    profile_path.write_text(json.dumps(local_store), encoding="utf-8")
+
+    available = loaded._available_entries(clear_expired=True, refresh=False)
+    assert [item.access_token for item in available] == [local_token]
+    global_after_local_login = json.loads(global_path.read_text(encoding="utf-8"))
+    unchanged_global = global_after_local_login["credential_pool"]["openai-codex"][0]
+    assert unchanged_global["access_token"] == rotated_token
+    assert unchanged_global["last_status"] == "exhausted"
+
+
+def test_profile_local_reauth_does_not_inherit_global_fallback_cooldown(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    global_token = _jwt({"exp": now + 3600, "jti": "global-old"})
+    local_token = _jwt({"exp": now + 3600, "jti": "profile-login"})
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    global_path = tmp_path / "root" / "auth.json"
+    global_store = _pool_only_rate_limited_store(now)
+    global_entry = global_store["credential_pool"]["openai-codex"][0]
+    global_entry.update(
+        {
+            "source": "device_code",
+            "access_token": global_token,
+            "refresh_token": "refresh-global-old",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    global_store["providers"]["openai-codex"] = {
+        "auth_mode": "chatgpt",
+        "label": global_entry["label"],
+        "tokens": {
+            "access_token": global_token,
+            "refresh_token": "refresh-global-old",
+        },
+        "last_refresh": "2026-07-27T07:00:00Z",
+    }
+    profile_store = {
+        "version": 1,
+        "providers": {
+            "openai-codex": {
+                "auth_mode": "chatgpt",
+                "label": "profile-login",
+                "tokens": {
+                    "access_token": local_token,
+                    "refresh_token": "refresh-profile-new",
+                },
+                "last_refresh": "2026-07-27T09:00:00Z",
+            }
+        },
+        "credential_pool": {},
+    }
+    _write_auth_store(profile_path.parent, profile_store)
+    _write_auth_store(global_path.parent, global_store)
+    monkeypatch.setattr(auth_mod, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    available = pool._available_entries(clear_expired=True, refresh=False)
+
+    assert [item.access_token for item in available] == [local_token]
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
+    local_entry = profile_after["credential_pool"]["openai-codex"][0]
+    assert local_entry["access_token"] == local_token
+    assert local_entry["refresh_token"] == "refresh-profile-new"
+    assert local_entry["last_status"] is None
+    global_after = json.loads(global_path.read_text(encoding="utf-8"))
+    persisted_global = global_after["credential_pool"]["openai-codex"][0]
+    assert persisted_global["access_token"] == global_token
+    assert persisted_global["last_status"] == "exhausted"
+
+
+@pytest.mark.parametrize("probe_restored", [False, True])
+@pytest.mark.parametrize("source", ["manual:device_code", "device_code"])
+def test_profile_quota_probe_refreshes_global_fallback_owner(
+    tmp_path, monkeypatch, probe_restored, source
+):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    fresh_token = _jwt({"exp": now + 3600})
+    reset_at = now + 3 * 24 * 3600
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    global_path = tmp_path / "root" / "auth.json"
+
+    profile_store = {"version": 1, "providers": {}, "credential_pool": {}}
+    global_store = _pool_only_rate_limited_store(now)
+    global_entry = global_store["credential_pool"]["openai-codex"][0]
+    global_entry.update(
+        {
+            "source": source,
+            "access_token": expired_token,
+            "refresh_token": "refresh-global-old",
+            "last_refresh": "2026-07-27T07:00:00Z",
+            "last_error_reset_at": reset_at,
+        }
+    )
+    if source == "device_code":
+        global_store["providers"]["openai-codex"] = {
+            "auth_mode": "chatgpt",
+            "label": global_entry["label"],
+            "tokens": {
+                "access_token": expired_token,
+                "refresh_token": "refresh-global-old",
+            },
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    _write_auth_store(profile_path.parent, profile_store)
+    _write_auth_store(global_path.parent, global_store)
+
+    monkeypatch.setattr(auth_mod, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-global-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        }
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _refresh)
+    monkeypatch.setattr(
+        auth_mod,
+        "_probe_codex_quota_restored",
+        lambda token, **kwargs: probe_restored,
+    )
+
+    available = pool._available_entries(clear_expired=True, refresh=False)
+    assert [item.access_token for item in available] == (
+        [fresh_token] if probe_restored else []
+    )
+    assert refresh_calls == [(expired_token, "refresh-global-old")]
+
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
+    global_after = json.loads(global_path.read_text(encoding="utf-8"))
+    assert not profile_after["credential_pool"].get("openai-codex")
+    assert "openai-codex" not in profile_after["providers"]
+    persisted_entry = global_after["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == fresh_token
+    assert persisted_entry["refresh_token"] == "refresh-global-new"
+    if probe_restored:
+        assert persisted_entry["last_status"] is None
+        assert persisted_entry["last_error_reset_at"] is None
+    else:
+        assert persisted_entry["last_status"] == "exhausted"
+        assert persisted_entry["last_error_reset_at"] == reset_at
+    if source == "device_code":
+        singleton = global_after["providers"]["openai-codex"]
+        assert singleton["tokens"]["access_token"] == fresh_token
+        assert singleton["tokens"]["refresh_token"] == "refresh-global-new"
+        assert singleton["last_refresh"] == "2026-07-27T08:00:00Z"
+
+
+def test_resolver_refreshes_global_fallback_owner(tmp_path, monkeypatch):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    fresh_token = _jwt({"exp": now + 3600})
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    global_path = tmp_path / "root" / "auth.json"
+    profile_store = {"version": 1, "providers": {}, "credential_pool": {}}
+    global_store = _pool_only_rate_limited_store(now)
+    global_entry = global_store["credential_pool"]["openai-codex"][0]
+    global_entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-global-old",
+        }
+    )
+    _write_auth_store(profile_path.parent, profile_store)
+    _write_auth_store(global_path.parent, global_store)
+    monkeypatch.setattr(auth_mod, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token, **kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": fresh_token,
+            "refresh_token": "refresh-global-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        }
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _refresh)
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", lambda token, **kwargs: True
+    )
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == fresh_token
+    assert resolved["source"] == "credential_pool"
+    assert refresh_calls == [(expired_token, "refresh-global-old")]
+    profile_after = json.loads(profile_path.read_text(encoding="utf-8"))
+    global_after = json.loads(global_path.read_text(encoding="utf-8"))
+    assert not profile_after["credential_pool"].get("openai-codex")
+    persisted_entry = global_after["credential_pool"]["openai-codex"][0]
+    assert persisted_entry["access_token"] == fresh_token
+    assert persisted_entry["refresh_token"] == "refresh-global-new"
+    assert persisted_entry["last_status"] is None
+    assert persisted_entry["last_error_reset_at"] is None
+
+
+def test_pool_adopts_rotated_refresh_metadata_when_probe_access_is_unchanged(
+    tmp_path, monkeypatch
+):
+    now = time.time()
+    expired_token = _jwt({"exp": now - 60})
+    store = _pool_only_rate_limited_store(now)
+    entry = store["credential_pool"]["openai-codex"][0]
+    entry.update(
+        {
+            "source": "manual:device_code",
+            "access_token": expired_token,
+            "refresh_token": "refresh-old",
+            "last_refresh": "2026-07-27T07:00:00Z",
+        }
+    )
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_auth_store(hermes_home, store)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_codex_oauth_pure",
+        lambda *args, **kwargs: {
+            "access_token": expired_token,
+            "refresh_token": "refresh-new",
+            "last_refresh": "2026-07-27T08:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        auth_mod, "_probe_codex_quota_restored", lambda token, **kwargs: False
+    )
+
+    assert pool._available_entries(clear_expired=True, refresh=False) == []
+
+    adopted = pool.entries()[0]
+    assert adopted.access_token == expired_token
+    assert adopted.refresh_token == "refresh-new"
+    assert adopted.last_refresh == "2026-07-27T08:00:00Z"
 
 
 def test_pool_entry_stays_frozen_when_probe_negative(tmp_path, monkeypatch):
@@ -502,7 +1626,7 @@ def test_redeem_reset_clears_pool_cooldowns(tmp_path, monkeypatch):
     )
     assert result.redeemed
 
-    store = json.loads((hermes_home / "auth.json").read_text())
+    store = json.loads((hermes_home / "auth.json").read_text(encoding="utf-8"))
     entry = store["credential_pool"]["openai-codex"][0]
     assert entry["last_status"] is None
     assert entry["last_error_reset_at"] is None
