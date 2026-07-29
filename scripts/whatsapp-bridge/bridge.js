@@ -19,7 +19,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, DEFAULT_CONNECTION_CONFIG, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -34,6 +34,8 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import { createInboxReceiptBuffer, createInboxSweepController } from './inbox_sweep.js';
+import { createBaileysVersionResolver } from './baileys_version.js';
+import { createReconnectScheduler } from './reconnect_scheduler.js';
 import {
   buildPollPayload,
   buildLocationPayload,
@@ -275,6 +277,12 @@ function buildLidMap() {
 let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
+const resolveBaileysVersion = createBaileysVersionResolver({
+  fetchVersion: fetchLatestBaileysVersion,
+  fallbackVersion: DEFAULT_CONNECTION_CONFIG.version,
+  timeoutMs: 5_000,
+  onFallback: (reason) => logger.warn({ reason }, 'Using bundled Baileys version fallback'),
+});
 
 // Message queue for polling
 const messageQueue = [];
@@ -417,6 +425,10 @@ function rememberSentId(id) {
 
 let sock = null;
 let connectionState = 'disconnected';
+const reconnectScheduler = createReconnectScheduler({
+  start: startSocket,
+  onError: (err) => logger.error({ err }, 'WhatsApp socket start failed; retrying'),
+});
 
 if (INBOX_SWEEP_ENABLED) {
   if (!Number.isSafeInteger(INBOX_SWEEP_INTERVAL_MS) || INBOX_SWEEP_INTERVAL_MS <= INBOX_SWEEP_WINDOW_MS) {
@@ -431,7 +443,7 @@ if (INBOX_SWEEP_ENABLED) {
         sock.end(new Boom('Inbox sweep window complete', { statusCode: 428 }));
       }
     },
-    reconnect: () => { startSocket(); },
+    reconnect: () => { reconnectScheduler.schedule(0); },
   });
   inboxSweepReceiptBuffer = createInboxReceiptBuffer({ deliver: enqueueGatewayEvent });
 }
@@ -445,7 +457,7 @@ function emitPairEvent(event) {
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await resolveBaileysVersion();
 
   sock = makeWASocket({
     version,
@@ -512,7 +524,7 @@ async function startSocket() {
         if (inboxSweep) {
           inboxSweep.closed({ intentional: false, reason });
         } else {
-          setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+          reconnectScheduler.schedule(reason === 515 ? 1000 : 3000);
         }
       }
     } else if (connection === 'open') {
@@ -1194,6 +1206,6 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    startSocket();
+    reconnectScheduler.schedule(0);
   });
 }
