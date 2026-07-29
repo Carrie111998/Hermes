@@ -845,11 +845,23 @@ def on_pre_llm_request(
     user_message: Any = None,
     turn_id: str = "",
     api_request_id: str = "",
+    request: Any = None,
     **_: Any,
 ) -> None:
     client = _get_langfuse()
     if client is None:
         return
+
+    # ``model`` is the agent's current attribute at hook time; the request
+    # body carries the model actually being dispatched. They can diverge
+    # (mid-session /model switch propagation, provider fallback, middleware
+    # rewrites) — prefer the wire truth for generation attribution.
+    if isinstance(request, dict):
+        body = request.get("body")
+        if isinstance(body, dict):
+            body_model = body.get("model")
+            if isinstance(body_model, str) and body_model:
+                model = body_model
 
     input_messages = _coerce_request_messages(
         request_messages=request_messages,
@@ -912,10 +924,17 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      usage: Any = None, assistant_content_chars: int = 0,
                      assistant_tool_call_count: int = 0, assistant_response: Any = None,
                      turn_id: str = "", api_request_id: str = "",
+                     response_model: Any = None,
                      **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
         return
+
+    # The provider's response echoes the model that actually served the
+    # request. Prefer it over the agent attribute, which can be stale after
+    # a mid-session model switch or fallback.
+    if isinstance(response_model, str) and response_model:
+        model = response_model
 
     task_key = _trace_key(
         task_id,

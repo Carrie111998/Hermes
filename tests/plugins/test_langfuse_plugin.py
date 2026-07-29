@@ -779,3 +779,109 @@ class TestUsageFromSanitizedResponse:
 
         assert seen["resp"] is resp
         assert captured["usage_details"] == {"input": 7, "output": 3}
+
+
+# ---------------------------------------------------------------------------
+# Model attribution: wire truth over stale agent attribute
+# ---------------------------------------------------------------------------
+
+class TestModelAttribution:
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def _client_capturing_generations(self, gens):
+        class _Gen:
+            def update(self, **kw): pass
+            def end(self, **kw): pass
+
+        class _Span:
+            def update(self, **kw): pass
+            def end(self, **kw): pass
+            def set_trace_io(self, **kw): pass
+            def start_observation(self, **kw):
+                gens.append(kw)
+                return _Gen()
+
+        class _RootCM:
+            def __enter__(self): return _Span()
+            def __exit__(self, *exc): return False
+
+        class _Client:
+            def create_trace_id(self, seed=None): return "t"
+            def start_as_current_observation(self, **kw): return _RootCM()
+            def flush(self): pass
+
+        return _Client()
+
+    def test_pre_api_request_prefers_request_body_model(self, monkeypatch):
+        """Agent attribute says old model; request body says the switched one."""
+        mod = self._fresh_plugin()
+        gens: list = []
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: self._client_capturing_generations(gens))
+        mod._TRACE_STATE.clear()
+
+        mod.on_pre_llm_request(
+            task_id="t", session_id="s", turn_id="s:t:turn1",
+            api_call_count=1,
+            model="old-model-attr",
+            provider="openrouter",
+            request_messages=[{"role": "user", "content": "hi"}],
+            request={"body": {"model": "switched/new-model"}},
+        )
+        assert gens, "no generation started"
+        assert gens[0]["model"] == "switched/new-model"
+
+    def test_pre_api_request_falls_back_to_attr_without_body_model(self, monkeypatch):
+        mod = self._fresh_plugin()
+        gens: list = []
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: self._client_capturing_generations(gens))
+        mod._TRACE_STATE.clear()
+
+        mod.on_pre_llm_request(
+            task_id="t", session_id="s", turn_id="s:t:turn2",
+            api_call_count=1,
+            model="attr-model",
+            request_messages=[{"role": "user", "content": "hi"}],
+            request={"body": {}},
+        )
+        assert gens[0]["model"] == "attr-model"
+
+    def test_post_api_request_uses_response_model_for_cost(self, monkeypatch):
+        """Cost estimation must key off the model that actually served."""
+        mod = self._fresh_plugin()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        mod._TRACE_STATE.clear()
+
+        seen = {}
+        def fake_usage_and_cost(response, *, provider, api_mode, model, base_url):
+            seen["model"] = model
+            return {"input": 1, "output": 1}, {}
+        monkeypatch.setattr(mod, "_usage_and_cost", fake_usage_and_cost)
+
+        class _Gen:
+            def update(self, **kw): pass
+            def end(self, **kw): pass
+
+        class _Root:
+            def update(self, **kw): pass
+            def end(self, **kw): pass
+            def set_trace_io(self, **kw): pass
+
+        turn_id = "s:t:turn3"
+        key = mod._trace_key("t", "s", turn_id=turn_id)
+        state = mod.TraceState(trace_id="x", root_ctx=None, root_span=_Root())
+        state.generations["1"] = _Gen()
+        mod._TRACE_STATE[key] = state
+
+        class _Resp:
+            usage = {"prompt_tokens": 1, "completion_tokens": 1}
+
+        mod.on_post_llm_call(
+            task_id="t", session_id="s", turn_id=turn_id, api_call_count=1,
+            model="stale-attr-model",
+            response_model="actual/served-model",
+            response=_Resp(),
+            assistant_content_chars=2,
+        )
+        assert seen["model"] == "actual/served-model"
