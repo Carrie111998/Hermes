@@ -347,6 +347,285 @@ class TestPermitFlow:
         assert ok is False
 
 
+class TestPermitFieldParity:
+    """consume_permit must re-check executor/capability/target_resource/
+    policy_version at consumption time, not just fencing/payload — closing
+    the gap where task_permits already stored these fields (written by
+    issue_permit) but consume_permit's atomic UPDATE never re-validated
+    them. Mirrors the exact-action-binding checks objectives_db.consume_permit
+    performs (issued_to==executor, capability match, target_resource match,
+    optional policy_version staleness).
+    """
+
+    def _issue(self, pg, **overrides):
+        from hermes_cli.postgres_authority import claim_task, issue_permit
+
+        task_id = _new_task()
+        token = _new_token()
+        payload = {"action": "send_email", "nonce": uuid.uuid4().hex}
+        gen = claim_task(
+            pg, task_id=task_id, claim_token=token,
+            organization_id=ORG, worker_id="w1",
+            claim_scope_url="", expires_at=time.time() + 3600,
+        )
+        issue_kwargs = dict(
+            task_id=task_id, organization_id=ORG,
+            claim_token=token, lease_generation=gen,
+            action_payload=payload,
+            executor="worker-alice", capability="send_email",
+            target_resource="mailbox:alice@example.test",
+            policy_version="policy-v1",
+        )
+        issue_kwargs.update(overrides)
+        permit_id = issue_permit(pg, **issue_kwargs)
+        return dict(
+            permit_id=permit_id, organization_id=ORG,
+            claim_token=token, lease_generation=gen,
+            action_payload=payload,
+        )
+
+    def test_matching_fields_succeeds(self, pg):
+        from hermes_cli.postgres_authority import consume_permit
+
+        ctx = self._issue(pg)
+        ok = consume_permit(
+            pg, **ctx,
+            executor="worker-alice", capability="send_email",
+            target_resource="mailbox:alice@example.test",
+            policy_version="policy-v1",
+        )
+        assert ok is True
+
+    def test_executor_mismatch_rejected(self, pg):
+        from hermes_cli.postgres_authority import consume_permit
+
+        ctx = self._issue(pg)
+        ok = consume_permit(
+            pg, **ctx,
+            executor="worker-mallory", capability="send_email",
+            target_resource="mailbox:alice@example.test",
+            policy_version="policy-v1",
+        )
+        assert ok is False
+
+    def test_capability_mismatch_rejected(self, pg):
+        from hermes_cli.postgres_authority import consume_permit
+
+        ctx = self._issue(pg)
+        ok = consume_permit(
+            pg, **ctx,
+            executor="worker-alice", capability="delete_account",
+            target_resource="mailbox:alice@example.test",
+            policy_version="policy-v1",
+        )
+        assert ok is False
+
+    def test_target_resource_mismatch_rejected(self, pg):
+        from hermes_cli.postgres_authority import consume_permit
+
+        ctx = self._issue(pg)
+        ok = consume_permit(
+            pg, **ctx,
+            executor="worker-alice", capability="send_email",
+            target_resource="mailbox:bob@example.test",
+            policy_version="policy-v1",
+        )
+        assert ok is False
+
+    def test_stale_policy_version_rejected(self, pg):
+        from hermes_cli.postgres_authority import consume_permit
+
+        ctx = self._issue(pg)
+        ok = consume_permit(
+            pg, **ctx,
+            executor="worker-alice", capability="send_email",
+            target_resource="mailbox:alice@example.test",
+            policy_version="policy-v2-superseded",
+        )
+        assert ok is False
+
+    def test_policy_version_omitted_skips_staleness_check(self, pg):
+        """Passing policy_version=None (the default) skips the staleness
+        check entirely, matching objectives_db.consume_permit's
+        current_policy_version=None convention."""
+        from hermes_cli.postgres_authority import consume_permit
+
+        ctx = self._issue(pg)
+        ok = consume_permit(
+            pg, **ctx,
+            executor="worker-alice", capability="send_email",
+            target_resource="mailbox:alice@example.test",
+        )
+        assert ok is True
+
+
+class TestObjectiveLifecycleGate:
+    """consume_permit must fail closed on missing or terminal mirrored
+    objective status when objective_id is supplied — a cancelled objective
+    must not authorize permit consumption merely because claim/fencing/
+    payload checks passed."""
+
+    def _issue_and_context(self, pg):
+        from hermes_cli.postgres_authority import claim_task, issue_permit
+
+        task_id = _new_task()
+        token = _new_token()
+        payload = {"action": "test", "nonce": uuid.uuid4().hex}
+        gen = claim_task(
+            pg, task_id=task_id, claim_token=token,
+            organization_id=ORG, worker_id="w1",
+            claim_scope_url="", expires_at=time.time() + 3600,
+        )
+        permit_id = issue_permit(
+            pg, task_id=task_id, organization_id=ORG,
+            claim_token=token, lease_generation=gen,
+            action_payload=payload,
+        )
+        return dict(
+            permit_id=permit_id, organization_id=ORG,
+            claim_token=token, lease_generation=gen,
+            action_payload=payload,
+        )
+
+    def test_missing_objective_status_row_rejected(self, pg):
+        from hermes_cli.postgres_authority import consume_permit
+
+        ctx = self._issue_and_context(pg)
+        ok = consume_permit(pg, **ctx, objective_id="obj-never-mirrored")
+        assert ok is False
+
+    def test_admissive_status_succeeds(self, pg):
+        from hermes_cli.postgres_authority import consume_permit, mirror_objective_status, mirror_autonomy_mode
+
+        ctx = self._issue_and_context(pg)
+        objective_id = "obj-executing"
+        mirror_objective_status(
+            pg, objective_id=objective_id, organization_id=ORG,
+            status="executing", version=1,
+        )
+        mirror_autonomy_mode(pg, organization_id=ORG, mode="autonomous", generation=1)
+        ok = consume_permit(pg, **ctx, objective_id=objective_id)
+        assert ok is True
+
+    @pytest.mark.parametrize("terminal_status", ["cancelled", "completed", "failed", "verified"])
+    def test_terminal_status_rejected(self, pg, terminal_status):
+        from hermes_cli.postgres_authority import consume_permit, mirror_objective_status
+
+        ctx = self._issue_and_context(pg)
+        objective_id = f"obj-{terminal_status}"
+        mirror_objective_status(
+            pg, objective_id=objective_id, organization_id=ORG,
+            status=terminal_status, version=1,
+        )
+        ok = consume_permit(pg, **ctx, objective_id=objective_id)
+        assert ok is False
+
+    def test_wrong_organization_mirror_rejected(self, pg):
+        """A mirror row for a different org must not authorize consumption."""
+        from hermes_cli.postgres_authority import consume_permit, mirror_objective_status
+
+        ctx = self._issue_and_context(pg)
+        objective_id = "obj-cross-org"
+        mirror_objective_status(
+            pg, objective_id=objective_id, organization_id="test-org-beta",
+            status="executing", version=1,
+        )
+        ok = consume_permit(pg, **ctx, objective_id=objective_id)
+        assert ok is False
+
+
+class TestAutonomyGate:
+    """consume_permit must fail closed on missing or stopped mirrored
+    autonomy mode when objective_id is supplied — master-autonomy-stop must
+    block consumption even when claim/fencing/payload checks pass."""
+
+    def _issue_and_context(self, pg, org=ORG):
+        from hermes_cli.postgres_authority import claim_task, issue_permit
+
+        task_id = _new_task()
+        token = _new_token()
+        payload = {"action": "test", "nonce": uuid.uuid4().hex}
+        gen = claim_task(
+            pg, task_id=task_id, claim_token=token,
+            organization_id=org, worker_id="w1",
+            claim_scope_url="", expires_at=time.time() + 3600,
+        )
+        permit_id = issue_permit(
+            pg, task_id=task_id, organization_id=org,
+            claim_token=token, lease_generation=gen,
+            action_payload=payload,
+        )
+        return dict(
+            permit_id=permit_id, organization_id=org,
+            claim_token=token, lease_generation=gen,
+            action_payload=payload,
+        )
+
+    def test_missing_autonomy_row_rejected(self, pg):
+        from hermes_cli.postgres_authority import consume_permit, mirror_objective_status
+
+        org = f"org-no-autonomy-row-{uuid.uuid4().hex[:8]}"
+        ctx = self._issue_and_context(pg, org=org)
+        mirror_objective_status(
+            pg, objective_id="obj-1", organization_id=org,
+            status="executing", version=1,
+        )
+        ok = consume_permit(pg, **ctx, objective_id="obj-1")
+        assert ok is False
+
+    def test_autonomous_mode_succeeds(self, pg):
+        from hermes_cli.postgres_authority import (
+            consume_permit, mirror_objective_status, mirror_autonomy_mode,
+        )
+
+        org = f"org-autonomous-{uuid.uuid4().hex[:8]}"
+        ctx = self._issue_and_context(pg, org=org)
+        mirror_objective_status(
+            pg, objective_id="obj-1", organization_id=org,
+            status="executing", version=1,
+        )
+        mirror_autonomy_mode(pg, organization_id=org, mode="autonomous", generation=1)
+        ok = consume_permit(pg, **ctx, objective_id="obj-1")
+        assert ok is True
+
+    def test_stopped_autonomy_rejected(self, pg):
+        from hermes_cli.postgres_authority import (
+            consume_permit, mirror_objective_status, mirror_autonomy_mode,
+        )
+
+        org = f"org-stopped-{uuid.uuid4().hex[:8]}"
+        ctx = self._issue_and_context(pg, org=org)
+        mirror_objective_status(
+            pg, objective_id="obj-1", organization_id=org,
+            status="executing", version=1,
+        )
+        mirror_autonomy_mode(pg, organization_id=org, mode="stopped", generation=1)
+        ok = consume_permit(pg, **ctx, objective_id="obj-1")
+        assert ok is False
+
+    def test_autonomy_stop_after_permit_issuance_blocks_consumption(self, pg):
+        """The realistic sequence: permit issued while autonomous, then
+        master-stop fires before consumption — consumption must be blocked
+        even though the permit itself is still validly fenced."""
+        from hermes_cli.postgres_authority import (
+            consume_permit, mirror_objective_status, mirror_autonomy_mode,
+        )
+
+        org = f"org-stop-after-issue-{uuid.uuid4().hex[:8]}"
+        mirror_objective_status(
+            pg, objective_id="obj-1", organization_id=org,
+            status="executing", version=1,
+        )
+        mirror_autonomy_mode(pg, organization_id=org, mode="autonomous", generation=1)
+        ctx = self._issue_and_context(pg, org=org)
+
+        # Master-stop fires after the permit was issued.
+        mirror_autonomy_mode(pg, organization_id=org, mode="stopped", generation=2)
+
+        ok = consume_permit(pg, **ctx, objective_id="obj-1")
+        assert ok is False
+
+
 class TestCleanup:
     def test_cleanup_expired_claims(self, pg):
         from hermes_cli.postgres_authority import (
