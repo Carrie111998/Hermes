@@ -20,6 +20,7 @@ from tools.skill_manager_tool import (
     _remove_file,
     skill_manage,
     MAX_NAME_LENGTH,
+    SKILL_MANAGE_SCHEMA,
 )
 from agent.skill_utils import (
     extract_skill_description,
@@ -1758,3 +1759,22 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+# Schema content
+# ---------------------------------------------------------------------------
+
+
+class TestSkillManageSchema:
+    def test_schema_guides_writable_state_paths(self):
+        """Schema must guide the agent away from skill-dir state writes.
+
+        Skill directories are synced and may be overwritten by skills_sync,
+        so persistent state must go under $HERMES_HOME/state/skills/<name>.
+        The guidance must name get_hermes_home() (the platform-safe resolver)
+        and prohibit Path(__file__).parent for state writes.
+        """
+        desc = SKILL_MANAGE_SCHEMA["description"]
+        assert "MUST NOT write state to" in desc
+        assert "skills_sync" in desc
+        assert "get_hermes_home" in desc
+        assert "$HERMES_HOME" in desc
+        assert "state/skills" in desc
