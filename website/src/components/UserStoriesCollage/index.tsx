@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import type { JSX } from 'react';
 import stories from '@site/src/data/userStories.json';
 import styles from './styles.module.css';
 

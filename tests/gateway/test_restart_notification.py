@@ -498,6 +498,63 @@ async def test_relay_fronted_logical_home_gets_startup_notification(tmp_path, mo
     assert relay.send_for_platform.await_args.kwargs["metadata"]["scope_id"] == "T123"
 
 
+@pytest.mark.asyncio
+async def test_send_home_channel_startup_notification_falls_back_when_live_send_degraded(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    import tools.send_message_tool as send_message_tool
+
+    standalone_send = AsyncMock(return_value={"message_id": "standalone-home"})
+    monkeypatch.setattr(send_message_tool, "_send_to_platform", standalone_send)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=False, error="send_path_degraded"))
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {("telegram", "home-42", None)}
+    adapter.send.assert_called_once()
+    standalone_send.assert_awaited_once_with(
+        Platform.TELEGRAM,
+        runner.config.platforms[Platform.TELEGRAM],
+        "home-42",
+        "♻️ Gateway online — Hermes is back and ready.",
+        thread_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_home_channel_startup_notification_keeps_warning_when_degraded_fallback_fails(
+    tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    import tools.send_message_tool as send_message_tool
+
+    standalone_send = AsyncMock(return_value={"error": "bot api down"})
+    monkeypatch.setattr(send_message_tool, "_send_to_platform", standalone_send)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=False, error="send_path_degraded"))
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == set()
+    assert "send_path_degraded; standalone fallback failed: bot api down" in caplog.text
+
+
 # ── _send_restart_notification ───────────────────────────────────────────
 
 

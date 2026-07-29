@@ -1144,10 +1144,41 @@ auxiliary:
     base_url: ""
     api_key: ""
     timeout: 120
+
+  # Read-only document/corpus processing (`hermes documents`). These slots
+  # emit summaries, checks, plans, and proposal-only merge drafts; they do
+  # not write final notes or mutate source artifacts.
+  document_summarization:
+    provider: "auto"
+    model: ""
+    base_url: ""
+    api_key: ""
+    timeout: 180
+
+  document_merge_draft:
+    provider: "auto"
+    model: ""
+    base_url: ""
+    api_key: ""
+    timeout: 300
+
+  document_integrity_check:
+    provider: "auto"
+    model: ""
+    base_url: ""
+    api_key: ""
+    timeout: 300
+
+  document_corpus_planner:
+    provider: "auto"
+    model: ""
+    base_url: ""
+    api_key: ""
+    timeout: 120
 ```
 
 :::tip
-Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 120s, web_extract 360s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
+Each auxiliary task has a configurable `timeout` (in seconds). Defaults include vision 120s, web_extract 360s, approval 30s, compression 120s, document_summarization 180s, document_merge_draft 300s, document_integrity_check 300s, and document_corpus_planner 120s. Increase these if you use slow local models for auxiliary tasks. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
 :::
 
 :::info

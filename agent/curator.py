@@ -1806,6 +1806,50 @@ def _resolve_review_runtime(cfg: Dict[str, Any]) -> _ReviewRuntimeBinding:
     return _ReviewRuntimeBinding(_main_provider, _main_model, None, None, {})
 
 
+def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
+    """Resolve inline or env-backed API key from a curator fallback entry."""
+    explicit = _strip_aux_credential(entry.get("api_key"))
+    if explicit:
+        return explicit
+    key_env = _strip_aux_credential(
+        entry.get("key_env") or entry.get("api_key_env")
+    )
+    if key_env:
+        return _strip_aux_credential(os.getenv(key_env, ""))
+    return None
+
+
+def _iter_review_runtime_bindings(cfg: Dict[str, Any]) -> List[_ReviewRuntimeBinding]:
+    """Return curator review runtime candidates in failover order.
+
+    The first entry preserves `_resolve_review_runtime()` precedence exactly.
+    Additional candidates come from `auxiliary.curator.fallback_chain`, matching
+    the central auxiliary-task fallback schema used by other tasks.
+    """
+    bindings = [_resolve_review_runtime(cfg)]
+    _aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+    _cur_task = _aux.get("curator", {}) if isinstance(_aux.get("curator"), dict) else {}
+    chain = _cur_task.get("fallback_chain") if isinstance(_cur_task, dict) else None
+    if not isinstance(chain, list):
+        return bindings
+
+    for entry in chain:
+        if not isinstance(entry, dict):
+            continue
+        provider = _strip_aux_credential(entry.get("provider"))
+        model = _strip_aux_credential(entry.get("model"))
+        if not provider or not model:
+            continue
+        bindings.append(_ReviewRuntimeBinding(
+            provider,
+            model,
+            _fallback_entry_api_key(entry),
+            _strip_aux_credential(entry.get("base_url")),
+            _merge_request_overrides({}, entry.get("extra_body")),
+        ))
+    return bindings
+
+
 def _resolve_review_model(cfg: Dict[str, Any]) -> tuple[str, str]:
     """Pick (provider, model) for the curator review fork.
 
@@ -1861,136 +1905,159 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     # arguments hits an auto-resolution path that fails for OAuth-only
     # providers and for pool-backed credentials.
     #
-    # `_resolve_review_runtime()` honors `auxiliary.curator.{provider,model,...}`
+    # `_iter_review_runtime_bindings()` honors `auxiliary.curator.{provider,model,...}`
     # (canonical aux-task slot, wired through `hermes model` → auxiliary
     # picker and the dashboard Models tab), with a legacy fallback to
-    # `curator.auxiliary.{provider,model,...}`. See docs/user-guide/features/curator.md.
-    _api_key = None
-    _base_url = None
-    _api_mode = None
-    _resolved_provider = None
-    _credential_pool = None
-    _request_overrides: Dict[str, Any] = {}
-    _max_tokens = None
-    _acp_command = None
-    _acp_args = None
-    _model_name = ""
+    # `curator.auxiliary.{provider,model,...}` and then configured
+    # `auxiliary.curator.fallback_chain` entries.
     try:
         from hermes_cli.config import load_config
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        _cfg = load_config()
-        _binding = _resolve_review_runtime(_cfg)
-        _provider, _model_name = _binding.provider, _binding.model
-        _rp = resolve_runtime_provider(
-            requested=_provider,
-            target_model=_model_name,
-            explicit_api_key=_binding.explicit_api_key,
-            explicit_base_url=_binding.explicit_base_url,
-        )
-        _api_key = _rp.get("api_key")
-        _base_url = _rp.get("base_url")
-        _api_mode = _rp.get("api_mode")
-        _resolved_provider = _rp.get("provider") or _provider
-        _credential_pool = _rp.get("credential_pool")
-        _request_overrides = _merge_request_overrides(
-            _rp.get("request_overrides"),
-            _binding.request_overrides.get("extra_body"),
-        )
-        _max_tokens = _rp.get("max_output_tokens")
-        _acp_command = _rp.get("command")
-        _acp_args = list(_rp.get("args") or [])
-        if isinstance(_rp.get("model"), str) and _rp["model"].strip():
-            _model_name = _rp["model"].strip()
+        _bindings = _iter_review_runtime_bindings(load_config())
     except Exception as e:
         logger.debug("Curator provider resolution failed: %s", e, exc_info=True)
+        _bindings = [_ReviewRuntimeBinding("auto", "", None, None, {})]
+        resolve_runtime_provider = None  # type: ignore[assignment]
 
-    result_meta["model"] = _model_name
-    result_meta["provider"] = _resolved_provider or ""
+    for _binding_index, _binding in enumerate(_bindings):
+        _api_key = None
+        _base_url = None
+        _api_mode = None
+        _resolved_provider = None
+        _credential_pool = None
+        _request_overrides: Dict[str, Any] = {}
+        _max_tokens = None
+        _acp_command = None
+        _acp_args = None
+        _provider, _model_name = _binding.provider, _binding.model
+        review_agent = None
+        try:
+            if resolve_runtime_provider is not None:
+                try:
+                    _rp = resolve_runtime_provider(
+                        requested=_provider,
+                        target_model=_model_name,
+                        explicit_api_key=_binding.explicit_api_key,
+                        explicit_base_url=_binding.explicit_base_url,
+                    )
+                    _api_key = _rp.get("api_key")
+                    _base_url = _rp.get("base_url")
+                    _api_mode = _rp.get("api_mode")
+                    _resolved_provider = _rp.get("provider") or _provider
+                    _credential_pool = _rp.get("credential_pool")
+                    _request_overrides = _merge_request_overrides(
+                        _rp.get("request_overrides"),
+                        _binding.request_overrides.get("extra_body"),
+                    )
+                    _max_tokens = _rp.get("max_output_tokens")
+                    _acp_command = _rp.get("command")
+                    _acp_args = list(_rp.get("args") or [])
+                    if isinstance(_rp.get("model"), str) and _rp["model"].strip():
+                        _model_name = _rp["model"].strip()
+                except Exception as e:
+                    logger.debug("Curator provider resolution failed: %s", e, exc_info=True)
+                    _resolved_provider = None if _provider == "auto" else _provider
+                    _request_overrides = _binding.request_overrides
+            else:
+                _resolved_provider = _provider
+                _request_overrides = _binding.request_overrides
 
-    review_agent = None
-    try:
-        _agent_kwargs: Dict[str, Any] = {}
-        if isinstance(_max_tokens, int):
-            _agent_kwargs["max_tokens"] = _max_tokens
-        if isinstance(_acp_command, str) and _acp_command:
-            _agent_kwargs["acp_command"] = _acp_command
-            _agent_kwargs["acp_args"] = _acp_args or []
-        review_agent = AIAgent(
-            model=_model_name,
-            provider=_resolved_provider,
-            api_key=_api_key,
-            base_url=_base_url,
-            api_mode=_api_mode,
-            credential_pool=_credential_pool,
-            request_overrides=_request_overrides,
-            **_agent_kwargs,
-            # Umbrella-building over a large skill collection is worth a
-            # high iteration ceiling — the pass typically takes 50-100
-            # API calls against hundreds of candidate skills. The
-            # single-session review path caps itself at a much smaller
-            # number because it's not doing a curation sweep.
-            max_iterations=9999,
-            quiet_mode=True,
-            platform="curator",
-            skip_context_files=True,
-            skip_memory=True,
-        )
-        # Disable recursive nudges — the curator must never spawn its own review.
-        review_agent._memory_nudge_interval = 0
-        review_agent._skill_nudge_interval = 0
-        # Tag this fork as autonomous background curation so skill_manage's
-        # background-review write guard fires. Without this the fork inherits
-        # the default "assistant_tool" origin, is_background_review() is False,
-        # and the external/bundled/hub-installed skill_manage guards never
-        # trigger during the curation pass they exist to protect against.
-        # turn_context.py binds this onto the write-origin ContextVar at turn
-        # start (see agent/turn_context.py).
-        review_agent._memory_write_origin = "background_review"
+            result_meta["model"] = _model_name
+            result_meta["provider"] = _resolved_provider or ""
+            result_meta["error"] = None
 
-        # Redirect the forked agent's stdout/stderr to /dev/null while it
-        # runs so its tool-call chatter doesn't pollute the foreground
-        # terminal. The background-thread runner also hides it; this
-        # belt-and-suspenders path matters when a caller invokes
-        # run_curator_review(synchronous=True) from the CLI.
-        with open(os.devnull, "w", encoding="utf-8") as _devnull, \
-             contextlib.redirect_stdout(_devnull), \
-             contextlib.redirect_stderr(_devnull):
-            conv_result = review_agent.run_conversation(user_message=prompt)
+            _agent_kwargs: Dict[str, Any] = {}
+            if isinstance(_max_tokens, int):
+                _agent_kwargs["max_tokens"] = _max_tokens
+            if isinstance(_acp_command, str) and _acp_command:
+                _agent_kwargs["acp_command"] = _acp_command
+                _agent_kwargs["acp_args"] = _acp_args or []
+            review_agent = AIAgent(
+                model=_model_name,
+                provider=_resolved_provider,
+                api_key=_api_key,
+                base_url=_base_url,
+                api_mode=_api_mode,
+                credential_pool=_credential_pool,
+                request_overrides=_request_overrides,
+                **_agent_kwargs,
+                # Umbrella-building over a large skill collection is worth a
+                # high iteration ceiling — the pass typically takes 50-100
+                # API calls against hundreds of candidate skills. The
+                # single-session review path caps itself at a much smaller
+                # number because it's not doing a curation sweep.
+                max_iterations=9999,
+                quiet_mode=True,
+                platform="curator",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            # Disable recursive nudges — the curator must never spawn its own review.
+            review_agent._memory_nudge_interval = 0
+            review_agent._skill_nudge_interval = 0
+            # Tag this fork as autonomous background curation so skill_manage's
+            # background-review write guard fires. Without this the fork inherits
+            # the default "assistant_tool" origin, is_background_review() is False,
+            # and the external/bundled/hub-installed skill_manage guards never
+            # trigger during the curation pass they exist to protect against.
+            # turn_context.py binds this onto the write-origin ContextVar at turn
+            # start (see agent/turn_context.py).
+            review_agent._memory_write_origin = "background_review"
 
-        final = ""
-        if isinstance(conv_result, dict):
-            final = str(conv_result.get("final_response") or "").strip()
-        result_meta["final"] = final
-        result_meta["summary"] = (final[:240] + "…") if len(final) > 240 else (final or "no change")
+            # Redirect the forked agent's stdout/stderr to /dev/null while it
+            # runs so its tool-call chatter doesn't pollute the foreground
+            # terminal. The background-thread runner also hides it; this
+            # belt-and-suspenders path matters when a caller invokes
+            # run_curator_review(synchronous=True) from the CLI.
+            with open(os.devnull, "w", encoding="utf-8") as _devnull, \
+                 contextlib.redirect_stdout(_devnull), \
+                 contextlib.redirect_stderr(_devnull):
+                conv_result = review_agent.run_conversation(user_message=prompt)
 
-        # Collect tool calls for the report. Walk the forked agent's
-        # session messages and extract every tool_call made during the
-        # pass. Truncate argument payloads so a giant skill_manage create
-        # doesn't blow up the report.
-        _calls: List[Dict[str, Any]] = []
-        for msg in getattr(review_agent, "_session_messages", []) or []:
-            if not isinstance(msg, dict):
-                continue
-            tcs = msg.get("tool_calls") or []
-            for tc in tcs:
-                if not isinstance(tc, dict):
+            final = ""
+            if isinstance(conv_result, dict):
+                final = str(conv_result.get("final_response") or "").strip()
+            result_meta["final"] = final
+            result_meta["summary"] = (final[:240] + "…") if len(final) > 240 else (final or "no change")
+
+            # Collect tool calls for the report. Walk the forked agent's
+            # session messages and extract every tool_call made during the
+            # pass. Truncate argument payloads so a giant skill_manage create
+            # doesn't blow up the report.
+            _calls: List[Dict[str, Any]] = []
+            for msg in getattr(review_agent, "_session_messages", []) or []:
+                if not isinstance(msg, dict):
                     continue
-                fn = tc.get("function") or {}
-                name = fn.get("name") or ""
-                args_raw = fn.get("arguments") or ""
-                if isinstance(args_raw, str) and len(args_raw) > 400:
-                    args_raw = args_raw[:400] + "…"
-                _calls.append({"name": name, "arguments": args_raw})
-        result_meta["tool_calls"] = _calls
-    except Exception as e:
-        result_meta["error"] = f"error: {e}"
-        result_meta["summary"] = result_meta["error"]
-    finally:
-        if review_agent is not None:
-            try:
-                review_agent.close()
-            except Exception:
-                pass
+                tcs = msg.get("tool_calls") or []
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    name = fn.get("name") or ""
+                    args_raw = fn.get("arguments") or ""
+                    if isinstance(args_raw, str) and len(args_raw) > 400:
+                        args_raw = args_raw[:400] + "…"
+                    _calls.append({"name": name, "arguments": args_raw})
+            result_meta["tool_calls"] = _calls
+            return result_meta
+        except Exception as e:
+            result_meta["error"] = f"error: {e}"
+            result_meta["summary"] = result_meta["error"]
+            if _binding_index < len(_bindings) - 1:
+                logger.warning(
+                    "curator: review fork failed on %s/%s; trying auxiliary.curator fallback_chain entry %d",
+                    _provider,
+                    _model_name,
+                    _binding_index + 1,
+                    exc_info=True,
+                )
+                continue
+        finally:
+            if review_agent is not None:
+                try:
+                    review_agent.close()
+                except Exception:
+                    pass
     return result_meta
 
 
