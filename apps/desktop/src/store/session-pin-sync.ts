@@ -99,10 +99,12 @@ function reconcile(): void {
     return
   }
 
-  pullRemotePins()
-
   const current = new Set($pinnedSessionIds.get())
 
+  // Push local intent before consulting the current session page. The page may
+  // still carry the value from before the click; writePin records that newer
+  // intent in `unconfirmed` so pullRemotePins cannot undo it.
+  //
   // Unpinned: anything we were tracking that's no longer in the set.
   for (const id of [...mirrored, ...pending]) {
     if (!current.has(id)) {
@@ -136,6 +138,10 @@ function reconcile(): void {
       pending.add(id)
     })
   }
+
+  // With local writes now guarded, adopt authoritative changes made by other
+  // clients without allowing an older page to clobber this app's latest click.
+  pullRemotePins()
 }
 
 // Sync once, then re-sync on pin-set and session-list changes. Call once per app.

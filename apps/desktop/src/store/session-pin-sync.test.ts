@@ -47,6 +47,15 @@ describe('watchSessionPins', () => {
     expect(patch).toHaveBeenCalledWith('a', true, 'work')
   })
 
+  it('keeps a new local pin while the loaded row still reports pinned=false', async () => {
+    $sessions.set([row('stale-pin', { pinned: false, profile: 'work' })])
+    $pinnedSessionIds.set(['stale-pin'])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toContain('stale-pin')
+    expect(patch).toHaveBeenCalledWith('stale-pin', true, 'work')
+  })
+
   it('mirrors an unpin as pinned=false', async () => {
     $sessions.set([row('b')])
     $pinnedSessionIds.set(['b'])
@@ -57,6 +66,18 @@ describe('watchSessionPins', () => {
     await flush()
 
     expect(patch).toHaveBeenCalledWith('b', false, undefined)
+  })
+
+  it('keeps a local unpin while the loaded row still reports pinned=true', async () => {
+    $sessions.set([row('stale-unpin', { pinned: true, profile: 'work' })])
+    await flush()
+    patch.mockClear()
+
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect($pinnedSessionIds.get()).not.toContain('stale-unpin')
+    expect(patch).toHaveBeenCalledWith('stale-unpin', false, 'work')
   })
 
   it('defers a pin whose row is not loaded, then flushes once it appears', async () => {
