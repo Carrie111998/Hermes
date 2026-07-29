@@ -10,6 +10,7 @@ mocking git would just test the mock.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -311,6 +312,76 @@ class TestUpdate:
         with pytest.raises(DistributionError, match="not a distribution"):
             update_distribution("plain")
 
+    def test_update_replaces_only_explicit_owned_subpaths(self, profile_env):
+        mf = DistributionManifest(
+            name="scoped",
+            version="1.0.0",
+            distribution_owned=["skills/demo"],
+        )
+        staged = _make_staging_dir(profile_env, "scoped", manifest=mf)
+        plan = install_distribution(str(staged), name="scoped")
+
+        user_skill = plan.target_dir / "skills" / "user-local" / "SKILL.md"
+        user_skill.parent.mkdir(parents=True)
+        user_skill.write_text("# User skill\n")
+        stale_file = plan.target_dir / "skills" / "demo" / "stale.txt"
+        stale_file.write_text("remove me\n")
+
+        (staged / "skills" / "demo" / "SKILL.md").write_text("# Updated demo\n")
+        (staged / "skills" / "other").mkdir()
+        (staged / "skills" / "other" / "SKILL.md").write_text("# Not owned\n")
+
+        update_distribution("scoped")
+
+        assert user_skill.read_text() == "# User skill\n"
+        assert not stale_file.exists()
+        assert (
+            plan.target_dir / "skills" / "demo" / "SKILL.md"
+        ).read_text() == "# Updated demo\n"
+        assert not (plan.target_dir / "skills" / "other").exists()
+
+    @pytest.mark.parametrize("owned_path", ["../outside", "/absolute", "memories"])
+    def test_explicit_owned_paths_reject_unsafe_targets(
+        self, profile_env, owned_path
+    ):
+        mf = DistributionManifest(
+            name="unsafe",
+            distribution_owned=[owned_path],
+        )
+        staged = _make_staging_dir(profile_env, "unsafe", manifest=mf)
+
+        with pytest.raises(DistributionError, match="distribution_owned"):
+            install_distribution(str(staged), name="unsafe")
+
+    def test_owned_subpath_rejects_symlinked_destination_parent(
+        self, profile_env
+    ):
+        mf = DistributionManifest(
+            name="scoped",
+            distribution_owned=["skills/demo"],
+        )
+        staged = _make_staging_dir(profile_env, "scoped-link", manifest=mf)
+        plan = install_distribution(str(staged), name="scoped")
+
+        outside = profile_env / "outside-profile"
+        outside.mkdir()
+        marker = outside / "keep.txt"
+        marker.write_text("outside\n")
+
+        shutil.rmtree(plan.target_dir / "skills")
+        try:
+            (plan.target_dir / "skills").symlink_to(
+                outside, target_is_directory=True
+            )
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+
+        with pytest.raises(DistributionError, match="symlinked parent"):
+            update_distribution("scoped")
+
+        assert marker.read_text() == "outside\n"
+        assert not (outside / "demo").exists()
+
 
 # ===========================================================================
 # describe_distribution — info subcommand
@@ -532,4 +603,3 @@ class TestErrorSurfaces:
         staged = _make_staging_dir(profile_env, "bad", manifest=mf)
         with pytest.raises((ValueError, DistributionError)):
             plan_install(str(staged), tmp_path / "work")
-

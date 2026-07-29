@@ -199,7 +199,11 @@ class DistributionManifest:
         dist_owned_raw = data.get("distribution_owned") or []
         if dist_owned_raw and not isinstance(dist_owned_raw, list):
             raise DistributionError("distribution_owned must be a list")
-        distribution_owned = [str(p).strip().strip("/") for p in dist_owned_raw if str(p).strip()]
+        distribution_owned = [
+            str(p).strip().rstrip("/")
+            for p in dist_owned_raw
+            if str(p).strip()
+        ]
         return cls(
             name=name,
             version=str(data.get("version") or "0.1.0"),
@@ -559,7 +563,83 @@ def _copy_dist_payload(
     shadowing a real ``.env``.
     """
     target.mkdir(parents=True, exist_ok=True)
+    target_root = target.resolve()
 
+    if manifest.distribution_owned:
+        for raw_path in manifest.owned_paths():
+            rel_path = Path(raw_path)
+            if (
+                rel_path.is_absolute()
+                or not rel_path.parts
+                or any(part in {"", ".", ".."} for part in rel_path.parts)
+            ):
+                raise DistributionError(
+                    f"Invalid distribution_owned path: {raw_path!r}"
+                )
+            if rel_path.parts[0] in USER_OWNED_EXCLUDE:
+                raise DistributionError(
+                    f"distribution_owned cannot include user-owned path: {raw_path!r}"
+                )
+            if (
+                rel_path.as_posix() == "config.yaml"
+                and preserve_config
+                and (target / rel_path).exists()
+            ):
+                continue
+
+            entry = staged / rel_path
+            dest = target / rel_path
+            try:
+                dest.parent.resolve().relative_to(target_root)
+            except ValueError as exc:
+                raise DistributionError(
+                    f"distribution_owned path escapes the profile through a "
+                    f"symlinked parent: {raw_path!r}"
+                ) from exc
+
+            if dest.is_symlink() or dest.is_file():
+                dest.unlink()
+            elif dest.is_dir():
+                shutil.rmtree(dest)
+
+            if not entry.exists():
+                continue
+
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if entry.is_dir():
+                shutil.copytree(entry, dest)
+            else:
+                shutil.copy2(entry, dest)
+    else:
+        _copy_legacy_dist_payload(staged, target, preserve_config)
+
+    # The env template and manifest are package metadata rather than payload
+    # ownership entries, so process them independently of distribution_owned.
+    env_template = staged / ENV_TEMPLATE_FILENAME
+    if env_template.is_file():
+        shutil.copy2(env_template, target / ENV_EXAMPLE_FILENAME)
+
+    # Emit .env.EXAMPLE from manifest if the staged tree didn't ship one
+    if manifest.env_requires and not (target / ENV_EXAMPLE_FILENAME).exists():
+        (target / ENV_EXAMPLE_FILENAME).write_text(
+            _env_template_from_manifest(manifest), encoding="utf-8"
+        )
+
+    # Make sure the manifest on disk reflects resolved name + source
+    write_manifest(target, manifest)
+
+
+def _copy_legacy_dist_payload(
+    staged: Path,
+    target: Path,
+    preserve_config: bool,
+) -> None:
+    """Copy legacy distributions that do not declare owned paths.
+
+    Historically Hermes copied every safe top-level staging entry. Keep that
+    behavior for manifests without ``distribution_owned`` while allowing
+    explicit manifests to replace only the paths they claim.
+    """
     for entry in staged.iterdir():
         name = entry.name
 
@@ -588,15 +668,6 @@ def _copy_dist_payload(
             )
         else:
             shutil.copy2(entry, dest)
-
-    # Emit .env.EXAMPLE from manifest if the staged tree didn't ship one
-    if manifest.env_requires and not (target / ENV_EXAMPLE_FILENAME).exists():
-        (target / ENV_EXAMPLE_FILENAME).write_text(
-            _env_template_from_manifest(manifest), encoding="utf-8"
-        )
-
-    # Make sure the manifest on disk reflects resolved name + source
-    write_manifest(target, manifest)
 
 
 def _bootstrap_user_dirs(target: Path) -> None:
