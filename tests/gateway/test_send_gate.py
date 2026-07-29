@@ -244,6 +244,55 @@ def test_send_with_retry_unaffected_when_gate_open():
     assert adapter.sent == [("c1", "hello")]
 
 
+BUILTIN_ADAPTER_MODULES = [
+    "gateway.platforms.signal",
+    "gateway.platforms.webhook",
+    "gateway.platforms.weixin",
+    "gateway.platforms.whatsapp_cloud",
+    "gateway.platforms.bluebubbles",
+    "gateway.platforms.yuanbao",
+    "gateway.platforms.qqbot.adapter",
+    "gateway.platforms.msgraph_webhook",
+    "gateway.platforms.api_server",
+    "gateway.relay.adapter",
+]
+
+
+@pytest.mark.parametrize("module_name", BUILTIN_ADAPTER_MODULES)
+def test_builtin_adapters_are_gated(module_name):
+    """Adapters outside plugins/ -- including RelayAdapter and APIServerAdapter."""
+    module = importlib.import_module(module_name)
+    found = [
+        attr
+        for attr in vars(module).values()
+        if isinstance(attr, type)
+        and issubclass(attr, BasePlatformAdapter)
+        and attr is not BasePlatformAdapter
+        and attr.__module__ == module_name
+    ]
+    assert found, f"no adapter class found in {module_name}"
+    for cls in found:
+        assert getattr(cls.send, "__send_gate_wrapped__", False), (
+            f"{module_name}.{cls.__name__}.send is not gated"
+        )
+
+
+def test_non_overriding_adapter_keeps_base_method_identity():
+    """The gate must not make every adapter look like it overrides everything.
+
+    Code (and tests such as tests/gateway/test_signal.py) distinguishes "this
+    adapter has a native media implementation" from "it inherits the default"
+    by comparing the bound function against BasePlatformAdapter's. Installing
+    a per-subclass wrapper unconditionally would silently break that; the
+    already-wrapped check in install_send_gate is what preserves it.
+    """
+    from gateway.platforms.signal import SignalAdapter
+
+    ntfy = importlib.import_module("plugins.platforms.ntfy.adapter").NtfyAdapter
+    assert ntfy.send_image is BasePlatformAdapter.send_image
+    assert SignalAdapter.send_image is not BasePlatformAdapter.send_image
+
+
 def test_platform_name_of():
     assert platform_name_of(Platform.SLACK) == "slack"
     assert platform_name_of(_FakeAdapter(_config(None))) == "slack"
