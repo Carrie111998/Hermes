@@ -1,12 +1,9 @@
 import { cn } from '@/lib/utils'
 
 /**
- * The composer surface and everything docked to it (slash·@ popover, `?` help)
- * paint ONE shared `--composer-fill` var. The state ladder (rest / scrolled /
- * focused / drawer-open) lives in styles.css on `[data-slot='composer-root']`,
- * so the two layers can never disagree — drawer-open forces an opaque fill via
- * `:has()`, because translucent glass sampling different backdrops (thread vs
- * fade gradient) renders as different colors even with identical tints.
+ * The composer surface and the status/queue stack paint ONE shared
+ * `--composer-fill` var. The state ladder (rest / scrolled) lives in styles.css
+ * on `[data-slot='composer-root']`, so the layers can never disagree.
  */
 export const composerFill = 'bg-(--composer-fill)'
 
@@ -26,6 +23,42 @@ const composerDockEdge = (edge: 'bottom' | 'top') =>
 export const composerDockCard = (edge: 'bottom' | 'top' = 'top') =>
   cn(composerDockEdge(edge), composerFill, composerSurfaceGlass)
 
-/** Fused docked card — completion drawers. Shares `--composer-fill` with the
- *  composer surface, which goes opaque while a drawer is open. */
-export const composerFusedDockCard = (edge: 'bottom' | 'top' = 'top') => cn(composerDockEdge(edge), composerFill)
+/** Floating composer panel skin — the `/`·`@`·`?` completion drawer and the
+ *  attach (`+`) menu. Glassy translucent card, hairline border, full radius,
+ *  smallest type, soft nous shadow. Uses an explicit fill (not `--composer-fill`)
+ *  so it renders identically whether mounted inside the composer or portaled out
+ *  of it. Visual skin only — consumers add their own size/position/padding. */
+export const composerPanelCard = cn(
+  'rounded-2xl border border-border/65 shadow-nous text-[length:var(--conversation-tool-font-size)]',
+  'bg-[color-mix(in_srgb,var(--dt-card)_72%,transparent)]',
+  composerSurfaceGlass
+)
+
+/**
+ * Shared grid for the chrome-free floating strips that bracket the composer —
+ * the micro-action pills above the surface and the `composer.underside` slot
+ * below it.
+ *
+ * Both strips are in-flow children of the SAME box (the composer root's
+ * content box), which is the whole point: they previously lived in different
+ * parents — the pills inside the status stack's absolute overlay lane, the
+ * chip in the root — so "no padding" resolved to two different left edges and
+ * they never lined up. Same parent, no inset, one constant: the left edges are
+ * identical by construction, not by matching numbers in two places.
+ *
+ * `relative z-1` at the call sites is load-bearing, not styling. The pop-out
+ * drag region is an `absolute` sibling, and positioned elements paint above
+ * static in-flow ones whatever the DOM order — so without a stacking context
+ * these strips sit UNDER it and their contents never receive hover or clicks
+ * (the region does, and hatches).
+ *
+ * The strip is full-width so a contribution can push itself to the right
+ * (`ml-auto`), but it is `pointer-events-none` with its CHILDREN re-enabled:
+ * the chips are interactive, while the empty space between and beside them
+ * falls through to the drag region and stays grab area. That combination is
+ * why the composer is still draggable by the band its badges live in.
+ */
+export const composerFloatingStrip = cn(
+  'relative z-1 flex w-full flex-wrap items-center gap-1.5',
+  'pointer-events-none [&>*]:pointer-events-auto'
+)
