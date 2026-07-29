@@ -31,6 +31,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 
+from tools.computer_use.uinput_safety import (
+    detect_uinput_leak_risk,
+    uinput_leak_risk_check,
+    uinput_leak_risk_possible,
+    uinput_read_write_accessible,
+)
+
 
 # Match the ALLOWED_STATUS_VALUES + ALLOWED_OVERALL_VALUES the cua-driver
 # integration test pins. If health_report widens its vocabulary, add here.
@@ -702,6 +709,52 @@ def _drive_health_report_or_fallback(
         )
 
 
+def _augment_report_with_uinput_leak_risk(report: Dict[str, Any]) -> None:
+    """Append an actionable check when this host hits the known-unsafe
+    Linux/X11 + old-cua-driver + inaccessible-uinput combination
+    (trycua/cua#2618, fixed by trycua/cua#2631; Hermes #74148).
+
+    Mutates ``report`` in place: appends to ``checks`` and, when the report
+    was otherwise ``ok``, downgrades ``overall`` to ``degraded`` (an
+    already-``degraded``/``failed`` overall is left as-is — this only ever
+    adds signal, never removes it). No-op when the combination isn't
+    detected, so a healthy/non-Linux/fixed-driver host's report is
+    byte-for-byte unchanged.
+
+    The platform/DISPLAY/version triple is checked first and, when it
+    already rules the risk out, ``/dev/uinput`` is never opened at all —
+    running doctor against a fixed (>=0.13.1) or non-Linux host does no
+    device I/O.
+    """
+    platform_value = report.get("platform")
+    if not isinstance(platform_value, str):
+        platform_value = sys.platform
+    driver_version = report.get("driver_version")
+    if not isinstance(driver_version, str):
+        driver_version = None
+    display = os.environ.get("DISPLAY")
+
+    if not uinput_leak_risk_possible(
+        platform=platform_value, display=display, driver_version=driver_version
+    ):
+        return
+
+    risk = detect_uinput_leak_risk(
+        platform=platform_value,
+        display=display,
+        driver_version=driver_version,
+        uinput_accessible=uinput_read_write_accessible(),
+    )
+    if risk is None:
+        return
+
+    checks = report.setdefault("checks", [])
+    if isinstance(checks, list):
+        checks.append(uinput_leak_risk_check(risk))
+    if report.get("overall") == "ok":
+        report["overall"] = "degraded"
+
+
 def _print_text_report(
     report: Dict[str, Any],
     color: bool,
@@ -839,6 +892,8 @@ def run_doctor(
     except RuntimeError as e:
         print(f"cua-driver health_report failed: {e}", file=sys.stderr)
         return 2
+
+    _augment_report_with_uinput_leak_risk(report)
 
     identity = _build_identity(binary, report)
 
