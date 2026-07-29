@@ -646,8 +646,14 @@ async def test_session_hygiene_skips_compression_during_failure_cooldown(monkeyp
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = None
-    runner._hygiene_compression_failure_cooldowns = {"sess-1": time.time() + 300}
+    # Make get_compression_failure_cooldown return an active cooldown for sess-1
+    _fake_db = MagicMock()
+    _fake_db.get_compression_failure_cooldown.return_value = {
+        "cooldown_until": time.time() + 300,
+        "remaining_seconds": 300,
+        "error": "previous failure",
+    }
+    runner._session_db = SimpleNamespace(_db=_fake_db)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(
@@ -818,7 +824,11 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     assert elapsed < 2.0
     assert worker_started.is_set()
     assert runner._run_agent.await_count == 1
-    assert runner._hygiene_compression_failure_cooldowns["sess-timeout"] > time.time()
+    assert fake_db.record_compression_failure_cooldown.call_count == 1
+    _call_args = fake_db.record_compression_failure_cooldown.call_args[0]
+    assert _call_args[0] == "sess-timeout"  # session_id
+    assert _call_args[1] > time.time()  # cooldown_until
+    assert _call_args[2] == "hygiene timeout"  # error
     timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
     assert len(timeout_warnings) == 1
     fake_db.archive_and_compact.assert_not_called()
@@ -1553,7 +1563,7 @@ async def test_hygiene_slow_but_streaming_worker_survives_past_timeout(
         "  hygiene_total_ceiling_seconds: 10\n"
         "  hygiene_failure_cooldown_seconds: 120\n",
     )
-    runner._hygiene_compression_failure_cooldowns = {}
+    runner._session_db = SimpleNamespace(_db=MagicMock())
 
     result = await runner._handle_message(event)
 
@@ -1566,7 +1576,8 @@ async def test_hygiene_slow_but_streaming_worker_survives_past_timeout(
         s for s in adapter.sent if "Context compression timed out" in s["content"]
     ]
     assert timeout_warnings == []
-    assert "sess-progress" not in runner._hygiene_compression_failure_cooldowns
+    # No cooldown was recorded because compression succeeded
+    runner._session_db._db.record_compression_failure_cooldown.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1616,7 +1627,6 @@ async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
         "  hygiene_total_ceiling_seconds: 0.3\n"
         "  hygiene_failure_cooldown_seconds: 120\n",
     )
-    runner._hygiene_compression_failure_cooldowns = {}
     runner._session_db = SimpleNamespace(_db=MagicMock())
 
     started = time.monotonic()
@@ -1635,7 +1645,8 @@ async def test_hygiene_trickle_stream_is_bounded_by_total_ceiling(
         s for s in adapter.sent if "Context compression timed out" in s["content"]
     ]
     assert len(timeout_warnings) == 1
-    assert runner._hygiene_compression_failure_cooldowns["sess-progress"] > time.time()
+    # A cooldown was recorded because the stream timed out
+    runner._session_db._db.record_compression_failure_cooldown.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_session_hygiene_does_not_repoint_when_rotated_transcript_write_fails(

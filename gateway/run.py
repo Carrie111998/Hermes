@@ -13834,18 +13834,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 if _needs_compress:
-                    _cooldowns = getattr(self, "_hygiene_compression_failure_cooldowns", None)
-                    if _cooldowns is None:
-                        _cooldowns = {}
-                        self._hygiene_compression_failure_cooldowns = _cooldowns
-                    _cooldown_key = session_entry.session_id
-                    _cooldown_until = float(_cooldowns.get(_cooldown_key) or 0.0)
-                    if _cooldown_until > time.time():
+                    _cooldown = None
+                    _session_db_ref = getattr(self, "_session_db", None)
+                    if _session_db_ref is not None:
+                        try:
+                            _cooldown = await _session_db_ref.get_compression_failure_cooldown(
+                                session_entry.session_id
+                            )
+                        except Exception:
+                            pass
+                    if _cooldown is not None:
                         logger.info(
                             "Session hygiene: skipping compression for %s; "
                             "previous failure cooldown active for %.1fs",
-                            _cooldown_key,
-                            max(0.0, _cooldown_until - time.time()),
+                            session_entry.session_id,
+                            _cooldown.get("remaining_seconds", 0),
                         )
                         _needs_compress = False
 
@@ -14018,9 +14021,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             _hyg_cleanup_deferred = True
                                             if _hyg_failure_cooldown_seconds >= 0:
-                                                self._hygiene_compression_failure_cooldowns[
-                                                    session_entry.session_id
-                                                ] = time.time() + _hyg_failure_cooldown_seconds
+                                                _session_db_ref = getattr(self, "_session_db", None)
+                                                if _session_db_ref is not None:
+                                                    try:
+                                                        await _session_db_ref.record_compression_failure_cooldown(
+                                                            session_entry.session_id,
+                                                            time.time() + _hyg_failure_cooldown_seconds,
+                                                            "hygiene timeout",
+                                                        )
+                                                    except Exception:
+                                                        pass
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
                                                 "made no progress for %.1fs "
@@ -14183,16 +14193,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # fresh.
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
                                     if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
-                                        if _hyg_failure_cooldown_seconds >= 0:
-                                            self._hygiene_compression_failure_cooldowns[
-                                                session_entry.session_id
-                                            ] = time.time() + _hyg_failure_cooldown_seconds
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message
                                         # reaches gateway users directly.
                                         from agent.redact import redact_sensitive_text
                                         _err = redact_sensitive_text(_err, force=True)
+                                        _err_redacted = _err
+                                        if _hyg_failure_cooldown_seconds >= 0:
+                                            _session_db_ref = getattr(self, "_session_db", None)
+                                            if _session_db_ref is not None:
+                                                try:
+                                                    await _session_db_ref.record_compression_failure_cooldown(
+                                                        session_entry.session_id,
+                                                        time.time() + _hyg_failure_cooldown_seconds,
+                                                        _err_redacted,
+                                                    )
+                                                except Exception:
+                                                    pass
                                         _warn_msg = (
                                             "⚠️ Context compression aborted "
                                             f"({_err}). No messages were dropped — "

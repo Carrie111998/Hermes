@@ -199,7 +199,7 @@ import {
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
-import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
+import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers, stopVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import {
   computeWindowOptions,
@@ -2720,6 +2720,109 @@ async function releaseBackendLockForUpdate(updateRoot) {
   return releaseBackendLock(updateRoot, 'updates')
 }
 
+// ---------------------------------------------------------------------------
+// Windows gateway pause/resume for update (Layer 1, #74386)
+// ---------------------------------------------------------------------------
+//
+// The `releaseBackendLockForUpdate` above only stops backends the desktop
+// spawned itself (primary window + pool).  Gateway processes run as
+// python(w).exe outside the desktop's PID tree, so they survive that cleanup
+// and keep the venv locked — and the subsequent `scanVenvBlockers` finds them
+// as blockers, aborting the update before the CLI updater even starts.
+//
+// The CLI updater (`hermes update`) already knows how to pause and resume
+// gateways, but the Electron preflight aborts before reaching it.  Here we
+// pause gateways ourselves via the same Python helper, then pass the resume
+// token to the CLI updater so it skips its own pause (avoids double-pause).
+//
+// Both functions are no-ops off Windows (the gateway lock hazard is a Windows
+// .pyd mandatory-lock phenomenon).
+
+/** Pause Windows gateways and return the JSON resume token (or null). */
+async function pauseWindowsGatewaysForUpdate(updateRoot) {
+  if (!IS_WINDOWS) {
+    return null
+  }
+
+  const venvPython = getVenvPython(updateRoot)
+
+  if (!fileExists(venvPython)) {
+    return null
+  }
+
+  try {
+    const { stdout } = await new Promise((resolve, reject) => {
+      execFile(
+        venvPython,
+        ['-m', 'hermes_cli._gateway_update_lock', 'pause'],
+        {
+          cwd: updateRoot,
+          encoding: 'utf-8',
+          timeout: 30000,
+          windowsHide: true,
+        },
+        (err, stdout, stderr) => {
+          if (err) {
+            reject(err)
+          } else {
+            resolve({ stdout, stderr })
+          }
+        }
+      )
+    })
+
+    const parsed = JSON.parse(stdout)
+
+    if (parsed && parsed.ok === true) {
+      return parsed.token ?? null
+    }
+
+    rememberLog(`[updates] gateway pause returned failure: ${parsed?.error ?? 'unknown'}`)
+
+    return null
+  } catch (err) {
+    rememberLog(`[updates] gateway pause subprocess failed: ${err.message}`)
+    return null
+  }
+}
+
+/** Resume Windows gateways from a previously-returned token (best-effort). */
+async function resumeWindowsGatewaysAfterUpdate(updateRoot, token) {
+  if (!IS_WINDOWS || !token) {
+    return
+  }
+
+  const venvPython = getVenvPython(updateRoot)
+
+  if (!fileExists(venvPython)) {
+    return
+  }
+
+  try {
+    await new Promise((resolve, reject) => {
+      execFile(
+        venvPython,
+        ['-m', 'hermes_cli._gateway_update_lock', 'resume', JSON.stringify(token)],
+        {
+          cwd: updateRoot,
+          encoding: 'utf-8',
+          timeout: 30000,
+          windowsHide: true,
+        },
+        (err, stdout, stderr) => {
+          if (err) {
+            reject(err)
+          } else {
+            resolve({ stdout, stderr })
+          }
+        }
+      )
+    })
+  } catch (err) {
+    rememberLog(`[updates] gateway resume subprocess failed (best-effort): ${err.message}`)
+  }
+}
+
 // Shared backend teardown + venv-shim unlock wait. Used by BOTH the self-update
 // hand-off and the desktop uninstaller — they have the identical Windows
 // problem: the desktop's backend (and the grandchildren IT spawned — a hermes
@@ -2923,6 +3026,13 @@ async function applyUpdates(opts = {}) {
       return { ok: false, error: message }
     }
 
+    // Pause Windows gateway processes BEFORE the venv-blocker scan (Layer 1,
+    // #74386).  The desktop's own backend cleanup above cannot reach gateway
+    // processes (they run as python(w).exe outside the desktop's PID tree),
+    // so without this step the blocker scan below finds them and aborts the
+    // update — before the CLI updater even gets to run its own gateway pause.
+    const gatewayToken = await pauseWindowsGatewaysForUpdate(updateRoot)
+
     // Preflight: after releasing our own backends, check for remaining
     // Hermes processes running from this venv.  The updater normally refuses
     // when it detects a holder, but because the updater is spawned detached
@@ -2939,6 +3049,8 @@ async function applyUpdates(opts = {}) {
         const message = formatBlockerMessage(scanOutcome.result)
 
         rememberLog(`[updates] venv-blocked: ${scanOutcome.result.processes.length} process(es) hold the install`)
+        // Resume gateways we paused before aborting (#74386).
+        await resumeWindowsGatewaysAfterUpdate(updateRoot, gatewayToken)
         emitUpdateProgress({ stage: 'error', message, percent: null })
         startHermes().catch(() => {})
 
@@ -2949,6 +3061,8 @@ async function applyUpdates(opts = {}) {
         const message = formatProbeFailedMessage()
 
         rememberLog(`[updates] venv-blocker probe failed: ${scanOutcome.error}`)
+        // Resume gateways we paused before aborting (#74386).
+        await resumeWindowsGatewaysAfterUpdate(updateRoot, gatewayToken)
         emitUpdateProgress({ stage: 'error', message, percent: null })
         startHermes().catch(() => {})
 
@@ -2963,6 +3077,9 @@ async function applyUpdates(opts = {}) {
       env: {
         ...process.env,
         HERMES_HOME,
+        HERMES_WINDOWS_GATEWAY_RESUME_TOKEN: gatewayToken
+          ? JSON.stringify(gatewayToken)
+          : undefined,
         PATH: pathWithHermesManagedNode(venvBin)
       },
       detached: true,
