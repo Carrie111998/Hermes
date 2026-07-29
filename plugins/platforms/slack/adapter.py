@@ -111,6 +111,101 @@ _SLACK_SPECIAL_MENTION_RE = re.compile(
     r"<!(?:everyone|channel|here)(?:\|[^>\n]*)?>", re.IGNORECASE
 )
 
+_SLACK_REPLY_MODE_THREAD = "thread"
+_SLACK_REPLY_MODE_CHANNEL = "channel"
+_SLACK_REPLY_MODE_AUTO = "auto"
+
+_SLACK_CHANNEL_REPLY_DIRECTIVE_RE = re.compile(
+    r"""
+    \b(?:
+        (?:keep|stay)\s+(?:(?:this|it)\s+)?(?:in|on)\s+(?:the\s+)?channel
+        |(?:keep|stay)\s+(?:this\s+)?here
+        |(?:reply|answer|respond|post)\s+(?:to\s+)?(?:this\s+)?here
+        |(?:no|without)\s+(?:a\s+)?thread
+        |(?:do\s+not|don't)\s+(?:start|use|make|open)\s+(?:a\s+)?thread
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_SLACK_THREAD_REPLY_DIRECTIVE_RE = re.compile(
+    r"""
+    \b(?:
+        thread\s+this
+        |(?:take|move|put)\s+(?:this|it)\s+(?:to|into)\s+(?:a|the)\s+thread
+        |(?:reply|answer|respond|continue)\s+(?:to\s+)?(?:this\s+)?in\s+(?:a|the)\s+thread
+        |(?:start|open)\s+(?:a|the)\s+thread
+        |(?:do\s+not|don't)\s+(?:reply|answer|respond)\s+here
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_SLACK_INVOLVED_REQUEST_RE = re.compile(
+    r"""
+    \b(?:
+        analy[sz]e|audit|debug|diagnose|investigate|research|review
+        |compare|evaluate|assess|plan|design|implement|build
+        |walk\s+me\s+through|step[\s-]+by[\s-]+step|deep[\s-]+dive
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_SLACK_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+", re.MULTILINE)
+
+
+def _normalize_slack_reply_mode(raw: Any) -> str:
+    """Normalize legacy booleans and the adaptive Slack reply mode.
+
+    ``True``/``"true"`` retain the historical thread-per-message behavior;
+    ``False``/``"false"`` retain channel-wide replies. ``"auto"`` opts into
+    contextual routing. Unknown values fail safe to the historical default.
+    """
+    if isinstance(raw, bool):
+        return _SLACK_REPLY_MODE_THREAD if raw else _SLACK_REPLY_MODE_CHANNEL
+    if raw is None:
+        return _SLACK_REPLY_MODE_THREAD
+    value = str(raw).strip().lower()
+    if value in {"true", "on", "yes", "1", _SLACK_REPLY_MODE_THREAD}:
+        return _SLACK_REPLY_MODE_THREAD
+    if value in {"false", "off", "no", "0", _SLACK_REPLY_MODE_CHANNEL}:
+        return _SLACK_REPLY_MODE_CHANNEL
+    if value == _SLACK_REPLY_MODE_AUTO:
+        return _SLACK_REPLY_MODE_AUTO
+    return _SLACK_REPLY_MODE_THREAD
+
+
+def _slack_auto_reply_in_thread(
+    text: str,
+    files: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Choose a human-like surface for a top-level Slack message.
+
+    The policy is deliberately deterministic: explicit surface requests win,
+    then clearly involved prompts move to a thread, while ordinary short
+    conversation stays in the channel. Existing Slack threads bypass this
+    classifier and always remain threaded.
+    """
+    authored = str(text or "").strip()
+    if _SLACK_CHANNEL_REPLY_DIRECTIVE_RE.search(authored):
+        return False
+    if _SLACK_THREAD_REPLY_DIRECTIVE_RE.search(authored):
+        return True
+
+    nonempty_lines = [line for line in authored.splitlines() if line.strip()]
+    list_items = _SLACK_LIST_ITEM_RE.findall(authored)
+    has_code_block = "```" in authored
+    has_involved_intent = bool(_SLACK_INVOLVED_REQUEST_RE.search(authored))
+    has_multiple_files = len(files or []) > 1
+
+    return bool(
+        has_code_block
+        or has_multiple_files
+        or has_involved_intent
+        or len(authored) >= 320
+        or len(nonempty_lines) >= 5
+        or len(list_items) >= 2
+    )
+
+
 # Cap on how many thread-root images are downloaded and delivered when the
 # bot is mentioned mid-thread (cold-start hydrate). Prior thread messages'
 # attachments are surfaced as text markers only — the root is special
@@ -3077,8 +3172,12 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             if self._cron_continuable_surface() != "in_channel":
                 return
-            # reply_in_thread defaults True (legacy: reply in a thread).
-            if self.config.extra.get("reply_in_thread", True):
+            # Only an explicitly channel-wide mode guarantees the shared
+            # in-channel continuation surface. Auto may route an involved
+            # continuation into a thread, so retain the warning there.
+            if _normalize_slack_reply_mode(
+                self.config.extra.get("reply_in_thread", True)
+            ) != _SLACK_REPLY_MODE_CHANNEL:
                 logger.warning(
                     "[Slack] %s: cron_continuable_surface=in_channel is set "
                     "WITHOUT reply_in_thread=false. A continuable in-channel "
@@ -3130,11 +3229,15 @@ class SlackAdapter(BasePlatformAdapter):
         Prefers metadata thread_id (the thread parent's ts, set by the
         gateway) over reply_to (which may be a child message's ts).
 
-        When ``reply_in_thread`` is ``false`` in the platform extra config,
-        top-level channel messages receive direct channel replies instead of
-        thread replies.  Messages that originate inside an existing thread are
-        always replied to in-thread to preserve conversation context.
+        ``reply_in_thread`` accepts the legacy booleans plus ``"auto"``.
+        ``false`` sends top-level channel replies directly; ``auto`` uses the
+        inbound handler's contextual decision. Messages that originate inside
+        an existing thread are always replied to in-thread.
         """
+        reply_mode = _normalize_slack_reply_mode(
+            self.config.extra.get("reply_in_thread", True)
+        )
+
         # When reply_in_thread is disabled (default: True for backward compat),
         # only thread messages that are already part of an existing thread.
         # For top-level channel messages, the inbound handler sets
@@ -3144,12 +3247,28 @@ class SlackAdapter(BasePlatformAdapter):
         # top-level message. reply_to is the incoming message's own id, so
         # when thread_id == reply_to the "thread" is synthetic and we reply
         # directly in the channel instead.
-        if not self.config.extra.get("reply_in_thread", True):
+        if reply_mode == _SLACK_REPLY_MODE_CHANNEL:
             md = metadata or {}
             existing_thread = md.get("thread_id") or md.get("thread_ts")
             if existing_thread and reply_to and existing_thread == reply_to:
                 existing_thread = None
             return existing_thread or None
+
+        if reply_mode == _SLACK_REPLY_MODE_AUTO:
+            # The inbound classifier represents its decision in the durable
+            # routing state: a thread-worthy top-level turn carries its message
+            # ts as thread_id; a conversational in-channel turn carries no
+            # thread_id. Existing threads likewise carry their real root ts.
+            md = metadata or {}
+            existing_thread = md.get("thread_id") or md.get("thread_ts")
+            if existing_thread:
+                return existing_thread
+            # A metadata-bearing gateway send with no thread id is an explicit
+            # in-channel auto decision. A direct adapter caller that supplies
+            # only reply_to retains normal explicit-reply semantics.
+            if metadata is not None:
+                return None
+            return reply_to
 
         if metadata:
             if metadata.get("thread_id"):
@@ -5555,7 +5674,7 @@ class SlackAdapter(BasePlatformAdapter):
         else:
             # Channel message session scoping.
             #
-            # Three cases:
+            # Four cases:
             #   (a) genuine thread reply   → scope session per thread
             #   (b) top-level, reply_in_thread=true (the default)  →
             #       legacy behaviour: each top-level message becomes its
@@ -5564,6 +5683,9 @@ class SlackAdapter(BasePlatformAdapter):
             #   (c) top-level, reply_in_thread=false → scope one session
             #       across the whole channel so context accumulates across
             #       messages (#15421 bug 1)
+            #   (d) top-level, reply_in_thread=auto → use a deterministic
+            #       conversational-vs-involved classifier; the chosen visible
+            #       surface and session scope always agree
             event_thread_ts_raw = event.get("thread_ts")
             # Align with ``is_thread_reply`` below — a ``thread_ts ==
             # ts`` payload (some thread-root shapes) is not a real reply
@@ -5573,18 +5695,31 @@ class SlackAdapter(BasePlatformAdapter):
             # variants (Copilot on #15464).
             if event_thread_ts_raw and event_thread_ts_raw != ts:
                 thread_ts = event_thread_ts_raw
-            elif self.config.extra.get("reply_in_thread", True):
-                # Legacy default: treat ts as a synthetic thread root so
-                # this top-level message gets its own session.
-                thread_ts = ts
             else:
-                # reply_in_thread=false: no thread key → session manager
-                # groups by (platform, channel_id, None) and the channel
-                # shares one conversation.  reply_to_message_id at the
-                # outbound side is already gated on ``thread_ts != ts``
-                # so None here produces a non-threaded reply without
-                # further changes.
-                thread_ts = None
+                reply_mode = _normalize_slack_reply_mode(
+                    self.config.extra.get("reply_in_thread", True)
+                )
+                if reply_mode == _SLACK_REPLY_MODE_AUTO:
+                    thread_ts = (
+                        ts
+                        if _slack_auto_reply_in_thread(
+                            original_text,
+                            files=event.get("files") or [],
+                        )
+                        else None
+                    )
+                elif reply_mode == _SLACK_REPLY_MODE_THREAD:
+                    # Legacy default: treat ts as a synthetic thread root so
+                    # this top-level message gets its own session.
+                    thread_ts = ts
+                else:
+                    # reply_in_thread=false: no thread key → session manager
+                    # groups by (platform, channel_id, None) and the channel
+                    # shares one conversation.  reply_to_message_id at the
+                    # outbound side is already gated on ``thread_ts != ts``
+                    # so None here produces a non-threaded reply without
+                    # further changes.
+                    thread_ts = None
 
         # In channels, respond if:
         #   (unless ignore_other_user_mentions is on and the message opens by

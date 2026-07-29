@@ -1960,3 +1960,21 @@ class TestSlackReplyInThreadProgressRouting:
             source_thread_id=None,
             event_message_id="1700000000.000100",
         ) == "1700000000.000100"
+
+    def test_slack_auto_uses_per_message_session_decision(self):
+        from gateway.run import _slack_progress_uses_thread
+
+        assert _slack_progress_uses_thread("auto", source_thread_id=None) is False
+        assert (
+            _slack_progress_uses_thread(
+                "auto",
+                source_thread_id="1700000000.000100",
+            )
+            is True
+        )
+
+    def test_slack_progress_normalizes_channel_aliases(self):
+        from gateway.run import _slack_progress_uses_thread
+
+        for value in (False, "false", "off", "no", "0", "channel"):
+            assert _slack_progress_uses_thread(value, "1700000000.000100") is False

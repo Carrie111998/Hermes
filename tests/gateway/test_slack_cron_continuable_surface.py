@@ -129,6 +129,19 @@ def test_warns_when_in_channel_with_reply_in_thread_true(caplog):
                for r in caplog.records)
 
 
+def test_warns_when_in_channel_with_adaptive_replies(caplog):
+    """Auto does not guarantee the flat continuation surface."""
+    adapter = _make_adapter(
+        {"cron_continuable_surface": "in_channel", "reply_in_thread": "auto"}
+    )
+    with caplog.at_level(logging.WARNING):
+        adapter._warn_if_inchannel_without_flat_reply("Acme")
+    assert any(
+        "cron_continuable_surface=in_channel" in record.message
+        for record in caplog.records
+    )
+
+
 def test_no_warning_when_properly_paired(caplog):
     """in_channel + reply_in_thread: false is the correct pairing → silent."""
     adapter = _make_adapter(
