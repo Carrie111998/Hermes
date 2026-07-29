@@ -215,6 +215,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # OpenRouter-prefixed models resolve via OpenRouter live API or models.dev.
     "claude-fable-5": 1000000,
     "claude-fable": 1000000,
+    "claude-opus-5": 1000000,
     "claude-sonnet-5": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4.8": 1000000,
@@ -2201,11 +2202,18 @@ def get_model_context_length(
     # acting context, so they're ignored here.
     if (provider or "").strip().lower() == "moa":
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config import (
+                get_compatible_custom_providers,
+                load_config,
+            )
             from hermes_cli.moa_config import resolve_moa_preset
             from hermes_cli.runtime_provider import resolve_runtime_provider
 
-            preset = resolve_moa_preset(load_config().get("moa") or {}, model)
+            config = load_config()
+            effective_custom_providers = custom_providers
+            if effective_custom_providers is None:
+                effective_custom_providers = get_compatible_custom_providers(config)
+            preset = resolve_moa_preset(config.get("moa") or {}, model)
             agg = preset.get("aggregator") or {}
             agg_provider = str(agg.get("provider") or "").strip()
             agg_model = str(agg.get("model") or "").strip()
@@ -2215,7 +2223,8 @@ def get_model_context_length(
                     agg_model,
                     base_url=rt.get("base_url", "") or "",
                     api_key=rt.get("api_key", "") or "",
-                    provider=agg_provider,
+                    provider=rt.get("provider") or agg_provider,
+                    custom_providers=effective_custom_providers,
                 )
         except Exception:
             logger.debug("MoA aggregator context-length resolution failed", exc_info=True)
@@ -2420,21 +2429,27 @@ def get_model_context_length(
         if context_length is not None:
             return context_length
         if not _is_known_provider_base_url(base_url):
-            # 2b. Ollama native /api/show — any URL might be an Ollama server
-            # (local, cloud, or custom hosting).  Non-Ollama servers return
-            # 404/405 quickly.  Fall through on failure.
-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
-            if ctx is not None:
-                if not _skip_persistent_context_cache(base_url, provider):
-                    save_context_length(model, base_url, ctx)
-                return ctx
-            # 3. Try querying local server directly
+            # For local endpoints, run the probe that respects configured
+            # Modelfile context values first.  _query_local_context_length
+            # prefers num_ctx from Modelfile, while _query_ollama_api_show
+            # returns the GGUF training max first which can be larger and
+            # would create a false-safe window for compression (#63122).
+            # Non-local endpoints preserve the existing GGUF-first behavior.
             if is_local_endpoint(base_url):
                 local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
                 if local_ctx and local_ctx > 0:
                     if not _skip_persistent_context_cache(base_url, provider):
                         _maybe_cache_local_context_length(model, base_url, local_ctx)
                     return local_ctx
+            # 2b. Ollama native /api/show — non-local endpoints preserve
+            # the existing generic /api/show GGUF-first behavior.
+            # Non-Ollama servers return 404/405 quickly.
+            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+            if ctx is not None:
+                if not _skip_persistent_context_cache(base_url, provider):
+                    save_context_length(model, base_url, ctx)
+                return ctx
+            # 3. Probe-down fallback after endpoint-specific detection failed
             logger.info(
                 "Could not detect context length for model %r at %s — "
                 "defaulting to %s tokens (probe-down). Set model.context_length "

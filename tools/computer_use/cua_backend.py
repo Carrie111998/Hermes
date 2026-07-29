@@ -166,6 +166,17 @@ _DESKTOP_WINDOW_NAMES = (
     "finder", "desktop", "dock",              # macOS desktop / shell
 )
 
+# Linux/X11 can surface GNOME Shell / desktop backdrop windows before real app
+# windows and cua-driver 0.6.x currently does not assign a useful z-order for
+# them. These windows are targetable X11 windows but do not produce screenshots
+# through get_window_state, so default app capture must skip them.
+_NON_APP_WINDOW_TITLE_PREFIXES = (
+    "@!",          # GNOME Shell background/monitor helper windows
+    "Desktop",
+    "gnome-shell",
+    "GNOME Shell",
+)
+
 
 # Env var cua-driver reads to gate its anonymous usage telemetry (PostHog).
 # Setting it to "0" disables telemetry; absence => the binary's own default
@@ -284,7 +295,7 @@ def _linux_x11_active_window_id() -> Optional[int]:
         proc = subprocess.run(
             ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=2,
             check=False,
         )
@@ -293,6 +304,15 @@ def _linux_x11_active_window_id() -> Optional[int]:
     if proc.returncode != 0:
         return None
     return _parse_xprop_net_active_window(proc.stdout or "")
+
+
+def _is_real_app_window(w: Dict[str, Any]) -> bool:
+    """Return False for desktop/shell helper windows that capture as empty."""
+    title = w.get("title", "")
+    return not any(
+        title.startswith(p) or title.lower().startswith(p.lower())
+        for p in _NON_APP_WINDOW_TITLE_PREFIXES
+    )
 
 
 def _select_capture_target(
@@ -305,25 +325,26 @@ def _select_capture_target(
 
     Callers pass windows already sorted by ``z_index`` descending (higher =
     frontmost). When ordering is informative, keep that frontmost contract.
-    On Linux/X11, for unqualified default captures only (no app filter and no
-    exact pid/window_id), when every on-screen candidate shares the same
-    ``z_index`` (tied or unknown), prefer ``_NET_ACTIVE_WINDOW`` over list
-    order (#58026). Exact-target captures must not pay for an ``xprop`` probe.
+    For unqualified default captures (no app filter and no exact
+    pid/window_id) on Linux, desktop/shell helper windows (GNOME ``ding``
+    "Desktop Icons", ``@!x,y;BDHF`` backdrop helpers) are skipped first —
+    they are targetable X11 windows but capture as empty. Then, when every
+    remaining candidate shares the same ``z_index`` (tied or unknown, the
+    common Linux/X11 case), prefer ``_NET_ACTIVE_WINDOW`` over list order
+    (#58026). Exact-target captures must not pay for an ``xprop`` probe.
     """
     candidates = [w for w in windows if not w["off_screen"]]
     pool = candidates
-    if (
-        not exact_target
-        and not app_requested
-        and pool
-        and sys.platform == "linux"
-        and _z_index_uninformative(pool)
-    ):
-        active_id = _linux_x11_active_window_id()
-        if active_id is not None:
-            for w in pool:
-                if w.get("window_id") == active_id:
-                    return w
+    if not exact_target and not app_requested and sys.platform == "linux":
+        real_apps = [w for w in candidates if _is_real_app_window(w)]
+        if real_apps:
+            pool = real_apps
+        if pool and _z_index_uninformative(pool):
+            active_id = _linux_x11_active_window_id()
+            if active_id is not None:
+                for w in pool:
+                    if w.get("window_id") == active_id:
+                        return w
     if pool:
         return pool[0]
     return windows[0]
@@ -358,7 +379,7 @@ def _resolve_mcp_invocation(
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [driver_cmd, "manifest"],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             stdin=subprocess.DEVNULL,
             # cua-driver is a third-party binary — never hand it provider
             # API keys via inherited env (same policy as the MCP and CLI
@@ -424,7 +445,7 @@ def _cua_driver_supports_no_overlay(driver_cmd: str) -> bool:
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [driver_cmd, "--help"],
-            capture_output=True, text=True, timeout=3.0,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3.0,
             stdin=subprocess.DEVNULL,
             env=_sanitize_subprocess_env(cua_driver_child_env()),
         )
@@ -536,11 +557,17 @@ def cua_driver_binary_available() -> bool:
     return resolve_cua_driver_cmd() is not None
 
 
-def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]:
+def cua_driver_update_check(*, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """Run ``cua-driver check-update --json`` and return its parsed state.
 
     The payload mirrors the ``check_for_update`` MCP tool:
     ``{current_version, latest_version, update_available, ...}``.
+
+    ``timeout`` defaults to 8s on POSIX and 25s on Windows — first-spawn of
+    the exe there routinely eats several seconds in Defender/SmartScreen
+    scanning, and a false timeout is expensive: callers treat ``None`` as
+    indeterminate, and the ``install_cua_driver(upgrade=True)`` path used to
+    fall through to a full multi-minute reinstall on it.
 
     Returns ``None`` (callers should stay quiet) when the result is
     indeterminate: the binary is missing, the driver is too old to support
@@ -548,6 +575,8 @@ def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]
     ``error`` field is set), or the output didn't parse. Best-effort; never
     raises.
     """
+    if timeout is None:
+        timeout = 25.0 if sys.platform == "win32" else 8.0
     driver_cmd = resolve_cua_driver_cmd()
     if not driver_cmd:
         return None
@@ -555,7 +584,7 @@ def cua_driver_update_check(*, timeout: float = 8.0) -> Optional[Dict[str, Any]]
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
             [driver_cmd, "check-update", "--json"],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             # Some older drivers don't have the verb and fall through to a
             # stdin-reading mode rather than erroring — DEVNULL gives them EOF
             # so they exit fast instead of blocking until the timeout.
@@ -880,6 +909,10 @@ class _CuaDriverSession:
         self._shutdown_event: Optional[asyncio.Event] = None  # created on bridge loop
         self._lifecycle_future = None  # concurrent.futures.Future
         self._setup_error: Optional[BaseException] = None
+        # Stable driver-side identity declared through start_session.
+        # Used to revive a logical ended-session rejection without
+        # recursive call_tool re-entry or backend-owned state (#71166).
+        self._declared_session_id: Optional[str] = None
 
     def _require_started(self) -> None:
         if not self._started:
@@ -1141,6 +1174,67 @@ class _CuaDriverSession:
         return self._capability_version
 
     @staticmethod
+    def _logical_error_text(result: Dict[str, Any]) -> str:
+        """Flatten a logical MCP error into text for narrow classification."""
+        chunks: List[str] = []
+        for value in (result.get("data"), result.get("structuredContent")):
+            if isinstance(value, str):
+                chunks.append(value)
+            elif value is not None:
+                try:
+                    chunks.append(json.dumps(value, sort_keys=True))
+                except (TypeError, ValueError):
+                    chunks.append(str(value))
+        return "\n".join(chunks)
+
+    @classmethod
+    def _is_ended_session_result(cls, result: Any) -> bool:
+        """Recognise cua-driver's explicit recoverable ended-session result."""
+        if not isinstance(result, dict) or result.get("isError") is not True:
+            return False
+        message = cls._logical_error_text(result).lower()
+        return (
+            "session" in message
+            and ("has ended" in message or "session ended" in message)
+            and "start_session" in message
+        )
+
+    def _revive_declared_session_once(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        first_result: Dict[str, Any],
+        timeout: float,
+    ) -> Dict[str, Any]:
+        """Revive the stable session and replay one rejected tool call once."""
+        session_id = self._declared_session_id
+        if not session_id or name in self._LIFECYCLE_CALLS:
+            return first_result
+
+        logger.warning(
+            "cua-driver session %s ended during %s; reviving and retrying once",
+            session_id,
+            name,
+        )
+        revive_result = self._bridge.run(
+            self._call_tool_async("start_session", {"session": session_id}),
+            timeout=timeout,
+        )
+        if revive_result.get("isError") is True:
+            logger.warning(
+                "cua-driver session %s could not be revived: %s",
+                session_id,
+                self._logical_error_text(revive_result),
+            )
+            return first_result
+
+        # Return the second result as-is. A second rejection is surfaced; no loop.
+        return self._bridge.run(
+            self._call_tool_async(name, args),
+            timeout=timeout,
+        )
+
+    @staticmethod
     def _is_closed_session_error(exc: Exception) -> bool:
         """Return True for MCP/stdio failures that are recoverable by reconnecting."""
         name = exc.__class__.__name__
@@ -1235,7 +1329,7 @@ class _CuaDriverSession:
             for attempt in range(attempts):
                 try:
                     proc = _subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=max(15.0, timeout),
+                        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=max(15.0, timeout),
                         env=_sanitize_subprocess_env(cua_driver_child_env()),
                     )
                 except Exception as e:  # pragma: no cover - subprocess spawn failure
@@ -1318,28 +1412,19 @@ class _CuaDriverSession:
 
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         # A prior session may have died (MCP drop / driver crash): its
-        # lifecycle coro reset _started to False in its finally (#55048
-        # Bug 1). Re-enter start() so we rebuild the session instead of
-        # calling _require_started() straight into a "not started" raise or
-        # a None session. start() is idempotent when already started. Skip
-        # this for the start_session/end_session handshake, which start()/
-        # stop() drive directly while _started is still in flux.
+        # lifecycle coro reset _started to False in its finally (#55048).
         if not self._started and name not in self._LIFECYCLE_CALLS:
             logger.warning(
                 "cua-driver session not active on %s; (re)starting before call", name
             )
             self.start()
         self._require_started()
-        # The cua-driver daemon proxy returns POSIX EAGAIN ("Resource
-        # temporarily unavailable") for heavier calls like get_window_state when
-        # its non-blocking socket buffer is full. On some machines/builds this
-        # is persistent for get_window_state over the MCP stdio bridge, while
-        # the direct CLI transport keeps working. So: try the MCP path ONCE,
-        # and on the transient/transport error fall straight through to the CLI
-        # transport (which has its own retry + screenshot-to-file mitigation)
-        # rather than burning a long backoff chain on a path that won't recover.
+
         try:
-            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            result = self._bridge.run(
+                self._call_tool_async(name, args),
+                timeout=timeout,
+            )
         except Exception as e:
             if self._is_transient_daemon_error(e):
                 logger.warning(
@@ -1349,13 +1434,31 @@ class _CuaDriverSession:
                 return self._call_tool_via_cli(name, args, timeout)
             if not self._is_closed_session_error(e):
                 raise
-            # Daemon restart closes the cached stdio channel. Reconnect once and
-            # retry exactly one more time — never loop, to avoid hammering a
-            # genuinely dead daemon.
             logger.warning("cua-driver MCP session closed during %s; reconnecting once", name)
             with self._lock:
                 self._restart_session_locked()
-            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            result = self._bridge.run(
+                self._call_tool_async(name, args),
+                timeout=timeout,
+            )
+
+        # Remember only a successfully declared stable identity. Failed
+        # start_session calls must not leave stale recovery state behind.
+        if name == "start_session" and result.get("isError") is not True:
+            declared_id = args.get("session")
+            if isinstance(declared_id, str) and declared_id:
+                self._declared_session_id = declared_id
+
+        if self._is_ended_session_result(result):
+            result = self._revive_declared_session_once(name, args, result, timeout)
+
+        if (
+            name == "end_session"
+            and result.get("isError") is not True
+            and args.get("session") == self._declared_session_id
+        ):
+            self._declared_session_id = None
+        return result
 
 
 def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
@@ -1497,7 +1600,9 @@ def _ingest_windows(raw_windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "app_name": w.get("app_name", ""),
             "pid": pid_int,
             "window_id": window_id_int,
-            "off_screen": not w.get("is_on_screen", True),
+            # cua-driver 0.6.x on Linux may return JSON null here.
+            # Only explicit False means off-screen; null means unknown.
+            "off_screen": w.get("is_on_screen") is False,
             "title": w.get("title", ""),
             "z_index": z_index,
         })
@@ -1893,8 +1998,9 @@ class CuaDriverBackend(ComputerUseBackend):
             windows = filtered
 
         # Pick first on-screen window (sorted by z_index / z-order above).
-        # On Linux/X11, unqualified default captures with tied/unknown z_index
-        # may additionally consult _NET_ACTIVE_WINDOW (#58026).
+        # On Linux, unqualified default captures skip desktop/shell helper
+        # windows and, with tied/unknown z_index, may additionally consult
+        # _NET_ACTIVE_WINDOW (#58026).
         target = _select_capture_target(
             windows,
             app_requested=bool(app),
@@ -1909,7 +2015,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # Record the resolved app name so capture_after= follow-ups can re-target
         # the same app rather than falling back to the frontmost window.
         if app or not self._last_app:
-            self._last_app = app_name
+            self._last_app = app_name or app or ""
         self._last_target = {
             "pid": self._active_pid,
             "window_id": self._active_window_id,
@@ -2423,7 +2529,7 @@ class CuaDriverBackend(ComputerUseBackend):
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
             self._snapshot_tokens = {}
-            self._last_app = target["app_name"]  # retained for back-compat diagnostics
+            self._last_app = target["app_name"] or app  # retained for back-compat diagnostics
             self._last_target = {
                 "pid": self._active_pid,
                 "window_id": self._active_window_id,
