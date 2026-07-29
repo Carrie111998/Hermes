@@ -60,9 +60,13 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # Branch C: systemctl ops on a hermes-gateway unit.
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
-    # token orders because real reproductions show both.
-    r"|(?:p?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:p?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    # token orders because real reproductions show both. The leading `\b`
+    # anchors the command identifier so `kill` cannot match as a substring
+    # inside an unrelated word — without it, a shell variable named
+    # `SKILL="hermes-gateway-recovery"` matches (the `KILL` in `SKILL`) and
+    # a script containing no lifecycle command at all is wrongly blocked.
+    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
+    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
 )
 
 

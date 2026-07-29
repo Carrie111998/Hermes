@@ -50,6 +50,13 @@ class TestGatewayLifecyclePattern:
         "kill hermes gateway process",
         "pkill -f hermes.*gateway",
         "pkill -f gateway.*hermes",          # inverse token order
+        # The leading `\b` added to branch D must not weaken real detection:
+        # a kill command is still caught at line start, after leading
+        # whitespace, after a shell operator, and when uppercased.
+        "  kill -TERM $(pgrep -f hermes-gateway)",
+        "x=1 && pkill -9 -f hermes.*gateway",
+        "sudo pkill -f hermes-gateway",
+        "PKILL -F HERMES.*GATEWAY",
     ])
     def test_kill_commands(self, text):
         assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
@@ -84,6 +91,15 @@ class TestGatewayLifecyclePattern:
         "Monitor the gateway and tell me if a restart is recommended",
         "research how the OpenAI API gateway handles restart after rate limiting",
         "compare AWS API Gateway vs Cloudflare on restart latency",
+        # Regression: `kill` must not match as a *substring* of an unrelated
+        # word. Branch D previously lacked a leading `\b`, so the `KILL` inside
+        # `SKILL` matched and any script assigning a gateway-related skill name
+        # was blocked despite containing no lifecycle command at all.
+        'SKILL="hermes-gateway-launchd-recovery"',
+        'SKILL="hermes gateway notes"',
+        "MYSKILL=hermes-gateway-docs; echo $MYSKILL",
+        'echo "follow the hermes-gateway-launchd-recovery skill"',
+        "# upskill on hermes gateway internals",
     ])
     def test_safe_commands(self, text):
         assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
