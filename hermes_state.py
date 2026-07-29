@@ -2459,6 +2459,126 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
 
+    def fork_session(
+        self,
+        source_session_id: str,
+        fork_session_id: str,
+        *,
+        source: str,
+        title: str,
+    ) -> Dict[str, Any]:
+        """Atomically fork a session and its active transcript.
+
+        The source end marker, child row, transcript copy, and title assignment
+        are one write transaction. A duplicate id/title or a copy failure
+        therefore leaves the source untouched and no partial child behind.
+        """
+        clean_title = self.sanitize_title(title)
+
+        def _do(conn):
+            source_row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone()
+            if source_row is None:
+                raise KeyError(source_session_id)
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (fork_session_id,),
+            ).fetchone():
+                raise FileExistsError(fork_session_id)
+            if clean_title:
+                conflict = conn.execute(
+                    "SELECT id FROM sessions WHERE title = ? AND id != ?",
+                    (clean_title, fork_session_id),
+                ).fetchone()
+                if conflict:
+                    raise ValueError(
+                        f"Title '{clean_title}' is already in use by session "
+                        f"{conflict['id']}"
+                    )
+
+            now = time.time()
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, model, system_prompt, parent_session_id,
+                   cwd, git_branch, git_repo_root, profile_name, title,
+                   started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    fork_session_id,
+                    source,
+                    source_row["model"],
+                    source_row["system_prompt"],
+                    source_session_id,
+                    source_row["cwd"],
+                    source_row["git_branch"],
+                    source_row["git_repo_root"],
+                    source_row["profile_name"],
+                    clean_title,
+                    now,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO messages (
+                   session_id, role, content, tool_call_id, tool_calls,
+                   tool_name, effect_disposition, timestamp, token_count,
+                   finish_reason, reasoning, reasoning_content,
+                   reasoning_details, codex_reasoning_items,
+                   codex_message_items, platform_message_id, observed,
+                   active, compacted, api_content, display_kind,
+                   display_metadata
+                )
+                SELECT ?, role, content, tool_call_id, tool_calls,
+                       tool_name, effect_disposition, timestamp, token_count,
+                       finish_reason, reasoning, reasoning_content,
+                       reasoning_details, codex_reasoning_items,
+                       codex_message_items, platform_message_id, observed,
+                       1, 0, api_content, display_kind, display_metadata
+                FROM messages
+                WHERE session_id = ? AND active = 1
+                ORDER BY timestamp, id""",
+                (fork_session_id, source_session_id),
+            )
+            counts = conn.execute(
+                """SELECT COUNT(*) AS message_count,
+                          COALESCE(SUM(
+                              CASE
+                                  WHEN tool_calls IS NULL THEN 0
+                                  WHEN json_valid(tool_calls) = 0 THEN 0
+                                  WHEN json_type(tool_calls) = 'array'
+                                      THEN json_array_length(tool_calls)
+                                  ELSE 1
+                              END
+                          ), 0) AS tool_call_count
+                   FROM messages
+                   WHERE session_id = ? AND active = 1""",
+                (fork_session_id,),
+            ).fetchone()
+            conn.execute(
+                """UPDATE sessions
+                   SET message_count = ?, tool_call_count = ?
+                   WHERE id = ?""",
+                (
+                    counts["message_count"],
+                    counts["tool_call_count"],
+                    fork_session_id,
+                ),
+            )
+            conn.execute(
+                """UPDATE sessions
+                   SET ended_at = ?, end_reason = 'branched'
+                   WHERE id = ?""",
+                (now, source_session_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (fork_session_id,),
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
     def record_gateway_session_peer(
         self,
         session_id: str,

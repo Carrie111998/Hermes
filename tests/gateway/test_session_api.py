@@ -218,6 +218,32 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
 
 
 @pytest.mark.asyncio
+async def test_session_fork_title_conflict_leaves_source_unchanged(adapter, session_db):
+    """A rejected fork must not end the source or leave an unreported child."""
+    source_id = session_db.create_session("source-session", "api_server")
+    session_db.set_session_title(source_id, "Original")
+    session_db.append_message(source_id, "user", "keep this conversation live")
+    other_id = session_db.create_session("other-session", "api_server")
+    session_db.set_session_title(other_id, "Already used")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{source_id}/fork",
+            json={"id": "rejected-fork", "title": "Already used"},
+        )
+
+    assert resp.status == 400
+    assert session_db.get_session("rejected-fork") is None
+    source = session_db.get_session(source_id)
+    assert source["ended_at"] is None
+    assert source["end_reason"] is None
+    assert [m["content"] for m in session_db.get_messages(source_id)] == [
+        "keep this conversation live"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_session_chat_loads_history_and_preserves_session_headers(auth_adapter, session_db):
     session_id = session_db.create_session("chat-session", "api_server")
     session_db.set_session_title(session_id, "Chat")
