@@ -3320,13 +3320,19 @@ class BasePlatformAdapter(ABC):
         """
         self._session_store = session_store
     
-    def _history_media_paths_for_session(self, session_key: str) -> Optional[set]:
+    def _history_media_paths_for_session(self, session_key: str, exclude_paths: set | None = None) -> Optional[set]:
         """Return media paths already delivered in prior turns of this session.
 
         Loads the persisted transcript, drops the most recent assistant entry
         (which belongs to the current response), and scans the remaining history
         for MEDIA: tags and image_generate JSON payloads.  Used to prevent the
         model from re-delivering the same file when it echoes an old MEDIA tag.
+
+        ``exclude_paths`` lets the caller skip specific paths (e.g. ones extracted
+        from the *current* assistant message) so they are never treated as
+        "delivered in prior turns" even if the persisted transcript already
+        contains them. Fixes response_delivery_dropped when the agent's current
+        MEDIA: tag gets deduplicated against itself.
         """
         store = getattr(self, "_session_store", None)
         if not store:
@@ -3356,7 +3362,10 @@ class BasePlatformAdapter(ABC):
             return None
         # Avoid circular import: gateway.run already imports this module.
         from gateway.run import _collect_history_media_paths
-        return _collect_history_media_paths(history)
+        result = _collect_history_media_paths(history)
+        if exclude_paths:
+            result = {p for p in result if p not in exclude_paths}
+        return result
 
     @abstractmethod
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -5561,7 +5570,18 @@ class BasePlatformAdapter(ABC):
                 # The model may echo a previous MEDIA: tag or bare file path in
                 # a later response; without this guard the same file is sent
                 # repeatedly.
-                _history_media_paths = self._history_media_paths_for_session(session_key)
+                #
+                # Exclude the CURRENT turn's extracted media paths from the
+                # dedupe set: the agent persists its own response (including
+                # MEDIA tags) to the transcript before delivery runs, so the
+                # history scan would otherwise find the current file and
+                # eliminate it as "already delivered." That caused
+                # response_delivery_dropped with voice notes.
+                _current_media_paths = {path for path, _is_voice in media_files}
+                _history_media_paths = self._history_media_paths_for_session(
+                    session_key,
+                    exclude_paths=_current_media_paths,
+                )
                 if _history_media_paths:
                     media_files = [
                         (path, is_voice)
