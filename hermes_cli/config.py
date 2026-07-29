@@ -1584,6 +1584,14 @@ DEFAULT_CONFIG = {
                                       # failure-cooldown / anti-thrash / per-session
                                       # lock guards as every automatic compaction.
                                       # Example: 1800 = compact after 30 min idle.
+        "rpc_timeout": 300.0,          # RPC-level timeout for manual /compress and
+                                      # session.compress. When the LLM summarizer
+                                      # takes longer than this, the RPC call returns
+                                      # DeadlineExceeded. Increase this when using a
+                                      # slow local model (e.g. LM Studio, Ollama) that
+                                      # needs more time to generate the compressed
+                                      # summary. Independent of auxiliary.compression.timeout
+                                      # which governs the model-side LLM call timeout.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
