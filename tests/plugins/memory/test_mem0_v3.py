@@ -1,11 +1,21 @@
 """Tests for Mem0 v3 API — new tool names, paginated responses, update/delete tools."""
 
 import json
+import sys
 import time
+import types
+
 import pytest
 
 import plugins.memory.mem0 as mem0_plugin
 from plugins.memory.mem0 import Mem0MemoryProvider
+
+
+def _mock_mem0_sdk(monkeypatch):
+    """Stub the mem0 module in sys.modules so is_available()'s import check passes."""
+    mod = types.ModuleType("mem0")
+    mod.__version__ = "0.0.0"
+    monkeypatch.setitem(sys.modules, "mem0", mod)
 
 
 class FakeBackend:
@@ -422,6 +432,7 @@ class TestMem0ModeSwitch:
         assert provider.is_available() is False
 
     def test_is_available_oss_needs_vector(self, monkeypatch, tmp_path):
+        _mock_mem0_sdk(monkeypatch)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         config_path = tmp_path / "mem0.json"
         config_path.write_text('{"mode": "oss", "oss": {"vector_store": {"provider": "qdrant"}}}')
@@ -609,6 +620,7 @@ class TestSelfHostedConfig:
         assert mem0_plugin._load_config()["host"] == "http://localhost:8888"
 
     def test_is_available_true_with_host_only(self, monkeypatch):
+        _mock_mem0_sdk(monkeypatch)
         monkeypatch.delenv("MEM0_API_KEY", raising=False)
         monkeypatch.setenv("MEM0_MODE", "platform")
         monkeypatch.setenv("MEM0_HOST", "http://localhost:8888")
