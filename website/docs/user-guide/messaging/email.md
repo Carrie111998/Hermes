@@ -122,6 +122,34 @@ Replies are sent via SMTP with proper email threading:
 - **Message-ID** generated with the agent's domain
 - Responses are sent as plain text (UTF-8)
 
+### Idempotent Automated Sends
+
+`send_message` email operations use a durable at-most-once claim by default. Every automated workflow must choose one stable `operation_id` for the real-world email and reuse it across supervisors, dispatchers, Kanban cards, retries, continuations, and workers. Also provide a stable `message_class` such as `onboarding`, `outreach`, or `notification`:
+
+```json
+{
+  "action": "send",
+  "target": "email:person@example.com",
+  "message": "Welcome to Polaris Healthcare",
+  "operation_id": "healthcare-onboarding-42",
+  "message_class": "onboarding"
+}
+```
+
+The claim key combines the operation ID, a SHA-256 digest of the normalized recipient, and the message class. It is committed to `$HERMES_HOME/state/outbound-email-claims.sqlite3` **before** SMTP submission. Concurrent workers therefore reconcile to one SMTP attempt. Reusing the same key with different message content is rejected.
+
+Claim states are `claimed`, `submitted`, and `uncertain`. A claimed or uncertain operation is not automatically retried because SMTP may have accepted the message before the connection failed. Do not create a new operation ID to bypass that result; reconcile the existing operation first. A deterministic `Message-ID` is also attached for provider-side tracing.
+
+To roll back this guard deliberately, set the following in `config.yaml`:
+
+```yaml
+platforms:
+  email:
+    send_idempotency_enabled: false
+```
+
+This escape hatch restores legacy unclaimed sends and can permit duplicates, so keep it temporary and documented.
+
 ### File Attachments
 
 The agent can send file attachments in replies. Include `MEDIA:/path/to/file` in the response and the file is attached to the outgoing email.

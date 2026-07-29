@@ -13,7 +13,11 @@ Covers:
 """
 
 import os
+import asyncio
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -1269,6 +1273,181 @@ class TestSendEmailStandalone(unittest.TestCase):
 
         self.assertIn("error", result)
         self.assertIn("not configured", result["error"])
+
+
+def test_concurrent_workers_submit_one_idempotent_email(monkeypatch, tmp_path):
+    """Two workers claiming the same outbound operation submit SMTP once."""
+    from plugins.platforms.email.adapter import _standalone_send
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("EMAIL_ADDRESS", "hermes@test.com")
+    monkeypatch.setenv("EMAIL_PASSWORD", "secret")
+    monkeypatch.setenv("EMAIL_SMTP_HOST", "smtp.test.com")
+    monkeypatch.setenv("EMAIL_SMTP_PORT", "587")
+
+    submissions = []
+    submission_lock = threading.Lock()
+
+    class FakeSMTP:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def starttls(self, **kwargs):
+            pass
+
+        def login(self, *args, **kwargs):
+            pass
+
+        def send_message(self, message):
+            # Keep the winning worker inside SMTP briefly so the loser must
+            # reconcile against a durable in-flight claim, not a completed row.
+            time.sleep(0.05)
+            with submission_lock:
+                submissions.append(message)
+
+        def quit(self):
+            pass
+
+    pconfig = SimpleNamespace(
+        token=None,
+        api_key=None,
+        extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"},
+    )
+
+    async def send_once():
+        return await _standalone_send(
+            pconfig,
+            "User@Test.com",
+            "Welcome to Polaris Healthcare",
+            operation_id="healthcare-onboarding-42",
+            message_class="onboarding",
+            _smtp_factory=FakeSMTP,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: asyncio.run(send_once()), range(2)))
+
+    assert len(submissions) == 1
+    assert sum(bool(result.get("success")) for result in results) == 2
+    assert sum(bool(result.get("skipped")) for result in results) == 1
+    skipped = next(result for result in results if result.get("skipped"))
+    assert skipped["reason"] == "email_send_already_claimed"
+
+
+def test_idempotent_email_rejects_same_key_with_different_content(monkeypatch, tmp_path):
+    """A stable operation key cannot be silently reused for another message."""
+    from plugins.platforms.email.adapter import _standalone_send
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("EMAIL_ADDRESS", "hermes@test.com")
+    monkeypatch.setenv("EMAIL_PASSWORD", "secret")
+    monkeypatch.setenv("EMAIL_SMTP_HOST", "smtp.test.com")
+
+    server = MagicMock()
+    pconfig = SimpleNamespace(
+        token=None,
+        api_key=None,
+        extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"},
+    )
+
+    async def send(body):
+        return await _standalone_send(
+            pconfig,
+            "user@test.com",
+            body,
+            operation_id="healthcare-onboarding-42",
+            message_class="onboarding",
+            _smtp_factory=lambda *args, **kwargs: server,
+        )
+
+    first = asyncio.run(send("Version one"))
+    second = asyncio.run(send("Version two"))
+
+    assert first["success"] is True
+    assert "error" in second
+    assert "different content" in second["error"]
+    server.send_message.assert_called_once()
+
+
+def test_ambiguous_smtp_failure_is_not_resubmitted(monkeypatch, tmp_path):
+    """A post-claim SMTP failure becomes uncertain and blocks blind retry."""
+    from plugins.platforms.email.adapter import _standalone_send
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("EMAIL_ADDRESS", "hermes@test.com")
+    monkeypatch.setenv("EMAIL_PASSWORD", "secret")
+    monkeypatch.setenv("EMAIL_SMTP_HOST", "smtp.test.com")
+
+    attempts = []
+
+    class AmbiguousSMTP:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def starttls(self, **kwargs):
+            pass
+
+        def login(self, *args, **kwargs):
+            pass
+
+        def send_message(self, message):
+            attempts.append(message)
+            raise ConnectionResetError("connection lost after DATA")
+
+    pconfig = SimpleNamespace(
+        token=None,
+        api_key=None,
+        extra={"address": "hermes@test.com", "smtp_host": "smtp.test.com"},
+    )
+
+    async def send_once():
+        return await _standalone_send(
+            pconfig,
+            "user@test.com",
+            "One attempt only",
+            operation_id="notification-ambiguous-7",
+            message_class="notification",
+            _smtp_factory=AmbiguousSMTP,
+        )
+
+    first = asyncio.run(send_once())
+    retry = asyncio.run(send_once())
+
+    assert "error" in first
+    assert retry["success"] is True
+    assert retry["skipped"] is True
+    assert retry["claim_status"] == "uncertain"
+    assert len(attempts) == 1
+
+
+def test_live_adapter_reconciles_duplicate_operation_metadata(monkeypatch, tmp_path):
+    """The gateway adapter path uses the same durable claim contract."""
+    from gateway.config import PlatformConfig
+    from plugins.platforms.email.adapter import EmailAdapter
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("EMAIL_ADDRESS", "hermes@test.com")
+    monkeypatch.setenv("EMAIL_PASSWORD", "secret")
+    monkeypatch.setenv("EMAIL_IMAP_HOST", "imap.test.com")
+    monkeypatch.setenv("EMAIL_SMTP_HOST", "smtp.test.com")
+
+    adapter = EmailAdapter(PlatformConfig(enabled=True))
+    metadata = {
+        "operation_id": "live-adapter-notification-8",
+        "message_class": "Notification",
+    }
+
+    with patch.object(adapter, "_send_email", return_value="<stable@test.com>") as smtp_send:
+        first = asyncio.run(adapter.send("user@test.com", "Status", metadata=metadata))
+        duplicate = asyncio.run(adapter.send("USER@test.com", "Status", metadata=metadata))
+
+    assert first.success is True
+    assert duplicate.success is True
+    assert duplicate.message_id == "idempotent-skip:submitted"
+    smtp_send.assert_called_once()
 
 
 class TestSmtpConnectionCleanup(unittest.TestCase):

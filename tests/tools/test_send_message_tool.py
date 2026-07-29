@@ -1825,6 +1825,89 @@ class TestEmailHomeChannelErrorHint:
         assert "TELEGRAM_HOME_CHANNEL" in result["error"]
 
 
+class TestEmailSendIdempotencyContract:
+    def _config(self, extra=None):
+        email_cfg = SimpleNamespace(
+            enabled=True,
+            token="",
+            api_key="",
+            extra=extra or {"address": "hermes@test.com"},
+        )
+        return SimpleNamespace(
+            platforms={Platform.EMAIL: email_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+    def test_schema_exposes_stable_operation_fields(self):
+        from tools.send_message_tool import SEND_MESSAGE_SCHEMA
+
+        properties = SEND_MESSAGE_SCHEMA["parameters"]["properties"]
+        assert "operation_id" in properties
+        assert "message_class" in properties
+
+    def test_kanban_guidance_carries_operation_across_workers(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE
+
+        assert "supervisor/dispatcher MUST assign one" in KANBAN_GUIDANCE
+        assert "every Kanban card, retry, continuation, and worker" in KANBAN_GUIDANCE
+        assert "never mint a new ID" in KANBAN_GUIDANCE
+
+    def test_email_send_requires_operation_id_before_dispatch(self):
+        with patch("gateway.config.load_gateway_config", return_value=self._config()), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("tools.send_message_tool._send_to_platform", new_callable=AsyncMock) as sender:
+            result = json.loads(send_message_tool({
+                "action": "send",
+                "target": "email:user@test.com",
+                "message": "Welcome",
+                "message_class": "onboarding",
+            }))
+
+        assert "operation_id" in result["error"]
+        sender.assert_not_awaited()
+
+    def test_email_send_forwards_stable_operation_fields(self):
+        with patch("gateway.config.load_gateway_config", return_value=self._config()), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new_callable=AsyncMock,
+                 return_value={"success": True},
+             ) as sender:
+            result = json.loads(send_message_tool({
+                "action": "send",
+                "target": "email:user@test.com",
+                "message": "Welcome",
+                "operation_id": "healthcare-onboarding-42",
+                "message_class": "onboarding",
+            }))
+
+        assert result["success"] is True
+        assert sender.await_args.kwargs["operation_id"] == "healthcare-onboarding-42"
+        assert sender.await_args.kwargs["message_class"] == "onboarding"
+
+    def test_config_can_disable_email_operation_requirement(self):
+        config = self._config({
+            "address": "hermes@test.com",
+            "send_idempotency_enabled": False,
+        })
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new_callable=AsyncMock,
+                 return_value={"success": True},
+             ) as sender:
+            result = json.loads(send_message_tool({
+                "action": "send",
+                "target": "email:user@test.com",
+                "message": "Legacy mode",
+            }))
+
+        assert result["success"] is True
+        sender.assert_awaited_once()
+
+
 class TestResolveSlackUserTargets:
     """_resolve_slack_user_target opens user targets as DMs before sending.
 

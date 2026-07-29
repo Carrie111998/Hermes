@@ -17,6 +17,7 @@ Environment variables:
 
 import asyncio
 import email as email_lib
+import hashlib
 import imaplib
 import logging
 import os
@@ -65,6 +66,25 @@ _AUTOMATED_HEADERS = {
 MAX_MESSAGE_LENGTH = 50_000
 
 SMTP_CONNECT_TIMEOUT = 30
+
+
+def _email_idempotency_enabled(extra: Dict[str, Any] | None) -> bool:
+    """Return whether explicit outbound operation claims are enabled."""
+    value = (extra or {}).get("send_idempotency_enabled", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "off"}
+    return bool(value)
+
+
+def _stable_operation_message_id(
+    operation_id: str,
+    recipient: str,
+    message_class: str,
+    domain: str,
+) -> str:
+    key = f"{operation_id}\0{recipient.strip().lower()}\0{message_class}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    return f"<hermes-operation-{digest}@{domain or 'localhost'}>"
 
 
 def _create_ipv4_connection(
@@ -898,13 +918,55 @@ class EmailAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an email reply to the given address."""
+        metadata = metadata or {}
+        operation_id = str(metadata.get("operation_id") or "").strip()
+        message_class = str(metadata.get("message_class") or "outbound").strip()
+        claim = None
+        if operation_id and _email_idempotency_enabled(self.config.extra):
+            from plugins.platforms.email.send_claims import claim_email_send
+
+            try:
+                claim = claim_email_send(
+                    operation_id=operation_id,
+                    recipient=chat_id,
+                    message_class=message_class,
+                    content=content,
+                )
+                message_class = claim.message_class
+            except ValueError as exc:
+                return SendResult(success=False, error=str(exc))
+            if claim.status == "conflict":
+                return SendResult(
+                    success=False,
+                    error="Email operation key was already used with different content",
+                )
+            if not claim.acquired:
+                return SendResult(
+                    success=True,
+                    message_id=f"idempotent-skip:{claim.status}",
+                )
+
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None,
+                self._send_email,
+                chat_id,
+                content,
+                reply_to,
+                operation_id or None,
+                message_class,
             )
+            if claim is not None:
+                from plugins.platforms.email.send_claims import mark_email_send_submitted
+
+                mark_email_send_submitted(claim, message_id=message_id)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
+            if claim is not None:
+                from plugins.platforms.email.send_claims import mark_email_send_uncertain
+
+                mark_email_send_uncertain(claim, error=str(e))
             logger.error("[Email] Send failed to %s: %s", chat_id, e)
             return SendResult(success=False, error=str(e))
 
@@ -923,6 +985,8 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        message_class: str = "outbound",
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
@@ -943,7 +1007,15 @@ class EmailAdapter(BasePlatformAdapter):
             msg["References"] = original_msg_id
 
         msg["Date"] = formatdate(localtime=True)
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+        if operation_id:
+            msg_id = _stable_operation_message_id(
+                operation_id,
+                to_addr,
+                message_class,
+                self._message_id_domain(),
+            )
+        else:
+            msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
         msg.attach(MIMEText(body, "plain", "utf-8"))
@@ -1195,6 +1267,9 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    operation_id=None,
+    message_class="outbound",
+    _smtp_factory=None,
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
@@ -1215,20 +1290,70 @@ async def _standalone_send(
     if not all([address, password, smtp_host]):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
+    claim = None
+    operation_id = str(operation_id or "").strip()
+    message_class = str(message_class or "outbound").strip()
+    if operation_id and _email_idempotency_enabled(extra):
+        from plugins.platforms.email.send_claims import claim_email_send
+
+        try:
+            claim = claim_email_send(
+                operation_id=operation_id,
+                recipient=chat_id,
+                message_class=message_class,
+                content=message,
+            )
+            message_class = claim.message_class
+        except ValueError as exc:
+            return {"error": str(exc)}
+        if claim.status == "conflict":
+            return {
+                "error": "Email operation key was already used with different content"
+            }
+        if not claim.acquired:
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "email_send_already_claimed",
+                "claim_status": claim.status,
+                "platform": "email",
+                "chat_id": chat_id,
+            }
+
     try:
         msg = MIMEText(message, "plain", "utf-8")
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
+        if operation_id:
+            domain = address.rsplit("@", 1)[-1] if "@" in address else "localhost"
+            msg["Message-ID"] = _stable_operation_message_id(
+                operation_id, chat_id, message_class, domain
+            )
 
-        server = smtplib.SMTP(smtp_host, smtp_port)
+        smtp_factory = _smtp_factory or smtplib.SMTP
+        server = smtp_factory(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())
         server.login(address, password)
         server.send_message(msg)
         server.quit()
-        return {"success": True, "platform": "email", "chat_id": chat_id}
+        message_id = msg.get("Message-ID")
+        if claim is not None:
+            from plugins.platforms.email.send_claims import mark_email_send_submitted
+
+            mark_email_send_submitted(claim, message_id=message_id)
+        return {
+            "success": True,
+            "platform": "email",
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
     except Exception as e:
+        if claim is not None:
+            from plugins.platforms.email.send_claims import mark_email_send_uncertain
+
+            mark_email_send_uncertain(claim, error=str(e))
         try:
             from tools.send_message_tool import _error as _e
             return _e(f"Email send failed: {e}")
