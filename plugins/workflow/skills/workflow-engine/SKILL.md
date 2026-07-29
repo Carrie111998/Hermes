@@ -1,7 +1,7 @@
 ---
 name: workflow-engine
 description: "Use when running multi-agent DAG pipelines via workflow_start — fire-and-forget orchestration across agents."
-version: 3.1.0
+version: 4.0.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -14,7 +14,7 @@ metadata:
 
 ## Overview
 
-The workflow engine runs DAG-based pipelines — multi-step processes where nodes depend on each other and execute in parallel where possible. You call `workflow_start`, it creates kanban cards, and returns immediately. The kanban dispatcher picks up ready cards and spawns workers. When the workflow finishes, you get a notification with a summary of what was done.
+The workflow engine runs DAG-based pipelines — multi-step processes where nodes depend on each other and execute in parallel where possible. You call `workflow_start`, it creates kanban cards, and returns immediately. The kanban dispatcher picks up ready cards and spawns workers. When the workflow finishes, you get a notification with a summary.
 
 Fire-and-forget. No monitoring loop. The engine does not block.
 
@@ -45,7 +45,7 @@ workflow_start(
     context={"topic": "Should we adopt X?"},
     inputs={"detail_level": "deep"},
     board="my-board",  # optional board override
-    attachments={"/path/to/design.png"},
+    attachments={"grill_artifact": "/path/to/file.md"},
 )
 ```
 
@@ -140,7 +140,8 @@ nodes:
 ```
 
 The caller passes named file paths:
-```
+
+```python
 workflow_start(
     workflow="my-workflow",
     attachments={"grill_artifact": "/path/to/file.md", "source_video": "/path/to/video.mp4"}
@@ -166,9 +167,10 @@ If `attachment` is set, only that named file is attached. If omitted, all attach
 ### Template Variables
 
 Resolve from:
-1. Engine-injected: `{run_id}`, `{date}`
+1. Engine-injected: `{run_id}`, `{run_short_id}`, `{date}`
 2. Inputs: `{inputs.topic}`, `{inputs.pr_link}`
 3. Upstream outputs: `{setup.findings}`
+4. Node metadata: `{nodes.node-id.name}` (disambiguated name), `{nodes.node-id.card_id}` (kanban task ID)
 
 ### Roles
 
@@ -211,9 +213,28 @@ nodes:
 
 1. Creator blocks card with `"pending review"` when done
 2. Supervisor detects the block → dispatches the first reviewer
-3. Reviewer passes → enriches creator with pass results → sets back to ready
-4. Reviewer fails → enriches creator with failure feedback → sets back to ready
-5. Creator picks up the enriched card and acts on the feedback
+3. Reviewer always completes (marks done) — pass or fail is in the result
+4. Engine reads the result to determine pass vs fail
+5. Pass → marks creator done → workflow advances
+6. Fail → enriches creator with feedback → resets to ready → creator re-works
+
+### Reviewer instructions
+
+Reviewers always complete the card — never block for pass/fail:
+
+```yaml
+qa-verify:
+  agent: "{qa}"
+  task: >
+    Run the tests. If all pass, complete this card with a summary
+    that includes the results. If any fail, complete this card
+    with a summary that includes the failure details.
+
+    Do NOT block this card. Always complete it with pass/fail
+    in the summary.
+```
+
+The engine detects pass/fail from the result content (checks for markers like "fail", "failure", "error", "blocked").
 
 ### Block reason convention
 
@@ -279,6 +300,7 @@ Reuses saved state. Skips completed nodes.
 | Template substitution failure | Missing key in context dict | Ensure all `{placeholders}` are in context |
 | Card auto-blocked "heartbeat stale" | Handled automatically in fire-and-forget mode | No action needed |
 | Review not triggered | Block reason doesn't start with "pending review" | Use exact phrase "pending review" |
+| Review loops hit triage | Reviewer blocked instead of completing | Reviewers must always complete (done), not block |
 
 ## Verification Checklist
 
