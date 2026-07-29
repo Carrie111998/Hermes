@@ -73,6 +73,7 @@ from hermes_cli.config import (
     save_env_value,
     remove_env_value,
     custom_endpoint_key_env,
+    _legacy_custom_endpoint_key_env,
     check_config_version,
     detect_install_method,
     format_docker_update_message,
@@ -7750,7 +7751,30 @@ def _detach_main_model_from_provider(cfg: Dict[str, Any], provider_key: str) -> 
     cfg["model"] = model_cfg
 
 
-def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> Tuple[str, Dict[str, Any]]:
+def _config_references_key_env(cfg: Dict[str, Any], key_env: str) -> bool:
+    """Return whether another configured route still owns ``key_env``."""
+    candidates: List[Any] = [cfg.get("model")]
+    providers = cfg.get("providers")
+    if isinstance(providers, dict):
+        candidates.extend(providers.values())
+    custom_providers = cfg.get("custom_providers")
+    if isinstance(custom_providers, list):
+        candidates.extend(custom_providers)
+
+    template = f"${{{key_env}}}"
+    for entry in candidates:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("key_env") or "").strip() == key_env:
+            return True
+        if str(entry.get("api_key") or "").strip() == template:
+            return True
+    return False
+
+
+def _write_custom_endpoint(
+    cfg: Dict[str, Any], body: CustomEndpointUpdate
+) -> Tuple[str, Dict[str, Any], Tuple[str, ...]]:
     endpoint_id = _custom_endpoint_id(body.id or body.name)
     name = (body.name or "").strip()
     base_url = (body.base_url or "").strip().rstrip("/")
@@ -7772,6 +7796,8 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     existing = providers.get(endpoint_id)
     if not isinstance(existing, dict):
         existing = {}
+    previous_key_env = str(existing.get("key_env") or "").strip()
+    obsolete_key_envs: set[str] = set()
 
     # Merge onto the existing entry rather than replacing it. A providers.<name>
     # block is not owned by this panel: it can carry hand-written keys the
@@ -7810,14 +7836,17 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     # reference it via ``key_env`` — the same indirection built-in providers
     # use and that runtime_provider.py already resolves at load time.
     env_var = custom_endpoint_key_env(endpoint_id)
+    legacy_env_var = _legacy_custom_endpoint_key_env(endpoint_id)
     submitted_key = body.api_key.strip() if body.api_key is not None else None
     if submitted_key:
         save_env_value(env_var, submitted_key)
         entry["key_env"] = env_var
         entry.pop("api_key", None)
+        if previous_key_env == legacy_env_var and previous_key_env != env_var:
+            obsolete_key_envs.add(previous_key_env)
     elif submitted_key is not None:
         # Blank field means "clear the key", not "leave it alone".
-        remove_env_value(env_var)
+        obsolete_key_envs.update((env_var, legacy_env_var))
         entry.pop("key_env", None)
         entry.pop("api_key", None)
     elif str(entry.get("api_key") or "").strip() and not _config_api_key_is_env_ref(endpoint_id):
@@ -7832,6 +7861,23 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
     providers[endpoint_id] = entry
     cfg["providers"] = providers
 
+    # ``activate`` mirrors the endpoint credential onto ``model``. Rotating or
+    # clearing an already-active endpoint must update that mirror before the
+    # legacy env slot is removed, otherwise the next request loses auth or
+    # keeps following the stale credential reference.
+    model_cfg = cfg.get("model")
+    if (
+        submitted_key is not None
+        and isinstance(model_cfg, dict)
+        and str(model_cfg.get("provider") or "").strip().lower() == endpoint_id
+    ):
+        if submitted_key:
+            model_cfg["key_env"] = env_var
+            model_cfg.pop("api_key", None)
+        else:
+            model_cfg.pop("key_env", None)
+            model_cfg.pop("api_key", None)
+
     if body.make_default:
         cfg["model"] = _apply_main_model_assignment(
             cfg.get("model", {}), endpoint_id, model, base_url
@@ -7840,7 +7886,7 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
             cfg["model"]["key_env"] = entry["key_env"]
             cfg["model"].pop("api_key", None)
 
-    return endpoint_id, entry
+    return endpoint_id, entry, tuple(sorted(obsolete_key_envs))
 
 
 @app.get("/api/providers/custom-endpoints")
@@ -7858,8 +7904,13 @@ def upsert_custom_endpoint(body: CustomEndpointUpdate):
     """Create or update a v12+ ``providers`` custom endpoint entry."""
     try:
         cfg = load_config()
-        endpoint_id, _entry = _write_custom_endpoint(cfg, body)
+        endpoint_id, _entry, obsolete_key_envs = _write_custom_endpoint(cfg, body)
         save_config(cfg)
+        # Commit the new config reference before removing the old secret. If
+        # config persistence fails, the previous endpoint remains usable.
+        for key_env in obsolete_key_envs:
+            if not _config_references_key_env(cfg, key_env):
+                remove_env_value(key_env)
         response = _custom_endpoint_response(cfg)
         response["ok"] = True
         response["id"] = endpoint_id
@@ -7916,8 +7967,15 @@ def delete_custom_endpoint(endpoint_id: str):
         providers.pop(provider_key, None)
         cfg["providers"] = providers
         _detach_main_model_from_provider(cfg, provider_key)
-        remove_env_value(custom_endpoint_key_env(provider_key))
         save_config(cfg)
+        # Remove both the current collision-resistant slot and the legacy
+        # slug-only slot used by endpoints saved before this fix.
+        for key_env in {
+            custom_endpoint_key_env(provider_key),
+            _legacy_custom_endpoint_key_env(provider_key),
+        }:
+            if not _config_references_key_env(cfg, key_env):
+                remove_env_value(key_env)
         response = _custom_endpoint_response(cfg)
         response["ok"] = True
         return response

@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -3875,11 +3876,26 @@ def custom_endpoint_key_env(identity: str) -> str:
     - It keys off the endpoint's own identity, not just its hostname, so two
       endpoints on one host (``127.0.0.1:8000`` and ``:8001``) get separate
       slots instead of the second save clobbering the first's credential.
+    - A stable digest preserves distinctions the readable slug cannot. For
+      example, ``acme-prod`` and ``acme_prod`` both slug to ``ACME_PROD``;
+      without the digest, saving either endpoint silently overwrites the
+      other's credential.
     - The fixed ``HERMES_CUSTOM_`` prefix keeps the result a valid POSIX name
       even when the slug starts with a digit, which every IP-based local
       endpoint does (``127.0.0.1`` → ``127_0_0_1``). ``save_env_value``
       rejects digit-leading names outright.
     """
+    canonical = str(identity or "").strip().upper()
+    if not canonical:
+        return "HERMES_CUSTOM_API_KEY"
+    slug = re.sub(r"[^A-Z0-9]+", "_", canonical).strip("_")
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest().upper()
+    readable = f"{slug}_" if slug else ""
+    return f"HERMES_CUSTOM_{readable}{digest}_API_KEY"
+
+
+def _legacy_custom_endpoint_key_env(identity: str) -> str:
+    """Return the pre-digest custom-endpoint slot for migration cleanup."""
     slug = re.sub(r"[^A-Z0-9]+", "_", str(identity or "").upper()).strip("_")
     return f"HERMES_CUSTOM_{slug}_API_KEY" if slug else "HERMES_CUSTOM_API_KEY"
 

@@ -5391,6 +5391,147 @@ class TestWebServerEndpoints:
         assert get_env_value(custom_endpoint_key_env("local-8000")) == "sk-first"
         assert get_env_value(custom_endpoint_key_env("local-8001")) == "sk-second"
 
+    def test_slug_colliding_endpoints_route_only_their_own_credentials(self):
+        """Distinct endpoint ids must never cross-route one another's secrets.
+
+        ``acme-prod`` and ``acme_prod`` are both valid provider ids, but the
+        old slug-only env name collapsed both to ``ACME_PROD``. The second
+        save then made runtime send its key to the first endpoint's URL.
+        """
+        from hermes_cli.config import get_env_value, load_config
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        endpoints = (
+            ("acme-prod", "https://endpoint-a.invalid/v1", "sk-only-a"),
+            ("acme_prod", "https://endpoint-b.invalid/v1", "sk-only-b"),
+        )
+        for endpoint_id, base_url, api_key in endpoints:
+            resp = self.client.post(
+                "/api/providers/custom-endpoints",
+                json={
+                    "id": endpoint_id,
+                    "name": endpoint_id,
+                    "base_url": base_url,
+                    "model": "m",
+                    "api_key": api_key,
+                },
+            )
+            assert resp.status_code == 200
+
+        providers = load_config()["providers"]
+        first_env = providers["acme-prod"]["key_env"]
+        second_env = providers["acme_prod"]["key_env"]
+        assert first_env != second_env
+        assert get_env_value(first_env) == "sk-only-a"
+        assert get_env_value(second_env) == "sk-only-b"
+
+        for endpoint_id, base_url, api_key in endpoints:
+            resolved = _get_named_custom_provider(endpoint_id)
+            assert resolved is not None
+            assert resolved["base_url"] == base_url
+            assert resolved["api_key"] == api_key
+
+    def test_rotating_a_legacy_custom_endpoint_key_migrates_active_mirror(self):
+        """A pre-digest slot stays live until config points at its replacement."""
+        from hermes_cli.config import (
+            _legacy_custom_endpoint_key_env,
+            custom_endpoint_key_env,
+            get_env_value,
+            load_config,
+            save_config,
+            save_env_value,
+        )
+
+        endpoint_id = "acme-prod"
+        legacy_env = _legacy_custom_endpoint_key_env(endpoint_id)
+        save_env_value(legacy_env, "sk-legacy")
+        cfg = load_config()
+        cfg["providers"] = {
+            endpoint_id: {
+                "name": "Acme",
+                "base_url": "https://endpoint-a.invalid/v1",
+                "model": "m",
+                "models": {"m": {}},
+                "key_env": legacy_env,
+            }
+        }
+        cfg["model"] = {
+            "provider": endpoint_id,
+            "default": "m",
+            "base_url": "https://endpoint-a.invalid/v1",
+            "key_env": legacy_env,
+        }
+        save_config(cfg)
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": endpoint_id,
+                "name": "Acme",
+                "base_url": "https://endpoint-a.invalid/v1",
+                "model": "m",
+                "api_key": "sk-rotated",
+            },
+        )
+        assert resp.status_code == 200
+
+        new_env = custom_endpoint_key_env(endpoint_id)
+        cfg = load_config()
+        assert cfg["providers"][endpoint_id]["key_env"] == new_env
+        assert cfg["model"]["key_env"] == new_env
+        assert get_env_value(new_env) == "sk-rotated"
+        assert not get_env_value(legacy_env)
+
+    def test_legacy_collision_slot_survives_until_last_reference_migrates(self):
+        """Repairing one pre-fix endpoint must not erase its sibling's key."""
+        from hermes_cli.config import (
+            _legacy_custom_endpoint_key_env,
+            custom_endpoint_key_env,
+            get_env_value,
+            load_config,
+            save_config,
+            save_env_value,
+        )
+
+        legacy_env = _legacy_custom_endpoint_key_env("acme-prod")
+        assert legacy_env == _legacy_custom_endpoint_key_env("acme_prod")
+        save_env_value(legacy_env, "sk-shared-last-value")
+        cfg = load_config()
+        cfg["providers"] = {
+            endpoint_id: {
+                "name": endpoint_id,
+                "base_url": base_url,
+                "model": "m",
+                "models": {"m": {}},
+                "key_env": legacy_env,
+            }
+            for endpoint_id, base_url in (
+                ("acme-prod", "https://endpoint-a.invalid/v1"),
+                ("acme_prod", "https://endpoint-b.invalid/v1"),
+            )
+        }
+        save_config(cfg)
+
+        resp = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "acme-prod",
+                "name": "acme-prod",
+                "base_url": "https://endpoint-a.invalid/v1",
+                "model": "m",
+                "api_key": "sk-only-a",
+            },
+        )
+        assert resp.status_code == 200
+
+        cfg = load_config()
+        assert cfg["providers"]["acme-prod"]["key_env"] == custom_endpoint_key_env(
+            "acme-prod"
+        )
+        assert cfg["providers"]["acme_prod"]["key_env"] == legacy_env
+        assert get_env_value(custom_endpoint_key_env("acme-prod")) == "sk-only-a"
+        assert get_env_value(legacy_env) == "sk-shared-last-value"
+
     def test_custom_endpoint_response_reports_a_key_held_in_env(self):
         """has_api_key must follow key_env, not just a plaintext api_key.
 

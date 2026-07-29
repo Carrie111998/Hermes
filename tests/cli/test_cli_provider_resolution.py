@@ -1011,3 +1011,11 @@ def test_custom_endpoint_key_env_separates_ports_on_one_host():
 
     assert custom_endpoint_key_env("127.0.0.1_8000") != custom_endpoint_key_env("127.0.0.1_8001")
     assert custom_endpoint_key_env("acme") == custom_endpoint_key_env("ACME")
+
+
+def test_custom_endpoint_key_env_preserves_punctuation_distinctions():
+    """Readable slugs that match must still use different credential slots."""
+    from hermes_cli.config import custom_endpoint_key_env
+
+    identities = ("acme-prod", "acme_prod", "acme.prod", "acme prod")
+    assert len({custom_endpoint_key_env(identity) for identity in identities}) == len(identities)
