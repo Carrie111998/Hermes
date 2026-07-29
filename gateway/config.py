@@ -2190,8 +2190,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     weixin_account_id = getenv("WEIXIN_ACCOUNT_ID")
     if weixin_token or weixin_account_id:
         if Platform.WEIXIN not in config.platforms:
-            config.platforms[Platform.WEIXIN] = PlatformConfig()
-        config.platforms[Platform.WEIXIN].enabled = True
+            config.platforms[Platform.WEIXIN] = PlatformConfig(enabled=True)
+        else:
+            weixin_config = config.platforms[Platform.WEIXIN]
+            # Match Telegram/Slack behavior: an explicit `weixin.enabled: false`
+            # or `platforms.weixin.enabled: false` in config.yaml must prevent
+            # env credentials from re-enabling the adapter. This prevents cloned
+            # profile .env files from competing for the same WEIXIN_TOKEN.
+            enabled_was_explicit = bool(weixin_config.extra.get("_enabled_explicit", False))
+            if not weixin_config.enabled and not enabled_was_explicit:
+                weixin_config.enabled = True
         if weixin_token:
             config.platforms[Platform.WEIXIN].token = weixin_token
         extra = config.platforms[Platform.WEIXIN].extra
