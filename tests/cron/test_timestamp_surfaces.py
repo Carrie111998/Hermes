@@ -38,6 +38,14 @@ def _stored_job(job_id: str):
     return next(job for job in load_jobs() if job["id"] == job_id)
 
 
+def test_shared_timestamp_setting_respects_explicit_false_with_other_keys():
+    from gateway.message_timestamps import message_timestamps_enabled
+
+    assert message_timestamps_enabled(
+        {"message_timestamps": {"enabled": False, "other": "stuff"}}
+    ) is False
+
+
 def test_model_tool_persists_true_false_and_inherit(isolated_home):
     from tools.cronjob_tools import cronjob
 
@@ -57,6 +65,41 @@ def test_model_tool_persists_true_false_and_inherit(isolated_home):
     assert _stored_job(job_id)["timestamps"] is False
 
     inherited = json.loads(cronjob(action="update", job_id=job_id, timestamps=None))
+    assert inherited["success"] is True
+    assert "timestamps" not in _stored_job(job_id)
+
+
+def test_registered_model_tool_handler_persists_timestamp_overrides(isolated_home):
+    import tools.cronjob_tools  # noqa: F401 - registers the tool
+    from tools.registry import registry
+
+    entry = registry.get_entry("cronjob")
+    assert entry is not None
+
+    created = json.loads(
+        entry.handler(
+            {
+                "action": "create",
+                "prompt": "registered handler timestamps",
+                "schedule": "every 1 hour",
+                "timestamps": True,
+            }
+        )
+    )
+    job_id = created["job_id"]
+    assert _stored_job(job_id)["timestamps"] is True
+
+    updated = json.loads(
+        entry.handler(
+            {"action": "update", "job_id": job_id, "timestamps": False}
+        )
+    )
+    assert updated["success"] is True
+    assert _stored_job(job_id)["timestamps"] is False
+
+    inherited = json.loads(
+        entry.handler({"action": "update", "job_id": job_id, "timestamps": None})
+    )
     assert inherited["success"] is True
     assert "timestamps" not in _stored_job(job_id)
 
