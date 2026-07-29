@@ -953,6 +953,37 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
             pricing["completion"] = str(float(novita_output) / 10_000 / 1_000_000)
         return pricing
 
+    # Venice.ai ships pricing under ``model_spec.pricing.{input,output,...}.usd``
+    # (sometimes top-level ``pricing``) with $/MTok values — nested dicts, not
+    # bare numbers. Convert to per-token strings before the generic alias scan
+    # (which crashes on unhashable dict values).
+    # Example: deepseek-v4-flash → input.usd=0.138, output.usd=0.275, cache_input.usd=0.028
+    model_spec = payload.get("model_spec") if isinstance(payload.get("model_spec"), dict) else {}
+    venice_pricing = None
+    for candidate in (payload.get("pricing"), model_spec.get("pricing") if model_spec else None):
+        if isinstance(candidate, dict) and any(
+            isinstance(candidate.get(k), dict) and candidate.get(k, {}).get("usd") is not None
+            for k in ("input", "output", "cache_input", "cache_read", "cache_write")
+        ):
+            venice_pricing = candidate
+            break
+    if isinstance(venice_pricing, dict):
+        vin = venice_pricing.get("input")
+        vout = venice_pricing.get("output")
+        vcache = venice_pricing.get("cache_input") or venice_pricing.get("cache_read")
+        vwrite = venice_pricing.get("cache_write")
+        result: Dict[str, Any] = {}
+        if isinstance(vin, dict) and vin.get("usd") is not None:
+            result["prompt"] = str(float(vin["usd"]) / 1_000_000)
+        if isinstance(vout, dict) and vout.get("usd") is not None:
+            result["completion"] = str(float(vout["usd"]) / 1_000_000)
+        if isinstance(vcache, dict) and vcache.get("usd") is not None:
+            result["cache_read"] = str(float(vcache["usd"]) / 1_000_000)
+        if isinstance(vwrite, dict) and vwrite.get("usd") is not None:
+            result["cache_write"] = str(float(vwrite["usd"]) / 1_000_000)
+        if result:
+            return result
+
     # DeepInfra ships pricing under ``metadata.pricing`` with $/MTok values:
     # ``input_tokens``, ``output_tokens``, ``cache_read_tokens``. Convert to
     # per-token strings so the generic cost machinery (usage_pricing.py)
@@ -985,8 +1016,15 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
         pricing: Dict[str, Any] = {}
         for target, aliases in alias_map.items():
             for alias in aliases:
-                if alias in normalized and normalized[alias] not in {None, ""}:
-                    pricing[target] = normalized[alias]
+                if alias not in normalized:
+                    continue
+                val = normalized[alias]
+                # Skip nested dicts (e.g. Venice-style pricing objects) — they
+                # are not scalar costs and break set membership tests.
+                if isinstance(val, (dict, list)):
+                    continue
+                if val not in {None, ""}:
+                    pricing[target] = val
                     break
         if pricing:
             return pricing

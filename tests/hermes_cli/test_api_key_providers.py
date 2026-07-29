@@ -1212,6 +1212,36 @@ class TestNovitaProvider:
         assert float(result["prompt"]) == 2690 / 10_000 / 1_000_000
         assert float(result["completion"]) == 4000 / 10_000 / 1_000_000
 
+    def test_venice_nested_pricing_unit_conversion(self):
+        """Venice returns nested USD-per-Mtok objects from its models API."""
+        from agent.model_metadata import _extract_pricing
+
+        result = _extract_pricing({
+            "id": "deepseek-v4-flash",
+            "model_spec": {
+                "pricing": {
+                    "input": {"usd": 0.138},
+                    "output": {"usd": 0.275},
+                    "cache_input": {"usd": 0.028},
+                }
+            },
+        })
+
+        assert float(result["prompt"]) == 0.138 / 1_000_000
+        assert float(result["completion"]) == 0.275 / 1_000_000
+        assert float(result["cache_read"]) == 0.028 / 1_000_000
+
+    def test_nested_non_pricing_values_are_ignored(self):
+        """Generic pricing aliases must not crash on nested provider data."""
+        from agent.model_metadata import _extract_pricing
+
+        assert _extract_pricing({
+            "pricing": {
+                "prompt": {"currency": "USD"},
+                "completion": {"currency": "USD"},
+            }
+        }) == {}
+
     def test_novita_pricing_cache(self, monkeypatch):
         """_fetch_novita_pricing should cache results in _pricing_cache."""
         from hermes_cli import models as models_mod

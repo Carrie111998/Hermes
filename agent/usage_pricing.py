@@ -1007,6 +1007,17 @@ def resolve_billing_route(
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):
         return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
+    # Venice must be detected BEFORE the custom/local short-circuit: Hermes
+    # default profile uses provider=custom with base_url=api.venice.ai, and
+    # Venice publishes live $/MTok rates on GET /models (needs ADMIN or
+    # inference key for the call — pricing is public on the model object).
+    if provider_name == "venice" or base_url_host_matches(base_url or "", "api.venice.ai"):
+        return BillingRoute(
+            provider="venice",
+            model=model.split("/")[-1] if model else "",
+            base_url=base_url or "https://api.venice.ai/api/v1",
+            billing_mode="official_models_api",
+        )
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     # "openai-api" is the picker/registry slug for direct api.openai.com; it
