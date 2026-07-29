@@ -75,6 +75,52 @@ def test_validate_references_filters_bad_names_and_refs():
     assert len(warnings) == 3
 
 
+def test_validate_references_rejects_unknown_structured_keys():
+    valid, warnings = op._validate_references(
+        {
+            "WORK_KEY": {
+                "reference": "op://Work/Hermes/key",
+                "acount": "work.1password.com",
+            }
+        }
+    )
+
+    assert valid == {}
+    assert any("unknown field" in warning and "acount" in warning for warning in warnings)
+
+
+def test_validate_references_rejects_non_string_structured_keys():
+    valid, warnings = op._validate_references(
+        {
+            "WORK_KEY": {
+                "reference": "op://Work/Hermes/key",
+                1: "valid YAML key, invalid schema",
+            }
+        }
+    )
+
+    assert valid == {}
+    assert any("field names must be strings" in warning for warning in warnings)
+
+
+def test_structured_empty_routing_fields_override_profile_defaults():
+    valid, warnings = op._validate_references(
+        {
+            "DESKTOP_KEY": {
+                "reference": "op://Personal/Hermes/key",
+                "account": "",
+                "service_account_token_env": "",
+            }
+        }
+    )
+
+    assert warnings == []
+    assert op._reference_route(
+        valid["DESKTOP_KEY"],
+        default_account="work.1password.com",
+        default_token_env="OP_TOKEN_WORK",
+    ) == ("op://Personal/Hermes/key", "", "")
+
 # ---------------------------------------------------------------------------
 # fetch_onepassword_secrets
 # ---------------------------------------------------------------------------
@@ -130,6 +176,79 @@ def test_fetch_uses_option_terminator_and_account(monkeypatch, tmp_path):
     assert "--account" in cmd and "my.1password.com" in cmd
     # `--` must precede the positional reference.
     assert cmd[-2:] == ["--", "op://V/I/F"]
+
+
+def test_fetch_routes_each_reference_to_its_account_and_token(monkeypatch, tmp_path):
+    """Each structured mapping must use only its selected account credential."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv("OP_TOKEN_WORK", "work-token")
+    monkeypatch.setenv("OP_TOKEN_PERSONAL", "personal-token")
+    calls = {}
+
+    def fake_run(cmd, **kwargs):
+        reference = cmd[cmd.index("--") + 1]
+        calls[reference] = {"cmd": cmd, "env": kwargs["env"]}
+        return _ok(f"resolved:{reference}")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={
+            "WORK_KEY": {
+                "reference": "op://Work/Hermes/key",
+                "account": "work.1password.com",
+                "service_account_token_env": "OP_TOKEN_WORK",
+            },
+            "PERSONAL_KEY": {
+                "reference": "op://Personal/Hermes/key",
+                "account": "personal.1password.com",
+                "service_account_token_env": "OP_TOKEN_PERSONAL",
+            },
+        },
+        binary=fake_op,
+        use_cache=False,
+    )
+
+    assert warnings == []
+    assert set(secrets) == {"WORK_KEY", "PERSONAL_KEY"}
+    work = calls["op://Work/Hermes/key"]
+    personal = calls["op://Personal/Hermes/key"]
+    assert work["cmd"][-4:] == [
+        "--account", "work.1password.com", "--", "op://Work/Hermes/key"
+    ]
+    assert personal["cmd"][-4:] == [
+        "--account", "personal.1password.com", "--", "op://Personal/Hermes/key"
+    ]
+    assert work["env"]["OP_SERVICE_ACCOUNT_TOKEN"] == "work-token"
+    assert personal["env"]["OP_SERVICE_ACCOUNT_TOKEN"] == "personal-token"
+    assert "personal-token" not in work["env"].values()
+    assert "work-token" not in personal["env"].values()
+
+
+def test_fetch_never_resolves_into_any_configured_token_env(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv("OP_TOKEN_PERSONAL", "original")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("op must not run for a protected token target")
+
+    monkeypatch.setattr(op.subprocess, "run", fail_if_called)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={
+            "OP_TOKEN_PERSONAL": {
+                "reference": "op://Personal/Hermes/token",
+                "account": "personal.1password.com",
+                "service_account_token_env": "OP_TOKEN_PERSONAL",
+            }
+        },
+        binary=fake_op,
+        use_cache=False,
+    )
+
+    assert secrets == {}
+    assert any("bootstrap token" in warning for warning in warnings)
 
 
 def test_fetch_empty_rc0_does_not_clobber(monkeypatch, tmp_path):
@@ -203,17 +322,57 @@ def test_fetch_child_env_is_allowlisted(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         captured["env"] = kwargs["env"]
-        return _ok("v")
+        return _ok("value")
 
     monkeypatch.setattr(op.subprocess, "run", fake_run)
     op.fetch_onepassword_secrets(
-        references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False
+        references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False,
     )
     env = captured["env"]
     assert "OPENAI_API_KEY" not in env          # not inherited
     assert env["OP_SERVICE_ACCOUNT_TOKEN"] == "ops_tok"
     assert env["OP_SESSION_myacct"] == "sess123"
     assert env.get("NO_COLOR") == "1"
+
+
+def test_structured_mapping_uses_isolated_auth_environment(monkeypatch, tmp_path):
+    """Account-bound reads must not inherit another 1Password auth mode."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv("OP_TOKEN_WORK", "selected-token")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "unrelated-token")
+    monkeypatch.setenv("OP_SESSION_personal", "unrelated-session")
+    monkeypatch.setenv("OP_ACCOUNT", "personal")
+    monkeypatch.setenv("OP_CONNECT_HOST", "https://connect.example.test")
+    monkeypatch.setenv("OP_CONNECT_TOKEN", "unrelated-connect-token")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        captured["stdin"] = kwargs.get("stdin")
+        return _ok("value")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op.fetch_onepassword_secrets(
+        references={
+            "WORK_KEY": {
+                "reference": "op://Work/Hermes/key",
+                "account": "work.1password.com",
+                "service_account_token_env": "OP_TOKEN_WORK",
+            }
+        },
+        binary=fake_op,
+        use_cache=False,
+    )
+
+    env = captured["env"]
+    assert env["OP_SERVICE_ACCOUNT_TOKEN"] == "selected-token"
+    assert "OP_SESSION_personal" not in env
+    assert "OP_ACCOUNT" not in env
+    assert "OP_CONNECT_HOST" not in env
+    assert "OP_CONNECT_TOKEN" not in env
+    assert captured["stdin"] is subprocess.DEVNULL
 
 
 def test_fetch_child_env_passes_load_desktop_app_settings(monkeypatch, tmp_path):
@@ -249,6 +408,7 @@ def test_fetch_child_env_passes_load_desktop_app_settings(monkeypatch, tmp_path)
 def test_inprocess_cache_hit(monkeypatch, tmp_path):
     fake_op = tmp_path / "op"
     fake_op.write_text("")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "test-token")
     calls = {"n": 0}
 
     def fake_run(*a, **k):
@@ -512,6 +672,37 @@ def test_apply_never_overrides_token_var(monkeypatch, tmp_path):
     assert calls["n"] == 0
 
 
+def test_apply_protects_every_structured_mapping_token_var(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setattr(op, "find_op", lambda binary_path="": fake_op)
+    monkeypatch.setenv("OP_TOKEN_PERSONAL", "original")
+    calls = {"n": 0}
+
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return _ok("malicious")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+
+    result = op.apply_onepassword_secrets(
+        enabled=True,
+        env={
+            "OP_TOKEN_PERSONAL": {
+                "reference": "op://Personal/Hermes/token",
+                "account": "personal.1password.com",
+                "service_account_token_env": "OP_TOKEN_PERSONAL",
+            }
+        },
+        override_existing=True,
+        cache_ttl_seconds=0,
+    )
+
+    assert "OP_TOKEN_PERSONAL" in result.skipped
+    assert os.environ["OP_TOKEN_PERSONAL"] == "original"
+    assert calls["n"] == 0
+
+
 def test_apply_never_raises_on_read_failure(monkeypatch, tmp_path):
     fake_op = tmp_path / "op"
     fake_op.write_text("")
@@ -538,3 +729,186 @@ def test_apply_no_valid_refs_is_noop(monkeypatch):
     assert result.ok
     assert result.applied == []
     assert result.warnings  # the bad mapping warned
+
+
+def test_source_protects_all_configured_token_env_vars():
+    protected = op.OnePasswordSource().protected_env_vars(
+        {
+            "service_account_token_env": "OP_TOKEN_DEFAULT",
+            "env": {
+                "WORK": {
+                    "reference": "op://Work/Hermes/key",
+                    "service_account_token_env": "OP_TOKEN_WORK",
+                },
+                "PERSONAL": {
+                    "reference": "op://Personal/Hermes/key",
+                    "service_account_token_env": "OP_TOKEN_PERSONAL",
+                },
+            },
+        }
+    )
+
+    assert protected == frozenset(
+        {
+            "OP_SERVICE_ACCOUNT_TOKEN",
+            "OP_TOKEN_DEFAULT",
+            "OP_TOKEN_WORK",
+            "OP_TOKEN_PERSONAL",
+        }
+    )
+
+
+def test_explicit_structured_token_route_fails_closed_when_token_is_missing(
+    monkeypatch, tmp_path
+):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+        return _ok("desktop-derived")
+
+    monkeypatch.delenv("OP_TOKEN_WORK", raising=False)
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={
+            "WORK": {
+                "reference": "op://Work/Service/credential",
+                "account": "work.1password.com",
+                "service_account_token_env": "OP_TOKEN_WORK",
+            }
+        },
+        binary=fake_op,
+        use_cache=False,
+    )
+
+    assert secrets == {}
+    assert calls["n"] == 0
+    assert any("OP_TOKEN_WORK" in warning and "unset" in warning for warning in warnings)
+
+
+def test_top_level_empty_token_env_uses_strict_desktop_auth(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return _ok("desktop-derived")
+
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "must-not-cross")
+    monkeypatch.setattr(op, "find_op", lambda binary_path="": fake_op)
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    result = op.OnePasswordSource().fetch(
+        {
+            "service_account_token_env": "",
+            "env": {"DESKTOP": "op://Personal/Service/credential"},
+            "cache_ttl_seconds": 0,
+        },
+        tmp_path,
+    )
+
+    assert result.secrets == {"DESKTOP": "desktop-derived"}
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in captured
+
+
+def test_desktop_auth_routes_are_not_cached_across_identity_switches(
+    monkeypatch, tmp_path
+):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+        return _ok(f"identity-{calls['n']}")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    refs = {
+        "DESKTOP": {
+            "reference": "op://Personal/Service/credential",
+            "account": "",
+            "service_account_token_env": "",
+        }
+    }
+    first, _ = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, home_path=tmp_path
+    )
+    second, _ = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, home_path=tmp_path
+    )
+
+    assert first == {"DESKTOP": "identity-1"}
+    assert second == {"DESKTOP": "identity-2"}
+    assert calls["n"] == 2
+
+
+def test_implicit_desktop_fallback_is_not_cached_across_identity_switches(
+    monkeypatch, tmp_path
+):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+        return _ok(f"identity-{calls['n']}")
+
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    refs = {"LEGACY": "op://Vault/Item/field"}
+    first, _ = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, home_path=tmp_path
+    )
+    second, _ = op.fetch_onepassword_secrets(
+        references=refs, binary=fake_op, home_path=tmp_path
+    )
+
+    assert first == {"LEGACY": "identity-1"}
+    assert second == {"LEGACY": "identity-2"}
+    assert calls["n"] == 2
+
+
+def test_op_stderr_redacts_selected_token(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    token = "selected-token-must-not-leak"
+    monkeypatch.setenv("OP_TOKEN_WORK", token)
+    monkeypatch.setattr(
+        op.subprocess,
+        "run",
+        lambda *args, **kwargs: _err(1, f"authentication failed for {token}"),
+    )
+    _secrets, warnings = op.fetch_onepassword_secrets(
+        references={
+            "WORK": {
+                "reference": "op://Work/Service/credential",
+                "service_account_token_env": "OP_TOKEN_WORK",
+            }
+        },
+        binary=fake_op,
+        use_cache=False,
+    )
+
+    rendered = "\n".join(warnings)
+    assert token not in rendered
+    assert "[REDACTED]" in rendered
+
+
+def test_all_reads_disable_stdin_to_prevent_interactive_fallback(
+    monkeypatch, tmp_path
+):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    stdins = []
+
+    def fake_run(*args, **kwargs):
+        stdins.append(kwargs.get("stdin"))
+        return _ok("resolved")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._run_op_read(fake_op, "op://V/I/F", strict_auth=False)
+    op._run_op_read(fake_op, "op://V/I/F", strict_auth=True)
+
+    assert stdins == [subprocess.DEVNULL, subprocess.DEVNULL]

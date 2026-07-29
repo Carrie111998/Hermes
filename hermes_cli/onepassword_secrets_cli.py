@@ -82,6 +82,14 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
         help="Provide the new token non-interactively (default: masked prompt)",
     )
     token.add_argument(
+        "--account",
+        help="Account shorthand/sign-in address to validate this token against",
+    )
+    token.add_argument(
+        "--token-env",
+        help="Env var in which to store this account's service-account token",
+    )
+    token.add_argument(
         "--no-verify",
         action="store_true",
         help="Store without probing 1Password first (not recommended)",
@@ -91,6 +99,14 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
     set_p = sub.add_parser("set", help="Map an env var to an op:// reference")
     set_p.add_argument("env_var", help="Environment variable name, e.g. OPENAI_API_KEY")
     set_p.add_argument("reference", help="1Password reference, e.g. op://Private/OpenAI/api key")
+    set_p.add_argument(
+        "--account",
+        help="Account shorthand/sign-in address for this reference",
+    )
+    set_p.add_argument(
+        "--token-env",
+        help="Env var holding this account's service-account token",
+    )
     set_p.set_defaults(func=cmd_set)
 
     remove = sub.add_parser("remove", help="Remove an env-var → reference mapping")
@@ -101,7 +117,7 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
     sync.add_argument(
         "--apply",
         action="store_true",
-        help="Actually export resolved values into the current shell (default: dry-run)",
+        help="Apply resolved values inside this validation process (default: dry-run)",
     )
     sync.set_defaults(func=cmd_sync)
 
@@ -202,10 +218,16 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     enabled = bool(op_cfg.get("enabled"))
     account = str(op_cfg.get("account", "") or "").strip()
-    token_env = op_cfg.get("service_account_token_env", _DEFAULT_TOKEN_ENV)
+    raw_token_env = op_cfg.get("service_account_token_env", _DEFAULT_TOKEN_ENV)
+    token_env = (
+        _DEFAULT_TOKEN_ENV
+        if raw_token_env is None
+        else str(raw_token_env).strip()
+    )
     binary_path = str(op_cfg.get("binary_path", "") or "").strip()
-    references = op_cfg.get("env") if isinstance(op_cfg.get("env"), dict) else {}
-    token_set = bool(os.environ.get(token_env))
+    raw_references = op_cfg.get("env")
+    references: dict = raw_references if isinstance(raw_references, dict) else {}
+    token_set = bool(token_env and os.environ.get(token_env))
 
     binary = op_src.find_op(binary_path)
 
@@ -213,8 +235,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     table.add_column("", style="bold")
     table.add_column("")
     table.add_row("Enabled", _yn(enabled))
-    table.add_row("Account", account or "[dim]default[/dim]")
-    table.add_row("Token env var", token_env)
+    table.add_row("Default account", account or "[dim]op default[/dim]")
+    table.add_row("Default token env var", token_env)
     table.add_row("Token in env", _yn(token_set))
     table.add_row("Override existing", _yn(bool(op_cfg.get("override_existing", True))))
     table.add_row("Cache TTL (s)", str(op_cfg.get("cache_ttl_seconds", 300)))
@@ -226,26 +248,85 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     console.print(Panel(table, title="1Password secret source", border_style="cyan"))
 
+    valid_references: dict = {}
+    effective_routes: dict[str, tuple[str, str, str]] = {}
     if references:
+        valid_references, reference_warnings = op_src._validate_references(references)
         ref_table = Table(show_header=True, header_style="bold")
         ref_table.add_column("Env var", style="cyan")
         ref_table.add_column("Reference")
-        for name in sorted(references):
-            ref_table.add_row(name, str(references[name]))
+        ref_table.add_column("Account")
+        ref_table.add_column("Token env")
+        ref_table.add_column("Token")
+        for name in sorted(valid_references):
+            route_cfg = valid_references[name]
+            route = op_src._reference_route(
+                route_cfg,
+                default_account=account,
+                default_token_env=token_env,
+            )
+            effective_routes[name] = route
+            reference, selected_account, selected_token_env = route
+            account_inherited = isinstance(route_cfg, str) or "account" not in route_cfg
+            token_inherited = (
+                isinstance(route_cfg, str)
+                or "service_account_token_env" not in route_cfg
+            )
+            ref_table.add_row(
+                name,
+                reference,
+                (selected_account or "op default")
+                + (" *" if account_inherited else ""),
+                (selected_token_env or "desktop")
+                + (" *" if token_inherited else ""),
+                _yn(bool(selected_token_env and os.environ.get(selected_token_env))),
+            )
         console.print(ref_table)
+        for warning in reference_warnings:
+            console.print(f"[yellow]warning:[/yellow] {warning}")
+        console.print("[dim]* inherited from profile defaults[/dim]")
 
     if not enabled:
         console.print("\n  Run [cyan]hermes secrets onepassword setup[/cyan] to enable.")
         return 0
-    if binary and not token_set:
-        who = _op_whoami(binary, account)
-        if who:
-            console.print(f"\n  [green]Active op session:[/green] {who}")
-        else:
+    if binary:
+        missing_token_routes: list[str] = []
+        desktop_routes: dict[tuple[str, bool], list[str]] = {}
+        for name, (_reference, selected_account, selected_token_env) in effective_routes.items():
+            route_cfg = valid_references[name]
+            token_is_explicit = (
+                isinstance(route_cfg, dict)
+                and "service_account_token_env" in route_cfg
+            ) or selected_token_env not in {"", _DEFAULT_TOKEN_ENV}
+            if selected_token_env and os.environ.get(selected_token_env):
+                continue
+            if selected_token_env and token_is_explicit:
+                missing_token_routes.append(name)
+                continue
+            strict_auth = isinstance(route_cfg, dict)
+            desktop_routes.setdefault((selected_account, strict_auth), []).append(name)
+
+        for name in missing_token_routes:
+            selected_token_env = effective_routes[name][2]
             console.print(
-                f"\n  [yellow]No active op session and {token_env} is unset — "
-                "Hermes will warn and skip 1Password on next startup.[/yellow]"
+                f"\n  [yellow]{name}: selected token env "
+                f"{selected_token_env} is unset; this mapping will be skipped.[/yellow]"
             )
+        for (selected_account, strict_auth), names in desktop_routes.items():
+            who = _op_whoami(
+                binary, selected_account, strict_auth=strict_auth
+            )
+            if who:
+                console.print(
+                    f"\n  [green]Active op session:[/green] {who} "
+                    f"([cyan]{', '.join(names)}[/cyan])"
+                )
+            else:
+                console.print(
+                    f"\n  [yellow]No active op session for "
+                    f"{selected_account or 'the op default account'}; mappings "
+                    f"{', '.join(names)} will be skipped.[/yellow]"
+                )
     if not references:
         console.print(
             "\n  [yellow]No references mapped yet.[/yellow]  Add one: "
@@ -259,7 +340,19 @@ def cmd_set(args: argparse.Namespace) -> int:
     # Reuse the backend validator so the CLI and startup paths agree on what a
     # valid reference is — and store the *validated/stripped* value, not the
     # raw arg (so trailing whitespace never lands in config.yaml).
-    valid, warnings = op_src._validate_references({args.env_var: args.reference})
+    account_arg = getattr(args, "account", None)
+    token_env_arg = getattr(args, "token_env", None)
+    account = str(account_arg or "").strip()
+    token_env = str(token_env_arg or "").strip()
+    candidate: object = args.reference
+    if account_arg is not None or token_env_arg is not None:
+        structured = {"reference": args.reference}
+        if account_arg is not None:
+            structured["account"] = account
+        if token_env_arg is not None:
+            structured["service_account_token_env"] = token_env
+        candidate = structured
+    valid, warnings = op_src._validate_references({args.env_var: candidate})
     if args.env_var not in valid:
         for w in warnings:
             console.print(f"[red]{w}[/red]")
@@ -273,9 +366,16 @@ def cmd_set(args: argparse.Namespace) -> int:
         op_cfg["env"] = env_map
     env_map[args.env_var] = valid[args.env_var]
     save_config(cfg)
+    reference, selected_account, selected_token_env = op_src._reference_route(
+        valid[args.env_var], default_account="", default_token_env=""
+    )
+    route = ""
+    if selected_account:
+        route += f" account={selected_account}"
+    if selected_token_env:
+        route += f" token-env={selected_token_env}"
     console.print(
-        f"[green]✓[/green] mapped [cyan]{args.env_var}[/cyan] → "
-        f"{valid[args.env_var]}"
+        f"[green]✓[/green] mapped [cyan]{args.env_var}[/cyan] → {reference}{route}"
     )
     if not op_cfg.get("enabled"):
         console.print(
@@ -309,8 +409,19 @@ def cmd_token(args: argparse.Namespace) -> int:
     console = Console()
     cfg = load_config()
     op_cfg = (cfg.get("secrets") or {}).get("onepassword") or {}
-    token_env = op_cfg.get("service_account_token_env", _DEFAULT_TOKEN_ENV)
-    account = str(op_cfg.get("account", "") or "").strip()
+    token_env_arg = getattr(args, "token_env", None)
+    raw_token_env = (
+        op_cfg.get("service_account_token_env", _DEFAULT_TOKEN_ENV)
+        if token_env_arg is None
+        else token_env_arg
+    )
+    token_env = str(raw_token_env).strip()
+    account_arg = getattr(args, "account", None)
+    raw_account = op_cfg.get("account", "") if account_arg is None else account_arg
+    account = str(raw_account or "").strip()
+    if not op_src.is_valid_env_name(token_env):
+        console.print(f"[red]{token_env!r} is not a valid token env-var name.[/red]")
+        return 1
     binary_path = str(op_cfg.get("binary_path", "") or "").strip()
 
     token = (args.token or "").strip()
@@ -403,17 +514,19 @@ def cmd_sync(args: argparse.Namespace) -> int:
         table.add_column("Env var", style="cyan")
         table.add_column("Action")
         for name in sorted(result.applied):
-            table.add_row(name, "[green]exported[/green]")
+            table.add_row(name, "[green]applied[/green]")
         for name in sorted(result.skipped):
             table.add_row(name, "[dim]skipped (already set / token var)[/dim]")
         console.print(table)
         for w in result.warnings:
             console.print(f"[yellow]warning:[/yellow] {w}")
         console.print(
-            f"\n  [green]Exported {len(result.applied)} secret(s) into current "
+            f"\n  [green]Applied {len(result.applied)} secret(s) inside this validation "
             "process.[/green]"
         )
         return 0
+
+    protected_token_envs = op_src.OnePasswordSource().protected_env_vars(op_cfg)
 
     # Dry-run: resolve fresh (no cache) and preview, mutating nothing.
     try:
@@ -433,7 +546,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     table.add_column("Env var", style="cyan")
     table.add_column("Action")
     for name in sorted(references):
-        if name == token_env:
+        if name in protected_token_envs:
             table.add_row(name, "[dim]skip (token var)[/dim]")
         elif name not in secrets:
             table.add_row(name, "[red]unresolved (see warnings)[/red]")
@@ -499,24 +612,36 @@ def _op_version(binary: Path) -> str:
 
 
 def _op_whoami(
-    binary: Path, account: str, *, token_value: str = ""
+    binary: Path,
+    account: str,
+    *,
+    token_value: str = "",
+    strict_auth: bool = False,
 ) -> Optional[str]:
     """Return a short identity string if op is authenticated, else None.
 
     ``token_value``, when given, is passed to the child as
     ``OP_SERVICE_ACCOUNT_TOKEN`` so a candidate token can be probed
-    without touching the caller's environment.
+    without touching the caller's environment. ``strict_auth`` also isolates
+    desktop probes from unrelated ambient 1Password credentials.
     """
     cmd = [str(binary), "whoami"]
     if account:
         cmd += ["--account", account]
-    env = os.environ.copy()
+    if token_value or strict_auth:
+        # Candidate tokens and structured desktop routes are validated in
+        # isolation so unrelated sessions, Connect credentials, and provider
+        # secrets cannot authenticate the probe or leak into its environment.
+        env = op_src._op_child_env(token_value, strict_auth=True)
+    else:
+        # Preserve the historical interactive-session behavior for setup/status
+        # probes that are not validating a candidate token.
+        env = os.environ.copy()
     env.setdefault("NO_COLOR", "1")
-    if token_value:
-        env["OP_SERVICE_ACCOUNT_TOKEN"] = token_value
     try:
         res = subprocess.run(
-            cmd, env=env, capture_output=True, text=True,
+            cmd, env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=10
         )
     except (OSError, subprocess.TimeoutExpired):

@@ -15,16 +15,18 @@ Design summary
           enabled: true
           env:
             OPENAI_API_KEY: "op://Private/OpenAI/api key"
-            ANTHROPIC_API_KEY: "op://Private/Anthropic/credential"
+            WORK_API_KEY:
+              reference: "op://Engineering/Internal API/credential"
+              account: work.1password.com
+              service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN_WORK
 
 * After ``.env`` loads, each reference is resolved with a single
   ``op read -- <reference>`` call and injected into ``os.environ`` (the
   same point in startup as the Bitwarden source).
-* Authentication is whatever the user's ``op`` CLI already uses — a
-  service-account token (``OP_SERVICE_ACCOUNT_TOKEN``) for headless boxes,
-  or a desktop/interactive session (``OP_SESSION_*``).  Hermes never
-  authenticates on the user's behalf; it shells out to an already-trusted,
-  already-authenticated CLI.
+* Legacy string mappings use the profile defaults and preserve the historical
+  ``op`` authentication environment.  Structured mappings can select an
+  account and token env per reference; each read receives only that service
+  token, or a clean desktop-integration context when no token is available.
 * Failures NEVER block startup.  A missing ``op`` binary, expired auth, a
   bad reference, or a permission error each surface a one-line warning and
   Hermes continues with whatever credentials ``.env`` already had.
@@ -40,6 +42,7 @@ material is fingerprinted, never stored.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -47,7 +50,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple, Union, cast
 
 from agent.secret_sources._cache import (
     CachedFetch,
@@ -72,6 +75,11 @@ _OP_RUN_TIMEOUT = 30
 # the value to the child as OP_SERVICE_ACCOUNT_TOKEN, which is what `op` itself
 # looks for.
 _DEFAULT_TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
+
+# Backward-compatible reference values.  Existing configs store a plain
+# ``op://`` string.  A structured mapping can override the account and token
+# env for one reference without changing the legacy profile-wide defaults.
+ReferenceConfig = Union[str, Dict[str, str]]
 
 # Strip whole ANSI CSI sequences (colour, cursor moves, line erases) from any
 # `op` diagnostic we surface — not just the lone ESC byte — so a control
@@ -145,34 +153,118 @@ def _disk_cache_path(home_path: Optional[Path] = None) -> Path:
 
 
 def _validate_references(
-    references: Optional[Dict[str, str]],
-) -> Tuple[Dict[str, str], List[str]]:
+    references: Optional[Mapping[str, object]],
+) -> Tuple[Dict[str, ReferenceConfig], List[str]]:
     """Return ``(valid_refs, warnings)`` from an ``env`` mapping.
 
     A reference is kept only if its target env-var name is a valid POSIX
     name and the value is a stripped ``op://…`` reference string.  Everything
     else produces a warning and is dropped (never fatal).
     """
-    valid: Dict[str, str] = {}
+    valid: Dict[str, ReferenceConfig] = {}
     warnings: List[str] = []
     for name, ref in (references or {}).items():
         if not is_valid_env_name(name):
             warnings.append(f"Skipping {name!r}: not a valid env-var name")
             continue
-        if not isinstance(ref, str):
-            warnings.append(f"Skipping {name!r}: reference is not a string")
+        if isinstance(ref, str):
+            cleaned = ref.strip()
+            structured = None
+        elif isinstance(ref, dict):
+            ref_map = cast(Dict[str, object], ref)
+            non_string_fields = [key for key in ref_map if not isinstance(key, str)]
+            if non_string_fields:
+                warnings.append(
+                    f"Skipping {name!r}: structured mapping field names must be strings"
+                )
+                continue
+            unknown = sorted(
+                set(ref_map)
+                - {"reference", "account", "service_account_token_env"}
+            )
+            if unknown:
+                warnings.append(
+                    f"Skipping {name!r}: unknown field(s): {', '.join(unknown)}"
+                )
+                continue
+            raw_reference = ref_map.get("reference")
+            if not isinstance(raw_reference, str):
+                warnings.append(
+                    f"Skipping {name!r}: structured mapping requires a string reference"
+                )
+                continue
+            cleaned = raw_reference.strip()
+            structured = {"reference": cleaned}
+            raw_account = ref_map.get("account", "")
+            if not isinstance(raw_account, str):
+                warnings.append(f"Skipping {name!r}: account must be a string")
+                continue
+            account = raw_account.strip()
+            if account:
+                if account.startswith("-") or any(ord(ch) < 32 for ch in account):
+                    warnings.append(f"Skipping {name!r}: account contains invalid characters")
+                    continue
+            if "account" in ref_map:
+                structured["account"] = account
+            raw_token_env = ref_map.get("service_account_token_env", "")
+            if not isinstance(raw_token_env, str):
+                warnings.append(
+                    f"Skipping {name!r}: service_account_token_env must be a string"
+                )
+                continue
+            token_env = raw_token_env.strip()
+            if token_env:
+                if not is_valid_env_name(token_env):
+                    warnings.append(
+                        f"Skipping {name!r}: {token_env!r} is not a valid token env-var name"
+                    )
+                    continue
+            if "service_account_token_env" in ref_map:
+                structured["service_account_token_env"] = token_env
+        else:
+            warnings.append(
+                f"Skipping {name!r}: reference must be a string or structured mapping"
+            )
             continue
-        cleaned = ref.strip()
         if not cleaned.startswith("op://"):
             warnings.append(
                 f"Skipping {name!r}: {ref!r} is not an op:// secret reference"
             )
             continue
-        valid[name] = cleaned
+        valid[name] = structured if structured is not None else cleaned
     return valid, warnings
 
 
-def _auth_fingerprint(token_env: str) -> str:
+def _reference_route(
+    value: ReferenceConfig,
+    *,
+    default_account: str,
+    default_token_env: str,
+) -> Tuple[str, str, str]:
+    """Return ``(reference, account, token_env)`` for a validated mapping."""
+    if isinstance(value, str):
+        return value, default_account, default_token_env
+    return (
+        value["reference"],
+        value.get("account", default_account),
+        value.get("service_account_token_env", default_token_env),
+    )
+
+
+def _configured_token_envs(
+    references: Dict[str, ReferenceConfig], default_token_env: str
+) -> frozenset[str]:
+    """Return every bootstrap-token env var named by validated mappings."""
+    configured = frozenset(
+        _reference_route(
+            value, default_account="", default_token_env=default_token_env
+        )[2]
+        for value in references.values()
+    ) | frozenset({default_token_env, _DEFAULT_TOKEN_ENV})
+    return frozenset(name for name in configured if name)
+
+
+def _auth_fingerprint(token_envs: Union[str, List[str]]) -> str:
     """SHA-256 prefix over the auth material `op` would use.
 
     Folds in the service-account token, ``OP_ACCOUNT``, the 1Password Connect
@@ -183,8 +275,10 @@ def _auth_fingerprint(token_env: str) -> str:
     previous identity is never served under a new one.  Never logged or
     displayed; the raw token never leaves this hash.
     """
+    if isinstance(token_envs, str):
+        token_envs = [token_envs]
     parts: List[str] = [
-        f"token={os.environ.get(token_env, '')}",
+        *(f"token:{name}={os.environ.get(name, '')}" for name in sorted(set(token_envs))),
         f"account={os.environ.get('OP_ACCOUNT', '')}",
         f"connect_host={os.environ.get('OP_CONNECT_HOST', '')}",
         f"connect_token={os.environ.get('OP_CONNECT_TOKEN', '')}",
@@ -196,9 +290,12 @@ def _auth_fingerprint(token_env: str) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
-def _refs_fingerprint(references: Dict[str, str]) -> str:
+def _refs_fingerprint(references: Dict[str, ReferenceConfig]) -> str:
     """SHA-256 prefix over the configured name→reference mapping."""
-    material = "\n".join(f"{name}={references[name]}" for name in sorted(references))
+    material = "\n".join(
+        f"{name}={json.dumps(references[name], sort_keys=True, separators=(',', ':'))}"
+        for name in sorted(references)
+    )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
@@ -234,17 +331,30 @@ def _scrub(text: str) -> str:
     return _ANSI_CSI_RE.sub("", text).replace("\x1b", "").strip()
 
 
-def _op_child_env(token_value: str) -> Dict[str, str]:
-    """Build a minimal allowlisted environment for the ``op`` child process."""
+def _op_child_env(token_value: str, *, strict_auth: bool = False) -> Dict[str, str]:
+    """Build a minimal allowlisted environment for the ``op`` child process.
+
+    Structured account-bound mappings use ``strict_auth`` so a read receives
+    exactly its selected service token, or no inherited CLI auth material when
+    desktop-app authentication is intended.  Legacy scalar mappings retain the
+    historical session/Connect environment for backward compatibility.
+    """
     env: Dict[str, str] = {}
     for key in _OP_ENV_ALLOWLIST:
+        if strict_auth and key in {
+            "OP_ACCOUNT",
+            "OP_CONNECT_HOST",
+            "OP_CONNECT_TOKEN",
+        }:
+            continue
         val = os.environ.get(key)
         if val is not None:
             env[key] = val
     # Desktop / interactive session credentials.
-    for key, val in os.environ.items():
-        if key.startswith("OP_SESSION_"):
-            env[key] = val
+    if not strict_auth:
+        for key, val in os.environ.items():
+            if key.startswith("OP_SESSION_"):
+                env[key] = val
     # `op` reads OP_SERVICE_ACCOUNT_TOKEN regardless of which env var the user
     # configured Hermes to source it from, so normalize to that name here.
     if token_value:
@@ -259,6 +369,7 @@ def _run_op_read(
     *,
     account: str = "",
     token_value: str = "",
+    strict_auth: bool = False,
 ) -> str:
     """Resolve a single ``op://`` reference to its value.
 
@@ -276,7 +387,8 @@ def _run_op_read(
     try:
         proc = subprocess.run(  # noqa: S603 — op path is user-trusted, argv list
             cmd,
-            env=_op_child_env(token_value),
+            env=_op_child_env(token_value, strict_auth=strict_auth),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -291,7 +403,21 @@ def _run_op_read(
         raise RuntimeError(f"failed to invoke op: {exc}") from exc
 
     if proc.returncode != 0:
-        err = _scrub(proc.stderr or "")[:200]
+        err: str = str(proc.stderr or "")
+        auth_values: list[str] = [token_value] + [
+            str(value)
+            for key, value in os.environ.items()
+            if key == "OP_SERVICE_ACCOUNT_TOKEN"
+            or key == "OP_CONNECT_TOKEN"
+            or key.startswith("OP_SESSION_")
+        ]
+        for auth_value in sorted(auth_values, key=len, reverse=True):
+            auth_value_text: str = str(auth_value)
+            if auth_value_text:
+                err = re.sub(
+                    re.escape(auth_value_text), "[REDACTED]", err
+                )
+        err = _scrub(err)[:200]
         if err:
             raise RuntimeError(f"op read failed for {reference!r}: {err}")
         raise RuntimeError(
@@ -315,7 +441,7 @@ def _run_op_read(
 
 def fetch_onepassword_secrets(
     *,
-    references: Dict[str, str],
+    references: Mapping[str, object],
     account: str = "",
     token_env: str = _DEFAULT_TOKEN_ENV,
     binary: Optional[Path] = None,
@@ -335,18 +461,43 @@ def fetch_onepassword_secrets(
     isn't frozen in for the whole TTL window.
     """
     valid, warnings = _validate_references(references)
+    protected_token_envs = _configured_token_envs(valid, token_env)
+    for name in list(valid):
+        if name in protected_token_envs:
+            warnings.append(
+                f"Skipping {name!r}: target is a 1Password bootstrap token env var"
+            )
+            del valid[name]
     if not valid:
         return {}, warnings
 
-    token_value = os.environ.get(token_env, "").strip()
+    routes = {
+        name: _reference_route(
+            value, default_account=account, default_token_env=token_env
+        )
+        for name, value in valid.items()
+    }
+    token_envs = [route[2] for route in routes.values()]
     cache_key: _CacheKey = (
-        _auth_fingerprint(token_env),
-        account or "",
+        _auth_fingerprint(token_envs),
+        hashlib.sha256(
+            "\n".join(
+                f"{name}={routes[name][1]}|{routes[name][2]}"
+                for name in sorted(routes)
+            ).encode("utf-8")
+        ).hexdigest()[:16],
         str(home_path) if home_path is not None else "",
         _refs_fingerprint(valid),
     )
 
-    if use_cache:
+    # Desktop-app identity is not represented by a stable environment value.
+    # Do not persist/reuse values for routes that intentionally select desktop
+    # auth; otherwise switching identities can replay a prior account's secret.
+    cache_allowed = use_cache and all(
+        bool(token_env and os.environ.get(token_env, "").strip())
+        for _reference, _account, token_env in routes.values()
+    )
+    if cache_allowed:
         cached = _CACHE.get(cache_key)
         if cached and cached.is_fresh(cache_ttl_seconds):
             return dict(cached.secrets), warnings
@@ -367,15 +518,33 @@ def fetch_onepassword_secrets(
     secrets: Dict[str, str] = {}
     read_errors = 0
     for name in sorted(valid):
+        reference, selected_account, selected_token_env = routes[name]
+        token_value = os.environ.get(selected_token_env, "").strip()
+        route_cfg = valid[name]
+        token_is_explicit = (
+            isinstance(route_cfg, dict)
+            and "service_account_token_env" in route_cfg
+        ) or selected_token_env not in {"", _DEFAULT_TOKEN_ENV}
+        if selected_token_env and token_is_explicit and not token_value:
+            warnings.append(
+                f"Skipping {name!r}: selected token env var "
+                f"{selected_token_env!r} is unset"
+            )
+            read_errors += 1
+            continue
         try:
             secrets[name] = _run_op_read(
-                op, valid[name], account=account, token_value=token_value
+                op,
+                reference,
+                account=selected_account,
+                token_value=token_value,
+                strict_auth=isinstance(route_cfg, dict) or not selected_token_env,
             )
         except RuntimeError as exc:
             warnings.append(str(exc))
             read_errors += 1
 
-    if use_cache and not read_errors and secrets:
+    if cache_allowed and not read_errors and secrets:
         entry = CachedFetch(secrets=dict(secrets), fetched_at=time.time())
         _CACHE[cache_key] = entry
         _DISK_CACHE.write(cache_key, entry, cache_ttl_seconds, home_path)
@@ -391,7 +560,7 @@ def fetch_onepassword_secrets(
 def apply_onepassword_secrets(
     *,
     enabled: bool,
-    env: Optional[Dict[str, str]] = None,
+    env: Optional[Mapping[str, object]] = None,
     account: str = "",
     service_account_token_env: str = _DEFAULT_TOKEN_ENV,
     binary_path: str = "",
@@ -420,9 +589,10 @@ def apply_onepassword_secrets(
     result.warnings.extend(warnings)
 
     # Skip-before-fetch: never resolve a reference we'd only throw away.
-    refs_to_fetch: Dict[str, str] = {}
+    protected_token_envs = _configured_token_envs(valid, service_account_token_env)
+    refs_to_fetch: Dict[str, ReferenceConfig] = {}
     for name, ref in valid.items():
-        if name == service_account_token_env:
+        if name in protected_token_envs:
             # Never let a resolved secret clobber the very token used to auth.
             result.skipped.append(name)
             continue
@@ -470,7 +640,7 @@ def apply_onepassword_secrets(
     for name, value in secrets.items():
         # The token-var and override guards already filtered refs_to_fetch, but
         # re-check defensively in case the fetch layer ever returns extras.
-        if name == service_account_token_env:
+        if name in protected_token_envs:
             if name not in result.skipped:
                 result.skipped.append(name)
             continue
@@ -517,15 +687,22 @@ class OnePasswordSource(SecretSource):
 
     def protected_env_vars(self, cfg: dict):
         token_env = _DEFAULT_TOKEN_ENV
+        valid: Dict[str, ReferenceConfig] = {}
         if isinstance(cfg, dict):
-            token_env = str(cfg.get("service_account_token_env") or token_env)
-        return frozenset({token_env})
+            raw_token_env = cfg.get("service_account_token_env", token_env)
+            token_env = token_env if raw_token_env is None else str(raw_token_env).strip()
+            env_map = cfg.get("env")
+            valid, _warnings = _validate_references(
+                env_map if isinstance(env_map, dict) else None
+            )
+        return _configured_token_envs(valid, token_env)
 
     def config_schema(self) -> dict:
         return {
             "enabled": {"description": "Master switch", "default": False},
             "env": {
-                "description": "Map of ENV_VAR -> op://vault/item/field reference",
+                "description": "Map of ENV_VAR to an op:// reference string or "
+                               "{reference, account?, service_account_token_env?}",
                 "default": {},
             },
             "account": {
@@ -594,12 +771,18 @@ class OnePasswordSource(SecretSource):
             ttl = 300.0
 
         try:
+            raw_token_env = cfg.get(
+                "service_account_token_env", _DEFAULT_TOKEN_ENV
+            )
+            token_env = (
+                _DEFAULT_TOKEN_ENV
+                if raw_token_env is None
+                else str(raw_token_env).strip()
+            )
             secrets, fetch_warnings = fetch_onepassword_secrets(
                 references=valid,
                 account=str(cfg.get("account") or ""),
-                token_env=str(
-                    cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV
-                ),
+                token_env=token_env,
                 binary=binary,
                 cache_ttl_seconds=ttl,
                 home_path=home_path,
@@ -617,7 +800,12 @@ class OnePasswordSource(SecretSource):
         if kind in (ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED):
             token_env = _DEFAULT_TOKEN_ENV
             if isinstance(cfg, dict):
-                token_env = str(cfg.get("service_account_token_env") or token_env)
+                raw_token_env = cfg.get("service_account_token_env", token_env)
+                token_env = (
+                    token_env if raw_token_env is None else str(raw_token_env).strip()
+                )
+            if not token_env:
+                return "Unlock 1Password and enable desktop app CLI integration."
             return (
                 "Run `hermes secrets onepassword token` to paste a fresh "
                 f"service-account token ({token_env}), or `op signin` for an "

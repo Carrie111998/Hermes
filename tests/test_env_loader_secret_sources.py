@@ -8,6 +8,7 @@ don't see an unexplained "credentials ✓" line when their .env is empty.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -355,6 +356,62 @@ def test_apply_external_secret_sources_records_onepassword_origin(tmp_path, monk
         env_loader.format_secret_source_suffix("ANTHROPIC_API_KEY")
         == " (from 1Password)"
     )
+
+
+def test_real_onepassword_source_routes_two_accounts_through_startup(
+    tmp_path, monkeypatch
+):
+    """The real registry path preserves routing, provenance, and token isolation."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OP_TOKEN_WORK", "work-bootstrap")
+    monkeypatch.setenv("OP_TOKEN_PERSONAL", "personal-bootstrap")
+    monkeypatch.delenv("WORK_API_KEY", raising=False)
+    monkeypatch.delenv("PERSONAL_API_KEY", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    cache_ttl_seconds: 0\n"
+        "    env:\n"
+        "      WORK_API_KEY:\n"
+        "        reference: 'op://Work/Hermes/key'\n"
+        "        account: work.1password.com\n"
+        "        service_account_token_env: OP_TOKEN_WORK\n"
+        "      PERSONAL_API_KEY:\n"
+        "        reference: 'op://Personal/Hermes/key'\n"
+        "        account: personal.1password.com\n"
+        "        service_account_token_env: OP_TOKEN_PERSONAL\n",
+        encoding="utf-8",
+    )
+
+    import agent.secret_sources.onepassword as op_module
+    from agent.secret_sources import registry as reg_module
+
+    monkeypatch.setattr(op_module, "find_op", lambda *_a, **_kw: Path("/fake/op"))
+    calls = {}
+
+    def fake_run(cmd, **kwargs):
+        account = cmd[cmd.index("--account") + 1]
+        calls[account] = kwargs["env"]
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=f"resolved-{account}\n", stderr=""
+        )
+
+    monkeypatch.setattr(op_module.subprocess, "run", fake_run)
+    reg_module._reset_registry_for_tests()
+
+    env_loader._apply_external_secret_sources(tmp_path)
+
+    assert os.environ["WORK_API_KEY"] == "resolved-work.1password.com"
+    assert os.environ["PERSONAL_API_KEY"] == "resolved-personal.1password.com"
+    assert env_loader.get_secret_source("WORK_API_KEY") == "onepassword"
+    assert env_loader.get_secret_source("PERSONAL_API_KEY") == "onepassword"
+    assert calls["work.1password.com"]["OP_SERVICE_ACCOUNT_TOKEN"] == "work-bootstrap"
+    assert calls["personal.1password.com"]["OP_SERVICE_ACCOUNT_TOKEN"] == "personal-bootstrap"
+    assert "personal-bootstrap" not in calls["work.1password.com"].values()
+    assert "work-bootstrap" not in calls["personal.1password.com"].values()
+    assert os.environ["OP_TOKEN_WORK"] == "work-bootstrap"
+    assert os.environ["OP_TOKEN_PERSONAL"] == "personal-bootstrap"
 
 
 def test_apply_external_secret_sources_survives_non_dict_section(tmp_path, monkeypatch):

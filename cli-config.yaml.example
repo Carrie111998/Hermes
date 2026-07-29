@@ -1629,13 +1629,16 @@ updates:
 #   # ---- 1Password (op CLI) -------------------------------------------------
 #   onepassword:
 #     enabled: false
-#     # Map env-var names to op:// secret references. Each is resolved with a
-#     # single `op read` at startup.
+#     # Map env-var names to op:// secret references. String mappings inherit
+#     # the defaults below; use the structured form for per-reference routing.
 #     env:
 #       OPENAI_API_KEY: "op://Private/OpenAI/api key"
-#       ANTHROPIC_API_KEY: "op://Private/Anthropic/credential"
-#     account: ""                                   # op --account shorthand; "" = default
-#     service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN  # headless auth; unset = desktop session
+#       WORK_API_KEY:
+#         reference: "op://Engineering/Internal API/credential"
+#         account: work.1password.com
+#         service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN_WORK
+#     account: ""                                   # default op --account; "" = op default
+#     service_account_token_env: OP_SERVICE_ACCOUNT_TOKEN  # default headless auth env
 #     binary_path: ""                               # "" = resolve op via PATH; else absolute path
 #     cache_ttl_seconds: 300                        # 0 disables BOTH cache layers
 #     override_existing: true                       # resolved values win over existing env
