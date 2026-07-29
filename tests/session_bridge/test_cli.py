@@ -81,6 +81,7 @@ from session_bridge.sidebar_hydration_executor import (
     SidebarHydrationExecutor,
     SidebarHydrationExecutionResult,
 )
+from session_bridge.sidebar_runtime import sidebar_registration_app_server_args
 from session_bridge.store import SessionBridgeStore
 
 
@@ -5766,8 +5767,11 @@ def test_production_sidebar_recovery_recycles_unavailable_codex_client(
     closed: list[str] = []
 
     class Client:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
         def close(self) -> None:
-            closed.append("client")
+            closed.append(self.name)
 
     class Store:
         def record_sidebar_recovery_progress(self, **value: object) -> None:
@@ -5784,10 +5788,12 @@ def test_production_sidebar_recovery_recycles_unavailable_codex_client(
                 error_code="codex_tool_unavailable",
             )
 
-    client = Client()
+    normal_client = Client("normal")
+    registration_client = Client("registration")
     hydration = HydrationExecutor()
     registration = RegistrationExecutor()
-    backend._sidebar_codex_client = client  # type: ignore[assignment]
+    backend._sidebar_codex_client = normal_client  # type: ignore[assignment]
+    backend._sidebar_registration_codex_client = registration_client  # type: ignore[assignment]
     backend._sidebar_hydration_executor = hydration  # type: ignore[assignment]
     backend._sidebar_executor = registration
     monkeypatch.setattr(backend, "_require_store", lambda: Store())
@@ -5799,8 +5805,9 @@ def test_production_sidebar_recovery_recycles_unavailable_codex_client(
         "thread_id": None,
         "error_code": "codex_tool_unavailable",
     }
-    assert closed == ["client"]
+    assert closed == ["normal", "registration"]
     assert backend._sidebar_codex_client is None
+    assert backend._sidebar_registration_codex_client is None
     assert backend._sidebar_hydration_executor is None
     assert backend._sidebar_executor is None
 
@@ -5814,8 +5821,11 @@ def test_production_sidebar_recovery_recycles_retryable_codex_transport(
     closed: list[str] = []
 
     class Client:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
         def close(self) -> None:
-            closed.append("client")
+            closed.append(self.name)
 
     class Store:
         def record_sidebar_recovery_progress(self, **value: object) -> None:
@@ -5833,10 +5843,12 @@ def test_production_sidebar_recovery_recycles_retryable_codex_transport(
                 error_code="bridge_temporarily_unavailable",
             )
 
-    client = Client()
+    normal_client = Client("normal")
+    registration_client = Client("registration")
     hydration = HydrationExecutor()
     registration = RegistrationExecutor()
-    backend._sidebar_codex_client = client  # type: ignore[assignment]
+    backend._sidebar_codex_client = normal_client  # type: ignore[assignment]
+    backend._sidebar_registration_codex_client = registration_client  # type: ignore[assignment]
     backend._sidebar_hydration_executor = hydration  # type: ignore[assignment]
     backend._sidebar_executor = registration
     monkeypatch.setattr(backend, "_require_store", lambda: Store())
@@ -5848,8 +5860,9 @@ def test_production_sidebar_recovery_recycles_retryable_codex_transport(
         "thread_id": None,
         "error_code": "bridge_temporarily_unavailable",
     }
-    assert closed == ["client"]
+    assert closed == ["normal", "registration"]
     assert backend._sidebar_codex_client is None
+    assert backend._sidebar_registration_codex_client is None
     assert backend._sidebar_hydration_executor is None
     assert backend._sidebar_executor is None
 
@@ -6389,7 +6402,13 @@ def test_production_sidebar_executor_uses_a_dedicated_codex_transport(
             self.close_count += 1
 
     provider_client = ProtocolCodexClient("provider")
-    sidebar_client = ProtocolCodexClient("sidebar")
+    created: list[tuple[dict[str, object], ProtocolCodexClient]] = []
+
+    def client_factory(**kwargs: object) -> ProtocolCodexClient:
+        client = ProtocolCodexClient(f"sidebar-{len(created)}")
+        created.append((dict(kwargs), client))
+        return client
+
     monkeypatch.setattr(backend, "_codex_client", provider_client)
     captured: dict[str, Any] = {}
 
@@ -6408,21 +6427,40 @@ def test_production_sidebar_executor_uses_a_dedicated_codex_transport(
     )
     monkeypatch.setattr(
         "session_bridge.cli.CodexAppServerClient",
-        lambda **_kwargs: sidebar_client,
+        client_factory,
     )
     monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
 
     try:
         assert backend.sidebar_run_once()["status"] == "idle"
-        assert captured["native"]._client is sidebar_client
-        assert captured["verifier"]._source_adapter._client is sidebar_client
+        registration_client = created[0][1]
+        assert created[0][0] == {
+            "codex_bin": "codex",
+            "extra_args": sidebar_registration_app_server_args(),
+        }
+        assert captured["native"]._client is registration_client
+        assert captured["verifier"]._source_adapter._client is registration_client
         assert backend._codex_client is provider_client
-        assert backend._sidebar_codex_client is sidebar_client
+        assert backend._sidebar_registration_codex_client is registration_client
+        assert backend._sidebar_codex_client is None
+
+        fresh_client = captured["native"]._fresh_client_factory()
+        assert created[1][0] == {"codex_bin": "codex"}
+        assert fresh_client is created[1][1]
+        fresh_client.close()
+
+        terminal = backend._require_sidebar_terminal_delivery()
+        normal_client = created[2][1]
+        assert created[2][0] == {"codex_bin": "codex"}
+        assert terminal._client is normal_client
+        assert backend._sidebar_codex_client is normal_client
     finally:
         backend.close()
 
     assert provider_client.close_count == 1
-    assert sidebar_client.close_count == 1
+    assert created[0][1].close_count == 1
+    assert created[1][1].close_count == 1
+    assert created[2][1].close_count == 1
 
 
 def test_production_backend_close_closes_both_codex_transports_once_and_resets_lifecycle(
@@ -6439,8 +6477,14 @@ def test_production_backend_close_closes_both_codex_transports_once_and_resets_l
 
     provider_client = ProtocolCodexClient()
     sidebar_client = ProtocolCodexClient()
+    registration_client = ProtocolCodexClient()
     monkeypatch.setattr(backend, "_codex_client", provider_client)
     monkeypatch.setattr(backend, "_sidebar_codex_client", sidebar_client)
+    monkeypatch.setattr(
+        backend,
+        "_sidebar_registration_codex_client",
+        registration_client,
+    )
     monkeypatch.setattr(backend, "_sidebar_executor", object())
 
     backend.close()
@@ -6448,8 +6492,10 @@ def test_production_backend_close_closes_both_codex_transports_once_and_resets_l
 
     assert provider_client.close_count == 1
     assert sidebar_client.close_count == 1
+    assert registration_client.close_count == 1
     assert backend._codex_client is None
     assert backend._sidebar_codex_client is None
+    assert backend._sidebar_registration_codex_client is None
     assert backend._sidebar_executor is None
 
 
@@ -6470,9 +6516,15 @@ def test_production_backend_close_attempts_all_cleanup_when_first_client_close_f
 
     provider_client = CloseProbe(failure=RuntimeError("provider close failed"))
     sidebar_client = CloseProbe()
+    registration_client = CloseProbe()
     database = CloseProbe()
     monkeypatch.setattr(backend, "_codex_client", provider_client)
     monkeypatch.setattr(backend, "_sidebar_codex_client", sidebar_client)
+    monkeypatch.setattr(
+        backend,
+        "_sidebar_registration_codex_client",
+        registration_client,
+    )
     monkeypatch.setattr(backend, "_db", database)
 
     with pytest.raises(RuntimeError, match="provider close failed"):
@@ -6481,9 +6533,11 @@ def test_production_backend_close_attempts_all_cleanup_when_first_client_close_f
 
     assert provider_client.close_count == 1
     assert sidebar_client.close_count == 1
+    assert registration_client.close_count == 1
     assert database.close_count == 1
     assert backend._codex_client is None
     assert backend._sidebar_codex_client is None
+    assert backend._sidebar_registration_codex_client is None
     assert backend._db is None
 
 

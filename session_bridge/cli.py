@@ -102,6 +102,7 @@ from .sidebar_executor import (
     SidebarExecutor,
 )
 from .sidebar_hydration_executor import SidebarHydrationExecutor
+from .sidebar_runtime import sidebar_registration_app_server_args
 from .store import (
     HYDRATION_FATAL_ERRORS,
     HYDRATION_RETRYABLE_ERRORS,
@@ -699,6 +700,7 @@ class ProductionBackend:
         )
         self._codex_client: RecoveringCodexAppServerClient | None = None
         self._sidebar_codex_client: CodexAppServerClient | None = None
+        self._sidebar_registration_codex_client: CodexAppServerClient | None = None
         self._sidebar_executor: SidebarExecutor | None = None
         self._sidebar_hydration_executor: SidebarHydrationExecutor | None = None
 
@@ -706,6 +708,10 @@ class ProductionBackend:
         provider_client, self._codex_client = self._codex_client, None
         sidebar_client, self._sidebar_codex_client = (
             self._sidebar_codex_client,
+            None,
+        )
+        registration_client, self._sidebar_registration_codex_client = (
+            self._sidebar_registration_codex_client,
             None,
         )
         db, self._db = self._db, None
@@ -719,7 +725,7 @@ class ProductionBackend:
 
         first_error: BaseException | None = None
         closed_clients: set[int] = set()
-        for client in (provider_client, sidebar_client):
+        for client in (provider_client, sidebar_client, registration_client):
             if client is not None and id(client) not in closed_clients:
                 closed_clients.add(id(client))
                 try:
@@ -1365,15 +1371,25 @@ class ProductionBackend:
             )
 
     def _recycle_sidebar_delivery_runtime(self) -> None:
-        client, self._sidebar_codex_client = self._sidebar_codex_client, None
+        sidebar_client, self._sidebar_codex_client = (
+            self._sidebar_codex_client,
+            None,
+        )
+        registration_client, self._sidebar_registration_codex_client = (
+            self._sidebar_registration_codex_client,
+            None,
+        )
         self._sidebar_executor = None
         self._sidebar_hydration_executor = None
-        if client is None:
-            return
-        try:
-            client.close()
-        except Exception:
-            _LOG.warning("sidebar Codex client recycle failed", exc_info=True)
+        closed_clients: set[int] = set()
+        for client in (sidebar_client, registration_client):
+            if client is None or id(client) in closed_clients:
+                continue
+            closed_clients.add(id(client))
+            try:
+                client.close()
+            except Exception:
+                _LOG.warning("sidebar Codex client recycle failed", exc_info=True)
 
     def sidebar_retry_bound(
         self,
@@ -3081,12 +3097,13 @@ class ProductionBackend:
             codex_command = resolve_cli_executable("codex")
             if len(codex_command) != 1:
                 raise RuntimeError("codex_direct_runtime_required")
-            if self._sidebar_codex_client is None:
-                self._sidebar_codex_client = CodexAppServerClient(
-                    codex_bin=codex_command[0]
+            if self._sidebar_registration_codex_client is None:
+                self._sidebar_registration_codex_client = CodexAppServerClient(
+                    codex_bin=codex_command[0],
+                    extra_args=sidebar_registration_app_server_args(),
                 )
             source = CodexSourceAdapter(
-                self._sidebar_codex_client,
+                self._sidebar_registration_codex_client,
                 marker_secret=marker_key,
             )
             verifier = SidebarThreadVerifier(
@@ -3098,7 +3115,7 @@ class ProductionBackend:
                 store=self._require_store(),
                 verifier=verifier,
                 native=CodexAppServerSidebarDelivery(
-                    cast(Any, self._sidebar_codex_client),
+                    cast(Any, self._sidebar_registration_codex_client),
                     fresh_client_factory=lambda: cast(
                         Any,
                         CodexAppServerClient(codex_bin=codex_command[0]),
