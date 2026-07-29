@@ -13296,8 +13296,10 @@ def _(rid, params: dict) -> dict:
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
 
     def run():
+        secret_capture_token = None
         session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
         try:
+            secret_capture_token = _wire_callbacks(parent)
             from run_agent import AIAgent
 
             result = AIAgent(
@@ -13325,6 +13327,7 @@ def _(rid, params: dict) -> dict:
                 {"task_id": task_id, "text": f"error: {e}"},
             )
         finally:
+            _reset_secret_capture_token(secret_capture_token)
             _clear_session_context(session_tokens)
 
     threading.Thread(target=run, daemon=True).start()
@@ -13393,8 +13396,10 @@ def _(rid, params: dict) -> dict:
     def run():
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
+        secret_capture_token = None
         session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
         try:
+            secret_capture_token = _wire_callbacks(parent)
             from run_agent import AIAgent
             from tools.terminal_tool import register_task_env_overrides
 
@@ -13438,6 +13443,7 @@ def _(rid, params: dict) -> dict:
                 clear_task_env_overrides(task_id)
             except Exception:
                 pass
+            _reset_secret_capture_token(secret_capture_token)
             _clear_session_context(session_tokens)
 
     threading.Thread(target=run, daemon=True).start()
