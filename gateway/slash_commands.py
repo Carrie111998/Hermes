@@ -2575,6 +2575,13 @@ class GatewaySlashCommandsMixin:
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
             self._ephemeral_system_prompt = ""
+            _sk = self._session_key_for_source(event.source)
+            if not hasattr(self, "_pending_personality_notes"):
+                self._pending_personality_notes = {}
+            self._pending_personality_notes[_sk] = (
+                "[Note: the personality overlay was just cleared. "
+                "From this point forward, respond in your normal default style.]"
+            )
             return t("gateway.personality.cleared")
         elif args in personalities:
             new_prompt = _resolve_prompt(personalities[args])
@@ -2590,6 +2597,15 @@ class GatewaySlashCommandsMixin:
 
             # Update in-memory so it takes effect on the very next message.
             self._ephemeral_system_prompt = new_prompt
+
+            _sk = self._session_key_for_source(event.source)
+            if not hasattr(self, "_pending_personality_notes"):
+                self._pending_personality_notes = {}
+            self._pending_personality_notes[_sk] = (
+                f"[Note: the assistant's personality was just changed to '{args}'. "
+                f"From this point forward, adopt this persona and respond "
+                f"accordingly, regardless of the style of earlier replies: {new_prompt}]"
+            )
 
             return t("gateway.personality.set_to", name=args)
 

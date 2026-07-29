@@ -2311,6 +2311,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_reasoning_overrides",
     "_session_service_tier_overrides",
     "_pending_model_notes",
+    "_pending_personality_notes",
     "_last_resolved_model",
     "_queued_events",
     # Staged-but-never-consumed sidecar notes (turn aborted between staging
@@ -22552,6 +22553,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _msn = _pending_notes.pop(session_key, None) if session_key else None
             if _msn:
                 message = _msn + "\n\n" + message
+
+            # Prepend pending personality note so the model pivots its style
+            # instead of imitating its own prior turns in the transcript.
+            _pending_pers = getattr(self, '_pending_personality_notes', {})
+            _psn = _pending_pers.pop(session_key, None) if session_key else None
+            if _psn:
+                message = _psn + "\n\n" + message
 
             # Auto-continue: if the loaded history ends with a tool result,
             # the previous agent turn was interrupted mid-work (gateway
