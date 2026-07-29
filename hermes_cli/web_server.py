@@ -848,6 +848,21 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Modal sandbox mode",
         "options": ["sandbox", "function"],
     },
+    "loop_detection.enabled": {
+        "type": "boolean",
+        "description": "Stop the model when it falls into a repetition loop (recommended)",
+        "category": "general",
+    },
+    "larp_detection.enabled": {
+        "type": "boolean",
+        "description": "Re-prompt when the model claims an action it didn't actually perform",
+        "category": "general",
+    },
+    "larp_detection.judge_tier_enabled": {
+        "type": "boolean",
+        "description": "Use an extra LLM check for ambiguous claims (costs 1 small call)",
+        "category": "general",
+    },
     "proxy.enabled": {
         "type": "boolean",
         "description": (

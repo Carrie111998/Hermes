@@ -445,6 +445,13 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     enabled: 'File Checkpoints',
     maxSnapshots: 'Checkpoint Limit'
   },
+  loopDetection: {
+    enabled: 'Stop Repetition Loops'
+  },
+  larpDetection: {
+    enabled: 'Flag Unperformed Action Claims',
+    judgeTierEnabled: 'Claim Check: Extra LLM Call'
+  },
   voice: {
     recordKey: 'Voice Shortcut',
     maxRecordingSeconds: 'Max Recording Length',
@@ -594,6 +601,13 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
   checkpoints: {
     enabled: 'Create rollback snapshots before file edits.'
   },
+  loopDetection: {
+    enabled: 'Stop the model when it falls into a repetition loop.'
+  },
+  larpDetection: {
+    enabled: "Re-prompt when the model claims an action it didn't actually perform.",
+    judgeTierEnabled: 'Use an extra LLM check for ambiguous claims (costs 1 small call).'
+  },
   memory: {
     memoryEnabled: 'Save durable memories that can help future sessions.',
     userProfileEnabled: 'Maintain a compact profile of user preferences.'
@@ -682,7 +696,10 @@ export const SECTIONS: DesktopConfigSection[] = [
       'security.allow_private_urls',
       'browser.allow_private_urls',
       'browser.auto_local_for_private_urls',
-      'checkpoints.enabled'
+      'checkpoints.enabled',
+      'loop_detection.enabled',
+      'larp_detection.enabled',
+      'larp_detection.judge_tier_enabled'
     ]
   },
   {
