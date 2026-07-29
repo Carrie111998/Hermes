@@ -2031,7 +2031,12 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # constructs a fresh one — no stale closed transport can be reused.
     # Tests in ``tests/run_agent/test_create_openai_client_reuse.py`` and
     # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
-    if "http_client" not in client_kwargs:
+    # The ChatGPT Codex edge rejects Hermes' injected httpx transport on some
+    # networks. Let the OpenAI SDK build its default client for this endpoint.
+    is_codex_backend = base_url_host_matches(
+        client_kwargs.get("base_url", ""), "chatgpt.com"
+    )
+    if "http_client" not in client_kwargs and not is_codex_backend:
         keepalive_http = agent._build_keepalive_http_client(
             client_kwargs.get("base_url", ""), verify=httpx_verify,
         )

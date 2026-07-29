@@ -83,7 +83,7 @@ def test_create_openai_client_routes_via_proxy_when_env_set(mock_openai, monkeyp
     agent = _make_agent()
     kwargs = {
         "api_key": "test-key",
-        "base_url": "https://chatgpt.com/backend-api/codex",
+        "base_url": "https://api.openai.com/v1",
     }
     agent._create_openai_client(kwargs, reason="test", shared=False)
 
@@ -118,7 +118,7 @@ def test_create_openai_client_no_proxy_when_env_unset(mock_openai, monkeypatch):
     agent = _make_agent()
     kwargs = {
         "api_key": "test-key",
-        "base_url": "https://chatgpt.com/backend-api/codex",
+        "base_url": "https://api.openai.com/v1",
     }
     agent._create_openai_client(kwargs, reason="test", shared=False)
 
@@ -135,6 +135,26 @@ def test_create_openai_client_no_proxy_when_env_unset(mock_openai, monkeypatch):
         "pools were %r" % (pool_types,)
     )
     http_client.close()
+
+
+@patch("run_agent.OpenAI")
+def test_create_openai_client_uses_sdk_transport_for_codex(mock_openai, monkeypatch):
+    """The ChatGPT Codex edge rejects Hermes' injected httpx transport."""
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+
+    agent = _make_agent()
+    agent._create_openai_client(
+        {
+            "api_key": "test-key",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        },
+        reason="test",
+        shared=False,
+    )
+
+    assert "http_client" not in mock_openai.call_args.kwargs
 
 
 @patch("run_agent.OpenAI")
