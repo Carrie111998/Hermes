@@ -2027,7 +2027,16 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             )
             return 1
         workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
+        if not kb.set_workspace_path(conn, task.id, str(workspace)):
+            # The claim succeeded, but the workspace CAS lost a race with
+            # another running task. Do not report a running task that has no
+            # workspace; return it to ready for a later retry.
+            kb.reclaim_task(conn, task.id, reason="workspace_busy")
+            print(
+                f"cannot claim {task.id}: workspace is busy ({workspace})",
+                file=sys.stderr,
+            )
+            return 1
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0

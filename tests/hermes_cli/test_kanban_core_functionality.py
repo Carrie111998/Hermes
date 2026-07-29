@@ -4151,6 +4151,15 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
                 state["alive"] = False
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        identity = {
+            "start_time": "42", "pgid": 12345, "sid": 12345, "ppid": 1,
+        }
+        original_identity = _kb._process_identity
+        monkeypatch.setattr(
+            _kb,
+            "_process_identity",
+            lambda pid: dict(identity) if pid == 12345 else original_identity(pid),
+        )
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
@@ -4158,8 +4167,9 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         )
         conn.execute(
             "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 12345, int(time.time())),
+            "worker_pid, worker_pgid, worker_sid, worker_start_time, started_at) "
+            "VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?)",
+            (t, lock, future, 12345, 12345, 12345, "42", int(time.time())),
         )
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
@@ -4348,6 +4358,8 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         # Drop the failure_limit to 3 so we don't need 5 timeouts.
         # This uses the module-level DEFAULT; we simulate by calling
         # _record_task_failure directly with a tight limit.
+        identity = _kb._process_identity(os.getpid())
+        assert identity is not None
         for _ in range(3):
             # Fresh claim + "started long ago" each iteration.
             with kb.write_txn(conn):
@@ -4365,13 +4377,17 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
                 )
                 conn.execute(
                     "INSERT INTO task_runs (task_id, status, claim_lock, "
-                    "claim_expires, worker_pid, started_at) "
-                    "VALUES (?, 'running', ?, ?, ?, ?)",
+                    "claim_expires, worker_pid, worker_pgid, worker_sid, "
+                    "worker_start_time, started_at) "
+                    "VALUES (?, 'running', ?, ?, ?, ?, ?, ?, ?)",
                     (
                         tid,
                         f"{_kb._claimer_id().split(':', 1)[0]}:lock",
                         int(time.time()) + 3600,
                         os.getpid(),
+                        identity["pgid"],
+                        identity["sid"],
+                        str(identity["start_time"]),
                         int(time.time()) - 30,
                     ),
                 )

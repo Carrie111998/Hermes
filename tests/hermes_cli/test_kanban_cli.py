@@ -159,6 +159,23 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_claim_returns_task_to_ready_when_workspace_persist_fails(
+    kanban_home, monkeypatch,
+):
+    """CLI claim must not leave a running task without its workspace."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="workspace race", assignee="worker")
+
+    monkeypatch.setattr(kb, "set_workspace_path", lambda *_args, **_kwargs: False)
+    args = argparse.Namespace(task_id=task_id, ttl=None)
+    assert kc._cmd_claim(args) == 1
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)

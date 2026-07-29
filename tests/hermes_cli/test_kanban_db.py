@@ -426,7 +426,6 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
 
 
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):
-    import signal
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -450,24 +449,20 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
         assert kb.get_task(conn, t).status == "ready"
-        assert killed == [signal.SIGTERM]
+        assert killed == []  # dead generation: no signal is necessary or safe
 
 
-def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
+def test_stale_claim_with_verified_live_identity_extends_instead_of_reclaiming(
     kanban_home, monkeypatch,
 ):
-    """A stale-by-TTL claim whose worker PID is still alive should be
-    extended, not reclaimed (#23025). Slow models can spend longer than
-    ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM call;
-    killing those healthy workers produces a respawn loop with zero
-    progress."""
+    """A stale claim extends only after the complete worker identity matches."""
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        kb._set_worker_pid(conn, t, os.getpid())
 
         old_expires = int(time.time()) - 60
         conn.execute(
@@ -475,7 +470,6 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
             (old_expires, t),
         )
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
         killed: list[int] = []
         reclaimed = kb.release_stale_claims(
             conn, signal_fn=lambda _p, sig: killed.append(sig),
@@ -485,7 +479,7 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert task.status == "running"
         assert task.claim_expires is not None
         assert task.claim_expires > old_expires
-        assert killed == []  # live worker not killed
+        assert killed == []  # verified live worker not killed
 
         kinds = [
             r["kind"] for r in conn.execute(
@@ -496,7 +490,7 @@ def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
         assert "reclaimed" not in kinds
 
 
-def test_stale_claim_with_live_pid_uses_env_ttl_override(
+def test_stale_claim_with_verified_live_identity_uses_env_ttl_override(
     kanban_home, monkeypatch,
 ):
     import hermes_cli.kanban_db as _kb
@@ -507,13 +501,12 @@ def test_stale_claim_with_live_pid_uses_env_ttl_override(
         t = kb.create_task(conn, title="x", assignee="a")
         host = _kb._claimer_id().split(":", 1)[0]
         kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
+        kb._set_worker_pid(conn, t, os.getpid())
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 60, t),
         )
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
         reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
         assert reclaimed == 0
 
@@ -521,6 +514,45 @@ def test_stale_claim_with_live_pid_uses_env_ttl_override(
         assert task is not None
         assert task.claim_expires is not None
         assert task.claim_expires > int(time.time()) + 3000
+
+
+def test_stale_claim_with_legacy_pid_only_never_gets_pid_alive_extension(
+    kanban_home, monkeypatch,
+):
+    """Unknown legacy identity holds the lease but never validates by PID alone."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, task_id, 12345)
+        conn.execute(
+            "UPDATE task_runs SET worker_start_time = NULL, worker_pgid = NULL, "
+            "worker_sid = NULL WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 60, task_id),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        signalled: list[int] = []
+
+        assert kb.release_stale_claims(
+            conn, signal_fn=lambda _pid, sig: signalled.append(sig),
+        ) == 0
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"  # fail closed: no duplicate writer
+        kinds = [
+            row["kind"] for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?", (task_id,),
+            ).fetchall()
+        ]
+        assert "claim_extended" not in kinds
+        assert "reclaim_deferred" in kinds
+        assert signalled == []  # unknown PID generation is never signalled
 
 
 def test_stale_claim_deferred_when_live_worker_survives_termination(
