@@ -603,9 +603,25 @@ def init_agent(
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
+    provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
+    # Provider-only callers may not have passed the runtime resolver's endpoint
+    # or API mode.  Honour the registered profile before transport detection so
+    # out-of-tree native-protocol providers get the same route as CLI/gateway
+    # callers. Explicit caller values always win.
+    if provider_name and not base_url:
+        try:
+            import importlib
+
+            profile = importlib.import_module("providers").get_provider_profile(provider_name)
+            if profile is not None:
+                if profile.base_url:
+                    base_url = profile.base_url
+                if api_mode is None and profile.api_mode:
+                    api_mode = profile.api_mode
+        except Exception:
+            pass
     # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
     agent.base_url = base_url or ""
-    provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     agent.provider = provider_name or ""
     agent.requested_provider = (
         requested_provider.strip().lower()
@@ -653,7 +669,17 @@ def init_agent(
 
         agent.api_mode = nous_api_mode(agent.model)
     else:
-        agent.api_mode = "chat_completions"
+        # Generic provider plugins declare their wire protocol on
+        # ProviderProfile.  Resolve through the shared API-mode helper so
+        # provider-only callers do not silently construct an OpenAI client for
+        # an Anthropic-compatible user plugin.
+        from hermes_cli.providers import determine_api_mode
+
+        agent.api_mode = determine_api_mode(
+            agent.provider,
+            agent.base_url,
+            model=agent.model,
+        )
 
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent

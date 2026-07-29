@@ -5,6 +5,7 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
@@ -210,6 +211,117 @@ class TestFallbackChainAdvancement:
         ):
             assert agent._try_activate_fallback() is True
             assert agent.api_mode == "anthropic_messages"
+
+    def test_user_profile_api_mode_controls_generic_fallback(self, monkeypatch):
+        """Fallback must honour native protocol metadata from user profiles.
+
+        The endpoint intentionally has no ``/anthropic`` suffix and is not an
+        Anthropic-owned host, so URL heuristics alone cannot select the wire.
+        """
+        import providers
+
+        profile = SimpleNamespace(
+            base_url="https://gateway.example/v1",
+            api_mode="anthropic_messages",
+        )
+        monkeypatch.setattr(
+            providers,
+            "get_provider_profile",
+            lambda name: profile if name == "third-party-native" else None,
+        )
+        agent = _make_agent(
+            fallback_model={
+                "provider": "third-party-native",
+                "model": "native-model",
+            }
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url=profile.base_url, api_key="fb-key"),
+                    "native-model",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ),
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert getattr(agent, "api_mode") == "anthropic_messages"
+        assert getattr(agent, "provider") == "third-party-native"
+        assert getattr(agent, "client") is None
+        assert getattr(agent, "_anthropic_client") is not None
+
+    def test_user_profile_chat_mode_is_not_upgraded_for_gpt5(self, monkeypatch):
+        """A declared profile transport is explicit, even for GPT-5 names."""
+        import providers
+
+        profile = SimpleNamespace(
+            base_url="https://gateway.example/v1",
+            api_mode="chat_completions",
+        )
+        monkeypatch.setattr(
+            providers,
+            "get_provider_profile",
+            lambda name: profile if name == "third-party-chat" else None,
+        )
+        agent = _make_agent(
+            fallback_model={
+                "provider": "third-party-chat",
+                "model": "gpt-5-custom",
+            }
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url=profile.base_url, api_key="fb-key"),
+                    "gpt-5-custom",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert getattr(agent, "api_mode") == "chat_completions"
+        assert getattr(agent, "client") is not None
+
+    def test_explicit_fallback_api_mode_is_authoritative(self):
+        """An api_mode written on the fallback entry is never auto-upgraded."""
+        agent = _make_agent(
+            fallback_model={
+                "provider": "third-party-explicit",
+                "model": "gpt-5-custom",
+                "base_url": "https://gateway.example/v1",
+                "api_mode": "chat_completions",
+            }
+        )
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="https://gateway.example/v1", api_key="fb-key"),
+                    "gpt-5-custom",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert getattr(agent, "api_mode") == "chat_completions"
 
     def test_nous_anthropic_fallback_uses_the_messages_wire(self):
         """Portal Claude fallbacks must not stay on chat_completions.

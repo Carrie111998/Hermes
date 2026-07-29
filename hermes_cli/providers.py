@@ -629,8 +629,9 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
       1. Host-mandated mode (special endpoints that only accept one protocol).
       2. Nous Portal dual-wire (model-derived; overlay alone is openai_chat).
       3. Known provider → transport → TRANSPORT_TO_API_MODE.
-      4. Direct provider checks (bedrock).
-      5. Default: 'chat_completions'.
+      4. Out-of-tree ProviderProfile declaration.
+      5. Direct provider checks (bedrock).
+      6. Default: 'chat_completions'.
 
     *model* is optional but required for dual-wire providers (Nous) whose
     transport depends on the catalog id, not just the provider/host.
@@ -650,6 +651,28 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     pdef = get_provider(provider)
     if pdef is not None:
         return TRANSPORT_TO_API_MODE.get(pdef.transport, "chat_completions")
+
+    # User model-provider plugins live outside HERMES_OVERLAYS and declare
+    # their transport directly on ProviderProfile.  Ignoring that field makes
+    # provider-only construction and some switch/fallback paths silently use
+    # OpenAI chat completions even though discovery resolved the plugin's
+    # endpoint and credentials.  Import lazily to avoid coupling CLI provider
+    # registry import-time initialization to plugin discovery.
+    try:
+        import importlib
+
+        profile = importlib.import_module("providers").get_provider_profile(provider_norm)
+        profile_mode = str(getattr(profile, "api_mode", "") or "").strip()
+        if profile_mode in {
+            "chat_completions",
+            "codex_responses",
+            "anthropic_messages",
+            "bedrock_converse",
+            "codex_app_server",
+        }:
+            return profile_mode
+    except Exception:
+        pass
 
     # Direct provider checks for providers not in HERMES_OVERLAYS
     if provider == "bedrock":
