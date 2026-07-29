@@ -155,6 +155,27 @@ def test_plaintext_session_maps_to_session_choice():
     _clear_approval_state()
 
 
+@pytest.mark.parametrize(
+    "reply",
+    ["/approve session", "`/approve session`", "`approve session`"],
+)
+def test_formatted_session_approval_maps_to_session_choice(reply):
+    """Copied inline-code commands must resolve instead of steering the run."""
+    _clear_approval_state()
+    runner, adapter = _make_runner()
+    session_key, entry = _register_blocking_approval(runner)
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(_make_event(reply), session_key)
+    )
+
+    assert handled is True
+    assert entry.event.is_set()
+    assert entry.result == "session"
+    adapter._send_with_retry.assert_awaited()
+    _clear_approval_state()
+
+
 def test_no_pending_approval_does_not_consume_conversational_yes():
     """A bare 'yes' with NO blocking approval must NOT be treated as an
     approval — it falls through to normal busy handling (design intent:

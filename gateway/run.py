@@ -5929,6 +5929,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from tools.approval import has_blocking_approval
             if has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
+                # Messaging clients often preserve the inline-code formatting
+                # from the approval prompt when a user copies the suggested
+                # command, yielding `` `/approve session` ``.  While an
+                # approval is actively pending, normalize one Markdown code
+                # wrapper and the optional slash before matching the same
+                # tightly-scoped approval vocabulary below.
+                if (
+                    len(_raw_text) >= 2
+                    and _raw_text.startswith("`")
+                    and _raw_text.endswith("`")
+                    and "`" not in _raw_text[1:-1]
+                    and "\n" not in _raw_text
+                ):
+                    _raw_text = _raw_text[1:-1].strip()
+                if _raw_text.startswith("/"):
+                    _raw_text = _raw_text[1:].strip()
                 _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
                 _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
                 _approval_handler = None
