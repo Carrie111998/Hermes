@@ -9139,3 +9139,102 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+
+class TestRetryDisplayCounterMonotonic:
+    """Regression tests for issue #12956: the user-visible '(attempt X/Y)'
+    status counter appeared to reset mid-sequence -- (1/3) (2/3) (1/3)
+    (2/3) -- whenever a fallback provider activated, because it displayed
+    retry_count directly, and retry_count intentionally resets to 0 on
+    every successful _try_activate_fallback() call (a fresh retry BUDGET
+    for the new endpoint -- that reset itself is correct and must not be
+    removed, per the triage review on the now-closed PR #12967, which
+    targeted the wrong/obsolete file and conflated the budget reset with
+    the display).
+
+    A separate, purely additive _display_attempt counter now drives every
+    user-facing '(attempt X/Y)' message; retry_count/max_retries keep
+    their existing reset-on-fallback semantics for the actual backoff and
+    give-up logic, verified unchanged by structural source inspection
+    (parsing the function body directly is more robust here than mocking
+    the full multi-provider retry+fallback state machine end to end).
+    """
+
+    def _loop_source(self):
+        import inspect
+        from agent import conversation_loop
+        return inspect.getsource(conversation_loop)
+
+    def test_display_attempt_initialized_exactly_once(self):
+        src = self._loop_source()
+        assert src.count("_display_attempt = 0") == 1, (
+            "_display_attempt must only be assigned 0 at its single "
+            "initialization -- if it's reset anywhere else, the fix "
+            "regresses to the reported bug"
+        )
+
+    def test_display_attempt_never_reset_alongside_retry_count(self):
+        """Every retry_count = 0 reset site (fallback activation) must NOT
+        have a matching _display_attempt reset nearby -- that's the whole
+        point of decoupling them."""
+        src = self._loop_source()
+        # retry_count = 0 must still appear multiple times (the intentional
+        # per-fallback budget resets are preserved, not removed).
+        assert src.count("retry_count = 0") >= 4, (
+            "The intentional retry-budget resets on fallback activation "
+            "must be preserved, not removed by this fix"
+        )
+        # But _display_attempt must never be reset back to 0 after its
+        # single initialization -- only incremented.
+        assert src.count("_display_attempt = 0") == 1
+        assert src.count("_display_attempt +=") >= 3, (
+            "The display counter must increment alongside every "
+            "retry_count += 1 site"
+        )
+
+    def test_increment_sites_paired(self):
+        """Every retry_count += 1 line must be immediately followed by a
+        _display_attempt += 1 line, so the two counters never drift apart
+        (a future retry_count += 1 added without the paired display
+        increment would silently reintroduce a stuck/wrong display count)."""
+        src = self._loop_source()
+        lines = src.splitlines()
+        retry_increment_indices = [
+            i for i, line in enumerate(lines) if line.strip() == "retry_count += 1"
+        ]
+        assert len(retry_increment_indices) >= 3
+        for idx in retry_increment_indices:
+            # Allow a couple of intervening blank/comment lines.
+            window = "\n".join(lines[idx + 1: idx + 3])
+            assert "_display_attempt += 1" in window, (
+                f"retry_count += 1 at source line {idx} has no paired "
+                f"_display_attempt increment nearby:\n{window}"
+            )
+
+    def test_no_user_facing_attempt_message_still_uses_retry_count(self):
+        """Every '(attempt {X}/{max_retries})'-shaped display string must
+        use _display_attempt as X, not the resettable retry_count --
+        this is the literal fix for the reported bug."""
+        import re
+        src = self._loop_source()
+        # Match f-string content like "(attempt {retry_count}/{max_retries})"
+        # or "({retry_count}/{max_retries})" appearing inside a quoted
+        # display string (buffer_vprint/buffer_status/logger calls).
+        leaked = re.findall(r"\{retry_count\}/\{max_retries\}", src)
+        assert not leaked, (
+            f"Found {len(leaked)} display string(s) still directly "
+            f"interpolating the resettable retry_count instead of "
+            f"_display_attempt"
+        )
+
+    def test_debug_dump_kwargs_still_use_real_retry_count(self):
+        """The fix must be display-only: structured debug/dump payloads
+        (request_dump kwargs, etc.) must keep reporting the REAL
+        retry-budget state (retry_count), not the display-only counter --
+        those consumers need the actual budget accounting, not the
+        monotonic UI number."""
+        src = self._loop_source()
+        assert "retry_count=retry_count" in src, (
+            "Debug/dump call sites must still pass the real retry_count, "
+            "not be silently switched to the display counter"
+        )
