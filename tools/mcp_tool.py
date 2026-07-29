@@ -1835,6 +1835,7 @@ class MCPServerTask:
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
         "_reconnect_retries", "_session_proven", "_was_parked",
+        "_static_catalog_generation", "_static_catalog_stale",
     )
 
     def __init__(self, name: str):
@@ -1869,6 +1870,8 @@ class MCPServerTask:
         # until the session proves healthy again — used to log the
         # parked→revived transition exactly once.
         self._was_parked: bool = False
+        self._static_catalog_generation: Optional[str] = None
+        self._static_catalog_stale: bool = False
         self._auth_type: str = ""
         self._refresh_lock = asyncio.Lock()
         # MCP stdio sessions are a single JSON-RPC stream. Some servers emit
@@ -2099,6 +2102,23 @@ class MCPServerTask:
                 new_mcp_tools = await _paginate_full_list(
                     self.session.list_tools, "tools", self.name
                 )
+
+            if self._static_catalog_generation:
+                self._tools = new_mcp_tools
+                self._static_catalog_stale = not self._static_catalog_matches()
+                if self._static_catalog_stale:
+                    logger.warning(
+                        "MCP server '%s': tools changed; static snapshot is stale. "
+                        "Refusing calls until `hermes mcp snapshot %s` and a new session.",
+                        self.name,
+                        self.name,
+                    )
+                else:
+                    logger.info(
+                        "MCP server '%s': tools/list_changed matched static snapshot",
+                        self.name,
+                    )
+                return
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
             # all names: live agent turns may already have tool-call IDs
@@ -2984,6 +3004,18 @@ class MCPServerTask:
                 reason = self._reconnect_or_reraise_group(_eg)
             return reason
 
+    def _static_catalog_matches(self) -> bool:
+        """Compare the current live tool surface with the pinned generation."""
+        if not self._static_catalog_generation:
+            return True
+        from tools.mcp_static_catalog import build_catalog
+
+        live = build_catalog(
+            self.name,
+            _catalog_entries_from_server(self.name, self, self._config),
+        )
+        return live["generation"] == self._static_catalog_generation
+
     async def _discover_tools(self):
         """Discover tools from the connected session.
 
@@ -3007,12 +3039,23 @@ class MCPServerTask:
                 self.name,
             )
             self._tools = []
+            if not self._static_catalog_matches():
+                self._static_catalog_stale = True
+                raise RuntimeError(
+                    f"MCP server '{self.name}' no longer matches its static snapshot"
+                )
             self._register_discovered_tools_if_needed()
             return
         async with self._rpc_lock:
             self._tools = await _paginate_full_list(
                 self.session.list_tools, "tools", self.name
             )
+        if not self._static_catalog_matches():
+            self._static_catalog_stale = True
+            raise RuntimeError(
+                f"MCP server '{self.name}' no longer matches its static snapshot"
+            )
+        self._static_catalog_stale = False
         self._register_discovered_tools_if_needed()
 
     def _register_discovered_tools_if_needed(self) -> None:
@@ -3429,6 +3472,11 @@ class MCPServerTask:
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
+        generation = config.get("_static_catalog_generation")
+        self._static_catalog_generation = (
+            str(generation) if generation else None
+        )
+        self._static_catalog_stale = False
         self._task = asyncio.ensure_future(self.run(config))
         try:
             await self._ready.wait()
@@ -3483,8 +3531,13 @@ class MCPServerTask:
         stops advertising them to the model. Called on shutdown AND when the
         reconnect budget is exhausted, so a dead server never leaves phantom
         tool definitions bloating the prompt cache and producing "not
-        connected" errors on every turn.
+        connected" errors on every turn. Static-catalog placeholders are the
+        exception: they describe a disconnected-capable surface and must
+        survive transport outages. ``shutdown_mcp_servers()`` removes them via
+        the lazy catalog registration cleanup after the transport is stopped.
         """
+        if self._static_catalog_generation:
+            return
         from tools.registry import registry
 
         for tool_name in list(getattr(self, "_registered_tool_names", [])):
@@ -3518,6 +3571,16 @@ class MCPServerTask:
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
+
+# Servers configured with ``lazy_connect`` are represented in the tool registry
+# by generation-bound static catalog entries. They do not own an MCP transport
+# until the first real tool invocation.
+_lazy_server_configs: Dict[str, dict] = {}
+_lazy_server_catalogs: Dict[str, dict] = {}
+_lazy_registered_names: Dict[str, set[str]] = {}
+_lazy_connect_locks: Dict[str, threading.Lock] = {}
+_lazy_connect_failures: Dict[str, tuple[float, str, str]] = {}
+_LAZY_CONNECT_FAILURE_COOLDOWN_S = 30.0
 
 # Connection-retry cooldown (per-server isolation against restart storms).
 #
@@ -4586,9 +4649,14 @@ def _load_mcp_config() -> Dict[str, dict]:
             pass
         safe_servers: Dict[str, dict] = {}
         for name, cfg in _filter_suspicious_mcp_servers(servers).items():
-            interpolated = _interpolate_env_vars(cfg)
-            if isinstance(interpolated, dict):
-                safe_servers[name] = interpolated
+            if _parse_boolish(cfg.get("lazy_connect"), False):
+                # Keep secret references unresolved until the first real
+                # connection. The static catalog never needs transport values.
+                safe_servers[name] = dict(cfg)
+            else:
+                interpolated = _interpolate_env_vars(cfg)
+                if isinstance(interpolated, dict):
+                    safe_servers[name] = interpolated
         return safe_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
@@ -4610,8 +4678,11 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         ImportError: if HTTP transport is needed but not available.
         Exception: on connection or initialization failure.
     """
+    resolved_config = _interpolate_env_vars(config)
+    if not isinstance(resolved_config, dict):
+        raise ValueError(f"MCP server '{name}' config must resolve to an object")
     server = MCPServerTask(name)
-    await server.start(config)
+    await server.start(resolved_config)
     return server
 
 
@@ -5590,6 +5661,90 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
+def _mcp_metadata_json(value: Any) -> Optional[dict]:
+    """Return canonical JSON metadata from an MCP SDK dict/model value."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump(mode="json", by_alias=True, exclude_none=True)
+        return dumped if isinstance(dumped, dict) else None
+    return None
+
+
+def _catalog_entries_from_server(
+    name: str,
+    server: MCPServerTask,
+    config: dict,
+) -> List[dict]:
+    """Build deterministic serializable entries for a server's live schema."""
+    tools_filter = config.get("tools") or {}
+    include_set = _normalize_name_filter(
+        tools_filter.get("include"), f"mcp_servers.{name}.tools.include"
+    )
+    exclude_set = _normalize_name_filter(
+        tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude"
+    )
+
+    def _selected(tool_name: str) -> bool:
+        if include_set:
+            return matches_name_filter(tool_name, include_set)
+        if exclude_set:
+            return not matches_name_filter(tool_name, exclude_set)
+        return True
+
+    entries: List[dict] = []
+    for mcp_tool in server._tools:
+        if not _selected(mcp_tool.name):
+            continue
+        _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
+        schema = _convert_mcp_schema(name, mcp_tool)
+        metadata = {}
+        output_schema = _mcp_metadata_json(getattr(mcp_tool, "outputSchema", None))
+        annotations = _mcp_metadata_json(getattr(mcp_tool, "annotations", None))
+        if output_schema is not None:
+            metadata["output_schema"] = output_schema
+        if annotations is not None:
+            metadata["annotations"] = annotations
+        entries.append({
+            "registry_name": schema["name"],
+            "remote_name": mcp_tool.name,
+            "kind": "tool",
+            "schema": schema,
+            "metadata": metadata,
+        })
+
+    for utility in _select_utility_schemas(name, server, config):
+        schema = utility["schema"]
+        entries.append({
+            "registry_name": schema["name"],
+            "remote_name": utility["handler_key"],
+            "kind": "utility",
+            "schema": schema,
+            "metadata": {},
+        })
+
+    # Provider-safe normalization is lossy. Mirror eager registration's
+    # fail-closed collision policy rather than selecting an arbitrary target.
+    counts: Dict[str, int] = {}
+    for entry in entries:
+        registry_name = entry["registry_name"]
+        counts[registry_name] = counts.get(registry_name, 0) + 1
+    ambiguous = {registry_name for registry_name, count in counts.items() if count > 1}
+    if ambiguous:
+        logger.error(
+            "MCP server '%s': omitting ambiguous static catalog name(s): %s",
+            name,
+            ", ".join(sorted(ambiguous)),
+        )
+    return sorted(
+        (entry for entry in entries if entry["registry_name"] not in ambiguous),
+        key=lambda entry: entry["registry_name"],
+    )
+
+
 def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
@@ -5804,9 +5959,320 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     return registered_names
 
 
+def _lazy_handler_delegate(server_name: str, entry: dict, tool_timeout: float):
+    """Build the existing live handler represented by a catalog entry."""
+    if entry["kind"] == "tool":
+        return _make_tool_handler(server_name, entry["remote_name"], tool_timeout)
+    factories = {
+        "list_resources": _make_list_resources_handler,
+        "read_resource": _make_read_resource_handler,
+        "list_prompts": _make_list_prompts_handler,
+        "get_prompt": _make_get_prompt_handler,
+    }
+    factory = factories.get(entry["remote_name"])
+    if factory is None:
+        raise ValueError(f"Unknown MCP catalog utility: {entry['remote_name']}")
+    return factory(server_name, tool_timeout)
+
+
+def _make_lazy_catalog_handler(
+    server_name: str,
+    entry: dict,
+    tool_timeout: float,
+    config: dict,
+    catalog: dict,
+):
+    """Create a placeholder handler that connects before the first real call."""
+    delegate = _lazy_handler_delegate(server_name, entry, tool_timeout)
+    expected_generation = catalog["generation"]
+    expected_config = dict(config)
+
+    def _handler(args: dict, **kwargs) -> str:
+        requested_generation = kwargs.pop(
+            "_deferred_catalog_generation", expected_generation
+        )
+        if requested_generation != expected_generation:
+            return _lazy_connect_error(
+                "mcp_catalog_stale",
+                f"Static MCP catalog generation for '{server_name}' changed; "
+                "start a new session.",
+            )
+        error = _ensure_lazy_server_connected(
+            server_name,
+            config=expected_config,
+            expected=catalog,
+        )
+        if error is not None:
+            return error
+        return delegate(args, **kwargs)
+
+    return _handler
+
+
+def _lazy_connect_error(error_type: str, message: str) -> str:
+    return json.dumps(
+        {"error": message, "error_type": error_type},
+        ensure_ascii=False,
+    )
+
+
+def _ensure_lazy_server_connected(
+    server_name: str,
+    *,
+    config: Optional[dict] = None,
+    expected: Optional[dict] = None,
+) -> Optional[str]:
+    """Connect and verify one lazy server; return a JSON error on failure."""
+    from tools.mcp_static_catalog import build_catalog
+
+    with _lock:
+        config = config or _lazy_server_configs.get(server_name)
+        expected = expected or _lazy_server_catalogs.get(server_name)
+        connected = _servers.get(server_name)
+        if connected is not None:
+            if (
+                expected is None
+                or getattr(connected, "_static_catalog_generation", None)
+                != expected["generation"]
+                or getattr(connected, "_static_catalog_stale", False)
+            ):
+                return _lazy_connect_error(
+                    "mcp_catalog_stale",
+                    f"Static MCP catalog for '{server_name}' became stale; refresh it and start a new session.",
+                )
+            return None
+        connect_lock = _lazy_connect_locks.setdefault(server_name, threading.Lock())
+    if config is None or expected is None:
+        return _lazy_connect_error(
+            "mcp_catalog_unavailable",
+            f"Static MCP catalog for '{server_name}' is unavailable; refresh it first.",
+        )
+
+    with connect_lock:
+        # Re-validate under the per-server lock: if _clear_lazy_server_catalog_registration
+        # ran between releasing _lock and acquiring connect_lock, our lock is now orphaned
+        # and config/catalog are gone. Bail out so the caller retries with fresh state.
+        with _lock:
+            if _lazy_connect_locks.get(server_name) is not connect_lock:
+                return _lazy_connect_error(
+                    "mcp_catalog_unavailable",
+                    f"Static MCP catalog for '{server_name}' was cleared; retry.",
+                )
+            # Re-read config/expected in case they were replaced
+            config = _lazy_server_configs.get(server_name)
+            expected = _lazy_server_catalogs.get(server_name)
+            if config is None or expected is None:
+                return _lazy_connect_error(
+                    "mcp_catalog_unavailable",
+                    f"Static MCP catalog for '{server_name}' is unavailable; refresh it first.",
+                )
+            connected = _servers.get(server_name)
+            if connected is not None:
+                if (
+                    getattr(connected, "_static_catalog_generation", None)
+                    != expected["generation"]
+                    or getattr(connected, "_static_catalog_stale", False)
+                ):
+                    return _lazy_connect_error(
+                        "mcp_catalog_stale",
+                        f"Static MCP catalog for '{server_name}' became stale; refresh it and start a new session.",
+                    )
+                return None
+            failed = _lazy_connect_failures.get(server_name)
+        if (
+            failed
+            and failed[2] == expected["generation"]
+            and time.monotonic() - failed[0] < _LAZY_CONNECT_FAILURE_COOLDOWN_S
+        ):
+            return failed[1]
+
+        server = None
+        try:
+            _ensure_mcp_loop()
+            connect_timeout = float(
+                config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+            )
+            with _lock:
+                _server_connecting.add(server_name)
+            connect_config = dict(config)
+            connect_config["_static_catalog_generation"] = expected["generation"]
+            server = _run_on_mcp_loop(
+                lambda: _connect_server(server_name, connect_config),
+                timeout=connect_timeout,
+            )
+            live_entries = _catalog_entries_from_server(server_name, server, config)
+            live_catalog = build_catalog(server_name, live_entries)
+            if live_catalog["generation"] != expected["generation"]:
+                stale_server = server
+                _run_on_mcp_loop(
+                    lambda: stale_server.shutdown(),
+                    timeout=min(connect_timeout, 15.0),
+                )
+                server = None
+                error = _lazy_connect_error(
+                    "mcp_catalog_stale",
+                    f"Static MCP catalog for '{server_name}' does not match the live server; refresh it before retrying.",
+                )
+                with _lock:
+                    _lazy_connect_failures[server_name] = (
+                        time.monotonic(), error, expected["generation"]
+                    )
+                return error
+
+            with _lock:
+                server._registered_tool_names = [
+                    entry["registry_name"] for entry in expected["tools"]
+                ]
+                _servers[server_name] = server
+                _server_connect_errors.pop(server_name, None)
+                _lazy_connect_failures.pop(server_name, None)
+            return None
+        except Exception as exc:
+            if server is not None:
+                try:
+                    _run_on_mcp_loop(lambda: server.shutdown(), timeout=5)
+                except Exception:
+                    logger.debug("Lazy MCP cleanup failed", exc_info=True)
+            message = _sanitize_error(
+                f"Lazy MCP server '{server_name}' failed to connect: {type(exc).__name__}: {_exc_str(exc)}"
+            )
+            error = _lazy_connect_error("mcp_lazy_connect_failed", message)
+            with _lock:
+                _server_connect_errors[server_name] = message
+                _lazy_connect_failures[server_name] = (
+                    time.monotonic(), error, expected["generation"]
+                )
+            return error
+        finally:
+            with _lock:
+                _server_connecting.discard(server_name)
+
+
+def _clear_lazy_server_catalog_registration(name: str) -> None:
+    """Remove one lazy server's placeholders and process-local state."""
+    from tools.registry import registry
+
+    with _lock:
+        registered = set(_lazy_registered_names.pop(name, set()))
+        _lazy_server_configs.pop(name, None)
+        _lazy_server_catalogs.pop(name, None)
+        _lazy_connect_locks.pop(name, None)
+        _lazy_connect_failures.pop(name, None)
+    toolset_name = f"mcp-{name}"
+    for tool_name in registered:
+        if registry.get_toolset_for_tool(tool_name) == toolset_name:
+            registry.deregister(tool_name)
+            _forget_mcp_tool_server(tool_name)
+
+
+def _register_lazy_server_catalog(name: str, config: dict) -> List[str]:
+    """Register static placeholders for one lazy server without connecting."""
+    from tools.mcp_static_catalog import (
+        CatalogNotFoundError,
+        CatalogValidationError,
+        load_catalog,
+    )
+    from tools.registry import registry
+
+    _clear_lazy_server_catalog_registration(name)
+    try:
+        catalog = load_catalog(name)
+    except (CatalogNotFoundError, CatalogValidationError) as exc:
+        logger.warning(
+            "MCP server '%s' is lazy but has no usable static catalog: %s. "
+            "Run an explicit catalog refresh before starting a session.",
+            name,
+            exc,
+        )
+        return []
+
+    toolset_name = f"mcp-{name}"
+    timeout = float(config.get("timeout", _DEFAULT_TOOL_TIMEOUT))
+    registered: List[str] = []
+    with _lock:
+        _lazy_server_configs[name] = dict(config)
+        _lazy_server_catalogs[name] = catalog
+        _lazy_connect_locks.setdefault(name, threading.Lock())
+
+    for entry in catalog["tools"]:
+        registry_name = entry["registry_name"]
+        existing_owner = registry.get_toolset_for_tool(registry_name)
+        if existing_owner is not None and existing_owner != toolset_name:
+            logger.error(
+                "MCP server '%s': static catalog tool '%s' collides with toolset '%s'; skipping",
+                name,
+                registry_name,
+                existing_owner,
+            )
+            continue
+        registry.register(
+            name=registry_name,
+            toolset=toolset_name,
+            schema=entry["schema"],
+            handler=_make_lazy_catalog_handler(name, entry, timeout, config, catalog),
+            check_fn=lambda: True,
+            is_async=False,
+        )
+        _track_mcp_tool_server(registry_name, name)
+        registered.append(registry_name)
+
+    if registered:
+        registry.register_toolset_alias(name, toolset_name)
+    with _lock:
+        _lazy_registered_names[name] = set(registered)
+    return registered
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+
+def refresh_mcp_static_catalog(server_name: str, config: dict) -> dict:
+    """Explicitly connect once and atomically refresh a server's tool snapshot."""
+    from tools.mcp_static_catalog import build_catalog, write_catalog
+
+    if not _MCP_AVAILABLE:
+        raise RuntimeError("MCP SDK is not available")
+    filtered = _filter_suspicious_mcp_servers({server_name: config})
+    if server_name not in filtered:
+        raise ValueError(f"MCP server '{server_name}' failed security validation")
+
+    with _lock:
+        server = _servers.get(server_name)
+    owns_connection = server is None
+    connect_timeout = float(config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT))
+    try:
+        if server is None:
+            _ensure_mcp_loop()
+            server = _run_on_mcp_loop(
+                lambda: _connect_server(server_name, config),
+                timeout=connect_timeout,
+            )
+        entries = _catalog_entries_from_server(server_name, server, config)
+        catalog = build_catalog(server_name, entries)
+        write_catalog(catalog)
+        return catalog
+    except Exception as exc:
+        message = _sanitize_error(
+            f"MCP snapshot for '{server_name}' failed: {type(exc).__name__}: {_exc_str(exc)}"
+        )
+        raise RuntimeError(message) from None
+    finally:
+        if owns_connection and server is not None:
+            try:
+                snapshot_server = server
+                _run_on_mcp_loop(
+                    lambda: snapshot_server.shutdown(),
+                    timeout=min(connect_timeout, 15.0),
+                )
+            except Exception:
+                logger.warning(
+                    "MCP server '%s': snapshot connection cleanup failed",
+                    server_name,
+                    exc_info=True,
+                )
+
 
 def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
@@ -5829,6 +6295,19 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("No explicit MCP servers provided")
         return []
 
+    lazy_servers = {
+        name: config
+        for name, config in servers.items()
+        if _parse_boolish(config.get("enabled", True), default=True)
+        and _parse_boolish(config.get("lazy_connect", False), default=False)
+    }
+    lazy_registered: List[str] = []
+    for name, config in lazy_servers.items():
+        with _lock:
+            already_connected = name in _servers
+        if not already_connected:
+            lazy_registered.extend(_register_lazy_server_catalog(name, config))
+
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
     with _lock:
@@ -5837,6 +6316,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             for k, v in servers.items()
             if k not in _servers
             and _parse_boolish(v.get("enabled", True), default=True)
+            and not _parse_boolish(v.get("lazy_connect", False), default=False)
             # Skip a server still serving its post-failure backoff. Without
             # this, a server that fails to connect (and is therefore never
             # recorded in ``_servers``) would be re-spawned on every worker
@@ -5869,7 +6349,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         _signal_reconnect(srv)
 
     if not new_servers:
-        return _existing_tool_names()
+        return list(dict.fromkeys([*_existing_tool_names(), *lazy_registered]))
 
     # Start the background event loop for MCP connections
     _ensure_mcp_loop()
@@ -5939,7 +6419,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             summary += f" ({failed} failed)"
         logger.info(summary)
 
-    return _existing_tool_names()
+    return list(dict.fromkeys([*_existing_tool_names(), *lazy_registered]))
 
 
 def discover_mcp_tools() -> List[str]:
@@ -6219,6 +6699,30 @@ def get_registered_mcp_server_names() -> set:
         return set(_mcp_tool_server_names.values())
 
 
+def has_static_lazy_mcp_catalogs() -> bool:
+    """Return whether this process registered any static lazy MCP catalog."""
+    with _lock:
+        return bool(_lazy_server_catalogs)
+
+
+def get_static_lazy_tool_generations(
+    tool_names: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """Return the current generation bound to each registered lazy tool."""
+    allowed = set(tool_names) if tool_names is not None else None
+    result: Dict[str, str] = {}
+    with _lock:
+        for server_name, registered_names in _lazy_registered_names.items():
+            catalog = _lazy_server_catalogs.get(server_name)
+            if catalog is None:
+                continue
+            generation = catalog["generation"]
+            for tool_name in registered_names:
+                if allowed is None or tool_name in allowed:
+                    result[tool_name] = generation
+    return result
+
+
 
 def refresh_agent_mcp_tools(
     agent,
@@ -6261,7 +6765,12 @@ def refresh_agent_mcp_tools(
     explicit user consent; the late-binding and between-turns paths only rebuild
     at a turn boundary, before that turn's ``tools=`` prefix is assembled).
     """
-    from model_tools import get_tool_definitions
+    if getattr(agent, "_deferred_tool_snapshot_locked", False):
+        return set()
+
+    from copy import deepcopy
+
+    from model_tools import assemble_tool_search_definitions, get_tool_definitions
     from tools.registry import registry
 
     # Explicit reloads (/reload-mcp) pass freshly-resolved toolsets so a server
@@ -6289,13 +6798,17 @@ def refresh_agent_mcp_tools(
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
     # publish below happen together in ONE critical section so two concurrent
     # callers can't torn-publish or compute overlapping ``added`` sets.
-    new_defs = list(
+    raw_defs = list(
         get_tool_definitions(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
-            quiet_mode=quiet_mode,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
         )
         or []
+    )
+    new_defs = list(
+        assemble_tool_search_definitions(raw_defs, quiet_mode=quiet_mode)
     )
     new_names = {t["function"]["name"] for t in new_defs}
 
@@ -6333,6 +6846,12 @@ def refresh_agent_mcp_tools(
             return set()
         agent.tools = new_defs
         agent.valid_tool_names = new_names
+        agent._deferred_tool_defs_snapshot = deepcopy(raw_defs)
+        agent._deferred_tool_generations_snapshot = get_static_lazy_tool_generations(
+            [tool["function"]["name"] for tool in raw_defs]
+        )
+        if hasattr(agent, "_deferred_tool_names_snapshot"):
+            delattr(agent, "_deferred_tool_names_snapshot")
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):
@@ -6420,6 +6939,7 @@ def shutdown_mcp_servers():
     """
     with _lock:
         servers_snapshot = list(_servers.values())
+        lazy_servers_snapshot = list(_lazy_registered_names)
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded
@@ -6428,6 +6948,8 @@ def shutdown_mcp_servers():
     # entries exist. Clear them so a post-shutdown restart re-attempts every
     # configured server immediately.
     if not servers_snapshot:
+        for server_name in lazy_servers_snapshot:
+            _clear_lazy_server_catalog_registration(server_name)
         with _lock:
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
@@ -6474,6 +6996,9 @@ def shutdown_mcp_servers():
     with _lock:
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
+
+    for server_name in lazy_servers_snapshot:
+        _clear_lazy_server_catalog_registration(server_name)
 
     _stop_mcp_loop()
 
