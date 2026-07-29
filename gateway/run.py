@@ -2190,6 +2190,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    shared_participant_label,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -12836,7 +12837,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        if _is_shared_multi_user:
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
             # own name. Neutralize embedded newlines/control chars before
@@ -12844,18 +12845,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # a hostile name can masquerade as a fake markdown section
             # (mirrors the same field's treatment in
             # build_session_context_prompt via _format_untrusted_prompt_value).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
-            # On Slack, expose the current author's verifiable user ID next to
-            # the display name (#17916): "mention me again" requests need a
-            # trusted `<@U...>` target for the CURRENT speaker — display names
-            # are ambiguous and historical mentions may point at someone else.
-            # The user_id comes from the Slack event envelope (not
-            # user-editable text), so it does not need neutralization.
-            if source.platform == Platform.SLACK and source.user_id:
-                _safe_user_name = (
-                    f"{_safe_user_name} | Slack user <@{source.user_id}>"
-                )
-            message_text = f"[{_safe_user_name}] {message_text}"
+            # Senders with no display name at all still need a STABLE,
+            # non-identifying label so the model can tell participants apart
+            # (shared_participant_label falls back to a hashed user id).
+            _sender_label = shared_participant_label(source)
+
+            if _sender_label:
+                _safe_user_name = neutralize_untrusted_inline_text(_sender_label)
+                # On Slack, expose the current author's verifiable user ID next to
+                # the display name (#17916): "mention me again" requests need a
+                # trusted `<@U...>` target for the CURRENT speaker — display names
+                # are ambiguous and historical mentions may point at someone else.
+                # The user_id comes from the Slack event envelope (not
+                # user-editable text), so it does not need neutralization.
+                if source.platform == Platform.SLACK and source.user_id:
+                    _safe_user_name = (
+                        f"{_safe_user_name} | Slack user <@{source.user_id}>"
+                    )
+                message_text = f"[{_safe_user_name}] {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the

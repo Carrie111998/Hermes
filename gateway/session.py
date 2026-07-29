@@ -84,6 +84,18 @@ def _hash_chat_id(value: str) -> str:
     return _hash_id(value)
 
 
+def _sanitize_participant_label(value: str) -> str:
+    """Make a user-controlled display name safe inside ``[label]`` prefixes.
+
+    Only whitespace collapsing and bracket neutralization happen here — length
+    clamping is the caller's job (``neutralize_untrusted_inline_text`` already
+    applies the shared prompt-metadata cap), so a long-but-legitimate name is
+    not truncated twice with two different limits.
+    """
+    collapsed = " ".join(str(value or "").split())
+    return collapsed.replace("[", "(").replace("]", ")").strip()
+
+
 from .config import (
     Platform,
     GatewayConfig,
@@ -292,7 +304,20 @@ class SessionSource:
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
         )
-    
+
+
+def shared_participant_label(source: SessionSource) -> Optional[str]:
+    """Return the stable label used to disambiguate speakers in shared sessions."""
+    display_name = _sanitize_participant_label(source.user_name or "")
+    if display_name:
+        return display_name
+
+    for raw_id in (source.user_id_alt, source.user_id):
+        raw = str(raw_id or "").strip()
+        if raw:
+            return _hash_sender_id(raw)
+
+    return None
 
 
 @dataclass
@@ -549,7 +574,7 @@ def build_session_context_prompt(
         session_label = "Multi-user thread" if context.source.thread_id else "Multi-user session"
         lines.append(
             f"**Session type:** {session_label} — messages are prefixed "
-            "with [sender name]. Multiple users may participate."
+            "with [sender label]. Multiple users may participate."
         )
     elif context.source.user_name:
         lines.append(
