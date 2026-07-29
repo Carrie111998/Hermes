@@ -267,6 +267,28 @@ _CONTEXT_OVERFLOW_PATTERNS = [
     "max input token",
     "input token",
     "exceeds the maximum number of input tokens",
+    # Azure / Azure OpenAI — full error text
+    "maximum context length exceeded",         # Azure
+    # Google / Gemini — token limit errors
+    "exceeds token limit",                     # Gemini API
+    "exceeds the maximum context length",      # Gemini full text
+    # Google / Vertex AI
+    "token count exceeds",                     # Vertex AI
+    "total token limit exceeded",              # Vertex AI generic
+    # OpenAI — output + input combined limits
+    "total tokens exceeds",                    # "total tokens exceeds the limit"
+    "completion tokens exceed",                # OpenAI per-response limit
+    # Ollama — "exceeds context length" without "exceeded"
+    "exceeds context length",                  # Ollama
+    # vLLM — prompt-token dimension
+    "exceeds the max_prompt_token",            # vLLM max prompt tokens
+    "exceeds max prompt tokens",               # vLLM variant (no "the")
+    # General gateway patterns
+    "request too large",                       # generic gateway
+    "request body too large",                  # generic gateway body
+    # Chinese variants (supplemental)
+    "超出上下文长度",                           # Chinese overflow
+    "输入超过最大",                            # Chinese input overflow
 ]
 
 # Model not found patterns
@@ -976,6 +998,16 @@ def _classify_by_status(
                 retryable=True,
                 should_compress=True,
             )
+        # Fallback: if the session is using >85% of context, a 500/502
+        # from a local inference server is very likely context overflow
+        # even if the provider's error text doesn't carry the keyword.
+        # See: #P0-B
+        if approx_tokens > context_length * 0.85:
+            return result_fn(
+                FailoverReason.context_overflow,
+                retryable=True,
+                should_compress=True,
+            )
         return result_fn(FailoverReason.server_error, retryable=True)
 
     if status_code in {503, 529}:
@@ -984,6 +1016,13 @@ def _classify_by_status(
         # overflow bodies into compression; otherwise treat as transient
         # overload and retry.
         if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
+            return result_fn(
+                FailoverReason.context_overflow,
+                retryable=True,
+                should_compress=True,
+            )
+        # Same fallback threshold for 503/529.
+        if approx_tokens > context_length * 0.85:
             return result_fn(
                 FailoverReason.context_overflow,
                 retryable=True,

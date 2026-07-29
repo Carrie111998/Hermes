@@ -108,6 +108,17 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("grok-4-fast-reasoning", 300),
     ("grok-4.20-reasoning", 300),
     ("grok-4-fast-non-reasoning", 180),
+    # Gemini — Google 的推理模型家族（Gemini 2.0 Flash / 2.5 Pro 等），
+    # 在 Google AI Studio / Vertex AI 上有类似的多分钟 thinking 阶段。
+    ("gemini-2.0-flash-thinking", 300),
+    ("gemini-2.5-pro", 600),
+    ("gemini-2.5-flash", 300),
+    ("gemini-exp", 600),
+    # Cohere 推理模型
+    ("command-r7b-12-2024", 300),        # Command R+ reasoning variant
+    ("command-r-plus", 300),
+    # Mistral 推理模型
+    ("mistral-large", 180),              # Mistral large models with thinking
 )
 
 
@@ -144,6 +155,39 @@ def _get_pattern(slug: str) -> re.Pattern[str]:
         )
         _PATTERN_CACHE[slug] = compiled
     return compiled
+
+
+def _is_reasoning_model_by_name(model_lower: str) -> Optional[float]:
+    """Heuristic reasoning-model detector based on naming patterns.
+
+    Covers reasoning models not in the explicit allowlist above.
+    Returns a conservative stale-timeout floor for unknown reasoning
+    models so they are classified as timeout rather than context_overflow
+    on disconnect.
+
+    Pattern families:
+      - o1, o3, o4-mini → OpenAI reasoning series
+      - claude-opus, claude-sonnet → Anthropic Claude thinking
+      - gemini-2.5-pro, gemini-exp → Google reasoning
+      - deepseek-r1, deepseek-reasoner → DeepSeek reasoning
+      - *reasoner*, *thinking* → any model with these suffixes
+    """
+    # OpenAI o-series reasoning (o1, o3, o4-mini, etc.)
+    if re.search(r'\bo(?:1|3|4)(?:-mini|-pro|-preview|-flash|-turbo)?(?:\.|\s|[/\-_]|$)', model_lower):
+        return 600.0
+    # Anthropic Claude thinking (opus, sonnet) — but NOT older non-reasoning models
+    if 'claude' in model_lower and re.search(r'(opus|sonnet)', model_lower):
+        return 240.0
+    # Google Gemini reasoning (2.5-pro, exp, flash-thinking)
+    if re.search(r'gemini(?:-2\.0-flash-thinking|-2\.5-(?:pro|flash)|-exp)', model_lower):
+        return 480.0
+    # DeepSeek reasoning (R1, reasoner)
+    if 'deepseek' in model_lower and re.search(r'(r1|reasoner)', model_lower):
+        return 600.0
+    # Generic: any model with "reasoner" or "thinking" in the name
+    if re.search(r'(reasoner|thinking)', model_lower):
+        return 300.0
+    return None
 
 
 def _match_any(model_lower: str) -> Optional[float]:
@@ -184,6 +228,12 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     and only when no explicit user-configured per-model
     ``stale_timeout_seconds`` exists.
 
+    Unknown reasoning models not in the explicit allowlist are detected
+    by name pattern (Claude, Gemini, DeepSeek, o-series, or any model
+    containing "reasoner"/"thinking").  A true reasoning model disconnect
+    is a timeout, not context_overflow — so the heuristic errs on the side
+    of a larger stale-timeout rather than triggering unnecessary compression.
+
     >>> get_reasoning_stale_timeout_floor("nvidia/nemotron-3-ultra-550b-a55b")
     600.0
     >>> get_reasoning_stale_timeout_floor("openai/o3-mini")
@@ -208,9 +258,21 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     name = model.strip().lower()
     if not name:
         return None
+    # 1. Explicit allowlist (exact or separator-anchored match)
     # Strip aggregator prefix (everything before and including the
     # last ``/``).  The wrapper regex anchors at start-of-string, so
     # the slug identity is the bare model name.
     if "/" in name:
-        name = name.rsplit("/", 1)[1]
-    return _match_any(name)
+        slug = name.rsplit("/", 1)[1]
+    else:
+        slug = name
+    explicit_floor = _match_any(slug)
+    if explicit_floor is not None:
+        return explicit_floor
+    # 2. Heuristic fallback: detect reasoning models by name pattern
+    # even if not in the explicit allowlist.  A true reasoning model
+    # disconnect is a timeout, not context_overflow.  Err on the side
+    # of larger stale-timeout (slight extra wait on hung providers)
+    # rather than triggering unnecessary context compression.
+    heuristic_floor = _is_reasoning_model_by_name(name)
+    return heuristic_floor

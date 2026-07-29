@@ -1001,7 +1001,7 @@ def run_conversation(
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
-        max_compression_attempts = 3
+        max_compression_attempts = 5
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail

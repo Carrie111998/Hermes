@@ -631,7 +631,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 return None
 
     config = load_config()
-    
+    # First check providers: dict (new-style user-defined providers)
     # First check providers: dict (new-style user-defined providers)
     providers = config.get("providers")
     if isinstance(providers, dict):
@@ -896,7 +896,6 @@ def _resolve_named_custom_runtime(
     # Bare `provider="custom"` with an explicit base_url (e.g. propagated
     # from a `model_aliases:` direct-alias resolution) — build a runtime
     # directly so the alias's base_url actually takes effect.
-    #
     # GitHub #27132: provider aliases that resolve to "custom" at runtime
     # (ollama, vllm, llamacpp, …) are treated identically here, so a YAML
     # `provider: ollama` with a LAN/WireGuard `base_url` doesn't silently
@@ -1224,11 +1223,9 @@ def _resolve_azure_foundry_runtime(
         base_url = re.sub(r"/v1/?$", "", base_url)
 
     # ── Entra ID (Microsoft Foundry recommended path) ──────────────────
-    #
     # OpenAI-style endpoints use the OpenAI SDK's native callable
     # ``api_key=`` contract — the SDK mints a fresh JWT per request
     # automatically.
-    #
     # Anthropic-style endpoints (Claude on Foundry) take the callable
     # too: :func:`agent.anthropic_adapter.build_anthropic_client`
     # detects the callable and constructs an ``httpx.Client`` with a

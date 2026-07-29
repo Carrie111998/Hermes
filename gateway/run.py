@@ -17,6 +17,8 @@ Usage:
 # on Windows.  No-op on POSIX.  See hermes_bootstrap.py for full rationale.
 try:
     import hermes_bootstrap  # noqa: F401
+
+
 except ModuleNotFoundError:
     # Graceful fallback when hermes_bootstrap isn't registered in the venv
     # yet — happens during partial ``hermes update`` where git-reset landed
@@ -1776,6 +1778,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
     try:
+        from hermes_cli.config import load_config
         runtime = resolve_runtime_provider()
     except AuthError as auth_exc:
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
@@ -8363,6 +8366,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await adapter.send(source.chat_id, content, metadata=metadata)
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+
+
         """
         Handle an incoming message from any platform.
         
