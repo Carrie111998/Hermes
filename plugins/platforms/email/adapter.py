@@ -422,6 +422,8 @@ def _extract_attachments(
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
 
+    preserve_media_message_boundaries = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
 
@@ -875,6 +877,7 @@ class EmailAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=sender_addr,
             user_name=msg_data["sender_name"] or sender_addr,
+            message_id=msg_data["message_id"],
         )
 
         event = MessageEvent(

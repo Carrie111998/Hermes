@@ -17,6 +17,7 @@ from gateway.platforms.base import (
     PlatformConfig,
     Platform,
 )
+from gateway.session import SessionSource, build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +393,61 @@ class TestBusyInputModeQueueFifo:
             message_id=f"m-{text}",
         )
 
+    def _email_event(
+        self,
+        index: int,
+        *,
+        source=None,
+        document: bool = False,
+    ) -> MessageEvent:
+        source = source or MagicMock(
+            chat_id="sender@example.com",
+            platform=Platform.EMAIL,
+            profile=None,
+        )
+        extension = "pdf" if document else "jpg"
+        media_type = "application/pdf" if document else "image/jpeg"
+        message_type = MessageType.DOCUMENT if document else MessageType.PHOTO
+        return MessageEvent(
+            text=f"invoice {index}",
+            message_type=message_type,
+            source=source,
+            message_id=f"<mail-{index}@example.com>",
+            media_urls=[f"/tmp/invoice-{index}.{extension}"],
+            media_types=[media_type],
+        )
+
+    def _run_email_base_fallback(self, *, with_runner: bool):
+        runner, adapter = self._make_runner_and_adapter()
+        adapter.platform = Platform.EMAIL
+        adapter.preserve_media_message_boundaries = True
+        adapter.gateway_runner = runner if with_runner else None
+        runner.adapters = {Platform.EMAIL: adapter}
+        source = SessionSource(
+            platform=Platform.EMAIL,
+            chat_id="sender@example.com",
+            user_id="sender@example.com",
+            chat_type="dm",
+        )
+        session_key = build_session_key(source)
+
+        async def scenario():
+            adapter._message_handler = MagicMock()
+            adapter._active_sessions[session_key] = asyncio.Event()
+            adapter._session_tasks[session_key] = asyncio.current_task()
+
+            async def failed_busy_handler(_event, _session_key):
+                raise RuntimeError("simulated busy-handler failure")
+
+            adapter._busy_session_handler = failed_busy_handler
+            for index in range(2):
+                await adapter.handle_message(
+                    self._email_event(index, source=source, document=True)
+                )
+
+        asyncio.run(scenario())
+        return runner, adapter, session_key
+
     def test_rapid_text_followups_are_queued_in_fifo_order(self):
         """Five rapid texts in queue mode must all survive (none silently dropped)."""
         runner, adapter = self._make_runner_and_adapter()
@@ -454,3 +510,88 @@ class TestBusyInputModeQueueFifo:
         head = adapter._pending_messages[session_key]
         assert head.message_type == MessageType.PHOTO
         assert len(head.media_urls) == 3
+
+    def test_email_media_keeps_one_fifo_turn_per_rfc_message(self):
+        """Different emails must not merge attachments or reply provenance."""
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        assert EmailAdapter.preserve_media_message_boundaries is True
+        runner, adapter = self._make_runner_and_adapter()
+        runner.adapters[Platform.EMAIL] = adapter
+        adapter.preserve_media_message_boundaries = True
+        session_key = "email:sender@example.com"
+
+        for i in range(3):
+            runner._queue_or_replace_pending_event(
+                session_key,
+                self._email_event(i),
+            )
+
+        head = adapter._pending_messages[session_key]
+        overflow = runner._queued_events[session_key]
+        assert head.message_id == "<mail-0@example.com>"
+        assert head.media_urls == ["/tmp/invoice-0.jpg"]
+        assert [event.message_id for event in overflow] == [
+            "<mail-1@example.com>",
+            "<mail-2@example.com>",
+        ]
+        assert [event.media_urls for event in overflow] == [
+            ["/tmp/invoice-1.jpg"],
+            ["/tmp/invoice-2.jpg"],
+        ]
+
+    def test_email_base_fallback_uses_gateway_fifo_when_busy_handler_fails(self):
+        """The adapter fallback must not merge complete email messages."""
+        runner, adapter, session_key = self._run_email_base_fallback(with_runner=True)
+
+        head = adapter._pending_messages[session_key]
+        overflow = runner._queued_events[session_key]
+        assert head.message_id == "<mail-0@example.com>"
+        assert head.media_urls == ["/tmp/invoice-0.pdf"]
+        assert [event.message_id for event in overflow] == ["<mail-1@example.com>"]
+        assert overflow[0].media_urls == ["/tmp/invoice-1.pdf"]
+
+    def test_email_base_fallback_without_runner_never_merges_identities(self):
+        """A broken standalone contract may drop, but must not misattribute."""
+        _runner, adapter, session_key = self._run_email_base_fallback(with_runner=False)
+
+        head = adapter._pending_messages[session_key]
+        assert head.message_id == "<mail-0@example.com>"
+        assert head.text == "invoice 0"
+        assert head.media_urls == ["/tmp/invoice-0.pdf"]
+
+    def test_recursion_cap_restores_drained_email_ahead_of_promoted_successor(self):
+        """Depth resets must preserve FIFO order and exact media identities."""
+        runner, adapter = self._make_runner_and_adapter()
+        runner.adapters[Platform.EMAIL] = adapter
+        adapter.preserve_media_message_boundaries = True
+        session_key = "email:sender@example.com"
+
+        events = []
+        for i in range(5):
+            event = self._email_event(i, document=True)
+            events.append(event)
+            runner._queue_or_replace_pending_event(session_key, event)
+
+        # Model four normal recursive drains. Each promotion stages its
+        # successor in the adapter slot while the drained event is processed.
+        for expected in events[:4]:
+            pending = adapter.get_pending_message(session_key)
+            assert pending is expected
+            pending = runner._promote_queued_event(session_key, adapter, pending)
+            assert pending is expected
+
+        # The depth guard fires after event 3 was drained and event 4 was
+        # promoted. Restore event 3 ahead of event 4 without merging/reversal.
+        runner._restore_pending_event_to_fifo_head(session_key, adapter, events[3])
+
+        restored = [adapter.get_pending_message(session_key)]
+        restored.extend(runner._queued_events.get(session_key, []))
+        assert [event.message_id for event in restored] == [
+            "<mail-3@example.com>",
+            "<mail-4@example.com>",
+        ]
+        assert [event.media_urls for event in restored] == [
+            ["/tmp/invoice-3.pdf"],
+            ["/tmp/invoice-4.pdf"],
+        ]
