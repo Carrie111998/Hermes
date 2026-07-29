@@ -2817,6 +2817,41 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _drop_disabled_skills(skills: list[str], assignee: str) -> list[str]:
+    """Strip skills the assignee profile has disabled.
+
+    A worker treats a disabled skill as missing — ``build_preloaded_skills_prompt``
+    bypasses the scan-time filter on purpose so a pinned name cannot force-load
+    something an operator disabled (#59156) — and hard-fails when *every*
+    requested skill is missing. A card pinning only disabled skills therefore
+    kills its worker before it does any work, and the task auto-blocks once
+    retries run out.
+
+    Dropping those names at creation keeps the card dispatchable. A card left
+    with nothing simply behaves like one that pinned no skills at all.
+    """
+    try:
+        from agent.skill_utils import get_globally_disabled_skill_names
+        from hermes_cli.profiles import get_profile_dir
+
+        disabled = get_globally_disabled_skill_names(get_profile_dir(assignee))
+    except Exception:
+        return skills  # profile config unreadable — leave the card untouched
+    if not disabled:
+        return skills
+    dropped = [s for s in skills if s in disabled]
+    if not dropped:
+        return skills
+    kept = [s for s in skills if s not in disabled]
+    _log.warning(
+        "kanban create: dropping skill(s) %s — disabled in profile %r; keeping %s",
+        ", ".join(dropped),
+        assignee,
+        ", ".join(kept) or "(none)",
+    )
+    return kept
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3035,6 +3070,11 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+        if skills_list and assignee:
+            # ``or None`` so a card whose every skill was dropped is stored
+            # exactly like one that pinned no skills, rather than as an empty
+            # list the dispatcher would have to special-case.
+            skills_list = _drop_disabled_skills(skills_list, assignee) or None
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast

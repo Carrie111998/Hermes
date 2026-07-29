@@ -751,6 +751,108 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
 
 
 
+# ---------------------------------------------------------------------------
+# Skills disabled by the assignee profile
+# ---------------------------------------------------------------------------
+
+def _write_profile_skills_config(kanban_home, profile: str, disabled: list[str]):
+    """Give *profile* a config.yaml that disables *disabled*."""
+    profile_dir = kanban_home / "profiles" / profile
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    body = "skills:\n  disabled:\n" + "".join(f"    - {n}\n" for n in disabled)
+    (profile_dir / "config.yaml").write_text(body, encoding="utf-8")
+
+
+def test_create_task_drops_skills_disabled_for_assignee(kanban_home):
+    """A skill the assignee profile disabled is stripped; the rest survive.
+
+    The worker treats a disabled skill as missing, so carrying it on the card
+    buys nothing and risks the all-missing hard failure below.
+    """
+    _write_profile_skills_config(kanban_home, "linguist", ["kanban-orchestrator"])
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="mixed skills",
+            assignee="linguist",
+            skills=["kanban-orchestrator", "translation"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.skills == ["translation"]
+    finally:
+        conn.close()
+
+
+def test_create_task_with_all_skills_disabled_pins_none(kanban_home):
+    """Every pinned skill disabled -> the card pins nothing, not an empty list.
+
+    Regression guard: such a card used to reach the worker intact, where
+    ``build_preloaded_skills_prompt`` reported every name missing and the
+    launch raised ``ValueError`` before any work happened — the task then
+    auto-blocked once retries ran out. Storing ``None`` makes it behave like
+    a card that pinned no skills at all.
+    """
+    _write_profile_skills_config(
+        kanban_home, "researcher", ["kanban-orchestrator", "arxiv"]
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="fully disabled skills",
+            assignee="researcher",
+            skills=["kanban-orchestrator", "arxiv"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.skills is None
+    finally:
+        conn.close()
+
+
+def test_create_task_keeps_skills_when_profile_has_no_config(kanban_home):
+    """No profile config -> nothing is known to be disabled, nothing is dropped."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="unknown profile",
+            assignee="no-such-profile",
+            skills=["translation", "github-code-review"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.skills == ["translation", "github-code-review"]
+    finally:
+        conn.close()
+
+
+def test_create_task_ignores_platform_disabled_skills(kanban_home):
+    """``platform_disabled`` is not consulted at creation time.
+
+    Which platform the worker will run as is unknown here, so only the global
+    ``skills.disabled`` list — disabled on every platform — is safe to act on.
+    """
+    profile_dir = kanban_home / "profiles" / "linguist"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "config.yaml").write_text(
+        "skills:\n"
+        "  platform_disabled:\n"
+        "    cli:\n"
+        "      - translation\n",
+        encoding="utf-8",
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="platform disabled only",
+            assignee="linguist",
+            skills=["translation"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.skills == ["translation"]
+    finally:
+        conn.close()
 
 
 def test_legacy_db_without_skills_column_migrates(tmp_path):
