@@ -729,6 +729,23 @@ _MIN_SUMMARY_CHARS = 2000
 # detection lives in the heartbeat staleness monitor below. Users can opt back
 # in via delegation.child_timeout_seconds.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
+# When an operator opts into a hard child timeout, reserve a bounded tail of
+# that budget for the child to stop starting work and write its final summary.
+# This does not affect the default no-timeout path and adds no model-tool schema.
+_DEADLINE_FINALIZATION_FRACTION = 0.10
+_DEADLINE_FINALIZATION_MIN_SECONDS = 5.0
+_DEADLINE_FINALIZATION_MAX_SECONDS = 60.0
+_DEADLINE_FINALIZATION_STEER = (
+    "[Delegation deadline approaching. Stop starting new work and summarize "
+    "the best verified findings now. Clearly label incomplete items and any "
+    "missing verdict. Do not call more tools.]"
+)
+_TIMEOUT_CHECKPOINT_MAX_TOOL_NAMES = 12
+_TIMEOUT_CHECKPOINT_MAX_TOOL_NAME_CHARS = 80
+_TIMEOUT_CHECKPOINT_MAX_MESSAGES = 100
+_TIMEOUT_CHECKPOINT_MAX_TOOL_CALLS = 200
+_TIMEOUT_CHECKPOINT_MAX_PATH_CHARS = 512
+_TIMEOUT_CHECKPOINT_MAX_CHARS = 2048
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no API-call progress is either:
 #   - idle between turns (no current_tool) — probably stuck on a slow API call
@@ -1961,6 +1978,161 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _deadline_finalization_grace(timeout_seconds: float) -> float:
+    """Return the portion of an explicit hard timeout reserved for summary.
+
+    The production config floor is 30 seconds, but clamping to half the supplied
+    timeout also keeps direct/unit callers with smaller values well-defined.
+    """
+    timeout = max(0.0, float(timeout_seconds))
+    if timeout == 0:
+        return 0.0
+    requested = max(
+        _DEADLINE_FINALIZATION_MIN_SECONDS,
+        timeout * _DEADLINE_FINALIZATION_FRACTION,
+    )
+    return min(_DEADLINE_FINALIZATION_MAX_SECONDS, requested, timeout / 2.0)
+
+
+def _request_deadline_finalization(child: Any, task_index: int) -> bool:
+    """Launch a best-effort summary request without consuming deadline budget.
+
+    ``AIAgent.steer`` is normally an immediate lock-protected assignment, but
+    children can be substituted by adapters/tests. Run it on a daemon thread so
+    a blocking implementation can never extend the configured hard timeout.
+    The return value means the request was launched, not that steer accepted it.
+    """
+    steer = getattr(child, "steer", None)
+    if not callable(steer):
+        return False
+
+    def _invoke() -> None:
+        try:
+            accepted = bool(steer(_DEADLINE_FINALIZATION_STEER))
+        except Exception:
+            logger.debug(
+                "Subagent %d deadline-finalization steer failed",
+                task_index,
+                exc_info=True,
+            )
+            return
+        if accepted:
+            logger.info(
+                "Subagent %d entered deadline-finalization window",
+                task_index,
+            )
+
+    request_thread = threading.Thread(
+        target=_invoke,
+        name=f"delegate-finalize-{task_index}",
+        daemon=True,
+    )
+    try:
+        request_thread.start()
+    except Exception:
+        logger.debug(
+            "Subagent %d deadline-finalization thread failed to start",
+            task_index,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def _build_timeout_partial_checkpoint(child: Any, api_calls: int) -> Optional[str]:
+    """Build a safe operational checkpoint for a progressed timed-out child.
+
+    Raw tool results are intentionally excluded: they can contain untrusted web
+    text, secrets, or huge payloads. The parent gets only bounded execution
+    metadata plus a bounded, escaped live-transcript path for deliberate inspection.
+    """
+    if api_calls <= 0:
+        return None
+
+    messages = getattr(child, "_session_messages", None)
+    tool_counts: Dict[str, int] = {}
+    omitted_tool_calls = 0
+    scan_capped = False
+    if isinstance(messages, list):
+        scan_capped = len(messages) > _TIMEOUT_CHECKPOINT_MAX_MESSAGES
+        # Snapshot only the recent bounded tail. The child worker may still be
+        # appending to the original list while timeout recovery runs.
+        messages_snapshot = messages[-_TIMEOUT_CHECKPOINT_MAX_MESSAGES :]
+        scanned_tool_calls = 0
+        for msg in messages_snapshot:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            tool_calls = msg.get("tool_calls") or []
+            if not isinstance(tool_calls, list):
+                continue
+            remaining = _TIMEOUT_CHECKPOINT_MAX_TOOL_CALLS - scanned_tool_calls
+            if remaining <= 0:
+                if tool_calls:
+                    scan_capped = True
+                break
+            if len(tool_calls) > remaining:
+                scan_capped = True
+            selected_tool_calls = tool_calls[:remaining]
+            scanned_tool_calls += len(selected_tool_calls)
+            for tool_call in selected_tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function") or {}
+                if not isinstance(function, dict):
+                    continue
+                name = str(function.get("name") or "unknown")
+                name = name.replace("\r", " ").replace("\n", " ")[
+                    :_TIMEOUT_CHECKPOINT_MAX_TOOL_NAME_CHARS
+                ]
+                if name in tool_counts:
+                    tool_counts[name] += 1
+                elif len(tool_counts) < _TIMEOUT_CHECKPOINT_MAX_TOOL_NAMES:
+                    tool_counts[name] = 1
+                else:
+                    omitted_tool_calls += 1
+
+    lines = [
+        "PARTIAL CHECKPOINT — NOT A FINAL VERDICT",
+        "",
+        f"- The configured hard deadline expired after {api_calls} API call(s).",
+        "- No final model summary was produced; do not treat this task as completed.",
+    ]
+    if tool_counts:
+        activity = ", ".join(
+            f"{name} × {count}" for name, count in tool_counts.items()
+        )
+        lines.append(f"- Recorded tool calls: {activity}.")
+        if omitted_tool_calls:
+            lines.append(
+                f"- Additional recorded tool calls omitted: {omitted_tool_calls}."
+            )
+    else:
+        lines.append("- No completed tool-call metadata was available to summarize safely.")
+
+    if scan_capped:
+        lines.append("- Checkpoint scan was capped; additional activity may exist.")
+
+    live_path = getattr(child, "_live_transcript_path", None)
+    if isinstance(live_path, str) and live_path:
+        path_was_truncated = len(live_path) > _TIMEOUT_CHECKPOINT_MAX_PATH_CHARS
+        escaped_path = json.dumps(
+            live_path[:_TIMEOUT_CHECKPOINT_MAX_PATH_CHARS],
+            ensure_ascii=True,
+        )
+        if path_was_truncated:
+            escaped_path += "…"
+        lines.append(f"- Full live transcript: {escaped_path}")
+
+    summary = "\n".join(lines)
+    if len(summary) > _TIMEOUT_CHECKPOINT_MAX_CHARS:
+        suffix = "\n[Checkpoint metadata truncated.]"
+        summary = (
+            summary[: _TIMEOUT_CHECKPOINT_MAX_CHARS - len(suffix)].rstrip()
+            + suffix
+        )
+    return summary
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2189,8 +2361,49 @@ def _run_single_child(
             _child_context.run,
             _run_with_thread_capture,
         )
+        deadline_finalization_requested = False
+        hard_deadline_expired = False
         try:
-            result = _child_future.result(timeout=child_timeout)
+            if child_timeout is None:
+                result = _child_future.result(timeout=None)
+            else:
+                hard_deadline = time.monotonic() + child_timeout
+                finalization_grace = _deadline_finalization_grace(child_timeout)
+                work_window = max(
+                    0.0,
+                    hard_deadline - finalization_grace - time.monotonic(),
+                )
+                try:
+                    result = _child_future.result(timeout=work_window)
+                except FuturesTimeoutError:
+                    # A TimeoutError raised *by* the child also emerges from
+                    # Future.result(). If completion won the boundary race,
+                    # recover its actual result/exception before deciding this
+                    # was the soft deadline.
+                    if _child_future.done():
+                        result = _child_future.result()
+                    else:
+                        deadline_finalization_requested = (
+                            _request_deadline_finalization(child, task_index)
+                        )
+                        remaining = max(0.0, hard_deadline - time.monotonic())
+                        if remaining <= 0.0:
+                            if _child_future.done():
+                                result = _child_future.result()
+                            else:
+                                hard_deadline_expired = True
+                                raise FuturesTimeoutError()
+                        else:
+                            try:
+                                result = _child_future.result(timeout=remaining)
+                            except FuturesTimeoutError:
+                                # Recover a result/child exception that landed
+                                # exactly as the remaining-budget wait expired.
+                                if _child_future.done():
+                                    result = _child_future.result()
+                                else:
+                                    hard_deadline_expired = True
+                                    raise
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -2201,7 +2414,10 @@ def _run_single_child(
             except Exception:
                 pass
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            # Do not infer from the exception class: a child can itself raise
+            # TimeoutError. Only the unfinished-future branch above proves the
+            # configured hard deadline elapsed.
+            is_timeout = hard_deadline_expired
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -2238,6 +2454,12 @@ def _run_single_child(
                         diagnostic_path,
                     )
 
+            partial_checkpoint = (
+                _build_timeout_partial_checkpoint(child, child_api_calls)
+                if is_timeout
+                else None
+            )
+
             if child_progress_cb:
                 try:
                     child_progress_cb(
@@ -2249,7 +2471,7 @@ def _run_single_child(
                         ),
                         status="timeout" if is_timeout else "error",
                         duration_seconds=duration,
-                        summary="",
+                        summary=partial_checkpoint or "",
                     )
                 except Exception:
                     pass
@@ -2267,19 +2489,16 @@ def _run_single_child(
                 else:
                     _err = (
                         f"Subagent timed out after {child_timeout}s with "
-                        f"{child_api_calls} API call(s) completed — likely "
-                        f"stuck on a slow API call, tool call, or unresponsive "
-                        f"network request."
+                        f"{child_api_calls} API call(s) completed — the configured "
+                        f"hard deadline expired before a final response."
                     )
-                    if diagnostic_path:
-                        _err += f" Diagnostic: {diagnostic_path}"
             else:
                 _err = str(_timeout_exc)
 
-            return {
+            error_entry = {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
-                "summary": None,
+                "summary": partial_checkpoint,
                 "error": _err,
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
@@ -2294,6 +2513,12 @@ def _run_single_child(
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
+            if is_timeout:
+                error_entry["partial"] = bool(partial_checkpoint)
+                error_entry["deadline_finalization_requested"] = (
+                    deadline_finalization_requested
+                )
+            return error_entry
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
@@ -2416,6 +2641,10 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if child_timeout is not None:
+            entry["deadline_finalization_requested"] = (
+                deadline_finalization_requested
+            )
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
