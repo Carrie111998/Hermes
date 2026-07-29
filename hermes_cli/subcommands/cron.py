@@ -7,6 +7,7 @@ import ``main`` (cycle avoidance).
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
@@ -82,6 +83,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
+    )
+    cron_create.add_argument(
+        "--timestamps",
+        choices=("on", "off", "inherit"),
+        default="inherit",
+        help="Timestamp each run's prompt: on, off, or inherit the gateway setting (default).",
     )
 
     # cron edit
@@ -159,6 +166,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--timestamps",
+        choices=("on", "off", "inherit"),
+        default=argparse.SUPPRESS,
+        help="Set timestamp behavior to on/off, or inherit to clear the per-job override.",
     )
 
     # lifecycle actions

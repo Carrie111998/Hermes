@@ -1543,8 +1543,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            if "timestamps" in updates and not (
+                updates["timestamps"] is None
+                or isinstance(updates["timestamps"], bool)
+            ):
+                raise ValueError("Cron job timestamps must be true, false, or null (inherit)")
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if "timestamps" in updates and updates["timestamps"] is None:
+                updated.pop("timestamps", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

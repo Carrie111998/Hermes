@@ -48,6 +48,15 @@ def _cron_api(**kwargs):
     return json.loads(cronjob_tool(**kwargs))
 
 
+def _timestamps_override(value: Optional[str]) -> Optional[bool]:
+    """Convert the CLI's on/off/inherit spelling to the stored tri-state."""
+    if value == "on":
+        return True
+    if value == "off":
+        return False
+    return None
+
+
 def _active_cron_provider_name() -> str:
     """Name of the resolved cron scheduler provider ('builtin', 'chronos', …).
 
@@ -352,6 +361,7 @@ def cron_create(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        timestamps=_timestamps_override(getattr(args, "timestamps", "inherit")),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -403,7 +413,7 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
-    result = _cron_api(
+    update_kwargs = dict(
         action="update",
         job_id=args.job_id,
         schedule=getattr(args, "schedule", None),
@@ -418,6 +428,9 @@ def cron_edit(args):
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", None),
     )
+    if hasattr(args, "timestamps"):
+        update_kwargs["timestamps"] = _timestamps_override(args.timestamps)
+    result = _cron_api(**update_kwargs)
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
