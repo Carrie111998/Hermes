@@ -383,6 +383,7 @@ class TestConversationLoopPartialStreamContinuation:
             "Partial-stream-stub must trigger a continuation API call, not "
             "exit the loop after one call."
         )
+        assert loop_agent.session_api_calls == 2
         # The continuation prompt the loop appended must be the network-error
         # variant, not the "output length limit" lie — otherwise the model
         # no-ops with "I wasn't truncated, I'm done."
