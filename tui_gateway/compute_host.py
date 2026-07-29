@@ -373,6 +373,7 @@ class ComputeHost:
         if not sid:
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "sid required"})
             return
+        owns_turn = False
         try:
             from tui_gateway import server
 
@@ -381,6 +382,7 @@ class ComputeHost:
                 if session.get("running"):
                     self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "session busy"})
                     return
+                owns_turn = True
                 session["running"] = True
                 session["_turn_cancel_requested"] = False
                 session["last_active"] = time.time()
@@ -427,16 +429,20 @@ class ComputeHost:
                 }
             )
         except Exception as exc:
-            try:
-                from tui_gateway import server
+            # Only the caller that actually acquired the turn may release it.
+            # A refused frame (busy session, scope conflict) runs this same
+            # block; clearing here would unlock a turn owned by someone else.
+            if owns_turn:
+                try:
+                    from tui_gateway import server
 
-                session = server._sessions.get(sid)
-                if session is not None:
-                    with session.get("history_lock", threading.Lock()):
-                        session["running"] = False
-                        server._clear_inflight_turn(session)
-            except Exception:
-                pass
+                    session = server._sessions.get(sid)
+                    if session is not None:
+                        with session.get("history_lock", threading.Lock()):
+                            session["running"] = False
+                            server._clear_inflight_turn(session)
+                except Exception:
+                    pass
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
 
     def _acquire_session_lock(self, sid: str) -> tuple[threading.Lock, _SessionLockEntry]:

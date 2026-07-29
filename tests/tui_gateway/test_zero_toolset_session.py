@@ -1006,3 +1006,114 @@ class TestToolsShowReporting:
         server = _reporting_server()
         session = {"session_key": "k", "agent": SimpleNamespace(enabled_toolsets=None)}
         assert _show_tools(server, session)["total"] > 0
+
+
+class TestTurnOwnershipCleanup:
+    """Only the caller that acquired the turn may release it.
+
+    A concurrent frame that is refused (scope conflict) runs the same except
+    block; if that block cleared `running` / `inflight_turn`, it would unlock a
+    session another turn is still using and let a third turn start in parallel.
+    """
+
+    def _host(self):
+        from tui_gateway.compute_host import ComputeHost
+
+        return ComputeHost(stdout=io.StringIO())
+
+    def _live_session(self, server, sid: str, selection):
+        session = {
+            "agent": SimpleNamespace(enabled_toolsets=selection, model="m",
+                                     provider="p", session_id="own-key"),
+            "session_key": "own-key",
+            "history": [],
+            "history_lock": threading.Lock(),
+            "history_version": 0,
+            "running": False,
+            "inflight_turn": None,
+            "last_active": 0.0,
+        }
+        server._sessions[sid] = session
+        return session
+
+    def test_refused_frame_does_not_release_the_owner_turn(
+        self, server, monkeypatch
+    ) -> None:
+        in_turn = threading.Event()
+        release = threading.Event()
+
+        def blocking_submit(request_id, sid, session, text):
+            in_turn.set()
+            assert release.wait(timeout=10), "test gate never released"
+
+        monkeypatch.setattr(server, "_run_prompt_submit", blocking_submit)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+
+        host = self._host()
+        events: list[dict] = []
+        host.emit = events.append
+        owner = threading.Thread(
+            target=host._run_real_turn,
+            args=({"sid": "own-sid", "session_key": "own-key", "request_id": "owner",
+                   "text": "hi", "enabled_toolsets": []},),
+        )
+        try:
+            with patch.dict(server._sessions, {}, clear=True):
+                session = self._live_session(server, "own-sid", [])
+                owner.start()
+                assert in_turn.wait(timeout=10), "owner turn never started"
+
+                # A concurrent, incompatible frame is refused.
+                host._run_real_turn(
+                    {"sid": "own-sid", "session_key": "own-key", "request_id": "intruder",
+                     "text": "hi", "enabled_toolsets": ["terminal"]}
+                )
+                refused = [e for e in events if e.get("request_id") == "intruder"]
+                assert refused and refused[-1]["type"] == "turn.error"
+
+                # The owner's turn state survives the refusal.
+                assert session["running"] is True
+                assert session["inflight_turn"] is not None
+
+                # And a third turn is still locked out while the owner runs.
+                host._run_real_turn(
+                    {"sid": "own-sid", "session_key": "own-key", "request_id": "third",
+                     "text": "hi", "enabled_toolsets": []}
+                )
+                third = [e for e in events if e.get("request_id") == "third"]
+                assert third and third[-1]["type"] == "turn.error"
+                assert "busy" in third[-1]["message"]
+
+                release.set()
+                owner.join(timeout=15)
+                assert not owner.is_alive()
+        finally:
+            release.set()
+            host._executor.shutdown(wait=False)
+
+    def test_owner_still_cleans_up_its_own_failure(self, server, monkeypatch) -> None:
+        def boom(request_id, sid, session, text):
+            raise RuntimeError("turn exploded")
+
+        monkeypatch.setattr(server, "_run_prompt_submit", boom)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+
+        host = self._host()
+        events: list[dict] = []
+        host.emit = events.append
+        try:
+            with patch.dict(server._sessions, {}, clear=True):
+                session = self._live_session(server, "own-sid", [])
+                host._run_real_turn(
+                    {"sid": "own-sid", "session_key": "own-key", "request_id": "owner",
+                     "text": "hi", "enabled_toolsets": []}
+                )
+                assert session["running"] is False
+                assert session["inflight_turn"] is None
+                assert events[-1]["type"] == "turn.error"
+        finally:
+            host._executor.shutdown(wait=False)
