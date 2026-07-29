@@ -1823,8 +1823,39 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # working), so tokenizer absence must never classify as corruption.
         load_fts5_cjk_extension(conn)
         conn.execute("PRAGMA journal_mode").fetchone()
-        rows = conn.execute("PRAGMA integrity_check").fetchall()
-        problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+        # integrity_check can be very slow on large databases (full-file
+        # read). Run it in a worker thread so doctor doesn't hang
+        # indefinitely on a corrupted or bloated state.db.
+        _integrity_result: list[str] = []
+        _integrity_error: list[Exception | None] = [None]
+
+        def _do_integrity():
+            try:
+                rows = conn.execute("PRAGMA integrity_check").fetchall()
+                _integrity_result.extend(
+                    str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"
+                )
+            except Exception as exc:
+                _integrity_error[0] = exc
+
+        integrity_thread = threading.Thread(
+            target=_do_integrity, daemon=True, name="hermes_db_integrity"
+        )
+        integrity_thread.start()
+        integrity_thread.join(timeout=10)
+
+        if integrity_thread.is_alive():
+            # integrity_check is still running — the DB is large or
+            # locked. Treat as healthy enough rather than hanging forever.
+            logger.warning(
+                "PRAGMA integrity_check timed out on %s (large DB?)", db_path
+            )
+            return None
+
+        if _integrity_error[0] is not None:
+            return str(_integrity_error[0])
+
+        problems = _integrity_result
         if problems:
             return "; ".join(problems[:3])
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()

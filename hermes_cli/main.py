@@ -9387,6 +9387,8 @@ def _coalesce_session_name_args(argv: list) -> list:
     Tokens are collected after the flag until we hit another flag (``-*``)
     or a known top-level subcommand.
     """
+    if argv == ["--"]:
+        return []
     _SUBCOMMANDS = {
         "chat",
         "model",
