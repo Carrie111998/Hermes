@@ -2653,11 +2653,14 @@ def _generate_neutts_warm(text: str, output_path: str, tts_config: Dict[str, Any
         entry = _neutts_cache.get(key)
         if entry is None:
             from neutts import NeuTTS
+            from tools.neutts_synth import resolve_neutts_devices
+
+            backbone_device, codec_device = resolve_neutts_devices(resolved["device"])
             tts = NeuTTS(
                 backbone_repo=resolved["model"],
-                backbone_device=resolved["device"],
+                backbone_device=backbone_device,
                 codec_repo=resolved["codec_repo"],
-                codec_device=resolved["device"],
+                codec_device=codec_device,
             )
             ref_codes = tts.encode_reference(str(ref_audio))
             ref_text = ref_text_path.read_text(encoding="utf-8").strip()

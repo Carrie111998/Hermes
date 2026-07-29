@@ -189,6 +189,39 @@ def test_neutts_warm_cache_reuses_model_and_reference(tmp_path, monkeypatch):
     _reset_neutts_cache()
 
 
+def test_neutts_warm_cache_translates_cuda_for_backbone(tmp_path, monkeypatch):
+    _reset_neutts_cache()
+    captured = {}
+    ref_audio, ref_text = _write_ref_files(tmp_path)
+
+    class FakeNeuTTS:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def encode_reference(self, path):
+            return {"path": path}
+
+        def infer(self, text, ref_codes, ref_text_value):
+            return [0.0, 0.1, -0.1, 0.0]
+
+    monkeypatch.setitem(sys.modules, "neutts", types.SimpleNamespace(NeuTTS=FakeNeuTTS))
+    cfg = {
+        "neutts": {
+            "warm_cache": True,
+            "idle_unload_seconds": 60,
+            "ref_audio": str(ref_audio),
+            "ref_text": str(ref_text),
+            "device": "cuda",
+        }
+    }
+
+    tts_tool._generate_neutts("hello", str(tmp_path / "out.wav"), cfg)
+
+    assert captured["backbone_device"] == "gpu"
+    assert captured["codec_device"] == "cuda"
+    _reset_neutts_cache()
+
+
 def test_neutts_warm_cache_key_changes_on_model(tmp_path, monkeypatch):
     _reset_neutts_cache()
     calls = _install_fake_neutts(monkeypatch)

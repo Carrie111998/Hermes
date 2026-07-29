@@ -48,6 +48,13 @@ def _write_wav(path: str, samples, sample_rate: int = 24000) -> None:
         f.write(pcm.tobytes())
 
 
+def resolve_neutts_devices(device: str) -> tuple[str, str]:
+    """Return the llama.cpp backbone and torch codec device names."""
+    # llama_cpp offloads only for the literal string "gpu", while torch uses
+    # "cuda". Keep this translation shared by subprocess and warm-cache paths.
+    return ("gpu" if device == "cuda" else device, device)
+
+
 def main():
     parser = argparse.ArgumentParser(description="NeuTTS synthesis helper")
     parser.add_argument("--text", required=True, help="Text to synthesize")
@@ -61,11 +68,7 @@ def main():
     parser.add_argument("--device", default="cpu", help="Device (cpu/cuda/mps)")
     args = parser.parse_args()
 
-    # llama_cpp (backbone) offloads to GPU only for the literal string "gpu";
-    # torch (codec) only accepts "cuda". A single --device value can't satisfy
-    # both — "cuda" silently no-ops on the backbone, leaving it on CPU.
-    backbone_device = "gpu" if args.device == "cuda" else args.device
-    codec_device = args.device
+    backbone_device, codec_device = resolve_neutts_devices(args.device)
 
     # Validate inputs
     ref_audio = Path(args.ref_audio).expanduser()
