@@ -1,5 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -344,6 +345,44 @@ async def test_session_chat_stream_emits_lifecycle_events_and_keepalive_safe_sha
     assert "event: assistant.completed" in body
     assert "event: run.completed" in body
     assert "event: done" in body
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_does_not_start_agent_when_sse_prepare_fails(
+    adapter, session_db
+):
+    session_id = session_db.create_session("prepare-fails", "api_server")
+    started = asyncio.Event()
+
+    async def fake_run(**kwargs):
+        started.set()
+        return {"final_response": "should not run", "session_id": session_id}, {
+            "total_tokens": 1
+        }
+
+    class _PrepareFailsStreamResponse:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def prepare(self, request):
+            raise ConnectionResetError("client disconnected before SSE headers")
+
+    app = _create_session_app(adapter)
+    with (
+        patch.object(adapter, "_run_agent", side_effect=fake_run) as run_mock,
+        patch("gateway.platforms.api_server.web.StreamResponse", _PrepareFailsStreamResponse),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "stream please"},
+            )
+            assert resp.status == 500
+
+        await asyncio.sleep(0)
+
+    assert not started.is_set()
+    run_mock.assert_not_called()
 
 
 @pytest.mark.asyncio

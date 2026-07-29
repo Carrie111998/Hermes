@@ -3615,14 +3615,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
-        task = asyncio.create_task(_run_and_signal())
-        try:
-            self._background_tasks.add(task)
-        except TypeError:
-            pass
-        if hasattr(task, "add_done_callback"):
-            task.add_done_callback(self._background_tasks.discard)
-
         headers = {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
@@ -3633,6 +3625,15 @@ class APIServerAdapter(BasePlatformAdapter):
             headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=headers)
         await response.prepare(request)
+
+        task = asyncio.create_task(_run_and_signal())
+        try:
+            self._background_tasks.add(task)
+        except TypeError:
+            pass
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
+
         last_write = time.monotonic()
         try:
             while True:
