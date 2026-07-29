@@ -24,8 +24,10 @@ export function buildSessionByAnyId(
   for (const session of [...cronSessions, ...messagingSessions, ...visibleSessions]) {
     map.set(session.id, session)
 
-    if (session._lineage_root_id && !map.has(session._lineage_root_id)) {
-      map.set(session._lineage_root_id, session)
+    for (const id of [session._lineage_root_id, ...(session._lineage_ids ?? [])]) {
+      if (id && !map.has(id)) {
+        map.set(id, session)
+      }
     }
   }
 
