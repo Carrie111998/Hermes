@@ -146,7 +146,7 @@ export const Thread = memo(function Thread({
   const loadingIndicator = useMemo(() => <BackgroundResumeNotice />, [])
 
   return (
-    <div className="relative grid h-full min-h-0 max-w-full grid-rows-[minmax(0,1fr)] overflow-hidden bg-transparent contain-[layout_paint]">
+    <div className="relative grid h-full min-h-0 max-w-full grid-rows-[minmax(0,1fr)] overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]">
       <ThreadMessageList
         clampToComposer={clampToComposer}
         components={messageComponents}

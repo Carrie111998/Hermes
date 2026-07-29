@@ -48,6 +48,8 @@ export const SKIN_COLOR_TOKENS = [
   'syntax_number',
   'syntax_keyword',
   'syntax_comment',
+  // Desktop sidebar background (optional; overrides the auto-mixed sidebar surface).
+  'sidebar_bg',
   // CLI / TUI chrome.
   'prompt',
   'input_rule',

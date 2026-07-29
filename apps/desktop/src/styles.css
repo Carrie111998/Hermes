@@ -465,6 +465,12 @@
     --backdrop-invert-mul: 1;
   }
 
+  /* Wallpaper mode: keep text legible while letting portrait art show through. */
+  :root.has-skin-wallpaper {
+    --ui-chat-surface-background: color-mix(in srgb, var(--ui-bg-chrome) 62%, transparent);
+    --ui-editor-surface-background: color-mix(in srgb, var(--ui-bg-chrome) 70%, transparent);
+  }
+
   :root.dark {
     /* Per-mode mix knobs — overridden inline by `applyTheme()` per skin. */
     --theme-mix-chrome: 74%;
@@ -900,8 +906,8 @@ code {
 }
 
 /* Arc-style multicolor action surface (static, not animated). Reusable on any
-   Button via className. Unlayered so it beats Tailwind's bg-*/
-text-* variant utilities. */ .btn-arc {
+   Button via className. Unlayered so it beats Tailwind bg/text variant utilities. */
+.btn-arc {
   background-image: linear-gradient(110deg, #5b6cff 0%, #8b5cf6 28%, #d946ef 58%, #fb7185 82%, #fb923c 100%);
   color: #fff;
   border-color: transparent;

@@ -35,6 +35,9 @@ export function Backdrop() {
   const [skinWallpaperUrl, setSkinWallpaperUrl] = useState<string | null>(null)
   const on = useStore($backdrop)
   const { theme } = useTheme()
+  // Use only the skin-provided wallpaper. A hardcoded local fallback causes
+  // palette/wallpaper mismatch (e.g. light palette over portrait background).
+  const wallpaper = (theme.backgroundImage ?? '').trim()
 
   useEffect(() => {
     if (!import.meta.env.DEV) {
@@ -67,7 +70,7 @@ export function Backdrop() {
   // Resolve skin wallpaper → data URL via Electron when needed.
   useEffect(() => {
     let cancelled = false
-    const raw = (theme.backgroundImage ?? '').trim()
+    const raw = wallpaper
 
     if (!raw) {
       setSkinWallpaperUrl(null)
@@ -102,36 +105,7 @@ export function Backdrop() {
     return () => {
       cancelled = true
     }
-  }, [theme.backgroundImage])
-
-  // Relative skin filenames: try a few common HERMES_HOME locations.
-  useEffect(() => {
-    let cancelled = false
-    const raw = (theme.backgroundImage ?? '').trim()
-    if (!raw || isHttpUrl(raw) || isAbsPath(raw) || !window.hermesDesktop?.readFileDataUrl) {
-      return
-    }
-
-    const homes = [`C:/Users/downl/.hermes/skins/${raw}`]
-
-    ;(async () => {
-      for (const candidate of homes) {
-        try {
-          const url = await window.hermesDesktop!.readFileDataUrl(candidate)
-          if (!cancelled && url) {
-            setSkinWallpaperUrl(url)
-            return
-          }
-        } catch {
-          // try next
-        }
-      }
-    })()
-
-    return () => {
-      cancelled = true
-    }
-  }, [theme.backgroundImage])
+  }, [wallpaper])
 
   const shape = useControls(
     'UI / Shape',
@@ -164,6 +138,15 @@ export function Backdrop() {
 
   const skinFit = theme.backgroundImageFit || 'cover'
   const skinPosition = theme.backgroundImagePosition || 'center'
+  // When a wallpaper is active, the chat surface must be opaque so text stays
+  // readable over the image. We signal this via a CSS class on <html>.
+  const hasWallpaper = !!skinWallpaperUrl
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('has-skin-wallpaper', hasWallpaper)
+    return () => document.documentElement.classList.remove('has-skin-wallpaper')
+  }, [hasWallpaper])
+
   const skinOverlay = theme.backgroundOverlay || ''
 
   const skinLayer = useMemo(() => {
@@ -172,7 +155,7 @@ export function Backdrop() {
     }
 
     return (
-      <div aria-hidden className="pointer-events-none absolute inset-0 z-1 overflow-hidden">
+      <div aria-hidden className="pointer-events-none absolute inset-0 z-0 overflow-hidden">
         <img
           alt=""
           className="h-full w-full"

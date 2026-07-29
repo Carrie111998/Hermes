@@ -65,7 +65,10 @@ export function skinToDesktopTheme(skin: HermesSkin): DesktopTheme | null {
   const accentSeed =
     pick(colors, ['ui_accent', 'banner_accent', 'banner_title'], background) ?? mix(foreground, background, 0.55)
 
-  const sidebar = mix(background, foreground, dark ? 0.02 : 0.012)
+  // sidebar_bg: explicit skin override for the sidebar surface; normalizeHex flattens alpha over background
+  // so a translucent value like "#1a1030f0" stays fully opaque once composed.
+  const sidebarExplicit = pick(colors, ['sidebar_bg'], background)
+  const sidebar = sidebarExplicit ?? mix(background, foreground, dark ? 0.02 : 0.012)
   const accent = ensureContrast(accentSeed, sidebar, ACCENT_MIN_CONTRAST)
 
   const border =
