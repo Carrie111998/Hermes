@@ -268,3 +268,24 @@ test('getVenvRootForPython rejects a system interpreter with no owning pyvenv.cf
     null
   )
 })
+
+test('getVenvRootForPython owns Windows Scripts/python.exe via adjacent pyvenv.cfg', () => {
+  const venvRoot = 'C:\\repo\\hermes-agent\\.venv'
+
+  assert.equal(
+    getVenvRootForPython(`${venvRoot}\\Scripts\\python.exe`, {
+      isWindows: true,
+      fileExists: p => p.toLowerCase() === `${venvRoot}\\pyvenv.cfg`.toLowerCase(),
+      pathModule: path.win32
+    }),
+    venvRoot
+  )
+  assert.equal(
+    getVenvRootForPython(`${venvRoot}\\SCRIPTS\\python.exe`, {
+      isWindows: true,
+      fileExists: p => p.toLowerCase() === `${venvRoot}\\pyvenv.cfg`.toLowerCase(),
+      pathModule: path.win32
+    }),
+    venvRoot
+  )
+})

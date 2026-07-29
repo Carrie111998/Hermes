@@ -305,9 +305,7 @@ export function resolveVenvHermesCommand(
   if (
     !canImportHermesCli(python, {
       env: {
-        PYTHONPATH: [...(directoryExists(root) ? [root] : []), process.env.PYTHONPATH]
-          .filter((entry): entry is string => Boolean(entry))
-          .join(path.delimiter)
+        ...(directoryExists(root) ? { PYTHONPATH: root } : {})
       }
     })
   ) {
