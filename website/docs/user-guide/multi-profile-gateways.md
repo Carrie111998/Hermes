@@ -4,14 +4,14 @@ sidebar_position: 4
 
 # Running Many Gateways at Once
 
-Operate multiple [profiles](./profiles.md) — each with its own bot tokens,
+Operate multiple [profiles](/user-guide/profiles) — each with its own bot tokens,
 sessions, and memory — as managed services on a single machine. This page
 covers the operational concerns: starting them all together, viewing logs
 across profiles, preventing the host from sleeping, and recovering from common
 launchd/systemd quirks.
 
 If you only run one Hermes agent, you don't need this page — see
-[Profiles](./profiles.md) for the basics.
+[Profiles](/user-guide/profiles) for the basics.
 
 ## When to use this
 

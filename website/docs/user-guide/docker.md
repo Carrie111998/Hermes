@@ -125,12 +125,9 @@ The dashboard is supervised by s6 — if it crashes, `s6-supervise` restarts it 
 
 The dashboard inside the container defaults to binding `0.0.0.0` — without it, the published `-p 9119:9119` port would not be reachable from the host. To restrict the bind to container loopback (for sidecar / reverse-proxy setups), set `HERMES_DASHBOARD_HOST=127.0.0.1`.
 
-The dashboard's auth gate engages automatically when both of the following are true:
+The dashboard's auth gate engages automatically whenever the bind host is non-loopback (for example, the default `0.0.0.0` inside the container). At least one `DashboardAuthProvider` must then register successfully; otherwise startup fails closed.
 
-1. The bind host is non-loopback (e.g. the default `0.0.0.0` inside the container), **and**
-2. A `DashboardAuthProvider` plugin is registered.
-
-There are three bundled ways to satisfy the second condition:
+There are three bundled ways to satisfy that provider requirement:
 
 - **Username/password** — the simplest for a self-hosted / on-prem / homelab container on a trusted network or behind a VPN: set `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` + `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` (and `HERMES_DASHBOARD_BASIC_AUTH_SECRET` for restart-stable sessions). Not suitable for direct public-internet exposure.
 - **OAuth (Nous Portal)** — for hosted/public deploys: the `dashboard_auth/nous` provider activates whenever `HERMES_DASHBOARD_OAUTH_CLIENT_ID` is set.

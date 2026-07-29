@@ -16,66 +16,134 @@
 // several minutes and burns GitHub API quota — but still gets the same
 // 2000+ external skills the deployed site has.
 //
-// If python3 or its deps (pyyaml) aren't available on the local machine, we
-// fall back to writing an empty skills.json so `npm run build` still
-// succeeds — the Skills Hub page just shows an empty state, and llms.txt
-// generation is skipped. CI always has the deps installed, so production
-// deploys get real data.
+// Production generation (`npm run generate`, build, and deploy) passes
+// `--strict` and fails closed if required artifacts cannot be refreshed.
+// `npm start` deliberately uses the best-effort mode for local preview: it
+// preserves an existing artifact, or writes an empty skills.json only when
+// none exists, and warns instead of aborting.
 
-import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, existsSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const scriptDir = dirname(fileURLToPath(import.meta.url));
-const websiteDir = resolve(scriptDir, "..");
-const extractScript = join(scriptDir, "extract-skills.py");
-const llmsScript = join(scriptDir, "generate-llms-txt.py");
-const cronBlueprintsScript = join(scriptDir, "extract-automation-blueprints.py");
-const outputFile = join(websiteDir, "static", "api", "skills.json");
-const unifiedIndexFile = join(websiteDir, "static", "api", "skills-index.json");
-const UNIFIED_INDEX_URL =
-  "https://hermes-agent.nousresearch.com/docs/api/skills-index.json";
-const UNIFIED_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h
+const scriptDir = dirname(fileURLToPath(import.meta.url))
+const websiteDir = resolve(scriptDir, '..')
+const repoDir = resolve(websiteDir, '..')
+const extractScript = join(scriptDir, 'extract-skills.py')
+const llmsScript = join(scriptDir, 'generate-llms-txt.py')
+const cronBlueprintsScript = join(scriptDir, 'extract-automation-blueprints.py')
+const outputFile = join(websiteDir, 'static', 'api', 'skills.json')
+const unifiedIndexFile = join(websiteDir, 'static', 'api', 'skills-index.json')
+const UNIFIED_INDEX_URL = 'https://hermes-agent.nousresearch.com/docs/api/skills-index.json'
+const UNIFIED_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000 // 24h
+const strict = process.argv.includes('--strict')
 
-function writeEmptyFallback(reason) {
-  mkdirSync(dirname(outputFile), { recursive: true });
-  writeFileSync(outputFile, "[]\n");
+function resolvePython() {
+  const venvExecutable = process.platform === 'win32' ? 'python.exe' : 'python3'
+  const venvBin = process.platform === 'win32' ? 'Scripts' : 'bin'
+  const candidates = [
+    process.env.PYTHON,
+    join(repoDir, '.venv', venvBin, venvExecutable),
+    join(repoDir, 'venv', venvBin, venvExecutable),
+    'python3',
+    'python'
+  ].filter((candidate, index, all) => candidate && all.indexOf(candidate) === index)
+
+  for (const candidate of candidates) {
+    if (candidate.includes('/') || candidate.includes('\\')) {
+      if (!existsSync(candidate)) continue
+    }
+    const probe = spawnSync(candidate, ['-c', 'import yaml'], { stdio: 'ignore' })
+    if (!probe.error && probe.status === 0) return candidate
+  }
+  return null
+}
+
+const pythonCommand = resolvePython()
+
+function failOrWarn(message) {
+  if (strict) {
+    throw new Error(`[prebuild] ${message}`)
+  }
+
+  console.warn(`[prebuild] ${message}`)
+  return false
+}
+
+function handleExtractFailure(reason) {
+  if (strict) {
+    return failOrWarn(`extract-skills.py failed (${reason})`)
+  }
+
+  mkdirSync(dirname(outputFile), { recursive: true })
+  const wroteFallback = !existsSync(outputFile)
+
+  if (wroteFallback) {
+    writeFileSync(outputFile, '[]\n')
+  }
+
   console.warn(
-    `[prebuild] extract-skills.py skipped (${reason}); wrote empty skills.json. ` +
-      `Install python3 + pyyaml locally for a populated Skills Hub page.`,
-  );
+    `[prebuild] extract-skills.py skipped (${reason}); ` +
+      `${wroteFallback ? 'wrote empty' : 'preserved existing'} skills.json. ` +
+      'Install python3 + pyyaml locally for a populated Skills Hub page.'
+  )
+
+  return false
+}
+
+function skillsOutputIsValid() {
+  try {
+    const parsed = JSON.parse(readFileSync(outputFile, 'utf8'))
+    return Array.isArray(parsed) && parsed.length > 0
+  } catch {
+    return false
+  }
 }
 
 function runPython(script, label) {
   if (!existsSync(script)) {
-    console.warn(`[prebuild] ${label} skipped (script missing)`);
-    return false;
+    return failOrWarn(`${label} skipped (script missing)`)
   }
-  const r = spawnSync("python3", [script], { stdio: "inherit", cwd: websiteDir });
-  if (r.error && r.error.code === "ENOENT") {
-    console.warn(`[prebuild] ${label} skipped (python3 not found)`);
-    return false;
+  if (!pythonCommand) {
+    return failOrWarn(`${label} skipped (python3 + pyyaml not found)`)
   }
-  if (r.status !== 0) {
-    console.warn(`[prebuild] ${label} exited with status ${r.status}`);
-    return false;
+  const r = spawnSync(pythonCommand, [script], { stdio: 'inherit', cwd: websiteDir })
+  if (r.error || r.status !== 0) {
+    const detail = r.error?.message || (r.signal ? `signal ${r.signal}` : `status ${r.status}`)
+    return failOrWarn(`${label} exited with ${detail}`)
   }
-  return true;
+  return true
+}
+
+function readValidUnifiedIndex() {
+  try {
+    const parsed = JSON.parse(readFileSync(unifiedIndexFile, 'utf8'))
+    return Boolean(parsed && Array.isArray(parsed.skills) && parsed.skills.length > 0)
+  } catch {
+    return false
+  }
 }
 
 async function ensureUnifiedIndex() {
-  // If we have a recent copy on disk, trust it.
+  const validLocalCopy = readValidUnifiedIndex()
+
+  // If we have a recent valid copy on disk, trust it.
   if (existsSync(unifiedIndexFile)) {
     try {
-      const age = Date.now() - statSync(unifiedIndexFile).mtimeMs;
-      if (age < UNIFIED_INDEX_MAX_AGE_MS) {
-        return true;
+      const age = Date.now() - statSync(unifiedIndexFile).mtimeMs
+      if (validLocalCopy && age < UNIFIED_INDEX_MAX_AGE_MS) {
+        return true
       }
-      console.log(
-        `[prebuild] skills-index.json is ${(age / 3600000).toFixed(1)}h old; ` +
-          `refreshing from ${UNIFIED_INDEX_URL}`,
-      );
+
+      if (validLocalCopy) {
+        console.log(
+          `[prebuild] skills-index.json is ${(age / 3600000).toFixed(1)}h old; ` +
+            `refreshing from ${UNIFIED_INDEX_URL}`
+        )
+      } else {
+        console.warn('[prebuild] local skills-index.json is invalid; fetching a replacement')
+      }
     } catch {
       // fall through to re-fetch
     }
@@ -83,63 +151,67 @@ async function ensureUnifiedIndex() {
 
   try {
     const resp = await fetch(UNIFIED_INDEX_URL, {
-      headers: { accept: "application/json" },
-    });
+      headers: { accept: 'application/json' }
+    })
     if (!resp.ok) {
       console.warn(
         `[prebuild] skills-index.json fetch returned HTTP ${resp.status}; ` +
-          `using local copy if any`,
-      );
-      return existsSync(unifiedIndexFile);
+          `${strict ? 'strict mode will not accept a stale copy' : 'using a non-empty local copy if any'}`
+      )
+      return !strict && validLocalCopy
     }
-    const text = await resp.text();
-    // Sanity check: must be valid JSON with a skills array
+    const text = await resp.text()
+    // Sanity check: must be valid JSON with a non-empty skills array.
     try {
-      const parsed = JSON.parse(text);
-      if (!parsed || !Array.isArray(parsed.skills)) {
-        console.warn(
-          "[prebuild] skills-index.json from live site has no skills array; ignoring",
-        );
-        return existsSync(unifiedIndexFile);
+      const parsed = JSON.parse(text)
+      if (!parsed || !Array.isArray(parsed.skills) || parsed.skills.length === 0) {
+        console.warn('[prebuild] skills-index.json from live site has no non-empty skills array; ignoring')
+        return !strict && validLocalCopy
       }
     } catch (e) {
-      console.warn(`[prebuild] skills-index.json from live site is not valid JSON: ${e}`);
-      return existsSync(unifiedIndexFile);
+      console.warn(`[prebuild] skills-index.json from live site is not valid JSON: ${e}`)
+      return !strict && validLocalCopy
     }
-    mkdirSync(dirname(unifiedIndexFile), { recursive: true });
-    writeFileSync(unifiedIndexFile, text);
+    mkdirSync(dirname(unifiedIndexFile), { recursive: true })
+    writeFileSync(unifiedIndexFile, text)
     console.log(
-      `[prebuild] downloaded skills-index.json from ${UNIFIED_INDEX_URL} ` +
-        `(${(text.length / 1024).toFixed(0)} KB)`,
-    );
-    return true;
+      `[prebuild] downloaded skills-index.json from ${UNIFIED_INDEX_URL} ` + `(${(text.length / 1024).toFixed(0)} KB)`
+    )
+    return true
   } catch (e) {
-    console.warn(`[prebuild] skills-index.json fetch failed: ${e}`);
-    return existsSync(unifiedIndexFile);
+    console.warn(`[prebuild] skills-index.json fetch failed: ${e}`)
+    return !strict && validLocalCopy
   }
 }
 
 // 0) Pull unified index if we don't have a fresh one.
-await ensureUnifiedIndex();
+if (!(await ensureUnifiedIndex())) {
+  failOrWarn('skills-index.json is unavailable or invalid')
+}
 
 // 1) skills.json — required for the Skills Hub page.
 if (!existsSync(extractScript)) {
-  writeEmptyFallback("extract script missing");
+  handleExtractFailure('extract script missing')
 } else {
-  const r = spawnSync("python3", [extractScript], {
-    stdio: "inherit",
-    cwd: websiteDir,
-  });
-  if (r.error && r.error.code === "ENOENT") {
-    writeEmptyFallback("python3 not found");
-  } else if (r.status !== 0) {
-    writeEmptyFallback(`extract-skills.py exited with status ${r.status}`);
+  const r = pythonCommand
+    ? spawnSync(pythonCommand, [extractScript], {
+        stdio: 'inherit',
+        cwd: websiteDir
+      })
+    : null
+  if (!r) {
+    handleExtractFailure('python3 + pyyaml not found')
+  } else if (r.error || r.status !== 0) {
+    const detail = r.error?.message || (r.signal ? `signal ${r.signal}` : `status ${r.status}`)
+    handleExtractFailure(`extract-skills.py exited with ${detail}`)
+  } else if (!skillsOutputIsValid()) {
+    handleExtractFailure('output is missing, invalid, or empty')
   }
 }
 
-// 2) llms.txt + llms-full.txt — agent-friendly docs entrypoints. Non-fatal.
-runPython(llmsScript, "generate-llms-txt.py");
+// 2) llms.txt + llms-full.txt — required in strict builds, best-effort for local preview.
+runPython(llmsScript, 'generate-llms-txt.py')
 
-// 3) automation-blueprints-index.json — Automation Blueprints catalog page. Non-fatal; the page
-//    renders an empty state if the generator can't run.
-runPython(cronBlueprintsScript, "extract-automation-blueprints.py");
+// 3) automation-blueprints-index.json — required in strict builds. Best-effort
+//    local preview still renders an empty state if the generator cannot run.
+runPython(cronBlueprintsScript, 'extract-automation-blueprints.py')

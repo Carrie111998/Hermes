@@ -14,15 +14,15 @@ It runs on **macOS, Windows, and Linux**.
 Hermes has several front ends that all talk to the same agent:
 
 - **Desktop App** (this page) — a native application with a purpose-built UI for chat, configuration, and management.
-- **CLI** (`hermes`) and **[TUI](./tui.md)** (`hermes --tui`) — terminal interfaces.
-- **[Web Dashboard](./features/web-dashboard.md)** (`hermes dashboard`) — a browser admin panel; its optional **Chat** tab embeds the TUI through a pseudo-terminal.
+- **CLI** (`hermes`) and **[TUI](/user-guide/tui)** (`hermes --tui`) — terminal interfaces.
+- **[Web Dashboard](/user-guide/features/web-dashboard)** (`hermes dashboard`) — a browser admin panel; its optional **Chat** tab embeds the TUI through a pseudo-terminal.
 
 Pick whichever fits the moment. They share state, so you can start a session in one and resume it in another.
 :::
 
 ## Install
 
-Follow the [installation instructions for Hermes Desktop](../getting-started/installation.md).
+Follow the [installation instructions for Hermes Desktop](/getting-started/installation).
 
 If you already have Hermes installed, simply run
 
@@ -50,9 +50,9 @@ The center of the app. You get:
 
 The bar along the bottom of the chat shows live session state and exposes quick controls without opening Settings:
 
-- **Per-session YOLO toggle** — flip YOLO on or off for just this session (matching the TUI). YOLO bypasses the dangerous-command approval prompts, so know what you're turning off — see [Security → YOLO Mode](./security.md#yolo-mode).
+- **Per-session YOLO toggle** — flip YOLO on or off for just this session (matching the TUI). YOLO bypasses the dangerous-command approval prompts, so know what you're turning off — see [Security → YOLO Mode](/user-guide/security#yolo-mode).
 
-Chatting against a Hermes instance on another machine instead of the bundled local backend? See [Connecting to a remote backend](#connecting-to-a-remote-backend) below — and for the full picture of how the remote-hosted dashboard connection works (the auth gate, the `/api/ws` chat socket, and WebSocket close-code triage), see [Web Dashboard → Connecting Hermes Desktop to a remote backend](./features/web-dashboard.md#connecting-hermes-desktop-to-a-remote-backend).
+Chatting against a Hermes instance on another machine instead of the bundled local backend? See [Connecting to a remote backend](#connecting-to-a-remote-backend) for the full Local, Cloud, Remote URL, and SSH architecture. For the explicit Remote URL mode's auth gate, `/api/ws` chat socket, and WebSocket close-code triage, see [Web Dashboard → Connecting Hermes Desktop to a remote backend](/user-guide/features/web-dashboard#connecting-hermes-desktop-to-a-remote-backend).
 
 #### Repository discovery
 
@@ -86,7 +86,7 @@ Explore and preview the working directory without leaving the app — useful for
 
 ### Voice
 
-Talk to Hermes and hear it back, the same [voice mode](./features/voice-mode.md) available elsewhere. On macOS the OS will prompt once for microphone access.
+Talk to Hermes and hear it back, the same [voice mode](/user-guide/features/voice-mode) available elsewhere. On macOS the OS will prompt once for microphone access.
 
 ### Settings & onboarding
 
@@ -104,9 +104,9 @@ First-run onboarding has been redesigned on a unified overlay design system, and
 
 The app also surfaces the broader Hermes management surface so you don't have to drop to a terminal:
 
-- **Skills** — browse, install, and manage [skills](./features/skills.md).
-- **Cron** — view and manage [scheduled jobs](../reference/cli-commands.md#hermes-cron).
-- **Profiles** — switch between [Hermes profiles](./profiles.md) (isolated config/skills/sessions).
+- **Skills** — browse, install, and manage [skills](/user-guide/features/skills).
+- **Cron** — view and manage [scheduled jobs](/reference/cli-commands#hermes-cron).
+- **Profiles** — switch between [Hermes profiles](/user-guide/profiles) (isolated config/skills/sessions).
 - **Messaging** — set up gateway channels.
 - **Agents** and **Command Center** — orchestration surfaces for multi-agent work.
 
@@ -121,7 +121,7 @@ The app also surfaces the broader Hermes management surface so you don't have to
 
 - **Session-list overhaul** — a reworked session list with archiving and general session hygiene to keep the list manageable as it grows.
 - **Search sessions by id** — find a specific session directly by its id.
-- **Concurrent multi-profile sessions** — run sessions across multiple [profiles](./profiles.md) at the same time, and reference a session in another profile with cross-profile `@session` links.
+- **Concurrent multi-profile sessions** — run sessions across multiple [profiles](/user-guide/profiles) at the same time, and reference a session in another profile with cross-profile `@session` links.
 
 ## Updating
 
@@ -162,26 +162,66 @@ To launch via the CLI, simply run `hermes desktop`. By default it installs works
 
 ## How it works
 
-The packaged app ships the Electron shell and a native React chat surface. On first launch it can install the Hermes Agent runtime into `HERMES_HOME` (`~/.hermes`, or `%LOCALAPPDATA%\hermes` on Windows) — **the same layout a CLI install uses**, which is why the two are interchangeable. Backend resolution first honours `HERMES_DESKTOP_HERMES_ROOT`, then a completed managed install, then a probed `hermes` on `PATH` (unless `--ignore-existing` / `HERMES_DESKTOP_IGNORE_EXISTING=1` is set), and finally an explicit `HERMES_DESKTOP_HERMES` command override for packagers such as Nix. The React renderer talks to a headless backend the app launches for you — a `hermes serve` process that serves the `tui_gateway` JSON-RPC/WebSocket API — and reuses the agent runtime rather than embedding `hermes --tui`. The desktop app is **self-contained**: it runs its own `hermes serve` backend and never opens or requires the [web dashboard](./features/web-dashboard.md). (Runtimes older than the `serve` command fall back to a headless `dashboard --no-open` automatically, so an app update never outruns its backend.) Install, backend-resolution, and self-update logic live in the Electron main process.
+The packaged app ships the Electron shell and a native React chat surface. On first launch it can install the Hermes Agent runtime into `HERMES_HOME` (`~/.hermes`, or `%LOCALAPPDATA%\hermes` on Windows) — **the same layout a CLI install uses**, which is why the two are interchangeable. Backend resolution first honours `HERMES_DESKTOP_HERMES_ROOT`, then a completed managed install, then a probed `hermes` on `PATH` (unless `--ignore-existing` / `HERMES_DESKTOP_IGNORE_EXISTING=1` is set), and finally an explicit `HERMES_DESKTOP_HERMES` command override for packagers such as Nix. In **Local gateway** mode, the React renderer talks to a headless backend the app launches for you — a `hermes serve` process that serves the `tui_gateway` JSON-RPC/WebSocket API — and reuses the agent runtime rather than embedding `hermes --tui`. The local app is **self-contained**: it never opens or requires the [web dashboard](/user-guide/features/web-dashboard). (Runtimes older than the `serve` command fall back to a headless `dashboard --no-open` automatically, so an app update never outruns its backend.) Cloud, Remote URL, and SSH modes skip that local backend launch and connect to the selected remote execution boundary instead. Install, connection, backend-resolution, and self-update logic live in the Electron main process.
 
 ## Connecting to a remote backend
 
-By default the app starts and manages its own **local** backend. You can instead point it at a Hermes backend running on another machine — a VPS, a home server, or a Mini behind Tailscale.
+Open **Settings → Gateway** and select which profile the connection applies to. Desktop exposes four distinct connection modes:
 
-:::info The remote backend is a running `hermes serve` process
-"Remote backend" means a **`hermes serve`** server running on the remote machine — that is the process the desktop app connects to. Nothing in this section works unless that backend is actually up and reachable. The desktop app does not start it for you; you (or a `systemd` service) keep `hermes serve` running on the remote host, and the app attaches to it. If you also use messaging channels (Telegram, Discord, etc.), the **gateway** is a *separate* long-running process you start independently — see the note after the setup steps.
+| Mode | Where Hermes runs | Who manages the backend | Network path and authentication | Use it when |
+|------|-------------------|-------------------------|---------------------------------|-------------|
+| **Local gateway** | This computer | Desktop starts and stops a private `hermes serve` process | Loopback only; no remote port to expose | You want Desktop to run the backend on this computer |
+| **Hermes Cloud** | A provisioned Hermes Cloud agent | Hermes Cloud | Sign in to the Portal, then Desktop discovers the agent URL and establishes the authenticated remote session | Your agent is hosted in Hermes Cloud |
+| **Remote gateway** | A server you operate | You keep `hermes serve` running | Desktop connects directly to a reachable URL; non-loopback binds require an auth provider | You want a persistent endpoint shared by one or more clients |
+| **Connect via SSH** | A host reachable over SSH | Desktop launches or reuses its dedicated remote `hermes serve` process | Key-based SSH plus a loopback-only port forward; no backend port is exposed | You want Desktop to manage a private remote connection |
+
+“Local” describes where the backend listens and executes; it does not force offline operation. Configured model, tool, update, and authentication providers may still make their normal outbound requests.
+
+:::note Backend server versus messaging gateway
+Desktop connects to the **backend server** provided by `hermes serve`. The Telegram, Discord, Slack, and other messaging **gateway** is a separate long-running process. Start that separately on the execution host only if you use messaging channels.
 :::
 
-The connection has two halves: on the backend you protect it with an **auth provider**, and in the app you enter the backend's URL and sign in. Binding the backend to a non-loopback address automatically engages its auth gate, and the provider you configure is what lets the desktop app through.
+Whichever remote mode you choose, that host is the execution boundary: agent tools, terminal commands, file access, profiles, sessions, skills, and memory come from the remote Hermes installation rather than the computer displaying the Desktop UI.
 
-**Pick a provider based on where the backend lives:**
+### Hermes Cloud
 
-- **OAuth (Nous Portal) — preferred for anything reachable beyond your own machine.** Logins are verified against your Nous account, so this is the option suitable for a VPS, a public host, or any remote backend. Register the dashboard with `hermes dashboard register` (or the Portal [`/local-dashboards`](https://portal.nousresearch.com/local-dashboards) page) to provision its OAuth client, then sign in from the app with **Sign in with Nous Research**. A self-hosted OIDC provider works the same way if you run your own identity provider.
-- **Username/password — local / trusted-network use only.** The simplest option when the backend is on the same trusted LAN or reachable only over a VPN (e.g. Tailscale). It protects a single shared credential with no external identity provider, so **do not use it for a dashboard exposed to the public internet** — reach for OAuth there instead.
+Choose **Hermes Cloud**, select **Sign in to Hermes Cloud**, and complete the browser login. Desktop discovers the organizations and agents associated with your account; choose an organization when prompted, select an agent, and click **Connect**. You do not paste a URL, expose a port, or start `hermes serve` yourself. Signing out clears the saved Cloud session from this Desktop installation.
 
-The rest of this section shows the username/password path because it's the quickest to stand up on a trusted network; for the OAuth path see [Web Dashboard → Default provider: Nous Research](./features/web-dashboard.md#default-provider-nous-research).
+### Connect via SSH
 
-### On the backend (the remote machine)
+SSH mode is a managed remote architecture, not a shortcut for the Remote URL field. It requires:
+
+- a current Hermes Agent installation on the remote Linux, macOS, or Windows
+  host (the Desktop client itself may also run on macOS, Windows, or Linux);
+- working **key-based** SSH access from the Desktop computer; and
+- the system OpenSSH client. Desktop honours `~/.ssh/config`, ssh-agent, custom ports, and an optional identity file or explicit remote Hermes path.
+
+Because Desktop runs SSH non-interactively, password prompts and interactive 2FA cannot be completed. Confirm that `ssh user@host` works with your key first, or load the key into ssh-agent.
+
+In **Settings → Gateway → Connect via SSH**:
+
+1. Enter `user@host` or select a `Host` alias from `~/.ssh/config`.
+2. Optionally set the user, port, identity file, or full remote Hermes path.
+3. Use **Test SSH**, then **Connect**.
+
+On first connection, Desktop accepts and pins the host's presented key. A later key change fails closed; verify the change out of band before removing the old `known_hosts` entry.
+
+After authentication, Desktop launches or safely reuses a backend dedicated to this Desktop installation and profile. The remote command is equivalent to `hermes serve --isolated --host 127.0.0.1 --port 0`; Desktop supplies a private session token, discovers the assigned port, and forwards it to a random `127.0.0.1` port on the Desktop computer. **Only SSH must be reachable. The Hermes backend is never bound to the remote LAN or public internet, so dashboard OAuth/basic-auth configuration is not part of this mode.**
+
+The remote backend is detached so it can survive a dropped SSH channel and be reused on the next connection. Quitting Desktop closes its tunnel and SSH master; on reconnect Desktop authenticates ownership before reuse and removes a stale process only when it can prove that process belongs to the same Desktop installation and profile.
+
+### Explicit Remote gateway URL
+
+Use this mode when a reachable **`hermes serve`** process already runs on the remote machine. Desktop attaches to that service; it does not start or stop it. Keep the process running under `systemd`, `tmux`, or another supervisor if the endpoint must survive logout and reboot.
+
+Binding `hermes serve` to any non-loopback address — including `0.0.0.0` — always engages the auth gate. `--insecure` is deprecated and no longer bypasses authentication. Pick a provider based on the endpoint's exposure:
+
+- **OAuth (Nous Portal) or self-hosted OIDC — required for an internet-facing endpoint.** Register the backend with `hermes dashboard register` (or the Portal [`/local-dashboards`](https://portal.nousresearch.com/local-dashboards) page), then use the provider's sign-in button in Desktop.
+- **Username/password — trusted LAN or VPN only.** This is the quickest setup behind Tailscale or another private network. Do not expose a password-only backend directly to the public internet.
+
+The example below uses username/password on a trusted network. For OAuth, see [Web Dashboard → Default provider: Nous Research](/user-guide/features/web-dashboard#default-provider-nous-research).
+
+#### On the backend (the remote machine)
 
 Set a username and password, then start the backend bound to a reachable address. The credentials live in `~/.hermes/.env` (the secrets file, mode 0600):
 
@@ -190,11 +230,10 @@ Set a username and password, then start the backend bound to a reachable address
 cat >> ~/.hermes/.env <<'EOF'
 HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
 HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=choose-a-strong-password
-# Recommended: a stable signing secret so sessions survive restarts.
-# Without it a random key is generated per boot and you'll be logged out
-# on every restart.
-HERMES_DASHBOARD_BASIC_AUTH_SECRET=$(openssl rand -base64 32)
 EOF
+# Add a generated stable signing secret so sessions survive restarts.
+printf 'HERMES_DASHBOARD_BASIC_AUTH_SECRET=%s\n' \
+  "$(openssl rand -base64 32)" >> ~/.hermes/.env
 chmod 600 ~/.hermes/.env
 
 # 2. Run the backend bound to a reachable address. The non-loopback bind
@@ -204,9 +243,9 @@ hermes serve --host 0.0.0.0 --port 9119
 
 Keep that `hermes serve` process running for as long as you want the desktop app to be able to connect — if it stops, the app can no longer reach the backend. Run it under `systemd`, `tmux`, or your process manager of choice so it survives logout and reboots.
 
-Separately, make sure the **gateway is running** on the remote host if you rely on messaging channels — the `hermes serve` backend is what the desktop app talks to, but your Telegram/Discord/Slack gateway sessions are a different process that you start and keep running on their own. See [Messaging](./messaging/index.md) for gateway setup.
+Separately, make sure the **gateway is running** on the remote host if you rely on messaging channels — the `hermes serve` backend is what the desktop app talks to, but your Telegram/Discord/Slack gateway sessions are a different process that you start and keep running on their own. See [Messaging](/user-guide/messaging) for gateway setup.
 
-Prefer not to keep a plaintext password at rest? Set `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH` to a scrypt hash instead — compute it with `python -c "from plugins.dashboard_auth.basic import hash_password; print(hash_password('PW'))"`. Full configuration surface (config.yaml keys, every env var, the rate limiter): [Web Dashboard → Username/password provider](./features/web-dashboard.md#usernamepassword-provider-no-oauth-idp).
+Prefer not to keep a plaintext password at rest? Set `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH` to a scrypt hash instead — compute it with `python -c "from plugins.dashboard_auth.basic import hash_password; print(hash_password('PW'))"`. Full configuration surface (config.yaml keys, every env var, the rate limiter): [Web Dashboard → Username/password provider](/user-guide/features/web-dashboard#usernamepassword-provider-no-oauth-idp).
 
 Running the backend as a systemd service? Give the unit `EnvironmentFile=%h/.hermes/.env` so the credentials are in the environment at boot.
 
@@ -214,7 +253,7 @@ Running the backend as a systemd service? Give the unit `EnvironmentFile=%h/.her
 The backend reads and writes your `.env` (API keys, secrets) and can run agent commands. The **username/password** setup shown above is for a trusted network — never expose a password-protected backend directly to the open internet; put it behind a VPN. [Tailscale](https://tailscale.com/) is the clean option: bind to the machine's tailscale IP (`--host <tailscale-ip>`) and use `http://<tailscale-ip>:9119` as the Remote URL so only your tailnet can reach it. To reach a backend over the public internet, use the **OAuth (Nous Portal)** provider instead.
 :::
 
-### In the app
+#### In the app
 
 **Settings → Gateway → Remote gateway:**
 
@@ -222,20 +261,25 @@ The backend reads and writes your `.env` (API keys, secrets) and can run agent c
 2. **Sign in** — the app detects which provider the backend advertises and adapts the button. For a username/password backend it shows a **Sign in** button that opens a credential form (enter the credentials from step 1). For an OAuth backend it shows **Sign in with `<provider>`** (e.g. *Sign in with Nous Research*), which runs the provider's browser sign-in. Either way the app ends up with an authenticated session against the backend.
 3. **Save and reconnect** — switches the desktop shell onto the remote backend. The session refreshes automatically; you stay signed in across restarts when `HERMES_DASHBOARD_BASIC_AUTH_SECRET` is set.
 
-You can also set the backend URL without the UI via the `HERMES_DESKTOP_REMOTE_URL` environment variable before launching the app (it overrides the in-app setting); you still sign in from the Gateway settings panel.
+For unattended static-token connections, set both `HERMES_DESKTOP_REMOTE_URL` and `HERMES_DESKTOP_REMOTE_TOKEN` before launching the app. This is a token-auth-only override: the URL without the token is rejected, the Gateway settings are read-only for the global/default connection, and interactive password/OAuth sign-in is unavailable. A named profile with an explicit Cloud, Remote URL, or SSH override still uses that override; a named profile set to **Local / Use default gateway** inherits the global environment-selected connection. Use the normal **Remote URL** settings above when you want interactive sign-in.
 
-:::note Per-profile remote hosts
-The remote gateway host is configured per [profile](./profiles.md), so each profile can point at its own remote backend (or stay on its local one). Switching profiles switches which remote host the app connects to.
-:::
+### Profiles and multiple Desktop clients
 
-### Troubleshooting
+Connection settings are scoped per [profile](/user-guide/profiles). The global/default connection can be Local, Cloud, Remote URL, or SSH. A named profile can either **Use default gateway** (which removes its override) or independently select Cloud, Remote URL, or SSH; selecting the Local-looking card for a named profile means inheritance, not a separately pinned local backend. Switching profiles switches the backend and therefore the sessions, files, tools, and state shown by the app.
+
+For several Desktop installations that should share one always-available Hermes endpoint, use **Hermes Cloud** or a supervised **Remote gateway URL**. SSH ownership is intentionally derived from the Desktop installation and profile, so two computers using SSH mode may each launch a separate isolated backend on the same host rather than sharing one service.
+
+### Remote connection troubleshooting
 
 - **Sign-in fails with 401 / "Invalid credentials"** — the username or password doesn't match the backend's `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` / `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD`. The backend returns the same generic error for an unknown user and a wrong password (no enumeration oracle), so double-check both. Confirm the gate is on with `curl -s http://<host>:9119/api/status | jq '.auth_required, .auth_providers'` — it should report `true` and include `"basic"`.
 - **No "Sign in" button — it asks for a session token instead** — the backend's username/password provider isn't active. `/api/status` won't list `"basic"` in `auth_providers`. Make sure both the username and a password (or password hash) are set in `~/.hermes/.env` and that the dashboard process actually loaded them.
 - **Signed out on every restart** — set `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to a stable value. Without it the token-signing key is regenerated per boot, invalidating all sessions.
 - **Connection refused / times out** — the backend bound to `127.0.0.1` (the default) or a firewall/VPN is blocking the port. Bind to `0.0.0.0` or the tailscale IP and open the port to your trusted network.
+- **SSH authentication failed** — make sure the key is loaded into ssh-agent or configured as `IdentityFile`; Desktop uses `BatchMode=yes` and cannot show a password prompt.
+- **SSH host key changed** — verify the remote host's new fingerprint before running `ssh-keygen -R <host>` and reconnecting.
+- **SSH says Hermes is missing or too old** — install or update Hermes on the remote host, or provide the full remote Hermes path in Settings.
 
-For the same setup from the web-dashboard angle, see [Web Dashboard → Connecting Hermes Desktop to a remote backend](./features/web-dashboard.md#connecting-hermes-desktop-to-a-remote-backend); the env vars are catalogued under [Environment Variables → Web Dashboard & Hermes Desktop](../reference/environment-variables.md#web-dashboard--hermes-desktop).
+For explicit Remote URL deployment details, see [Web Dashboard → Connecting Hermes Desktop to a remote backend](/user-guide/features/web-dashboard#connecting-hermes-desktop-to-a-remote-backend); the env vars are catalogued under [Environment Variables → Web Dashboard & Hermes Desktop](/reference/environment-variables#web-dashboard--hermes-desktop).
 
 ## Extending the desktop app
 
@@ -246,7 +290,7 @@ you can add your own. A plugin is a single ESM file dropped in
 hot-reloads every save. Manage installed plugins live in **Settings → Plugins**.
 
 See [Desktop Plugin SDK](../developer-guide/desktop-plugin-sdk.md) for the full
-reference. (This is separate from the [web dashboard plugin system](./features/extending-the-dashboard.md).)
+reference. (This is separate from the [web dashboard plugin system](/user-guide/features/extending-the-dashboard).)
 
 ## Troubleshooting
 
@@ -346,8 +390,8 @@ time. Grants are stable from then on. If a permission gets stuck, reset it with
 
 ## See also
 
-- [CLI Guide](./cli.md) — the terminal interface
-- [TUI](./tui.md) — the modern terminal UI used by `hermes --tui` and the dashboard chat tab
-- [Web Dashboard](./features/web-dashboard.md) — browser admin panel with an embedded chat tab
-- [Configuration](./configuration.md) — config that the desktop app reads and writes
-- [Windows (Native)](./windows-native.md) — native Windows install path
+- [CLI Guide](/user-guide/cli) — the terminal interface
+- [TUI](/user-guide/tui) — the modern terminal UI used by `hermes --tui` and the dashboard chat tab
+- [Web Dashboard](/user-guide/features/web-dashboard) — browser admin panel with an embedded chat tab
+- [Configuration](/user-guide/configuration) — config that the desktop app reads and writes
+- [Windows (Native)](/user-guide/windows-native) — native Windows install path

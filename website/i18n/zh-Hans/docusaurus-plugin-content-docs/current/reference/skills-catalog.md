@@ -20,7 +20,6 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 | [`apple-reminders`](/user-guide/skills/bundled/apple/apple-apple-reminders) | 通过 remindctl 操作 Apple Reminders：添加、列出、完成。 | `apple/apple-reminders` |
 | [`findmy`](/user-guide/skills/bundled/apple/apple-findmy) | 在 macOS 上通过 FindMy.app 追踪 Apple 设备/AirTag。 | `apple/findmy` |
 | [`imessage`](/user-guide/skills/bundled/apple/apple-imessage) | 在 macOS 上通过 imsg CLI 发送和接收 iMessage/SMS。 | `apple/imessage` |
-| [`macos-computer-use`](/user-guide/skills/bundled/apple/apple-macos-computer-use) | 在后台驱动 macOS 桌面——截图、鼠标、键盘、滚动、拖拽——不抢占用户的光标、键盘焦点或 Space。适用于任何支持工具调用的模型。每当需要 `computer_use` 工具时加载此技能。 | `apple/macos-computer-use` |
 
 ## autonomous-ai-agents
 
@@ -28,6 +27,7 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 |-------|-------------|------|
 | [`claude-code`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code) | 将编码任务委托给 Claude Code CLI（功能开发、PR）。 | `autonomous-ai-agents/claude-code` |
 | [`codex`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex) | 将编码任务委托给 OpenAI Codex CLI（功能开发、PR）。 | `autonomous-ai-agents/codex` |
+| [`computer-use`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-computer-use) | 在后台驱动桌面进行点击、输入、滚动和拖拽，不抢占光标、键盘焦点或虚拟桌面；支持 macOS、Windows 和 Linux。 | `autonomous-ai-agents/computer-use` |
 | [`hermes-agent`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent) | 配置、扩展或贡献 Hermes Agent。 | `autonomous-ai-agents/hermes-agent` |
 | [`opencode`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode) | 将编码任务委托给 OpenCode CLI（功能开发、PR 审查）。 | `autonomous-ai-agents/opencode` |
 
@@ -52,22 +52,11 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 | [`songwriting-and-ai-music`](/user-guide/skills/bundled/creative/creative-songwriting-and-ai-music) | 歌曲创作技巧与 Suno AI 音乐 prompt（提示词）。 | `creative/songwriting-and-ai-music` |
 | [`touchdesigner-mcp`](/user-guide/skills/bundled/creative/creative-touchdesigner-mcp) | 通过 twozero MCP 控制运行中的 TouchDesigner 实例——创建算子、设置参数、连接节点、执行 Python、构建实时视觉效果。36 个原生工具。 | `creative/touchdesigner-mcp` |
 
-## devops
-
-| 技能 | 描述 | 路径 |
-|-------|-------------|------|
-
-
 ## email
 
 | 技能 | 描述 | 路径 |
 |-------|-------------|------|
 | [`himalaya`](/user-guide/skills/bundled/email/email-himalaya) | Himalaya CLI：在终端中收发 IMAP/SMTP 邮件。 | `email/himalaya` |
-
-## gaming
-
-| 技能 | 描述 | 路径 |
-|-------|-------------|------|
 
 ## github
 
@@ -79,11 +68,6 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 | [`github-issues`](/user-guide/skills/bundled/github/github-github-issues) | 通过 gh 或 REST API 创建、分类、标记、分配 GitHub issue。 | `github/github-issues` |
 | [`github-pr-workflow`](/user-guide/skills/bundled/github/github-github-pr-workflow) | GitHub PR 生命周期：分支、提交、开启、CI、合并。 | `github/github-pr-workflow` |
 | [`github-repo-management`](/user-guide/skills/bundled/github/github-github-repo-management) | 克隆/创建/fork 仓库；管理远程、发布版本。 | `github/github-repo-management` |
-
-## mcp
-
-| 技能 | 描述 | 路径 |
-|-------|-------------|------|
 
 ## media
 
@@ -97,9 +81,9 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 
 | 技能 | 描述 | 路径 |
 |-------|-------------|------|
+| [`evaluating-llms-harness`](/user-guide/skills/bundled/mlops/mlops-evaluation-evaluating-llms-harness) | lm-eval-harness：对 LLM 进行基准测试（MMLU、GSM8K 等）。 | `mlops/evaluation/evaluating-llms-harness` |
 | [`huggingface-hub`](/user-guide/skills/bundled/mlops/mlops-huggingface-hub) | HuggingFace hf CLI：搜索/下载/上传模型、数据集。 | `mlops/huggingface-hub` |
 | [`llama-cpp`](/user-guide/skills/bundled/mlops/mlops-inference-llama-cpp) | llama.cpp 本地 GGUF 推理 + HF Hub 模型发现。 | `mlops/inference/llama-cpp` |
-| [`evaluating-llms-harness`](/user-guide/skills/bundled/mlops/mlops-evaluation-evaluating-llms-harness) | lm-eval-harness：对 LLM 进行基准测试（MMLU、GSM8K 等）。 | `mlops/evaluation/evaluating-llms-harness` |
 | [`serving-llms-vllm`](/user-guide/skills/bundled/mlops/mlops-inference-serving-llms-vllm) | vLLM：高吞吐量 LLM 服务、OpenAI API 兼容、量化支持。 | `mlops/inference/serving-llms-vllm` |
 | [`weights-and-biases`](/user-guide/skills/bundled/mlops/mlops-evaluation-weights-and-biases) | W&B：记录 ML 实验、超参数搜索、模型注册表、仪表盘。 | `mlops/evaluation/weights-and-biases` |
 
@@ -114,13 +98,16 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 | 技能 | 描述 | 路径 |
 |-------|-------------|------|
 | [`airtable`](/user-guide/skills/bundled/productivity/productivity-airtable) | 通过 curl 调用 Airtable REST API：记录增删改查、过滤、upsert。 | `productivity/airtable` |
+| [`docx`](/user-guide/skills/bundled/productivity/productivity-docx) | 创建、读取和编辑 Word `.docx` 文档及模板。 | `productivity/docx` |
 | [`google-workspace`](/user-guide/skills/bundled/productivity/productivity-google-workspace) | 通过 gws CLI 或 Python 操作 Gmail、Calendar、Drive、Docs、Sheets。 | `productivity/google-workspace` |
 | [`maps`](/user-guide/skills/bundled/productivity/productivity-maps) | 通过 OpenStreetMap/OSRM 进行地理编码、POI 查询、路线规划、时区查询。 | `productivity/maps` |
 | [`nano-pdf`](/user-guide/skills/bundled/productivity/productivity-nano-pdf) | 通过自然语言指令编辑现有 PDF 中的文本。 | `productivity/nano-pdf` |
 | [`notion`](/user-guide/skills/bundled/productivity/productivity-notion) | Notion API + ntn CLI：页面、数据库、Markdown、Workers。 | `productivity/notion` |
 | [`ocr-and-documents`](/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) | 从 PDF/扫描件中提取文本（pymupdf、marker-pdf）。 | `productivity/ocr-and-documents` |
+| [`pdf`](/user-guide/skills/bundled/productivity/productivity-pdf) | 创建、合并、拆分、填写和保护 PDF 文件。 | `productivity/pdf` |
 | [`powerpoint`](/user-guide/skills/bundled/productivity/productivity-powerpoint) | 创建、读取、编辑 .pptx 演示文稿、幻灯片、备注、模板。 | `productivity/powerpoint` |
 | [`teams-meeting-pipeline`](/user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline) | 通过 Hermes CLI 操作 Teams 会议摘要流水线——汇总会议、检查流水线状态、重放任务、管理 Microsoft Graph 订阅。 | `productivity/teams-meeting-pipeline` |
+| [`xlsx`](/user-guide/skills/bundled/productivity/productivity-xlsx) | 创建、读取和编辑 Excel `.xlsx` 工作簿及 CSV 文件。 | `productivity/xlsx` |
 
 ## research
 
@@ -150,10 +137,12 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 |-------|-------------|------|
 | [`dogfood`](/user-guide/skills/bundled/software-development/software-development-dogfood) | Web 应用探索性 QA：发现 bug、收集证据、生成报告。 | `software-development/dogfood` |
 | [`hermes-agent-skill-authoring`](/user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring) | 编写仓库内 SKILL.md：frontmatter、验证器、结构规范。 | `software-development/hermes-agent-skill-authoring` |
+| [`inspecting-hermes-desktop-dom`](/user-guide/skills/bundled/software-development/software-development-inspecting-hermes-desktop-dom) | Read the live Hermes desktop DOM/CSS over CDP. | `software-development/inspecting-hermes-desktop-dom` |
 | [`node-inspect-debugger`](/user-guide/skills/bundled/software-development/software-development-node-inspect-debugger) | 通过 --inspect + Chrome DevTools Protocol CLI 调试 Node.js。 | `software-development/node-inspect-debugger` |
 | [`plan`](/user-guide/skills/bundled/software-development/software-development-plan) | 计划模式：将 Markdown 计划写入 `.hermes/plans/`，不执行。 | `software-development/plan` |
 | [`python-debugpy`](/user-guide/skills/bundled/software-development/software-development-python-debugpy) | 调试 Python：pdb REPL + debugpy 远程调试（DAP）。 | `software-development/python-debugpy` |
 | [`requesting-code-review`](/user-guide/skills/bundled/software-development/software-development-requesting-code-review) | 提交前审查：安全扫描、质量门控、自动修复。 | `software-development/requesting-code-review` |
+| [`simplify-code`](/user-guide/skills/bundled/software-development/software-development-simplify-code) | 使用 4 个并行 agent 清理近期代码变更。 | `software-development/simplify-code` |
 | [`spike`](/user-guide/skills/bundled/software-development/software-development-spike) | 一次性实验，在正式构建前验证想法。 | `software-development/spike` |
 | [`systematic-debugging`](/user-guide/skills/bundled/software-development/software-development-systematic-debugging) | 四阶段根因调试：先理解 bug，再修复。 | `software-development/systematic-debugging` |
 | [`test-driven-development`](/user-guide/skills/bundled/software-development/software-development-test-driven-development) | TDD：强制执行红-绿-重构流程，先写测试再写代码。 | `software-development/test-driven-development` |

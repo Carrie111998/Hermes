@@ -72,7 +72,7 @@ mcp_servers:
 - 需要低延迟访问本地资源
 - 你参考的 MCP 服务器文档中使用了 `command`、`args` 和 `env`
 
-### HTTP 服务器
+### HTTP 服务器 {#http-servers}
 
 HTTP MCP 服务器是 Hermes 直接连接的远程端点。
 
@@ -88,6 +88,39 @@ mcp_servers:
 - MCP 服务器托管在其他地方
 - 你的组织暴露了内部 MCP 端点
 - 你不希望 Hermes 为该集成在本地启动子进程
+
+### 通过 OAuth 验证的 HTTP 服务器 {#oauth-authenticated-http-servers}
+
+多数托管 MCP 服务器（Linear、Sentry、Atlassian、Asana、Figma、Stripe 等）使用 OAuth 2.1，而不是静态 bearer token。设置 `auth: oauth` 后，Hermes 会通过 MCP Python SDK 处理发现、动态客户端注册、PKCE、token 交换、刷新和 step-up 认证。
+
+```yaml
+mcp_servers:
+  linear:
+    url: "https://mcp.linear.app/mcp"
+    auth: oauth
+```
+
+首次连接时，Hermes 会打印授权 URL，在可用时打开浏览器，并在本地回环端口等待回调。Token 缓存在 `~/.hermes/mcp-tokens/<server>.json`，权限为 `0o600`。
+
+**远程或无头主机：**
+
+- **粘贴回调 URL：** 在浏览器中完成授权，复制最终跳转的完整 URL，然后粘贴回交互式终端。
+- **SSH 端口转发：** 在另一个终端运行 `ssh -N -L <port>:127.0.0.1:<port> user@host`。
+- **代理回调：** 设置固定的 `oauth.redirect_port` 和公开 HTTPS `oauth.redirect_uri`，让反向代理或 Tailscale Funnel 将回调转发到 Hermes。
+
+```yaml
+mcp_servers:
+  myserver:
+    url: "https://mcp.example.com/mcp"
+    auth: oauth
+    oauth:
+      redirect_port: 8765
+      redirect_uri: "https://oauth.example.ts.net/callback"
+```
+
+完全无交互的 gateway 可使用 [`mcp-oauth-remote-gateway`](/user-guide/skills/optional/mcp/mcp-mcp-oauth-remote-gateway) skill。若授权服务器的 WAF 拒绝包含 `127.0.0.1` 的回调，设置 `oauth.redirect_host: localhost`。不支持动态客户端注册的提供商还需要显式配置 `oauth.client_id`，必要时再配置 `oauth.client_secret`，然后运行 `hermes mcp login <server>`。
+
+完整远程流程见 [通过 SSH / 远程主机使用 OAuth](/guides/oauth-over-ssh)。
 
 ## 基本配置参考
 
@@ -300,7 +333,7 @@ mcp_servers:
 
 Hermes 在启动时发现 MCP 服务器，并将其工具注册到普通工具注册表中。
 
-### 动态工具发现
+### 动态工具发现 {#dynamic-tool-discovery}
 
 MCP 服务器可以在运行时通过发送 `notifications/tools/list_changed` 通知，告知 Hermes 其可用工具发生了变化。Hermes 收到该通知后，会自动重新获取服务器的工具列表并更新注册表——无需手动执行 `/reload-mcp`。
 
@@ -484,7 +517,7 @@ mcp_servers:
       enabled: false
 ```
 
-## 将 Hermes 作为 MCP 服务器运行
+## 将 Hermes 作为 MCP 服务器运行 {#running-hermes-as-an-mcp-server}
 
 除了连接**到** MCP 服务器，Hermes 也可以**作为** MCP 服务器运行。这让其他支持 MCP 的 agent（Claude Code、Cursor、Codex 或任何 MCP 客户端）能够使用 Hermes 的消息能力——列出会话、读取消息历史，以及跨所有已连接平台发送消息。
 

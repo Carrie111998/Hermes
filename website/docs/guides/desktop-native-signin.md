@@ -114,6 +114,6 @@ The relevant endpoints (all public, pre-auth bootstrap, same as the existing
 
 ## See also
 
-- [OAuth over SSH / Remote Hosts](./oauth-over-ssh.md) — the loopback-callback
+- [OAuth over SSH / Remote Hosts](/guides/oauth-over-ssh) — the loopback-callback
   pattern for provider/MCP OAuth on remote machines.
-- [Run Hermes with Nous Portal](./run-hermes-with-nous-portal.md)
+- [Run Hermes with Nous Portal](/guides/run-hermes-with-nous-portal)

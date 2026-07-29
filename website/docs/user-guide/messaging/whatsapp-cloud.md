@@ -15,11 +15,11 @@ In exchange:
 - The Hermes gateway needs a **public HTTPS URL** so Meta can deliver inbound messages via webhook.
 - Replies more than 24 hours after the user's last message require a pre-approved **template** (this is Meta's "customer service window" rule, not a Hermes limit).
 
-If those constraints don't work for your use case, the [Baileys bridge integration](./whatsapp.md) is the alternative — personal account, no public URL needed, but unofficial and ban-prone.
+If those constraints don't work for your use case, the [Baileys bridge integration](/user-guide/messaging/whatsapp) is the alternative — personal account, no public URL needed, but unofficial and ban-prone.
 
 :::tip Which one should I use?
 - **Cloud API (this guide)** — running a real business bot, want stability, fine with the Meta verification + template paperwork
-- **[Baileys bridge](./whatsapp.md)** — personal projects, quick demos, single-user setups, willing to risk the bot phone number's account
+- **[Baileys bridge](/user-guide/messaging/whatsapp)** — personal projects, quick demos, single-user setups, willing to risk the bot phone number's account
 :::
 
 ---
@@ -414,5 +414,5 @@ Most users running Hermes for personal projects prefer Baileys. Most users runni
 ## See also
 
 - [Meta's official WhatsApp Business Cloud API docs](https://developers.facebook.com/documentation/business-messaging/whatsapp/) — authoritative reference for the underlying platform, pricing, App Review, and Meta-side rate limits.
-- [WhatsApp (Baileys bridge) Setup](whatsapp.md) — the alternative integration for personal projects.
-- [Messaging Platforms overview](index.md) — all messaging integrations at a glance.
+- [WhatsApp (Baileys bridge) Setup](/user-guide/messaging/whatsapp) — the alternative integration for personal projects.
+- [Messaging Platforms overview](/user-guide/messaging) — all messaging integrations at a glance.

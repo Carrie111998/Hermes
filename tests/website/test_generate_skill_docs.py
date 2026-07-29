@@ -114,3 +114,100 @@ def test_bundled_catalog_explains_missing_local_skills(gen_module):
     result = gen_module.build_catalog_md_bundled([])
     assert "respects local deletions and user edits" in result
     assert "hermes skills reset <name> --restore" in result
+
+
+def test_generated_skill_routes_do_not_embed_site_base_url(gen_module):
+    """Generated route links must remain portable across localized base URLs."""
+    meta = {
+        "source_kind": "bundled",
+        "category": "testing",
+        "sub": None,
+        "slug": "example",
+        "rel_path": "testing/example",
+    }
+    result = gen_module.build_catalog_md_bundled([(meta, {"frontmatter": {}})])
+    assert "](/user-guide/skills/bundled/testing/testing-example)" in result
+    assert "](/docs/user-guide/skills/" not in result
+
+    optional_meta = {**meta, "source_kind": "optional"}
+    optional_result = gen_module.build_catalog_md_optional(
+        [(optional_meta, {"frontmatter": {}})]
+    )
+    assert "](/user-guide/skills/optional/testing/testing-example)" in optional_result
+    assert "](/docs/user-guide/skills/" not in optional_result
+
+    page_result = gen_module.render_skill_page(
+        meta,
+        {
+            "name": "example",
+            "metadata": {"hermes": {"related_skills": ["sibling"]}},
+        },
+        "Example body.",
+        skill_index={"sibling": optional_meta},
+    )
+    assert "[`sibling`](/user-guide/skills/optional/testing/testing-example)" in page_result
+    assert "/docs/user-guide/skills/" not in page_result
+
+
+def test_localized_catalog_rows_follow_source_categories(gen_module):
+    """Translated rows retain their prose but move with the canonical source category."""
+    entries = [
+        (
+            {
+                "source_kind": "bundled",
+                "category": "apple",
+                "sub": None,
+                "slug": "notes",
+                "rel_path": "apple/notes",
+            },
+            {"frontmatter": {"name": "notes", "description": "Notes"}},
+        ),
+        (
+            {
+                "source_kind": "bundled",
+                "category": "autonomous-ai-agents",
+                "sub": None,
+                "slug": "computer-use",
+                "rel_path": "autonomous-ai-agents/computer-use",
+            },
+            {
+                "frontmatter": {
+                    "name": "computer-use",
+                    "description": "Desktop control",
+                }
+            },
+        ),
+    ]
+    current = """---
+title: 目录
+---
+
+# 目录
+
+## apple
+
+| 技能 | 描述 | 路径 |
+|-------|-------------|------|
+| [`notes`](/user-guide/skills/bundled/apple/apple-notes) | 笔记说明 | `apple/notes` |
+| [`computer-use`](/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-computer-use) | 桌面控制说明 | `autonomous-ai-agents/computer-use` |
+
+## autonomous-ai-agents
+
+| 技能 | 描述 | 路径 |
+|-------|-------------|------|
+"""
+
+    result = gen_module.synchronize_localized_catalog(entries, "bundled", current)
+    apple_section, autonomous_section = result.split("## apple", 1)[1].split(
+        "## autonomous-ai-agents", 1
+    )
+    assert "computer-use" not in apple_section
+    assert "computer-use" in autonomous_section
+    assert "桌面控制说明" in autonomous_section
+
+
+def test_checked_in_generated_docs_match_sources(gen_module):
+    """Committed pages, catalogs in both locales, and sidebar match SKILL.md sources."""
+    entries = gen_module.discover_skills()
+    drift = gen_module.generated_output_drift(entries)
+    assert drift == {"missing": [], "stale": [], "orphaned": []}

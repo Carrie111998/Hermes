@@ -20,7 +20,7 @@ Hermes Agent 采用纵深防御安全模型。本页涵盖所有安全边界—�
 6. **跨会话隔离** — 会话之间无法访问彼此的数据或状态；cron 任务存储路径已针对路径遍历攻击进行加固
 7. **输入清理** — 终端工具后端中的工作目录参数会经过允许列表验证，以防止 shell 注入
 
-## 危险命令审批
+## 危险命令审批 {#dangerous-command-approval}
 
 在执行任何命令之前，Hermes 会将其与一份精心维护的危险模式列表进行比对。若匹配，用户必须明确批准。
 
@@ -44,7 +44,7 @@ approvals:
 设置 `approvals.mode: off` 将禁用所有安全提示。仅在受信任的环境（CI/CD、容器等）中使用。
 :::
 
-### YOLO 模式
+### YOLO 模式 {#yolo-mode}
 
 YOLO 模式会绕过当前会话中**所有**危险命令审批提示。可通过以下三种方式激活：
 
@@ -193,6 +193,40 @@ command_allowlist:
 使用 `hermes config edit` 查看或删除永久允许列表中的模式。
 :::
 
+## 文件写入安全 {#file-write-safety}
+
+在 `write_file` 或 `patch` 修改磁盘前，Hermes 会根据拒绝列表和可选沙箱检查目标路径。被阻止的写入会立即向 Agent 返回错误；**不会出现审批提示，也不能从聊天界面覆盖**。默认启用 `display.file_mutation_verifier` 时，应以文件变更验证器的结果为准，而不是仅相信助手的结束语。
+
+### 始终受保护的路径
+
+即使未设置 `HERMES_WRITE_SAFE_ROOT`，以下类别也始终禁止写入：
+
+| 类别 | 示例 |
+|----------|----------|
+| 操作系统凭据存储 | `~/.ssh/`、`~/.aws/`、`~/.kube/`、`/etc/sudoers`、`~/.netrc` |
+| Hermes 凭据存储 | HERMES_HOME 下的 `auth.json`、`.env`、`.anthropic_oauth.json`、`mcp-tokens/`、`pairing/` |
+| 项目密钥文件 | 磁盘任意位置的 `.env`、`.env.local`、`.env.production`、`.envrc` |
+
+即使敏感路径位于安全根目录内也仍会被阻止。安全根目录违规会返回 `Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (…)`；凭据路径会返回 `Write denied: '…' is a protected system/credential file.`。
+
+### HERMES_WRITE_SAFE_ROOT（可选沙箱）
+
+设置后，`write_file` 和 `patch` 只能写入列出的目录前缀。Unix 使用 `:` 分隔多个根目录，Windows 使用 `;`。官方 Docker 镜像会自动设置 `HERMES_WRITE_SAFE_ROOT=/opt/data`。
+
+```bash
+export HERMES_WRITE_SAFE_ROOT=/path/to/project:/home/you/.hermes
+```
+
+取消设置该变量可恢复不受安全根目录限制的写入，但受保护路径拒绝列表仍然生效。完整参考见 [HERMES_WRITE_SAFE_ROOT](/reference/environment-variables#hermes_write_safe_root)。
+
+### Cron 与其他 Hermes 状态
+
+不要让 Agent 直接 `patch` `~/.hermes/cron/jobs.json`。使用 `cronjob` 工具、[`hermes cron`](/user-guide/features/cron) 或 `/cron`，由支持的 API 更新任务存储。
+
+:::note 纵深防御，而非完整沙箱
+写入保护只应用于 `write_file` 和 `patch`。`terminal` 工具仍以同一操作系统用户运行，因此这套机制用于减少意外破坏，而不是隔离恶意或已受攻击的 Agent。
+:::
+
 ## 用户授权（Gateway）
 
 运行消息 gateway 时，Hermes 通过分层授权系统控制谁可以与机器人交互。
@@ -239,7 +273,7 @@ or configure platform allowlists (e.g., TELEGRAM_ALLOWED_USERS=your_id).
 ```
 :::
 
-### DM 配对系统
+### DM 配对系统 {#dm-pairing-system}
 
 为实现更灵活的授权，Hermes 提供了基于验证码的配对系统。无需预先提供用户 ID，未知用户会收到一次性配对码，由机器人所有者通过 CLI 批准。
 

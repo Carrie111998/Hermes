@@ -10,7 +10,15 @@ description: "在 Linux、macOS、WSL2、原生 Windows 或通过 Termux 在 And
 
 ## 快速安装
 
-### 一行安装命令（Linux / macOS / WSL2）
+### 使用 macOS 或 Windows Hermes Desktop 安装程序（推荐）
+
+如需轻松安装命令行与桌面应用，请从 [Hermes Agent 网站](https://hermes-agent.nousresearch.com/) 下载 Hermes Desktop 安装程序并运行。
+
+### 不使用 Hermes Desktop
+
+如需仅安装命令行版本，请按平台运行以下命令。
+
+#### 一行安装命令（Linux / macOS / WSL2 / Android Termux） {#linux--macos--wsl2--android-termux}
 
 基于 git 的安装方式，跟踪 `main` 分支，可立即获取最新变更：
 
@@ -18,7 +26,17 @@ description: "在 Linux、macOS、WSL2、原生 Windows 或通过 Termux 在 And
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 ```
 
-### Windows（原生，PowerShell）
+在 Android 的 Termux 中，同一条命令会自动切换到经过测试的 Android 流程：
+
+- 使用 Termux `pkg` 安装系统依赖（`git`、`python`、`nodejs`、`ripgrep`、`ffmpeg`、构建工具）
+- 使用 `python -m venv` 创建虚拟环境
+- 自动导出 `ANDROID_API_LEVEL` 以用于 Android wheel 构建
+- 优先使用较宽泛的 `.[termux-all]` extra，若首次编译失败则回退到较小的 `.[termux]` extra（最终回退到基础安装）
+- 默认跳过未经测试的浏览器 / WhatsApp 引导
+
+如需完整的显式步骤，请参阅专门的 [Termux 指南](./termux.md)。
+
+#### Windows（原生，PowerShell） {#windows-native}
 
 原生 Windows 无需 WSL 即可运行 Hermes——CLI、gateway、TUI 和工具均可原生运行。（原生安装与 WSL2 安装可干净共存；唯一仅限 WSL2 的功能见下方功能说明。）遇到 bug 请[提交 issue](https://github.com/NousResearch/hermes-agent/issues)。
 
@@ -42,24 +60,6 @@ iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 如果你偏好 WSL2，上方的 Linux 安装程序可在其中运行；原生安装和 WSL 安装可以共存而不冲突（原生数据位于 `%LOCALAPPDATA%\hermes`，WSL 数据位于 `~/.hermes`）。
 
 **桌面安装程序（替代方案）：** 也提供一个轻量 GUI 安装程序——下载 Hermes Desktop，运行 `.exe`，首次启动时它会在后台调用 `install.ps1` 来配置 Python（通过 `uv`）、Node、PortableGit 及其余依赖。桌面应用和 PowerShell 安装的 CLI 共享相同的安装目录和数据目录，可以单独或同时使用。详见 [Windows（原生）指南](../user-guide/windows-native#desktop-installer-alternative)。
-
-### Android / Termux
-
-Hermes 现在也提供 Termux 感知的安装路径：
-
-```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-```
-
-安装程序会自动检测 Termux 并切换到经过测试的 Android 流程：
-
-- 使用 Termux `pkg` 安装系统依赖（`git`、`python`、`nodejs`、`ripgrep`、`ffmpeg`、构建工具）
-- 使用 `python -m venv` 创建虚拟环境
-- 自动导出 `ANDROID_API_LEVEL` 以用于 Android wheel 构建
-- 优先使用较宽泛的 `.[termux-all]` extra，若首次编译失败则回退到较小的 `.[termux]` extra（最终回退到基础安装）
-- 默认跳过未经测试的浏览器 / WhatsApp 引导
-
-如需完整的显式步骤，请参阅专门的 [Termux 指南](./termux.md)。
 
 :::note Windows 功能对等性
 
