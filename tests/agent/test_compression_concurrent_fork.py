@@ -827,6 +827,11 @@ def test_equal_copy_compression_result_does_not_rewrite_session(
 
 def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypatch) -> None:
     """The owning compression call must keep its lease alive while it runs."""
+    import hermes_state
+
+    clock = [1_000.0]
+    monkeypatch.setattr(hermes_state.time, "time", lambda: clock[0])
+
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
     def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
@@ -835,16 +840,50 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
 
     db = SessionDB(db_path=tmp_path / "state.db")
+    real_refresh = SessionDB.refresh_compression_lock
+    first_refresh = threading.Event()
+    allow_second_refresh = threading.Event()
+    second_refresh = threading.Event()
+    refresh_count = 0
+
+    def _tracked_refresh(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        nonlocal refresh_count
+        refresh_count += 1
+        current = refresh_count
+        if current == 2 and not allow_second_refresh.wait(timeout=10):
+            return False
+        refreshed = real_refresh(
+            self,
+            session_id,
+            holder,
+            ttl_seconds=ttl_seconds,
+        )
+        if current == 1:
+            first_refresh.set()
+        elif current == 2:
+            second_refresh.set()
+        return refreshed
+
+    monkeypatch.setattr(
+        SessionDB,
+        "refresh_compression_lock",
+        _tracked_refresh,
+    )
 
     parent_sid = "REFRESH_TEST"
     db.create_session(parent_sid, source="discord")
 
     agent_a = _build_agent_with_db(db, parent_sid)
-    # 3s TTL / 0.25s refresh: ~12 refresh opportunities per lease. A 1s TTL
-    # left one missed scheduling quantum between "refreshed" and "expired"
-    # on a loaded runner.
+    # Acquisition is deliberately one second while refreshes extend by three.
+    # A controlled clock plus explicit refresh handshakes proves recurring
+    # renewal without a load-sensitive multi-second sleep.
     agent_a._compression_lock_ttl_seconds = 3.0
-    agent_a._compression_lock_refresh_interval = 0.25
+    agent_a._compression_lock_refresh_interval = 0.1
     compression_started = threading.Event()
     release_compression = threading.Event()
 
@@ -867,7 +906,21 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
     try:
         assert compression_started.wait(timeout=10), "compression never acquired its lock"
         assert db.get_compression_lock_holder(parent_sid) is not None
-        time.sleep(3.5)
+        assert first_refresh.wait(timeout=10), "initial lease refresh never completed"
+        first_expiry = db._conn.execute(
+            "SELECT expires_at FROM compression_locks WHERE session_id = ?",
+            (parent_sid,),
+        ).fetchone()[0]
+        clock[0] = first_expiry - 0.5
+        allow_second_refresh.set()
+        assert second_refresh.wait(timeout=10), "recurring lease refresh never completed"
+        second_expiry = db._conn.execute(
+            "SELECT expires_at FROM compression_locks WHERE session_id = ?",
+            (parent_sid,),
+        ).fetchone()[0]
+        assert second_expiry > first_expiry
+        clock[0] = first_expiry + 0.5
+        assert clock[0] < second_expiry
         assert db.try_acquire_compression_lock(
             parent_sid, "refresh_probe", ttl_seconds=3.0
         ) is False, "live owner lease expired and was reclaimable before compression finished"

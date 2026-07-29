@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -55,12 +56,65 @@ def _pid_alive(pid: int) -> bool:
         # test is skipped on Windows so the path is unreachable.
         raise RuntimeError("_pid_alive POSIX-only")
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok — guarded POSIX-only probe
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
     return True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell runner")
+def test_canonical_runner_preserves_private_tmpdir(tmp_path: Path) -> None:
+    """The env-isolated runner must retain the caller's temp filesystem identity."""
+
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests.sh"
+    selected_tmpdir = tmp_path / "private temp"
+    selected_tmpdir.mkdir()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    capture = tmp_path / "captured-tmpdir"
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        textwrap.dedent(
+            f"""\
+            #!/bin/sh
+            if [ "${{1:-}}" = "-I" ]; then
+              exit 0
+            fi
+            if [ "${{1:-}}" = "-m" ] && [ "${{2:-}}" = "compileall" ]; then
+              exit 0
+            fi
+            printf '%s' "${{TMPDIR-unset}}" > {shlex.quote(str(capture))}
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+
+    completed = subprocess.run(
+        [
+            str(runner),
+            "--python",
+            str(fake_python),
+            "--paths",
+            str(tmp_path / "unused"),
+        ],
+        cwd=repo_root,
+        env={
+            "HOME": str(fake_home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TMPDIR": str(selected_tmpdir),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    assert capture.read_text(encoding="utf-8") == str(selected_tmpdir.resolve())
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
@@ -118,15 +172,18 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
             # handoff, then walk away — don't close the pipe (would
             # signal EOF and let the child see SIGPIPE on next write).
             first_line = child.stdout.readline().decode().strip()
-            HANDOFF.write_text(json.dumps({{
-                "pid": child.pid,
-                "diag": first_line,
-                "test_pid": os.getpid(),
-                "test_pgid": os.getpgid(0),
-            }}))
+            HANDOFF.write_text(
+                json.dumps({{
+                    "pid": child.pid,
+                    "diag": first_line,
+                    "test_pid": os.getpid(),
+                    "test_pgid": os.getpgid(0),
+                }}),
+                encoding="utf-8",
+            )
             assert child.pid > 0
     """).strip()
-    probe.write_text(probe_src + "\n")
+    probe.write_text(probe_src + "\n", encoding="utf-8")
 
     # Run the parallel runner against just the probe file. The runner
     # discovers under ``tests/`` by default, so we override via --paths.
@@ -153,7 +210,7 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
     assert handoff.exists(), (
         f"probe never wrote handoff file; runner output:\n{proc.stdout}"
     )
-    handoff_data = json.loads(handoff.read_text())
+    handoff_data = json.loads(handoff.read_text(encoding="utf-8"))
     grandchild_pid = handoff_data["pid"]
     diag = handoff_data.get("diag", "(no diag)")
     test_pid = handoff_data.get("test_pid")
@@ -293,7 +350,7 @@ def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
             def test_flaky_once():
                 marker = Path({str(marker)!r})
                 if not marker.exists():
-                    marker.write_text("failed once")
+                    marker.write_text("failed once", encoding="utf-8")
                     assert False, "simulated first-attempt flake"
                 assert True
             """

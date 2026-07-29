@@ -164,6 +164,33 @@ if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
   EXTRA_PYTEST_PLUGINS="pytest_live_guard"
 fi
 
+# Keep pytest's temporary files in the invoking user's private temp root.
+# macOS assigns files created directly under /private/tmp to wheel (gid 0),
+# while launchd provides a per-user TMPDIR owned by the caller's primary
+# group. Dropping TMPDIR at the env -i boundary therefore changes filesystem
+# identity semantics and makes owner/group-sensitive tests fail only under the
+# canonical runner. Resolve the directory before the environment is cleared;
+# this carries a path, never credential material.
+RUNNER_TMPDIR="${TMPDIR:-}"
+if [ -z "$RUNNER_TMPDIR" ] && [ "$(uname -s)" = "Darwin" ]; then
+  RUNNER_TMPDIR="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+fi
+if [ -z "$RUNNER_TMPDIR" ]; then
+  RUNNER_TMPDIR="/tmp"
+fi
+case "$RUNNER_TMPDIR" in
+  /*) ;;
+  *)
+    echo "error: TMPDIR must be an absolute writable directory" >&2
+    exit 1
+    ;;
+esac
+if [ ! -d "$RUNNER_TMPDIR" ] || [ ! -w "$RUNNER_TMPDIR" ]; then
+  echo "error: TMPDIR must be an absolute writable directory" >&2
+  exit 1
+fi
+RUNNER_TMPDIR="$(cd "$RUNNER_TMPDIR" && pwd -P)"
+
 
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
@@ -189,6 +216,7 @@ exec env -i \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  TMPDIR="$RUNNER_TMPDIR" \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
   ${MUNCHO_OWNER_GATE_ISOLATED_TEST_RUNTIME:+MUNCHO_OWNER_GATE_ISOLATED_TEST_RUNTIME="$MUNCHO_OWNER_GATE_ISOLATED_TEST_RUNTIME"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
