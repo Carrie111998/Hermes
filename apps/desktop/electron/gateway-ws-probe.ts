@@ -30,7 +30,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000
 // post-handshake closes the socket almost immediately. Wait a short grace
 // window: a frame (gateway.ready) or a still-open socket means success; an
 // early close means the upgrade was accepted but the session was refused.
-const DEFAULT_READY_GRACE_MS = 750
+const DEFAULT_READY_GRACE_MS = 30_000
 
 /**
  * Attempt a live WebSocket connection and classify the outcome.
