@@ -16,8 +16,16 @@ instead of duplicating the ``HERMES_HOME = Path(os.getenv(...))`` pattern.
 
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 from pathlib import Path
+from typing import Any
+
+try:
+    from utils import atomic_json_write as _core_atomic_json_write  # type: ignore[import-not-found]
+except (ModuleNotFoundError, ImportError):
+    _core_atomic_json_write = None
 
 try:
     from hermes_constants import display_hermes_home as display_hermes_home
@@ -40,3 +48,35 @@ except (ModuleNotFoundError, ImportError):
             return "~/" + str(home.relative_to(Path.home()))
         except ValueError:
             return str(home)
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    """Replace *path* with complete private JSON for concurrent readers."""
+    path = Path(path)
+    target = path.resolve() if path.is_symlink() else path
+    if _core_atomic_json_write is not None:
+        _core_atomic_json_write(target, payload, mode=0o600)
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        temporary_path.unlink(missing_ok=True)
+        raise

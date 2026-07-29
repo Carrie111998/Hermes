@@ -102,6 +102,36 @@ def test_bridge_refreshes_expired_token(bridge_module, tmp_path):
     assert saved["type"] == "authorized_user"
 
 
+def test_bridge_refresh_persists_through_atomic_writer(bridge_module, monkeypatch):
+    token_data = {
+        "token": "ya29.old",
+        "refresh_token": "1//refresh",
+        "client_id": "123.apps.googleusercontent.com",
+        "client_secret": "secret",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(
+        {"access_token": "ya29.refreshed", "expires_in": 3600}
+    ).encode()
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+    writes = []
+    monkeypatch.setattr(
+        bridge_module,
+        "atomic_write_json",
+        lambda path, payload: writes.append((path, payload)),
+        raising=False,
+    )
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        bridge_module.refresh_token(token_data)
+
+    assert len(writes) == 1
+    assert writes[0][0] == bridge_module.get_token_path()
+    assert writes[0][1]["token"] == "ya29.refreshed"
+
+
 def test_bridge_refresh_passes_timeout_to_urlopen(bridge_module):
     """Token refresh must pass an explicit timeout so a hung Google endpoint
     cannot block the agent turn indefinitely (no `timeout=` defaults to the
@@ -477,10 +507,19 @@ def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, m
     monkeypatch.setitem(sys.modules, "google.oauth2.credentials", credentials_module)
     monkeypatch.setitem(sys.modules, "google.auth.transport", transport_module)
     monkeypatch.setitem(sys.modules, "google.auth.transport.requests", requests_module)
+    writes = []
+    monkeypatch.setattr(
+        api_module,
+        "atomic_write_json",
+        lambda path, payload: writes.append((path, payload)),
+        raising=False,
+    )
 
     creds = api_module.get_credentials()
 
-    saved = json.loads(token_path.read_text())
+    assert len(writes) == 1
+    assert writes[0][0] == token_path
+    saved = writes[0][1]
     assert isinstance(creds, FakeCredentials)
     assert saved["token"] == "ya29.refreshed"
     assert saved["type"] == "authorized_user"
