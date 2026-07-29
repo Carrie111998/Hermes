@@ -3102,7 +3102,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # post-update cron-jobs safety net uses it to detect job loss.
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
 
-    _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
+    # Layer 3 coordination (#74386): the Desktop Electron preflight may have
+    # already paused gateways via ``_gateway_update_lock pause``. When it did,
+    # it passes the resume token via $HERMES_WINDOWS_GATEWAY_RESUME_TOKEN so we
+    # do NOT re-pause (the gateways are already gone) but MUST still resume on
+    # exit. Using the Electron's token ensures all pre-pause state (unmapped
+    # argv snapshots, profile PID mappings) is preserved for resume.
+    _gateway_was_pre_paused = False
+    _pre_paused_token = os.environ.get("HERMES_WINDOWS_GATEWAY_RESUME_TOKEN")
+    if _pre_paused_token:
+        try:
+            _parsed_token = json.loads(_pre_paused_token)
+            if isinstance(_parsed_token, dict):
+                _windows_gateway_resume = _parsed_token
+                _gateway_was_pre_paused = True
+        except (json.JSONDecodeError, TypeError):
+            pass
+        del os.environ["HERMES_WINDOWS_GATEWAY_RESUME_TOKEN"]
+
+    if not _gateway_was_pre_paused:
+        _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
+
     if _windows_gateway_resume:
         import atexit as _atexit
 
@@ -3121,12 +3141,49 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # and app.asar — a non-desktop venv python holding a .pyd would sail
     # through and corrupt the sync (the exact failure this guard exists for).
     # --force-venv is the explicit escape hatch.
+    #
+    # Layer 3 (#74386): the scan can find gateway processes that our own
+    # _pause_windows_gateways_for_update missed (gateways spawned via
+    # ``--replace`` or ``hermes.exe`` shim-wrapped children that don't register
+    # in the PID-file registry). The information is already in the scan — the
+    # cmdline classifies them (``_format_venv_python_holders_message`` annotates
+    # ``← gateway``). When ALL remaining holders are gateways, force-kill them
+    # and proceed instead of aborting. Only abort when a non-gateway holder
+    # (the Desktop backend) remains.
     if _m()._is_windows() and not getattr(args, "force_venv", False):
         _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
-            print(_format_venv_python_holders_message(_venv_holders))
-            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
-            sys.exit(2)
+            _all_gateways = all(
+                "gateway" in cmdline.lower()
+                for _, _, cmdline in _venv_holders
+            )
+            if _all_gateways:
+                # Gateways that escaped pause — safe to force-kill since the
+                # resume token (from Electron or our own pause above) will
+                # respawn them post-update via the same mechanism.
+                try:
+                    from gateway.status import terminate_pid  # noqa: PLC0415
+                except Exception:
+                    terminate_pid = None
+                if terminate_pid:
+                    for pid, name, cmdline in _venv_holders:
+                        try:
+                            terminate_pid(int(pid), force=True)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                    print(
+                        f"  → Force-stopped {len(_venv_holders)} remaining"
+                        f" gateway process(es) after update lock"
+                    )
+                else:
+                    print(
+                        "  ⚠ Could not force-stop remaining gateway processes"
+                        " (terminate_pid unavailable); update may fail"
+                    )
+            else:
+                print(_format_venv_python_holders_message(_venv_holders))
+                _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+                sys.exit(2)
 
     # Try git-based update first, fall back to ZIP download on Windows
     # when git file I/O is broken (antivirus, NTFS filter drivers, etc.)
