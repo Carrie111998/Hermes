@@ -213,6 +213,68 @@ def test_dispatcher_threads_delivery_mode_to_backend():
         assert clicks and clicks[-1].get("delivery_mode") == "foreground"
 
 
+def test_dispatcher_threads_exact_pid_window_to_input_actions():
+    """Callers that already discovered a native window can target it directly.
+
+    This is the same escape hatch capture() exposes for Linux/X11 windows whose
+    app names are generic or whose discovery context came from list_windows in a
+    previous tool call. Input actions must not force an extra capture/focus_app
+    just to populate backend sticky state.
+    """
+    from tools.computer_use import tool as cu
+
+    with patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": "noop"}, clear=False):
+        cu.reset_backend_for_tests()
+        be = cu._get_backend()
+
+        cu.handle_computer_use({
+            "action": "click",
+            "coordinate": [10, 20],
+            "pid": 4242,
+            "window_id": 7,
+        })
+        cu.handle_computer_use({
+            "action": "type",
+            "text": "hello",
+            "pid": 4242,
+            "window_id": 7,
+        })
+
+        clicks = [kw for (name, kw) in be.calls if name == "click"]  # type: ignore[attr-defined]
+        types = [kw for (name, kw) in be.calls if name == "type"]  # type: ignore[attr-defined]
+        assert clicks and clicks[-1].get("pid") == 4242
+        assert clicks[-1].get("window_id") == 7
+        assert types and types[-1].get("pid") == 4242
+        assert types[-1].get("window_id") == 7
+
+
+def test_cua_backend_exact_target_allows_input_without_prior_capture():
+    out = {"isError": False, "data": {}, "structuredContent": {"effect": "confirmed"}}
+    sess = _FakeSession(out)
+    be = _make_backend(sess)
+    be._active_pid = None  # type: ignore[attr-defined]
+    be._active_window_id = None  # type: ignore[attr-defined]
+
+    res = be.click(x=10, y=20, pid=111, window_id=222)
+
+    assert res.ok is True
+    assert sess.last_args["pid"] == 111
+    assert sess.last_args["window_id"] == 222
+    assert sess.last_args["x"] == 10
+    assert sess.last_args["y"] == 20
+    assert be._last_target == {"pid": 111, "window_id": 222}  # type: ignore[attr-defined]
+
+
+def test_cua_backend_rejects_partial_exact_target():
+    out = {"isError": False, "data": {}, "structuredContent": {"effect": "confirmed"}}
+    be = _make_backend(_FakeSession(out))
+
+    res = be.type_text("hello", pid=111)
+
+    assert res.ok is False
+    assert "requires both pid and window_id" in res.message
+
+
 # ---------------------------------------------------------------------------
 # Phase C — foreground approval scoping (action + delivery_mode + session)
 # ---------------------------------------------------------------------------

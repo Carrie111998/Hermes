@@ -147,6 +147,8 @@ class ComputerUseBackend(ABC):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,   # background (default) | foreground
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult: ...
 
     @abstractmethod
@@ -161,6 +163,8 @@ class ComputerUseBackend(ABC):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult: ...
 
     @abstractmethod
@@ -175,16 +179,20 @@ class ComputerUseBackend(ABC):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult: ...
 
     # ── Keyboard ────────────────────────────────────────────────────
     @abstractmethod
     def type_text(self, text: str, *, delivery_mode: Optional[str] = None,
-                  bring_to_front: bool = False) -> ActionResult: ...
+                  bring_to_front: bool = False, pid: Optional[int] = None,
+                  window_id: Optional[int] = None) -> ActionResult: ...
 
     @abstractmethod
     def key(self, keys: str, *, delivery_mode: Optional[str] = None,
-            bring_to_front: bool = False) -> ActionResult:
+            bring_to_front: bool = False, pid: Optional[int] = None,
+            window_id: Optional[int] = None) -> ActionResult:
         """Send a key combo, e.g. 'cmd+s', 'ctrl+alt+t', 'return'."""
 
     # ── Introspection ───────────────────────────────────────────────

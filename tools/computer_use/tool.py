@@ -446,6 +446,11 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
     # model can escalate background → foreground per cua-driver's ladder.
     delivery_mode = args.get("delivery_mode")
     bring_to_front = bool(args.get("bring_to_front"))
+    # Optional exact native target discovered via list_windows or another
+    # capture. This lets callers act on a known X11/window target without an
+    # extra focus_app/capture round-trip solely to hydrate backend sticky state.
+    target_pid = args.get("pid")
+    target_window_id = args.get("window_id")
 
     if action in {"click", "double_click", "right_click", "middle_click"}:
         button = args.get("button")
@@ -466,6 +471,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             x=x, y=y, button=button or "left", click_count=click_count,
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+            pid=target_pid, window_id=target_window_id,
         )
         return _maybe_follow_capture(backend, res, capture_after)
 
@@ -484,6 +490,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             button=args.get("button", "left"),
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+            pid=target_pid, window_id=target_window_id,
         )
         return _maybe_follow_capture(backend, res, capture_after)
 
@@ -497,17 +504,20 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             y=coord[1] if coord and coord[1] is not None else None,
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+            pid=target_pid, window_id=target_window_id,
         )
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "type":
         res = backend.type_text(args.get("text", ""),
-                                delivery_mode=delivery_mode, bring_to_front=bring_to_front)
+                                delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+                                pid=target_pid, window_id=target_window_id)
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "key":
         res = backend.key(args.get("keys", ""),
-                          delivery_mode=delivery_mode, bring_to_front=bring_to_front)
+                          delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+                          pid=target_pid, window_id=target_window_id)
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "set_value":

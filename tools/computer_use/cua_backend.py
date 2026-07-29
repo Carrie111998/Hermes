@@ -2273,6 +2273,56 @@ class CuaDriverBackend(ComputerUseBackend):
             args["bring_to_front"] = True
         return None
 
+    def _resolve_input_target(
+        self,
+        action: str,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
+    ) -> tuple[Optional[int], Optional[int], Optional[ActionResult]]:
+        """Return the input target, allowing an exact pid/window override.
+
+        capture() and focus_app() populate sticky target state. When the caller
+        already knows the native target from list_windows or an earlier capture,
+        accepting an explicit pair avoids a redundant capture/focus_app round-trip
+        and keeps coordinate/keyboard actions pointed at the intended X11 window.
+        """
+        if pid is None and window_id is None:
+            target_pid = self._active_pid
+            target_window_id = self._active_window_id
+            if target_pid is None or target_window_id is None:
+                return None, None, ActionResult(
+                    ok=False,
+                    action=action,
+                    message=(
+                        "No active window — call capture() first or pass both "
+                        "pid and window_id."
+                    ),
+                )
+            return target_pid, target_window_id, None
+
+        if pid is None or window_id is None:
+            return None, None, ActionResult(
+                ok=False,
+                action=action,
+                message="Exact input targeting requires both pid and window_id.",
+            )
+
+        target_pid = _positive_int(pid)
+        target_window_id = _positive_int(window_id)
+        if target_pid is None or target_window_id is None:
+            return None, None, ActionResult(
+                ok=False,
+                action=action,
+                message="Exact input targeting requires positive integer pid and window_id.",
+            )
+
+        if self._active_pid != target_pid or self._active_window_id != target_window_id:
+            self._snapshot_tokens = {}
+        self._active_pid = target_pid
+        self._active_window_id = target_window_id
+        self._last_target = {"pid": target_pid, "window_id": target_window_id}
+        return target_pid, target_window_id, None
+
     def click(
         self,
         *,
@@ -2284,11 +2334,14 @@ class CuaDriverBackend(ComputerUseBackend):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult:
-        pid = self._active_pid
-        if pid is None:
-            return ActionResult(ok=False, action="click",
-                                message="No active window — call capture() first.")
+        target_pid, target_window_id, target_error = self._resolve_input_target(
+            "click", pid, window_id
+        )
+        if target_error is not None:
+            return target_error
 
         # Choose tool by click_count only — single-vs-double — and pass the
         # button through to `click`'s `button` enum (Surface 5 of
@@ -2304,20 +2357,14 @@ class CuaDriverBackend(ComputerUseBackend):
                                 message=f"unknown button {button!r} — expected left, right, middle.")
         tool = "double_click" if click_count == 2 else "click"
 
-        args: Dict[str, Any] = {"pid": pid, "button": button_norm}
+        args: Dict[str, Any] = {"pid": target_pid, "button": button_norm}
         if element is not None:
-            if self._active_window_id is None:
-                return ActionResult(ok=False, action=tool,
-                                    message="No active window_id for element_index click.")
             args["element_index"] = element
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         elif x is not None and y is not None:
-            if self._active_window_id is None:
-                return ActionResult(ok=False, action=tool,
-                                    message="No active window_id for coordinate click.")
             args["x"] = x
             args["y"] = y
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         else:
             return ActionResult(ok=False, action=tool,
                                 message="click requires element= or x/y.")
@@ -2340,26 +2387,23 @@ class CuaDriverBackend(ComputerUseBackend):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult:
-        pid = self._active_pid
-        if pid is None:
-            return ActionResult(ok=False, action="drag",
-                                message="No active window — call capture() first.")
-        args: Dict[str, Any] = {"pid": pid}
+        target_pid, target_window_id, target_error = self._resolve_input_target(
+            "drag", pid, window_id
+        )
+        if target_error is not None:
+            return target_error
+        args: Dict[str, Any] = {"pid": target_pid}
         if from_element is not None and to_element is not None:
-            if self._active_window_id is None:
-                return ActionResult(ok=False, action="drag",
-                                    message="No active window_id for element-based drag.")
             args["from_element"] = from_element
             args["to_element"] = to_element
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         elif from_xy is not None and to_xy is not None:
-            if self._active_window_id is None:
-                return ActionResult(ok=False, action="drag",
-                                    message="No active window_id for coordinate drag.")
             args["from_x"], args["from_y"] = int(from_xy[0]), int(from_xy[1])
             args["to_x"], args["to_y"] = int(to_xy[0]), int(to_xy[1])
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         else:
             return ActionResult(ok=False, action="drag",
                                 message="drag requires from_element/to_element or from_coordinate/to_coordinate.")
@@ -2379,23 +2423,26 @@ class CuaDriverBackend(ComputerUseBackend):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult:
-        pid = self._active_pid
-        if pid is None:
-            return ActionResult(ok=False, action="scroll",
-                                message="No active window — call capture() first.")
+        target_pid, target_window_id, target_error = self._resolve_input_target(
+            "scroll", pid, window_id
+        )
+        if target_error is not None:
+            return target_error
         args: Dict[str, Any] = {
-            "pid": pid,
+            "pid": target_pid,
             "direction": direction,
             "amount": max(1, min(50, amount)),
         }
-        if element is not None and self._active_window_id is not None:
+        if pid is not None or window_id is not None:
+            args["window_id"] = target_window_id
+        if element is not None:
             args["element_index"] = element
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         elif x is not None and y is not None:
-            if self._active_window_id is None:
-                return ActionResult(ok=False, action="scroll",
-                                    message="No active window_id for coordinate scroll.")
+            args["window_id"] = target_window_id
             # CUA Driver 0.7.1 Linux schema rejects x/y on scroll. Only
             # include them when the driver explicitly advertises support
             # for coordinate scrolling; otherwise omit and let the driver
@@ -2407,33 +2454,46 @@ class CuaDriverBackend(ComputerUseBackend):
             ):
                 args["x"] = x
                 args["y"] = y
-            args["window_id"] = self._active_window_id
         refusal = self._apply_delivery("scroll", args, delivery_mode, bring_to_front)
         if refusal is not None:
             return refusal
         return self._action("scroll", args)
 
     # ── Keyboard ───────────────────────────────────────────────────
-    def type_text(self, text: str, *, delivery_mode: Optional[str] = None,
-                  bring_to_front: bool = False) -> ActionResult:
-        pid = self._active_pid
-        window_id = self._active_window_id
-        if pid is None or window_id is None:
-            return ActionResult(ok=False, action="type_text",
-                                message="No active window — call capture() first.")
-        args: Dict[str, Any] = {"pid": pid, "window_id": window_id, "text": text}
+    def type_text(
+        self,
+        text: str,
+        *,
+        delivery_mode: Optional[str] = None,
+        bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
+    ) -> ActionResult:
+        target_pid, target_window_id, target_error = self._resolve_input_target(
+            "type_text", pid, window_id
+        )
+        if target_error is not None:
+            return target_error
+        args: Dict[str, Any] = {"pid": target_pid, "window_id": target_window_id, "text": text}
         refusal = self._apply_delivery("type_text", args, delivery_mode, bring_to_front)
         if refusal is not None:
             return refusal
         return self._action("type_text", args)
 
-    def key(self, keys: str, *, delivery_mode: Optional[str] = None,
-            bring_to_front: bool = False) -> ActionResult:
-        pid = self._active_pid
-        window_id = self._active_window_id
-        if pid is None or window_id is None:
-            return ActionResult(ok=False, action="key",
-                                message="No active window — call capture() first.")
+    def key(
+        self,
+        keys: str,
+        *,
+        delivery_mode: Optional[str] = None,
+        bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
+    ) -> ActionResult:
+        target_pid, target_window_id, target_error = self._resolve_input_target(
+            "key", pid, window_id
+        )
+        if target_error is not None:
+            return target_error
 
         key_name, modifiers = _parse_key_combo(keys)
         if not key_name:
@@ -2442,14 +2502,14 @@ class CuaDriverBackend(ComputerUseBackend):
 
         if modifiers:
             # hotkey requires at least one modifier + one key.
-            args: Dict[str, Any] = {"pid": pid, "window_id": window_id,
+            args: Dict[str, Any] = {"pid": target_pid, "window_id": target_window_id,
                                     "keys": modifiers + [key_name]}
             refusal = self._apply_delivery("hotkey", args, delivery_mode, bring_to_front)
             if refusal is not None:
                 return refusal
             return self._action("hotkey", args)
         else:
-            args = {"pid": pid, "window_id": window_id, "key": key_name}
+            args = {"pid": target_pid, "window_id": target_window_id, "key": key_name}
             refusal = self._apply_delivery("press_key", args, delivery_mode, bring_to_front)
             if refusal is not None:
                 return refusal
