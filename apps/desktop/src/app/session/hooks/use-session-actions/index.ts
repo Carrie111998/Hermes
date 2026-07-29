@@ -778,7 +778,17 @@ export function useSessionActions({
               busyRef.current = running
               setBusy(running)
               setAwaitingResponse(running)
-              syncSessionStateToView(cachedRuntimeId, activatedState)
+
+              // Skip the view sync when the activated transcript matches
+              // what the warm cache already painted (L690).  For idle
+              // sessions — the common switch case — the persisted REST
+              // transcript carries the same rows as the runtime cache,
+              // so the reconcile above produces a deep-equal array.
+              // The unconditional sync stages a second RAF that
+              // re-renders the full message list for no visible change.
+              if (!chatMessageArraysEquivalent($messages.get(), activatedState.messages)) {
+                syncSessionStateToView(cachedRuntimeId, activatedState)
+              }
 
               return
             }
