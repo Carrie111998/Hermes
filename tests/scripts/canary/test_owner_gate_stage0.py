@@ -126,6 +126,31 @@ def _python_pair(tmp_path: Path) -> tuple[Path, Path]:
     return launcher, target
 
 
+def test_regular_reader_allows_empty_only_when_explicitly_requested(
+    tmp_path: Path,
+) -> None:
+    empty = tmp_path / "py.typed"
+    empty.touch(mode=0o600)
+    expected = {
+        "maximum": 1,
+        "expected_uid": empty.stat().st_uid,
+        "expected_gid": empty.stat().st_gid,
+        "allowed_modes": frozenset({0o600}),
+    }
+
+    with pytest.raises(
+        stage0.OwnerGateStage0Error,
+        match="owner_gate_stage0_file_invalid",
+    ):
+        stage0._read_regular(empty, **expected)
+
+    assert stage0._read_regular(
+        empty,
+        allow_empty=True,
+        **expected,
+    ) == b""
+
+
 def test_exact_python_interpreter_accepts_only_pinned_relative_symlink(
     tmp_path: Path,
 ) -> None:

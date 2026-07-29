@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
+from typing import Mapping
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+)
 
 from scripts.canary import trusted_signer_provisioning as provisioning
 
@@ -158,3 +163,666 @@ def test_selected_release_rejects_non_root_symlink_owner(
         match="trusted_signer_current_release_invalid",
     ):
         provisioning._selected_release_evidence(layout)
+
+
+def test_release_projection_accepts_signed_zero_byte_runtime_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    revision = "a" * 40
+    release = tmp_path / revision
+    public_raw = bytes(range(32))
+    public_key_id = hashlib.sha256(public_raw).hexdigest()
+    payloads = {
+        "bin/provision": (b"entrypoint", 0o555),
+        "scripts/canary/trusted_signer_provisioning.py": (
+            b"signer provisioning source",
+            0o444,
+        ),
+        "scripts/canary/storage_growth_trusted_collector.py": (
+            b"storage collector source",
+            0o444,
+        ),
+    }
+    interpreter = b"exact offline interpreter"
+    files = {
+        **payloads,
+        "venv/bin/python": (interpreter, 0o555),
+        "venv/lib/python3.11/site-packages/example/py.typed": (b"", 0o444),
+        "trust/cloud-observation-attestation.pub": (public_raw, 0o444),
+    }
+    for relative, (raw, mode) in files.items():
+        path = release / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        path.chmod(mode)
+    manifest = {
+        "release_revision": revision,
+        "package_sha256": "b" * 64,
+        "collector_public_key_ids": {
+            role: public_key_id for role in ("network", "cloud", "host")
+        },
+        "runtime_source_closure": [
+            "scripts/canary/trusted_signer_provisioning.py",
+            "scripts/canary/storage_growth_trusted_collector.py",
+        ],
+        "wheels": [{"project": "cryptography", "version": "49.0.0"}],
+        "interpreter_sha256": hashlib.sha256(interpreter).hexdigest(),
+        "payloads": [
+            {
+                "release_relative": relative,
+                "mode": f"{mode:04o}",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+            }
+            for relative, (raw, mode) in payloads.items()
+        ],
+    }
+    authority_manifest = release / "package-manifest.json"
+    authority_manifest.write_bytes(
+        provisioning.foundation.canonical_json_bytes(manifest)
+    )
+    authority_manifest.chmod(0o444)
+    for directory in sorted(
+        (path for path in release.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        directory.chmod(0o555)
+    release.chmod(0o555)
+    uid = os.getuid()
+    gid = os.getgid()
+    layout = provisioning.SignerLayout(
+        role="cloud",
+        release_base=release.parent,
+        release=release,
+        authority_manifest=authority_manifest,
+        pinned_public_key=release / "trust/cloud-observation-attestation.pub",
+        private_key=tmp_path / "private.key",
+        installed_public_key=tmp_path / "installed.pub",
+        config=tmp_path / "config.json",
+        replay_directory=tmp_path / "replay",
+        receipt=tmp_path / "receipt.json",
+        lock=tmp_path / "lock",
+        activation_seal=tmp_path / "activation-seal",
+        current_link=tmp_path / "current",
+        private_uid=uid,
+        private_gid=gid,
+        config_uid=uid,
+        config_gid=gid,
+        replay_uid=uid,
+        replay_gid=gid,
+        receipt_uid=uid,
+        receipt_gid=gid,
+        release_uid=uid,
+        release_gid=gid,
+        runtime_entrypoint_name="provision",
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_validate_layout_directories",
+        lambda _layout: None,
+    )
+
+    evidence = provisioning._validate_release_and_authority(layout)
+
+    assert evidence["runtime"]["immutable_release_projection_count"] > len(files)
+    assert len(evidence["runtime"]["immutable_release_projection_sha256"]) == 64
+
+
+def _runtime_projection_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    provisioning.SignerLayout,
+    bytes,
+    bytes,
+    Path,
+    Path,
+]:
+    current_revision = "b" * 40
+    historical_revision = "a" * 40
+    uid = os.getuid()
+    gid = os.getgid()
+    release_base = tmp_path / "releases"
+    current_release = release_base / current_revision
+    historical_release = release_base / historical_revision
+    current_release.mkdir(parents=True)
+    historical_release.mkdir()
+    receipt_root = tmp_path / "receipts"
+    receipt_root.mkdir()
+    public_root = tmp_path / "public"
+    public_root.mkdir()
+    runtime_receipt = public_root / "cloud-signer-provisioning-receipt.json"
+
+    def layout(revision: str) -> provisioning.SignerLayout:
+        release = release_base / revision
+        return provisioning.SignerLayout(
+            role="cloud",
+            release_base=release_base,
+            release=release,
+            authority_manifest=release / "package-manifest.json",
+            pinned_public_key=release / "cloud.pub",
+            private_key=tmp_path / "private.key",
+            installed_public_key=tmp_path / "installed.pub",
+            config=tmp_path / "config.json",
+            replay_directory=tmp_path / "replay",
+            receipt=receipt_root / f"cloud-signer-{revision}.json",
+            lock=tmp_path / "lock",
+            activation_seal=tmp_path / "activation-seal",
+            current_link=tmp_path / "current",
+            private_uid=uid,
+            private_gid=gid,
+            config_uid=uid,
+            config_gid=gid,
+            replay_uid=uid,
+            replay_gid=gid,
+            receipt_uid=uid,
+            receipt_gid=gid,
+            runtime_receipt=runtime_receipt,
+            runtime_receipt_uid=uid,
+            runtime_receipt_gid=gid,
+            runtime_receipt_mode=0o440,
+            release_uid=uid,
+            release_gid=gid,
+            runtime_entrypoint_name="provision",
+        )
+
+    current_layout = layout(current_revision)
+    historical_layout = layout(historical_revision)
+    historical_public_raw = (
+        Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    )
+    historical_public_id = hashlib.sha256(historical_public_raw).hexdigest()
+    historical_authority = {
+        "package_sha256": "1" * 64,
+        "manifest_sha256": "2" * 64,
+        "public_raw": historical_public_raw,
+        "public_key_id": historical_public_id,
+        "runtime": {"release": str(historical_release)},
+    }
+    historical_receipt = {
+        "schema": provisioning.PROVISIONING_RECEIPT_SCHEMA,
+        "role": "cloud",
+        "release_revision": historical_revision,
+        "package_sha256": historical_authority["package_sha256"],
+        "package_manifest_sha256": historical_authority["manifest_sha256"],
+        "public_key_id": historical_public_id,
+        "runtime": historical_authority["runtime"],
+    }
+    current_receipt = {
+        "schema": provisioning.PROVISIONING_RECEIPT_SCHEMA,
+        "role": "cloud",
+        "release_revision": current_revision,
+        "package_sha256": "3" * 64,
+        "package_manifest_sha256": "4" * 64,
+        "public_key_id": "5" * 64,
+        "runtime": {"release": str(current_release)},
+    }
+    historical_raw = provisioning.foundation.canonical_json_bytes(
+        historical_receipt
+    )
+    current_raw = provisioning.foundation.canonical_json_bytes(current_receipt)
+    historical_layout.receipt.write_bytes(historical_raw)
+    historical_layout.receipt.chmod(0o444)
+    current_layout.receipt.write_bytes(current_raw)
+    current_layout.receipt.chmod(0o444)
+    runtime_receipt.write_bytes(historical_raw)
+    runtime_receipt.chmod(0o440)
+
+    monkeypatch.setattr(
+        provisioning,
+        "cloud_layout",
+        lambda revision: (
+            historical_layout
+            if revision == historical_revision
+            else (_ for _ in ()).throw(AssertionError("unexpected revision"))
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_validate_release_and_authority",
+        lambda selected: (
+            historical_authority
+            if selected is historical_layout
+            else (_ for _ in ()).throw(AssertionError("unexpected layout"))
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_verify_receipt",
+        lambda receipt, *, public_key: dict(receipt),
+    )
+    return (
+        current_layout,
+        current_raw,
+        historical_raw,
+        historical_layout.receipt,
+        runtime_receipt,
+    )
+
+
+def test_runtime_receipt_projection_replaces_only_verified_historical_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        current_raw,
+        historical_raw,
+        historical_receipt,
+        runtime_receipt,
+    ) = _runtime_projection_case(tmp_path, monkeypatch)
+    current = provisioning._canonical_mapping(
+        current_raw,
+        code="test_invalid",
+    )
+
+    evidence = provisioning._install_runtime_receipt_projection(
+        layout,
+        current,
+        current_raw,
+        public_key=Ed25519PrivateKey.generate().public_key(),
+    )
+
+    assert runtime_receipt.read_bytes() == current_raw
+    assert historical_receipt.read_bytes() == historical_raw
+    assert layout.receipt.read_bytes() == current_raw
+    assert evidence["path"] == str(runtime_receipt)
+    assert evidence["sha256"] == hashlib.sha256(current_raw).hexdigest()
+    assert not (
+        runtime_receipt.parent
+        / f".{runtime_receipt.name}.muncho-replacement"
+    ).exists()
+
+
+def test_runtime_receipt_projection_rejects_unbacked_historical_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        current_raw,
+        historical_raw,
+        historical_receipt,
+        runtime_receipt,
+    ) = _runtime_projection_case(tmp_path, monkeypatch)
+    historical_receipt.chmod(0o644)
+    historical_receipt.write_bytes(b'{"different":"authoritative-copy"}')
+    historical_receipt.chmod(0o444)
+    current = provisioning._canonical_mapping(
+        current_raw,
+        code="test_invalid",
+    )
+
+    with pytest.raises(
+        provisioning.TrustedSignerProvisioningError,
+        match="trusted_signer_runtime_receipt_recovery_invalid",
+    ):
+        provisioning._install_runtime_receipt_projection(
+            layout,
+            current,
+            current_raw,
+            public_key=Ed25519PrivateKey.generate().public_key(),
+        )
+
+    assert runtime_receipt.read_bytes() == historical_raw
+    assert layout.receipt.read_bytes() == current_raw
+
+
+def test_runtime_receipt_projection_replays_after_staged_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        current_raw,
+        historical_raw,
+        historical_receipt,
+        runtime_receipt,
+    ) = _runtime_projection_case(tmp_path, monkeypatch)
+    current = provisioning._canonical_mapping(
+        current_raw,
+        code="test_invalid",
+    )
+    replacement = (
+        runtime_receipt.parent
+        / f".{runtime_receipt.name}.muncho-replacement"
+    )
+
+    with pytest.raises(SimulatedCrash):
+        provisioning._install_runtime_receipt_projection(
+            layout,
+            current,
+            current_raw,
+            public_key=Ed25519PrivateKey.generate().public_key(),
+            after_stage=_crash,
+        )
+
+    assert runtime_receipt.read_bytes() == historical_raw
+    assert replacement.read_bytes() == current_raw
+    assert historical_receipt.read_bytes() == historical_raw
+
+    provisioning._install_runtime_receipt_projection(
+        layout,
+        current,
+        current_raw,
+        public_key=Ed25519PrivateKey.generate().public_key(),
+    )
+
+    assert runtime_receipt.read_bytes() == current_raw
+    assert not replacement.exists()
+
+
+def _projection_rollover_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    provisioning.SignerLayout,
+    Mapping[str, object],
+    Mapping[str, bytes],
+    Mapping[str, bytes],
+]:
+    previous_revision = "a" * 40
+    current_revision = "b" * 40
+    uid = os.getuid()
+    gid = os.getgid()
+    release_base = tmp_path / "releases"
+    previous_release = release_base / previous_revision
+    current_release = release_base / current_revision
+    previous_release.mkdir(parents=True)
+    current_release.mkdir()
+    receipt_root = tmp_path / "receipts"
+    receipt_root.mkdir()
+
+    def layout(revision: str) -> provisioning.SignerLayout:
+        release = release_base / revision
+        return provisioning.SignerLayout(
+            role="cloud",
+            release_base=release_base,
+            release=release,
+            authority_manifest=release / "package-manifest.json",
+            pinned_public_key=release / "cloud.pub",
+            private_key=tmp_path / "private.key",
+            installed_public_key=tmp_path / "installed.pub",
+            config=tmp_path / "config.json",
+            replay_directory=tmp_path / "replay",
+            receipt=receipt_root / f"cloud-signer-{revision}.json",
+            lock=tmp_path / "lock",
+            activation_seal=tmp_path / "activation-seal",
+            current_link=tmp_path / "current",
+            private_uid=uid,
+            private_gid=gid,
+            config_uid=uid,
+            config_gid=gid,
+            replay_uid=uid,
+            replay_gid=gid,
+            receipt_uid=uid,
+            receipt_gid=gid,
+            sudoers=tmp_path / "sudoers",
+            sudoers_template=release / "sudoers.in",
+            release_uid=uid,
+            release_gid=gid,
+            runtime_entrypoint_name="provision",
+        )
+
+    current_layout = layout(current_revision)
+    previous_layout = layout(previous_revision)
+    projection_paths = {
+        "installed_public_key": (
+            current_layout.installed_public_key,
+            uid,
+            gid,
+            0o444,
+        ),
+        "config": (current_layout.config, uid, gid, 0o444),
+        "sudoers": (current_layout.sudoers, uid, gid, 0o440),
+    }
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_paths",
+        lambda selected: (
+            projection_paths
+            if selected in {current_layout, previous_layout}
+            else (_ for _ in ()).throw(AssertionError("unexpected layout"))
+        ),
+    )
+    previous_public = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    current_private = Ed25519PrivateKey.generate()
+    current_public = current_private.public_key().public_bytes_raw()
+    previous_authority: Mapping[str, object] = {
+        "package_sha256": "1" * 64,
+        "public_raw": previous_public,
+        "public_key_id": hashlib.sha256(previous_public).hexdigest(),
+    }
+    current_authority: Mapping[str, object] = {
+        "package_sha256": "2" * 64,
+        "public_raw": current_public,
+        "public_key_id": hashlib.sha256(current_public).hexdigest(),
+    }
+    previous_payloads = {
+        "installed_public_key": previous_public,
+        "config": b'{"projection":"previous"}',
+        "sudoers": (
+            f"root ALL=(root) NOPASSWD: "
+            f"{release_base}/{previous_revision}/bin/provision\n"
+        ).encode("ascii"),
+    }
+    current_payloads = {
+        "installed_public_key": current_public,
+        "config": b'{"projection":"current"}',
+        "sudoers": (
+            f"root ALL=(root) NOPASSWD: "
+            f"{release_base}/{current_revision}/bin/provision\n"
+        ).encode("ascii"),
+    }
+    current_layout.private_key.write_bytes(current_private.private_bytes_raw())
+    current_layout.private_key.chmod(0o400)
+    for name, (path, _uid, _gid, mode) in provisioning._projection_paths(
+        current_layout
+    ).items():
+        path.write_bytes(previous_payloads[name])
+        path.chmod(mode)
+
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_layout",
+        lambda revision, *, role: (
+            previous_layout
+            if revision == previous_revision and role == "cloud"
+            else (_ for _ in ()).throw(AssertionError("unexpected release"))
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_validate_release_and_authority",
+        lambda selected: (
+            previous_authority
+            if selected is previous_layout
+            else (_ for _ in ()).throw(AssertionError("unexpected layout"))
+        ),
+    )
+    monkeypatch.setattr(
+        provisioning,
+        "_projection_payloads",
+        lambda selected, *, authority: (
+            previous_payloads
+            if selected is previous_layout and authority is previous_authority
+            else (
+                current_payloads
+                if selected is current_layout and authority is current_authority
+                else (_ for _ in ()).throw(
+                    AssertionError("unexpected projection")
+                )
+            )
+        ),
+    )
+    return (
+        current_layout,
+        current_authority,
+        previous_payloads,
+        current_payloads,
+    )
+
+
+def test_projection_rollover_replaces_only_exact_predecessor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        previous_payloads,
+        current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+
+    provisioning._recover_release_bound_projections(
+        layout,
+        authority=authority,
+    )
+
+    for name, (path, _uid, _gid, _mode) in provisioning._projection_paths(
+        layout
+    ).items():
+        assert path.read_bytes() == current_payloads[name]
+        assert path.read_bytes() != previous_payloads[name]
+    intent = provisioning._projection_intent_path(layout)
+    assert intent.exists()
+    assert intent.stat().st_mode & 0o777 == 0o444
+
+
+def test_projection_rollover_replays_mixed_crash_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        _previous_payloads,
+        current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+
+    def crash_after_config_stage(name: str) -> None:
+        if name == "config":
+            raise SimulatedCrash("simulated_projection_rollover_crash")
+
+    with pytest.raises(SimulatedCrash):
+        provisioning._recover_release_bound_projections(
+            layout,
+            authority=authority,
+            after_stage=crash_after_config_stage,
+        )
+
+    provisioning._recover_release_bound_projections(
+        layout,
+        authority=authority,
+    )
+
+    for name, (path, _uid, _gid, _mode) in provisioning._projection_paths(
+        layout
+    ).items():
+        assert path.read_bytes() == current_payloads[name]
+        replacement = path.parent / (
+            f".{path.name}.muncho-projection-{layout.release.name}"
+        )
+        assert not replacement.exists()
+
+
+def test_projection_rollover_rejects_unbound_mixed_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        _previous_payloads,
+        current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+    layout.installed_public_key.chmod(0o644)
+    layout.installed_public_key.write_bytes(
+        current_payloads["installed_public_key"]
+    )
+    layout.installed_public_key.chmod(0o444)
+
+    with pytest.raises(
+        provisioning.TrustedSignerProvisioningError,
+        match="trusted_signer_projection_rollover_invalid",
+    ):
+        provisioning._recover_release_bound_projections(
+            layout,
+            authority=authority,
+        )
+
+    assert not provisioning._projection_intent_path(layout).exists()
+
+
+def test_projection_rollover_never_replaces_mismatched_private_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        previous_payloads,
+        _current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+    layout.private_key.chmod(0o600)
+    layout.private_key.write_bytes(Ed25519PrivateKey.generate().private_bytes_raw())
+    layout.private_key.chmod(0o400)
+
+    with pytest.raises(
+        provisioning.TrustedSignerProvisioningError,
+        match="trusted_signer_private_public_mismatch",
+    ):
+        provisioning._recover_release_bound_projections(
+            layout,
+            authority=authority,
+        )
+
+    for name, (path, _uid, _gid, _mode) in provisioning._projection_paths(
+        layout
+    ).items():
+        assert path.read_bytes() == previous_payloads[name]
+    assert not provisioning._projection_intent_path(layout).exists()
+
+
+def test_projection_rollover_rechecks_inert_boundary_after_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        layout,
+        authority,
+        previous_payloads,
+        current_payloads,
+    ) = _projection_rollover_case(tmp_path, monkeypatch)
+
+    def activate_after_stage(name: str) -> None:
+        if name == "installed_public_key":
+            layout.activation_seal.write_bytes(b"activation-race")
+
+    with pytest.raises(
+        provisioning.TrustedSignerProvisioningError,
+        match="trusted_signer_activation_not_inert",
+    ):
+        provisioning._recover_release_bound_projections(
+            layout,
+            authority=authority,
+            after_stage=activate_after_stage,
+        )
+
+    assert (
+        layout.installed_public_key.read_bytes()
+        == previous_payloads["installed_public_key"]
+    )
+    layout.activation_seal.unlink()
+
+    provisioning._recover_release_bound_projections(
+        layout,
+        authority=authority,
+    )
+
+    for name, (path, _uid, _gid, _mode) in provisioning._projection_paths(
+        layout
+    ).items():
+        assert path.read_bytes() == current_payloads[name]

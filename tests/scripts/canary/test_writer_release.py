@@ -286,6 +286,13 @@ def test_release_commands_pin_managed_copied_frozen_noneditable_install(tmp_path
     assert sync_command.argv[sync_command.argv.index("--python") + 1] == str(
         spec.interpreter
     )
+    assert dict(build_command.env)["HERMES_SEALED_RELEASE_BUILD"] == (
+        "canonical-writer-release-v1"
+    )
+    assert all(
+        "HERMES_SEALED_RELEASE_BUILD" not in command.environment()
+        for command in (venv_command, lock_command, sync_command)
+    )
     runtime_install, runtime_verify = writer_release.runtime_dependency_commands(spec)
     expected_prefix = (
         str(spec.interpreter),

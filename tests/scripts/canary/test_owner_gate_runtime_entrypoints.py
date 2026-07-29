@@ -19,6 +19,7 @@ ENTRYPOINTS = (
     ("muncho-passkey-v2-authority", 29102),
     ("muncho-passkey-v2-executor", 29103),
     ("muncho-passkey-v2-web", 29101),
+    ("muncho-owner-gate-cloud-observation-signer", 29103),
     ("muncho-owner-gate-install", 0),
     ("muncho-owner-gate-activate-storage", 0),
     ("muncho-owner-gate-stage-activation-evidence", 0),
@@ -44,6 +45,12 @@ def _flags(**changes: Any) -> SimpleNamespace:
     }
     values.update(changes)
     return SimpleNamespace(**values)
+
+
+def _runtime_error(name: str) -> str:
+    if name == "muncho-owner-gate-cloud-observation-signer":
+        return "cloud_signer_runtime_invalid"
+    return "runtime_entrypoint_invalid"
 
 
 def _root_lstat(
@@ -80,7 +87,9 @@ def _layout(
     releases.chmod(0o755)
     release.chmod(0o555)
     entrypoint.chmod(0o555)
-    interpreter.chmod(0o755)
+    interpreter.chmod(
+        0o755 if revision == f".{REVISION}.bootstrap" else 0o555
+    )
     return releases, release, entrypoint, interpreter
 
 
@@ -98,8 +107,9 @@ def _call(
     geteuid_fn: Callable[[], int] | None = None,
     getgid_fn: Callable[[], int] | None = None,
     getegid_fn: Callable[[], int] | None = None,
+    getgroups_fn: Callable[[], list[int]] | None = None,
 ) -> Path:
-    return validator(
+    kwargs = dict(
         entrypoint=entrypoint,
         executable=interpreter if executable is None else executable,
         releases_root=releases,
@@ -110,6 +120,11 @@ def _call(
         getegid_fn=(lambda: uid) if getegid_fn is None else getegid_fn,
         flags=_flags() if flags is None else flags,
     )
+    if "getgroups_fn" in validator.__code__.co_varnames:
+        kwargs["getgroups_fn"] = (
+            (lambda: []) if getgroups_fn is None else getgroups_fn
+        )
+    return validator(**kwargs)
 
 
 def test_activation_evidence_wrapper_imports_exact_module_under_isolation() -> None:
@@ -206,7 +221,7 @@ def test_runtime_installer_rejects_ambiguous_staging_names(
     )
     release.chmod(0o700)
 
-    with pytest.raises(SystemExit, match="runtime_entrypoint_invalid"):
+    with pytest.raises(SystemExit, match=_runtime_error(name)):
         _call(
             _validator(name),
             releases=releases,
@@ -242,7 +257,7 @@ def test_runtime_entrypoint_rejects_wrong_effective_identity(
     uid: int,
 ) -> None:
     releases, _, entrypoint, interpreter = _layout(tmp_path, name)
-    with pytest.raises(SystemExit, match="runtime_entrypoint_invalid"):
+    with pytest.raises(SystemExit, match=_runtime_error(name)):
         _call(
             _validator(name),
             releases=releases,
@@ -315,7 +330,7 @@ def test_runtime_entrypoint_rejects_interpreter_from_another_release(
     releases, _, entrypoint, interpreter = _layout(tmp_path, name)
     other = tmp_path / "other-python"
     other.write_bytes(b"other interpreter")
-    other.chmod(0o755)
+    other.chmod(0o555)
     with pytest.raises(SystemExit, match="runtime_entrypoint_invalid"):
         _call(
             _validator(name),
@@ -342,7 +357,7 @@ def test_runtime_entrypoint_rejects_interpreter_file_identity_drift(
     elif case == "hardlink":
         os.link(interpreter, interpreter.with_name("python-second-link"))
     elif case == "mode":
-        interpreter.chmod(0o555)
+        interpreter.chmod(0o755)
     else:
         wrong_owner = interpreter.resolve()
 

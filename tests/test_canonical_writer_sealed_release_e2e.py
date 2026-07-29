@@ -1,10 +1,15 @@
-"""Installed-wheel regression for the privileged Canonical Writer runtime.
+"""Sealed-release regression for the privileged Canonical Writer runtime.
 
-The service runs with ``python -B -I`` and therefore cannot import anything
-from the repository source tree.  This test builds the real wheel, installs it
-without that tree, proves every declared production launcher is packaged, and
-reaches the first typed PING dispatch so lazy runtime imports are covered as
-well as bootstrap imports.
+Hermes does not publish or support standalone wheel/sdist distributions.  The
+production owner-runtime builder is the exact exception: it builds one
+revision-bound wheel as an internal artifact, installs it into an immutable
+release-local runtime, removes dynamic import hooks, seals the whole tree, and
+attests it under ``python -I -B``.
+
+This test invokes that supported builder from a clean exact Git revision,
+proves every declared production launcher is present in the retained internal
+wheel, and reaches the first typed PING dispatch from the sealed interpreter so
+lazy Canonical Writer imports are covered as well as bootstrap imports.
 """
 
 from __future__ import annotations
@@ -16,8 +21,6 @@ import runpy
 import shutil
 import subprocess
 import textwrap
-import tomllib
-import venv
 import zipfile
 from pathlib import Path
 
@@ -96,7 +99,9 @@ def _bytecode_snapshot(root: Path) -> dict[str, str | None]:
     os.name == "nt",
     reason="Canonical Writer requires Linux peer credentials",
 )
-def test_installed_wheel_runs_first_canonical_writer_ping(tmp_path):
+def test_sealed_owner_runtime_runs_first_canonical_writer_ping(tmp_path):
+    from scripts.canary import package_production_owner_runtime as owner_runtime
+
     fixture = runpy.run_path(
         str(REPO_ROOT / "tests/gateway/test_canonical_writer_planner.py")
     )
@@ -110,33 +115,78 @@ def test_installed_wheel_runs_first_canonical_writer_ping(tmp_path):
         ),
         encoding="utf-8",
     )
-    source_tree = tmp_path / "source"
-    shutil.copytree(
-        REPO_ROOT,
-        source_tree,
-        ignore=shutil.ignore_patterns(
-            ".git",
-            ".venv",
-            "venv",
-            "build",
-            "dist",
-            "node_modules",
-            "__pycache__",
-            "*.pyc",
-        ),
-    )
-    wheel_dir = tmp_path / "wheel"
-    build = subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(wheel_dir), "."],
-        cwd=source_tree,
+    git_executable_raw = shutil.which("git")
+    uv_executable_raw = shutil.which("uv")
+    assert git_executable_raw is not None
+    assert uv_executable_raw is not None
+    git_executable = Path(git_executable_raw).resolve(strict=True)
+    uv_executable = Path(uv_executable_raw).resolve(strict=True)
+    revision_run = subprocess.run(
+        [str(git_executable), "-C", str(REPO_ROOT), "rev-parse", "--verify", "HEAD"],
         capture_output=True,
         text=True,
-        timeout=600,
+        check=True,
+        timeout=30,
     )
-    assert build.returncode == 0, f"uv build failed:\n{build.stderr}"
-    wheels = list(wheel_dir.glob("*.whl"))
+    revision = revision_run.stdout.strip()
+    assert len(revision) == 40
+
+    # The production builder accepts only a clean exact Git revision.  A
+    # shared local clone keeps the E2E independent of ignored pytest state or
+    # unrelated developer worktree changes while preserving that real gate.
+    source_tree = tmp_path / "source"
+    subprocess.run(
+        [
+            str(git_executable),
+            "clone",
+            "--shared",
+            "--quiet",
+            "--no-checkout",
+            str(REPO_ROOT),
+            str(source_tree),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    subprocess.run(
+        [
+            str(git_executable),
+            "-C",
+            str(source_tree),
+            "checkout",
+            "--quiet",
+            "--detach",
+            revision,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+
+    spec = owner_runtime.OwnerRuntimeBuildSpec(
+        revision=revision,
+        source_root=source_tree.resolve(strict=True),
+        release_base=(tmp_path / "sealed-owner-runtime").resolve(),
+        uv_executable=uv_executable,
+        git_executable=git_executable,
+    )
+    publication = owner_runtime.build_owner_runtime(spec)
+    assert publication["runtime_reused"] is False
+    assert publication["non_editable_install"] is True
+    assert publication["secret_material_recorded"] is False
+    assert publication["secret_digest_recorded"] is False
+    verified = owner_runtime.verify_owner_runtime(spec)
+    assert verified["runtime_reused"] is True
+    assert verified["manifest_sha256"] == publication["manifest_sha256"]
+    assert verified["attestation_sha256"] == publication["attestation_sha256"]
+
+    wheels = list(spec.artifact_root.glob("*.whl"))
     assert len(wheels) == 1, f"expected one wheel, found: {wheels}"
     wheel = wheels[0]
+    assert hashlib.sha256(wheel.read_bytes()).hexdigest() == publication["wheel_sha256"]
 
     with zipfile.ZipFile(wheel) as archive:
         packaged = set(archive.namelist())
@@ -149,48 +199,9 @@ def test_installed_wheel_runs_first_canonical_writer_ping(tmp_path):
     assert required_script_modules <= packaged
     assert not (_FORBIDDEN_SCRIPT_MODULES & packaged)
 
-    venv_dir = tmp_path / "venv"
-    venv.create(venv_dir, with_pip=True)
-    interpreter = venv_dir / "bin/python"
-    project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    required_names = {"cryptography", "pyyaml"}
-    bootstrap_requirements = [
-        requirement.split(";", 1)[0]
-        for requirement in project["project"]["dependencies"]
-        if requirement.split("==", 1)[0].split("[", 1)[0].casefold() in required_names
-    ]
-    assert {
-        requirement.split("==", 1)[0].split("[", 1)[0].casefold()
-        for requirement in bootstrap_requirements
-    } == required_names
-    subprocess.run(
-        [
-            str(interpreter),
-            "-m",
-            "pip",
-            "install",
-            "-q",
-            *bootstrap_requirements,
-        ],
-        check=True,
-        timeout=300,
-    )
-    subprocess.run(
-        [
-            str(interpreter),
-            "-m",
-            "pip",
-            "install",
-            "-q",
-            "--no-deps",
-            "--force-reinstall",
-            str(wheel),
-        ],
-        check=True,
-        timeout=300,
-    )
-    site_packages_roots = list((venv_dir / "lib").glob("python*/site-packages"))
-    assert len(site_packages_roots) == 1
+    interpreter = spec.interpreter
+    site_packages_roots = [spec.site_packages]
+    assert site_packages_roots[0].is_dir()
     bytecode_before = _bytecode_snapshot(site_packages_roots[0])
 
     probe = textwrap.dedent(
@@ -279,7 +290,7 @@ def test_installed_wheel_runs_first_canonical_writer_ping(tmp_path):
             gateway_uid=os.getuid(),
             owner_discord_user_ids=frozenset(),
             gateway_unit="hermes-cloud-gateway.service",
-            socket_path=Path("/tmp/canonical-writer-wheel-test.sock"),
+            socket_path=Path("/tmp/canonical-writer-sealed-release-test.sock"),
             connection_timeout_seconds=2.0,
             max_connections=1,
             database=object(),
@@ -511,7 +522,7 @@ def test_installed_wheel_runs_first_canonical_writer_ping(tmp_path):
         timeout=120,
     )
     assert run.returncode == 0, (
-        "installed Canonical Writer wheel probe failed:\n"
+        "sealed Canonical Writer release probe failed:\n"
         f"stdout: {run.stdout}\nstderr: {run.stderr}"
     )
     alias_help_run = subprocess.run(

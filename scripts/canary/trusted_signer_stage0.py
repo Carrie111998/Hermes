@@ -17,6 +17,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -38,6 +39,14 @@ HOST_SUDOERS_TEMPLATE = (
 )
 HOST_RUNTIME_RECEIPT_SCHEMA = "muncho-host-offline-trusted-runtime.v1"
 MAX_FILE_BYTES = 128 * 1024 * 1024
+_RELEASE_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_SUDOERS_RELEASE_PATH = re.compile(
+    rb"/opt/muncho-trusted-observation/releases/([0-9a-f]{40})/"
+)
+_SUDOERS_STAGING_RELEASE_PATH = re.compile(
+    rb"/opt/muncho-trusted-observation/releases/"
+    rb"\.([0-9a-f]{40})\.bootstrap/"
+)
 
 
 class TrustedSignerStage0Error(RuntimeError):
@@ -66,6 +75,18 @@ def _fsync_directory(path: Path) -> None:
             os.close(descriptor)
 
 
+def _lock_parent_is_trusted(state: os.stat_result) -> bool:
+    """Accept the exact Debian 12 /run/lock mode without widening the lock."""
+
+    return (
+        not stat.S_ISLNK(state.st_mode)
+        and stat.S_ISDIR(state.st_mode)
+        and state.st_uid == 0
+        and state.st_gid == 0
+        and stat.S_IMODE(state.st_mode) in {0o755, 0o775, 0o1777}
+    )
+
+
 @contextmanager
 def _stage0_lock(path: Path = HOST_STAGE0_LOCK) -> Any:
     descriptor: int | None = None
@@ -83,11 +104,7 @@ def _stage0_lock(path: Path = HOST_STAGE0_LOCK) -> Any:
         state = os.fstat(descriptor)
         parent = path.parent.lstat()
         if (
-            stat.S_ISLNK(parent.st_mode)
-            or not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid != 0
-            or parent.st_gid != 0
-            or stat.S_IMODE(parent.st_mode) not in {0o755, 0o775}
+            not _lock_parent_is_trusted(parent)
             or not stat.S_ISREG(state.st_mode)
             or state.st_nlink != 1
             or state.st_uid != 0
@@ -176,8 +193,18 @@ def _exact_directory(path: Path, *, mode: int) -> Mapping[str, Any]:
     return {"path": str(path), "uid": 0, "gid": 0, "mode": f"{mode:04o}"}
 
 
-def _render_sudoers(release: Path) -> bytes:
-    source = release / HOST_SUDOERS_TEMPLATE
+def _render_sudoers(
+    source_release: Path,
+    *,
+    command_release: Path | None = None,
+) -> bytes:
+    selected_release = command_release or source_release
+    if (
+        source_release.parent != HOST_RELEASE_BASE
+        or selected_release.parent != HOST_RELEASE_BASE
+    ):
+        _error("trusted_signer_stage0_sudoers_invalid")
+    source = source_release / HOST_SUDOERS_TEMPLATE
     raw = stage0._read_regular(
         source,
         maximum=64 * 1024,
@@ -187,10 +214,15 @@ def _render_sudoers(release: Path) -> bytes:
     placeholder = b"@RELEASE_SHA@"
     if raw.count(placeholder) < 1:
         _error("trusted_signer_stage0_sudoers_invalid")
-    rendered = raw.replace(placeholder, release.name.encode("ascii"))
+    rendered = raw.replace(
+        placeholder,
+        selected_release.name.encode("ascii"),
+    )
     if b"@" in rendered or b"/usr/bin/python3" in rendered or b"\r" in rendered:
         _error("trusted_signer_stage0_sudoers_invalid")
-    expected_prefix = str(release / "venv/bin/python").encode("ascii")
+    expected_prefix = str(selected_release / "venv/bin/python").encode(
+        "ascii"
+    )
     if expected_prefix not in rendered:
         _error("trusted_signer_stage0_sudoers_invalid")
     return rendered
@@ -214,9 +246,228 @@ def _default_runner(argv: Sequence[str]) -> bytes:
     return completed.stdout
 
 
+def _sudoers_snapshot(path: Path) -> tuple[bytes, tuple[int, ...]]:
+    try:
+        before = path.lstat()
+        raw = stage0._read_regular(
+            path,
+            maximum=64 * 1024,
+            expected_uid=0,
+            expected_gid=0,
+            allowed_modes=frozenset({0o440}),
+        )
+        after = path.lstat()
+    except (OSError, stage0.OwnerGateStage0Error) as exc:
+        _error("trusted_signer_stage0_sudoers_conflict", exc)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_nlink,
+        before.st_uid,
+        before.st_gid,
+        stat.S_IMODE(before.st_mode),
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_nlink,
+        after.st_uid,
+        after.st_gid,
+        stat.S_IMODE(after.st_mode),
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        _error("trusted_signer_stage0_sudoers_conflict")
+    return raw, after_identity
+
+
+def _validate_predecessor_sudoers(
+    raw: bytes,
+    *,
+    successor_release: Path,
+) -> Path:
+    revisions = set(_SUDOERS_RELEASE_PATH.findall(raw))
+    staging_revisions = set(_SUDOERS_STAGING_RELEASE_PATH.findall(raw))
+    if (
+        successor_release.parent != HOST_RELEASE_BASE
+        or _RELEASE_REVISION.fullmatch(successor_release.name) is None
+        or (len(revisions), len(staging_revisions)) not in {(1, 0), (0, 1)}
+    ):
+        _error("trusted_signer_stage0_sudoers_conflict")
+    try:
+        predecessor_revision = next(
+            iter(revisions or staging_revisions)
+        ).decode(
+            "ascii", errors="strict"
+        )
+    except UnicodeError:
+        _error("trusted_signer_stage0_sudoers_conflict")
+    predecessor = HOST_RELEASE_BASE / predecessor_revision
+    try:
+        state = predecessor.lstat()
+    except OSError as exc:
+        _error("trusted_signer_stage0_sudoers_conflict", exc)
+    broken_staging = (
+        HOST_RELEASE_BASE / f".{predecessor_revision}.bootstrap"
+        if staging_revisions
+        else None
+    )
+    if broken_staging is not None and os.path.lexists(broken_staging):
+        _error("trusted_signer_stage0_sudoers_conflict")
+    try:
+        expected_payload = _render_sudoers(
+            predecessor,
+            command_release=broken_staging,
+        )
+    except TrustedSignerStage0Error as exc:
+        _error("trusted_signer_stage0_sudoers_conflict", exc)
+    if (
+        predecessor == successor_release
+        or stat.S_ISLNK(state.st_mode)
+        or not stat.S_ISDIR(state.st_mode)
+        or state.st_uid != 0
+        or state.st_gid != 0
+        or stat.S_IMODE(state.st_mode) != 0o555
+        or expected_payload != raw
+    ):
+        _error("trusted_signer_stage0_sudoers_conflict")
+    for relative in (
+        "venv/bin/python",
+        "bin/muncho-host-trusted-signer-provision",
+        "bin/muncho-host-observation-attestor",
+    ):
+        stage0._read_regular(
+            predecessor / relative,
+            maximum=MAX_FILE_BYTES,
+            expected_uid=0,
+            expected_gid=0,
+            allowed_modes=frozenset({0o555}),
+        )
+    return predecessor
+
+
+def _replace_predecessor_sudoers(
+    payload: bytes,
+    *,
+    successor_release: Path,
+    destination: Path,
+    temporary: Path,
+    runner: Callable[[Sequence[str]], bytes],
+    after_open: Callable[[], None] | None,
+) -> None:
+    predecessor_raw, predecessor_identity = _sudoers_snapshot(destination)
+    _validate_predecessor_sudoers(
+        predecessor_raw,
+        successor_release=successor_release,
+    )
+    if (
+        HOST_CURRENT_LINK.exists()
+        or HOST_CURRENT_LINK.is_symlink()
+        or HOST_ACTIVATION_SEAL.exists()
+        or HOST_ACTIVATION_SEAL.is_symlink()
+    ):
+        _error("trusted_signer_stage0_sudoers_conflict")
+
+    descriptor: int | None = None
+    try:
+        if temporary.exists() or temporary.is_symlink():
+            staged_state = temporary.lstat()
+            if (
+                stat.S_ISREG(staged_state.st_mode)
+                and staged_state.st_nlink == 1
+                and staged_state.st_size == 0
+                and staged_state.st_uid == 0
+                and staged_state.st_gid == 0
+                and not (stat.S_IMODE(staged_state.st_mode) & ~0o440)
+            ):
+                temporary.unlink()
+                _fsync_directory(destination.parent)
+            else:
+                staged_raw = stage0._read_regular(
+                    temporary,
+                    maximum=64 * 1024,
+                    expected_uid=0,
+                    expected_gid=0,
+                    allowed_modes=frozenset({0o440}),
+                )
+                staged_state = temporary.lstat()
+                same_as_predecessor = (
+                    staged_raw == predecessor_raw
+                    and staged_state.st_nlink == 2
+                    and (staged_state.st_dev, staged_state.st_ino)
+                    == (
+                        predecessor_identity[0],
+                        predecessor_identity[1],
+                    )
+                )
+                if same_as_predecessor:
+                    temporary.unlink()
+                    _fsync_directory(destination.parent)
+                elif (
+                    staged_state.st_nlink == 1
+                    and staged_state.st_uid == 0
+                    and staged_state.st_gid == 0
+                    and stat.S_IMODE(staged_state.st_mode) == 0o440
+                    and len(staged_raw) < len(payload)
+                    and payload.startswith(staged_raw)
+                ):
+                    temporary.unlink()
+                    _fsync_directory(destination.parent)
+                elif staged_raw != payload or staged_state.st_nlink != 1:
+                    _error("trusted_signer_stage0_sudoers_conflict")
+        if not temporary.exists():
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(temporary, flags, 0o440)
+            if after_open is not None:
+                after_open()
+            os.fchmod(descriptor, 0o440)
+            os.fchown(descriptor, 0, 0)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view[: min(len(view), 64)])
+                if written <= 0:
+                    raise OSError
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            _fsync_directory(destination.parent)
+        staged_raw, _staged_identity = _sudoers_snapshot(temporary)
+        if staged_raw != payload:
+            _error("trusted_signer_stage0_sudoers_conflict")
+        runner(("/usr/sbin/visudo", "-cf", str(temporary)))
+        repeated_raw, repeated_identity = _sudoers_snapshot(destination)
+        if (
+            repeated_raw != predecessor_raw
+            or repeated_identity != predecessor_identity
+            or HOST_CURRENT_LINK.exists()
+            or HOST_CURRENT_LINK.is_symlink()
+            or HOST_ACTIVATION_SEAL.exists()
+            or HOST_ACTIVATION_SEAL.is_symlink()
+        ):
+            _error("trusted_signer_stage0_sudoers_conflict")
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    except TrustedSignerStage0Error:
+        raise
+    except (OSError, stage0.OwnerGateStage0Error) as exc:
+        _error("trusted_signer_stage0_sudoers_install_failed", exc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _install_sudoers(
     payload: bytes,
     *,
+    successor_release: Path,
     destination: Path = HOST_SUDOERS_PATH,
     runner: Callable[[Sequence[str]], bytes] = _default_runner,
     after_open: Callable[[], None] | None = None,
@@ -225,6 +476,16 @@ def _install_sudoers(
     descriptor: int | None = None
     try:
         if destination.exists() or destination.is_symlink():
+            existing, _existing_identity = _sudoers_snapshot(destination)
+            if existing != payload:
+                _replace_predecessor_sudoers(
+                    payload,
+                    successor_release=successor_release,
+                    destination=destination,
+                    temporary=temporary,
+                    runner=runner,
+                    after_open=after_open,
+                )
             if temporary.exists() or temporary.is_symlink():
                 final_state = destination.lstat()
                 staged_state = temporary.lstat()
@@ -277,6 +538,7 @@ def _install_sudoers(
             state = destination.lstat()
             if raw != payload or state.st_gid != 0:
                 _error("trusted_signer_stage0_sudoers_conflict")
+            _fsync_directory(destination.parent)
             if temporary.exists() or temporary.is_symlink():
                 staged_state = temporary.lstat()
                 if (
@@ -499,6 +761,7 @@ def _seal_release(staging_or_release: Path, *, revision: str) -> Mapping[str, An
                 maximum=MAX_FILE_BYTES,
                 expected_uid=0,
                 allowed_modes=frozenset({mode}),
+                allow_empty=True,
             )
             projection.append({
                 "path": relative,
@@ -575,14 +838,15 @@ def _install_host_offline_runtime_locked(
         runner=stage0_runner,
     )
     revision = str(manifest["release_revision"])
-    sudoers_payload = _render_sudoers(staging)
     release_evidence = _seal_release(staging, revision=revision)
+    final = HOST_RELEASE_BASE / revision
+    sudoers_payload = _render_sudoers(final)
     sudoers_evidence = _install_sudoers(
         sudoers_payload,
+        successor_release=final,
         destination=sudoers_path,
         runner=command_runner,
     )
-    final = HOST_RELEASE_BASE / revision
     runtime_inventory_raw = stage0_runner(
         (
             str(final / "venv/bin/python"),

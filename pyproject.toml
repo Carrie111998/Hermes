@@ -329,6 +329,11 @@ include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*",
 # topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
 # in gateway/status_phrases.py and gateway/run.py.
 gateway = ["assets/**/*"]
+# General plugin-wheel distribution remains intentionally unsupported.  The
+# sealed owner runtime has one exact allowlisted observer, however, and its
+# normal PluginManager discovery contract requires this manifest beside the
+# packaged module.  Do not widen this to a wildcard.
+plugins = ["muncho_canary_evidence/plugin.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

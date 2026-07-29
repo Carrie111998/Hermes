@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -217,6 +218,135 @@ def _bootstrap_receipt_fixture(
     return runtime, path, receipt
 
 
+def _install_sdk_repair_binding(
+    runtime: launcher.TrustedGcloudExecutable,
+    bootstrap_path: Path,
+    bootstrap_receipt: dict[str, object],
+    tmp_path: Path,
+) -> Path:
+    cache = launcher._TrustedSdkBytecodeCache(
+        absolute_path=runtime._sdk_root + "/lib/__pycache__",
+        relative_path="lib/__pycache__",
+        identity=(
+            1,
+            2,
+            stat.S_IFDIR | 0o700,
+            1,
+            os.getuid(),
+            os.getgid(),
+            0,
+            3,
+            4,
+        ),
+    )
+    files = tuple(
+        launcher._TrustedSdkBytecodeFile(
+            absolute_path=(
+                runtime._sdk_root
+                + f"/lib/__pycache__/module_{index}.cpython-311.pyc"
+            ),
+            relative_path=(
+                f"lib/__pycache__/module_{index}.cpython-311.pyc"
+            ),
+            cache_path=cache.absolute_path,
+            fingerprint=(
+                stat.S_IFREG | 0o600,
+                os.getuid(),
+                os.getgid(),
+                5 + index,
+                7 + index,
+                1,
+                8 + index,
+                9 + index,
+                10 + index,
+                f"{index + 5:x}" * 64,
+            ),
+        )
+        for index in range(2)
+    )
+    repair_intent = launcher._trusted_sdk_bytecode_repair_intent_value(
+        release_sha=RELEASE_SHA,
+        launcher_sha256=runtime._launcher_sha256,
+        destination=runtime._sdk_root,
+        publication_tree=runtime._sdk_publication_fingerprint,
+        publication_intent=runtime._publication_intent,
+        caches=(cache,),
+        files=files,
+        planned_at_unix=2_000,
+    )
+    intent_path = Path(
+        launcher._trusted_sdk_bytecode_repair_intent_path(
+            str(tmp_path),
+            RELEASE_SHA,
+        )
+    )
+    intent_path.write_bytes(_canonical(repair_intent) + b"\n")
+    intent_path.chmod(0o600)
+
+    repair_unsigned = {
+        "schema": launcher.TRUSTED_SDK_BYTECODE_REPAIR_RECEIPT_SCHEMA,
+        "ok": True,
+        "state": "trusted_sdk_bytecode_removed",
+        "release_sha": RELEASE_SHA,
+        "launcher_sha256": runtime._launcher_sha256,
+        "sdk_root": runtime._sdk_root,
+        "sdk_version": launcher._GCLOUD_SDK_VERSION,
+        "sdk_archive_sha256": launcher._GCLOUD_SDK_ARCHIVE_SHA256,
+        "sdk_publication_release_sha": runtime._publication_intent[
+            "publication_release_sha"
+        ],
+        "sdk_publication_intent_sha256": runtime._publication_intent[
+            "intent_sha256"
+        ],
+        "repair_intent_sha256": repair_intent["intent_sha256"],
+        "sdk_publication_tree_entries": runtime._sdk_publication_fingerprint[0],
+        "sdk_publication_tree_bytes": runtime._sdk_publication_fingerprint[1],
+        "sdk_publication_tree_sha256": runtime._sdk_publication_fingerprint[2],
+        "bytecode_files_removed": len(files),
+        "bytecode_bytes_removed": repair_intent["bytecode_bytes"],
+        "bytecode_file_set_sha256": repair_intent[
+            "bytecode_file_set_sha256"
+        ],
+        "cache_directories_removed": 1,
+        "cache_directory_set_sha256": repair_intent[
+            "cache_directory_set_sha256"
+        ],
+        "post_repair_sdk_tree_entries": runtime._sdk_fingerprint[0],
+        "post_repair_sdk_tree_bytes": runtime._sdk_fingerprint[1],
+        "post_repair_sdk_tree_sha256": runtime._sdk_fingerprint[2],
+        "repaired_at_unix": 2_001,
+    }
+    repair_receipt = {
+        **repair_unsigned,
+        "receipt_sha256": hashlib.sha256(
+            _canonical(repair_unsigned)
+        ).hexdigest(),
+    }
+    repair_path = Path(
+        launcher._trusted_sdk_bytecode_repair_receipt_path(
+            str(tmp_path),
+            RELEASE_SHA,
+        )
+    )
+    repair_path.write_bytes(_canonical(repair_receipt) + b"\n")
+    repair_path.chmod(0o600)
+
+    bootstrap_receipt["sdk_tree_entries"] = runtime._sdk_fingerprint[0]
+    bootstrap_receipt["sdk_tree_bytes"] = runtime._sdk_fingerprint[1]
+    bootstrap_receipt["sdk_tree_sha256"] = "9" * 64
+    bootstrap_unsigned = {
+        name: value
+        for name, value in bootstrap_receipt.items()
+        if name != "receipt_sha256"
+    }
+    bootstrap_receipt["receipt_sha256"] = hashlib.sha256(
+        _canonical(bootstrap_unsigned)
+    ).hexdigest()
+    bootstrap_path.write_bytes(_canonical(bootstrap_receipt) + b"\n")
+    bootstrap_path.chmod(0o600)
+    return repair_path
+
+
 def test_owner_support_constants_pin_exact_release_inputs() -> None:
     wheels = launcher._TRUSTED_OWNER_SUPPORT_WHEELS
 
@@ -307,6 +437,70 @@ def test_v2_bootstrap_receipt_binds_owner_support_tree_and_sources(
         _canonical(unsigned)
     ).hexdigest()
     assert runtime._validate_bootstrap_receipt()
+
+
+def test_bootstrap_receipt_accepts_valid_post_bootstrap_sdk_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, path, receipt = _bootstrap_receipt_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    _install_sdk_repair_binding(runtime, path, receipt, tmp_path)
+
+    assert runtime._validate_bootstrap_receipt()
+
+
+def test_bootstrap_receipt_rejects_historical_sdk_tree_without_repair_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, path, receipt = _bootstrap_receipt_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    repair_path = _install_sdk_repair_binding(
+        runtime,
+        path,
+        receipt,
+        tmp_path,
+    )
+    repair_path.unlink()
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="trusted_runtime_bootstrap_receipt_invalid",
+    ):
+        runtime._validate_bootstrap_receipt()
+
+
+def test_sdk_repair_binding_cannot_hide_non_sdk_bootstrap_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, path, receipt = _bootstrap_receipt_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    _install_sdk_repair_binding(runtime, path, receipt, tmp_path)
+    receipt["python_tree_sha256"] = "8" * 64
+    unsigned = {
+        name: value
+        for name, value in receipt.items()
+        if name != "receipt_sha256"
+    }
+    receipt["receipt_sha256"] = hashlib.sha256(
+        _canonical(unsigned)
+    ).hexdigest()
+    path.write_bytes(_canonical(receipt) + b"\n")
+    path.chmod(0o600)
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="trusted_runtime_bootstrap_receipt_invalid",
+    ):
+        runtime._validate_bootstrap_receipt()
 
 
 def test_sealed_runtime_identity_matches_owner_reauth_contract(

@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -82,23 +83,39 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
     assert list(tmp_path.glob(artifact_glob))
 
 
-def test_wheel_build_allows_exact_owner_runtime_role(tmp_path):
+@pytest.mark.parametrize(
+    "sealed_build",
+    ["canonical-writer-release-v1", "owner-runtime-v1"],
+)
+def test_wheel_build_allows_exact_sealed_release_roles(sealed_build, tmp_path):
     result = _build_artifact(
         "wheel",
         tmp_path,
         nix_build=False,
-        sealed_build="owner-runtime-v1",
+        sealed_build=sealed_build,
     )
 
     assert result.returncode == 0, result.stderr
-    assert list(tmp_path.glob("hermes_agent-*.whl"))
+    wheels = list(tmp_path.glob("hermes_agent-*.whl"))
+    assert len(wheels) == 1
+    with zipfile.ZipFile(wheels[0]) as archive:
+        packaged = set(archive.namelist())
+    observer_manifest = "plugins/muncho_canary_evidence/plugin.yaml"
+    assert observer_manifest in packaged
+    assert {
+        name
+        for name in packaged
+        if name.startswith("plugins/") and name.endswith("/plugin.yaml")
+    } == {observer_manifest}
 
 
 @pytest.mark.parametrize(
     ("kind", "sealed_build"),
     [
         ("wheel", "owner-runtime-v1-near-miss"),
+        ("wheel", "canonical-writer-release-v1-near-miss"),
         ("sdist", "owner-runtime-v1"),
+        ("sdist", "canonical-writer-release-v1"),
     ],
 )
 def test_sealed_wheel_role_is_exact_and_never_authorizes_sdist(

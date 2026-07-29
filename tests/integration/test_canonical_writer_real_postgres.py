@@ -36,7 +36,6 @@ from gateway.canonical_writer_db import (
     CanonicalWriterDB,
     CredentialSource,
     ManagedCloudSQLAdminHBAReceipt,
-    PostgresProtocolError,
     RoutineIdentity,
     WriterDBConfig,
     WriterPrivilegePolicy,
@@ -93,6 +92,15 @@ IMAGE = "postgres:18"
 SCHEMA_CONTRACT_ASSET = (
     ROOT / "gateway/assets/canonical_writer_schema_contract_v1.json"
 )
+CONTROL_INSTALL = (
+    ROOT / "scripts/sql/canonical_writer_schema_reconciliation_control_v1.sql"
+)
+CONTROL_RETIRE = (
+    ROOT
+    / "scripts/sql/canonical_writer_schema_reconciliation_control_retire_v1.sql"
+)
+CONTROL_INSTALL_SHA256 = hashlib.sha256(CONTROL_INSTALL.read_bytes()).hexdigest()
+CONTROL_RETIRE_SHA256 = hashlib.sha256(CONTROL_RETIRE.read_bytes()).hexdigest()
 DATABASE = "muncho_canary_brain"
 LOGIN = "muncho_canary_writer_login"
 DISCORD_GUILD_ID = "1282725267068157972"
@@ -138,11 +146,16 @@ def _run(
     return completed
 
 
-def _wait_ready(name: str, *, timeout: int = 60) -> None:
+def _wait_ready(
+    name: str,
+    *,
+    user: str = "postgres",
+    timeout: int = 60,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         probe = subprocess.run(
-            ["docker", "exec", name, "pg_isready", "-U", "postgres"],
+            ["docker", "exec", name, "pg_isready", "-U", user],
             capture_output=True,
             text=True,
             check=False,
@@ -397,6 +410,50 @@ def _test_managed_hba_receipt(config: WriterDBConfig) -> ManagedCloudSQLAdminHBA
     )
 
 
+def _install_schema_reconciliation_control(name: str) -> None:
+    control_login = "muncho_canary_control_" + "c" * 16
+    _psql(
+        name,
+        DATABASE,
+        "DROP FUNCTION "
+        "canonical_brain._discord_guild_routeback_target_valid(jsonb);\n",
+    )
+    # Stock PostgreSQL cannot model Cloud SQL's provider-only CREATEROLE
+    # authority. Keep the superuser surrogate inside this disposable fixture
+    # and remove it immediately after the reviewed control artifact commits.
+    _psql_as(
+        name,
+        DATABASE,
+        "cloudsqladmin",
+        "ALTER ROLE cloudsqlsuperuser SUPERUSER;\n"
+        f"CREATE ROLE {control_login} LOGIN INHERIT NOSUPERUSER CREATEDB "
+        "CREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1;\n"
+        f"GRANT cloudsqlsuperuser TO {control_login} "
+        "WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;\n",
+    )
+    _psql_as(
+        name,
+        DATABASE,
+        control_login,
+        CONTROL_INSTALL.read_text(encoding="utf-8"),
+    )
+    _psql(
+        name,
+        DATABASE,
+        f"DROP ROLE {control_login};\n"
+        "ALTER ROLE cloudsqlsuperuser LOGIN NOSUPERUSER CREATEDB CREATEROLE "
+        "NOREPLICATION NOBYPASSRLS;\n",
+    )
+    _psql(
+        name,
+        DATABASE,
+        _migration_invocation(
+            DATABASE,
+            MIGRATION.read_text(encoding="utf-8"),
+        ),
+    )
+
+
 def _seed_policy(config: WriterDBConfig) -> WriterPrivilegePolicy:
     def identity(signature: str, security_definer: bool) -> RoutineIdentity:
         return RoutineIdentity(
@@ -495,6 +552,8 @@ def real_writer_stack(tmp_path_factory: pytest.TempPathFactory) -> RealWriterSta
                 "-e",
                 "POSTGRES_PASSWORD",
                 "-e",
+                "POSTGRES_USER=cloudsqladmin",
+                "-e",
                 "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
                 "-p",
                 "127.0.0.1::5432",
@@ -504,7 +563,14 @@ def real_writer_stack(tmp_path_factory: pytest.TempPathFactory) -> RealWriterSta
             timeout=180,
             secret_values=(admin_password,),
         )
-        _wait_ready(name)
+        _wait_ready(name, user="cloudsqladmin")
+        _psql_as(
+            name,
+            "postgres",
+            "cloudsqladmin",
+            "CREATE ROLE postgres LOGIN SUPERUSER CREATEDB CREATEROLE "
+            "REPLICATION BYPASSRLS;\n",
+        )
 
         _run(["docker", "cp", str(server_cert), f"{name}:/tmp/cw-server.crt"])
         _run(["docker", "cp", str(server_key), f"{name}:/tmp/cw-server.key"])
@@ -543,11 +609,8 @@ def real_writer_stack(tmp_path_factory: pytest.TempPathFactory) -> RealWriterSta
             "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;\n"
             f"GRANT {CANONICAL_WRITER_ROLE} TO {LOGIN} "
             "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;\n"
-            "CREATE ROLE cloudsqladmin LOGIN SUPERUSER CREATEDB CREATEROLE "
-            "REPLICATION BYPASSRLS;\n"
             "CREATE ROLE cloudsqlsuperuser LOGIN NOSUPERUSER CREATEDB CREATEROLE "
             "NOREPLICATION NOBYPASSRLS;\n"
-            "CREATE DATABASE cloudsqladmin OWNER cloudsqladmin;\n"
             f"CREATE DATABASE {DATABASE} OWNER cloudsqlsuperuser;\n"
             f"REVOKE ALL ON DATABASE {DATABASE} FROM PUBLIC;\n"
             f"GRANT CONNECT ON DATABASE {DATABASE} TO {CANONICAL_WRITER_ROLE};\n",
@@ -600,6 +663,7 @@ def real_writer_stack(tmp_path_factory: pytest.TempPathFactory) -> RealWriterSta
         ) == ["t", "0"]
         _psql(name, DATABASE, _migration_invocation(DATABASE, migration_sql))
         _psql(name, DATABASE, _migration_invocation(DATABASE, migration_sql))
+        _install_schema_reconciliation_control(name)
         assert _psql_fields(
             name,
             DATABASE,
@@ -678,14 +742,14 @@ def test_release_schema_contract_asset_matches_real_postgresql_18(
     assert observed.value == asset.contract.value
 
 
-def _temporary_admin_config(
+def _temporary_executor_config(
     writer_config: WriterDBConfig,
     tmp_path: Path,
     *,
-    admin: str,
+    executor: str,
     password: str,
 ) -> WriterDBConfig:
-    credential = tmp_path / (admin + "-password")
+    credential = tmp_path / (executor + "-password")
     credential.write_text(password + "\n", encoding="utf-8")
     credential.chmod(0o600)
     return WriterDBConfig(
@@ -693,7 +757,7 @@ def _temporary_admin_config(
         tls_server_name=writer_config.tls_server_name,
         port=writer_config.port,
         database=writer_config.database,
-        user=admin,
+        user=executor,
         ca_file=writer_config.ca_file,
         credential=CredentialSource(
             expected_uid=os.getuid(),
@@ -705,60 +769,31 @@ def _temporary_admin_config(
     )
 
 
-def _schema_reconciliation_role_graph(name: str, admin: str) -> list[str]:
+def _schema_reconciliation_role_graph(name: str, executor: str) -> list[str]:
     return _psql_fields(
         name,
         DATABASE,
-        "WITH role_graph AS (SELECT membership.roleid, membership.member, "
-        "membership.grantor, membership.admin_option, "
-        "membership.inherit_option, membership.set_option, "
-        "granted.rolname AS granted_name, member.rolname AS member_name, "
-        "grantor.rolname AS grantor_name FROM pg_catalog.pg_auth_members AS "
-        "membership JOIN pg_catalog.pg_roles AS granted ON granted.oid = "
+        "SELECT granted.rolname, member.rolname, grantor.rolname, "
+        "NOT membership.admin_option, membership.inherit_option, "
+        "membership.set_option FROM pg_catalog.pg_auth_members AS membership "
+        "JOIN pg_catalog.pg_roles AS granted ON granted.oid = "
         "membership.roleid JOIN pg_catalog.pg_roles AS member ON member.oid = "
         "membership.member JOIN pg_catalog.pg_roles AS grantor ON grantor.oid "
-        "= membership.grantor WHERE member.rolname IN ('"
-        + admin
-        + "', 'canonical_brain_migration_owner') OR granted.rolname IN ('"
-        + admin
-        + "', 'canonical_brain_migration_owner') OR grantor.rolname IN ('"
-        + admin
-        + "', 'canonical_brain_migration_owner')) SELECT "
-        "pg_catalog.count(*)::text, "
-        "pg_catalog.count(DISTINCT roleid)::text, "
-        "pg_catalog.string_agg(granted_name, ',' ORDER BY granted_name), "
-        "pg_catalog.min(member_name), pg_catalog.min(grantor_name), "
-        "pg_catalog.bool_and(NOT admin_option), "
-        "pg_catalog.bool_and(inherit_option), "
-        "pg_catalog.bool_and(NOT set_option) FROM role_graph;",
+        "= membership.grantor WHERE granted.rolname = "
+        "'canonical_brain_schema_reconciler' AND member.rolname = '"
+        + executor
+        + "';",
     )
 
 
-def _install_cloudsql_api_role_graph(name: str, admin: str) -> None:
-    """Model the exact membership rows written by the Cloud SQL Admin API.
-
-    Stock PostgreSQL requires the SQL grantor to hold ADMIN OPTION, while the
-    managed API records ``cloudsqladmin`` directly without creating that extra
-    membership.  Seed the ordinary grants first, then change only their
-    catalog grantor so the production collector sees the real Cloud shape.
-    """
-
-    _psql(
+def _install_cloudsql_api_executor_edge(name: str, executor: str) -> None:
+    _psql_as(
         name,
         DATABASE,
-        f"GRANT {CANONICAL_WRITER_MIGRATION_OWNER}, {CANONICAL_WRITER_ROLE} "
-        f"TO {admin} WITH ADMIN FALSE, INHERIT TRUE, SET FALSE "
-        "GRANTED BY postgres;\n"
-        "WITH cloud_grantor AS (SELECT oid FROM pg_catalog.pg_roles "
-        "WHERE rolname = 'cloudsqladmin'), temporary_login AS (SELECT oid "
-        "FROM pg_catalog.pg_roles WHERE rolname = '"
-        + admin
-        + "'), expected_roles AS (SELECT oid FROM pg_catalog.pg_roles WHERE "
-        "rolname IN ('canonical_brain_migration_owner', "
-        "'canonical_brain_writer')) UPDATE pg_catalog.pg_auth_members AS "
-        "membership SET grantor = cloud_grantor.oid FROM cloud_grantor, "
-        "temporary_login WHERE membership.member = temporary_login.oid AND "
-        "membership.roleid IN (SELECT oid FROM expected_roles);\n",
+        "cloudsqladmin",
+        "GRANT canonical_brain_schema_reconciler TO "
+        + executor
+        + " WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;\n",
     )
 
 
@@ -825,7 +860,7 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
     name = real_writer_stack.name
     database = real_writer_stack.backend._database
     writer_config = database._config
-    admin = "muncho_canary_admin_" + "f" * 16
+    executor = "muncho_canary_reconciler_" + "f" * 16
     password = secrets.token_hex(32)
     escaped_password = password.replace("'", "''")
     seeded_case = "case:schema-reconciliation:4097"
@@ -838,11 +873,13 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
         target_asset.contract,
         artifact,
         target_asset_sha256=target_asset.sha256,
+        control_install_artifact_sha256=CONTROL_INSTALL_SHA256,
+        control_retire_artifact_sha256=CONTROL_RETIRE_SHA256,
     )
-    admin_config = _temporary_admin_config(
+    executor_config = _temporary_executor_config(
         writer_config,
         tmp_path,
-        admin=admin,
+        executor=executor,
         password=password,
     )
     writer_probe = _open_postgres_session(writer_config)
@@ -856,11 +893,13 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
         _test_managed_hba_receipt(writer_config),
         server_certificate_sha256=tls_peer_certificate_sha256,
     )
+    executor_hba_receipt = replace(
+        _test_managed_hba_receipt(executor_config),
+        server_certificate_sha256=tls_peer_certificate_sha256,
+    )
     expected_role_graph = [
-        "2",
-        "2",
-        "canonical_brain_migration_owner,canonical_brain_writer",
-        admin,
+        "canonical_brain_schema_reconciler",
+        executor,
         "cloudsqladmin",
         "t",
         "t",
@@ -876,7 +915,7 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
         _psql(
             name,
             DATABASE,
-            f"CREATE ROLE {admin} LOGIN INHERIT NOSUPERUSER NOCREATEDB "
+            f"CREATE ROLE {executor} LOGIN INHERIT NOSUPERUSER NOCREATEDB "
             "NOCREATEROLE NOREPLICATION NOBYPASSRLS "
             f"PASSWORD '{escaped_password}';\n"
             "DROP FUNCTION "
@@ -901,8 +940,8 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
             secrets_=(password,),
         )
         _create_quarantine_truth_anchors(name)
-        _install_cloudsql_api_role_graph(name, admin)
-        assert _schema_reconciliation_role_graph(name, admin) == (
+        _install_cloudsql_api_executor_edge(name, executor)
+        assert _schema_reconciliation_role_graph(name, executor) == (
             expected_role_graph
         )
         assert _psql_fields(
@@ -917,9 +956,12 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
             schema_reconciliation_db.PostgresSchemaReconciliationDatabase(
                 plan=plan,
                 target=target_asset.contract,
-                admin_config=admin_config,
+                executor_config=executor_config,
                 writer_config=writer_config,
                 managed_hba_receipt=managed_hba_receipt,
+                executor_managed_hba_receipt=executor_hba_receipt,
+                pre_begin_admission=lambda: None,
+                _stabilization_sleep=lambda _seconds: None,
             )
         )
 
@@ -960,7 +1002,9 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
                 item.object_oid > 0 and len(item.acl_sha256) == 64
                 for item in truth_before.quarantine_anchor_receipts
             )
-            transaction.execute_sql(plan.mutation_sql)
+            transaction.apply_missing_helper(
+                authorized_intent_sha256="1" * 64
+            )
             target_contract = transaction.observe_contract()
             truth_after = transaction.observe_canonical_truth()
             assert target_contract.value == target_asset.contract.value
@@ -970,7 +1014,7 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
             assert truth_after == truth_before
 
         assert _trampoline_semantic_identity(name) == trampoline_before
-        assert _schema_reconciliation_role_graph(name, admin) == (
+        assert _schema_reconciliation_role_graph(name, executor) == (
             expected_role_graph
         )
 
@@ -984,24 +1028,24 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
             assert replay_truth == truth_before
 
         assert _trampoline_semantic_identity(name) == trampoline_before
-        assert _schema_reconciliation_role_graph(name, admin) == (
+        assert _schema_reconciliation_role_graph(name, executor) == (
             expected_role_graph
         )
-        _psql(name, DATABASE, f"DROP ROLE {admin};\n")
+        _psql(name, DATABASE, f"DROP ROLE {executor};\n")
 
         terminal = schema_reconciliation_db.collect_post_delete_terminal_receipt(
             plan=plan,
             target=target_asset.contract,
-            temporary_login=admin,
+            temporary_executor_login=executor,
             writer_config=writer_config,
             managed_hba_receipt=managed_hba_receipt,
             pre_delete_canonical_truth=truth_before,
         )
         assert terminal.observed_contract_sha256 == target_asset.contract.sha256
         assert terminal.writer_session_identity_exact is True
-        assert terminal.temporary_login_absent is True
-        assert terminal.temporary_login_inventory_empty is True
-        assert terminal.migration_owner_memberships_absent is True
+        assert terminal.temporary_executor_absent is True
+        assert terminal.temporary_executor_inventory_empty is True
+        assert terminal.persistent_executor_memberships_empty is True
         assert terminal.writer_authority_exact is True
         assert terminal.writer_ping_verified is True
         assert terminal.writer_ping_request_id == (
@@ -1018,7 +1062,7 @@ def test_real_postgresql_18_sealed_schema_reconciliation_preserves_truth(
         _psql(
             name,
             DATABASE,
-            f"DROP ROLE IF EXISTS {admin};\n"
+            f"DROP ROLE IF EXISTS {executor};\n"
             + _migration_invocation(
                 DATABASE,
                 MIGRATION.read_text(encoding="utf-8"),
@@ -1038,7 +1082,7 @@ def test_real_postgresql_18_quarantine_projection_binds_object_identity(
     name = real_writer_stack.name
     database = real_writer_stack.backend._database
     writer_config = database._config
-    admin = "muncho_canary_admin_" + "e" * 16
+    executor = "muncho_canary_reconciler_" + "e" * 16
     password = secrets.token_hex(32)
     escaped_password = password.replace("'", "''")
     target_asset = SchemaContractAsset.from_bytes(
@@ -1050,11 +1094,13 @@ def test_real_postgresql_18_quarantine_projection_binds_object_identity(
         target_asset.contract,
         artifact,
         target_asset_sha256=target_asset.sha256,
+        control_install_artifact_sha256=CONTROL_INSTALL_SHA256,
+        control_retire_artifact_sha256=CONTROL_RETIRE_SHA256,
     )
-    admin_config = _temporary_admin_config(
+    executor_config = _temporary_executor_config(
         writer_config,
         tmp_path,
-        admin=admin,
+        executor=executor,
         password=password,
     )
     writer_probe = _open_postgres_session(writer_config)
@@ -1068,24 +1114,26 @@ def test_real_postgresql_18_quarantine_projection_binds_object_identity(
         _test_managed_hba_receipt(writer_config),
         server_certificate_sha256=tls_peer_certificate_sha256,
     )
+    executor_hba_receipt = replace(
+        _test_managed_hba_receipt(executor_config),
+        server_certificate_sha256=tls_peer_certificate_sha256,
+    )
     trampoline_before = _trampoline_semantic_identity(name)
 
     try:
         _psql(
             name,
             DATABASE,
-            f"CREATE ROLE {admin} LOGIN INHERIT NOSUPERUSER NOCREATEDB "
+            f"CREATE ROLE {executor} LOGIN INHERIT NOSUPERUSER NOCREATEDB "
             "NOCREATEROLE NOREPLICATION NOBYPASSRLS "
             f"PASSWORD '{escaped_password}';\n",
             secrets_=(password,),
         )
         _create_quarantine_truth_anchors(name)
-        _install_cloudsql_api_role_graph(name, admin)
-        assert _schema_reconciliation_role_graph(name, admin) == [
-            "2",
-            "2",
-            "canonical_brain_migration_owner,canonical_brain_writer",
-            admin,
+        _install_cloudsql_api_executor_edge(name, executor)
+        assert _schema_reconciliation_role_graph(name, executor) == [
+            "canonical_brain_schema_reconciler",
+            executor,
             "cloudsqladmin",
             "t",
             "t",
@@ -1095,9 +1143,12 @@ def test_real_postgresql_18_quarantine_projection_binds_object_identity(
             schema_reconciliation_db.PostgresSchemaReconciliationDatabase(
                 plan=plan,
                 target=target_asset.contract,
-                admin_config=admin_config,
+                executor_config=executor_config,
                 writer_config=writer_config,
                 managed_hba_receipt=managed_hba_receipt,
+                executor_managed_hba_receipt=executor_hba_receipt,
+                pre_begin_admission=lambda: None,
+                _stabilization_sleep=lambda _seconds: None,
             )
         )
 
@@ -1146,16 +1197,14 @@ def test_real_postgresql_18_quarantine_projection_binds_object_identity(
         )
         with reconciliation_database.transaction(
             advisory_lock_key=CANONICAL_WRITER_DEPLOYMENT_LOCK_KEY
-        ) as rejected_observation:
-            rejected_observation.lock_canonical_truth()
-            assert rejected_observation.observe_contract().value == (
+        ) as unrelated_observation:
+            unrelated_observation.lock_canonical_truth()
+            assert unrelated_observation.observe_contract().value == (
                 target_asset.contract.value
             )
-            with pytest.raises(
-                PostgresProtocolError,
-                match="schema_reconciliation_quarantine_anchor_invalid",
-            ):
-                rejected_observation.observe_canonical_truth()
+            # Control v1 binds the three reviewed quarantine anchors, not
+            # unrelated quarantine relations.
+            assert unrelated_observation.observe_canonical_truth() == truth_b
 
         assert _trampoline_semantic_identity(name) == trampoline_before
         assert _psql_fields(
@@ -1181,7 +1230,7 @@ def test_real_postgresql_18_quarantine_projection_binds_object_identity(
         _psql(
             name,
             DATABASE,
-            f"DROP ROLE IF EXISTS {admin};\n"
+            f"DROP ROLE IF EXISTS {executor};\n"
             "DROP SCHEMA IF EXISTS canonical_brain_legacy_quarantine "
             "CASCADE;\n",
         )
@@ -1189,11 +1238,15 @@ def test_real_postgresql_18_quarantine_projection_binds_object_identity(
 
 def test_stock_postgresql_18_rejects_wrong_cloud_role_graph_cleanly(
     real_writer_stack: RealWriterStack,
+    tmp_path: Path,
 ) -> None:
-    """The exact custom-role path must not be faked with cloudsqlsuperuser."""
+    """The inert executor path must not be faked with cloudsqlsuperuser."""
 
     name = real_writer_stack.name
-    admin = "muncho_canary_admin_" + "a" * 16
+    writer_config = real_writer_stack.backend._database._config
+    executor = "muncho_canary_reconciler_" + "a" * 16
+    password = secrets.token_hex(32)
+    escaped_password = password.replace("'", "''")
     asset = SchemaContractAsset.from_bytes(SCHEMA_CONTRACT_ASSET.read_bytes())
     artifact = _load_source_artifacts_for_tests()["base_migration"]
     plan = schema_reconciliation._build_plan_from_artifact(
@@ -1201,44 +1254,77 @@ def test_stock_postgresql_18_rejects_wrong_cloud_role_graph_cleanly(
         asset.contract,
         artifact,
         target_asset_sha256=asset.sha256,
+        control_install_artifact_sha256=CONTROL_INSTALL_SHA256,
+        control_retire_artifact_sha256=CONTROL_RETIRE_SHA256,
+    )
+    executor_config = _temporary_executor_config(
+        writer_config,
+        tmp_path,
+        executor=executor,
+        password=password,
+    )
+    writer_probe = _open_postgres_session(writer_config)
+    try:
+        tls_peer_certificate_sha256 = writer_probe.tls_peer_certificate_sha256
+    finally:
+        writer_probe.close()
+    managed_hba_receipt = replace(
+        _test_managed_hba_receipt(writer_config),
+        server_certificate_sha256=tls_peer_certificate_sha256,
+    )
+    executor_hba_receipt = replace(
+        _test_managed_hba_receipt(executor_config),
+        server_certificate_sha256=tls_peer_certificate_sha256,
     )
     before_truth = _canonical14_identity(name)
 
     _psql(
         name,
         DATABASE,
-        "DROP FUNCTION "
-        "canonical_brain._discord_guild_routeback_target_valid(jsonb);\n"
-        f"CREATE ROLE {admin} LOGIN INHERIT NOSUPERUSER CREATEDB CREATEROLE "
-        "NOREPLICATION NOBYPASSRLS;\n"
-        "GRANT cloudsqlsuperuser TO cloudsqladmin "
-        "WITH ADMIN TRUE, INHERIT FALSE, SET TRUE;\n"
-        f"GRANT cloudsqlsuperuser TO {admin} "
-        "WITH ADMIN FALSE, INHERIT TRUE, SET TRUE "
-        "GRANTED BY cloudsqladmin;\n",
-        )
+        f"CREATE ROLE {executor} LOGIN INHERIT NOSUPERUSER CREATEDB CREATEROLE "
+        "NOREPLICATION NOBYPASSRLS "
+        f"PASSWORD '{escaped_password}';\n",
+        secrets_=(password,),
+    )
+    _psql_as(
+        name,
+        DATABASE,
+        "cloudsqladmin",
+        f"GRANT cloudsqlsuperuser TO {executor} "
+        "WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;\n",
+    )
     try:
-        with pytest.raises(RuntimeError):
-            _psql_as(
-                name,
-                DATABASE,
-                admin,
-                "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;\n"
-                + plan.mutation_sql
-                + "\nCOMMIT;\n",
+        reconciliation_database = (
+            schema_reconciliation_db.PostgresSchemaReconciliationDatabase(
+                plan=plan,
+                target=asset.contract,
+                executor_config=executor_config,
+                writer_config=writer_config,
+                managed_hba_receipt=managed_hba_receipt,
+                executor_managed_hba_receipt=executor_hba_receipt,
+                pre_begin_admission=lambda: None,
+                _stabilization_sleep=lambda _seconds: None,
             )
+        )
+        with pytest.raises(
+            schema_reconciliation.SchemaReconciliationError,
+            match=(
+                "schema_reconciliation_authority_"
+                "temporary_executor_attributes_exact"
+            ),
+        ):
+            with reconciliation_database.transaction(
+                advisory_lock_key=CANONICAL_WRITER_DEPLOYMENT_LOCK_KEY
+            ):
+                raise AssertionError("wrong authority reached a transaction")
 
         assert _psql_fields(
             name,
             DATABASE,
             "SELECT pg_catalog.to_regprocedure("
             "'canonical_brain._discord_guild_routeback_target_valid(jsonb)') "
-            "IS NULL, (SELECT pg_catalog.count(*) FROM "
-            "pg_catalog.pg_auth_members AS membership JOIN "
-            "pg_catalog.pg_roles AS owner ON owner.oid = membership.roleid "
-            "OR owner.oid = membership.member WHERE owner.rolname = "
-            "'canonical_brain_migration_owner')::text;",
-        ) == ["t", "0"]
+            "IS NOT NULL;",
+        ) == ["t"]
         assert _psql_fields(
             name,
             DATABASE,
@@ -1251,21 +1337,11 @@ def test_stock_postgresql_18_rejects_wrong_cloud_role_graph_cleanly(
             "membership.roleid JOIN pg_catalog.pg_roles AS member ON member.oid = "
             "membership.member JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = "
             "membership.grantor WHERE granted.rolname = 'cloudsqlsuperuser' AND "
-            f"member.rolname = '{admin}';",
+            f"member.rolname = '{executor}';",
         ) == ["1", "t", "t", "t", "cloudsqladmin"]
         assert _canonical14_identity(name) == before_truth
     finally:
-        _psql(
-            name,
-            DATABASE,
-            f"DROP ROLE IF EXISTS {admin};\n"
-            "REVOKE cloudsqlsuperuser FROM cloudsqladmin "
-            "GRANTED BY postgres;\n"
-            + _migration_invocation(
-                DATABASE,
-                MIGRATION.read_text(encoding="utf-8"),
-            ),
-        )
+        _psql(name, DATABASE, f"DROP ROLE IF EXISTS {executor};\n")
 
 
 def test_schema_reconciliation_rejects_indirect_unexpected_role_before_begin(
@@ -1276,7 +1352,7 @@ def test_schema_reconciliation_rejects_indirect_unexpected_role_before_begin(
 
     name = real_writer_stack.name
     writer_config = real_writer_stack.backend._database._config
-    admin = "muncho_canary_admin_" + "b" * 16
+    executor = "muncho_canary_reconciler_" + "b" * 16
     unexpected = "muncho_canary_unexpected_role"
     password = secrets.token_hex(32)
     escaped_password = password.replace("'", "''")
@@ -1289,11 +1365,13 @@ def test_schema_reconciliation_rejects_indirect_unexpected_role_before_begin(
         target_asset.contract,
         artifact,
         target_asset_sha256=target_asset.sha256,
+        control_install_artifact_sha256=CONTROL_INSTALL_SHA256,
+        control_retire_artifact_sha256=CONTROL_RETIRE_SHA256,
     )
-    admin_config = _temporary_admin_config(
+    executor_config = _temporary_executor_config(
         writer_config,
         tmp_path,
-        admin=admin,
+        executor=executor,
         password=password,
     )
     writer_probe = _open_postgres_session(writer_config)
@@ -1307,31 +1385,33 @@ def test_schema_reconciliation_rejects_indirect_unexpected_role_before_begin(
         _test_managed_hba_receipt(writer_config),
         server_certificate_sha256=tls_peer_certificate_sha256,
     )
+    executor_hba_receipt = replace(
+        _test_managed_hba_receipt(executor_config),
+        server_certificate_sha256=tls_peer_certificate_sha256,
+    )
     trampoline_before = _trampoline_semantic_identity(name)
 
     try:
         _psql(
             name,
             DATABASE,
-            f"CREATE ROLE {admin} LOGIN INHERIT NOSUPERUSER NOCREATEDB "
+            f"CREATE ROLE {executor} LOGIN INHERIT NOSUPERUSER NOCREATEDB "
             "NOCREATEROLE NOREPLICATION NOBYPASSRLS "
             f"PASSWORD '{escaped_password}';\n"
             f"CREATE ROLE {unexpected} NOLOGIN INHERIT NOSUPERUSER "
             "NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;\n",
             secrets_=(password,),
         )
-        _install_cloudsql_api_role_graph(name, admin)
+        _install_cloudsql_api_executor_edge(name, executor)
         _psql(
             name,
             DATABASE,
-            f"GRANT {unexpected} TO canonical_brain_writer "
-            "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE GRANTED BY postgres;\n",
+            f"GRANT {unexpected} TO canonical_brain_schema_reconciler "
+            "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;\n",
         )
-        assert _schema_reconciliation_role_graph(name, admin) == [
-            "2",
-            "2",
-            "canonical_brain_migration_owner,canonical_brain_writer",
-            admin,
+        assert _schema_reconciliation_role_graph(name, executor) == [
+            "canonical_brain_schema_reconciler",
+            executor,
             "cloudsqladmin",
             "t",
             "t",
@@ -1341,7 +1421,7 @@ def test_schema_reconciliation_rejects_indirect_unexpected_role_before_begin(
             name,
             DATABASE,
             "SELECT pg_catalog.pg_has_role('"
-            + admin
+            + executor
             + "', '"
             + unexpected
             + "', 'MEMBER');",
@@ -1350,17 +1430,20 @@ def test_schema_reconciliation_rejects_indirect_unexpected_role_before_begin(
             schema_reconciliation_db.PostgresSchemaReconciliationDatabase(
                 plan=plan,
                 target=target_asset.contract,
-                admin_config=admin_config,
+                executor_config=executor_config,
                 writer_config=writer_config,
                 managed_hba_receipt=managed_hba_receipt,
+                executor_managed_hba_receipt=executor_hba_receipt,
+                pre_begin_admission=lambda: None,
+                _stabilization_sleep=lambda _seconds: None,
             )
         )
 
         with pytest.raises(
             schema_reconciliation.SchemaReconciliationError,
             match=(
-                "schema_reconciliation_authority_role_graph_"
-                "forward_closure_unexpected"
+                "schema_reconciliation_authority_"
+                "role_graph_stabilization_timeout"
             ),
         ):
             with reconciliation_database.transaction(
@@ -1369,11 +1452,9 @@ def test_schema_reconciliation_rejects_indirect_unexpected_role_before_begin(
                 raise AssertionError("unsafe indirect role reached a transaction")
 
         assert _trampoline_semantic_identity(name) == trampoline_before
-        assert _schema_reconciliation_role_graph(name, admin) == [
-            "2",
-            "2",
-            "canonical_brain_migration_owner,canonical_brain_writer",
-            admin,
+        assert _schema_reconciliation_role_graph(name, executor) == [
+            "canonical_brain_schema_reconciler",
+            executor,
             "cloudsqladmin",
             "t",
             "t",
@@ -1383,9 +1464,8 @@ def test_schema_reconciliation_rejects_indirect_unexpected_role_before_begin(
         _psql(
             name,
             DATABASE,
-            f"REVOKE {unexpected} FROM canonical_brain_writer "
-            "GRANTED BY postgres;\n"
-            f"DROP ROLE IF EXISTS {admin};\n"
+            f"REVOKE {unexpected} FROM canonical_brain_schema_reconciler;\n"
+            f"DROP ROLE IF EXISTS {executor};\n"
             f"DROP ROLE IF EXISTS {unexpected};\n",
         )
 

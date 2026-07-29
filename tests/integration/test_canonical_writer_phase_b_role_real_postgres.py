@@ -12,6 +12,8 @@ import uuid
 import pytest
 
 
+pytestmark = pytest.mark.integration
+
 ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_PATH = (
     ROOT / "scripts" / "sql" / "canonical_writer_foundation_phase_b_role_v1.sql"

@@ -1444,6 +1444,125 @@ def _install_exact_bytes(
     }
 
 
+def _replace_exact_predecessor_bytes(
+    path: Path,
+    payload: bytes,
+    predecessor_payload: bytes,
+    *,
+    mode: int,
+    uid: int = 0,
+    gid: int = 0,
+    _checkpoint: Callable[[str], None] | None = None,
+) -> Mapping[str, Any]:
+    """Crash-replay-safe exact replacement of one proven predecessor file."""
+
+    if (
+        not payload
+        or not predecessor_payload
+        or not path.is_absolute()
+        or payload == predecessor_payload
+    ):
+        if payload == predecessor_payload:
+            physical = _install_exact_bytes(
+                path,
+                payload,
+                mode=mode,
+                uid=uid,
+                gid=gid,
+            )
+            return {
+                **physical,
+                "created": False,
+                "created_by_transaction": False,
+                "replaced_by_transaction": False,
+                "predecessor_sha256": hashlib.sha256(
+                    predecessor_payload
+                ).hexdigest(),
+            }
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_successor_file_invalid"
+        )
+    successor_sha256 = hashlib.sha256(payload).hexdigest()
+    predecessor_sha256 = hashlib.sha256(predecessor_payload).hexdigest()
+    current = _read_regular(
+        path,
+        maximum=max(MAX_JSON_BYTES, len(payload), len(predecessor_payload)),
+        expected_uid=uid,
+        allowed_modes=frozenset({mode}),
+    )
+    current_state = path.lstat()
+    if current_state.st_gid != gid:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_successor_file_invalid"
+        )
+    if current == predecessor_payload:
+        temporary = path.with_name(
+            f".{path.name}.successor.{os.getpid()}."
+            f"{os.urandom(16).hex()}.pending"
+        )
+        descriptor: int | None = None
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(temporary, flags, mode)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError
+                view = view[written:]
+            os.fchmod(descriptor, mode)
+            os.fchown(descriptor, uid, gid)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            _fsync_directory(path.parent)
+            if _checkpoint is not None:
+                _checkpoint("successor_scratch_fsynced")
+            os.replace(temporary, path)
+            _fsync_directory(path.parent)
+            if _checkpoint is not None:
+                _checkpoint("successor_file_replaced")
+        except OSError as exc:
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_successor_file_write_failed"
+            ) from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    elif current != payload:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_successor_file_conflict"
+        )
+    readback = _read_regular(
+        path,
+        maximum=max(MAX_JSON_BYTES, len(payload)),
+        expected_uid=uid,
+        allowed_modes=frozenset({mode}),
+    )
+    readback_state = path.lstat()
+    if readback != payload or readback_state.st_gid != gid:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_successor_file_readback_invalid"
+        )
+    return {
+        "path": str(path),
+        "sha256": successor_sha256,
+        "mode": f"{mode:04o}",
+        "uid": uid,
+        "gid": gid,
+        "created": False,
+        "created_by_transaction": False,
+        "replaced_by_transaction": True,
+        "predecessor_sha256": predecessor_sha256,
+    }
+
+
 def _asset(release: Path, name: str) -> Path:
     return release / "ops/muncho/owner-gate" / name
 
@@ -1532,6 +1651,7 @@ def _install_executor_hosts_file(
     layout: InstallLayout,
     expected_uid: int = 0,
     expected_gid: int = 0,
+    installer: Callable[..., Mapping[str, Any]] | None = None,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     source = _asset(release, "compute-api-hosts.fragment")
     payload = source.read_bytes()
@@ -1562,7 +1682,8 @@ def _install_executor_hosts_file(
             "owner_gate_bootstrap_executor_hosts_manifest_invalid"
         )
     path = layout.etc_root / EXECUTOR_HOSTS_FILENAME
-    installed_file = _install_exact_bytes(
+    install = _install_exact_bytes if installer is None else installer
+    installed_file = install(
         path,
         payload,
         mode=0o444,
@@ -1572,7 +1693,11 @@ def _install_executor_hosts_file(
     # This fixed, service-specific path is owned by the bootstrap contract on
     # every replay.  Normalizing ownership makes a crash after file publication
     # but before journal commit indistinguishable from a clean idempotent retry.
-    file_evidence = {**installed_file, "created": True}
+    file_evidence = (
+        dict(installed_file)
+        if installed_file.get("created_by_transaction") is False
+        else {**installed_file, "created": True}
+    )
     state = path.lstat()
     unsigned = {
         "schema": EXECUTOR_HOSTS_RECEIPT_SCHEMA,
@@ -1837,29 +1962,69 @@ def generate_or_verify_receipt_key(
         )
         created = True
     created_by_transaction = created
+    adopted_from_predecessor: str | None = None
     if transaction_intent is not None:
         targets = transaction_intent.get("targets")
-        expected = {
-            str(private_path): True,
-            str(public_path): True,
-        }
-        if (
-            transaction_intent.get("schema")
-            != "muncho-owner-gate-receipt-key-phase-intent.v1"
-            or not isinstance(targets, list)
-            or {
-                str(item.get("path")): item.get("created_by_transaction")
-                for item in targets
-                if isinstance(item, Mapping)
-            }
-            != expected
-        ):
+        schema = transaction_intent.get("schema")
+        if not isinstance(targets, list):
             raise OwnerGateBootstrapError(
                 "owner_gate_bootstrap_phase_intent_invalid"
             )
-        created_by_transaction = True
-    return {
-        "schema": "muncho-owner-gate-authority-receipt-key.v1",
+        ownership = {
+            str(item.get("path")): item
+            for item in targets
+            if isinstance(item, Mapping)
+        }
+        if set(ownership) != {str(private_path), str(public_path)}:
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_phase_intent_invalid"
+            )
+        if schema == "muncho-owner-gate-receipt-key-phase-intent.v1":
+            if any(
+                item.get("created_by_transaction") is not True
+                for item in ownership.values()
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_phase_intent_invalid"
+                )
+            created_by_transaction = True
+        elif schema == "muncho-owner-gate-receipt-key-phase-intent.v2":
+            adopted_from_predecessor = str(
+                transaction_intent.get("predecessor_sha256", "")
+            )
+            if (
+                set(transaction_intent)
+                != {"schema", "predecessor_sha256", "targets"}
+                or _SHA256.fullmatch(adopted_from_predecessor) is None
+                or created
+                or any(
+                    set(item)
+                    != {
+                        "path",
+                        "created_by_transaction",
+                        "adopted_from_predecessor",
+                        "preserve_on_rollback",
+                    }
+                    or item.get("created_by_transaction") is not False
+                    or item.get("adopted_from_predecessor") is not True
+                    or item.get("preserve_on_rollback") is not True
+                    for item in ownership.values()
+                )
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_phase_intent_invalid"
+                )
+            created_by_transaction = False
+        else:
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_phase_intent_invalid"
+            )
+    evidence = {
+        "schema": (
+            "muncho-owner-gate-authority-receipt-key.v2"
+            if adopted_from_predecessor is not None
+            else "muncho-owner-gate-authority-receipt-key.v1"
+        ),
         "public_key_sha256": hashlib.sha256(public_raw).hexdigest(),
         "public_key_id": hashlib.sha256(
             public_key.public_bytes_raw()
@@ -1870,6 +2035,11 @@ def generate_or_verify_receipt_key(
         "created": created_by_transaction,
         "created_by_transaction": created_by_transaction,
     }
+    if adopted_from_predecessor is not None:
+        evidence["adopted_from_predecessor_sha256"] = (
+            adopted_from_predecessor
+        )
+    return evidence
 
 
 def _validate_web_config_asset(value: Any) -> Mapping[str, Any]:
@@ -1898,6 +2068,102 @@ def install_configuration_units_firewall_and_hosts(
     runner: Callable[[Sequence[str]], bytes] = _default_runner,
     transaction_intent: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
+    successor_targets: dict[str, Mapping[str, Any]] | None = None
+    if (
+        transaction_intent is not None
+        and transaction_intent.get("schema")
+        == "muncho-owner-gate-system-files-phase-intent.v2"
+    ):
+        targets = transaction_intent.get("targets")
+        if (
+            set(transaction_intent)
+            != {"schema", "predecessor_sha256", "targets"}
+            or _SHA256.fullmatch(
+                str(transaction_intent.get("predecessor_sha256", ""))
+            )
+            is None
+            or not isinstance(targets, list)
+        ):
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_phase_intent_invalid"
+            )
+        successor_targets = {}
+        for item in targets:
+            if (
+                not isinstance(item, Mapping)
+                or set(item)
+                != {
+                    "path",
+                    "predecessor_sha256",
+                    "predecessor_payload_b64url",
+                    "mode",
+                    "uid",
+                    "gid",
+                    "created_by_transaction",
+                    "reversible",
+                }
+                or not Path(str(item.get("path", ""))).is_absolute()
+                or _SHA256.fullmatch(
+                    str(item.get("predecessor_sha256", ""))
+                )
+                is None
+                or type(item.get("uid")) is not int
+                or type(item.get("gid")) is not int
+                or item.get("created_by_transaction") is not False
+                or item.get("reversible") is not True
+                or str(item["path"]) in successor_targets
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_phase_intent_invalid"
+                )
+            successor_targets[str(item["path"])] = item
+
+    def install_managed(
+        path: Path,
+        payload: bytes,
+        *,
+        mode: int,
+        uid: int = 0,
+        gid: int = 0,
+    ) -> Mapping[str, Any]:
+        if successor_targets is None:
+            return _install_exact_bytes(
+                path,
+                payload,
+                mode=mode,
+                uid=uid,
+                gid=gid,
+            )
+        item = successor_targets.get(str(path))
+        if (
+            not isinstance(item, Mapping)
+            or item.get("mode") != f"{mode:04o}"
+            or item.get("uid") != uid
+            or item.get("gid") != gid
+        ):
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_phase_intent_invalid"
+            )
+        predecessor_payload = _b64url(
+            item.get("predecessor_payload_b64url"),
+            maximum=MAX_JSON_BYTES,
+        )
+        if (
+            hashlib.sha256(predecessor_payload).hexdigest()
+            != item.get("predecessor_sha256")
+        ):
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_phase_intent_invalid"
+            )
+        return _replace_exact_predecessor_bytes(
+            path,
+            payload,
+            predecessor_payload,
+            mode=mode,
+            uid=uid,
+            gid=gid,
+        )
+
     try:
         executor = json.loads(
             _asset(release, "executor.json").read_text(encoding="utf-8")
@@ -2083,17 +2349,17 @@ def install_configuration_units_firewall_and_hosts(
         "metadata-firewall.rules": layout.etc_root / "metadata-firewall.rules",
     }
     for name, destination in static_configs.items():
-        files.append(_install_exact_bytes(
+        files.append(install_managed(
             destination,
             _asset(release, name).read_bytes(),
             mode=0o444,
         ))
-    files.append(_install_exact_bytes(
+    files.append(install_managed(
         layout.etc_root / "executor.json",
         foundation.canonical_json_bytes(executor),
         mode=0o444,
     ))
-    files.append(_install_exact_bytes(
+    files.append(install_managed(
         layout.etc_root / "cloud-observation-attestor.json",
         foundation.canonical_json_bytes(cloud_attestor),
         mode=0o444,
@@ -2101,31 +2367,31 @@ def install_configuration_units_firewall_and_hosts(
     python_sha = _executable_target_sha256(layout.python)
     if python_sha != bundle.manifest["interpreter_sha256"]:
         raise OwnerGateBootstrapError("owner_gate_bootstrap_runtime_mismatch")
-    files.append(_install_exact_bytes(
+    files.append(install_managed(
         layout.etc_root / "python3.sha256",
         f"{python_sha}  {layout.python}\n".encode("ascii"),
         mode=0o444,
     ))
     for name in ("cloud", "host"):
         source = bundle.root / "trust" / f"{name}-observation-attestation.pub"
-        files.append(_install_exact_bytes(
+        files.append(install_managed(
             layout.etc_root / "public" / f"{name}-observation-attestation.pub",
             source.read_bytes(),
             mode=0o444,
         ))
-    files.append(_install_exact_bytes(
+    files.append(install_managed(
         layout.sysusers_root / "muncho-owner-gate.conf",
         _asset(release, "muncho-owner-gate.sysusers").read_bytes(),
         mode=0o444,
     ))
-    files.append(_install_exact_bytes(
+    files.append(install_managed(
         layout.tmpfiles_root / "muncho-owner-gate.conf",
         _asset(release, "muncho-owner-gate.tmpfiles").read_bytes(),
         mode=0o444,
     ))
     sudoers_source = _asset(release, "muncho-owner-gate.sudoers")
     runner(("/usr/sbin/visudo", "-cf", str(sudoers_source)))
-    files.append(_install_exact_bytes(
+    files.append(install_managed(
         layout.sudoers_root / "muncho-owner-gate",
         sudoers_source.read_bytes(),
         mode=0o440,
@@ -2180,23 +2446,27 @@ def install_configuration_units_firewall_and_hosts(
             provisioning_validation.unlink(missing_ok=True)
         except OSError:
             pass
-    files.append(_install_exact_bytes(
+    files.append(install_managed(
         layout.sudoers_root / "muncho-owner-gate-provisioning",
         provisioning_sudoers,
         mode=0o440,
     ))
     executor_hosts_file, executor_hosts_receipt = (
-        _install_executor_hosts_file(release, layout=layout)
+        _install_executor_hosts_file(
+            release,
+            layout=layout,
+            installer=install_managed,
+        )
     )
     files.append(executor_hosts_file)
     for name in SYSTEMD_ASSETS:
-        files.append(_install_exact_bytes(
+        files.append(install_managed(
             layout.systemd_root / name,
             _asset(release, name).read_bytes(),
             mode=0o444,
         ))
     _attest_executor_hosts_service_isolation(layout=layout)
-    if transaction_intent is not None:
+    if transaction_intent is not None and successor_targets is None:
         targets = transaction_intent.get("targets")
         if (
             transaction_intent.get("schema")
@@ -2233,13 +2503,52 @@ def install_configuration_units_firewall_and_hosts(
             }
             for item in files
         ]
+    elif successor_targets is not None:
+        if set(successor_targets) != {
+            str(item["path"]) for item in files
+        }:
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_phase_intent_invalid"
+            )
+        normalized: list[Mapping[str, Any]] = []
+        for item in files:
+            target = successor_targets[str(item["path"])]
+            if (
+                item.get("created") is not False
+                or item.get("created_by_transaction") is not False
+                or item.get("predecessor_sha256")
+                != target.get("predecessor_sha256")
+                or item.get("replaced_by_transaction")
+                is not (
+                    item.get("sha256")
+                    != target.get("predecessor_sha256")
+                )
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_phase_intent_invalid"
+                )
+            normalized.append(dict(item))
+        files = normalized
     return {
-        "schema": "muncho-owner-gate-installed-system-files.v1",
+        "schema": (
+            "muncho-owner-gate-installed-system-files.v2"
+            if successor_targets is not None
+            else "muncho-owner-gate-installed-system-files.v1"
+        ),
         "files": sorted(files, key=lambda item: str(item["path"])),
         "executor_hosts": executor_hosts_receipt,
         "systemd_units_enabled": [],
         "current_release_selected": False,
         "activation_seal_created": False,
+        **(
+            {
+                "adopted_from_predecessor_sha256": (
+                    transaction_intent["predecessor_sha256"]
+                )
+            }
+            if successor_targets is not None
+            else {}
+        ),
     }
 
 
@@ -2370,17 +2679,20 @@ def bootstrap_and_verify_databases(
         f".{executor_path.name}.bootstrap-stage"
     )
     imported_by_transaction: bool | None = None
+    adopted_from_predecessor: str | None = None
     if transaction_intent is None:
         authority_stage = default_authority_stage
         executor_stage = default_executor_stage
     else:
         targets = transaction_intent.get("targets")
+        intent_schema = transaction_intent.get("schema")
         if (
-            transaction_intent.get("schema")
-            != "muncho-owner-gate-databases-phase-intent.v1"
-            or not isinstance(targets, list)
-            or transaction_intent.get("credential_imported_by_transaction")
-            is not True
+            not isinstance(targets, list)
+            or intent_schema
+            not in {
+                "muncho-owner-gate-databases-phase-intent.v1",
+                "muncho-owner-gate-databases-phase-intent.v2",
+            }
         ):
             raise OwnerGateBootstrapError(
                 "owner_gate_bootstrap_phase_intent_invalid"
@@ -2396,24 +2708,94 @@ def bootstrap_and_verify_databases(
             len(by_path) != 2
             or not isinstance(authority_target, Mapping)
             or not isinstance(executor_target, Mapping)
-            or authority_target.get("created_by_transaction") is not True
-            or executor_target.get("created_by_transaction") is not True
         ):
             raise OwnerGateBootstrapError(
                 "owner_gate_bootstrap_phase_intent_invalid"
             )
-        authority_stage = Path(str(authority_target.get("stage_path", "")))
-        executor_stage = Path(str(executor_target.get("stage_path", "")))
-        if (
+        if intent_schema == "muncho-owner-gate-databases-phase-intent.v1":
+            if (
+                transaction_intent.get(
+                    "credential_imported_by_transaction"
+                )
+                is not True
+                or authority_target.get("created_by_transaction") is not True
+                or executor_target.get("created_by_transaction") is not True
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_phase_intent_invalid"
+                )
+            authority_stage = Path(
+                str(authority_target.get("stage_path", ""))
+            )
+            executor_stage = Path(
+                str(executor_target.get("stage_path", ""))
+            )
+            if (
+                authority_stage.parent != authority_path.parent
+                or executor_stage.parent != executor_path.parent
+                or not authority_stage.name.startswith(
+                    f".{authority_path.name}."
+                )
+                or not executor_stage.name.startswith(
+                    f".{executor_path.name}."
+                )
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_phase_intent_invalid"
+                )
+            imported_by_transaction = True
+        else:
+            adopted_from_predecessor = str(
+                transaction_intent.get("predecessor_sha256", "")
+            )
+            if (
+                set(transaction_intent)
+                != {
+                    "schema",
+                    "predecessor_sha256",
+                    "targets",
+                    "credential_imported_by_transaction",
+                    "credential_id_sha256",
+                    "preserve_append_only_truth_on_rollback",
+                }
+                or _SHA256.fullmatch(adopted_from_predecessor) is None
+                or transaction_intent.get(
+                    "credential_imported_by_transaction"
+                )
+                is not False
+                or transaction_intent.get("credential_id_sha256")
+                != EXPECTED_CREDENTIAL_ID_SHA256
+                or transaction_intent.get(
+                    "preserve_append_only_truth_on_rollback"
+                )
+                is not True
+                or any(
+                    set(item)
+                    != {
+                        "path",
+                        "created_by_transaction",
+                        "adopted_from_predecessor",
+                        "preserve_on_rollback",
+                    }
+                    or item.get("created_by_transaction") is not False
+                    or item.get("adopted_from_predecessor") is not True
+                    or item.get("preserve_on_rollback") is not True
+                    for item in (authority_target, executor_target)
+                )
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_phase_intent_invalid"
+                )
+            authority_stage = default_authority_stage
+            executor_stage = default_executor_stage
+            imported_by_transaction = False
+        if adopted_from_predecessor is None and (
             authority_stage.parent != authority_path.parent
             or executor_stage.parent != executor_path.parent
-            or not authority_stage.name.startswith(f".{authority_path.name}.")
-            or not executor_stage.name.startswith(f".{executor_path.name}.")
         ):
             raise OwnerGateBootstrapError(
                 "owner_gate_bootstrap_phase_intent_invalid"
             )
-        imported_by_transaction = True
     migration = bundle.migration
     credential = webauthn_backend.build_migrated_credential(
         owner_discord_user_id=OWNER_DISCORD_USER_ID,
@@ -2460,6 +2842,96 @@ def bootstrap_and_verify_databases(
             pinned_authority_receipt_public_key=receipt_public_key,
             pinned_authority_receipt_key_id=str(key_receipt["public_key_id"]),
         )
+
+    if adopted_from_predecessor is not None:
+        if (
+            not os.path.lexists(authority_path)
+            or not os.path.lexists(executor_path)
+            or any(
+                os.path.lexists(path)
+                for path in (
+                    *_sqlite_sidecars(authority_path),
+                    *_sqlite_sidecars(executor_path),
+                    authority_stage,
+                    executor_stage,
+                    *_sqlite_sidecars(authority_stage),
+                    *_sqlite_sidecars(executor_stage),
+                )
+            )
+        ):
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_successor_database_invalid"
+            )
+        authority = authority_database(authority_path)
+        executor = executor_database(executor_path)
+        active_credentials = authority.read_active_credentials()
+        if len(active_credentials) != 1:
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_authority_credential_conflict"
+            )
+        adopted_credential = dict(active_credentials[0])
+        stable_fields = (
+            "schema",
+            "owner_discord_user_id",
+            "expected_user_handle_sha256",
+            "credential_id_b64url",
+            "credential_id_sha256",
+            "public_key_cose_b64url",
+            "public_key_cose_sha256",
+            "source_public_key_sha256",
+            "public_key_byte_count",
+            "initial_sign_count",
+            "initial_credential_backed_up",
+            "rp_id",
+            "origin",
+            "status",
+        )
+        adopted_identity = {
+            name: adopted_credential[name] for name in stable_fields
+        }
+        successor_identity = {
+            name: credential[name] for name in stable_fields
+        }
+        if (
+            adopted_identity != successor_identity
+            or adopted_credential.get("credential_id_sha256")
+            != EXPECTED_CREDENTIAL_ID_SHA256
+            or adopted_credential.get("source_public_key_sha256")
+            != EXPECTED_PUBLIC_KEY_SHA256
+            or adopted_credential.get("expected_user_handle_sha256")
+            != EXPECTED_USER_HANDLE_SHA256
+        ):
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_authority_credential_conflict"
+            )
+        return {
+            "schema": (
+                "muncho-owner-gate-canonical-databases-adoption.v1"
+            ),
+            "authority_preflight": authority.preflight(),
+            "executor_preflight": executor.preflight(),
+            "credential_id_sha256": adopted_credential[
+                "credential_id_sha256"
+            ],
+            "credential_record_sha256": adopted_credential[
+                "credential_record_sha256"
+            ],
+            "credential_identity_sha256": foundation.sha256_json(
+                adopted_identity
+            ),
+            "successor_migration_envelope_sha256": migration[
+                "envelope_sha256"
+            ],
+            "credential_count": 1,
+            "credential_imported_this_attempt": False,
+            "credential_imported_by_transaction": False,
+            "authority_database_created_by_transaction": False,
+            "executor_database_created_by_transaction": False,
+            "adopted_from_predecessor_sha256": (
+                adopted_from_predecessor
+            ),
+            "append_only_truth": True,
+        }
 
     imported_this_attempt = False
     authority_created_this_attempt = False
@@ -2880,10 +3352,18 @@ def emit_signed_install_receipt(
 def _attest_installed_file_evidence(evidence: Mapping[str, Any]) -> None:
     allowed_fields = {"path", "sha256", "mode", "uid", "gid", "created"}
     transaction_fields = allowed_fields | {"created_by_transaction"}
+    successor_fields = transaction_fields | {
+        "replaced_by_transaction",
+        "predecessor_sha256",
+    }
     if (
         not isinstance(evidence, Mapping)
         or frozenset(evidence)
-        not in {frozenset(allowed_fields), frozenset(transaction_fields)}
+        not in {
+            frozenset(allowed_fields),
+            frozenset(transaction_fields),
+            frozenset(successor_fields),
+        }
         or _SHA256.fullmatch(str(evidence.get("sha256", ""))) is None
         or type(evidence.get("uid")) is not int
         or type(evidence.get("gid")) is not int
@@ -2892,6 +3372,23 @@ def _attest_installed_file_evidence(evidence: Mapping[str, Any]) -> None:
             "created_by_transaction" in evidence
             and evidence.get("created_by_transaction")
             is not evidence.get("created")
+        )
+        or (
+            frozenset(evidence) == frozenset(successor_fields)
+            and (
+                evidence.get("created") is not False
+                or evidence.get("created_by_transaction") is not False
+                or type(evidence.get("replaced_by_transaction")) is not bool
+                or _SHA256.fullmatch(
+                    str(evidence.get("predecessor_sha256", ""))
+                )
+                is None
+                or evidence.get("replaced_by_transaction")
+                is not (
+                    evidence.get("sha256")
+                    != evidence.get("predecessor_sha256")
+                )
+            )
         )
     ):
         raise OwnerGateBootstrapError(
@@ -3098,8 +3595,41 @@ def _revalidate_committed_phase(
         return dict(stored)
 
     if phase == "generate_or_verify_authority_receipt_key":
+        successor_key = (
+            stored.get("schema")
+            == "muncho-owner-gate-authority-receipt-key.v2"
+        )
         if (
-            stored.get("schema") != "muncho-owner-gate-authority-receipt-key.v1"
+            stored.get("schema")
+            not in {
+                "muncho-owner-gate-authority-receipt-key.v1",
+                "muncho-owner-gate-authority-receipt-key.v2",
+            }
+            or set(stored)
+            != (
+                {
+                    "schema",
+                    "public_key_sha256",
+                    "public_key_id",
+                    "private_key_path",
+                    "public_key_path",
+                    "generated_on_target",
+                    "created",
+                    "created_by_transaction",
+                    "adopted_from_predecessor_sha256",
+                }
+                if successor_key
+                else {
+                    "schema",
+                    "public_key_sha256",
+                    "public_key_id",
+                    "private_key_path",
+                    "public_key_path",
+                    "generated_on_target",
+                    "created",
+                    "created_by_transaction",
+                }
+            )
             or stored.get("private_key_path")
             != str(layout.etc_root / "keys/receipt-signing-key.pem")
             or stored.get("public_key_path")
@@ -3108,6 +3638,21 @@ def _revalidate_committed_phase(
             or type(stored.get("created")) is not bool
             or stored.get("created_by_transaction")
             is not stored.get("created")
+            or (
+                successor_key
+                and (
+                    stored.get("created") is not False
+                    or _SHA256.fullmatch(
+                        str(
+                            stored.get(
+                                "adopted_from_predecessor_sha256",
+                                "",
+                            )
+                        )
+                    )
+                    is None
+                )
+            )
         ):
             raise OwnerGateBootstrapError(
                 "owner_gate_bootstrap_committed_phase_drift"
@@ -3152,22 +3697,62 @@ def _revalidate_committed_phase(
 
     if phase == "install_root_owned_configuration_units_firewall_and_hosts":
         files = stored.get("files")
+        successor_system = (
+            stored.get("schema")
+            == "muncho-owner-gate-installed-system-files.v2"
+        )
         if (
             set(stored)
-            != {
-                "schema",
-                "files",
-                "executor_hosts",
-                "systemd_units_enabled",
-                "current_release_selected",
-                "activation_seal_created",
-            }
+            != (
+                {
+                    "schema",
+                    "files",
+                    "executor_hosts",
+                    "systemd_units_enabled",
+                    "current_release_selected",
+                    "activation_seal_created",
+                    "adopted_from_predecessor_sha256",
+                }
+                if successor_system
+                else {
+                    "schema",
+                    "files",
+                    "executor_hosts",
+                    "systemd_units_enabled",
+                    "current_release_selected",
+                    "activation_seal_created",
+                }
+            )
             or stored.get("schema")
-            != "muncho-owner-gate-installed-system-files.v1"
+            not in {
+                "muncho-owner-gate-installed-system-files.v1",
+                "muncho-owner-gate-installed-system-files.v2",
+            }
             or not isinstance(files, list)
             or stored.get("systemd_units_enabled") != []
             or stored.get("current_release_selected") is not False
             or stored.get("activation_seal_created") is not False
+            or (
+                successor_system
+                and (
+                    _SHA256.fullmatch(
+                        str(
+                            stored.get(
+                                "adopted_from_predecessor_sha256",
+                                "",
+                            )
+                        )
+                    )
+                    is None
+                    or stored.get(
+                        "adopted_from_predecessor_sha256"
+                    )
+                    != all_evidence.get(
+                        "generate_or_verify_authority_receipt_key",
+                        {},
+                    ).get("adopted_from_predecessor_sha256")
+                )
+            )
         ):
             raise OwnerGateBootstrapError(
                 "owner_gate_bootstrap_committed_phase_drift"
@@ -3194,8 +3779,10 @@ def _revalidate_committed_phase(
             or file_evidence.get("mode") != executor_hosts["mode"]
             or file_evidence.get("uid") != executor_hosts["uid"]
             or file_evidence.get("gid") != executor_hosts["gid"]
-            or file_evidence.get("created") is not True
-            or file_evidence.get("created_by_transaction") is not True
+            or file_evidence.get("created")
+            is not (False if successor_system else True)
+            or file_evidence.get("created_by_transaction")
+            is not (False if successor_system else True)
         ):
             raise OwnerGateBootstrapError(
                 "owner_gate_bootstrap_committed_phase_drift"
@@ -3261,6 +3848,98 @@ def _revalidate_committed_phase(
                 migration["expected_user_handle_b64url"], maximum=256
             ),
         )
+        if (
+            stored.get("schema")
+            == "muncho-owner-gate-canonical-databases-adoption.v1"
+        ):
+            active_credentials = authority.read_active_credentials()
+            if len(active_credentials) != 1:
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_committed_phase_drift"
+                )
+            adopted_credential = dict(active_credentials[0])
+            stable_fields = (
+                "schema",
+                "owner_discord_user_id",
+                "expected_user_handle_sha256",
+                "credential_id_b64url",
+                "credential_id_sha256",
+                "public_key_cose_b64url",
+                "public_key_cose_sha256",
+                "source_public_key_sha256",
+                "public_key_byte_count",
+                "initial_sign_count",
+                "initial_credential_backed_up",
+                "rp_id",
+                "origin",
+                "status",
+            )
+            adopted_identity = {
+                name: adopted_credential[name] for name in stable_fields
+            }
+            successor_identity = {
+                name: credential[name] for name in stable_fields
+            }
+            if (
+                adopted_identity != successor_identity
+                or set(stored)
+                != {
+                    "schema",
+                    "authority_preflight",
+                    "executor_preflight",
+                    "credential_id_sha256",
+                    "credential_record_sha256",
+                    "credential_identity_sha256",
+                    "successor_migration_envelope_sha256",
+                    "credential_count",
+                    "credential_imported_this_attempt",
+                    "credential_imported_by_transaction",
+                    "authority_database_created_by_transaction",
+                    "executor_database_created_by_transaction",
+                    "adopted_from_predecessor_sha256",
+                    "append_only_truth",
+                }
+                or stored.get("authority_preflight")
+                != authority.preflight()
+                or stored.get("executor_preflight") != executor.preflight()
+                or stored.get("credential_id_sha256")
+                != adopted_credential["credential_id_sha256"]
+                or stored.get("credential_record_sha256")
+                != adopted_credential["credential_record_sha256"]
+                or stored.get("credential_identity_sha256")
+                != foundation.sha256_json(adopted_identity)
+                or stored.get("successor_migration_envelope_sha256")
+                != migration["envelope_sha256"]
+                or stored.get("credential_count") != 1
+                or stored.get("credential_imported_this_attempt") is not False
+                or stored.get("credential_imported_by_transaction") is not False
+                or stored.get(
+                    "authority_database_created_by_transaction"
+                )
+                is not False
+                or stored.get(
+                    "executor_database_created_by_transaction"
+                )
+                is not False
+                or _SHA256.fullmatch(
+                    str(
+                        stored.get(
+                            "adopted_from_predecessor_sha256",
+                            "",
+                        )
+                    )
+                )
+                is None
+                or stored.get("adopted_from_predecessor_sha256")
+                != key_evidence.get(
+                    "adopted_from_predecessor_sha256"
+                )
+                or stored.get("append_only_truth") is not True
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_committed_phase_drift"
+                )
+            return dict(stored)
         if (
             stored.get("schema")
             != "muncho-owner-gate-canonical-databases-bootstrap.v1"
@@ -3491,14 +4170,720 @@ def _configuration_target_paths(layout: InstallLayout) -> tuple[Path, ...]:
     )
 
 
+_INSTALL_RECEIPT_FIELDS = frozenset({
+    "schema",
+    "release_revision",
+    "package_sha256",
+    "source_tree_oid",
+    "pre_foundation_authority_sha256",
+    "foundation_apply_receipt_sha256",
+    "project_ancestry_evidence_sha256",
+    "project_ancestry_chain_sha256",
+    "resource_ancestor_chain",
+    "installed_at_unix",
+    "release_path",
+    "release_tree_sha256",
+    "transaction_prefix_sha256",
+    "phase_evidence_sha256",
+    "authority_receipt_public_key_sha256",
+    "authority_receipt_public_key_id",
+    "credential_id_sha256",
+    "executor_hosts_receipt_sha256",
+    "current_release_selected",
+    "systemd_units_enabled",
+    "activation_performed",
+    "activation_seal_created",
+    "iam_binding_created",
+    "cloud_mutation_performed",
+    "caddy_cutover_performed",
+    "receipt_sha256",
+    "signer_key_id",
+    "signature_ed25519_b64url",
+})
+
+
+@contextmanager
+def _exclusive_host_install_lock(
+    layout: InstallLayout,
+) -> Iterator[None]:
+    """Serialize all release journals without creating mutable lock state."""
+
+    root = layout.state_root / "bootstrap-receipts"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            root,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_host_install_locked"
+            ) from None
+        yield
+    except OSError as exc:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_host_install_lock_invalid"
+        ) from None
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
+def _require_inert_successor_host(
+    *,
+    layout: InstallLayout,
+    runner: Callable[[Sequence[str]], bytes],
+) -> None:
+    seal = layout.etc_root / foundation.MUTATION_ENABLE_SEAL.name
+    if os.path.lexists(layout.current_link) or os.path.lexists(seal):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_successor_host_not_inert"
+        )
+    command = [
+        "/usr/bin/systemctl",
+        "show",
+        "--no-pager",
+        "--property=Id",
+        "--property=ActiveState",
+        "--property=UnitFileState",
+        *SYSTEMD_ASSETS,
+    ]
+    try:
+        raw = runner(tuple(command))
+        blocks = raw.decode("ascii", errors="strict").strip().split("\n\n")
+        observed = {}
+        for block in blocks:
+            values = dict(
+                line.split("=", 1)
+                for line in block.splitlines()
+                if line
+            )
+            unit = values.get("Id")
+            if not isinstance(unit, str) or unit in observed:
+                raise ValueError
+            observed[unit] = values
+    except (UnicodeError, ValueError) as exc:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_successor_service_state_invalid"
+        ) from None
+    if (
+        set(observed) != set(SYSTEMD_ASSETS)
+        or any(
+            values
+            != {
+                "Id": unit,
+                "ActiveState": "inactive",
+                "UnitFileState": "disabled",
+            }
+            for unit, values in observed.items()
+        )
+    ):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_successor_service_state_invalid"
+        )
+
+
+def _predecessor_release_tree(
+    release: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> tuple[str, int]:
+    state = release.lstat()
+    if (
+        not stat.S_ISDIR(state.st_mode)
+        or state.st_uid != expected_uid
+        or state.st_gid != expected_gid
+        or stat.S_IMODE(state.st_mode) != 0o555
+        or (release / ".bootstrap-wheelhouse").exists()
+        or (release / ".bootstrap-wheelhouse-installed.json").exists()
+        or any(release.rglob("__pycache__"))
+    ):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_release_invalid"
+        )
+    projection: list[dict[str, Any]] = []
+    for path in sorted(
+        release.rglob("*"),
+        key=lambda item: str(item.relative_to(release)),
+    ):
+        relative = str(path.relative_to(release))
+        item_state = path.lstat()
+        if (
+            item_state.st_uid != expected_uid
+            or item_state.st_gid != expected_gid
+        ):
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_predecessor_release_invalid"
+            )
+        if stat.S_ISLNK(item_state.st_mode):
+            link = os.readlink(path)
+            if os.path.isabs(link) or ".." in Path(link).parts:
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_predecessor_release_invalid"
+                )
+            projection.append({
+                "path": relative,
+                "type": "symlink",
+                "target": link,
+            })
+        elif stat.S_ISDIR(item_state.st_mode):
+            if stat.S_IMODE(item_state.st_mode) != 0o555:
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_predecessor_release_invalid"
+                )
+            projection.append({
+                "path": relative,
+                "type": "directory",
+                "mode": "0555",
+            })
+        elif stat.S_ISREG(item_state.st_mode):
+            mode = stat.S_IMODE(item_state.st_mode)
+            if mode not in {0o444, 0o555}:
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_predecessor_release_invalid"
+                )
+            digest, size = package._sha256_file(path)
+            projection.append({
+                "path": relative,
+                "type": "file",
+                "mode": f"{mode:04o}",
+                "sha256": digest,
+                "size": size,
+            })
+        else:
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_predecessor_release_invalid"
+            )
+    return foundation.sha256_json(projection), len(projection)
+
+
+def _load_predecessor_transaction(
+    revision: str,
+    *,
+    layout: InstallLayout,
+    expected_uid: int,
+    expected_gid: int,
+) -> Mapping[str, Any]:
+    if _REVISION.fullmatch(revision) is None:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_invalid"
+        )
+    journal_path = (
+        layout.state_root
+        / "bootstrap-receipts"
+        / f"transaction-{revision}.json"
+    )
+    journal = bootstrap_journal.BootstrapInstallJournal(
+        journal_path,
+        owner_uid=expected_uid,
+        owner_gid=expected_gid,
+    )
+    try:
+        with journal.transaction_lease(create=False):
+            manifest = journal.read("manifest")
+            terminal = journal.read("terminal-success")
+            if (
+                not isinstance(manifest, Mapping)
+                or not isinstance(terminal, Mapping)
+                or any(
+                    journal.read(name) is not None
+                    for name in (
+                        "rollback-intent",
+                        "rollback-success",
+                        "rollback-terminal",
+                    )
+                )
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_predecessor_invalid"
+                )
+            predecessor_bundle = VerifiedBundle(
+                root=Path("/"),
+                manifest={
+                    "release_revision": revision,
+                    "package_sha256": manifest.get("package_sha256"),
+                },
+                authority={},
+                migration={},
+            )
+            transaction, pending = _load_transaction_from_journal(
+                journal,
+                bundle=predecessor_bundle,
+            )
+    except bootstrap_journal.BootstrapJournalError as exc:
+        raise OwnerGateBootstrapError(str(exc)) from None
+    if pending is not None or not transaction["complete"]:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_invalid"
+        )
+    return transaction
+
+
+def _validate_predecessor_install(
+    revision: str,
+    *,
+    layout: InstallLayout,
+    runner: Callable[[Sequence[str]], bytes],
+    expected_uid: int,
+    expected_gid: int,
+    expected_projection: Mapping[str, Any] | None = None,
+    require_configuration_exact: bool,
+) -> Mapping[str, Any]:
+    """Validate one completed inert install as the sole successor authority."""
+
+    transaction = _load_predecessor_transaction(
+        revision,
+        layout=layout,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    evidence = {
+        str(item["phase"]): dict(item["evidence"])
+        for item in transaction["completed_phases"]
+    }
+    evidence_hashes = {
+        str(item["phase"]): str(item["evidence_sha256"])
+        for item in transaction["completed_phases"]
+    }
+    key_evidence = evidence.get(INSTALL_PHASES[2])
+    system_evidence = evidence.get(INSTALL_PHASES[3])
+    database_evidence = evidence.get(INSTALL_PHASES[4])
+    release_evidence = evidence.get(INSTALL_PHASES[5])
+    receipt_reference = evidence.get(INSTALL_PHASES[6])
+    if not all(
+        isinstance(item, Mapping)
+        for item in (
+            key_evidence,
+            system_evidence,
+            database_evidence,
+            release_evidence,
+            receipt_reference,
+        )
+    ):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_invalid"
+        )
+    public_path = layout.etc_root / "public/authority-receipt-public.pem"
+    public_raw = _read_regular(
+        public_path,
+        maximum=4096,
+        expected_uid=expected_uid,
+        allowed_modes=frozenset({0o444}),
+    )
+    try:
+        public_key = serialization.load_pem_public_key(public_raw)
+    except (TypeError, ValueError) as exc:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_key_invalid"
+        ) from None
+    if not isinstance(public_key, Ed25519PublicKey):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_key_invalid"
+        )
+    public_sha256 = hashlib.sha256(public_raw).hexdigest()
+    public_key_id = hashlib.sha256(public_key.public_bytes_raw()).hexdigest()
+    if (
+        key_evidence.get("public_key_path") != str(public_path)
+        or key_evidence.get("public_key_sha256") != public_sha256
+        or key_evidence.get("public_key_id") != public_key_id
+    ):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_key_invalid"
+        )
+
+    receipt_path = (
+        layout.state_root
+        / "bootstrap-receipts"
+        / f"install-{revision}.json"
+    )
+    receipt_raw = _read_regular(
+        receipt_path,
+        maximum=MAX_JSON_BYTES,
+        expected_uid=expected_uid,
+        allowed_modes=frozenset({0o400}),
+    )
+    receipt = _canonical_json(receipt_raw)
+    signature_text = receipt.get("signature_ed25519_b64url")
+    signature = _b64url(signature_text, maximum=64)
+    signed = {
+        name: item
+        for name, item in receipt.items()
+        if name not in {"signer_key_id", "signature_ed25519_b64url"}
+    }
+    unsigned = {
+        name: item for name, item in signed.items() if name != "receipt_sha256"
+    }
+    if len(signature) != 64:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_receipt_invalid"
+        )
+    try:
+        public_key.verify(
+            signature,
+            foundation.canonical_json_bytes(signed),
+        )
+    except (InvalidSignature, ValueError) as exc:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_receipt_invalid"
+        ) from None
+    phase_hashes = receipt.get("phase_evidence_sha256")
+    if (
+        frozenset(receipt) != _INSTALL_RECEIPT_FIELDS
+        or receipt.get("schema") != BOOTSTRAP_RECEIPT_SCHEMA
+        or receipt.get("release_revision") != revision
+        or receipt.get("package_sha256")
+        != transaction["package_sha256"]
+        or receipt.get("release_path")
+        != str(layout.release_base / revision)
+        or receipt.get("receipt_sha256")
+        != foundation.sha256_json(unsigned)
+        or receipt.get("signer_key_id") != public_key_id
+        or receipt.get("authority_receipt_public_key_id")
+        != public_key_id
+        or receipt.get("authority_receipt_public_key_sha256")
+        != public_sha256
+        or receipt.get("transaction_prefix_sha256")
+        != transaction["completed_phases"][-2]["phase_success_sha256"]
+        or phase_hashes
+        != {
+            phase: evidence_hashes[phase]
+            for phase in INSTALL_PHASES[:-1]
+        }
+        or receipt.get("systemd_units_enabled") != []
+        or any(
+            receipt.get(name) is not False
+            for name in (
+                "current_release_selected",
+                "activation_performed",
+                "activation_seal_created",
+                "iam_binding_created",
+                "cloud_mutation_performed",
+                "caddy_cutover_performed",
+            )
+        )
+        or receipt_reference.get("receipt_path") != str(receipt_path)
+        or receipt_reference.get("receipt_sha256")
+        != receipt.get("receipt_sha256")
+        or receipt_reference.get("signed_receipt_file_sha256")
+        != hashlib.sha256(receipt_raw).hexdigest()
+    ):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_receipt_invalid"
+        )
+
+    files = system_evidence.get("files")
+    if (
+        system_evidence.get("schema")
+        not in {
+            "muncho-owner-gate-installed-system-files.v1",
+            "muncho-owner-gate-installed-system-files.v2",
+        }
+        or not isinstance(files, list)
+        or {str(item.get("path")) for item in files if isinstance(item, Mapping)}
+        != {str(path) for path in _configuration_target_paths(layout)}
+    ):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_configuration_invalid"
+        )
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise OwnerGateBootstrapError(
+                "owner_gate_bootstrap_predecessor_configuration_invalid"
+            )
+        if require_configuration_exact:
+            _attest_installed_file_evidence(item)
+    if require_configuration_exact:
+        _attest_executor_hosts_service_isolation(layout=layout)
+
+    release = layout.release_base / revision
+    tree_sha256, node_count = _predecessor_release_tree(
+        release,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if (
+        release_evidence.get("release_revision") != revision
+        or release_evidence.get("release_path") != str(release)
+        or release_evidence.get("release_tree_sha256") != tree_sha256
+        or release_evidence.get("release_node_count") != node_count
+        or receipt.get("release_tree_sha256") != tree_sha256
+    ):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_release_invalid"
+        )
+
+    from scripts.canary import passkey_v2_sqlite as sqlite_backend
+
+    authority = sqlite_backend.PasskeyV2AuthorityDatabase(
+        layout.state_root / "authority/passkey-v2.sqlite3",
+        authority_uid=AUTHORITY_UID,
+        authority_gid=AUTHORITY_UID,
+    )
+    executor = sqlite_backend.PasskeyV2ExecutorDatabase(
+        layout.state_root / "executor/execution-v2.sqlite3",
+        executor_uid=EXECUTOR_UID,
+        executor_gid=EXECUTOR_UID,
+        pinned_authority_receipt_public_key=public_key,
+        pinned_authority_receipt_key_id=public_key_id,
+    )
+    credentials = authority.read_active_credentials()
+    if (
+        len(credentials) != 1
+        or credentials[0].get("credential_id_sha256")
+        != EXPECTED_CREDENTIAL_ID_SHA256
+        or credentials[0].get("source_public_key_sha256")
+        != EXPECTED_PUBLIC_KEY_SHA256
+        or credentials[0].get("expected_user_handle_sha256")
+        != EXPECTED_USER_HANDLE_SHA256
+        or receipt.get("credential_id_sha256")
+        != EXPECTED_CREDENTIAL_ID_SHA256
+        or database_evidence.get("append_only_truth") is not True
+    ):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_database_invalid"
+        )
+    authority_preflight = authority.preflight()
+    executor_preflight = executor.preflight()
+    unsigned_projection = {
+        "schema": "muncho-owner-gate-predecessor-install.v1",
+        "release_revision": revision,
+        "package_sha256": transaction["package_sha256"],
+        "journal_transaction_id": transaction["journal_transaction_id"],
+        "journal_manifest_sha256": transaction[
+            "journal_manifest_sha256"
+        ],
+        "install_terminal_sha256": transaction["transaction_sha256"],
+        "install_receipt_sha256": receipt["receipt_sha256"],
+        "install_receipt_file_sha256": hashlib.sha256(
+            receipt_raw
+        ).hexdigest(),
+        "authority_receipt_public_key_sha256": public_sha256,
+        "authority_receipt_public_key_id": public_key_id,
+        "system_files_evidence_sha256": evidence_hashes[INSTALL_PHASES[3]],
+        "database_evidence_sha256": evidence_hashes[INSTALL_PHASES[4]],
+        "release_tree_sha256": tree_sha256,
+        "authority_preflight_sha256": authority_preflight[
+            "preflight_sha256"
+        ],
+        "executor_preflight_sha256": executor_preflight[
+            "preflight_sha256"
+        ],
+        "credential_record_sha256": credentials[0][
+            "credential_record_sha256"
+        ],
+        "activation_performed": False,
+        "cloud_mutation_performed": False,
+    }
+    projection = {
+        **unsigned_projection,
+        "predecessor_sha256": foundation.sha256_json(
+            unsigned_projection
+        ),
+    }
+    if expected_projection is not None and projection != expected_projection:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_drift"
+        )
+    return {
+        "projection": projection,
+        "transaction": transaction,
+        "system_evidence": system_evidence,
+    }
+
+
+def _recorded_predecessor_projection(
+    bundle: VerifiedBundle,
+    *,
+    layout: InstallLayout,
+    expected_uid: int,
+    expected_gid: int,
+) -> Mapping[str, Any] | None:
+    journal_path = (
+        layout.state_root
+        / "bootstrap-receipts"
+        / f"transaction-{bundle.revision}.json"
+    )
+    journal_root = journal_path.with_suffix(".journal")
+    if not journal_root.exists():
+        return None
+    journal = bootstrap_journal.BootstrapInstallJournal(
+        journal_path,
+        owner_uid=expected_uid,
+        owner_gid=expected_gid,
+    )
+    try:
+        with journal.transaction_lease(create=False):
+            p0 = journal.read("p0-intent")
+            if p0 is None:
+                return None
+            _transaction, _pending = _load_transaction_from_journal(
+                journal,
+                bundle=bundle,
+            )
+    except bootstrap_journal.BootstrapJournalError as exc:
+        raise OwnerGateBootstrapError(str(exc)) from None
+    intent = p0.get("intent") if isinstance(p0, Mapping) else None
+    predecessor = (
+        intent.get("predecessor")
+        if isinstance(intent, Mapping)
+        and intent.get("schema")
+        == "muncho-owner-gate-runtime-phase-intent.v2"
+        and intent.get("install_mode") == "successor"
+        else None
+    )
+    if (
+        not isinstance(intent, Mapping)
+        or set(intent)
+        != {
+            "schema",
+            "release_revision",
+            "package_sha256",
+            "install_mode",
+            "predecessor",
+            "side_effects",
+        }
+        or intent.get("release_revision") != bundle.revision
+        or intent.get("package_sha256")
+        != bundle.manifest["package_sha256"]
+        or intent.get("side_effects") != []
+        or not isinstance(predecessor, Mapping)
+        or predecessor.get("predecessor_sha256")
+        != foundation.sha256_json({
+            name: item
+            for name, item in predecessor.items()
+            if name != "predecessor_sha256"
+        })
+    ):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_invalid"
+        )
+    return dict(predecessor)
+
+
+def _resolve_predecessor_install(
+    bundle: VerifiedBundle,
+    *,
+    layout: InstallLayout,
+    runner: Callable[[Sequence[str]], bytes],
+    expected_uid: int,
+    expected_gid: int,
+) -> Mapping[str, Any] | None:
+    recorded = _recorded_predecessor_projection(
+        bundle,
+        layout=layout,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if recorded is not None:
+        _require_inert_successor_host(layout=layout, runner=runner)
+        return _validate_predecessor_install(
+            str(recorded["release_revision"]),
+            layout=layout,
+            runner=runner,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            expected_projection=recorded,
+            require_configuration_exact=False,
+        )
+
+    managed_targets = (
+        layout.etc_root / "keys/receipt-signing-key.pem",
+        layout.etc_root / "public/authority-receipt-public.pem",
+        *_configuration_target_paths(layout),
+        layout.state_root / "authority/passkey-v2.sqlite3",
+        layout.state_root / "executor/execution-v2.sqlite3",
+    )
+    if not any(os.path.lexists(path) for path in managed_targets):
+        return None
+    _require_inert_successor_host(layout=layout, runner=runner)
+    public_raw = _read_regular(
+        layout.etc_root / "public/authority-receipt-public.pem",
+        maximum=4096,
+        expected_uid=expected_uid,
+        allowed_modes=frozenset({0o444}),
+    )
+    try:
+        public_key = serialization.load_pem_public_key(public_raw)
+    except (TypeError, ValueError) as exc:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_key_invalid"
+        ) from None
+    if not isinstance(public_key, Ed25519PublicKey):
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_key_invalid"
+        )
+    key_id = hashlib.sha256(public_key.public_bytes_raw()).hexdigest()
+    receipts = layout.state_root / "bootstrap-receipts"
+    matching: list[str] = []
+    for path in sorted(receipts.glob("install-*.json")):
+        match = re.fullmatch(r"install-([0-9a-f]{40})\.json", path.name)
+        if match is None:
+            continue
+        value = _canonical_json(_read_regular(
+            path,
+            maximum=MAX_JSON_BYTES,
+            expected_uid=expected_uid,
+            allowed_modes=frozenset({0o400}),
+        ))
+        if value.get("signer_key_id") == key_id:
+            matching.append(match.group(1))
+    exact: list[str] = []
+    for revision in matching:
+        transaction = _load_predecessor_transaction(
+            revision,
+            layout=layout,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        system = next(
+            (
+                item["evidence"]
+                for item in transaction["completed_phases"]
+                if item["phase"] == INSTALL_PHASES[3]
+            ),
+            None,
+        )
+        files = system.get("files") if isinstance(system, Mapping) else None
+        if not isinstance(files, list):
+            continue
+        try:
+            for item in files:
+                _attest_installed_file_evidence(item)
+        except (OSError, OwnerGateBootstrapError):
+            continue
+        exact.append(revision)
+    if len(exact) != 1:
+        raise OwnerGateBootstrapError(
+            "owner_gate_bootstrap_predecessor_ambiguous"
+        )
+    return _validate_predecessor_install(
+        exact[0],
+        layout=layout,
+        runner=runner,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        require_configuration_exact=True,
+    )
+
+
 def _production_phase_intent_builders(
     *,
     bundle: VerifiedBundle,
     release: Path,
     layout: InstallLayout,
     transaction_context: Mapping[str, Any],
+    predecessor: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Callable[[], Mapping[str, Any]]]:
-    """Build fixed fresh-VM intents before any managed side effect."""
+    """Build fixed fresh-VM or receipt-bound successor intents."""
 
     private_key = layout.etc_root / "keys/receipt-signing-key.pem"
     public_key = layout.etc_root / "public/authority-receipt-public.pem"
@@ -3512,8 +4897,25 @@ def _production_phase_intent_builders(
         / "bootstrap-receipts"
         / f"install-{bundle.revision}.json"
     )
+    predecessor_projection = (
+        None if predecessor is None else predecessor["projection"]
+    )
+    predecessor_sha256 = (
+        None
+        if predecessor_projection is None
+        else str(predecessor_projection["predecessor_sha256"])
+    )
 
     def runtime() -> Mapping[str, Any]:
+        if predecessor_projection is not None:
+            return {
+                "schema": "muncho-owner-gate-runtime-phase-intent.v2",
+                "release_revision": bundle.revision,
+                "package_sha256": bundle.manifest["package_sha256"],
+                "install_mode": "successor",
+                "predecessor": dict(predecessor_projection),
+                "side_effects": [],
+            }
         return {
             "schema": "muncho-owner-gate-runtime-phase-intent.v1",
             "release_revision": bundle.revision,
@@ -3532,6 +4934,22 @@ def _production_phase_intent_builders(
         }
 
     def receipt_key() -> Mapping[str, Any]:
+        if predecessor_projection is not None:
+            return {
+                "schema": (
+                    "muncho-owner-gate-receipt-key-phase-intent.v2"
+                ),
+                "predecessor_sha256": predecessor_sha256,
+                "targets": [
+                    {
+                        "path": str(path),
+                        "created_by_transaction": False,
+                        "adopted_from_predecessor": True,
+                        "preserve_on_rollback": True,
+                    }
+                    for path in (private_key, public_key)
+                ],
+            }
         _require_fresh_targets_absent(
             (private_key, public_key),
             phase="generate_or_verify_authority_receipt_key",
@@ -3549,6 +4967,71 @@ def _production_phase_intent_builders(
         }
 
     def system_files() -> Mapping[str, Any]:
+        if predecessor_projection is not None:
+            system_evidence = predecessor.get("system_evidence")
+            files = (
+                system_evidence.get("files")
+                if isinstance(system_evidence, Mapping)
+                else None
+            )
+            if (
+                not isinstance(files, list)
+                or {
+                    str(item.get("path"))
+                    for item in files
+                    if isinstance(item, Mapping)
+                }
+                != {str(path) for path in configuration_targets}
+            ):
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_predecessor_configuration_invalid"
+                )
+            targets: list[Mapping[str, Any]] = []
+            for item in sorted(files, key=lambda value: str(value["path"])):
+                try:
+                    mode = int(str(item["mode"]), 8)
+                    uid = int(item["uid"])
+                    gid = int(item["gid"])
+                    path = Path(str(item["path"]))
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise OwnerGateBootstrapError(
+                        "owner_gate_bootstrap_predecessor_configuration_invalid"
+                    ) from None
+                raw = _read_regular(
+                    path,
+                    maximum=MAX_JSON_BYTES,
+                    expected_uid=uid,
+                    allowed_modes=frozenset({mode}),
+                )
+                if (
+                    path.lstat().st_gid != gid
+                    or hashlib.sha256(raw).hexdigest()
+                    != item.get("sha256")
+                ):
+                    raise OwnerGateBootstrapError(
+                        "owner_gate_bootstrap_predecessor_configuration_invalid"
+                    )
+                targets.append({
+                    "path": str(path),
+                    "predecessor_sha256": hashlib.sha256(raw).hexdigest(),
+                    "predecessor_payload_b64url": base64.urlsafe_b64encode(
+                        raw
+                    )
+                    .rstrip(b"=")
+                    .decode("ascii"),
+                    "mode": f"{mode:04o}",
+                    "uid": uid,
+                    "gid": gid,
+                    "created_by_transaction": False,
+                    "reversible": True,
+                })
+            return {
+                "schema": (
+                    "muncho-owner-gate-system-files-phase-intent.v2"
+                ),
+                "predecessor_sha256": predecessor_sha256,
+                "targets": targets,
+            }
         _require_fresh_targets_absent(
             configuration_targets,
             phase="install_root_owned_configuration_units_firewall_and_hosts",
@@ -3566,6 +5049,23 @@ def _production_phase_intent_builders(
         }
 
     def databases() -> Mapping[str, Any]:
+        if predecessor_projection is not None:
+            return {
+                "schema": "muncho-owner-gate-databases-phase-intent.v2",
+                "predecessor_sha256": predecessor_sha256,
+                "targets": [
+                    {
+                        "path": str(path),
+                        "created_by_transaction": False,
+                        "adopted_from_predecessor": True,
+                        "preserve_on_rollback": True,
+                    }
+                    for path in (authority_database, executor_database)
+                ],
+                "credential_imported_by_transaction": False,
+                "credential_id_sha256": EXPECTED_CREDENTIAL_ID_SHA256,
+                "preserve_append_only_truth_on_rollback": True,
+            }
         transaction_id = str(transaction_context["transaction_id"])
         authority_stage = authority_database.with_name(
             f".{authority_database.name}.{transaction_id}.stage"
@@ -3657,8 +5157,9 @@ def _production_fresh_target_guard(
     bundle: VerifiedBundle,
     layout: InstallLayout,
     transaction_context: Mapping[str, Any],
+    predecessor: Mapping[str, Any] | None = None,
 ) -> Callable[[frozenset[str]], None]:
-    """Reject every unexplained managed target before the first side effect."""
+    """Reject unexplained targets; allow only a proven inert predecessor."""
 
     key_targets = (
         layout.etc_root / "keys/receipt-signing-key.pem",
@@ -3699,6 +5200,33 @@ def _production_fresh_target_guard(
         }
         for phase, targets in targets_by_phase.items():
             if phase not in authorized_phases:
+                if (
+                    predecessor is not None
+                    and phase
+                    in {
+                        INSTALL_PHASES[2],
+                        INSTALL_PHASES[3],
+                        INSTALL_PHASES[4],
+                    }
+                ):
+                    if phase == INSTALL_PHASES[3]:
+                        system = predecessor.get("system_evidence")
+                        files = (
+                            system.get("files")
+                            if isinstance(system, Mapping)
+                            else None
+                        )
+                        if not isinstance(files, list):
+                            raise OwnerGateBootstrapError(
+                                "owner_gate_bootstrap_predecessor_configuration_invalid"
+                            )
+                        for item in files:
+                            if not isinstance(item, Mapping):
+                                raise OwnerGateBootstrapError(
+                                    "owner_gate_bootstrap_predecessor_configuration_invalid"
+                                )
+                            _attest_installed_file_evidence(item)
+                    continue
                 _require_fresh_targets_absent(targets, phase=phase)
 
         database_intent = transaction_context.get("phase_intents", {}).get(
@@ -3735,6 +5263,29 @@ def install_after_stage0(
     runner: Callable[[Sequence[str]], bytes] = _default_runner,
     now_unix: int | None = None,
 ) -> Mapping[str, Any]:
+    """Serialize and complete/replay one inert host install transaction."""
+
+    if layout != PRODUCTION_LAYOUT or os.geteuid() != 0:  # windows-footgun: ok — Debian root boundary
+        raise OwnerGateBootstrapError("owner_gate_bootstrap_root_required")
+    _ensure_bootstrap_state_roots(layout)
+    with _exclusive_host_install_lock(layout):
+        return _install_after_stage0_locked(
+            bundle_root,
+            release,
+            layout=layout,
+            runner=runner,
+            now_unix=now_unix,
+        )
+
+
+def _install_after_stage0_locked(
+    bundle_root: Path,
+    release: Path,
+    *,
+    layout: InstallLayout = PRODUCTION_LAYOUT,
+    runner: Callable[[Sequence[str]], bytes] = _default_runner,
+    now_unix: int | None = None,
+) -> Mapping[str, Any]:
     """Complete/replay the inert target transaction after stage-zero venv setup."""
 
     if layout != PRODUCTION_LAYOUT or os.geteuid() != 0:  # windows-footgun: ok — Debian root boundary
@@ -3750,6 +5301,13 @@ def install_after_stage0(
     if timestamp <= 0:
         raise OwnerGateBootstrapError("owner_gate_bootstrap_time_invalid")
     _ensure_bootstrap_state_roots(layout)
+    predecessor = _resolve_predecessor_install(
+        bundle,
+        layout=layout,
+        runner=runner,
+        expected_uid=0,
+        expected_gid=0,
+    )
     journal_path = (
         layout.state_root
         / "bootstrap-receipts"
@@ -3847,11 +5405,13 @@ def install_after_stage0(
             release=release,
             layout=layout,
             transaction_context=transaction_context,
+            predecessor=predecessor,
         ),
         fresh_target_guard=_production_fresh_target_guard(
             bundle=bundle,
             layout=layout,
             transaction_context=transaction_context,
+            predecessor=predecessor,
         ),
     )
     reference = transaction["completed_phases"][-1]["evidence"]
@@ -4069,38 +5629,123 @@ def rollback_inert_install(
             if (
                 not isinstance(phase_intent, Mapping)
                 or not isinstance(phase_intent.get("intent"), Mapping)
-                or phase_intent["intent"].get("schema")
-                != "muncho-owner-gate-system-files-phase-intent.v1"
             ):
                 raise OwnerGateBootstrapError(
                     "owner_gate_bootstrap_rollback_intent_invalid"
                 )
-            reversible = {
-                str(item.get("path"))
-                for item in phase_intent["intent"].get("targets", [])
-                if isinstance(item, Mapping)
-                and item.get("created_by_transaction") is True
-                and item.get("reversible") is True
-            }
+            system_intent = phase_intent["intent"]
+            successor_rollback = (
+                system_intent.get("schema")
+                == "muncho-owner-gate-system-files-phase-intent.v2"
+            )
+            if system_intent.get("schema") not in {
+                "muncho-owner-gate-system-files-phase-intent.v1",
+                "muncho-owner-gate-system-files-phase-intent.v2",
+            }:
+                raise OwnerGateBootstrapError(
+                    "owner_gate_bootstrap_rollback_intent_invalid"
+                )
             files = {
                 str(item.get("path")): dict(item)
                 for item in system.get("files", [])
                 if isinstance(item, Mapping)
-                and item.get("created_by_transaction") is True
+                and item.get("created_by_transaction")
+                is (False if successor_rollback else True)
             }
-            if reversible != set(files) or not reversible:
+            rollback_targets: list[Mapping[str, Any]] = []
+            if successor_rollback:
+                predecessor_targets = {
+                    str(item.get("path")): item
+                    for item in system_intent.get("targets", [])
+                    if isinstance(item, Mapping)
+                    and item.get("created_by_transaction") is False
+                    and item.get("reversible") is True
+                }
+                if (
+                    set(predecessor_targets) != set(files)
+                    or not predecessor_targets
+                ):
+                    raise OwnerGateBootstrapError(
+                        "owner_gate_bootstrap_rollback_intent_invalid"
+                    )
+                for path in sorted(files):
+                    predecessor_target = predecessor_targets[path]
+                    successor_file = files[path]
+                    predecessor_payload = _b64url(
+                        predecessor_target.get(
+                            "predecessor_payload_b64url"
+                        ),
+                        maximum=MAX_JSON_BYTES,
+                    )
+                    if (
+                        hashlib.sha256(predecessor_payload).hexdigest()
+                        != predecessor_target.get("predecessor_sha256")
+                        or predecessor_target.get("predecessor_sha256")
+                        != successor_file.get("predecessor_sha256")
+                        or any(
+                            predecessor_target.get(name)
+                            != successor_file.get(name)
+                            for name in ("mode", "uid", "gid")
+                        )
+                    ):
+                        raise OwnerGateBootstrapError(
+                            "owner_gate_bootstrap_rollback_intent_invalid"
+                        )
+                    rollback_targets.append({
+                        "path": path,
+                        "successor_sha256": successor_file["sha256"],
+                        "predecessor_sha256": predecessor_target[
+                            "predecessor_sha256"
+                        ],
+                        "predecessor_payload_b64url": predecessor_target[
+                            "predecessor_payload_b64url"
+                        ],
+                        "mode": successor_file["mode"],
+                        "uid": successor_file["uid"],
+                        "gid": successor_file["gid"],
+                    })
+            else:
+                reversible = {
+                    str(item.get("path"))
+                    for item in system_intent.get("targets", [])
+                    if isinstance(item, Mapping)
+                    and item.get("created_by_transaction") is True
+                    and item.get("reversible") is True
+                }
+                if reversible != set(files) or not reversible:
+                    raise OwnerGateBootstrapError(
+                        "owner_gate_bootstrap_rollback_intent_invalid"
+                    )
+                rollback_targets = [
+                    files[path] for path in sorted(files)
+                ]
+            if not files:
                 raise OwnerGateBootstrapError(
                     "owner_gate_bootstrap_rollback_intent_invalid"
                 )
             expected_intent_unsigned = {
-                "schema": "muncho-owner-gate-inert-rollback-intent.v2",
+                "schema": (
+                    "muncho-owner-gate-inert-rollback-intent.v3"
+                    if successor_rollback
+                    else "muncho-owner-gate-inert-rollback-intent.v2"
+                ),
                 "transaction_id": transaction["journal_transaction_id"],
                 "install_terminal_sha256": transaction[
                     "transaction_sha256"
                 ],
                 "release_revision": bundle.revision,
                 "package_sha256": bundle.manifest["package_sha256"],
-                "targets": [files[path] for path in sorted(files)],
+                "targets": rollback_targets,
+                **(
+                    {
+                        "restore_exact_predecessor_configuration": True,
+                        "predecessor_sha256": system_intent[
+                            "predecessor_sha256"
+                        ],
+                    }
+                    if successor_rollback
+                    else {}
+                ),
                 "preserve_authority_key": True,
                 "preserve_databases": True,
                 "preserve_append_only_receipts": True,
@@ -4149,17 +5794,72 @@ def rollback_inert_install(
                 )
                 for index, item in enumerate(rollback_intent["targets"]):
                     path = Path(str(item["path"]))
-                    if os.path.lexists(path):
-                        _remove_exact_installed_file(
-                            item,
-                            allowed_roots=allowed_roots,
-                        )
-                    if os.path.lexists(path):
+                    if not any(path.parent == root for root in allowed_roots):
                         raise OwnerGateBootstrapError(
-                            "owner_gate_bootstrap_rollback_file_changed"
+                            "owner_gate_bootstrap_rollback_file_invalid"
                         )
+                    if successor_rollback:
+                        predecessor_payload = _b64url(
+                            item["predecessor_payload_b64url"],
+                            maximum=MAX_JSON_BYTES,
+                        )
+                        successor_raw = _read_regular(
+                            path,
+                            maximum=MAX_JSON_BYTES,
+                            expected_uid=int(item["uid"]),
+                            allowed_modes=frozenset({
+                                int(str(item["mode"]), 8)
+                            }),
+                        )
+                        current_sha256 = hashlib.sha256(
+                            successor_raw
+                        ).hexdigest()
+                        if current_sha256 not in {
+                            item["successor_sha256"],
+                            item["predecessor_sha256"],
+                        }:
+                            raise OwnerGateBootstrapError(
+                                "owner_gate_bootstrap_rollback_file_changed"
+                            )
+                        if current_sha256 == item["successor_sha256"]:
+                            _replace_exact_predecessor_bytes(
+                                path,
+                                predecessor_payload,
+                                successor_raw,
+                                mode=int(str(item["mode"]), 8),
+                                uid=int(item["uid"]),
+                                gid=int(item["gid"]),
+                            )
+                        restored = _read_regular(
+                            path,
+                            maximum=MAX_JSON_BYTES,
+                            expected_uid=int(item["uid"]),
+                            allowed_modes=frozenset({
+                                int(str(item["mode"]), 8)
+                            }),
+                        )
+                        if (
+                            hashlib.sha256(restored).hexdigest()
+                            != item["predecessor_sha256"]
+                        ):
+                            raise OwnerGateBootstrapError(
+                                "owner_gate_bootstrap_rollback_file_changed"
+                            )
+                    else:
+                        if os.path.lexists(path):
+                            _remove_exact_installed_file(
+                                item,
+                                allowed_roots=allowed_roots,
+                            )
+                        if os.path.lexists(path):
+                            raise OwnerGateBootstrapError(
+                                "owner_gate_bootstrap_rollback_file_changed"
+                            )
                     if _checkpoint is not None:
-                        _checkpoint(f"rollback_target_{index}_absent")
+                        _checkpoint(
+                            f"rollback_target_{index}_"
+                            f"{'restored' if successor_rollback else 'absent'}"
+                        )
                 preservation = _rollback_preservation_projection(
                     evidence,
                     bundle=bundle,
@@ -4190,7 +5890,11 @@ def rollback_inert_install(
                     )
                 hosts_path = str(layout.etc_root / EXECUTOR_HOSTS_FILENAME)
                 unsigned = {
-                    "schema": "muncho-owner-gate-inert-install-rollback.v2",
+                    "schema": (
+                        "muncho-owner-gate-inert-install-rollback.v3"
+                        if successor_rollback
+                        else "muncho-owner-gate-inert-install-rollback.v2"
+                    ),
                     "release_revision": bundle.revision,
                     "package_sha256": bundle.manifest["package_sha256"],
                     "transaction_sha256": transaction[
@@ -4200,13 +5904,35 @@ def rollback_inert_install(
                         "rollback_intent_sha256"
                     ],
                     "current_release_selection_removed": False,
-                    "removed_entry_files": sorted(files),
+                    "removed_entry_files": (
+                        [] if successor_rollback else sorted(files)
+                    ),
+                    **(
+                        {"restored_entry_files": sorted(files)}
+                        if successor_rollback
+                        else {}
+                    ),
                     "executor_hosts_rollback": {
                         "schema": (
-                            "muncho-owner-gate-executor-hosts-rollback.v2"
+                            "muncho-owner-gate-executor-hosts-rollback.v3"
+                            if successor_rollback
+                            else "muncho-owner-gate-executor-hosts-rollback.v2"
                         ),
                         "path": hosts_path,
-                        "removed_by_transaction": hosts_path in files,
+                        "removed_by_transaction": (
+                            False
+                            if successor_rollback
+                            else hosts_path in files
+                        ),
+                        **(
+                            {
+                                "restored_from_predecessor": (
+                                    hosts_path in files
+                                )
+                            }
+                            if successor_rollback
+                            else {}
+                        ),
                         "global_etc_hosts_mutated": False,
                     },
                     **preservation,
@@ -4254,11 +5980,22 @@ def rollback_inert_install(
                         receipt_raw
                     ).hexdigest(),
                     "rollback_receipt_sha256": receipt["receipt_sha256"],
-                    "removed_entry_files": sorted(files),
+                    "removed_entry_files": (
+                        [] if successor_rollback else sorted(files)
+                    ),
+                    **(
+                        {"restored_entry_files": sorted(files)}
+                        if successor_rollback
+                        else {}
+                    ),
                     **preservation,
                 }
                 success_unsigned = {
-                    "schema": "muncho-owner-gate-inert-rollback-success.v2",
+                    "schema": (
+                        "muncho-owner-gate-inert-rollback-success.v3"
+                        if successor_rollback
+                        else "muncho-owner-gate-inert-rollback-success.v2"
+                    ),
                     "install_terminal_sha256": transaction[
                         "transaction_sha256"
                     ],
@@ -4284,7 +6021,11 @@ def rollback_inert_install(
             else:
                 if (
                     rollback_success.get("schema")
-                    != "muncho-owner-gate-inert-rollback-success.v2"
+                    != (
+                        "muncho-owner-gate-inert-rollback-success.v3"
+                        if successor_rollback
+                        else "muncho-owner-gate-inert-rollback-success.v2"
+                    )
                     or rollback_success.get("install_terminal_sha256")
                     != transaction["transaction_sha256"]
                     or rollback_success.get("rollback_intent_sha256")
@@ -4299,7 +6040,14 @@ def rollback_inert_install(
                     or rollback_success["evidence"].get(
                         "removed_entry_files"
                     )
-                    != sorted(files)
+                    != ([] if successor_rollback else sorted(files))
+                    or (
+                        successor_rollback
+                        and rollback_success["evidence"].get(
+                            "restored_entry_files"
+                        )
+                        != sorted(files)
+                    )
                     or any(
                         rollback_success["evidence"].get(name) is not True
                         for name in (
@@ -4397,7 +6145,13 @@ def rollback_inert_install(
                 != transaction["transaction_sha256"]
                 or receipt.get("rollback_intent_sha256")
                 != rollback_intent["rollback_intent_sha256"]
-                or receipt.get("removed_entry_files") != sorted(files)
+                or receipt.get("removed_entry_files")
+                != ([] if successor_rollback else sorted(files))
+                or (
+                    successor_rollback
+                    and receipt.get("restored_entry_files")
+                    != sorted(files)
+                )
                 or receipt.get("current_release_selection_removed")
                 is not False
                 or receipt.get("activation_seal_present") is not False
@@ -4413,12 +6167,33 @@ def rollback_inert_install(
                     "owner_gate_bootstrap_rollback_success_invalid"
                 )
             for item in rollback_intent["targets"]:
-                if os.path.lexists(Path(str(item["path"]))):
+                path = Path(str(item["path"]))
+                if successor_rollback:
+                    restored = _read_regular(
+                        path,
+                        maximum=MAX_JSON_BYTES,
+                        expected_uid=int(item["uid"]),
+                        allowed_modes=frozenset({
+                            int(str(item["mode"]), 8)
+                        }),
+                    )
+                    if (
+                        hashlib.sha256(restored).hexdigest()
+                        != item["predecessor_sha256"]
+                    ):
+                        raise OwnerGateBootstrapError(
+                            "owner_gate_bootstrap_rollback_replay_drift"
+                        )
+                elif os.path.lexists(path):
                     raise OwnerGateBootstrapError(
                         "owner_gate_bootstrap_rollback_replay_drift"
                     )
             terminal_unsigned = {
-                "schema": "muncho-owner-gate-inert-rollback-terminal.v2",
+                "schema": (
+                    "muncho-owner-gate-inert-rollback-terminal.v3"
+                    if successor_rollback
+                    else "muncho-owner-gate-inert-rollback-terminal.v2"
+                ),
                 "install_terminal_sha256": transaction[
                     "transaction_sha256"
                 ],
