@@ -53,6 +53,7 @@ DURABLE_BOUNDARIES = (
     "readback_validated",
 )
 RECOVERY_DURABLE_BOUNDARIES = (
+    "recovery_uncommitted_pending_binding_validated",
     "recovery_uncommitted_pending_removed",
     "recovery_uncommitted_pending_cleanup_fsynced",
     "recovery_final_directory_fsynced",
@@ -275,14 +276,37 @@ class ReleaseUpdateJournal:
         *,
         authority_record: Mapping[str, Any],
     ) -> None:
-        """Bind production to the fixed root-owned transaction directory."""
+        """Bind fresh execution to the fixed root-owned transaction directory."""
 
         self._configure(
             transaction_directory=None,
             authority_record=authority_record,
             require_root=True,
+            create_transaction=True,
             xattr_reader=_read_descriptor_xattrs,
         )
+
+    @classmethod
+    def open_existing(
+        cls,
+        *,
+        authority_record: Mapping[str, Any],
+    ) -> ReleaseUpdateJournal:
+        """Bind recovery to an existing exact production journal.
+
+        Activation must finish a clean, final authority header before it
+        publishes the active marker that makes this recovery path discoverable.
+        """
+
+        instance = object.__new__(cls)
+        instance._configure(
+            transaction_directory=None,
+            authority_record=authority_record,
+            require_root=True,
+            create_transaction=False,
+            xattr_reader=_read_descriptor_xattrs,
+        )
+        return instance
 
     @classmethod
     def _for_test(
@@ -299,6 +323,31 @@ class ReleaseUpdateJournal:
             transaction_directory=transaction_directory,
             authority_record=authority_record,
             require_root=False,
+            create_transaction=True,
+            xattr_reader=(
+                (lambda _descriptor: ())
+                if xattr_reader is None
+                else xattr_reader
+            ),
+        )
+        return instance
+
+    @classmethod
+    def _open_existing_for_test(
+        cls,
+        transaction_directory: Path,
+        *,
+        authority_record: Mapping[str, Any],
+        xattr_reader: _XattrReader | None = None,
+    ) -> ReleaseUpdateJournal:
+        """Bind recovery to a private existing test journal."""
+
+        instance = object.__new__(cls)
+        instance._configure(
+            transaction_directory=transaction_directory,
+            authority_record=authority_record,
+            require_root=False,
+            create_transaction=False,
             xattr_reader=(
                 (lambda _descriptor: ())
                 if xattr_reader is None
@@ -313,6 +362,7 @@ class ReleaseUpdateJournal:
         transaction_directory: Path | None,
         authority_record: Mapping[str, Any],
         require_root: bool,
+        create_transaction: bool,
         xattr_reader: _XattrReader,
     ) -> None:
         try:
@@ -363,6 +413,7 @@ class ReleaseUpdateJournal:
         self._authority_record = validated_authority
         self._intent = validated_intent
         self._require_root = require_root
+        self._create_transaction = create_transaction
         self._xattr_reader = xattr_reader
         self._uid = (
             0
@@ -412,7 +463,11 @@ class ReleaseUpdateJournal:
             and self._trusted_owner(value)
         )
 
-    def _open_absolute_parent(self) -> int:
+    def _open_absolute_parent(
+        self,
+        *,
+        missing_ok: bool = False,
+    ) -> int | None:
         parts = self._transaction_directory.parent.parts
         if not parts or parts[0] != os.path.sep:
             raise ProductionReleaseUpdateJournalError(
@@ -445,6 +500,14 @@ class ReleaseUpdateJournal:
                 xattr_reader=self._xattr_reader,
             )
             return descriptor
+        except FileNotFoundError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            if missing_ok:
+                return None
+            raise ProductionReleaseUpdateJournalError(
+                "release_update_journal_directory_invalid"
+            ) from exc
         except ProductionReleaseUpdateJournalError:
             if descriptor is not None:
                 os.close(descriptor)
@@ -461,7 +524,9 @@ class ReleaseUpdateJournal:
         *,
         create: bool,
     ) -> tuple[int, int] | None:
-        parent_fd = self._open_absolute_parent()
+        parent_fd = self._open_absolute_parent(missing_ok=not create)
+        if parent_fd is None:
+            return None
         name = self._transaction_directory.name
         created = False
         try:
@@ -562,6 +627,10 @@ class ReleaseUpdateJournal:
         try:
             parent = os.fstat(parent_fd)
             reopened_parent_fd = self._open_absolute_parent()
+            if reopened_parent_fd is None:
+                raise ProductionReleaseUpdateJournalError(
+                    "release_update_journal_directory_changed"
+                )
             reopened_parent = os.fstat(reopened_parent_fd)
             opened = os.fstat(transaction_fd)
             reachable = os.stat(
@@ -1021,6 +1090,25 @@ class ReleaseUpdateJournal:
             expected_links=1,
         )
 
+    def _require_existing_authority_header(
+        self,
+        transaction_fd: int,
+    ) -> None:
+        names = self._names(transaction_fd)
+        if AUTHORITY_FILE_NAME not in names:
+            raise ProductionReleaseUpdateJournalError(
+                "release_update_journal_authority_missing"
+            )
+        if AUTHORITY_PENDING_NAME in names:
+            raise ProductionReleaseUpdateJournalError(
+                "release_update_journal_authority_recovery_invalid"
+            )
+        self._read_authority_file(
+            transaction_fd,
+            AUTHORITY_FILE_NAME,
+            expected_links=1,
+        )
+
     def _inventory(
         self,
         transaction_fd: int,
@@ -1087,6 +1175,7 @@ class ReleaseUpdateJournal:
 
     def _discard_uncommitted_pending(
         self,
+        parent_fd: int,
         transaction_fd: int,
         pending_name: str,
         *,
@@ -1126,11 +1215,22 @@ class ReleaseUpdateJournal:
             xattr_reader=self._xattr_reader,
         )
         try:
+            self._boundary(
+                "recovery_uncommitted_pending_binding_validated",
+                parent_fd,
+                transaction_fd,
+            )
             os.unlink(pending_name, dir_fd=transaction_fd)
-            _checkpoint("recovery_uncommitted_pending_removed")
+            self._boundary(
+                "recovery_uncommitted_pending_removed",
+                parent_fd,
+                transaction_fd,
+            )
             os.fsync(transaction_fd)
-            _checkpoint(
-                "recovery_uncommitted_pending_cleanup_fsynced"
+            self._boundary(
+                "recovery_uncommitted_pending_cleanup_fsynced",
+                parent_fd,
+                transaction_fd,
             )
         except OSError as exc:
             raise ProductionReleaseUpdateJournalError(
@@ -1173,12 +1273,12 @@ class ReleaseUpdateJournal:
                     "release_update_journal_recovery_invalid"
                 )
             self._discard_uncommitted_pending(
+                parent_fd,
                 transaction_fd,
                 pending_name,
                 final_name=final_name,
                 status=pending_status,
             )
-            self._verify_binding(parent_fd, transaction_fd)
             return
         if (
             pending_status.st_nlink != 2
@@ -1296,11 +1396,24 @@ class ReleaseUpdateJournal:
             os.close(parent_fd)
 
     def load(self) -> Sequence[Mapping[str, Any]]:
-        opened = self._locked_transaction(create=True)
-        assert opened is not None
+        opened = self._locked_transaction(
+            create=self._create_transaction
+        )
+        if opened is None:
+            raise ProductionReleaseUpdateJournalError(
+                "release_update_journal_not_found"
+            )
         parent_fd, transaction_fd = opened
         try:
-            self._ensure_authority_header(parent_fd, transaction_fd)
+            if self._create_transaction:
+                self._ensure_authority_header(
+                    parent_fd,
+                    transaction_fd,
+                )
+            else:
+                self._require_existing_authority_header(
+                    transaction_fd
+                )
             self._recover_pending(parent_fd, transaction_fd)
             events = self._load_final_events(transaction_fd)
             os.fsync(transaction_fd)
@@ -1327,11 +1440,24 @@ class ReleaseUpdateJournal:
             raise ProductionReleaseUpdateJournalError(
                 "release_update_journal_event_invalid"
             )
-        opened = self._locked_transaction(create=True)
-        assert opened is not None
+        opened = self._locked_transaction(
+            create=self._create_transaction
+        )
+        if opened is None:
+            raise ProductionReleaseUpdateJournalError(
+                "release_update_journal_not_found"
+            )
         parent_fd, transaction_fd = opened
         try:
-            self._ensure_authority_header(parent_fd, transaction_fd)
+            if self._create_transaction:
+                self._ensure_authority_header(
+                    parent_fd,
+                    transaction_fd,
+                )
+            else:
+                self._require_existing_authority_header(
+                    transaction_fd
+                )
             self._recover_pending(parent_fd, transaction_fd)
             events = self._load_final_events(transaction_fd)
             sequence = validated["sequence"]
