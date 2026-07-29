@@ -1578,6 +1578,19 @@ DEFAULT_CONFIG = {
             "model": "voxtral-mini-tts-2603",
             "voice_id": "c69964a6-ab8b-4f8a-9465-ec0925096ec8",  # Paul - Neutral
         },
+        "gemini": {
+            # Available models:
+            #   gemini-2.5-flash-preview-tts  (default, fast, cost-efficient)
+            #   gemini-2.5-pro-preview-tts    (higher quality, lower throughput)
+            #   gemini-3.1-flash-tts-preview  (newest, more expressive, 30 prebuilt voices)
+            "model": "gemini-2.5-flash-preview-tts",
+            "voice": "Kore",
+            # 30 prebuilt voices: Zephyr, Puck, Charon, Kore, Fenrir, Leda, Orus,
+            # Aoede, Callirrhoe, Autonoe, Enceladus, Iapetus, Umbriel, Algieba,
+            # Despina, Erinome, Algenib, Rasalgethi, Laomedeia, Achernar, Alnilam,
+            # Schedar, Gacrux, Pulcherrima, Achird, Zubenelgenubi, Vindemiatrix,
+            # Sadachbia, Sadaltager, Sulafat
+        },
         "neutts": {
             "ref_audio": "",  # Path to reference voice audio (empty = bundled default)
             "ref_text": "",   # Path to reference voice transcript (empty = bundled default)

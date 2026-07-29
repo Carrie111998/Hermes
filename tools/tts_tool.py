@@ -187,6 +187,10 @@ DEFAULT_XAI_SAMPLE_RATE = 24000
 DEFAULT_XAI_BIT_RATE = 128000
 DEFAULT_XAI_AUTO_SPEECH_TAGS = False
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
+# Gemini TTS — available models:
+#   gemini-2.5-flash-preview-tts  (default, fast, cost-efficient)
+#   gemini-2.5-pro-preview-tts    (higher quality, lower throughput)
+#   gemini-3.1-flash-tts-preview  (newest, more expressive, 30 prebuilt voices)
 DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
