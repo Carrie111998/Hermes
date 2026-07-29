@@ -493,8 +493,7 @@ class TestRebuilds:
         kwargs = server._background_agent_kwargs(agent, "task-1")
         assert kwargs["enabled_toolsets"] == []
 
-    def _reload_mcp(self, server, monkeypatch, agent_toolsets):
-        """Drive reload.mcp on a session and return refresh's enabled_override."""
+    def _reload_mcp(self, server, monkeypatch, agent_toolsets, pinned):
         seen: dict = {}
         fake_mcp = MagicMock()
         fake_mcp.refresh_agent_mcp_tools.side_effect = (
@@ -505,6 +504,7 @@ class TestRebuilds:
         session = {
             "session_key": "k-mcp",
             "agent": SimpleNamespace(enabled_toolsets=agent_toolsets),
+            "create_enabled_toolsets": pinned,
         }
         monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["terminal", "file"])
         monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
@@ -524,12 +524,13 @@ class TestRebuilds:
         return seen
 
     def test_reload_mcp_keeps_empty_selection(self, server, monkeypatch) -> None:
-        assert self._reload_mcp(server, monkeypatch, [])["enabled_override"] == []
+        seen = self._reload_mcp(server, monkeypatch, [], pinned=[])
+        assert seen["enabled_override"] == []
 
     def test_reload_mcp_without_selection_re_resolves_global(
         self, server, monkeypatch
     ) -> None:
-        seen = self._reload_mcp(server, monkeypatch, None)
+        seen = self._reload_mcp(server, monkeypatch, None, pinned=None)
         assert seen["enabled_override"] == ["terminal", "file"]
 
     def test_background_agent_without_selection_uses_global(self, server, monkeypatch) -> None:
@@ -538,6 +539,346 @@ class TestRebuilds:
         agent = SimpleNamespace(enabled_toolsets=None)
         kwargs = server._background_agent_kwargs(agent, "task-2")
         assert kwargs["enabled_toolsets"] == ["terminal", "file"]
+
+
+class TestSessionBranch:
+    class _BranchDB:
+        def get_session_title(self, _key):
+            return "parent"
+
+        def get_next_title_in_lineage(self, current):
+            return f"{current} 2"
+
+        def create_session(self, *a, **k):
+            return None
+
+        def append_message(self, **k):
+            return None
+
+        def set_session_title(self, *a, **k):
+            return None
+
+    def _branch(self, server, monkeypatch, live: dict) -> dict:
+        calls = _capture_builds(server, monkeypatch)
+        monkeypatch.setattr(server, "_get_db", lambda: self._BranchDB())
+        monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+        monkeypatch.setattr(server, "_new_session_key", lambda: "child-key")
+        monkeypatch.setattr(server, "_resolve_model", lambda *a, **k: "m")
+        monkeypatch.setattr(
+            server,
+            "_init_session",
+            lambda sid, key, agent, history, **kw: server._sessions.__setitem__(
+                sid,
+                {"agent": agent, "session_key": key, "history": list(history),
+                 "history_lock": threading.Lock()},
+            ),
+        )
+        ready = threading.Event()
+        ready.set()
+        live.update({
+            "agent_ready": ready,
+            "history_lock": threading.Lock(),
+            "cwd": "/tmp",
+            "cols": 80,
+        })
+        with patch.dict(server._sessions, {"s-parent": live}, clear=True):
+            resp = server.handle_request(
+                {"id": "r-branch", "method": "session.branch",
+                 "params": {"session_id": "s-parent"}}
+            )
+            assert "error" not in resp, resp
+            child = server._sessions[resp["result"]["session_id"]]
+            return {"calls": calls, "child": child, "result": resp["result"]}
+
+    def test_branch_keeps_the_empty_selection(self, server, monkeypatch) -> None:
+        live = {
+            "session_key": "parent-key",
+            "agent": SimpleNamespace(enabled_toolsets=[]),
+            "history": [{"role": "user", "content": "hi"}],
+            "create_enabled_toolsets": [],
+        }
+        out = self._branch(server, monkeypatch, live)
+        assert out["calls"][-1]["enabled_toolsets_override"] == []
+        assert out["child"].get("create_enabled_toolsets") == []
+        assert out["child"]["agent"].enabled_toolsets == []
+
+    def test_branch_without_selection_is_unchanged(self, server, monkeypatch) -> None:
+        live = {
+            "session_key": "parent-key",
+            "agent": SimpleNamespace(enabled_toolsets=["terminal"]),
+            "history": [{"role": "user", "content": "hi"}],
+        }
+        out = self._branch(server, monkeypatch, live)
+        assert out["calls"][-1].get("enabled_toolsets_override") is None
+        assert out["child"].get("create_enabled_toolsets") is None
+
+
+class TestReloadMcpProvenance:
+    """The decision comes from what the client asked, not from the built agent.
+
+    A session created WITHOUT the field already carries a resolved global list
+    on its agent, so reading the agent would wrongly pin it forever.
+    """
+
+    def _reload(self, server, monkeypatch, session_extra: dict):
+        seen: dict = {}
+        fake_mcp = MagicMock()
+        fake_mcp.refresh_agent_mcp_tools.side_effect = (
+            lambda agent, enabled_override=None, **kw: seen.update(
+                {"enabled_override": enabled_override}
+            )
+        )
+        session = {"session_key": "k-mcp", **session_extra}
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["terminal", "file", "mcp_new"])
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+        monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+        monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+        with patch.dict(server._sessions, {"s-mcp": session}, clear=False), patch.dict(
+            "sys.modules", {"tools.mcp_tool": fake_mcp}
+        ):
+            resp = server.handle_request(
+                {"id": "r-mcp", "method": "reload.mcp",
+                 "params": {"session_id": "s-mcp", "confirm": True}}
+            )
+        assert "error" not in resp
+        return seen
+
+    def test_global_session_re_resolves_config(self, server, monkeypatch) -> None:
+        seen = self._reload(
+            server,
+            monkeypatch,
+            {"agent": SimpleNamespace(enabled_toolsets=["terminal", "file"])},
+        )
+        assert seen["enabled_override"] == ["terminal", "file", "mcp_new"]
+
+    def test_explicitly_empty_session_stays_empty(self, server, monkeypatch) -> None:
+        seen = self._reload(
+            server,
+            monkeypatch,
+            {"agent": SimpleNamespace(enabled_toolsets=[]), "create_enabled_toolsets": []},
+        )
+        assert seen["enabled_override"] == []
+
+    def test_explicit_list_stays_pinned(self, server, monkeypatch) -> None:
+        seen = self._reload(
+            server,
+            monkeypatch,
+            {"agent": SimpleNamespace(enabled_toolsets=["file"]),
+             "create_enabled_toolsets": ["file"]},
+        )
+        assert seen["enabled_override"] == ["file"]
+
+
+TOOLSET_CONFLICT_FRAGMENT = "different toolset selection"
+
+
+def _conflict_error_type():
+    from tui_gateway.compute_host import ToolsetScopeConflictError
+
+    return ToolsetScopeConflictError
+
+
+class TestComputeHostScopeConflicts:
+    def _host(self):
+        from tui_gateway.compute_host import ComputeHost
+
+        return ComputeHost(stdout=io.StringIO())
+
+    def test_existing_session_refuses_incompatible_frame(self, server, monkeypatch) -> None:
+        calls = _capture_builds(server, monkeypatch)
+        agent = SimpleNamespace(enabled_toolsets=["terminal"])
+        session = {
+            "agent": agent,
+            "session_key": "host-key",
+            "history": [],
+            "history_lock": threading.Lock(),
+        }
+        host = self._host()
+        try:
+            with patch.dict(server._sessions, {"host-sid": session}, clear=True):
+                with pytest.raises(
+                    _conflict_error_type(), match=TOOLSET_CONFLICT_FRAGMENT
+                ):
+                    host._ensure_server_session(
+                        server,
+                        {"sid": "host-sid", "session_key": "host-key",
+                         "history": [], "cols": 80, "enabled_toolsets": []},
+                    )
+                # No mutation, no silently tooled agent handed back.
+                assert session["agent"].enabled_toolsets == ["terminal"]
+                assert session.get("create_enabled_toolsets") is None
+        finally:
+            host._executor.shutdown(wait=False)
+        assert calls == []
+
+    def _race(self, server, monkeypatch, second_selection):
+        """Start a build, hold it, then send a second frame on the same sid.
+
+        Returns the host plus the observation hooks, with the first build still
+        blocked so the caller can inspect the lock table mid-race.
+        """
+        state = {
+            "entered": threading.Event(),
+            "release": threading.Event(),
+            "waiting": threading.Event(),
+            "calls": [],
+            "errors": [],
+            "results": [],
+        }
+        calls_lock = threading.Lock()
+
+        def fake_make_agent(sid, key, **kw):
+            with calls_lock:
+                state["calls"].append(kw)
+                first = len(state["calls"]) == 1
+            if first:
+                state["entered"].set()
+                assert state["release"].wait(timeout=10), "test gate never released"
+            return SimpleNamespace(
+                enabled_toolsets=kw.get("enabled_toolsets_override"),
+                model="m", provider="p", session_id=key,
+            )
+
+        monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+        monkeypatch.setattr(
+            server,
+            "_init_session",
+            lambda sid, key, agent, history, **kw: server._sessions.__setitem__(
+                sid,
+                {"agent": agent, "session_key": key, "history": list(history),
+                 "history_lock": threading.Lock()},
+            ),
+        )
+
+        host = self._host()
+        # Signal the exact moment the second caller has registered its interest
+        # in the sid and is about to block: an Event, so no timing guesswork.
+        original_acquire = host._acquire_session_lock
+
+        def spy_acquire(sid):
+            lock, entry = original_acquire(sid)
+            if entry.waiters >= 2:
+                state["waiting"].set()
+            return lock, entry
+
+        host._acquire_session_lock = spy_acquire
+
+        def run(frame):
+            try:
+                state["results"].append(host._ensure_server_session(server, frame))
+            except BaseException as exc:  # noqa: BLE001 - recorded for the assert
+                state["errors"].append(exc)
+
+        base = {"sid": "race-sid", "session_key": "race-key", "history": [], "cols": 80}
+        state["threads"] = (
+            threading.Thread(target=run, args=({**base, "enabled_toolsets": []},)),
+            threading.Thread(
+                target=run, args=({**base, "enabled_toolsets": second_selection},)
+            ),
+        )
+        return host, state
+
+    def _finish_race(self, state) -> None:
+        state["release"].set()
+        for thread in state["threads"]:
+            thread.join(timeout=15)
+        assert all(not t.is_alive() for t in state["threads"])
+
+    def test_concurrent_first_builds_cannot_both_win(self, server, monkeypatch) -> None:
+        """Two incompatible frames on a fresh sid: one builds, the other fails."""
+        host, state = self._race(server, monkeypatch, ["terminal"])
+        first, second = state["threads"]
+        try:
+            with patch.dict(server._sessions, {}, clear=True):
+                first.start()
+                assert state["entered"].wait(timeout=10), "first build never started"
+                second.start()
+                assert state["waiting"].wait(timeout=10), "second caller never queued"
+                self._finish_race(state)
+                assert len(state["errors"]) == 1, (state["errors"], state["results"])
+                assert isinstance(state["errors"][0], _conflict_error_type())
+                assert TOOLSET_CONFLICT_FRAGMENT in str(state["errors"][0])
+                assert len(state["results"]) == 1
+                # The zero-tool builder entered first and must be the one live.
+                assert server._sessions["race-sid"]["agent"].enabled_toolsets == []
+                assert len(state["calls"]) == 1, state["calls"]
+        finally:
+            state["release"].set()
+            host._executor.shutdown(wait=False)
+
+    def test_lock_entry_is_shared_during_the_race_then_evicted(
+        self, server, monkeypatch
+    ) -> None:
+        host, state = self._race(server, monkeypatch, ["terminal"])
+        first, second = state["threads"]
+        try:
+            with patch.dict(server._sessions, {}, clear=True):
+                first.start()
+                assert state["entered"].wait(timeout=10)
+                second.start()
+                assert state["waiting"].wait(timeout=10)
+                # Both callers share ONE entry while the race is on.
+                assert list(host._session_locks) == ["race-sid"]
+                assert host._session_locks["race-sid"].waiters == 2
+                self._finish_race(state)
+                # Winner and loser both released: no per-sid lock leaks.
+                assert host._session_locks == {}
+        finally:
+            state["release"].set()
+            host._executor.shutdown(wait=False)
+
+    def test_lock_table_is_empty_after_a_conflict(self, server, monkeypatch) -> None:
+        _capture_builds(server, monkeypatch)
+        session = {
+            "agent": SimpleNamespace(enabled_toolsets=["terminal"]),
+            "session_key": "host-key",
+            "history": [],
+            "history_lock": threading.Lock(),
+        }
+        host = self._host()
+        try:
+            with patch.dict(server._sessions, {"host-sid": session}, clear=True):
+                with pytest.raises(_conflict_error_type()):
+                    host._ensure_server_session(
+                        server,
+                        {"sid": "host-sid", "session_key": "host-key",
+                         "history": [], "cols": 80, "enabled_toolsets": []},
+                    )
+            assert host._session_locks == {}
+        finally:
+            host._executor.shutdown(wait=False)
+
+    def test_lock_is_released_before_the_turn_runs(self, server, monkeypatch) -> None:
+        """The lock guards ensure/build only, never the model turn after it."""
+        _capture_builds(server, monkeypatch)
+        monkeypatch.setattr(
+            server,
+            "_init_session",
+            lambda sid, key, agent, history, **kw: server._sessions.__setitem__(
+                sid,
+                {"agent": agent, "session_key": key, "history": list(history),
+                 "history_lock": threading.Lock()},
+            ),
+        )
+        host = self._host()
+        try:
+            with patch.dict(server._sessions, {}, clear=True):
+                host._ensure_server_session(
+                    server,
+                    {"sid": "turn-sid", "session_key": "turn-key",
+                     "history": [], "cols": 80, "enabled_toolsets": []},
+                )
+                assert host._session_locks == {}
+                # Whatever the turn does next, the sid is immediately lockable.
+                lock, entry = host._acquire_session_lock("turn-sid")
+                try:
+                    assert lock.acquire(blocking=False)
+                    lock.release()
+                finally:
+                    host._release_session_lock("turn-sid", entry)
+                assert host._session_locks == {}
+        finally:
+            host._executor.shutdown(wait=False)
 
 
 def _reporting_server():

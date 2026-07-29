@@ -26,6 +26,29 @@ def now_ns() -> int:
     return time.perf_counter_ns()
 
 
+class _SessionLockEntry:
+    """A per-sid build lock plus the number of callers holding a reference.
+
+    Refcounted so the table cannot grow one entry per session for the life of
+    the host: a caller registers its interest under the guard BEFORE waiting on
+    the lock, and the last one out evicts the entry.
+    """
+
+    __slots__ = ("lock", "waiters")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.waiters = 0
+
+
+class ToolsetScopeConflictError(RuntimeError):
+    """A turn frame asked for a toolset scope the live session cannot honor.
+
+    Raised instead of mutating the session: an agent's toolset snapshot is
+    fixed at build time, so the only fail-closed answer is to refuse the turn.
+    """
+
+
 @dataclass
 class SpikeAgent:
     """A deterministic AIAgent-shaped object for pipe/interrupt measurements."""
@@ -142,6 +165,8 @@ class ComputeHost:
         self._progress_lock = threading.Lock()
         self._turn_futures: set[concurrent.futures.Future] = set()
         self._turn_futures_lock = threading.Lock()
+        self._session_locks: dict[str, _SessionLockEntry] = {}
+        self._session_locks_guard = threading.Lock()
         self._transport = _HostTransport(self.emit)
         self._heartbeat_secs = (
             float(heartbeat_secs)
@@ -414,11 +439,44 @@ class ComputeHost:
                 pass
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
 
+    def _acquire_session_lock(self, sid: str) -> tuple[threading.Lock, _SessionLockEntry]:
+        with self._session_locks_guard:
+            entry = self._session_locks.get(sid)
+            if entry is None:
+                entry = _SessionLockEntry()
+                self._session_locks[sid] = entry
+            entry.waiters += 1
+            return entry.lock, entry
+
+    def _release_session_lock(self, sid: str, entry: _SessionLockEntry) -> None:
+        with self._session_locks_guard:
+            entry.waiters -= 1
+            if entry.waiters <= 0 and self._session_locks.get(sid) is entry:
+                del self._session_locks[sid]
+
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
+        # Serialized per sid: two concurrent first turns used to build two
+        # agents and let the last writer win, so an incompatible scope could
+        # silently replace a session that was opened without tools. The lock
+        # covers ensure/build only and is dropped before the turn runs.
+        sid = str(frame.get("sid") or "")
+        lock, entry = self._acquire_session_lock(sid)
+        try:
+            with lock:
+                return self._ensure_server_session_locked(server, frame)
+        finally:
+            self._release_session_lock(sid, entry)
+
+    def _ensure_server_session_locked(self, server: Any, frame: dict[str, Any]) -> dict:
         sid = str(frame.get("sid") or "")
         key = str(frame.get("session_key") or sid)
         session = server._sessions.get(sid)
         if session is not None:
+            if server._toolset_selection_conflict(session, frame.get("enabled_toolsets")):
+                raise ToolsetScopeConflictError(
+                    "compute host: session is already live with a different "
+                    "toolset selection"
+                )
             session["transport"] = self._transport
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)

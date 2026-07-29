@@ -9149,11 +9149,13 @@ def _(rid, params: dict) -> dict:
     try:
         tokens = _set_session_context(new_key)
         try:
+            branch_toolsets = session.get("create_enabled_toolsets")
             agent = _make_agent(
                 new_sid,
                 new_key,
                 session_id=new_key,
                 platform_override=source,
+                enabled_toolsets_override=branch_toolsets,
             )
         finally:
             _clear_session_context(tokens)
@@ -9167,6 +9169,10 @@ def _(rid, params: dict) -> dict:
         )
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
+            # A branch inherits the parent's scope: the copy of a session
+            # opened without tools must not come back tooled.
+            if branch_toolsets is not None:
+                _sessions[new_sid]["create_enabled_toolsets"] = branch_toolsets
     except Exception as e:
         if lease is not None:
             lease.release()
@@ -12836,15 +12842,16 @@ def _(rid, params: dict) -> dict:
                 from tools.mcp_tool import refresh_agent_mcp_tools
 
                 # Explicit reload: re-resolve enabled toolsets so a server the
-                # user just enabled in config this session is picked up. An
-                # explicitly scoped session keeps its own list instead, or the
-                # reload would re-tool a session opened without tools.
-                _agent_toolsets = getattr(agent, "enabled_toolsets", None)
+                # user just enabled in config this session is picked up. The
+                # decision reads the REQUESTED scope on the record, not the
+                # agent: a session opened without the field already carries a
+                # resolved global list on its agent, so reading the agent would
+                # pin it forever and stop honoring config edits.
+                _pinned = session.get("create_enabled_toolsets")
                 refresh_agent_mcp_tools(
                     agent,
                     enabled_override=(
-                        list(_agent_toolsets)
-                        if _agent_toolsets is not None
+                        list(_pinned) if _pinned is not None
                         else _load_enabled_toolsets()
                     ),
                     quiet_mode=True,
