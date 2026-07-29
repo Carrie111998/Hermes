@@ -47,6 +47,10 @@ ui-tui/packages/hermes-ink/dist/
 *.swp
 *.swo
 
+# macOS AppleDouble metadata is binary and can be named like Python source
+# (for example tools/._registry.py). Never copy resource forks into images.
+**/._*
+
 # Testing
 .pytest_cache/
 .coverage

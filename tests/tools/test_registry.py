@@ -5,6 +5,8 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
 
 
@@ -338,6 +340,30 @@ class TestBuiltinDiscovery:
 
         assert imported == ["tools.alpha"]
         mock_import.assert_called_once_with("tools.alpha")
+
+    def test_ignores_appledouble_metadata(self, tmp_path):
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        (tools_dir / "._alpha.py").write_bytes(b"\x00\x05\x16\x07\x00\xa3")
+        (tools_dir / "alpha.py").write_text(
+            "from tools.registry import registry\n"
+            "registry.register(name='alpha', toolset='x', schema={}, "
+            "handler=lambda *_a, **_k: '{}')\n",
+            encoding="utf-8",
+        )
+
+        with patch("tools.registry.importlib.import_module") as mock_import:
+            imported = discover_builtin_tools(tools_dir)
+
+        assert imported == ["tools.alpha"]
+        mock_import.assert_called_once_with("tools.alpha")
+
+    def test_non_utf8_tool_source_reports_path(self, tmp_path):
+        module_path = tmp_path / "broken.py"
+        module_path.write_bytes(b"\x00\xa3")
+
+        with pytest.raises(RuntimeError, match=r"broken\.py"):
+            _module_registers_tools(module_path)
 
 
 class TestEmojiMetadata:

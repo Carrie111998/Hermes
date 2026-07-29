@@ -48,6 +48,10 @@ def _module_registers_tools(module_path: Path) -> bool:
     try:
         source = module_path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(module_path))
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(
+            f"tool module is not UTF-8 source: {module_path}"
+        ) from exc
     except (OSError, SyntaxError):
         return False
 
@@ -61,6 +65,7 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
         f"tools.{path.stem}"
         for path in sorted(tools_path.glob("*.py"))
         if path.name not in {"__init__.py", "registry.py", "mcp_tool.py"}
+        and not path.name.startswith("._")
         and _module_registers_tools(path)
     ]
 
