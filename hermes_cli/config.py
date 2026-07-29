@@ -1491,6 +1491,10 @@ DEFAULT_CONFIG = {
                                       # prompt-cache invalidation amortized: one big
                                       # episodic break instead of a tiny break every
                                       # tool iteration. 0 = commit any non-zero prune.
+        "proactive_prune_artifacts": False,  # only applies when proactive_prune_tokens
+                                      # is enabled. Persist redacted old TOOL RESULT
+                                      # bodies in the active sandbox before replacing
+                                      # them with integrity-checked file references.
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
         "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
                                       # WITHOUT forward progress. The summary call streams, so
