@@ -246,6 +246,63 @@ def test_resolve_runtime_provider_anthropic_explicit_override_skips_pool(monkeyp
     assert resolved.get("credential_pool") is None
 
 
+def test_resolve_runtime_provider_anthropic_azure_com_in_path_not_classified_as_azure(monkeypatch):
+    """A base URL whose PATH (not hostname) contains "azure.com" must not be
+    routed through the Azure Anthropic short-circuit — the explicit Anthropic
+    credential should win instead of an Azure key lookup. Regression for
+    issue #74312."""
+
+    def _unexpected_pool(provider):
+        raise AssertionError(f"load_pool should not be called for {provider}")
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "anthropic", "base_url": ""},
+    )
+    monkeypatch.setattr(rp, "load_pool", _unexpected_pool)
+    # If the buggy substring check fired, it would look for an Azure key and
+    # ignore the explicit token entirely — so no need to set AZURE_ANTHROPIC_KEY.
+    monkeypatch.delenv("AZURE_ANTHROPIC_KEY", raising=False)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="anthropic",
+        explicit_api_key="explicit-anthropic-token",
+        explicit_base_url="https://example.invalid/proxy/azure.com/v1",
+    )
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["api_key"] == "explicit-anthropic-token"
+    assert resolved["base_url"] == "https://example.invalid/proxy/azure.com/v1"
+    assert resolved["source"] == "explicit"
+
+
+def test_resolve_runtime_provider_anthropic_real_azure_host_still_short_circuits(monkeypatch):
+    """Regression guard: a genuine Azure host must still take the Azure
+    Anthropic short-circuit (using the Azure key, not the OAuth chain)."""
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "anthropic", "base_url": ""},
+    )
+    monkeypatch.setenv("AZURE_ANTHROPIC_KEY", "azure-env-key")
+
+    resolved = rp.resolve_runtime_provider(
+        requested="anthropic",
+        explicit_base_url="https://foo.openai.azure.com/anthropic/v1",
+    )
+
+    assert resolved["provider"] == "anthropic"
+    assert resolved["api_mode"] == "anthropic_messages"
+    assert resolved["api_key"] == "azure-env-key"
+    assert resolved["base_url"] == "https://foo.openai.azure.com/anthropic/v1"
+    assert resolved["source"] == "azure-explicit"
+
+
 def test_resolve_runtime_provider_falls_back_when_pool_empty(monkeypatch):
     class _Pool:
         def has_credentials(self):
@@ -2580,6 +2637,40 @@ class TestAzureAnthropicEnvVarHint:
         # The normal chain runs — key_env is not consulted off-Azure.
         assert called["resolve_anthropic_token"] is True
         assert resolved["api_key"] == "token-from-resolver"
+
+    def test_azure_com_in_path_ignores_key_env(self, monkeypatch):
+        """A cfg base_url whose PATH (not hostname) contains "azure.com" must
+        not be classified as Azure — key_env is not consulted and the regular
+        resolve_anthropic_token chain runs. Regression for issue #74312.
+
+        The path ends with "/anthropic" so it clears the unrelated
+        `_anthropic_base_url_override_ok` gate (which would otherwise reset
+        cfg_base_url to "" before the Azure check ever runs), keeping this
+        test focused on the substring-vs-hostname bug specifically."""
+        monkeypatch.setenv("MY_KEY", "custom-key-value")
+        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+        monkeypatch.setattr(rp, "_get_model_config", lambda: {
+            "provider": "anthropic",
+            "base_url": "https://example.invalid/azure.com/anthropic",  # host isn't Azure
+            "key_env": "MY_KEY",
+        })
+        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+        called = {"resolve_anthropic_token": False}
+
+        def _fake_resolve():
+            called["resolve_anthropic_token"] = True
+            return "token-from-resolver"
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.resolve_anthropic_token",
+            _fake_resolve,
+        )
+
+        resolved = rp.resolve_runtime_provider(requested="anthropic")
+
+        assert called["resolve_anthropic_token"] is True
+        assert resolved["api_key"] == "token-from-resolver"
+        assert resolved["base_url"] == "https://example.invalid/azure.com/anthropic"
 
 
 # ──────────────────────────────────────────────────────────────────────────
