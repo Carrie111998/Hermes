@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesRepoStatus } from '@/global'
 
-import { $repoStatus, $repoStatusLoading, refreshRepoStatus } from './coding-status'
+import { $repoStatus, $repoStatusLoading, refreshRepoStatus, repoChangeKindForPath } from './coding-status'
 import { $currentCwd, $selectedStoredSessionId } from './session'
 
 const sampleStatus: HermesRepoStatus = {
@@ -165,5 +165,30 @@ describe('refreshRepoStatus', () => {
     await vi.runAllTicks()
 
     expect(probe).toHaveBeenCalledWith('/repo')
+  })
+})
+
+describe('repoChangeKindForPath', () => {
+  it('does not notify a row when only another path changes', () => {
+    $currentCwd.set('/repo')
+    $repoStatus.set({ ...sampleStatus, files: [] })
+    const row = repoChangeKindForPath('/repo/a.ts')
+    const listener = vi.fn()
+    const unsubscribe = row.subscribe(listener)
+
+    $repoStatus.set({
+      ...sampleStatus,
+      files: [{ path: 'b.ts', untracked: true } as HermesRepoStatus['files'][number]]
+    })
+    expect(listener).toHaveBeenCalledTimes(1)
+
+    $repoStatus.set({
+      ...sampleStatus,
+      files: [{ path: 'a.ts', untracked: true } as HermesRepoStatus['files'][number]]
+    })
+    expect(listener).toHaveBeenCalledTimes(2)
+    expect(listener.mock.calls.at(-1)?.[0]).toBe('added')
+
+    unsubscribe()
   })
 })

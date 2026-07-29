@@ -1,4 +1,4 @@
-import { atom, computed } from 'nanostores'
+import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
 import { desktopGit } from '@/lib/desktop-git'
@@ -43,6 +43,14 @@ export const $repoChangeByPath = computed([$repoStatus, $currentCwd], (status, c
 
   return map
 })
+
+/**
+ * Per-row Git decoration subscription. A visible file row reads one scalar, so
+ * a fresh repo-status map only re-renders that row when its own kind changed.
+ */
+export function repoChangeKindForPath(path: string): ReadableAtom<RepoChangeKind | undefined> {
+  return computed($repoChangeByPath, changes => changes.get(path))
+}
 
 async function loadWorktrees(target: string): Promise<void> {
   const list = desktopGit()?.worktreeList
