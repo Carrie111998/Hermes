@@ -1281,7 +1281,7 @@ if (ENABLE_HISTORY_API) {
     if (!msgs) {
       return res.json({ messages: [], total: 0 });
     }
-    res.json({ messages: msgs, total: (chatOrderQueues?.get(chatId) || []).length });
+    res.json({ messages: msgs, total: chatOrderQueues?.get(chatId)?.size || 0 });
   });
 
   // GET /chats — List all chats that have stored messages
@@ -1290,13 +1290,14 @@ if (ENABLE_HISTORY_API) {
     if (chatMessageStore && chatOrderQueues) {
       for (const [chatId, byMsgId] of chatMessageStore) {
         const order = chatOrderQueues.get(chatId);
-        if (!order || order.length === 0) continue;
-        const lastId = order[order.length - 1];
+        if (!order || order.size === 0) continue;
+        const keysArr = [...order.keys()];
+        const lastId = keysArr[keysArr.length - 1];
         const last = lastId ? byMsgId.get(lastId) || {} : {};
         chats.push({
           chatId,
           isGroup: chatId.endsWith('@g.us'),
-          messageCount: order.length,
+          messageCount: order.size,
           lastMessage: last.body || (last.hasMedia ? '[Media]' : ''),
           lastTimestamp: last.timestamp || null,
         });
