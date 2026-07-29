@@ -18,10 +18,10 @@ in-memory state or signal handler surviving the death of the process.
     except Exception:
         ...  # entry stays pending — picked up by the next outbox_drain()
 
-outbox_drain() is intentionally NOT wired into any signal handler or gateway
-startup hook in this change — it is a standalone, independently-callable
-function. Wiring it into a periodic driver (cron) is a separate decision
-(schedule changes are user-approval-gated) left for a follow-up.
+outbox_drain() is invoked by the gateway after the Telegram adapter reports
+connected (cold start and outage reconnect; see
+GatewayRunner._schedule_telegram_outbox_drain) with an item/deadline budget.
+It stays independently callable for tests and manual recovery.
 
 Every function here is best-effort: a failure in outbox bookkeeping must
 NEVER prevent or delay the real send it wraps. Callers should treat all
@@ -40,6 +40,50 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _OUTBOX_FILENAME = "telegram-outbox.jsonl"
+
+
+class _outbox_lock:
+    """Advisory inter-process lock over the outbox file (sidecar .lock).
+
+    Serializes hot-path appends/tombstones against the drain's compaction
+    rewrite so an append landing mid-compaction can never be dropped by the
+    os.replace. Held only around file I/O — never across network sends.
+    Best-effort like everything here: if flock is unavailable (non-POSIX) or
+    fails, callers proceed unlocked rather than blocking the real send.
+    """
+
+    def __init__(self, path: Path):
+        self._lock_path = path.with_suffix(path.suffix + ".lock")
+        self._fh = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+
+            self._fh = open(self._lock_path, "a+")
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._fh is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+        return False
 
 
 def _outbox_path() -> Path:
@@ -71,8 +115,9 @@ def outbox_append(chat_id: str, message: str, thread_id: str | None = None) -> s
     }
     try:
         path = _outbox_path()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with _outbox_lock(path):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         return entry_id
     except Exception as e:
         logger.warning("telegram_outbox: append failed (send proceeds anyway): %s", e)
@@ -91,8 +136,9 @@ def outbox_mark_sent(entry_id: str | None) -> None:
         return
     try:
         path = _outbox_path()
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"id": entry_id, "status": "sent", "sent_at": time.time()}, ensure_ascii=False) + "\n")
+        with _outbox_lock(path):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"id": entry_id, "status": "sent", "sent_at": time.time()}, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.warning("telegram_outbox: mark_sent failed for %s (message was sent; only the outbox record is stale): %s", entry_id, e)
 
@@ -141,8 +187,24 @@ def outbox_pending_entries() -> list[dict]:
     return [e for rid, e in sorted(pending.items(), key=lambda kv: kv[1].get("created_at", 0)) if rid not in resolved]
 
 
-def outbox_drain(send_fn=None, max_age_seconds: float = 7 * 24 * 3600) -> dict:
-    """Re-attempt delivery for every still-pending entry, then compact the file.
+def outbox_drain(
+    send_fn=None,
+    max_age_seconds: float = 7 * 24 * 3600,
+    max_items: int = 100,
+    deadline_seconds: float | None = None,
+    grace_seconds: float = 60.0,
+) -> dict:
+    """Re-attempt delivery for still-pending entries, then compact the file.
+
+    Bounded: at most ``max_items`` resend attempts per call, and no new
+    attempt starts after ``deadline_seconds`` (entries left over simply stay
+    pending for the next drain). The deadline bounds *starting* attempts —
+    a single already-running ``send_fn`` call (network stall, RetryAfter
+    sleep) can overshoot it; strict wall-clock kill of a synchronous sender
+    is deliberately out of scope here. Entries younger than ``grace_seconds`` are
+    skipped — an entry that fresh is very likely an in-flight send by a live
+    sender in this or another process, and resending it now would double-send;
+    it either gets tombstoned by its own sender or picked up by a later drain.
 
     Args:
         send_fn: callable(chat_id, message, thread_id) -> bool (True = delivered).
@@ -184,18 +246,21 @@ def outbox_drain(send_fn=None, max_age_seconds: float = 7 * 24 * 3600) -> dict:
         return {"attempted": 0, "sent": 0, "dropped_stale": 0, "still_pending": 0}
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        with _outbox_lock(path):
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
     except Exception as e:
         logger.warning("telegram_outbox: drain could not read outbox: %s", e)
         return {"attempted": 0, "sent": 0, "dropped_stale": 0, "still_pending": 0}
 
     pending, resolved = _load_resolved_ids(lines)
     now = time.time()
+    started = time.monotonic()
     attempted = 0
     sent = 0
     dropped_stale = 0
-    still_pending: dict[str, dict] = {}
+    sent_ids: set[str] = set()
+    stale_ids: set[str] = set()
 
     for rid, entry in pending.items():
         if rid in resolved:
@@ -203,7 +268,15 @@ def outbox_drain(send_fn=None, max_age_seconds: float = 7 * 24 * 3600) -> dict:
         age = now - entry.get("created_at", now)
         if age > max_age_seconds:
             dropped_stale += 1
+            stale_ids.add(rid)
             continue
+        if age < grace_seconds:
+            # Likely in-flight by a live sender — leave it alone this pass.
+            continue
+        if attempted >= max_items:
+            break
+        if deadline_seconds is not None and time.monotonic() - started > deadline_seconds:
+            break
         attempted += 1
         try:
             ok = bool(send_fn(entry.get("chat_id"), entry.get("message"), entry.get("thread_id")))
@@ -212,19 +285,32 @@ def outbox_drain(send_fn=None, max_age_seconds: float = 7 * 24 * 3600) -> dict:
             ok = False
         if ok:
             sent += 1
-        else:
-            still_pending[rid] = entry
+            sent_ids.add(rid)
 
-    # Compact: rewrite the file containing only entries still genuinely
-    # pending after this drain (drops sent/stale ones). Atomic replace via
-    # tmp file + os.replace so a crash mid-write never leaves a truncated
-    # outbox — worst case the old file (superset, safe to over-retry) survives.
+    # Fallback summary count from the snapshot (used when compaction fails:
+    # entries then remain on disk, so reporting 0 would be wrong).
+    still_pending_count = len(
+        [rid for rid in pending if rid not in resolved and rid not in sent_ids and rid not in stale_ids]
+    )
+    # Compact under the lock, against a FRESH read of the file — not the
+    # pre-send snapshot. Appends/tombstones that landed while this drain was
+    # sending (from live senders in this or another process) are therefore
+    # preserved, closing the lost-append window a snapshot-based os.replace
+    # would have. We drop only ids that are resolved in the fresh content,
+    # were sent by this drain, or aged out. Atomic tmp+os.replace as before.
     try:
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for entry in still_pending.values():
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        os.replace(tmp_path, path)
+        with _outbox_lock(path):
+            with open(path, "r", encoding="utf-8") as f:
+                fresh_lines = f.readlines()
+            fresh_pending, fresh_resolved = _load_resolved_ids(fresh_lines)
+            drop = fresh_resolved | sent_ids | stale_ids
+            keep = {rid: e for rid, e in fresh_pending.items() if rid not in drop}
+            still_pending_count = len(keep)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                for entry in keep.values():
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            os.replace(tmp_path, path)
     except Exception as e:
         logger.warning("telegram_outbox: drain compaction failed (outbox left as-is, will re-attempt next drain): %s", e)
 
@@ -232,5 +318,5 @@ def outbox_drain(send_fn=None, max_age_seconds: float = 7 * 24 * 3600) -> dict:
         "attempted": attempted,
         "sent": sent,
         "dropped_stale": dropped_stale,
-        "still_pending": len(still_pending),
+        "still_pending": still_pending_count,
     }

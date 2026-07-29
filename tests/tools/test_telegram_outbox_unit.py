@@ -44,7 +44,7 @@ def test_drain_delivers_pending_and_compacts():
         delivered.append((chat_id, message))
         return True  # pretend Telegram accepted it
 
-    summary = ob.outbox_drain(send_fn=fake_send)
+    summary = ob.outbox_drain(send_fn=fake_send, grace_seconds=0)
     assert summary == {"attempted": 2, "sent": 2, "dropped_stale": 0, "still_pending": 0}
     assert len(delivered) == 2
     assert ob.outbox_pending_entries() == []
@@ -56,7 +56,7 @@ def test_drain_leaves_failed_sends_pending():
     def fake_send_fail(chat_id, message, thread_id):
         return False  # simulate Telegram API down
 
-    summary = ob.outbox_drain(send_fn=fake_send_fail)
+    summary = ob.outbox_drain(send_fn=fake_send_fail, grace_seconds=0)
     assert summary["attempted"] == 1
     assert summary["sent"] == 0
     assert summary["still_pending"] == 1
@@ -80,7 +80,7 @@ def test_drain_drops_stale_entries_without_attempting_resend():
         called.append(1)
         return True
 
-    summary = ob.outbox_drain(send_fn=fake_send, max_age_seconds=3600)
+    summary = ob.outbox_drain(send_fn=fake_send, max_age_seconds=3600, grace_seconds=0)
     assert summary["dropped_stale"] == 1
     assert summary["attempted"] == 0
     assert called == [], "stale entry must not be attempted"

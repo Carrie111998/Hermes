@@ -8030,6 +8030,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("Failed to cancel gateway loop floor timer", exc_info=True)
 
+    def _schedule_telegram_outbox_drain(self) -> None:
+        """One-shot, deferred drain of the durable Telegram outbox.
+
+        Runs after the Telegram adapter reports connected (cold start and
+        outage reconnect) so text sends interrupted by SIGKILL/reboot are
+        re-attempted instead of staying pending forever. Deferred off the
+        connect path for the same reason as the adapter's post-connect
+        housekeeping (#46298): resends are Bot API calls and must not eat
+        into the gateway's connect timeout. Contract: at most one drain task
+        in flight per runner — a reconnect landing mid-drain does not start a
+        second one (later reconnects after it finishes may drain again; the
+        WAL's own grace window and fresh-read compaction keep that safe).
+        Bounded (max_items/deadline) so a large backlog cannot stall shutdown
+        for long. Deliberately NOT wired into the per-profile adapter paths
+        in this change: profile sends write outboxes under their own profile
+        homes, and draining those correctly requires running the resend under
+        the matching profile runtime/secret scope — left as an explicit
+        follow-up rather than resending through the wrong bot from here.
+        """
+        # Shutdown guard. Deliberately keyed on _shutdown_event, NOT
+        # self._running: start() only flips _running=True after the connect
+        # loop, so a _running check would silently skip the cold-start drain
+        # (the primary reboot-recovery case this exists for).
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        if shutdown_event is not None and shutdown_event.is_set():
+            return
+        task = getattr(self, "_telegram_outbox_drain_task", None)
+        if task is not None and not task.done():
+            return
+
+        async def _drain() -> None:
+            try:
+                from tools.telegram_outbox import outbox_drain
+
+                summary = await asyncio.to_thread(
+                    outbox_drain, max_items=100, deadline_seconds=120.0
+                )
+                if summary.get("attempted") or summary.get("dropped_stale"):
+                    logger.info("telegram outbox drain: %s", summary)
+            except Exception:
+                logger.warning(
+                    "telegram outbox drain failed; entries stay pending for "
+                    "the next connect",
+                    exc_info=True,
+                )
+
+        task = asyncio.ensure_future(_drain())
+        self._telegram_outbox_drain_task = task
+        # Owned like every other runner task: cancelled by _stop_impl's
+        # background-task sweep instead of surviving into shutdown.
+        registry = getattr(self, "_background_tasks", None)
+        if registry is not None:
+            registry.add(task)
+            task.add_done_callback(registry.discard)
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -8482,6 +8537,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error_message=None,
                     )
                     logger.info("✓ %s connected", platform.value)
+                    if platform == Platform.TELEGRAM:
+                        self._schedule_telegram_outbox_drain()
                 else:
                     logger.warning("✗ %s failed to connect", platform.value)
                     # Defensive cleanup: a failed connect() may have
@@ -9566,6 +9623,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
                         self.delivery_router.adapters = self.adapters
+                        if platform == Platform.TELEGRAM:
+                            self._schedule_telegram_outbox_drain()
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
                             platform.value,
