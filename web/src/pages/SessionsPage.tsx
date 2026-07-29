@@ -25,11 +25,17 @@ import {
   Play,
   Eraser,
   Download,
+  Upload,
   Pencil,
   Check,
   Archive,
 } from "lucide-react";
 import { api } from "@/lib/api";
+import { shouldRefreshSessions } from "@/lib/session-refresh";
+import {
+  importSummary,
+  parseImportSessions,
+} from "@/lib/session-import";
 import type {
   SessionInfo,
   SessionMessage,
@@ -386,7 +392,6 @@ function SessionRow({
   resumeInChatEnabled,
 }: SessionRowProps) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(session.title ?? "");
@@ -395,15 +400,20 @@ function SessionRow({
   const navigate = useNavigate();
 
   useEffect(() => {
-    if (isExpanded && messages === null && !loading) {
-      setLoading(true);
-      api
-        .getSessionMessages(session.id)
-        .then((resp) => setMessages(resp.messages))
-        .catch((err) => setError(String(err)))
-        .finally(() => setLoading(false));
-    }
-  }, [isExpanded, session.id, messages, loading]);
+    if (!isExpanded || messages !== null) return;
+    let cancelled = false;
+    api
+      .getSessionMessages(session.id)
+      .then((resp) => {
+        if (!cancelled) setMessages(resp.messages);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isExpanded, session.id, messages]);
 
   const sourceInfo = (session.source
     ? SOURCE_CONFIG[session.source]
@@ -604,10 +614,14 @@ function SessionRow({
                 )}
               </div>
               <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-muted-foreground">
-                <span className="max-w-[min(100%,12rem)] truncate sm:max-w-[180px]">
-                  {(session.model ?? t.common.unknown).split("/").pop()}
-                </span>
-                <span className="text-border">&#183;</span>
+                {session.model && (
+                  <>
+                    <span className="max-w-[min(100%,12rem)] truncate sm:max-w-[180px]">
+                      {session.model.split("/").pop()}
+                    </span>
+                    <span className="text-border">&#183;</span>
+                  </>
+                )}
                 <span className="shrink-0">
                   {session.message_count} {t.common.msgs}
                 </span>
@@ -638,7 +652,7 @@ function SessionRow({
 
       {isExpanded && (
         <div className="min-w-0 border-t border-border bg-background/50 p-4">
-          {loading && (
+          {messages === null && !error && (
             <div className="flex items-center justify-center py-8">
               <Spinner className="text-xl text-primary" />
             </div>
@@ -724,6 +738,7 @@ export default function SessionsPage() {
   >(null);
   const [searching, setSearching] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
@@ -756,6 +771,7 @@ export default function SessionsPage() {
   const [pruneOpen, setPruneOpen] = useState(false);
   const [pruneDays, setPruneDays] = useState("90");
   const [pruning, setPruning] = useState(false);
+  const [importingSessions, setImportingSessions] = useState(false);
   const { toast, showToast } = useToast();
   const { t } = useI18n();
   const { setAfterTitle, setEnd } = usePageHeader();
@@ -794,10 +810,9 @@ export default function SessionsPage() {
       <Button
         outlined
         size="sm"
-        className="gap-1.5"
         onClick={() => setPruneOpen(true)}
+        prefix={<Archive />}
       >
-        <Archive className="h-3.5 w-3.5" />
         Prune old sessions
       </Button>,
     );
@@ -806,8 +821,12 @@ export default function SessionsPage() {
     };
   }, [setEnd]);
 
-  const loadSessions = useCallback((p: number) => {
-    setLoading(true);
+  const loadSessions = useCallback((p: number, silent = false) => {
+    // ``silent`` skips the loading spinner so background refreshes
+    // (triggered when the overview poll detects a new session from
+    // another process) don't flicker the whole page or drop the user's
+    // scroll position.
+    if (!silent) setLoading(true);
     api
       .getSessions(PAGE_SIZE, p * PAGE_SIZE)
       .then((resp) => {
@@ -815,7 +834,9 @@ export default function SessionsPage() {
         setTotal(resp.total);
       })
       .catch(() => {})
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!silent) setLoading(false);
+      });
   }, []);
 
   const loadStats = useCallback(() => {
@@ -825,13 +846,63 @@ export default function SessionsPage() {
       .catch(() => {});
   }, []);
 
+  const handleImportSessions = useCallback(
+    async (files: FileList | null) => {
+      const file = files?.[0];
+      if (!file) return;
+      setImportingSessions(true);
+      try {
+        const text = await file.text();
+        const importedSessions = parseImportSessions(text);
+        const result = await api.importSessions(importedSessions);
+        showToast(`Import complete: ${importSummary(result)}`, "success");
+        clearSelection();
+        loadSessions(page, true);
+        loadStats();
+        refreshEmptyCount();
+      } catch (error) {
+        showToast(`Import failed: ${error}`, "error");
+      } finally {
+        setImportingSessions(false);
+        if (importInputRef.current) importInputRef.current.value = "";
+      }
+    },
+    [
+      clearSelection,
+      loadSessions,
+      loadStats,
+      page,
+      refreshEmptyCount,
+      showToast,
+    ],
+  );
+
   useEffect(() => {
     loadStats();
   }, [loadStats]);
 
+  // Refs for the overview poll's new-session detection. The poll effect
+  // below is mounted once with stable deps, so it reads the current page
+  // and the last-seen newest session id through refs instead of capturing
+  // stale values. ``newestSeenRef`` starts null so the first poll sets a
+  // baseline without triggering a redundant reload (mount already loads).
+  const newestSeenRef = useRef<string | null>(null);
+  const pageRef = useRef(page);
+
   useEffect(() => {
-    loadSessions(page);
-    refreshEmptyCount();
+    pageRef.current = page;
+  }, [page]);
+
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      loadSessions(page);
+      refreshEmptyCount();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [loadSessions, page, refreshEmptyCount]);
 
   useEffect(() => {
@@ -842,13 +913,27 @@ export default function SessionsPage() {
         .catch(() => {});
       api
         .getSessions(50)
-        .then((r) => setOverviewSessions(r.sessions))
+        .then((r) => {
+          setOverviewSessions(r.sessions);
+          // The dashboard server and a terminal CLI are separate
+          // processes sharing one session DB — there is no push channel,
+          // so we detect sessions created in another process here. The
+          // overview poll already fetches the 50 newest sessions, so we
+          // reuse its head id as a cheap change signal: when it changes,
+          // silently refresh the paginated list so the new session shows
+          // up in real time without a visible loading flicker.
+          const newest = r.sessions[0]?.id ?? null;
+          if (shouldRefreshSessions(newestSeenRef.current, newest)) {
+            loadSessions(pageRef.current, true);
+          }
+          newestSeenRef.current = newest;
+        })
         .catch(() => {});
     };
     loadOverview();
     const id = setInterval(loadOverview, 5000);
     return () => clearInterval(id);
-  }, []);
+  }, [loadSessions]);
 
   useEffect(() => {
     const el = logScrollRef.current;
@@ -873,6 +958,7 @@ export default function SessionsPage() {
   const updateSearch = useCallback(
     (value: string) => {
       setSearch(value);
+      if (value.trim()) setView("list");
       clearSelection();
     },
     [clearSelection],
@@ -890,13 +976,15 @@ export default function SessionsPage() {
     if (debounceRef.current) clearTimeout(debounceRef.current);
 
     if (!search.trim()) {
-      setSearchResults(null);
-      setSearching(false);
+      debounceRef.current = setTimeout(() => {
+        setSearchResults(null);
+        setSearching(false);
+      }, 0);
       return;
     }
 
-    setSearching(true);
     debounceRef.current = setTimeout(() => {
+      setSearching(true);
       api
         .searchSessions(search.trim())
         .then((resp) => setSearchResults(resp.results))
@@ -1181,10 +1269,6 @@ export default function SessionsPage() {
   const showList = view === "list" || isSearching || !showOverviewTab;
   const showPagination = showList && !searchResults && total > PAGE_SIZE;
 
-  useEffect(() => {
-    if (isSearching) setView("list");
-  }, [isSearching]);
-
   const alerts: { message: string; detail?: string }[] = [];
   if (status) {
     if (status.gateway_state === "startup_failed") {
@@ -1220,6 +1304,13 @@ export default function SessionsPage() {
     <div className="flex min-w-0 w-full max-w-full flex-col gap-4">
       <PluginSlot name="sessions:top" />
       <Toast toast={toast} />
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".json,.jsonl,application/json,application/x-ndjson"
+        className="hidden"
+        onChange={(event) => void handleImportSessions(event.currentTarget.files)}
+      />
 
       <DeleteConfirmDialog
         open={sessionDelete.isOpen}
@@ -1491,10 +1582,27 @@ export default function SessionsPage() {
                 onClick={() => setDeleteEmptyOpen(true)}
                 aria-label={t.sessions.deleteEmpty}
                 title={t.sessions.deleteEmpty}
+                prefix={<Eraser />}
               >
-                <Eraser className="h-3.5 w-3.5" />
                 <span className="font-mondwest normal-case text-xs">
                   {t.sessions.deleteEmpty} ({emptyCount})
+                </span>
+              </Button>
+            )}
+
+            {!isSearching && (
+              <Button
+                outlined
+                size="sm"
+                className="shrink-0"
+                disabled={importingSessions}
+                onClick={() => importInputRef.current?.click()}
+                aria-label="Import exported sessions"
+                title="Import exported session JSON or JSONL"
+                prefix={importingSessions ? <Spinner /> : <Upload />}
+              >
+                <span className="font-mondwest normal-case text-xs">
+                  Import sessions
                 </span>
               </Button>
             )}
@@ -1565,8 +1673,8 @@ export default function SessionsPage() {
               "{count}",
               String(selectedIds.size),
             )}
+            prefix={<Trash2 />}
           >
-            <Trash2 className="h-3.5 w-3.5" />
             <span className="font-mondwest normal-case text-xs">
               {t.sessions.deleteSelected.replace(
                 "{count}",
@@ -1648,19 +1756,29 @@ export default function SessionsPage() {
                     className="flex min-w-0 max-w-full flex-col gap-2 border border-border p-3 sm:flex-row sm:items-center sm:justify-between"
                   >
                     <div className="flex min-w-0 flex-1 flex-col gap-1">
-                      <span className="font-mondwest normal-case min-w-0 truncate text-sm font-medium">
-                        {s.title ?? t.common.untitled}
+                      <span
+                        className={`font-mondwest normal-case min-w-0 truncate text-sm ${s.title ? "font-medium" : "text-muted-foreground italic"}`}
+                      >
+                        {s.title ??
+                          (s.preview
+                            ? s.preview.slice(0, 60)
+                            : t.common.untitled)}
                       </span>
 
                       <span className="min-w-0 break-words text-xs text-muted-foreground">
-                        <span className="font-mono-ui">
-                          {(s.model ?? t.common.unknown).split("/").pop()}
-                        </span>{" "}
-                        · {s.message_count} {t.common.msgs} ·{" "}
+                        {s.model && (
+                          <>
+                            <span className="font-mono-ui">
+                              {s.model.split("/").pop()}
+                            </span>{" "}
+                            ·{" "}
+                          </>
+                        )}
+                        {s.message_count} {t.common.msgs} ·{" "}
                         {timeAgo(s.last_active)}
                       </span>
 
-                      {s.preview && (
+                      {s.preview && s.title && (
                         <p className="font-mondwest normal-case min-w-0 max-w-full text-xs leading-snug text-text-tertiary [overflow-wrap:anywhere]">
                           {s.preview}
                         </p>

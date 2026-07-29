@@ -57,10 +57,10 @@ def test_active_session_lease_blocks_until_release(tmp_path, monkeypatch):
     )
 
     assert blocked_lease is None
-    assert blocked_message == (
-        "Hermes is at the active session limit (1/1). "
-        "Try again when another session finishes."
-    )
+    assert "active session limit (1/1)" in blocked_message
+    # The rejected surface is rarely the one holding the slots, so the message
+    # must name the holder — here the "cli" lease, not the blocked "tui" one.
+    assert "Held by: cli" in blocked_message
 
     lease.release()
 
@@ -110,6 +110,33 @@ def test_active_session_registry_prunes_dead_pids(tmp_path, monkeypatch):
     assert [entry["session_id"] for entry in active_sessions.active_session_registry_snapshot()] == [
         "session-1"
     ]
+    lease.release()
+
+
+def test_transfer_active_session_reanchors_existing_lease(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="session-old",
+        surface="tui",
+        config={"max_concurrent_sessions": 1},
+        metadata={"live_session_id": "ui-1"},
+    )
+
+    assert message is None
+    assert lease is not None
+    assert active_sessions.transfer_active_session(
+        lease,
+        session_id="session-new",
+        metadata={"live_session_id": "ui-1"},
+    )
+
+    snapshot = active_sessions.active_session_registry_snapshot()
+    assert lease.session_id == "session-new"
+    assert len(snapshot) == 1
+    assert snapshot[0]["session_id"] == "session-new"
+    assert snapshot[0]["metadata"] == {"live_session_id": "ui-1"}
     lease.release()
 
 
@@ -208,6 +235,8 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
     repo_root = Path(__file__).resolve().parents[2]
     ready_dir = tmp_path / "ready"
     ready_dir.mkdir()
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
     go_file = tmp_path / "go"
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
@@ -217,7 +246,10 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
         "from pathlib import Path\n"
         "from hermes_cli.active_sessions import try_acquire_active_session\n"
         "idx = os.environ['WORKER_INDEX']\n"
+        "worker_count = int(os.environ['WORKER_COUNT'])\n"
+        "delayed_worker = os.environ.get('DELAYED_WORKER_INDEX')\n"
         "ready_dir = Path(os.environ['READY_DIR'])\n"
+        "results_dir = Path(os.environ['RESULTS_DIR'])\n"
         "go_file = Path(os.environ['GO_FILE'])\n"
         "(ready_dir / idx).write_text('ready', encoding='utf-8')\n"
         "deadline = time.time() + 10\n"
@@ -225,16 +257,24 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
         "    if time.time() > deadline:\n"
         "        raise RuntimeError('timed out waiting for go file')\n"
         "    time.sleep(0.01)\n"
+        "if idx == delayed_worker:\n"
+        "    time.sleep(2.5)\n"
         "lease, message = try_acquire_active_session(\n"
         "    session_id=f'process-{idx}',\n"
         "    surface='cli',\n"
         "    config={'max_concurrent_sessions': 1},\n"
         ")\n"
         "if lease is None:\n"
+        "    (results_dir / idx).write_text('BLOCK', encoding='utf-8')\n"
         "    print('BLOCK', flush=True)\n"
         "else:\n"
+        "    (results_dir / idx).write_text('OK', encoding='utf-8')\n"
         "    print('OK', flush=True)\n"
-        "    time.sleep(2.0)\n"
+        "    deadline = time.time() + 10\n"
+        "    while len(list(results_dir.iterdir())) < worker_count:\n"
+        "        if time.time() > deadline:\n"
+        "            raise RuntimeError('timed out waiting for all workers to attempt acquire')\n"
+        "        time.sleep(0.01)\n"
         "    lease.release()\n"
     )
     workers: list[subprocess.Popen[str]] = []
@@ -242,7 +282,10 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
         for index in range(6):
             worker_env = env.copy()
             worker_env["WORKER_INDEX"] = str(index)
+            worker_env["WORKER_COUNT"] = "6"
+            worker_env["DELAYED_WORKER_INDEX"] = "5"
             worker_env["READY_DIR"] = str(ready_dir)
+            worker_env["RESULTS_DIR"] = str(results_dir)
             worker_env["GO_FILE"] = str(go_file)
             workers.append(
                 subprocess.Popen(
@@ -311,3 +354,33 @@ def test_pid_start_time_mismatch_prunes_reused_pid(tmp_path, monkeypatch):
         "new-session"
     ]
     lease.release()
+
+
+def test_release_orphaned_leases_reclaims_only_unowned_own_pid_entries(tmp_path, monkeypatch):
+    """A long-lived server must reclaim leases whose session skipped teardown.
+
+    ``_prune_dead`` only fires when the owning pid dies, so a ``hermes
+    dashboard`` running for days holds a leaked lease until restart. The
+    process reconciles against the leases it still owns instead.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    cfg = {"max_concurrent_sessions": 5}
+    kept, orphan = (
+        active_sessions.try_acquire_active_session(
+            session_id=sid, surface="desktop", config=cfg
+        )[0]
+        for sid in ("kept", "orphaned")
+    )
+    # Another live process's lease is not ours to reclaim.
+    active_sessions._write_entries(
+        active_sessions._state_path(),
+        active_sessions._read_entries(active_sessions._state_path())
+        + [{"lease_id": "elsewhere", "session_id": "other", "surface": "cli", "pid": os.getpid() }],
+    )
+
+    assert active_sessions.release_orphaned_leases({kept.lease_id, "elsewhere"}) == 1
+    assert sorted(
+        entry["session_id"]
+        for entry in active_sessions.active_session_registry_snapshot()
+    ) == ["kept", "other"]
+    assert orphan is not None

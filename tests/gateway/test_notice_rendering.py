@@ -63,7 +63,10 @@ def test_real_policy_notices_render_without_doubling():
     from agent.credits_tracker import CreditsState, evaluate_credits_notices
 
     def _emitted(uf=None, paid=True, purchased=0):
-        latch = {"active": set(), "seen_below_90": True, "usage_band": None}
+        # Both crossing gates pre-opened: this test's subject is RENDERING of
+        # every notice the policy can emit, not the gating.
+        latch = {"active": set(), "seen_below_90": True, "usage_band": None,
+                 "seen_grant_unspent": True}
         if uf is None:
             st = CreditsState(
                 subscription_limit_micros=None, subscription_micros=0,
@@ -84,10 +87,12 @@ def test_real_policy_notices_render_without_doubling():
     notices = (
         _emitted(uf=0.9)                          # band 90 (warn)
         + _emitted(uf=0.5)                        # band 50 (info)
-        + _emitted(uf=1.0, purchased=5_000_000)   # band 90 + grant_spent
+        + _emitted(uf=1.0, purchased=5_000_000)   # grant_spent (band suppressed by top-up)
         + _emitted(uf=None, paid=False)           # depleted
     )
-    assert notices, "policy produced no notices to check"
+    # Every leg above must actually produce its notice — a gate regression that
+    # silences one leg must fail here, not silently shrink the coverage.
+    assert len(notices) == 4, [n.key for n in notices]
     for n in notices:
         assert render_notice_line(n) == n.text  # verbatim — no prepended glyph
 
@@ -107,6 +112,10 @@ def _make_source(platform_value="telegram", chat_id="555", user_id="u1"):
     src.platform = plat
     src.chat_id = chat_id
     src.user_id = user_id
+    # Real SessionSource.profile is None (single-profile) or a str; a MagicMock
+    # auto-attribute would read as a truthy "stamped profile" and trip the
+    # fail-closed path in _adapter_for_source (see AGENTS.md pitfall #17).
+    src.profile = None
     return src
 
 
