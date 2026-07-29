@@ -457,6 +457,47 @@ def _mask_token(token: str) -> str:
     return mask_secret(token, head=6, tail=4, floor=18)
 
 
+def _looks_like_credential(value: str) -> bool:
+    """Return True if ``value`` looks like a real credential (not a code constant).
+
+    Used to gate name-driven redaction so that simple code values like
+    ``MAX_TOKENS=100``, ``API_VERSION=v2``, or ``DEFAULT_SECRET=none`` are
+    left alone even when the key name matches a secret-like keyword.
+
+    Heuristics:
+      - 12+ chars: likely a credential. Skip pure-hex (commit SHAs) and pure
+        alpha-under-20 (prose words, identifiers).
+      - Short (3-11 chars): flag if mixed-case + digits (``MyTokenA1``) OR
+        8+ chars with any letters (plausible password length).
+    """
+    if not value or len(value) < 3:
+        return False
+
+    # Very short (3-11 chars)
+    if len(value) < 12:
+        has_upper = any(c.isupper() for c in value)
+        has_lower = any(c.islower() for c in value)
+        has_digit = any(c.isdigit() for c in value)
+        # Mixed-case AND digits — compact credential format
+        if has_upper and has_lower and has_digit:
+            return True
+        # 8+ chars with letters — plausible password length
+        if len(value) >= 8 and (has_upper or has_lower):
+            return True
+        # Short all-digit or all-lowercase is a code constant
+        return False
+
+    # 12+ chars: likely a credential. Skip pure-hex (commit SHAs, UUIDs)
+    # and pure-alpha-under-20 (prose words).
+    digit = [c for c in value if c.isdigit()]
+    alpha = [c for c in value if c.isalpha()]
+    if len(digit) == len(value):
+        return False  # all digits — phone number, port, etc.
+    if len(alpha) == len(value) and len(value) < 20:
+        return False  # pure alpha under 20 — prose word, code identifier
+    return True
+
+
 def _redact_query_string(query: str) -> str:
     """Redact sensitive parameter values in a URL query string.
 
@@ -639,10 +680,13 @@ def redact_sensitive_text(
     URL userinfo. The default remains False because actionable OAuth callback,
     magic-link, and pre-signed URLs must survive ordinary tool flows unchanged.
 
-    Set code_file=True to skip the ENV-assignment and JSON-field regex
-    patterns when the text is known to be source code (e.g. MAX_TOKENS=***
-    constants, "apiKey": "test" fixtures). Prefix patterns, auth headers,
-    private keys, DB connstrings, JWTs, and URL secrets are still redacted.
+    Set code_file=True to skip the JSON-field and YAML regex patterns when the
+    text is known to be source code (e.g. MAX_TOKENS=*** constants,
+    "apiKey": "test" fixtures). Unlike previous versions, the ENV-assignment
+    pass is NOT gated by code_file — it runs in ALL contexts because
+    _looks_like_credential filters out code constants. Prefix patterns, auth
+    headers, private keys, DB connstrings, JWTs, and URL secrets are still
+    redacted.
 
     Set file_read=True for file *content* returned to the agent (read_file /
     search_files / cat). Secrets are STILL redacted — they are never exposed —
@@ -683,32 +727,48 @@ def redact_sensitive_text(
         _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
         text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
 
-    # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
+    # ENV assignments: OPENAI_API_KEY=***  — name-driven, runs in ALL contexts
+    # (including code_file=True) because _looks_like_credential prevents false
+    # positives on code constants like MAX_TOKENS=*** (issue #72925).
+    if "=" in text:
+        def _redact_env(m):
+            name, quote, value = m.group(1), m.group(2), m.group(3)
+            # Programmatic env lookups reference variable *names*, not
+            # secret values — masking them corrupts code snippets in
+            # prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
+            if _ENV_LOOKUP_VALUE_RE.match(value):
+                return m.group(0)
+            # Keyword must sit at a word boundary within the key —
+            # ``author=Smith`` / ``press.secretary=…`` are prose, not
+            # credentials (ported from nearai/ironclaw#6129). All-caps
+            # keys (the _ENV_ASSIGN_RE shape) short-circuit to legacy
+            # embedded matching inside the helper.
+            if not _key_has_secret_keyword(name):
+                return m.group(0)
+            # Name-driven guard: skip values that don't look like
+            # real credentials. This lets ``MAX_TOKENS=100`` and
+            # ``API_VERSION=v2`` pass through unmasked even when the
+            # key name matches a secret keyword, and allows the ENV
+            # assignment pass to run in ALL contexts (not just when
+            # ``code_file=False``) — making redaction truly name-driven
+            # rather than vendor-prefix-driven (issue #72925).
+            if not _looks_like_credential(value):
+                return m.group(0)
+            return f"{name}={quote}{_mask_token(value)}{quote}"
+        text = _ENV_ASSIGN_RE.sub(_redact_env, text)
+
+    # Lowercase/dotted config keys, JSON fields, and YAML values — skip for
+    # code files (false positives on code constants and config fixtures).
+    # These remain gated by ``not code_file`` because their key-name patterns
+    # are broader and more likely to misclassify prose/code identifiers.
     if not code_file:
-        if "=" in text:
-            def _redact_env(m):
-                name, quote, value = m.group(1), m.group(2), m.group(3)
-                # Programmatic env lookups reference variable *names*, not
-                # secret values — masking them corrupts code snippets in
-                # prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
-                if _ENV_LOOKUP_VALUE_RE.match(value):
-                    return m.group(0)
-                # Keyword must sit at a word boundary within the key —
-                # ``author=Smith`` / ``press.secretary=…`` are prose, not
-                # credentials (ported from nearai/ironclaw#6129). All-caps
-                # keys (the _ENV_ASSIGN_RE shape) short-circuit to legacy
-                # embedded matching inside the helper.
-                if not _key_has_secret_keyword(name):
-                    return m.group(0)
-                return f"{name}={quote}{_mask_token(value)}{quote}"
-            text = _ENV_ASSIGN_RE.sub(_redact_env, text)
-            # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
-            # web-URL query params are intentionally passed through (see note
-            # near the bottom of this function); _DB_CONNSTR_RE still guards
-            # connection-string passwords.
-            if "://" not in text:
-                text = _CFG_DOTTED_RE.sub(_redact_env, text)
-                text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+        # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
+        # web-URL query params are intentionally passed through (see note
+        # near the bottom of this function); _DB_CONNSTR_RE still guards
+        # connection-string passwords.
+        if "=" in text and "://" not in text:
+            text = _CFG_DOTTED_RE.sub(_redact_env, text)
+            text = _CFG_ANCHORED_RE.sub(_redact_env, text)
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
