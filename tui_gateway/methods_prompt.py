@@ -813,19 +813,27 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    assert session is not None
     try:
-        from tools.approval import resolve_gateway_approval
-
-        return _ok(
-            rid,
-            {
-                "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
-                )
-            },
+        from tools.approval import (
+            resolve_gateway_approval,
+            resolve_gateway_approval_by_id,
         )
+
+        request_id = str(params.get("request_id") or "")
+        if request_id:
+            resolved = resolve_gateway_approval_by_id(
+                session["session_key"],
+                request_id,
+                params.get("choice", "deny"),
+            )
+        else:
+            resolved = resolve_gateway_approval(
+                session["session_key"],
+                params.get("choice", "deny"),
+                resolve_all=params.get("all", False),
+            )
+        return _ok(rid, {"resolved": resolved})
     except Exception as e:
         return _err(rid, 5004, str(e))
 

@@ -223,6 +223,24 @@ describe('respondToApprovalAction', () => {
     expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
   })
 
+  it('includes the exact approval request id when available', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({
+      command: 'rm -rf /',
+      description: 'dangerous',
+      requestId: 'opaque-request-id',
+      sessionId: 'bg'
+    })
+
+    await respondToApprovalAction('bg', 'approve')
+
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'opaque-request-id',
+      session_id: 'bg'
+    })
+  })
+
   it('ignores unknown action ids', async () => {
     await respondToApprovalAction('bg', 'snooze')
     expect(request).not.toHaveBeenCalled()

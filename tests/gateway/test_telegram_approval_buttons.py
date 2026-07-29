@@ -347,6 +347,26 @@ class TestTelegramExecApproval:
         kwargs = adapter._bot.send_message.call_args[1]
         assert "..." in kwargs["text"]
         assert len(kwargs["text"]) < 5000
+
+    @pytest.mark.asyncio
+    async def test_cross_surface_buttons_are_restart_durable_and_within_limit(self):
+        adapter = _make_adapter()
+        mock_msg = MagicMock(message_id=1)
+        adapter._bot.send_message = AsyncMock(return_value=mock_msg)
+        token = "A" * 43
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345", command="ls", session_key=f"xsurf:{token}"
+        )
+
+        assert result.success is True
+        keyboard = adapter._bot.send_message.call_args.kwargs["reply_markup"]
+        callback_data = [
+            button.callback_data for row in keyboard.inline_keyboard for button in row
+        ]
+        assert all(f"x:{token}" in value for value in callback_data)
+        assert all(len(value.encode("utf-8")) <= 64 for value in callback_data)
+        assert adapter._approval_state == {}
 # _handle_callback_query — approval button clicks
 # ===========================================================================
 
@@ -384,6 +404,117 @@ class TestTelegramApprovalCallback:
 
         # State should be cleaned up
         assert 1 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_cross_surface_click_records_opaque_bridge_decision(self):
+        adapter = _make_adapter()
+        token = "B" * 43
+
+        query = AsyncMock()
+        query.data = f"ea:once:x:{token}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.message_thread_id = None
+        query.message.message_id = 777
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Jimbo"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with (
+                patch("gateway.cross_surface_bridge.resolve_request", return_value=True) as resolve,
+                patch("gateway.cross_surface_bridge.wait_for_resolution", return_value="resolved"),
+            ):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        resolve.assert_called_once_with(
+            token,
+            "once",
+            chat_id="12345",
+            thread_id=None,
+            user_id="12345",
+            message_id="777",
+        )
+        assert "Approved" in query.edit_message_text.call_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_cross_surface_stale_click_is_expired(self):
+        adapter = _make_adapter()
+        token = "C" * 43
+
+        query = AsyncMock()
+        query.data = f"ea:deny:x:{token}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.message_thread_id = None
+        query.from_user = MagicMock()
+        query.from_user.id = "12345"
+        query.from_user.first_name = "Jimbo"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("gateway.cross_surface_bridge.resolve_request", return_value=False):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        assert "expired" in query.answer.call_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_cross_surface_pending_desktop_ack_does_not_claim_approval(self):
+        adapter = _make_adapter()
+        token = "E" * 43
+        query = AsyncMock()
+        query.data = f"ea:once:x:{token}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.message.message_thread_id = None
+        query.message.message_id = 778
+        query.from_user = MagicMock(id="12345", first_name="Jimbo")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with (
+                patch("gateway.cross_surface_bridge.resolve_request", return_value=True),
+                patch("gateway.cross_surface_bridge.wait_for_resolution", return_value="pending"),
+            ):
+                await adapter._handle_callback_query(
+                    MagicMock(callback_query=query), MagicMock()
+                )
+
+        rendered = query.edit_message_text.call_args.kwargs["text"]
+        assert "Decision sent" in rendered
+        assert "Approved" not in rendered
+
+    @pytest.mark.asyncio
+    async def test_cross_surface_click_rejects_unauthorized_user(self):
+        adapter = _make_adapter()
+        runner = _AuthRunner(authorized=False)
+        adapter._message_handler = runner._handle_message
+        token = "D" * 43
+
+        query = AsyncMock()
+        query.data = f"ea:once:x:{token}"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id=222, first_name="Mallory")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+
+        with patch("gateway.cross_surface_bridge.resolve_request") as resolve:
+            await adapter._handle_callback_query(update, MagicMock())
+
+        resolve.assert_not_called()
+        assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
 
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):

@@ -5350,26 +5350,33 @@ class TelegramAdapter(BasePlatformAdapter):
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
 
-            # We'll use the message_id as part of callback_data to look up session_key
-            # Send a placeholder first, then update — or use a counter.
-            # Simpler: use a monotonic counter to generate short IDs.
-            import itertools
-            if not hasattr(self, "_approval_counter"):
-                self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
+            # Local gateway approvals use an in-memory monotonic ID. Cross-surface
+            # Desktop approvals carry their unguessable opaque token directly in
+            # callback_data so a gateway restart does not invalidate a live button.
+            # token_urlsafe(32) is 43 chars; even ``ea:session:x:<token>`` stays
+            # below Telegram's 64-byte callback_data limit.
+            is_cross_surface = session_key.startswith("xsurf:")
+            if is_cross_surface:
+                callback_ref = "x:" + session_key.removeprefix("xsurf:")
+            else:
+                import itertools
+                if not hasattr(self, "_approval_counter"):
+                    self._approval_counter = itertools.count(1)
+                approval_id = next(self._approval_counter)
+                callback_ref = str(approval_id)
 
             buttons = [
-                InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}")
+                InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{callback_ref}")
             ]
             if not smart_denied and allow_session:
                 buttons.append(
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
+                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{callback_ref}")
                 )
                 if allow_permanent:
                     buttons.append(
-                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
+                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{callback_ref}")
                     )
-            buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"))
+            buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{callback_ref}"))
             # Pair into rows (2x2 for the full set) so labels stay readable on
             # mobile — a single 4-button row truncates to "Allo… / Ses… / …".
             rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
@@ -5396,8 +5403,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
-            # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            # Cross-surface ownership is persisted in the bridge DB and encoded
+            # by opaque token; only local approvals need process-memory state.
+            if not is_cross_surface:
+                self._approval_state[int(callback_ref)] = session_key
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -6209,6 +6218,7 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat = getattr(query_message, "chat", None)
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
+        query_message_id = getattr(query_message, "message_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
         # --- Model picker callbacks ---
@@ -6242,9 +6252,15 @@ class TelegramAdapter(BasePlatformAdapter):
             parts = data.split(":", 2)
             if len(parts) == 3:
                 choice = parts[1]  # once, session, always, deny
+                callback_ref = parts[2]
+                is_cross_surface = callback_ref.startswith("x:")
+                token = callback_ref.removeprefix("x:") if is_cross_surface else ""
                 try:
-                    approval_id = int(parts[2])
+                    approval_id = None if is_cross_surface else int(callback_ref)
                 except (ValueError, IndexError):
+                    await query.answer(text="Invalid approval data.")
+                    return
+                if is_cross_surface and not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
                     await query.answer(text="Invalid approval data.")
                     return
 
@@ -6260,26 +6276,63 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
+                if is_cross_surface:
+                    session_key = f"xsurf:{token}"
+                else:
+                    assert approval_id is not None
+                    session_key = self._approval_state.pop(approval_id, None)
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
 
                 user_display = getattr(query.from_user, "first_name", "User")
 
-                # Resolve the approval FIRST — unblocks the agent thread.
-                # Rendering happens after so the message reflects what
-                # actually occurred: a tap that lands after the approval
-                # wait timed out (count == 0) must NOT claim "Approved" —
-                # the command was already denied and will not run (#63501
-                # regression follow-up: 60s waits made stale taps common).
+                # Resolve the approval FIRST — unblocks the owning agent thread.
+                # ``xsurf:`` entries belong to a Desktop process, so record the
+                # opaque single-use decision in the profile-local bridge mailbox;
+                # ordinary entries resolve this gateway process's in-memory queue.
+                pending_desktop_ack = False
                 try:
-                    from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
-                    logger.info(
-                        "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                        count, session_key, choice, user_display,
-                    )
+                    if session_key.startswith("xsurf:"):
+                        from gateway.cross_surface_bridge import (
+                            resolve_request,
+                            wait_for_resolution,
+                        )
+
+                        bridge_token = session_key.removeprefix("xsurf:")
+                        accepted = resolve_request(
+                            bridge_token,
+                            choice,
+                            chat_id=str(query_chat_id or ""),
+                            thread_id=(
+                                str(query_thread_id) if query_thread_id is not None else None
+                            ),
+                            user_id=str(getattr(query.from_user, "id", "")),
+                            message_id=(
+                                str(query_message_id) if query_message_id is not None else None
+                            ),
+                        )
+                        bridge_status = (
+                            await asyncio.to_thread(wait_for_resolution, bridge_token, 3.0)
+                            if accepted
+                            else "expired"
+                        )
+                        count = 1 if bridge_status == "resolved" else 0
+                        pending_desktop_ack = accepted and bridge_status == "pending"
+                        logger.info(
+                            "Telegram cross-surface approval decision "
+                            "(accepted=%s, desktop_status=%s, choice=%s, user=%s)",
+                            accepted, bridge_status, choice, user_display,
+                        )
+                    else:
+                        from tools.approval import resolve_gateway_approval
+
+                        count = resolve_gateway_approval(session_key, choice)
+                        logger.info(
+                            "Telegram button resolved %d approval(s) for session %s "
+                            "(choice=%s, user=%s)",
+                            count, session_key, choice, user_display,
+                        )
                 except Exception as exc:
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
                     count = 0
@@ -6294,6 +6347,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     }
                     label = label_map.get(choice, "Resolved")
                     edit_text = f"{label} by {user_display}"
+                elif pending_desktop_ack:
+                    label = "📨 Decision sent"
+                    edit_text = (
+                        f"{label} by {user_display} — awaiting confirmation from Desktop."
+                    )
                 else:
                     label = "⌛ Approval expired"
                     edit_text = (

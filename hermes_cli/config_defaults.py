@@ -1960,6 +1960,14 @@ DEFAULT_CONFIG = {
         # false.  TUI has its own modal overlay (HERMES_TUI_NO_CONFIRM=1 to
         # opt out there).
         "destructive_slash_confirm": True,
+        # Optional Desktop → messaging approval bridge. Disabled by default.
+        # The messaging gateway discovers the configured platform home channel;
+        # Desktop never receives or persists that destination.
+        "cross_surface": {
+            "enabled": False,
+            "target": "telegram",
+            "process_notifications": True,
+        },
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)
