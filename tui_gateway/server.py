@@ -4011,6 +4011,19 @@ class CompressionLockHeld(Exception):
         super().__init__(f"Compression lock held: {holder or 'unknown'}")
 
 
+def _get_compress_rpc_timeout() -> float:
+    """Read ``compression.rpc_timeout`` from config, falling back to 300.0."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        val = cfg.get("compression", {}).get("rpc_timeout")
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
+    return 300.0
+
+
 def _compress_session_history(
     session: dict,
     focus_topic: str | None = None,
@@ -10057,7 +10070,7 @@ def _(rid, params: dict) -> dict:
                 route_name="session.compress",
                 command=command,
                 wait=True,
-                timeout=120.0,
+                timeout=_get_compress_rpc_timeout(),
             )
         except Exception as exc:
             return _err(rid, 5019, f"compute-host compress failed: {exc}")
@@ -15827,6 +15840,7 @@ def _(rid, params: dict) -> dict:
                     route_name="slash.compress",
                     command=command,
                     wait=True,
+                    timeout=_get_compress_rpc_timeout(),
                 )
             except Exception as exc:
                 return _err(rid, 5019, f"compute-host slash.compress failed: {exc}")
