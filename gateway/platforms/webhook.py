@@ -993,7 +993,7 @@ class WebhookAdapter(BasePlatformAdapter):
     def _validate_signature(
         self, request: "web.Request", body: bytes, secret: str
     ) -> bool:
-        """Validate webhook signature (GitHub, GitLab, Svix, generic HMAC-SHA256)."""
+        """Validate webhook signature (GitHub, Fireflies, GitLab, Svix, generic HMAC-SHA256)."""
         def _header(name: str) -> str:
             return (
                 request.headers.get(name, "")
@@ -1020,12 +1020,23 @@ class WebhookAdapter(BasePlatformAdapter):
             )
 
         # GitHub: X-Hub-Signature-256 = sha256=<hex>
-        gh_sig = request.headers.get("X-Hub-Signature-256", "")
+        gh_sig = _header("X-Hub-Signature-256")
         if gh_sig:
             expected = "sha256=" + hmac.new(
                 secret.encode(), body, hashlib.sha256
             ).hexdigest()
             return _hmac_str_equal(gh_sig, expected)
+
+        # Fireflies: X-Hub-Signature = sha256=<hex>
+        # Fireflies does not use GitHub's `-256` header suffix.  Keep this
+        # separate from generic X-Webhook-Signature V1 below because the
+        # Fireflies value includes the `sha256=` prefix.
+        fireflies_sig = _header("X-Hub-Signature")
+        if fireflies_sig:
+            expected = "sha256=" + hmac.new(
+                secret.encode(), body, hashlib.sha256
+            ).hexdigest()
+            return _hmac_str_equal(fireflies_sig, expected)
 
         # GitLab: X-Gitlab-Token = <plain secret>
         gl_token = request.headers.get("X-Gitlab-Token", "")
