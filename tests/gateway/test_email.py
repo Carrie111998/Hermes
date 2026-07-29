@@ -398,6 +398,76 @@ class TestSendMethods(unittest.TestCase):
             adapter = EmailAdapter(PlatformConfig(enabled=True))
         return adapter
 
+    def test_declares_native_chunking(self):
+        """Email must advertise chunking so the delivery router skips its
+        non-chunking truncation cap (a Telegram-era 4,000-char limit that
+        silently severed a 5,199-char cron memo)."""
+        from plugins.platforms.email.adapter import EmailAdapter
+        self.assertTrue(EmailAdapter.splits_long_messages)
+
+    def test_send_delivers_long_content_whole(self):
+        """Content above the router's 4,000-char cap must arrive intact."""
+        import asyncio
+        adapter = self._make_adapter()
+        sent = []
+        adapter._send_email = lambda to, body, reply=None: (
+            sent.append(body), "<id@test>")[1]
+
+        long_content = "line\n" * 1200  # 6,000 chars — over the old cap
+        result = asyncio.run(adapter.send("user@test.com", long_content))
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(sent), 1)  # under MAX_MESSAGE_LENGTH: one email
+        self.assertEqual(sent[0], long_content)
+        self.assertNotIn("truncated", sent[0].lower())
+
+    def test_send_splits_above_body_limit(self):
+        """Beyond the Gmail-safe body size, send() splits across emails
+        instead of dropping the overflow."""
+        import asyncio
+        from plugins.platforms.email.adapter import MAX_MESSAGE_LENGTH
+        adapter = self._make_adapter()
+        sent = []
+        adapter._send_email = lambda to, body, reply=None: (
+            sent.append(body), "<id@test>")[1]
+
+        huge = "z" * (MAX_MESSAGE_LENGTH * 2 + 100)
+        result = asyncio.run(adapter.send("user@test.com", huge))
+
+        self.assertTrue(result.success)
+        self.assertGreater(len(sent), 1)
+        # Every original character survives across the chunks.
+        self.assertEqual(sum(c.count("z") for c in sent), huge.count("z"))
+
+    def test_router_does_not_truncate_email_delivery(self):
+        """End-to-end through the real DeliveryRouter: an oversized cron
+        payload reaches the email adapter whole, with the audit copy still
+        written to disk."""
+        import asyncio, tempfile, pathlib
+        from gateway.delivery import DeliveryRouter, DeliveryTarget
+        from gateway.config import GatewayConfig, Platform
+
+        adapter = self._make_adapter()
+        sent = []
+        adapter._send_email = lambda to, body, reply=None: (
+            sent.append(body), "<id@test>")[1]
+
+        payload = "memo body\n" * 600  # 6,000 chars
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        with patch("gateway.delivery.get_hermes_home", lambda: tmp):
+            router = DeliveryRouter(
+                GatewayConfig(), adapters={Platform.EMAIL: adapter})
+            asyncio.run(router._deliver_to_platform(
+                DeliveryTarget.parse("email:user@test.com"),
+                payload,
+                metadata={"job_id": "shift1"},
+            ))
+
+        self.assertEqual("".join(sent), payload)
+        self.assertNotIn("truncated", "".join(sent).lower())
+        saved = list(tmp.glob("cron/output/shift1_*.txt"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_text(), payload)
 
     def test_send_document_with_attachment(self):
         """send_document should send email with file attachment."""

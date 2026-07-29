@@ -467,6 +467,8 @@ def _extract_attachments(
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
 
+    splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
 
@@ -942,12 +944,23 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an email reply to the given address."""
+        """Send an email reply to the given address.
+
+        Long content is split into multiple emails at ``MAX_MESSAGE_LENGTH``
+        (Gmail-safe body size) rather than being cut off.  This is what
+        ``splits_long_messages = True`` promises the delivery router: cron
+        output above the router's non-chunking cap reaches the mailbox whole
+        instead of truncated at 4,000 chars (a Telegram-era limit that email
+        never shared).
+        """
         try:
             loop = asyncio.get_running_loop()
-            message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
-            )
+            chunks = self.truncate_message(content, MAX_MESSAGE_LENGTH) or [content]
+            message_id = None
+            for chunk in chunks:
+                message_id = await loop.run_in_executor(
+                    None, self._send_email, chat_id, chunk, reply_to
+                )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error("[Email] Send failed to %s: %s", chat_id, e)
