@@ -5362,6 +5362,18 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
             if not _user_survives:
                 _force_user_leading = True
+        # Resolve ``tool`` role to its semantic predecessor for strict
+        # alternation backends.  llama.cpp's Mistral Jinja template treats
+        # tool results as continuations of the preceding assistant turn, so
+        # ``last_head_role == "tool"`` must resolve back to ``"assistant"``
+        # to avoid producing ``assistant → assistant`` in the template's
+        # view (which would cause a permanent HTTP 500, #74086).
+        if last_head_role == "tool":
+            for _i in range(len(compressed) - 2, -1, -1):
+                _r = compressed[_i].get("role", "")
+                if _r not in ("tool", "system"):
+                    last_head_role = _r
+                    break
         # Pick a role that avoids consecutive same-role with both neighbors.
         # Priority: avoid colliding with head (already committed), then tail.
         if last_head_role in {"assistant", "tool"} or _force_user_leading:
