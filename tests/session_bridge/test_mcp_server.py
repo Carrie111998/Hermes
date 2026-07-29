@@ -2102,6 +2102,7 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "last_visible_task_id",
         "recent_error_codes",
         "delivery_latency_seconds",
+        "stage_latency_seconds",
         "scheduler",
         "recovery",
         "hydration",
@@ -2129,6 +2130,12 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "p50": None,
         "p95": None,
         "p99": None,
+    }
+    assert sidebar["stage_latency_seconds"] == {
+        "source_to_index": {"p50": None, "p95": None},
+        "index_to_queue": {"p50": None, "p95": None},
+        "queue_to_visible": {"p50": None, "p95": None},
+        "source_to_visible": {"p50": None, "p95": None},
     }
     assert sidebar["scheduler"] == {
         "fresh_claims_since_oldest": 0,

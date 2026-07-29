@@ -4429,6 +4429,36 @@ def _public_sidebar_status(
     )
     raw_latency = raw.get("delivery_latency_seconds")
     latency = raw_latency if isinstance(raw_latency, Mapping) else {}
+    stage_names = (
+        "source_to_index",
+        "index_to_queue",
+        "queue_to_visible",
+        "source_to_visible",
+    )
+    raw_stage_latency = raw.get("stage_latency_seconds")
+    if raw_stage_latency is None:
+        stage_latency: Mapping[str, Any] = {}
+    elif isinstance(raw_stage_latency, Mapping):
+        stage_latency = raw_stage_latency
+    else:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    if any(stage not in stage_names for stage in stage_latency):
+        raise ConfigurationFailure("invalid_sidebar_status")
+    shaped_stage_latency: dict[str, dict[str, float | None]] = {}
+    for stage in stage_names:
+        raw_percentiles = stage_latency.get(stage)
+        if raw_percentiles is None:
+            percentiles: Mapping[str, Any] = {}
+        elif isinstance(raw_percentiles, Mapping):
+            percentiles = raw_percentiles
+        else:
+            raise ConfigurationFailure("invalid_sidebar_status")
+        if any(key not in {"p50", "p95"} for key in percentiles):
+            raise ConfigurationFailure("invalid_sidebar_status")
+        shaped_stage_latency[stage] = {
+            percentile: _optional_status_number(percentiles.get(percentile))
+            for percentile in ("p50", "p95")
+        }
     raw_scheduler = raw.get("scheduler")
     if raw_scheduler is None:
         scheduler: Mapping[str, Any] = {}
@@ -4496,6 +4526,7 @@ def _public_sidebar_status(
             percentile: _optional_status_number(latency.get(percentile))
             for percentile in ("p50", "p95", "p99")
         },
+        "stage_latency_seconds": shaped_stage_latency,
         "scheduler": {
             "fresh_claims_since_oldest": fresh_claims,
             "next_lane": next_lane,

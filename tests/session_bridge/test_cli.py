@@ -3121,6 +3121,12 @@ def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
         "last_visible_task_id": None,
         "recent_error_codes": [],
         "delivery_latency_seconds": {"p50": None, "p95": None, "p99": None},
+        "stage_latency_seconds": {
+            "source_to_index": {"p50": 1.0, "p95": 2.0},
+            "index_to_queue": {"p50": 3.0, "p95": 4.0},
+            "queue_to_visible": {"p50": 5.0, "p95": 6.0},
+            "source_to_visible": {"p50": 9.0, "p95": 12.0},
+        },
     })
 
     status = backend.sidebar_status()
@@ -3128,6 +3134,12 @@ def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
     assert status["healthy"] is True
     assert status["degraded_reasons"] == []
     assert status["last_successful_heartbeat_at"] is None
+    assert status["stage_latency_seconds"] == {
+        "source_to_index": {"p50": 1.0, "p95": 2.0},
+        "index_to_queue": {"p50": 3.0, "p95": 4.0},
+        "queue_to_visible": {"p50": 5.0, "p95": 6.0},
+        "source_to_visible": {"p50": 9.0, "p95": 12.0},
+    }
 
     fresh_pending = _production_sidebar_backend({
         "eligible_by_provider": {"claude": 1, "hermes": 0},
@@ -3428,6 +3440,9 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
                 "last_cycle_at": 1.0,
             }
         },
+        {"stage_latency_seconds": {"secret_stage": {"p50": 1.0}}},
+        {"stage_latency_seconds": {"source_to_index": {"p99": 1.0}}},
+        {"stage_latency_seconds": {"source_to_index": "private timing"}},
     ),
 )
 def test_sidebar_status_rejects_invalid_scheduler_or_recovery_progress(

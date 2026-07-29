@@ -3955,6 +3955,80 @@ async def test_sidebar_registration_accepts_plain_source_without_indexed_git_met
 
 
 @pytest.mark.asyncio
+async def test_sidebar_registration_preserves_claude_catalog_indexed_at(
+    sidebar_db: SessionDB,
+) -> None:
+    source_active_at = 3_000_000.0
+    indexed_at = source_active_at + 6.0
+    registration_time = indexed_at + 8.0
+    clock = [indexed_at]
+    store = SessionBridgeStore(sidebar_db, clock=lambda: clock[0])
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="indexed-timing-claude",
+            content="Measure this Claude delivery pipeline",
+            last_active=source_active_at,
+            cwd=str(_sidebar_source_repo(sidebar_db)),
+        )
+    )
+    clock[0] = registration_time
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: registration_time,
+    )
+
+    summary = await coordinator.register_sidebar_jobs_once(
+        now=registration_time,
+        limit=1,
+    )
+
+    assert summary.queued == 1
+    job = store.get_sidebar_job_for_source("claude:indexed-timing-claude")
+    assert job is not None
+    assert job["eligible_at"] == source_active_at
+    assert job["indexed_at"] == indexed_at
+    assert job["created_at"] == registration_time
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_uses_cycle_time_for_hermes_indexed_at(
+    sidebar_db: SessionDB,
+) -> None:
+    source_active_at = 3_000_000.0
+    registration_time = source_active_at + 14.0
+    _add_hermes_sidebar_source(
+        sidebar_db,
+        session_id="indexed-timing-hermes",
+        content="Measure this Hermes delivery pipeline",
+        last_active=source_active_at,
+    )
+    store = SessionBridgeStore(sidebar_db, clock=lambda: registration_time)
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: registration_time,
+    )
+
+    summary = await coordinator.register_sidebar_jobs_once(
+        now=registration_time,
+        limit=1,
+    )
+
+    assert summary.queued == 1
+    job = store.get_sidebar_job_for_source("indexed-timing-hermes")
+    assert job is not None
+    assert job["eligible_at"] == source_active_at
+    assert job["indexed_at"] == registration_time
+    assert job["created_at"] == registration_time
+
+
+@pytest.mark.asyncio
 async def test_sidebar_registration_accepts_head_sentinel_without_git_identity(
     sidebar_db: SessionDB,
     tmp_path: Path,
