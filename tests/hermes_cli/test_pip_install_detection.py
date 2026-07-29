@@ -124,6 +124,45 @@ def test_home_docker_stamp_honored_inside_container(tmp_path):
         assert detect_install_method(project_root=code) == "docker"
 
 
+def test_home_docker_stamp_ignored_for_git_checkout_in_container(tmp_path):
+    """A 'docker' home stamp is ignored for a git checkout, even in a container.
+
+    Regression: Hermes installed as a git checkout but run inside an unrelated
+    sandbox container (a "terminal sandbox"), whose shared $HERMES_HOME was
+    poisoned with a 'docker' stamp by a co-located published image. Being
+    containerized is not enough to honour the stamp — the published image
+    excludes ``.git`` and carries a code-scoped stamp, so a working tree with
+    ``.git`` is provably not that image and must resolve to 'git' so
+    ``hermes update`` is allowed.
+    """
+    code = tmp_path / "code"
+    home = tmp_path / "home"
+    code.mkdir()
+    home.mkdir()
+    (code / ".git").mkdir()
+    (home / ".install_method").write_text("docker\n")
+    with patch("hermes_cli.config.get_managed_system", return_value=None), \
+         patch("hermes_cli.config.get_hermes_home", return_value=home), \
+         patch("hermes_cli.config._running_in_container", return_value=True):
+        from hermes_cli.config import detect_install_method
+        assert detect_install_method(project_root=code) == "git"
+
+
+def test_home_docker_stamp_ignored_for_git_worktree_in_container(tmp_path):
+    """Same as above but the checkout is a git worktree (``.git`` is a file)."""
+    code = tmp_path / "code"
+    home = tmp_path / "home"
+    code.mkdir()
+    home.mkdir()
+    (code / ".git").write_text("gitdir: /elsewhere/.git/worktrees/hermes\n")
+    (home / ".install_method").write_text("docker\n")
+    with patch("hermes_cli.config.get_managed_system", return_value=None), \
+         patch("hermes_cli.config.get_hermes_home", return_value=home), \
+         patch("hermes_cli.config._running_in_container", return_value=True):
+        from hermes_cli.config import detect_install_method
+        assert detect_install_method(project_root=code) == "git"
+
+
 def test_home_non_docker_stamp_still_honored_for_backcompat(tmp_path):
     """Legacy non-'docker' home stamps (e.g. 'git') are still respected.
 
