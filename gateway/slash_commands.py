@@ -3070,11 +3070,22 @@ class GatewaySlashCommandsMixin:
 
         result = mgr.restore(cwd, target_hash)
         if result["success"]:
+            # The default message states a pre-rollback snapshot was taken.
+            # When restore() reports it could not take one, saying so anyway
+            # is the false reassurance this path exists to avoid.
+            if result.get("warning"):
+                return t(
+                    "gateway.rollback.restored_no_snapshot",
+                    hash=result["restored_to"],
+                    reason=result["reason"],
+                    warning=result["warning"],
+                )
             return t(
                 "gateway.rollback.restored",
                 hash=result["restored_to"],
                 reason=result["reason"],
             )
+
         return t("gateway.rollback.restore_failed", error=result["error"])
 
     async def _handle_diff_command(self, event: MessageEvent) -> str:

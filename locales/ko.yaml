@@ -277,6 +277,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     none_found:            "{cwd}에 체크포인트를 찾을 수 없습니다"
     invalid_number:        "잘못된 체크포인트 번호입니다. 1-{max}을 사용하세요."
     restored:              "✅ 체크포인트 {hash}(으)로 복원됨: {reason}\n롤백 전 스냅샷이 자동으로 저장되었습니다."
+    restored_no_snapshot:  "✅ Restored to checkpoint {hash}: {reason}\n⚠️  {warning}"
     restore_failed:        "❌ {error}"
 
   diff:

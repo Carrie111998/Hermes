@@ -516,6 +516,9 @@ export interface RollbackRestoreResponse {
   reason?: string
   restored_to?: string
   success?: boolean
+  // Set when the restore succeeded but no pre-rollback snapshot could be
+  // taken, so the operation cannot be undone through checkpoint recovery.
+  warning?: string
 }
 
 // ── Subagent events ──────────────────────────────────────────────────

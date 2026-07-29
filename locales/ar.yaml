@@ -297,6 +297,7 @@ gateway:
     none_found:            "لم يُعثر على نقاط تحقّق لـ {cwd}"
     invalid_number:        "رقم نقطة تحقّق غير صالح. استخدم 1-{max}."
     restored:              "✅ استُعيد إلى نقطة التحقّق {hash}: {reason}\nحُفظت لقطة ما قبل التراجع تلقائيًا."
+    restored_no_snapshot:  "✅ Restored to checkpoint {hash}: {reason}\n⚠️  {warning}"
     restore_failed:        "❌ {error}"
 
   diff:
