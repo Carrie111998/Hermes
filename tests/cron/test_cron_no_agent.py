@@ -93,6 +93,38 @@ def test_update_job_roundtrips_no_agent_flag(hermes_env):
     assert reloaded["no_agent"] is True
 
 
+def test_update_job_rejects_clearing_script_while_no_agent(hermes_env):
+    """Data-layer invariant: no_agent jobs must always retain a script."""
+    from cron.jobs import create_job, update_job, get_job
+
+    script_path = hermes_env / "scripts" / "w.sh"
+    script_path.write_text("echo hi\n")
+    job = create_job(prompt=None, schedule="every 5m", script="w.sh", no_agent=True, deliver="local")
+
+    with pytest.raises(ValueError, match="no_agent=True requires a script"):
+        update_job(job["id"], {"script": None})
+
+    reloaded = get_job(job["id"])
+    assert reloaded["no_agent"] is True
+    assert reloaded["script"] == "w.sh"
+
+
+def test_update_job_rejects_whitespace_script_while_no_agent(hermes_env):
+    """Whitespace script clears normalize to None and still violate no_agent mode."""
+    from cron.jobs import create_job, update_job, get_job
+
+    script_path = hermes_env / "scripts" / "w.sh"
+    script_path.write_text("echo hi\n")
+    job = create_job(prompt=None, schedule="every 5m", script="w.sh", no_agent=True, deliver="local")
+
+    with pytest.raises(ValueError, match="no_agent=True requires a script"):
+        update_job(job["id"], {"script": "   \t"})
+
+    reloaded = get_job(job["id"])
+    assert reloaded["no_agent"] is True
+    assert reloaded["script"] == "w.sh"
+
+
 # ---------------------------------------------------------------------------
 # cronjob tool: API-layer validation
 # ---------------------------------------------------------------------------
@@ -145,7 +177,7 @@ def test_cronjob_tool_update_toggles_no_agent(hermes_env):
     )
     job_id = created["job_id"]
 
-    off = json.loads(cronjob(action="update", job_id=job_id, no_agent=False, prompt="run"))
+    off = json.loads(cronjob(action="update", job_id=job_id, no_agent=False))
     assert off["success"] is True
     assert off["job"].get("no_agent") in {False, None}
 
@@ -166,6 +198,23 @@ def test_cronjob_tool_update_no_agent_without_script_errors(hermes_env):
     result = json.loads(cronjob(action="update", job_id=job_id, no_agent=True))
     assert result.get("success") is False
     assert "without a script" in result.get("error", "")
+
+
+def test_cronjob_tool_update_cannot_clear_script_while_no_agent(hermes_env):
+    """Clearing script from an existing no_agent job must be rejected."""
+    from tools.cronjob_tools import cronjob
+
+    script_path = hermes_env / "scripts" / "w.sh"
+    script_path.write_text("echo hi\n")
+
+    created = json.loads(
+        cronjob(action="create", schedule="every 5m", script="w.sh", no_agent=True, deliver="local")
+    )
+    job_id = created["job_id"]
+
+    result = json.loads(cronjob(action="update", job_id=job_id, script=""))
+    assert result.get("success") is False
+    assert "no_agent=True requires a script" in result.get("error", "")
 
 
 def test_cronjob_tool_create_does_not_require_prompt_when_no_agent(hermes_env):
