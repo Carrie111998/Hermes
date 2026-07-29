@@ -499,6 +499,13 @@ def cron_command(args):
     if subcmd in {"remove", "rm", "delete"}:
         return _job_action("remove", args.job_id, "Removed")
 
+    if subcmd == "audit-models":
+        from hermes_cli.cron_audit import audit_cron_models
+
+        json_output = getattr(args, "json_output", False)
+        print(audit_cron_models(json_output=json_output))
+        return 0
+
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|audit-models|tick]")
     sys.exit(1)
