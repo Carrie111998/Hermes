@@ -83,6 +83,7 @@ def test_real_entry_shapes_qualify_or_reject_without_bypassing_routing(
     monkeypatch.setenv("HERMES_HOME", str(home))
     board = "qualified-flow"
     kb.ensure_product_board_defaults(board)
+    monkeypatch.setattr(kb, "resolve_profile_iteration_budget", lambda _profile: 10)
 
     brief_path = "/tmp/product-brief.md"
     with kb.connect(board=board) as conn:
@@ -141,6 +142,27 @@ def test_real_entry_shapes_qualify_or_reject_without_bypassing_routing(
                     "run_id": po_run_id,
                     "artifact": brief_path,
                 }
+                decision["sizing"] = {
+                    "configured_iteration_budget": 10,
+                    "estimated_turns": 1,
+                    "card_estimates": [],
+                    "fits_budget": True,
+                    "rationale": "small fixture",
+                }
+                decision["requirement_feasibility"] = {
+                    "rationale": "fixture requirements fit one iteration",
+                    "achievable_requirements": [
+                        {
+                            "requirement": "tests or verification",
+                            "basis": ["this test verifies the materialized task row"],
+                        },
+                        {
+                            "requirement": "contract outcome is satisfied",
+                            "basis": ["this test asserts the expected phase and assignee"],
+                        },
+                    ],
+                    "deferred_findings": [],
+                }
             result = qualifier.qualify_intake(
                 conn,
                 board=board,
@@ -149,7 +171,7 @@ def test_real_entry_shapes_qualify_or_reject_without_bypassing_routing(
                 secret=b"test-only-secret",
                 issued_at=100,
             )
-            assert result["status"] == "qualified"
+            assert result["status"] == "qualified", result
             task = kb.get_task(conn, result["task_id"])
             assert task is not None
             assert task.current_step_key == phase

@@ -13,7 +13,9 @@ from hermes_cli import kanban_db
 PRODUCT_OWNER_PROFILE = "productowner"
 PRODUCT_OWNER_PROMPT = (
     "Assess the claimed Work Inbox intake. Use work_inbox_show first, then "
-    "finish with exactly one work_inbox_decide call."
+    "finish with exactly one work_inbox_decide call. Handoffs are context, not "
+    "authority for card shape or sizing. Size each card against the configured "
+    "Development budget and justify every binding evidence or done-when item."
 )
 
 
@@ -25,6 +27,18 @@ def _is_new_work(intake: dict[str, Any]) -> bool:
     return isinstance(payload, dict) and payload.get("kind") == "task_create"
 
 
+def _is_product_owner_requalification(intake: dict[str, Any]) -> bool:
+    try:
+        payload = json.loads(str(intake.get("raw_request") or ""))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("kind") == "task_requalification"
+        and payload.get("qualification_route") == "product_owner"
+    )
+
+
 def route_pending_intake(
     conn,
     *,
@@ -33,7 +47,7 @@ def route_pending_intake(
 ) -> dict[str, Any]:
     """Send only new product work to the primary PO; preserve requalification."""
 
-    if _is_new_work(intake):
+    if _is_new_work(intake) or _is_product_owner_requalification(intake):
         return dispatch_product_owner_intake(
             conn, board=board, intake_id=str(intake["id"])
         )
@@ -245,6 +259,24 @@ def show_product_owner_intake(conn, *, board: str) -> dict[str, Any]:
     if intake is None:
         raise ValueError(f"unknown qualification intake: {intake_id}")
     metadata = kanban_db.read_board_metadata(board)
+    qualification = metadata.get("qualification")
+    phase_assignees = (
+        qualification.get("phase_assignees")
+        if isinstance(qualification, dict)
+        else {}
+    )
+    development_profile = (
+        phase_assignees.get("development")
+        if isinstance(phase_assignees, dict)
+        else None
+    )
+    guidance = {
+        "development_iteration_budget": kanban_db.resolve_profile_iteration_budget(
+            str(development_profile or "")
+        ),
+        "handoffs": "context only; Product Owner owns card shape and sizing",
+        "feasibility": "every binding evidence and done-when item needs a basis",
+    }
     return {
         "intake": intake,
         "run": {
@@ -255,6 +287,7 @@ def show_product_owner_intake(conn, *, board: str) -> dict[str, Any]:
         "repository_instructions": kanban_qualifier._repository_instructions(metadata),
         "current_task_graph": kanban_qualifier._task_graph(conn),
         "events": kanban_db.list_qualification_intake_events(conn, intake_id),
+        "qualification_guidance": guidance,
     }
 
 
@@ -478,6 +511,10 @@ def decide_product_owner_intake(
             )
         },
         "po_evidence": copy.deepcopy(validated["po_evidence"]),
+        "sizing": copy.deepcopy(validated["sizing"]),
+        "requirement_feasibility": copy.deepcopy(
+            validated["requirement_feasibility"]
+        ),
         "issuer": {
             "surface": "work_inbox_intake",
             "profile": run["profile"],

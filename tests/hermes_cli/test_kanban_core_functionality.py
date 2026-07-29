@@ -4462,6 +4462,89 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     return _drive_worker_exit(conn, tid, fake_pid, 256)
 
 
+def _drive_development_budget_exhaustion(conn, tid):
+    assert kb.claim_task(conn, tid) is not None
+    assert kb.handle_development_budget_exhaustion(conn, tid)
+
+
+def test_first_development_budget_exhaustion_routes_to_product_owner(
+    kanban_home, monkeypatch
+):
+    board = "budget-po-route"
+    kb.create_board(board, preset="product")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="bounded development",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            work_contract_id="wc_budget",
+        )
+        _drive_development_budget_exhaustion(conn, tid)
+        task = kb.get_task(conn, tid)
+        intakes = kb.list_qualification_intakes(conn)
+        assert not kb.unblock_task(conn, tid)
+
+    assert task.status == "scheduled"
+    budget_intakes = [
+        intake
+        for intake in intakes
+        if '"qualification_route":"product_owner"' in intake["raw_request"]
+    ]
+    assert len(budget_intakes) == 1
+    request = json.loads(budget_intakes[0]["raw_request"])
+    assert request["target_task_id"] == tid
+    assert "resize or decompose" in request["reason"]
+
+
+def test_second_development_budget_exhaustion_is_a_human_stop(
+    kanban_home, monkeypatch
+):
+    board = "budget-human-stop"
+    kb.create_board(board, preset="product")
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="bounded development",
+            board=board,
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            work_contract_id="wc_budget",
+        )
+        _drive_development_budget_exhaustion(conn, tid)
+        # Product Owner requalification is the only route back to work.
+        assert not kb.unblock_task(conn, tid)
+        with kb.authorized_governance_write():
+            assert kb.unblock_task(conn, tid)
+        _drive_development_budget_exhaustion(conn, tid)
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        promoted = kb.recompute_ready(conn)
+        cannot_unblock = kb.unblock_task(conn, tid)
+        cannot_promote = kb.promote_task(
+            conn, tid, actor="operator", force=True
+        )
+        cannot_claim = kb.claim_task(conn, tid)
+
+    assert task.status == "blocked"
+    assert promoted == 0
+    assert cannot_unblock is False
+    assert cannot_promote == (
+        False,
+        "human approval is required after repeated budget exhaustion",
+    )
+    assert cannot_claim is None
+    assert [event.kind for event in events].count("development_budget_exhausted") == 2
+    assert any(
+        "human decision required" in (event.payload or {}).get("reason", "")
+        for event in events
+        if event.kind == "blocked"
+    )
+
+
 def test_detect_crashed_workers_protocol_violation_first_occurrence_retries(kanban_home):
     """A first clean-exit protocol violation gets a retry, not a block.
 

@@ -226,7 +226,7 @@ def _validate_auxiliary_epic_boundary(
 def _artifact_references(intake: Mapping[str, Any], run: Mapping[str, Any]) -> str:
     pieces = [str(run.get("summary") or ""), str(run.get("metadata") or "")]
     for attachment in intake.get("attachments") or ():
-        if isinstance(attachment, Mapping):
+        if isinstance(attachment, Mapping) and not _is_advisory_handoff(attachment):
             pieces.extend(str(value) for value in attachment.values())
     return "\n".join(pieces)
 
@@ -271,6 +271,14 @@ def _validate_po_evidence(
     if type(run_id) is not int or not isinstance(artifact, str) or not artifact.strip():
         errors.append("Product Owner evidence requires run_id and artifact")
         return
+    if any(
+        artifact.strip() == str(value).strip()
+        for attachment in intake.get("attachments") or ()
+        if _is_advisory_handoff(attachment)
+        for value in attachment.values()
+    ):
+        errors.append("advisory handoff documents cannot become Product Owner evidence")
+        return
     row = conn.execute(
         "SELECT id, profile, status, summary, metadata FROM task_runs WHERE id = ?",
         (run_id,),
@@ -285,6 +293,100 @@ def _validate_po_evidence(
         errors.append("Product Owner run is not complete")
     if artifact.strip() not in _artifact_references(intake, run):
         errors.append("Product Owner artifact is not referenced by the run or intake")
+
+
+def _development_iteration_budget(board_metadata: Mapping[str, Any]) -> Optional[int]:
+    qualification = board_metadata.get("qualification")
+    assignees = (
+        qualification.get("phase_assignees")
+        if isinstance(qualification, Mapping)
+        else None
+    )
+    profile = assignees.get("development") if isinstance(assignees, Mapping) else None
+    return kanban_db.resolve_profile_iteration_budget(str(profile or ""))
+
+
+def _binding_requirements(decision: Mapping[str, Any]) -> list[str]:
+    requirements: list[str] = []
+    handover = decision.get("handover")
+    if isinstance(handover, Mapping):
+        for field in ("required_evidence", "done_when"):
+            requirements.extend(handover.get(field) or [])
+    work = decision.get("work")
+    if isinstance(work, Mapping) and work.get("item_kind") == "epic":
+        for story in decision.get("stories") or []:
+            if isinstance(story, Mapping):
+                requirements.extend(story.get("done_when") or [])
+    return [value.strip() for value in requirements if isinstance(value, str) and value.strip()]
+
+
+def _validate_po_budget_and_feasibility(
+    decision: Mapping[str, Any],
+    *,
+    board_metadata: Mapping[str, Any],
+    errors: list[str],
+) -> None:
+    sizing = decision.get("sizing")
+    budget = _development_iteration_budget(board_metadata)
+    if not isinstance(sizing, Mapping) or budget is None:
+        errors.append("Product Owner path requires sizing and a Development budget")
+        return
+    if not isinstance(sizing.get("rationale"), str) or not sizing["rationale"].strip():
+        errors.append("sizing.rationale is required")
+    if sizing.get("configured_iteration_budget") != budget:
+        errors.append(f"sizing must use the configured Development budget ({budget})")
+    work = decision.get("work")
+    is_epic = isinstance(work, Mapping) and work.get("item_kind") == "epic"
+    stories = decision.get("stories") if is_epic else None
+    estimates = sizing.get("card_estimates") if is_epic else [sizing.get("estimated_turns")]
+    if not isinstance(estimates, list) or (
+        is_epic
+        and (not isinstance(stories, list) or len(estimates) != len(stories))
+    ):
+        errors.append("sizing must provide one estimate per card")
+    elif not estimates or any(
+        type(value) is not int or value < 1 or value > budget for value in estimates
+    ):
+        errors.append("a card estimate exceeds the configured Development budget")
+    elif is_epic and sizing.get("estimated_turns") != max(estimates):
+        errors.append("Epic estimated_turns must equal the largest card estimate")
+    if not is_epic and sizing.get("card_estimates") not in (None, []):
+        errors.append("card sizing must not include Epic card_estimates")
+    if sizing.get("fits_budget") is not True:
+        errors.append("sizing.fits_budget must be true")
+
+    feasibility = decision.get("requirement_feasibility")
+    if not isinstance(feasibility, Mapping):
+        errors.append("Product Owner path requires requirement_feasibility")
+        return
+    if not isinstance(feasibility.get("rationale"), str) or not feasibility["rationale"].strip():
+        errors.append("requirement_feasibility.rationale is required")
+    assessments = feasibility.get("achievable_requirements")
+    assessed: list[str] = []
+    if isinstance(assessments, list):
+        for item in assessments:
+            if not isinstance(item, Mapping) or not _non_empty_strings(item.get("basis")):
+                errors.append("each binding requirement needs a concrete basis")
+                continue
+            requirement = item.get("requirement")
+            if isinstance(requirement, str) and requirement.strip():
+                assessed.append(requirement.strip())
+    else:
+        errors.append("achievable_requirements must be a list")
+    required = set(_binding_requirements(decision))
+    if len(assessed) != len(set(assessed)) or set(assessed) != required:
+        errors.append(
+            "an achievable requirement assessment must cover every binding "
+            "evidence and done-when item"
+        )
+    for item in feasibility.get("deferred_findings") or []:
+        if not isinstance(item, Mapping) or any(
+            not isinstance(item.get(field), str) or not item[field].strip()
+            for field in ("finding", "reason", "enabling_dependency")
+        ):
+            errors.append("each deferred finding needs a reason and enabling dependency")
+        elif item["finding"].strip() in required:
+            errors.append("a deferred finding cannot remain a binding requirement")
 
 
 def _is_advisory_handoff(attachment: Any) -> bool:
@@ -442,6 +544,9 @@ def revalidate_contract_evidence(
             decision=contract,
             product_owner_profile=phase_assignees.get("backlog"),
             errors=errors,
+        )
+        _validate_po_budget_and_feasibility(
+            contract, board_metadata=board_metadata, errors=errors
         )
     if errors:
         raise QualificationValidationError(errors)
@@ -616,6 +721,11 @@ def validate_decision(
     if not _non_empty_strings(normalized.get("classification")):
         errors.append("classification must contain framework-owned labels")
 
+    if path == "po":
+        _validate_po_budget_and_feasibility(
+            normalized, board_metadata=board_metadata, errors=errors
+        )
+
     if errors:
         raise QualificationValidationError(errors)
     return normalized
@@ -659,7 +769,7 @@ EPIC OUTPUT SHAPE:
 List stories in dependency order. Each depends_on value is the zero-based index
 of an earlier story in the same list. Never return an empty Epic.
 
-PO PATH ADDITION: Set qualification_path to "po", use "path:po", and add only grounded evidence in "po_evidence":{"run_id":123,"artifact":"<referenced artifact>"}.
+PO PATH ADDITION: Set qualification_path to "po", use "path:po", and add grounded evidence in "po_evidence":{"run_id":123,"artifact":"<referenced artifact>"}, "sizing":{"rationale":"<why this fits>","configured_iteration_budget":123,"estimated_turns":80,"fits_budget":true}, and "requirement_feasibility":{"rationale":"<why achievable>","achievable_requirements":[],"deferred_findings":[]}. Size every card against AUTHORITATIVE INPUT development_iteration_budget. Every binding required_evidence and done_when string must have one concrete feasibility basis.
 
 LATE ENTRY OBJECT SHAPE: When entry_phase is not the first phase, list every
 earlier phase in policy order as
@@ -704,6 +814,9 @@ def build_qualification_prompt(
         "current_task_graph": _task_graph(conn),
         "agent_memory_recall": recall_for_qualification(intake.get("raw_request")),
     }
+    payload["development_iteration_budget"] = _development_iteration_budget(
+        board_metadata
+    )
     target_task_id = kanban_intake.requalification_target_id(intake)
     requalification = ""
     if isinstance(target_task_id, str):
@@ -736,8 +849,9 @@ def build_qualification_prompt(
         "Choose the earliest unfinished phase unless exact submitted evidence proves "
         "each earlier phase complete. Decide meaning; do not invent "
         "evidence. Return one JSON object containing qualification_path, work, "
-        "routing, entry_assessment, handover, rules, classification, stories, and po_evidence "
-        "only for the PO path. Use only phases, profiles, work types, task ids, and "
+        "routing, entry_assessment, handover, rules, classification, stories, and "
+        "po_evidence, sizing, and requirement_feasibility only for the PO path. "
+        "Use only phases, profiles, work types, task ids, and "
         "Epic ids present below. Epics are non-executable containers; dependencies "
         "and Epic membership are separate. Late entry must explain every skipped "
         "phase with evidence; Review entry needs independent writer/test provenance. "
@@ -890,6 +1004,10 @@ def qualify_intake(
         }
         if qualification_path == "po":
             contract["po_evidence"] = copy.deepcopy(decision["po_evidence"])
+            contract["sizing"] = copy.deepcopy(decision["sizing"])
+            contract["requirement_feasibility"] = copy.deepcopy(
+                decision["requirement_feasibility"]
+            )
         if decision["work"]["item_kind"] == "epic":
             contract["stories"] = copy.deepcopy(decision["stories"])
         if override_authority is not None:

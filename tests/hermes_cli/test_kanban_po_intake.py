@@ -18,6 +18,12 @@ def _strict_board(tmp_path, monkeypatch, board="po-intake"):
     metadata["qualification"]["required"] = True
     metadata.setdefault("product_workflow", {})["handoff_v2"] = True
     path.write_text(json.dumps(metadata))
+    developer_profile = home / "profiles" / "developer"
+    developer_profile.mkdir(parents=True)
+    (developer_profile / "config.yaml").write_text(
+        "agent:\n  max_turns: 500\n",
+        encoding="utf-8",
+    )
     return board
 
 
@@ -79,6 +85,29 @@ def _proposal():
             "allowed": ["Implement CSV export"],
             "forbidden": ["Add PDF export"],
         },
+        "sizing": {
+            "rationale": "One bounded export outcome fits one Development turn budget.",
+            "configured_iteration_budget": 500,
+            "estimated_turns": 80,
+            "fits_budget": True,
+        },
+        "requirement_feasibility": {
+            "rationale": (
+                "Each binding requirement is achievable with the current "
+                "Architecture test surface."
+            ),
+            "achievable_requirements": [
+                {
+                    "requirement": "Architecture tests",
+                    "basis": ["The repository already exposes Architecture tests."],
+                },
+                {
+                    "requirement": "Architecture is implementable",
+                    "basis": ["Architecture review can verify implementability."],
+                },
+            ],
+            "deferred_findings": [],
+        },
         "classification": ["framework:story", "path:po", "intake:feature"],
         "stories": [],
     }
@@ -93,6 +122,8 @@ def test_work_inbox_decision_tool_publishes_complete_proposal_shape():
         "routing",
         "handover",
         "rules",
+        "sizing",
+        "requirement_feasibility",
         "classification",
         "stories",
     }
@@ -121,6 +152,26 @@ def test_work_inbox_decision_tool_publishes_complete_proposal_shape():
         "allowed",
         "forbidden",
     }
+    assert set(
+        proposal["properties"]["requirement_feasibility"]["required"]
+    ) == {
+        "rationale",
+        "achievable_requirements",
+        "deferred_findings",
+    }
+
+
+def test_development_budget_comes_from_the_profile_config(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "developer"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "agent:\n  max_turns: 37\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert kb.resolve_profile_iteration_budget("developer") == 37
 
 
 def test_new_work_launches_configured_product_owner_without_waiting(
@@ -238,7 +289,7 @@ def test_spawn_is_detached_intake_scoped_and_disables_provider_fallback(
         "kanban",
         "chat",
         "-q",
-        "Assess the claimed Work Inbox intake. Use work_inbox_show first, then finish with exactly one work_inbox_decide call.",
+        kanban_po_intake.PRODUCT_OWNER_PROMPT,
     ]
     env = captured["env"]
     assert env["HERMES_WORK_INBOX_INTAKE"] == "qi_one"
@@ -275,6 +326,35 @@ def test_requalification_keeps_auxiliary_qualifier(monkeypatch):
 
     assert result["status"] == "qualified"
     assert called == ["qi_requal"]
+
+
+def test_budget_requalification_routes_to_product_owner(monkeypatch):
+    from hermes_cli import kanban_po_intake
+
+    record = {
+        "id": "qi_budget",
+        "raw_request": json.dumps(
+            {
+                "kind": "task_requalification",
+                "target_task_id": "t_one",
+                "qualification_route": "product_owner",
+            }
+        ),
+    }
+    called = []
+    monkeypatch.setattr(
+        kanban_po_intake,
+        "dispatch_product_owner_intake",
+        lambda conn, *, board, intake_id: called.append((board, intake_id))
+        or {"status": "running"},
+    )
+
+    result = kanban_po_intake.route_pending_intake(
+        SimpleNamespace(), board="strict", intake=record
+    )
+
+    assert result["status"] == "running"
+    assert called == [("strict", "qi_budget")]
 
 
 def test_accepted_po_decision_is_signed_and_materialized_at_architecture(
@@ -317,6 +397,375 @@ def test_accepted_po_decision_is_signed_and_materialized_at_architecture(
         assert kb.get_qualification_intake_run(check, run["id"])["status"] == "completed"
     finally:
         check.close()
+
+
+def test_po_sizing_rationale_is_durable_and_handoff_shape_is_advisory(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-sizing")
+    conn = kb.connect(board=board)
+    intake_id = kb.create_qualification_intake(
+        conn,
+        raw_request=json.dumps(
+            {
+                "kind": "task_create",
+                "request": {"title": "Several outcomes"},
+            }
+        ),
+        source="work-inbox",
+        attachments=(
+            {
+                "kind": "handoff_document",
+                "title": "qualification handoff",
+                "content": (
+                    "Closed decision: retain the existing API. "
+                    "Suggested shape: one user-story card."
+                ),
+            },
+        ),
+        created_at=100,
+    )
+    run = kb.claim_qualification_intake(
+        conn,
+        intake_id,
+        profile="productowner",
+        runtime_identity={
+            "provider": "claude-cli",
+            "model": "claude-opus-5",
+            "effort": "high",
+            "surface": "work_inbox_intake",
+        },
+        now=101,
+    )
+    monkeypatch.setenv("HERMES_WORK_INBOX_INTAKE", intake_id)
+    monkeypatch.setenv("HERMES_WORK_INBOX_RUN_ID", str(run["id"]))
+    monkeypatch.setenv("HERMES_WORK_INBOX_CLAIM_LOCK", run["claim_lock"])
+    monkeypatch.setenv("HERMES_PROFILE", "productowner")
+    shown = kanban_po_intake.show_product_owner_intake(conn, board=board)
+    guidance = shown["qualification_guidance"]
+    assert guidance["development_iteration_budget"] == 500
+    assert guidance["handoffs"].startswith("context only")
+    assert shown["intake"]["attachments"][0]["content"].startswith("Closed decision:")
+    proposal = _proposal()
+    proposal["work"] = {
+        "item_kind": "epic",
+        "work_type": "story",
+        "title": "Several outcomes",
+        "outcome": "Each outcome is independently deliverable",
+        "scope": ["API", "CLI", "documentation"],
+        "out_of_scope": [],
+    }
+    proposal["routing"] = {
+        "entry_phase": None,
+        "assignee": None,
+        "epic_id": None,
+        "dependencies": [],
+    }
+    proposal["handover"] = {
+        "deliverables": ["Three delivered outcomes"],
+        "required_evidence": ["All three outcomes verified"],
+        "done_when": ["The three outcomes are complete"],
+        "next_phase": None,
+        "next_role": None,
+    }
+    proposal["rules"] = {
+        "allowed": ["Retain the existing API"],
+        "forbidden": ["Reopen the closed API decision"],
+    }
+    proposal["stories"] = [
+        {
+            "title": "API outcome",
+            "outcome": "API remains compatible",
+            "scope": ["API"],
+            "out_of_scope": [],
+            "done_when": ["Compatibility is verified"],
+            "depends_on": [],
+        },
+        {
+            "title": "CLI outcome",
+            "outcome": "CLI exposes the outcome",
+            "scope": ["CLI"],
+            "out_of_scope": [],
+            "done_when": ["CLI behavior is verified"],
+            "depends_on": [0],
+        },
+        {
+            "title": "Documentation outcome",
+            "outcome": "The outcome is documented",
+            "scope": ["documentation"],
+            "out_of_scope": [],
+            "done_when": ["Documentation is checked"],
+            "depends_on": [1],
+        },
+    ]
+    proposal["sizing"] = {
+        "rationale": "I independently split the three deliverables into three cards.",
+        "configured_iteration_budget": 500,
+        "estimated_turns": 80,
+        "card_estimates": [80, 60, 40],
+        "fits_budget": True,
+    }
+    proposal["requirement_feasibility"] = {
+        "rationale": "Each Epic and story requirement has a current verification path.",
+        "achievable_requirements": [
+            {"requirement": requirement, "basis": ["Existing verification path"]}
+            for requirement in (
+                "All three outcomes verified",
+                "The three outcomes are complete",
+                "Compatibility is verified",
+                "CLI behavior is verified",
+                "Documentation is checked",
+            )
+        ],
+        "deferred_findings": [],
+    }
+    try:
+        result = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="Closed API decision retained; decomposition is independently sized.",
+            proposal=proposal,
+        )
+        contract = kb.get_work_contract(
+            conn, kb.get_task(conn, result["task_id"]).work_contract_id
+        )["contract"]
+        task_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE work_item_kind = 'card'"
+        ).fetchone()[0]
+        story_ids = kb.list_epic_members(conn, result["task_id"])
+        story_contracts = [
+            kb.get_work_contract(
+                conn, kb.get_task(conn, story_id).work_contract_id
+            )["contract"]
+            for story_id in story_ids
+        ]
+        worker_contexts = [
+            kb.build_worker_context(conn, story_id) for story_id in story_ids
+        ]
+    finally:
+        conn.close()
+
+    assert result["status"] == "qualified"
+    assert task_count == 3
+    estimates_by_title = {
+        contract["work"]["title"]: contract["sizing"]["estimated_turns"]
+        for contract in story_contracts
+    }
+    assert estimates_by_title == {
+        "API outcome": 80,
+        "CLI outcome": 60,
+        "Documentation outcome": 40,
+    }
+    assert "independently split" in contract["sizing"]["rationale"]
+    assert "Closed decision:" not in json.dumps(contract)
+    assert "Closed decision:" not in json.dumps(story_contracts)
+    assert all("Closed decision:" not in context for context in worker_contexts)
+
+
+def test_po_requires_achievability_basis_for_every_binding_requirement(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-feasibility-gate")
+    conn = kb.connect(board=board)
+    _active_intake(conn, monkeypatch, title="Unproven requirement")
+    proposal = _proposal()
+    proposal["requirement_feasibility"]["achievable_requirements"] = []
+    try:
+        result = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="Requirement was copied from a Test finding.",
+            proposal=proposal,
+        )
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert result["status"] == "invalid"
+    assert any("achievable requirement" in error for error in result["errors"])
+    assert task_count == 0
+
+
+def test_po_defers_unachievable_test_finding_instead_of_contractualizing(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-feasibility-deferral")
+    conn = kb.connect(board=board)
+    _active_intake(conn, monkeypatch, title="Attachment projection")
+    impossible = "Verify authentic attachment bytes with Range support"
+    proposal = _proposal()
+    proposal["requirement_feasibility"]["deferred_findings"] = [
+        {
+            "finding": impossible,
+            "reason": "The current asset endpoint does not implement Range.",
+            "enabling_dependency": "T2 Paperclip write path and byte-serving support",
+        }
+    ]
+    try:
+        accepted = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="Keep achievable evidence binding and defer the Test symptom.",
+            proposal=proposal,
+        )
+        contract = kb.get_work_contract(
+            conn, kb.get_task(conn, accepted["task_id"]).work_contract_id
+        )["contract"]
+
+        _active_intake(
+            conn,
+            monkeypatch,
+            now=200,
+            session_id="impossible-binding",
+            title="Impossible binding",
+        )
+        invalid = _proposal()
+        invalid["handover"]["required_evidence"].append(impossible)
+        invalid["requirement_feasibility"]["deferred_findings"] = [
+            {
+                "finding": impossible,
+                "reason": "The current asset endpoint does not implement Range.",
+                "enabling_dependency": "T2 Paperclip write path and byte-serving support",
+            }
+        ]
+        rejected = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="Do not permit an impossible Test symptom to become binding.",
+            proposal=invalid,
+        )
+    finally:
+        conn.close()
+
+    assert accepted["status"] == "qualified"
+    assert impossible not in contract["handover"]["required_evidence"]
+    assert contract["requirement_feasibility"]["deferred_findings"][0][
+        "enabling_dependency"
+    ].startswith("T2")
+    assert rejected["status"] == "invalid"
+    assert any("achievable requirement" in error for error in rejected["errors"])
+
+
+def test_po_rejects_a_card_that_does_not_fit_configured_development_budget(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-budget-gate")
+    conn = kb.connect(board=board)
+    intake_id, _run = _active_intake(conn, monkeypatch, title="Too large")
+    proposal = _proposal()
+    proposal["sizing"] = {
+        "rationale": "The card is larger than one configured Development budget.",
+        "configured_iteration_budget": 500,
+        "estimated_turns": 501,
+        "fits_budget": False,
+    }
+    try:
+        result = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="Needs decomposition",
+            proposal=proposal,
+        )
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        intake_status = kb.get_qualification_intake(conn, intake_id)["status"]
+    finally:
+        conn.close()
+
+    assert result["status"] == "invalid"
+    assert any("exceeds" in error for error in result["errors"])
+    assert task_count == 0
+    assert intake_status == "running"
+
+
+def test_real_budget_exit_creates_product_owner_requalification_intake(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-budget-e2e")
+    conn = kb.connect(board=board)
+    _intake_id, _run = _active_intake(conn, monkeypatch, title="Budgeted card")
+    try:
+        result = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="Bounded outcome",
+            proposal=_proposal(),
+        )
+        task_id = result["task_id"]
+        assert kb.set_phase(conn, task_id, "development", board=board)
+        assert kb.claim_task(conn, task_id, board=board) is not None
+        routed = kb.handle_development_budget_exhaustion(conn, task_id, board=board)
+        intakes = kb.list_qualification_intakes(conn)
+        budget_intakes = [
+            intake
+            for intake in intakes
+            if '"qualification_route":"product_owner"' in intake["raw_request"]
+        ]
+    finally:
+        conn.close()
+
+    assert routed is True
+    assert len(budget_intakes) == 1
+    assert json.loads(budget_intakes[0]["raw_request"])["target_task_id"] == task_id
+
+
+def test_budget_exhaustion_routing_rolls_back_as_one_transaction(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import kanban_intake, kanban_po_intake
+
+    board = _strict_board(tmp_path, monkeypatch, "po-intake-budget-atomic")
+    conn = kb.connect(board=board)
+    _active_intake(conn, monkeypatch, title="Atomic budget card")
+    try:
+        result = kanban_po_intake.decide_product_owner_intake(
+            conn,
+            board=board,
+            disposition="accepted",
+            reason="Bounded outcome",
+            proposal=_proposal(),
+        )
+        task_id = result["task_id"]
+        assert kb.set_phase(conn, task_id, "development", board=board)
+        assert kb.claim_task(conn, task_id, board=board) is not None
+        kb._set_worker_pid(conn, task_id, 981002)
+        monkeypatch.setattr(
+            kanban_intake,
+            "submit_requalification",
+            lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("intake failed")),
+        )
+        with pytest.raises(RuntimeError, match="intake failed"):
+            kb.handle_development_budget_exhaustion(conn, task_id, board=board)
+
+        card = kb.get_task(conn, task_id)
+        budget_events = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "development_budget_exhausted"
+        ]
+        intakes = kb.list_qualification_intakes(conn)
+    finally:
+        conn.close()
+
+    assert card.status == "running"
+    assert card.worker_pid == 981002
+    assert budget_events == []
+    assert len(intakes) == 1  # only the original admission intake
 
 
 def test_clarification_stays_inert_and_two_invalid_decisions_need_attention(
@@ -424,6 +873,20 @@ def test_accepted_epic_materializes_all_stories_ready_at_architecture(
             "depends_on": [0],
         },
     ]
+    proposal["sizing"]["card_estimates"] = [80, 80]
+    proposal["requirement_feasibility"] = {
+        "rationale": "The Epic and both story outcomes have current verification paths.",
+        "achievable_requirements": [
+            {"requirement": requirement, "basis": ["Existing verification path"]}
+            for requirement in (
+                "Architecture tests",
+                "Architecture is implementable",
+                "CSV is valid",
+                "Download succeeds",
+            )
+        ],
+        "deferred_findings": [],
+    }
     try:
         result = kanban_po_intake.decide_product_owner_intake(
             conn,

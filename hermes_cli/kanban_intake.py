@@ -491,11 +491,38 @@ def _requalification_evidence_digest(evidence: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _capture_requalification_evidence(
+    conn: Any, row: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Capture the current evidence used to qualify a successor contract."""
+
+    from hermes_cli import kanban_db
+
+    task_id = str(row["id"])
+    stored_contract = kanban_db.get_work_contract(
+        conn, str(row["work_contract_id"])
+    )
+    return {
+        "task": dict(row),
+        "contract": stored_contract.get("contract") if stored_contract else None,
+        "dependencies": kanban_db.parent_ids(conn, task_id),
+        "epic_id": kanban_db.epic_id_for_task(conn, task_id),
+        "runs": [asdict(run) for run in kanban_db.list_runs(conn, task_id)],
+        "events": [asdict(event) for event in kanban_db.list_events(conn, task_id)],
+        "comments": [
+            asdict(comment) for comment in kanban_db.list_comments(conn, task_id)
+        ],
+        "repository": kanban_db.task_repository_evidence(row),
+    }
+
+
 def submit_requalification(
     conn: Any,
     *,
     task_id: str,
     reason: str,
+    qualification_route: Optional[str] = None,
+    _wake: bool = True,
 ) -> dict[str, Any]:
     """Submit one Hermes-owned, inert requalification request for a parked card."""
 
@@ -504,6 +531,8 @@ def submit_requalification(
     reason = str(reason or "").strip()
     if not reason:
         raise WorkContractError("requalification reason is required")
+    if qualification_route not in {None, "product_owner"}:
+        raise WorkContractError("unknown requalification qualification route")
 
     with kanban_db.authorized_governance_write():
         with kanban_db.write_txn(conn):
@@ -527,28 +556,7 @@ def submit_requalification(
                     "cannot requalify a task with an unresolved blocker"
                 )
 
-            stored_contract = kanban_db.get_work_contract(
-                conn, str(row["work_contract_id"])
-            )
-            evidence = {
-                "task": dict(row),
-                "contract": (
-                    stored_contract.get("contract") if stored_contract else None
-                ),
-                "dependencies": kanban_db.parent_ids(conn, task_id),
-                "epic_id": kanban_db.epic_id_for_task(conn, task_id),
-                "runs": [
-                    asdict(run) for run in kanban_db.list_runs(conn, task_id)
-                ],
-                "events": [
-                    asdict(event) for event in kanban_db.list_events(conn, task_id)
-                ],
-                "comments": [
-                    asdict(comment)
-                    for comment in kanban_db.list_comments(conn, task_id)
-                ],
-                "repository": kanban_db.task_repository_evidence(row),
-            }
+            evidence = _capture_requalification_evidence(conn, row)
             evidence_digest = _requalification_evidence_digest(evidence)
             existing = existing_requalification_intake(
                 conn,
@@ -574,6 +582,11 @@ def submit_requalification(
                     "kind": "task_requalification",
                     "target_task_id": task_id,
                     "reason": reason,
+                    **(
+                        {"qualification_route": qualification_route}
+                        if qualification_route
+                        else {}
+                    ),
                     "evidence": evidence,
                     "evidence_digest": evidence_digest,
                     "qualifier_revision": REQUALIFICATION_QUALIFIER_REVISION,
@@ -595,7 +608,8 @@ def submit_requalification(
                 {"intake_id": intake_id, "reason": reason},
             )
 
-    _wake_intake_qualifier()
+    if _wake:
+        _wake_intake_qualifier()
     return {
         "status": "requalification_required",
         "created": True,
@@ -670,6 +684,16 @@ def _apply_requalification(
     if fields["work_item_kind"] != row["work_item_kind"]:
         raise WorkContractError("requalification must preserve the work item kind")
 
+    payload = intake_payload(intake_record)
+    captured_digest = payload.get("evidence_digest")
+    current_digest = _requalification_evidence_digest(
+        _capture_requalification_evidence(conn, row)
+    )
+    if not isinstance(captured_digest, str) or current_digest != captured_digest:
+        raise WorkContractError(
+            "requalification evidence changed during qualification; submit a fresh intake"
+        )
+
     old_contract_id = str(row["work_contract_id"])
     parents = tuple(dict.fromkeys(str(item) for item in fields["parents"]))
     if target_task_id in parents:
@@ -736,6 +760,7 @@ def _epic_story_contract(
     *,
     epic_contract: Mapping[str, Any],
     story: Mapping[str, Any],
+    story_index: int,
     epic_id: str,
     dependencies: list[str],
     board_metadata: Mapping[str, Any],
@@ -843,6 +868,35 @@ def _epic_story_contract(
     for field in ("po_evidence", "override_authority"):
         if field in epic_contract:
             contract[field] = copy.deepcopy(epic_contract[field])
+
+    epic_sizing = epic_contract.get("sizing")
+    if isinstance(epic_sizing, Mapping):
+        estimates = epic_sizing.get("card_estimates")
+        if isinstance(estimates, list) and story_index < len(estimates):
+            contract["sizing"] = {
+                "rationale": epic_sizing.get("rationale"),
+                "configured_iteration_budget": epic_sizing.get(
+                    "configured_iteration_budget"
+                ),
+                "estimated_turns": estimates[story_index],
+                "fits_budget": True,
+            }
+    epic_feasibility = epic_contract.get("requirement_feasibility")
+    if isinstance(epic_feasibility, Mapping):
+        story_requirements = set(story["done_when"])
+        assessments = epic_feasibility.get("achievable_requirements")
+        contract["requirement_feasibility"] = {
+            "rationale": epic_feasibility.get("rationale"),
+            "achievable_requirements": [
+                copy.deepcopy(assessment)
+                for assessment in assessments or []
+                if isinstance(assessment, Mapping)
+                and assessment.get("requirement") in story_requirements
+            ],
+            "deferred_findings": copy.deepcopy(
+                epic_feasibility.get("deferred_findings") or []
+            ),
+        }
     return contract
 
 
@@ -1015,6 +1069,7 @@ def materialize_contract(
         is_override = contract["qualification_path"] == "override"
         override_authority = contract.get("override_authority") or {}
         decision_reason = "Work Contract validated and materialized"
+
         if is_override:
             decision_reason = (
                 "Authenticated Ole-to-Hermes override; "
@@ -1048,13 +1103,14 @@ def materialize_contract(
                     fields=fields,
                 )
                 story_task_ids: list[str] = []
-                for story in contract.get("stories", []):
+                for story_index, story in enumerate(contract.get("stories", [])):
                     dependency_ids = [
                         story_task_ids[index] for index in story["depends_on"]
                     ]
                     story_contract = _epic_story_contract(
                         epic_contract=contract,
                         story=story,
+                        story_index=story_index,
                         epic_id=task_id,
                         dependencies=dependency_ids,
                         board_metadata=metadata,

@@ -3664,6 +3664,82 @@ WORK_INBOX_PROPOSAL_SCHEMA = {
             "required": ["allowed", "forbidden"],
             "additionalProperties": False,
         },
+        "sizing": {
+            "type": "object",
+            "description": (
+                "Independent Product Owner sizing. The configured budget is "
+                "the Development profile's agent.max_turns; provide one "
+                "estimate for a card or one per Epic story."
+            ),
+            "properties": {
+                "rationale": {"type": "string"},
+                "configured_iteration_budget": {
+                    "type": "integer",
+                    "minimum": 1,
+                },
+                "estimated_turns": {"type": "integer", "minimum": 1},
+                "card_estimates": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                },
+                "fits_budget": {"type": "boolean"},
+            },
+            "required": [
+                "rationale",
+                "configured_iteration_budget",
+                "estimated_turns",
+                "fits_budget",
+            ],
+            "additionalProperties": False,
+        },
+        "requirement_feasibility": {
+            "type": "object",
+            "description": (
+                "Auditable achievability gate. Every binding required-evidence "
+                "or Epic story done-when item must appear exactly once under "
+                "achievable_requirements with a concrete basis. Current-state "
+                "Test findings that cannot yet be achieved belong in "
+                "deferred_findings and must not remain binding."
+            ),
+            "properties": {
+                "rationale": {"type": "string"},
+                "achievable_requirements": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "requirement": {"type": "string"},
+                            "basis": _WORK_INBOX_STRING_LIST_SCHEMA,
+                        },
+                        "required": ["requirement", "basis"],
+                        "additionalProperties": False,
+                    },
+                },
+                "deferred_findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "finding": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "enabling_dependency": {"type": "string"},
+                        },
+                        "required": [
+                            "finding",
+                            "reason",
+                            "enabling_dependency",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": [
+                "rationale",
+                "achievable_requirements",
+                "deferred_findings",
+            ],
+            "additionalProperties": False,
+        },
         "classification": _WORK_INBOX_STRING_LIST_SCHEMA,
         "stories": {
             "type": "array",
@@ -3698,6 +3774,8 @@ WORK_INBOX_PROPOSAL_SCHEMA = {
         "routing",
         "handover",
         "rules",
+        "sizing",
+        "requirement_feasibility",
         "classification",
         "stories",
     ],

@@ -6414,16 +6414,46 @@ def task_repository_evidence(row: sqlite3.Row) -> dict[str, Any]:
             return None
         return (result.stdout or "").strip() if result.returncode == 0 else None
 
+    def git_bytes(*args: str) -> Optional[bytes]:
+        try:
+            result = subprocess.run(
+                [git_executable, "-C", str(root), *args],
+                capture_output=True,
+                text=False,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout if result.returncode == 0 else None
+
     head = git_output("rev-parse", "HEAD")
     status = git_output("status", "--porcelain")
     branch = git_output("branch", "--show-current")
+    tracked_diff = git_bytes("diff", "--binary", "HEAD", "--")
+    untracked = git_bytes("ls-files", "--others", "--exclude-standard", "-z")
+    worktree_digest = None
+    if tracked_diff is not None and untracked is not None:
+        digest = hashlib.sha256(tracked_diff)
+        for relative_bytes in sorted(path for path in untracked.split(b"\0") if path):
+            digest.update(relative_bytes)
+            try:
+                digest.update((root / os.fsdecode(relative_bytes)).read_bytes())
+            except OSError:
+                digest.update(b"<unreadable>")
+        worktree_digest = digest.hexdigest()
     evidence.update(
         {
-            "available": head is not None and status is not None,
+            "available": (
+                head is not None
+                and status is not None
+                and worktree_digest is not None
+            ),
             "repository_root": str(root),
             "head": head,
             "current_branch": branch or None,
             "status_porcelain": status.splitlines() if status is not None else None,
+            "worktree_digest": worktree_digest,
         }
     )
     return evidence
@@ -7427,6 +7457,8 @@ def work_contract_view(
         "handover": contract.get("handover"),
         "rules": contract.get("rules"),
         "classification": contract.get("classification"),
+        "sizing": contract.get("sizing"),
+        "requirement_feasibility": contract.get("requirement_feasibility"),
     }
 
 
@@ -8862,6 +8894,94 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         (task_id,),
     ).fetchone()
     return bool(row) and row["kind"] == "blocked"
+
+
+def _development_budget_exhaustion_count(
+    conn: sqlite3.Connection, task_id: str
+) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS count FROM task_events "
+        "WHERE task_id = ? AND kind = 'development_budget_exhausted'",
+        (task_id,),
+    ).fetchone()
+    return int(row["count"] or 0) if row is not None else 0
+
+
+def handle_development_budget_exhaustion(
+    conn: sqlite3.Connection, task_id: str, *, board: Optional[str] = None
+) -> bool:
+    """Atomically park a Development card for PO review or human action."""
+    from hermes_cli import kanban_intake
+
+    wake_product_owner = False
+    with authorized_governance_write(), write_txn(conn):
+        task = conn.execute(
+            "SELECT status, workflow_template_id, current_step_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "running"
+            or task["workflow_template_id"] != "product"
+            or task["current_step_key"] != "development"
+        ):
+            return False
+
+        occurrence = _development_budget_exhaustion_count(conn, task_id) + 1
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="budget_exhausted",
+            status="budget_exhausted",
+            summary="Development iteration budget exhausted",
+        )
+        if run_id is None:
+            return False
+        next_status = "scheduled" if occurrence == 1 else "ready"
+        updated = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, running = 0, blocked = 0 "
+            "WHERE id = ? AND status = 'running' AND current_run_id IS NULL",
+            (next_status, task_id),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("Development budget state changed during finalization")
+        _append_event(
+            conn,
+            task_id,
+            "development_budget_exhausted",
+            {"occurrence": occurrence},
+            run_id=run_id,
+        )
+
+        if occurrence == 1:
+            kanban_intake.submit_requalification(
+                conn,
+                task_id=task_id,
+                reason=(
+                    "Development exhausted its configured iteration budget; "
+                    "Product Owner must resize or decompose the work."
+                ),
+                qualification_route="product_owner",
+                _wake=False,
+            )
+            wake_product_owner = True
+        elif not block_task(
+            conn,
+            task_id,
+            reason=(
+                "Development exhausted its configured iteration budget twice; "
+                "human decision required."
+            ),
+            kind="transient",
+            board=board or _board_slug_for_connection(conn),
+        ):
+            raise RuntimeError("could not block repeated Development budget exhaustion")
+
+    if wake_product_owner:
+        kanban_intake._wake_intake_qualifier()
+    return True
 
 
 def recompute_ready(
@@ -11175,6 +11295,19 @@ def promote_task(
             f"'todo' or 'blocked'"
         )
 
+    if cur_status == "blocked":
+        scope = conn.execute(
+            "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            scope is not None
+            and scope["workflow_template_id"] == "product"
+            and scope["current_step_key"] == "development"
+            and _development_budget_exhaustion_count(conn, task_id) >= 2
+        ):
+            return False, "human approval is required after repeated budget exhaustion"
+
     if not force:
         parents = conn.execute(
             "SELECT t.id, t.status FROM tasks t "
@@ -11340,6 +11473,15 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "WHERE t.id = ?",
             (task_id,),
         ).fetchone()
+        if (
+            meta is not None
+            and not _GOVERNANCE_WRITE_AUTHORIZED.get()
+            and task_scope is not None
+            and task_scope["workflow_template_id"] == "product"
+            and task_scope["current_step_key"] == "development"
+            and _development_budget_exhaustion_count(conn, task_id) >= 1
+        ):
+            return False
         architecture_assessment = (
             task_scope is not None
             and task_scope["current_step_key"] == "architecture"
@@ -17412,6 +17554,34 @@ def resolve_profile_runtime_identity(
         return None
 
 
+def resolve_profile_iteration_budget(profile_name: str) -> Optional[int]:
+    """Return the configured ``agent.max_turns`` for one profile."""
+    if not profile_name:
+        return None
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.config import DEFAULT_CONFIG, load_config
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile = normalize_profile_name(profile_name)
+        token = set_hermes_home_override(resolve_profile_env(profile))
+        try:
+            config = load_config()
+        finally:
+            reset_hermes_home_override(token)
+        agent = config.get("agent") if isinstance(config, dict) else None
+        configured = agent.get("max_turns") if isinstance(agent, dict) else None
+        if configured is None:
+            configured = DEFAULT_CONFIG["agent"]["max_turns"]
+        budget = int(configured)
+        return budget if budget > 0 else None
+    except (FileNotFoundError, TypeError, ValueError, KeyError, OSError):
+        return None
+
+
 def _resolve_worker_runtime_identity(task: Task) -> Optional[dict[str, Any]]:
     """Resolve the fixed profile runtime selected for this dispatched run."""
     if not task.assignee:
@@ -18051,7 +18221,15 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             )
             + "`"
         )
-        for key in ("work", "routing", "handover", "rules", "classification"):
+        for key in (
+            "work",
+            "routing",
+            "handover",
+            "rules",
+            "classification",
+            "sizing",
+            "requirement_feasibility",
+        ):
             lines.append(
                 _cap(
                     json.dumps(

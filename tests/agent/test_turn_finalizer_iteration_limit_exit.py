@@ -273,6 +273,10 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.handle_development_budget_exhaustion",
+        lambda *_a, **_kw: False,
+    )
     monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
     agent = _LimitAgent()
 
@@ -296,6 +300,32 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
+
+
+def test_product_development_budget_exhaustion_routes_directly(
+    monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    record = MagicMock(name="record_task_failure")
+    route = MagicMock(name="handle_development_budget_exhaustion", return_value=True)
+    conn = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.handle_development_budget_exhaustion", route
+    )
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+
+    result = _finalize(
+        _LimitAgent(),
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="partial development report",
+    )
+
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    route.assert_called_once_with(conn, "task-123")
+    record.assert_not_called()
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):

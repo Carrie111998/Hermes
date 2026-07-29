@@ -1544,6 +1544,7 @@ def test_requalification_captures_current_git_head_and_status(tmp_path, monkeypa
                 "branch_name = 'main' WHERE id = ?",
                 (str(repository), task_id),
             )
+        (repository / "README.md").write_bytes(b"dirty\r\n")
         receipt = intake.submit_requalification(
             connection,
             task_id=task_id,
@@ -1557,7 +1558,16 @@ def test_requalification_captures_current_git_head_and_status(tmp_path, monkeypa
         assert repository_evidence["available"] is True
         assert repository_evidence["head"] == head
         assert repository_evidence["current_branch"] == "main"
-        assert repository_evidence["status_porcelain"] == []
+        assert repository_evidence["status_porcelain"] == ["M README.md"]
+
+        captured_digest = repository_evidence["worktree_digest"]
+        (repository / "README.md").write_bytes(b"dirty\n")
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        current_evidence = kb.task_repository_evidence(row)
+        assert current_evidence["status_porcelain"] == ["M README.md"]
+        assert current_evidence["worktree_digest"] != captured_digest
 
 
 def test_repository_evidence_is_unavailable_when_git_is_not_installed(
@@ -1648,6 +1658,59 @@ def test_successor_contract_requalifies_same_card_and_preserves_audit(
             "new_work_contract_id": card.work_contract_id,
             "entry_phase": "development",
         }
+
+
+@pytest.mark.parametrize("mutation", ["comment", "dependency", "repository"])
+def test_requalification_refuses_stale_card_evidence(
+    tmp_path, monkeypatch, mutation
+):
+    board = "strict-requalification-stale-evidence"
+    _strict_product_board(tmp_path, monkeypatch, board)
+
+    with kb.connect(board=board) as connection:
+        task_id = _materialized_scheduled_card(connection, board)
+        old_contract_id = kb.get_task(connection, task_id).work_contract_id
+        receipt = intake.submit_requalification(
+            connection,
+            task_id=task_id,
+            reason="qualify the current evidence snapshot",
+        )
+        contract = _signed_contract(receipt["intake_id"])["contract"]
+        successor = intake.sign_work_contract(
+            contract, secret=b"test-only-secret"
+        )
+
+        if mutation == "comment":
+            kb.add_comment(
+                connection,
+                task_id,
+                "operator",
+                "New evidence arrived while Product Owner qualification was running",
+            )
+        elif mutation == "dependency":
+            parent_id = _materialized_card(connection, board)
+            with kb.authorized_governance_write():
+                kb.link_tasks(connection, parent_id, task_id)
+        else:
+            with kb.authorized_governance_write(), kb.write_txn(connection):
+                connection.execute(
+                    "UPDATE tasks SET branch_name = 'changed-branch' WHERE id = ?",
+                    (task_id,),
+                )
+
+        with pytest.raises(
+            intake.WorkContractError, match="evidence changed during qualification"
+        ):
+            intake.materialize_contract(
+                connection,
+                board=board,
+                signed_contract=successor,
+                secret=b"test-only-secret",
+            )
+
+        card = kb.get_task(connection, task_id)
+        assert card.status == "scheduled"
+        assert card.work_contract_id == old_contract_id
 
 
 def test_requalification_replaces_dependencies_and_epic_membership(
