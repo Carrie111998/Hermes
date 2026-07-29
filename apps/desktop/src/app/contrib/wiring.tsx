@@ -424,6 +424,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   }, [restartPreviewServer])
 
   const {
+    archiveAllSessions,
     archiveSession,
     branchCurrentSession,
     branchStoredSession,
@@ -827,6 +828,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const nextActions: WiringActions = {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
+    onArchiveAllSessions: () => archiveAllSessions().then(() => refreshSessions()),
     onArchiveSession: sessionId => void archiveSession(sessionId),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
