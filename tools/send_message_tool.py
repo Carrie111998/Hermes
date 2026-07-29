@@ -224,6 +224,14 @@ SEND_MESSAGE_SCHEMA = {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
             },
+            "operation_id": {
+                "type": "string",
+                "description": "Required for outbound email sends when idempotency is enabled. Use one stable workflow/side-effect id across every supervisor, dispatcher, retry, and worker that could attempt the same email."
+            },
+            "message_class": {
+                "type": "string",
+                "description": "Outbound email class used with operation_id and recipient for the durable pre-SMTP claim (for example 'onboarding', 'outreach', or 'notification'). Defaults to 'outbound'."
+            },
             "emoji": {
                 "type": "string",
                 "description": "For action='react': the emoji to react with (e.g. '❤️'). On iMessage, ❤️👍👎😂‼️❓ render as native tapbacks; other emoji use custom-emoji reactions."
@@ -464,6 +472,17 @@ def _handle_send(args):
                 f"or set a home channel via: hermes config set {home_env} <channel_id>"
             )
 
+    operation_id = str(args.get("operation_id") or "").strip()
+    message_class = str(args.get("message_class") or "outbound").strip().lower()
+    if platform_name == "email":
+        from plugins.platforms.email.adapter import _email_idempotency_enabled
+
+        if _email_idempotency_enabled(getattr(pconfig, "extra", None)) and not operation_id:
+            return tool_error(
+                "Outbound email requires operation_id before SMTP so supervisor, "
+                "dispatcher, retry, and worker attempts reconcile to one durable send claim."
+            )
+
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
         return json.dumps(duplicate_skip)
@@ -487,15 +506,23 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        send_options = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+            "force_document": force_document_attachments,
+        }
+        if platform_name == "email":
+            send_options.update({
+                "operation_id": operation_id or None,
+                "message_class": message_class,
+            })
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document_attachments,
+                **send_options,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -780,7 +807,17 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    operation_id=None,
+    message_class="outbound",
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1119,13 +1156,24 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         )
 
     last_result = None
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks):
         if platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:
-            result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id)
+            email_operation_id = operation_id
+            if operation_id and len(chunks) > 1:
+                email_operation_id = f"{operation_id}:part:{chunk_index + 1}"
+            result = await _registry_standalone_send(
+                "email",
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id,
+                operation_id=email_operation_id,
+                message_class=message_class,
+            )
         elif platform == Platform.SMS:
             result = await _registry_standalone_send("sms", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.DINGTALK:
@@ -1497,7 +1545,14 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 # (plugins/platforms/slack/adapter.py), wired via standalone_sender_fn. #41112.
 
 
-async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):
+async def _registry_standalone_send(
+    platform_name,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    **send_kwargs,
+):
     """Dispatch a one-shot send through a migrated platform plugin's
     standalone_sender_fn (registry hook).  Used for platforms whose adapter
     moved out of gateway/platforms/ into plugins/platforms/<name>/ (#41112):
@@ -1510,7 +1565,13 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
     entry = platform_registry.get(platform_name)
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
-    return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
+    return await entry.standalone_sender_fn(
+        pconfig,
+        chat_id,
+        message,
+        thread_id=thread_id,
+        **send_kwargs,
+    )
 
 
 # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,
