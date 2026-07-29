@@ -2,6 +2,8 @@ import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
+
 import { PersistentTerminal, TerminalSlot } from './persistent'
 
 vi.mock('./terminals', () => ({
@@ -9,7 +11,9 @@ vi.mock('./terminals', () => ({
 }))
 
 vi.mock('./workspace', () => ({
-  TerminalWorkspace: () => <div data-testid="terminal-workspace" />
+  TerminalWorkspace: ({ surfaceVisible }: { surfaceVisible?: boolean }) => (
+    <div data-surface-visible={surfaceVisible ? 'true' : 'false'} data-testid="terminal-workspace" />
+  )
 }))
 
 let resizeObserverCallback: ResizeObserverCallback | null = null
@@ -114,10 +118,12 @@ function installRaf() {
   }
 }
 
-function Harness() {
+function Harness({ paneVisible = true }: { paneVisible?: boolean }) {
   return (
     <>
-      <TerminalSlot className="slot" />
+      <PaneVisibleContext.Provider value={paneVisible}>
+        <TerminalSlot className="slot" />
+      </PaneVisibleContext.Provider>
       <PersistentTerminal onAddSelectionToChat={() => undefined} />
     </>
   )
@@ -203,6 +209,22 @@ describe('PersistentTerminal rect tracking', () => {
 
     expect(raf.request).toHaveBeenCalledTimes(3)
     expect(raf.pending()).toBe(0)
+  })
+
+  it('withdraws the fixed overlay slot while its outer function tab is hidden', () => {
+    installRaf()
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(() => rect(10, 20, 200, 100))
+
+    render(<Harness />)
+    const overlay = container!.lastElementChild as HTMLElement
+    expect(overlay.style.visibility).toBe('visible')
+
+    act(() => {
+      root!.render(<Harness paneVisible={false} />)
+    })
+
+    expect(overlay.style.visibility).toBe('hidden')
+    expect(overlay.style.pointerEvents).toBe('none')
   })
 
   it('remeasures when layout moves the slot without resizing it', () => {

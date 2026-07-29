@@ -1440,6 +1440,26 @@ export interface Translations {
   }
 
   artifacts: {
+    projectLibrary: string
+    allProjects: string
+    allProjectsHint: string
+    noProjects: string
+    noProjectsDesc: string
+    openSidebar: string
+    openProject: string
+    paneTitle: string
+    projectPaneTitle: (project: string) => string
+    indexingProject: (project: string) => string
+    indexingContext: string
+    sessionCount: (count: number) => string
+    loadMoreSessions: (loaded: number, total: number) => string
+    noArtifactsInProject: string
+    noContextArtifactsDesc: string
+    noConversationArtifacts: string
+    noRecentProjectArtifacts: string
+    thisConversation: string
+    recentInProject: string
+    viewAll: string
     search: string
     refresh: string
     refreshing: string
@@ -2097,7 +2117,14 @@ export interface Translations {
   rightSidebar: {
     aria: string
     panelsAria: string
+    choosePanel: string
+    addPanel: string
+    showPanel: string
+    hidePanel: string
     files: string
+    review: string
+    artifacts: string
+    preview: string
     terminal: string
     noFolderSelected: string
     changeCwdTitle: string

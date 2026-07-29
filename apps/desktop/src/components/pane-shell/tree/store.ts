@@ -851,7 +851,13 @@ function adoptMissingPanes(target: LayoutNode, source: LayoutNode): LayoutNode {
  * persisted customization; a persisted tree from an older default adopts any
  * panes it's missing.
  */
-export function declareDefaultTree(tree: LayoutNode) {
+export interface DeclareDefaultTreeOptions {
+  /** One-time product migration for a recognized stock layout. Custom/user
+   * arrangements must return false; missing panes are still adopted below. */
+  migratePersisted?: (current: LayoutNode) => boolean
+}
+
+export function declareDefaultTree(tree: LayoutNode, options: DeclareDefaultTreeOptions = {}) {
   defaultTree = tree
   const current = $layoutTree.get()
 
@@ -861,7 +867,13 @@ export function declareDefaultTree(tree: LayoutNode) {
     return
   }
 
-  const next = adoptMissingPanes(current, tree)
+  // A default architecture can evolve (e.g. several stock right columns
+  // become one tab group). Start from the new default only when the caller
+  // positively recognizes the old stock shape, then adopt dynamic panes such
+  // as session tiles/plugins from the persisted tree. Everyone else keeps
+  // their layout and merely adopts newly contributed default panes.
+  const migrating = options.migratePersisted?.(current) ?? false
+  const next = migrating ? adoptMissingPanes(tree, current) : adoptMissingPanes(current, tree)
 
   if (next !== current) {
     commit(next)

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $sidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
-import { applyConfiguredDefaultProjectDir } from '@/store/session'
+import { $currentCwd, applyConfiguredDefaultProjectDir } from '@/store/session'
 
 import {
   $activeProjectId,
@@ -19,6 +19,7 @@ import {
   createProject,
   endSessionMutation,
   enterProject,
+  enterProjectWorkspace,
   exitProjectScope,
   openProjectCreate,
   pickProjectFolder,
@@ -109,6 +110,39 @@ describe('project scope', () => {
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
     expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+  })
+
+  it('enters the shared Desktop workspace when a project-aware surface switches projects', () => {
+    $currentCwd.set('/work/old-project')
+    $sidebarAgentsGrouped.set(false)
+
+    enterProjectWorkspace({
+      id: 'p_desktop',
+      label: 'Desktop',
+      path: '/work/hermes/apps/desktop',
+      repos: [],
+      sessionCount: 0
+    })
+
+    expect($projectScope.get()).toBe('p_desktop')
+    expect($currentCwd.get()).toBe('/work/hermes/apps/desktop')
+    expect($sidebarAgentsGrouped.get()).toBe(true)
+  })
+
+  it('does not replace the workspace cwd when entering the folderless Home bucket', () => {
+    $currentCwd.set('/work/current')
+
+    enterProjectWorkspace({
+      id: NO_PROJECT_ID,
+      isNoProject: true,
+      label: 'Home',
+      path: null,
+      repos: [],
+      sessionCount: 0
+    })
+
+    expect($projectScope.get()).toBe(NO_PROJECT_ID)
+    expect($currentCwd.get()).toBe('/work/current')
   })
 })
 

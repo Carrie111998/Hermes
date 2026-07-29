@@ -10,13 +10,14 @@ import { $activeTerminalId, $terminals, ensureAgentTerminal } from './terminals'
 
 interface TerminalWorkspaceProps {
   onAddSelectionToChat: (text: string, label?: string) => void
+  surfaceVisible?: boolean
 }
 
 /** The persistent-overlay layer: the stack of live xterm instances (only these
  *  must stay in the fixed overlay, for the WebGL host). Mount/visibility is owned
  *  by PersistentTerminal (latched so shells survive hiding); the tab rail and
  *  new-terminal control live in the pane DOM — see TerminalPaneChrome. */
-export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspaceProps) {
+export function TerminalWorkspace({ onAddSelectionToChat, surfaceVisible = true }: TerminalWorkspaceProps) {
   const terminals = useStore($terminals)
   const activeId = useStore($activeTerminalId)
   const background = useStore($backgroundStatusBySession)
@@ -48,10 +49,15 @@ export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspacePro
     <>
       {terminals.map(term =>
         term.kind === 'agent' ? (
-          <AgentTerminalInstance active={term.id === activeId} id={term.id} key={term.id} procId={term.procId!} />
+          <AgentTerminalInstance
+            active={surfaceVisible && term.id === activeId}
+            id={term.id}
+            key={term.id}
+            procId={term.procId!}
+          />
         ) : (
           <TerminalInstance
-            active={term.id === activeId}
+            active={surfaceVisible && term.id === activeId}
             cwd={term.cwd}
             id={term.id}
             key={term.id}

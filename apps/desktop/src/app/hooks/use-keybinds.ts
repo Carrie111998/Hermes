@@ -2,9 +2,15 @@ import { useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
+import {
+  toggleFilesPanel,
+  toggleReviewPanel,
+  toggleRightPanelOpen,
+  toggleTerminalPanel
+} from '@/app/right-panel/actions'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { closeActiveTerminal, createTerminal, cycleTerminal } from '@/app/right-sidebar/terminal/terminals'
-import { activateTreeTabSlot, cycleTreeTabInFocusedZone, layoutHasRootSide } from '@/components/pane-shell/tree/store'
+import { activateTreeTabSlot, cycleTreeTabInFocusedZone } from '@/components/pane-shell/tree/store'
 import { findBarClaimsCombo } from '@/lib/find-in-page'
 import { contributedKeybindHandler, PROFILE_SLOT_COUNT, SESSION_SLOT_COUNT } from '@/lib/keybinds/actions'
 import { comboAllowedInInput, comboFromEvent, isEditableTarget } from '@/lib/keybinds/combo'
@@ -18,13 +24,7 @@ import {
   openFindBar
 } from '@/store/find-in-page'
 import { $capture, $comboIndex, endCapture, setBinding } from '@/store/keybinds'
-import {
-  requestSessionSearchFocus,
-  setFileBrowserOpen,
-  toggleFileBrowserOpen,
-  togglePanesFlipped,
-  toggleSidebarOpen
-} from '@/store/layout'
+import { requestSessionSearchFocus, togglePanesFlipped, toggleSidebarOpen } from '@/store/layout'
 import {
   $newChatProfile,
   cycleProfile,
@@ -34,7 +34,6 @@ import {
   toggleShowAllProfiles
 } from '@/store/profile'
 import { requestNewWorktree } from '@/store/projects'
-import { toggleReview } from '@/store/review'
 import { setModelPickerOpen } from '@/store/session'
 import { reopenLastClosedTile } from '@/store/session-states'
 import {
@@ -125,11 +124,6 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     goToSession(openOrAdvanceSwitcher(direction))
   }
 
-  const showFiles = () => {
-    setFileBrowserOpen(true)
-    setTerminalTakeover(false)
-  }
-
   handlersRef.current = {
     'keybinds.openPanel': () => navigate(`${SETTINGS_ROUTE}?tab=keybinds`),
 
@@ -170,15 +164,13 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
 
     // Narrow-viewport reveal is handled inside the store toggles now.
     'view.toggleSidebar': toggleSidebarOpen,
-    // ⌘J toggles the right sidebar — but a layout with no right side (e.g.
-    // terminal-on-bottom) would leave it a dead key, so it falls back to the
-    // terminal there. The single "secondary panel" toggle.
-    'view.toggleRightSidebar': () =>
-      layoutHasRootSide('right') ? toggleFileBrowserOpen() : setTerminalTakeover(!$terminalTakeover.get()),
-    'view.toggleReview': toggleReview,
+    // ⌘J owns the whole right tools workspace; individual functions keep
+    // their open state and nested tabs while the side is hidden.
+    'view.toggleRightSidebar': toggleRightPanelOpen,
+    'view.toggleReview': toggleReviewPanel,
     'view.toggleStatusbar': toggleStatusbarVisible,
-    'view.showFiles': showFiles,
-    'view.showTerminal': () => setTerminalTakeover(!$terminalTakeover.get()),
+    'view.showFiles': toggleFilesPanel,
+    'view.showTerminal': toggleTerminalPanel,
     // Create first so the pane's open-effect ensure sees a non-empty set and
     // doesn't also spawn one — net effect is exactly one fresh terminal.
     'view.newTerminal': () => {

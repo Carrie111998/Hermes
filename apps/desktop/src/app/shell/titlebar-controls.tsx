@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type ComponentProps, type MouseEvent, type ReactNode, useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 
+import { RightPanelPicker } from '@/app/right-panel/picker'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
 import { resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
@@ -11,13 +12,8 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
-import {
-  $fileBrowserOpen,
-  $sidebarOpen,
-  toggleFileBrowserOpen,
-  togglePanesFlipped,
-  toggleSidebarOpen
-} from '@/store/layout'
+import { $sidebarOpen, togglePanesFlipped, toggleSidebarOpen } from '@/store/layout'
+import { $rightPanelOpen } from '@/store/right-panel'
 
 import { appViewForPath, isOverlayView, SETTINGS_ROUTE } from '../routes'
 
@@ -100,7 +96,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const location = useLocation()
   const modHeld = useModifierHeld()
   const hapticsMuted = useStore($hapticsMuted)
-  const fileBrowserOpen = useStore($fileBrowserOpen)
+  const rightPanelOpen = useStore($rightPanelOpen)
   const sidebarOpen = useStore($sidebarOpen)
 
   const toggleHaptics = () => {
@@ -121,7 +117,6 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   // $fileBrowserOpen ≙ right side. Never an active highlight — plain
   // show/hide affordances.
   const leftEdge = { open: sidebarOpen, toggle: toggleSidebarOpen }
-  const rightEdge = { open: fileBrowserOpen, toggle: toggleFileBrowserOpen }
 
   const leftToolbarTools: TitlebarTool[] = [
     {
@@ -146,17 +141,6 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
     },
     ...leftTools
   ]
-
-  const rightSidebarTool: TitlebarTool = {
-    actionId: 'view.toggleRightSidebar',
-    icon: <Codicon name="layout-sidebar-right" />,
-    id: 'right-sidebar',
-    label: rightEdge.open ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar,
-    onSelect: () => {
-      triggerHaptic('tap')
-      rightEdge.toggle()
-    }
-  }
 
   // Static system tools — always pinned to the screen's right edge.
   const systemTools: TitlebarTool[] = [
@@ -259,7 +243,22 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
         {visibleSystemTools.map(tool => (
           <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
         ))}
-        <TitlebarToolButton navigate={navigate} tool={rightSidebarTool} />
+        <RightPanelPicker
+          trigger={
+            <Button
+              aria-label={t.rightSidebar.choosePanel}
+              aria-pressed={rightPanelOpen}
+              className={cn(titlebarButtonClass, 'bg-transparent select-none')}
+              onPointerDown={event => event.stopPropagation()}
+              size="icon-titlebar"
+              title={t.rightSidebar.choosePanel}
+              type="button"
+              variant="ghost"
+            >
+              <Codicon name="layout-sidebar-right" />
+            </Button>
+          }
+        />
       </div>
     </>
   )

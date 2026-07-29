@@ -16,10 +16,11 @@ import { ESCAPE_PRIORITY, isTopEscapeLayer, pushEscapeLayer } from '@/lib/escape
 import { cn } from '@/lib/utils'
 
 import { PANE_TOGGLE_REVEAL_EVENT } from '../..'
-import { allPaneIds } from '../model'
+import { allPaneIds, findGroupOfPane, type GroupNode } from '../model'
 import { $hiddenTreePanes, $layoutTree, $narrowViewport } from '../store'
 
 import { paneChrome } from './track-model'
+import { TreeGroup } from './tree-group'
 
 export function NarrowOverlays() {
   const narrow = useStore($narrowViewport)
@@ -107,6 +108,21 @@ export function NarrowOverlays() {
   const sideOf = (c: Contribution) => (paneChrome(c).placement === 'left' ? 'left' : 'right')
   const revealed = reveal ? collapsibles.find(p => p.id === reveal.id) : undefined
   const sides = [...new Set(collapsibles.map(sideOf))]
+  const sourceGroup = revealed && tree ? findGroupOfPane(tree, revealed.id) : null
+
+  const overlayPanes =
+    sourceGroup?.panes.filter(id => collapsibles.some(pane => pane.id === id && sideOf(pane) === sideOf(revealed!))) ??
+    []
+
+  const overlayGroup: GroupNode | null =
+    revealed && sourceGroup
+      ? {
+          ...sourceGroup,
+          active: revealed.id,
+          minimized: false,
+          panes: overlayPanes
+        }
+      : null
 
   return (
     <>
@@ -138,7 +154,11 @@ export function NarrowOverlays() {
           // width) instead of a fat fixed 20rem — capped for tiny screens.
           style={{ width: `min(${(revealed.data as { width?: string } | undefined)?.width ?? '18rem'}, 85vw)` }}
         >
-          <ContribBoundary id={revealed.id}>{revealed.render?.()}</ContribBoundary>
+          {overlayGroup && overlayGroup.panes.length > 0 ? (
+            <TreeGroup narrowOverlay node={overlayGroup} railSide={sideOf(revealed)} />
+          ) : (
+            <ContribBoundary id={revealed.id}>{revealed.render?.()}</ContribBoundary>
+          )}
         </div>
       )}
     </>

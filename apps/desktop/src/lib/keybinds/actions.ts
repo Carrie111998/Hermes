@@ -107,7 +107,10 @@ export const KEYBIND_ACTIONS: readonly KeybindActionMeta[] = [
   { id: 'view.toggleStatusbar', category: 'view', defaults: ['mod+shift+s'] },
   // ⌘G — "g" for git; the review pane is the source-control view.
   { id: 'view.toggleReview', category: 'view', defaults: ['mod+g'] },
-  { id: 'view.showFiles', category: 'view', defaults: [] },
+  // ⌘⇧E / Ctrl⇧E — the familiar Explorer toggle. Keep the legacy action id
+  // so existing custom bindings continue to work even though the action is
+  // now a real open/close toggle.
+  { id: 'view.showFiles', category: 'view', defaults: ['mod+shift+e'] },
   // Control+` everywhere (literal `ctrl`, NOT `mod`): ⌘` is macOS-reserved for
   // cycling app windows, so VS Code/Cursor/Zed bind the terminal to Ctrl+` on
   // every platform. Off macOS `ctrl` folds to `mod` (= Ctrl), so it's unchanged.

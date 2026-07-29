@@ -9,6 +9,7 @@
  */
 
 export interface LoneHeaderChrome {
+  forceHeader?: boolean
   placement?: string
   uncloseable?: boolean
 }
@@ -18,6 +19,10 @@ export function forceLoneHeaderForPanes(
   chromeOf: (id: string) => LoneHeaderChrome,
   isCollapsePane: (id: string) => boolean
 ): boolean {
+  if (shown.some(id => chromeOf(id).forceHeader)) {
+    return true
+  }
+
   if (shown.some(id => id.startsWith('session-tile:'))) {
     return true
   }
