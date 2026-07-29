@@ -1054,6 +1054,16 @@ class CodexAppServerSession:
             )
 
     def _decide_exec_approval(self, params: dict) -> str:
+        try:
+            from capability.codex_hook import observe_codex_tool
+
+            observe_codex_tool(tool="terminal")
+
+        except Exception:
+            logger.debug(
+                "codex capability shadow failed",
+                exc_info=True,
+            )
         if self._routing.auto_approve_exec:
             return "accept"
         command = params.get("command") or ""

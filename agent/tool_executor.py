@@ -1183,6 +1183,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not _execution_blocked:
             agent._current_tool = function_name
             agent._touch_activity(f"executing tool: {function_name}")
+            # Shadow observation never changes the execution decision.
+            try:
+                from capability.shadow_hook import observe_tool_call
+
+                observe_tool_call(function_name=function_name)
+            except Exception:
+                logger.debug(
+                    "capability shadow observation failed",
+                    exc_info=True,
+                )
 
         # Set activity callback for long-running tool execution (terminal
         # commands, etc.) so the gateway's inactivity monitor doesn't kill

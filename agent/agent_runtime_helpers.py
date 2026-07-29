@@ -2419,6 +2419,16 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
+    try:
+        from capability.shadow_hook import observe_tool_call
+
+        observe_tool_call(function_name=function_name)
+    except Exception:
+        logger.debug(
+            "capability shadow observation failed",
+            exc_info=True,
+        )
+
     tool_start_time = time.monotonic()
 
     def _finish_agent_tool(result: Any, observed_args: Optional[dict] = None) -> Any:

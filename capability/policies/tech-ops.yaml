@@ -1,0 +1,14 @@
+filesystem.read:
+  decision: ALLOW
+
+filesystem.write:
+  decision: ALLOW
+
+docker.inspect:
+  decision: ALLOW
+
+docker.restart:
+  decision: APPROVAL_REQUIRED
+
+execution.code:
+  decision: APPROVAL_REQUIRED
