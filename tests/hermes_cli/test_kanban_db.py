@@ -8957,6 +8957,146 @@ def test_pinned_review_target_survives_run_completion(
     }
 
 
+def test_review_closure_keeps_dispatcher_pins_over_worker_claims(
+    kanban_home, tmp_path, all_assignees_spawnable, monkeypatch,
+):
+    board = "review-target-authoritative-at-closure"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    reviewer_executor = {
+        "profile": "reviewer",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh",
+        "surface": "hermes-primary",
+        "source": "dispatcher",
+        "version": 1,
+    }
+    writer_executor = {
+        "profile": "developer",
+        "provider": "anthropic",
+        "model": "claude-opus-4.5",
+        "effort": "high",
+        "surface": "hermes-primary",
+        "source": "dispatcher",
+        "version": 1,
+    }
+    worker_head_sha = "b" * 40
+    worker_base_sha = "c" * 40
+    worker_executor = {
+        "profile": "reviewer",
+        "provider": "worker-claim",
+        "model": "worker-model",
+        "effort": "worker-effort",
+        "surface": "worker-surface",
+    }
+    monkeypatch.setattr(
+        kb, "_resolve_worker_runtime_identity", lambda _task: reviewer_executor,
+    )
+
+    with kb.connect(board=board) as conn:
+        tid, _workspace, pinned_base_sha, pinned_head_sha = (
+            _seed_product_review_worktree(conn, board, repo)
+        )
+        review_task = kb.get_task(conn, tid)
+        assert review_task is not None and review_task.branch_name
+        branch = review_task.branch_name
+        with kb.write_txn(conn):
+            kb._synthesize_ended_run(
+                conn,
+                tid,
+                outcome="advanced",
+                step_key="development",
+                metadata={
+                    "executor": writer_executor,
+                    "ai_provenance": {
+                        "writer": {"agent": writer_executor["provider"]},
+                    },
+                },
+            )
+            kb._synthesize_ended_run(
+                conn,
+                tid,
+                outcome="advanced",
+                step_key="test",
+                metadata={
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {
+                        "tester": {"agent": "hermes", "result": "passed"},
+                    },
+                },
+            )
+        result = kb.dispatch_once(
+            conn,
+            board=board,
+            spawn_fn=lambda *args, **kwargs: 4242,
+        )
+        assert result.spawned[0][0] == tid
+        running_task = kb.get_task(conn, tid)
+        assert running_task is not None and running_task.current_run_id is not None
+        run_id = running_task.current_run_id
+        assert kb.handoff(
+            conn,
+            tid,
+            board=board,
+            summary="Approved the dispatcher-pinned review target.",
+            metadata={
+                "review_base_sha": worker_base_sha,
+                "review_head_sha": worker_head_sha,
+                "executor": worker_executor,
+                "workflow_outcome": {"verdict": "approved"},
+                "ai_provenance": {
+                    "writer": {"agent": writer_executor["provider"]},
+                    "reviewer": {
+                        "agent": reviewer_executor["provider"],
+                        "verdict": "approved",
+                        "reviewed_branch": branch,
+                        "reviewed_commit": worker_head_sha,
+                    },
+                },
+            },
+            expected_run_id=run_id,
+            expected_phase="review",
+        )
+        persisted = kb.get_run(conn, run_id)
+        evidence = kb._release_run_evidence(conn, tid, branch, pinned_head_sha)
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb._release_run_evidence(conn, tid, branch, worker_head_sha)
+        conflict_events = [
+            event
+            for event in kb.list_events(conn, tid)
+            if event.kind == "dispatcher_metadata_conflict"
+        ]
+
+    assert persisted is not None
+    assert persisted.metadata["review_base_sha"] == pinned_base_sha
+    assert persisted.metadata["review_head_sha"] == pinned_head_sha
+    assert persisted.metadata["executor"] == reviewer_executor
+    assert (
+        persisted.metadata["ai_provenance"]["reviewer"]["reviewed_commit"]
+        == pinned_head_sha
+    )
+    assert evidence["review_run_id"] == run_id
+    assert "reviewed_candidate" in exc_info.value.missing
+    assert conflict_events[-1].payload == {
+        "conflicts": {
+            "review_base_sha": {
+                "dispatcher": pinned_base_sha,
+                "worker": worker_base_sha,
+            },
+            "review_head_sha": {
+                "dispatcher": pinned_head_sha,
+                "worker": worker_head_sha,
+            },
+            "executor": {
+                "dispatcher": reviewer_executor,
+                "worker": worker_executor,
+            },
+        }
+    }
+
+
 def test_dispatch_blocks_dirty_review_target_before_spawn(
     kanban_home, tmp_path, all_assignees_spawnable,
 ):

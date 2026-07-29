@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from tools.approval import (
     shell_command_argvs,
     shell_command_has_redirection,
@@ -700,6 +700,71 @@ for _mutator in {
 }:
     _COMMAND_POLICIES[_mutator] = _CommandPolicy(targets=_all_operand_targets)
 
+# Execution-bearing flags turn a verification runner into a general code
+# loader/evaluator. Both ``--flag=value`` and ``--flag value`` stay ambiguous.
+_EXECUTION_BEARING_RUNNER_FLAGS = {
+    "--eval",
+    "--eval-file",
+    "--experimental-loader",
+    "--import",
+    "--loader",
+    "--node-options",
+    "--print",
+    "--require",
+    "-c",
+    "-e",
+    "-p",
+    "-r",
+}
+_ALLOWED_NPM_RUN_SCRIPTS = {"build", "lint", "test", "typecheck"}
+
+
+def _has_execution_bearing_runner_flag(args: list[str]) -> bool:
+    return any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in args
+        for flag in _EXECUTION_BEARING_RUNNER_FLAGS
+    )
+
+
+def _verification_runner_targets(argv: list[str]) -> tuple[list[str], bool]:
+    executable = os.path.basename(argv[0]).lower()
+    args = argv[1:]
+    if _has_execution_bearing_runner_flag(args):
+        return [], True
+
+    target_args: list[str]
+    if executable == "npm":
+        if args and args[0] == "test":
+            target_args = args[1:]
+        elif len(args) >= 2 and args[0] == "run" and args[1] in _ALLOWED_NPM_RUN_SCRIPTS:
+            target_args = args[2:]
+        else:
+            return [], True
+    elif executable == "npx":
+        if not args or args[0] != "vitest":
+            return [], True
+        target_args = args[1:]
+    elif executable in {"pytest", "vitest"}:
+        target_args = args
+    elif executable == "python3":
+        if len(args) < 2 or args[0] != "-m" or args[1] not in {"pytest", "unittest"}:
+            return [], True
+        target_args = args[2:]
+    elif executable == "make":
+        if args != ["test"]:
+            return [], True
+        target_args = []
+    else:
+        return [], True
+    return _positional_operands(target_args), False
+
+
+# Allow only verification command shapes, not general-purpose executables.
+# Operands remain targets so paths outside the card workspace are refused.
+for _runner in {"make", "npm", "npx", "pytest", "python3", "vitest"}:
+    _COMMAND_POLICIES[_runner] = _CommandPolicy(targets=_verification_runner_targets)
+
 def _command_policy(argv: list[str]) -> Optional[_CommandPolicy]:
     raw_executable = argv[0]
     executable = os.path.basename(raw_executable).lower()
@@ -790,7 +855,10 @@ def _effective_targets(
 
 
 def _governance(path: Path) -> Optional[dict]:
-    with pdb.connect() as conn:
+    # Always the root projects DB: workers run under a profile-scoped
+    # HERMES_HOME (`hermes -p <assignee>`), and the profile's projects.db
+    # does not know the board's projects — governance is a root concern.
+    with pdb.connect(get_default_hermes_root() / "projects.db") as conn:
         return pdb.governance_for_path(conn, str(path))
 
 

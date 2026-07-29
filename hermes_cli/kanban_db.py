@@ -2664,6 +2664,33 @@ def _canonicalize_product_ai_provenance(
     if writer_executor is not None:
         _stamp("writer", writer_executor)
     canonical["ai_provenance"] = provenance
+    if step == "review":
+        # Release evidence is read from ``ai_provenance.reviewer``. Reviewer
+        # runs have recorded the same facts at the metadata root instead, in
+        # more than one shape, so canonicalize them here rather than relying
+        # on the worker to author the right keys.
+        pinned_review_head = ""
+        if run is not None and isinstance(run.metadata, dict):
+            pinned_review_head = str(run.metadata.get("review_head_sha") or "").strip()
+        evidence_metadata = dict(canonical)
+        if pinned_review_head:
+            evidence_metadata["review_head_sha"] = pinned_review_head
+        verdict, reviewed_branch, reviewed_commit = _reviewer_evidence(evidence_metadata)
+        reviewer_facts = provenance.get("reviewer")
+        reviewer_facts = dict(reviewer_facts) if isinstance(reviewer_facts, dict) else {}
+        for key, value in (
+            ("verdict", verdict),
+            ("reviewed_branch", reviewed_branch),
+            ("reviewed_commit", reviewed_commit),
+        ):
+            if value and (
+                (key == "reviewed_commit" and pinned_review_head)
+                or not str(reviewer_facts.get(key) or "").strip()
+            ):
+                reviewer_facts[key] = value
+        if reviewer_facts:
+            provenance["reviewer"] = reviewer_facts
+            canonical["ai_provenance"] = provenance
     return canonical
 
 
@@ -8677,11 +8704,17 @@ def _end_run(
         )
     except (TypeError, ValueError):
         active_metadata = {}
+    dispatcher_metadata_conflicts: dict[str, dict[str, Any]] = {}
     if isinstance(active_metadata, dict):
         for key in ("review_base_sha", "review_head_sha", "executor"):
             value = active_metadata.get(key)
             if value is not None:
-                final_metadata.setdefault(key, value)
+                if key in final_metadata and final_metadata[key] != value:
+                    dispatcher_metadata_conflicts[key] = {
+                        "dispatcher": value,
+                        "worker": final_metadata[key],
+                    }
+                final_metadata[key] = value
     closed = conn.execute(
         """
         UPDATE task_runs
@@ -8719,6 +8752,14 @@ def _end_run(
     )
     if closed.rowcount != 1 or cleared.rowcount != 1:
         return None
+    if dispatcher_metadata_conflicts:
+        _append_event(
+            conn,
+            task_id,
+            "dispatcher_metadata_conflict",
+            {"conflicts": dispatcher_metadata_conflicts},
+            run_id=run_id,
+        )
     return run_id
 
 
@@ -12991,6 +13032,48 @@ def _latest_event_of_kind(
     return events[-1] if events else None
 
 
+def _reviewer_evidence(metadata: dict) -> tuple[str, str, str]:
+    """Return ``(verdict, reviewed_branch, reviewed_commit)`` from a review run.
+
+    The canonical location is ``ai_provenance.reviewer``. Reviewer runs have
+    also recorded the same facts at the metadata root, in more than one shape,
+    so those are accepted as fallbacks. This only widens where the values are
+    *read from* — callers still compare them against the release branch and
+    source SHA, so approval stays bound to the exact candidate.
+    """
+    reviewer = _provenance_payload(metadata).get("reviewer")
+    reviewer = reviewer if isinstance(reviewer, dict) else {}
+    candidate = metadata.get("candidate")
+    candidate = candidate if isinstance(candidate, dict) else {}
+    workflow = metadata.get("workflow_outcome")
+    workflow = workflow if isinstance(workflow, dict) else {}
+
+    def _first(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    return (
+        _first(reviewer.get("verdict"), metadata.get("verdict"), workflow.get("verdict")),
+        # Branch has no dispatcher-pinned source; release cross-checks this
+        # worker-authored chain against the branch it is actually releasing.
+        _first(
+            reviewer.get("reviewed_branch"),
+            metadata.get("reviewed_branch"),
+            metadata.get("branch"),
+            candidate.get("branch"),
+        ),
+        _first(
+            metadata.get("review_head_sha"),
+            reviewer.get("reviewed_commit"),
+            metadata.get("reviewed_commit"),
+            candidate.get("head_sha"),
+        ),
+    )
+
+
 def _latest_approved_review_candidate(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12999,17 +13082,14 @@ def _latest_approved_review_candidate(
     for run in reversed(list_runs(conn, task_id, include_active=False)):
         metadata = run.metadata if isinstance(run.metadata, dict) else {}
         workflow = metadata.get("workflow_outcome")
-        reviewer = _provenance_payload(metadata).get("reviewer")
+        verdict, branch, commit = _reviewer_evidence(metadata)
         if (
             run.step_key == "review"
             and isinstance(workflow, dict)
             and workflow.get("verdict") == "approved"
-            and isinstance(reviewer, dict)
-            and reviewer.get("verdict") == "approved"
+            and verdict == "approved"
             and _reviewer_agent_from_metadata(metadata)
         ):
-            branch = str(reviewer.get("reviewed_branch") or "").strip()
-            commit = str(reviewer.get("reviewed_commit") or "").strip()
             if branch and commit:
                 return branch, commit
     return None
@@ -13047,18 +13127,17 @@ def _release_run_evidence(
             ):
                 test_run = run
         if run.step_key == "review":
-            reviewer = provenance.get("reviewer")
+            verdict, run_branch, run_commit = _reviewer_evidence(metadata)
             if (
                 isinstance(workflow, dict)
                 and workflow.get("verdict") == "approved"
-                and isinstance(reviewer, dict)
-                and reviewer.get("verdict") == "approved"
+                and verdict == "approved"
                 and _reviewer_agent_from_metadata(metadata)
             ):
                 review_run = run
                 reviewer_agent = _reviewer_agent_from_metadata(metadata)
-                reviewed_branch = str(reviewer.get("reviewed_branch") or "").strip()
-                reviewed_commit = str(reviewer.get("reviewed_commit") or "").strip()
+                reviewed_branch = run_branch
+                reviewed_commit = run_commit
                 reviewed_writer_agent = run_writer or writer_agent
 
     missing: list[str] = []

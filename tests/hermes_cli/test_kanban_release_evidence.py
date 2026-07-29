@@ -155,6 +155,14 @@ def _seed_structured_evidence(
     return ids
 
 
+def _replace_run_metadata(conn, run_id: int, metadata: dict) -> None:
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata, sort_keys=True), run_id),
+        )
+
+
 def test_product_board_defaults_to_manual_deployment_policy(release_home):
     board = "release-default-policy"
     kb.ensure_product_board_defaults(board)
@@ -197,6 +205,119 @@ def test_release_rejects_missing_or_untrustworthy_run_evidence(
         assert task is not None
         assert task.status == "ready"
         assert task.current_step_key == "release_measure"
+
+
+def test_release_evidence_prefers_dispatcher_pinned_review_commit(
+    release_home, tmp_path,
+):
+    repo, branch, pinned_sha = _repo_with_story_branch(tmp_path)
+    board = "release-pinned-review-head"
+    _release_board(board, repo)
+    claimed_sha = "b" * 40
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        run_ids = _seed_structured_evidence(
+            conn, task_id, branch, pinned_sha, reviewed_commit=claimed_sha,
+        )
+        review_run = kb.get_run(conn, run_ids["review"])
+        assert review_run is not None
+        metadata = dict(review_run.metadata or {})
+        metadata["review_head_sha"] = pinned_sha
+        _replace_run_metadata(conn, run_ids["review"], metadata)
+
+        evidence = kb._release_run_evidence(conn, task_id, branch, pinned_sha)
+        assert evidence["review_run_id"] == run_ids["review"]
+
+        with pytest.raises(kb.ReleaseEvidenceError) as exc_info:
+            kb._release_run_evidence(conn, task_id, branch, claimed_sha)
+        assert "reviewed_candidate" in exc_info.value.missing
+
+
+@pytest.mark.parametrize(
+    "review_facts",
+    [
+        lambda branch, sha: {"candidate": {"branch": branch, "head_sha": sha}},
+        lambda branch, sha: {"reviewed_branch": branch, "reviewed_commit": sha},
+    ],
+)
+def test_release_evidence_accepts_historical_unpinned_review_shapes(
+    release_home, tmp_path, review_facts,
+):
+    repo, branch, source_sha = _repo_with_story_branch(tmp_path)
+    board = f"release-historical-{len(review_facts(branch, source_sha))}"
+    _release_board(board, repo)
+    with kb.connect(board=board) as conn:
+        task_id = _release_task(conn, board, repo, branch)
+        run_ids = _seed_structured_evidence(conn, task_id, branch, source_sha)
+        historical = {
+            "workflow_outcome": {"verdict": "approved"},
+            "ai_provenance": {
+                "writer": {"agent": "claude-code"},
+                "reviewer": {"agent": "codex"},
+            },
+            **review_facts(branch, source_sha),
+        }
+        _replace_run_metadata(conn, run_ids["review"], historical)
+
+        evidence = kb._release_run_evidence(conn, task_id, branch, source_sha)
+        assert evidence["review_run_id"] == run_ids["review"]
+
+
+def test_review_canonicalization_records_dispatcher_pinned_commit(
+    release_home, tmp_path,
+):
+    repo, branch, pinned_sha = _repo_with_story_branch(tmp_path)
+    board = "review-canonical-pinned-head"
+    _release_board(board, repo)
+    claimed_sha = "c" * 40
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Review canonicalization",
+            assignee="reviewer",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=branch,
+            workflow_template_id="product",
+            current_step_key="review",
+            initial_status="running",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        _replace_run_metadata(
+            conn,
+            claimed.current_run_id,
+            {
+                "executor": {
+                    "profile": "reviewer",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6",
+                    "effort": "high",
+                    "surface": "hermes",
+                },
+                "review_head_sha": pinned_sha,
+            },
+        )
+        worker_metadata = {
+            "workflow_outcome": {"verdict": "approved"},
+            "ai_provenance": {
+                "writer": {"agent": "claude-code"},
+                "reviewer": {
+                    "agent": "openai-codex",
+                    "verdict": "approved",
+                    "reviewed_branch": branch,
+                    "reviewed_commit": claimed_sha,
+                },
+            },
+        }
+
+        canonical = kb._canonicalize_product_ai_provenance(
+            conn, task_id, "review", worker_metadata,
+        )
+
+        assert canonical is not None
+        assert canonical["ai_provenance"]["reviewer"]["reviewed_commit"] == pinned_sha
 
 
 def test_standalone_release_integrates_before_done_and_attaches_terminal_evidence(
