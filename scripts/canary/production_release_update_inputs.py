@@ -36,8 +36,8 @@ from scripts.canary import production_release_update_runtime as update_runtime
 RELEASE_CONSUMER_SET_SCHEMA = (
     "muncho-production-release-consumer-set.v1"
 )
-ACTIVATION_PLAN_SCHEMA = "muncho-production-release-activation-plan.v1"
-ROLLBACK_PLAN_SCHEMA = "muncho-production-release-rollback-plan.v1"
+ACTIVATION_PLAN_SCHEMA = "muncho-production-release-activation-plan.v2"
+ROLLBACK_PLAN_SCHEMA = "muncho-production-release-rollback-plan.v2"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -88,6 +88,10 @@ _ACTIVATION_PLAN_FIELDS = frozenset(
         "forward_phase_count",
         "commit_phase",
         "first_application_mutation_phase",
+        "unit_input_preauthorization_phase",
+        "unit_input_finalization_phase",
+        "unit_input_preauthorization_before_commit",
+        "unit_input_finalization_after_commit",
         "catalog_consumer_unit_count",
         "catalog_execution_service_count",
         "catalog_trigger_unit_count",
@@ -109,6 +113,11 @@ _ROLLBACK_PLAN_FIELDS = frozenset(
         "artifact_identities",
         "rollback_phase_order",
         "rollback_phase_count",
+        "preauthorized_rollback_phase_order",
+        "preauthorized_rollback_phase_count",
+        "unit_input_preauthorization_discriminator_phase",
+        "unit_input_preauthorization_cancel_phase",
+        "unit_input_preauthorization_cancel_before_host_restore",
         "commit_phase",
         "rollback_allowed_before_commit_only",
         "catalog_consumer_unit_count",
@@ -535,6 +544,12 @@ def build_activation_plan(
         "first_application_mutation_phase": (
             update_runtime.FIRST_APPLICATION_MUTATION_PHASE
         ),
+        "unit_input_preauthorization_phase": (
+            update_runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE
+        ),
+        "unit_input_finalization_phase": "unit_inputs_finalized",
+        "unit_input_preauthorization_before_commit": True,
+        "unit_input_finalization_after_commit": True,
         "catalog_consumer_unit_count": inventory.EXPECTED_UNIT_COUNT,
         "catalog_execution_service_count": (
             inventory.EXPECTED_EXECUTION_SERVICE_COUNT
@@ -604,6 +619,19 @@ def build_rollback_plan(
         "artifact_identities": identities,
         "rollback_phase_order": list(update_runtime.ROLLBACK_PHASES),
         "rollback_phase_count": len(update_runtime.ROLLBACK_PHASES),
+        "preauthorized_rollback_phase_order": list(
+            update_runtime.PREAUTHORIZED_ROLLBACK_PHASES
+        ),
+        "preauthorized_rollback_phase_count": len(
+            update_runtime.PREAUTHORIZED_ROLLBACK_PHASES
+        ),
+        "unit_input_preauthorization_discriminator_phase": (
+            update_runtime.UNIT_INPUT_PREAUTHORIZATION_DISCRIMINATOR_PHASE
+        ),
+        "unit_input_preauthorization_cancel_phase": (
+            update_runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+        ),
+        "unit_input_preauthorization_cancel_before_host_restore": True,
         "commit_phase": update_runtime.COMMIT_PHASE,
         "rollback_allowed_before_commit_only": True,
         "catalog_consumer_unit_count": inventory.EXPECTED_UNIT_COUNT,

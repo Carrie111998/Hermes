@@ -19,7 +19,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
-PLAN_SCHEMA = "muncho-production-release-update-plan.v4"
+PLAN_SCHEMA = "muncho-production-release-update-plan.v5"
 APPROVAL_SCHEMA = "muncho-production-release-update-approval.v1"
 PUBLICATION_SCHEMA = "muncho-production-release-update-publication.v1"
 PREDECESSOR_TRUST_SCHEMA = (

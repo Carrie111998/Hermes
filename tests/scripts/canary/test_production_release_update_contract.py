@@ -172,6 +172,28 @@ def test_owner_signed_publication_binds_exact_pinned_release() -> None:
     assert validated["plan"]["release_owner"] == {"uid": 0, "gid": 0}
     assert validated["plan"]["builder_identity"]["uid"] == 29104
     assert validated["plan"]["plan_sha256"] == plan["plan_sha256"]
+    assert validated["plan"]["schema"] == (
+        "muncho-production-release-update-plan.v5"
+    )
+
+
+def test_prior_dormant_plan_schema_is_not_accepted_as_current_authority() -> None:
+    _private, trusted, plan, _approval_value, _publication = _documents()
+    legacy = deepcopy(plan)
+    legacy["schema"] = "muncho-production-release-update-plan.v4"
+    _rehash(legacy, "plan_sha256")
+
+    with pytest.raises(
+        contract.ProductionReleaseUpdateContractError,
+        match="release_update_plan_invalid",
+    ):
+        contract.validate_plan(
+            legacy,
+            trusted_predecessor=trusted,
+            expected_predecessor_trust_sha256=str(
+                trusted["trust_sha256"]
+            ),
+        )
 
 
 def test_target_cannot_replace_predecessor_trust_key() -> None:

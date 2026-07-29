@@ -21,10 +21,13 @@ host mutation set, fixed production entrypoint, recovery gate, and disposable
 Linux power-loss/restart E2E suite land together.  The missing entrypoint is an
 intentional deployment interlock, not a packaging omission.
 
-The dormant transaction identity is currently
-`muncho-production-release-update-intent.v3`.  An activation installer must
-prove that no v2 authority record or journal exists on the host, or perform an
-explicitly reviewed migration before enabling any updater or recovery caller.
+The dormant runtime currently uses transaction intent v4, authority-record v2,
+and event v2 (`muncho-production-release-update-intent.v4`,
+`muncho-production-release-update-authority-record.v2`, and
+`muncho-production-release-update-event.v2`).  An activation installer must
+prove that no legacy v3/v1/v1 authority or journal evidence, or any earlier
+format, exists on the host, or perform an explicitly reviewed migration before
+enabling any updater or recovery caller.
 
 Release unit-input rotation evidence now uses the
 `release-unit-input-authority-rotations-v5` audit namespace.  The historical
