@@ -844,6 +844,7 @@ def classify_branch_health(
     upstream: UpstreamReference,
     tracking: TrackingInfo,
     ahead_behind: AheadBehind,
+    divergence_age_days: int | None,
     mutual: MutualPaths,
     scope: ScopeHealth,
 ) -> BranchHealth:
@@ -865,6 +866,8 @@ def classify_branch_health(
         return BranchHealth.ERROR
     if (scope.unique_local_commits > SCOPE_PASS_MAX_COMMITS
             or scope.changed_files > SCOPE_PASS_MAX_FILES):
+        return BranchHealth.WARN
+    if divergence_age_days is not None and divergence_age_days > 30:
         return BranchHealth.WARN
     if mutual.critical_mutual_paths:
         return BranchHealth.WARN
@@ -933,6 +936,7 @@ def collect_branch_health(
             upstream=upstream,
             tracking=tracking,
             ahead_behind=ab,
+            divergence_age_days=divergence.divergence_age_days,
             mutual=mutual,
             scope=scope,
         )

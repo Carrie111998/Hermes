@@ -438,6 +438,7 @@ def test_T15_mutual_paths_never_directly_block(gitrepo) -> None:
             tracking=TrackingInfo(True, "origin/main", "origin",
                                   "refs/heads/main", "explicit"),
             ahead_behind=AheadBehind(0, 0),
+            divergence_age_days=None,
             mutual=mut,
             scope=ScopeHealth(0, 0, 0, 0),
         ),
@@ -453,6 +454,42 @@ def test_T15_mutual_paths_never_directly_block(gitrepo) -> None:
     )
     safety = update_safety_check(bh)
     assert safety.decision == UpdateSafetyDecision.UPDATE_SAFETY_PASS
+
+
+def test_UH4_divergence_age_over_30_warns() -> None:
+    """UH4: divergence age > 30 warns without making healthy inputs fail."""
+    upstream = UpstreamReference(
+        True,
+        "origin/main",
+        "origin",
+        "main",
+        resolution_chain=["tracking"],
+    )
+    tracking = TrackingInfo(
+        True,
+        "origin/main",
+        "origin",
+        "refs/heads/main",
+        "explicit",
+    )
+    ahead_behind = AheadBehind(0, 0)
+    mutual = MutualPaths([], [], [], [])
+    scope = ScopeHealth(0, 0, 0, 0)
+
+    def verdict(divergence_age_days: int | None) -> BranchHealth:
+        return classify_branch_health(
+            upstream=upstream,
+            tracking=tracking,
+            ahead_behind=ahead_behind,
+            divergence_age_days=divergence_age_days,
+            mutual=mutual,
+            scope=scope,
+        )
+
+    assert verdict(None) == BranchHealth.PASS
+    assert verdict(30) == BranchHealth.PASS
+    assert verdict(31) == BranchHealth.WARN
+    assert verdict(90) == BranchHealth.WARN
 
 
 # =========================================================================== #
