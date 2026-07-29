@@ -3,10 +3,18 @@ from types import SimpleNamespace
 from agent.usage_pricing import (
     CanonicalUsage,
     estimate_usage_cost,
+    format_token_count_compact,
     get_pricing_entry,
     normalize_usage,
     resolve_billing_route,
 )
+
+
+def test_format_token_count_compact_rolls_over_rounded_units():
+    assert format_token_count_compact(999_499) == "999K"
+    assert format_token_count_compact(999_500) == "1M"
+    assert format_token_count_compact(999_999_999) == "1B"
+    assert format_token_count_compact(-999_999) == "-1M"
 
 
 def test_normalize_usage_anthropic_keeps_cache_buckets_separate():
