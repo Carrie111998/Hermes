@@ -123,6 +123,9 @@ def _patch_spawn(
     (sidecar_dir / "node_modules").mkdir(parents=True)
     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", sidecar_dir)
     monkeypatch.setattr(photon_adapter, "_sidecar_deps_stale", lambda: False)
+    # The unified deps check requires spectrum-ts inside node_modules; these
+    # tests exercise the runtime record, not dependency installation.
+    monkeypatch.setattr(photon_adapter, "sidecar_deps_installed", lambda: True)
 
     async def _no_reap(self: PhotonAdapter) -> None:
         return None
