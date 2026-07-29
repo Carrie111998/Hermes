@@ -21,6 +21,8 @@
 //   - POST /send        -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "text": "...",
 //              "format": "text" | "markdown" (default "text")}
+//   - POST /send-richlink -> {"ok": true, "messageId": "..."}
+//       body: {"spaceId": "...", "url": "https://..."}
 //   - POST /send-attachment -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "path": "...", "name": "..." | null,
 //              "mimeType": "..." | null, "caption": "..." | null,
@@ -31,6 +33,12 @@
 //   - POST /unreact     -> {"ok": true} | 400 soft failure
 //       body: {"spaceId": "...", "messageId": "<target msg id>",
 //              "reactionId": "..." | null (restart-recovery fallback)}
+//   - POST /send-poll   -> {"ok": true, "messageId": "..."}
+//       body: {"spaceId": "...", "title": "...", "options": ["...", "..."]}
+//       Sends a native poll (orange iMessage poll bubble). A tap streams
+//       back inbound as a `poll_option` event ({title, selected}).
+//   - POST /send-effect -> {"ok": true, "messageId": "..."}
+//       body: {"spaceId": "...", "text": "...", "effect": "confetti" | ...}
 //   - POST /typing      -> {"ok": true}
 //       body: {"spaceId": "...", "state": "start" | "stop"}
 //   - POST /shutdown    -> {"ok": true}; then process exits
@@ -230,7 +238,6 @@ try {
       "Original error: " +
       (e && e.stack ? e.stack : String(e))
   );
-  process.exit(3);
 }
 let Spectrum,
   imessage,
@@ -238,17 +245,22 @@ let Spectrum,
   voice,
   spectrumText,
   spectrumMarkdown,
-  spectrumTyping;
+  spectrumRichlink,
+  spectrumTyping,
+  spectrumPoll,
+  imessageEffect;
 try {
   ({
     Spectrum,
     attachment,
     voice,
+    poll: spectrumPoll,
     text: spectrumText,
     markdown: spectrumMarkdown,
+    richlink: spectrumRichlink,
     typing: spectrumTyping,
   } = await import("spectrum-ts"));
-  ({ imessage } = await import("spectrum-ts/providers/imessage"));
+  ({ imessage, effect: imessageEffect } = await import("spectrum-ts/providers/imessage"));
 } catch (e) {
   console.error(
     "photon-sidecar: spectrum-ts is not installed. Run `npm install` " +
@@ -265,6 +277,11 @@ const app = await Spectrum({
   options: { flattenGroups: true },
   telemetry,
 });
+
+// Effect-name → native effect id map. Optional chaining: an SDK build
+// without the iMessage effect surface (or a test stub) must not crash the
+// sidecar at import — /send-effect then rejects with "unsupported effect".
+const MESSAGE_EFFECTS = imessage?.effect?.message || {};
 
 // ---------------------------------------------------------------------------
 // Inbound: forward `app.messages` (gRPC stream) to the Python consumer.
@@ -419,11 +436,17 @@ function reactionTargetText(target) {
   let text = null;
   if (c.type === "text") {
     text = c.text;
+  } else if (c.type === "richlink") {
+    text = c.url;
   } else if (c.type === "group") {
     for (const item of Array.isArray(c.items) ? c.items : []) {
       const ic = item && typeof item === "object" ? item.content : null;
       if (ic && ic.type === "text" && ic.text) {
         text = ic.text;
+        break;
+      }
+      if (ic && ic.type === "richlink" && ic.url) {
+        text = ic.url;
         break;
       }
     }
@@ -440,6 +463,16 @@ async function normalizeContent(content) {
   }
   if (content.type === "text") {
     return { type: "text", text: content.text || "" };
+  }
+  if (content.type === "richlink") {
+    const out = { type: "richlink", url: content.url || "" };
+    if (typeof content.title === "string") {
+      out.title = content.title;
+    }
+    if (typeof content.summary === "string") {
+      out.summary = content.summary;
+    }
+    return out;
   }
   if (content.type === "attachment" || content.type === "voice") {
     return await normalizeBinaryContent(content);
@@ -467,6 +500,29 @@ async function normalizeContent(content) {
       // Text of the reacted-to message, so Python can correlate the tapback to
       // the gateway's reply_to_text. Null for attachment/voice-only targets.
       targetText: reactionTargetText(target),
+    };
+  }
+  // A user tapping a poll choice arrives as `poll_option` carrying the chosen
+  // option title + whether it was selected (true) or deselected (false). This
+  // is how a native iMessage poll's vote streams back — Python turns a
+  // selection into the answer that resolves a pending `clarify`.
+  if (content.type === "poll_option") {
+    return {
+      type: "poll_option",
+      title: content.option?.title ?? content.title ?? "",
+      selected: content.selected !== false,
+      pollTitle: content.poll?.title ?? null,
+    };
+  }
+  // The poll message itself (its creation) — surfaced for completeness so the
+  // agent isn't told "content type not handled" if it sees the echo.
+  if (content.type === "poll") {
+    return {
+      type: "poll",
+      title: content.title ?? "",
+      options: Array.isArray(content.options)
+        ? content.options.map((o) => o?.title ?? "")
+        : [],
     };
   }
   return { type: content.type || "unknown" };
@@ -597,13 +653,65 @@ function badRequest(res, msg) {
   res.end(JSON.stringify({ ok: false, error: msg }));
 }
 
-function serverError(res) {
+function classifySidecarError(err) {
+  const message = String(err && err.message ? err.message : err || "");
+  const lowered = message.toLowerCase();
+
+  // Spectrum raises AuthenticationError("Target not allowed for this
+  // project") from space.send when a shared/free-tier line tries to
+  // initiate an outbound conversation with a new target. That is a plan
+  // limitation, not a transient fault — surface a dedicated class so the
+  // adapter can explain it instead of retrying (issues #50971/#51897).
+  if (lowered.includes("target not allowed")) {
+    return { errorClass: "target_not_allowed", retryable: false };
+  }
+
+  if (
+    lowered.includes("unauthorized") ||
+    lowered.includes("forbidden") ||
+    lowered.includes("permission") ||
+    lowered.includes("401") ||
+    lowered.includes("403") ||
+    lowered.includes("invalid token") ||
+    lowered.includes("project secret") ||
+    lowered.includes("unable to resolve space id")
+  ) {
+    return { errorClass: "auth_or_config", retryable: false };
+  }
+
+  if (
+    lowered.includes("timeout") ||
+    lowered.includes("timed out") ||
+    lowered.includes("econnreset") ||
+    lowered.includes("econnrefused") ||
+    lowered.includes("socket hang up") ||
+    lowered.includes("fetch failed") ||
+    lowered.includes("unavailable") ||
+    lowered.includes("upstream connect") ||
+    lowered.includes("reset reason") ||
+    lowered.includes("overflow") ||
+    lowered.includes("temporarily") ||
+    lowered.includes("429")
+  ) {
+    return { errorClass: "upstream_transient", retryable: true };
+  }
+
+  return { errorClass: "sidecar_internal", retryable: false };
+}
+
+function serverError(res, err) {
   res.statusCode = 500;
   res.setHeader("Content-Type", "application/json");
+  const classified = classifySidecarError(err);
   // Don't leak stack traces or raw exception text to the caller — even
-  // though we listen on loopback, the supervisor logs the real error
-  // and the client only needs a generic failure signal.
-  res.end(JSON.stringify({ ok: false, error: "internal sidecar error" }));
+  // though we listen on loopback, the supervisor logs the real error. The
+  // Python adapter only needs a safe class plus retryability.
+  res.end(JSON.stringify({
+    ok: false,
+    error: "internal sidecar error",
+    error_class: classified.errorClass,
+    retryable: classified.retryable,
+  }));
 }
 
 function ok(res, data) {
@@ -697,6 +805,16 @@ function tokenOk(header) {
   return h.length === _tokenBuf.length && crypto.timingSafeEqual(h, _tokenBuf);
 }
 
+function isHttpUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    const parsed = new URL(value.trim());
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   if (!tokenOk(req.headers["x-hermes-sidecar-token"])) {
     return unauthorized(res);
@@ -733,6 +851,15 @@ const server = http.createServer(async (req, res) => {
       const builder =
         format === "markdown" ? spectrumMarkdown(text) : spectrumText(text);
       const result = await space.send(builder);
+      return ok(res, { messageId: result?.id || null });
+    }
+    if (req.url === "/send-richlink") {
+      const { spaceId, url } = body || {};
+      if (!spaceId || !isHttpUrl(url)) {
+        return badRequest(res, "spaceId and http(s) url are required");
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await space.send(spectrumRichlink(url.trim()));
       return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-attachment") {
@@ -828,6 +955,37 @@ const server = http.createServer(async (req, res) => {
       }
       return badRequest(res, "no tracked reaction for message");
     }
+    if (req.url === "/send-poll") {
+      const { spaceId, title, options } = body || {};
+      const choices = Array.isArray(options)
+        ? options.map((option) => String(option || "").trim()).filter(Boolean)
+        : [];
+      if (!spaceId || typeof title !== "string" || !title.trim()) {
+        return badRequest(res, "spaceId and title are required");
+      }
+      if (choices.length < 2) {
+        return badRequest(res, "options must contain at least two choices");
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await space.send(spectrumPoll(title.trim(), choices));
+      return ok(res, { messageId: result?.id || null });
+    }
+    if (req.url === "/send-effect") {
+      const { spaceId, text, effect } = body || {};
+      const effectName = String(effect || "").trim();
+      const effectId = MESSAGE_EFFECTS[effectName];
+      if (!spaceId || typeof text !== "string" || !text.trim()) {
+        return badRequest(res, "spaceId and text are required");
+      }
+      if (!effectId) {
+        return badRequest(res, "unsupported effect");
+      }
+      const space = await resolveSpace(spaceId);
+      const result = await space.send(
+        imessageEffect(spectrumText(text.trim()), effectId)
+      );
+      return ok(res, { messageId: result?.id || null });
+    }
     if (req.url === "/typing") {
       const { spaceId, state = "start" } = body || {};
       if (!spaceId) return badRequest(res, "spaceId is required");
@@ -848,7 +1006,7 @@ const server = http.createServer(async (req, res) => {
     );
     // serverError() intentionally returns a generic message — see its
     // body for the rationale.
-    return serverError(res);
+    return serverError(res, e);
   }
 });
 
