@@ -7475,8 +7475,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
     # we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            "webhook_admitted",
+        }
     )
+
+    async def admit_webhook_turn(
+        self,
+        event: MessageEvent,
+        *,
+        expected_session_key: str,
+    ) -> bool:
+        """Durably admit a managed webhook turn before its HTTP 202.
+
+        The delivery ledger intentionally cannot contain the prompt.  Hermes'
+        canonical transcript is therefore the durable work record: append the
+        rendered user turn under the provider message id, verify that SQLite
+        can read it back, then mark the existing session ``resume_pending``.
+        A fresh process can now synthesize the normal non-interactive resume
+        turn without an in-memory adapter event or task.
+
+        Returns True when this process should schedule the resume event.  A
+        duplicate arriving while either adapter or runner state is active is
+        already owned and must not enqueue a second turn.
+        """
+        source = getattr(event, "source", None)
+        if source is None or source.platform != Platform.WEBHOOK:
+            raise ValueError("Durable webhook admission requires a webhook source")
+        message_id = str(getattr(event, "message_id", "") or "").strip()
+        if not message_id:
+            raise ValueError("Durable webhook admission requires a message id")
+
+        session_entry = await self.async_session_store.get_or_create_session(
+            source
+        )
+        session_key = session_entry.session_key
+        if session_key != expected_session_key:
+            raise RuntimeError("Webhook session identity changed during admission")
+
+        already_persisted = await self.async_session_store.has_platform_message_id(
+            session_entry.session_id,
+            message_id,
+        )
+        if not already_persisted:
+            timestamp = _coerce_gateway_timestamp(
+                getattr(event, "timestamp", None)
+            )
+            await self.async_session_store.append_to_transcript(
+                session_entry.session_id,
+                {
+                    "role": "user",
+                    "content": event.text or "",
+                    "message_id": message_id,
+                    "timestamp": timestamp if timestamp is not None else time.time(),
+                },
+            )
+            persisted = await self.async_session_store.has_platform_message_id(
+                session_entry.session_id,
+                message_id,
+            )
+            if not persisted:
+                raise RuntimeError("Webhook turn transcript write was not durable")
+
+        if not session_entry.resume_pending:
+            marked = await self.async_session_store.mark_resume_pending(
+                session_key,
+                reason="webhook_admitted",
+            )
+            if not marked:
+                raise RuntimeError("Webhook turn resume marker was not durable")
+
+        adapter = self._adapter_for_source(source)
+        adapter_active = bool(
+            adapter is not None
+            and session_key in getattr(adapter, "_active_sessions", {})
+        )
+        runner_active = session_key in self._running_agents
+        return not (adapter_active or runner_active)
 
     async def _run_startup_resume_event(
         self,
@@ -7694,7 +7772,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     restored = bool(
                         callable(restore_context)
-                        and restore_context(row["chat_id"], delivery_context)
+                        and restore_context(
+                            row["chat_id"],
+                            delivery_context,
+                            session_key=row.get("session_key"),
+                        )
                     )
                 except Exception:
                     restored = False
@@ -14417,13 +14499,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 self._clear_restart_failure_count(session_key)
-                try:
-                    await self.async_session_store.clear_resume_pending(session_key)
-                except Exception as _e:
-                    logger.debug(
-                        "clear_resume_pending failed for %s: %s",
-                        session_key, _e,
-                    )
+                # A durably admitted webhook owns a terminal callback
+                # obligation, not merely an agent-run obligation.  Its marker
+                # is cleared by WebhookAdapter only after the terminal target
+                # accepts the callback (or by startup terminal redelivery).
+                defer_webhook_clear = (
+                    source.platform == Platform.WEBHOOK
+                    and getattr(session_entry, "resume_reason", None)
+                    == "webhook_admitted"
+                )
+                if not defer_webhook_clear:
+                    try:
+                        await self.async_session_store.clear_resume_pending(
+                            session_key
+                        )
+                    except Exception as _e:
+                        logger.debug(
+                            "clear_resume_pending failed for %s: %s",
+                            session_key, _e,
+                        )
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.

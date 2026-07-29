@@ -483,6 +483,8 @@ class WebhookAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         context: Mapping[str, Any],
+        *,
+        session_key: Optional[str] = None,
     ) -> bool:
         """Restore only a validated, privacy-bounded rendered callback route."""
         projected = project_delivery_ledger_context(context)
@@ -493,6 +495,10 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver_extra": dict(projected["deliver_extra"]),
             "_hermes_delivery_id": projected["delivery_id"],
         }
+        if session_key:
+            self._delivery_info[str(chat_id)]["_hermes_session_key"] = str(
+                session_key
+            )
         now = time.time()
         self._delivery_info_created[str(chat_id)] = now
         self._delivery_info_order.append((now, str(chat_id)))
@@ -573,7 +579,9 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             decision = begin_terminal_attempt(
                 obligation_id=obligation_id,
-                session_key=str(chat_id),
+                session_key=str(
+                    delivery.get("_hermes_session_key") or chat_id
+                ),
                 platform=Platform.WEBHOOK.value,
                 chat_id=str(chat_id),
                 thread_id=None,
@@ -630,6 +638,20 @@ class WebhookAdapter(BasePlatformAdapter):
                 from gateway.delivery_ledger import mark_delivered, mark_failed
 
                 if result.success:
+                    # The session admission marker owns the accepted-turn
+                    # recovery obligation until the terminal callback crosses
+                    # its target boundary.  Clear it before settling the
+                    # delivery row: if the process dies between these two
+                    # durable writes, the row still contains the exact
+                    # terminal body and startup redelivery owns recovery.
+                    session_key = normalize_delivery_identity(
+                        delivery.get("_hermes_session_key")
+                    )
+                    runner = self.gateway_runner
+                    if session_key and runner is not None:
+                        await runner.async_session_store.clear_resume_pending(
+                            session_key
+                        )
                     mark_delivered(obligation_id)
                 else:
                     mark_failed(obligation_id, "terminal target rejected")
@@ -1147,6 +1169,52 @@ class WebhookAdapter(BasePlatformAdapter):
         # same route get independent agent runs (not queued/interrupted).
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
+        # Build source and event before journaling so the callback obligation
+        # and Hermes session admission use the exact same deterministic
+        # session key.  This is construction only; no prompt or payload is
+        # persisted until the existing SessionStore admission below.
+        source = self.build_source(
+            chat_id=session_chat_id,
+            chat_name=f"webhook/{route_name}",
+            chat_type="webhook",
+            user_id=f"webhook:{route_name}",
+            user_name=route_name,
+        )
+        if profile and isinstance(profile, str):
+            source.profile = profile
+        event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=payload,
+            message_id=delivery_id,
+        )
+
+        runner = self.gateway_runner
+        session_key_fn = getattr(runner, "_session_key_for_source", None)
+        admit_turn = getattr(runner, "admit_webhook_turn", None)
+        if not callable(session_key_fn) or not callable(admit_turn):
+            self._seen_deliveries.pop(delivery_id, None)
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "Callback admission unavailable",
+                    "delivery_id": delivery_id,
+                },
+                status=503,
+            )
+        admission_session_key = session_key_fn(source)
+        if not isinstance(admission_session_key, str) or not admission_session_key:
+            self._seen_deliveries.pop(delivery_id, None)
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "Callback admission unavailable",
+                    "delivery_id": delivery_id,
+                },
+                status=503,
+            )
+
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
         # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
@@ -1163,6 +1231,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 delivery_id,
                 profile,
             ),
+            # Internal session linkage only.  The delivery-context projection
+            # rejects this field, so it never widens the privacy-bounded route
+            # JSON stored in the ledger.
+            "_hermes_session_key": admission_session_key,
         }
 
         # The 202 contract begins only after the rendered callback route and
@@ -1188,6 +1260,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 DeliveryConflictError,
                 compute_obligation_id,
                 record_accepted_route,
+                get_obligation_state,
             )
 
             admission_id = compute_obligation_id(
@@ -1198,11 +1271,12 @@ class WebhookAdapter(BasePlatformAdapter):
             admission = await asyncio.to_thread(
                 record_accepted_route,
                 obligation_id=admission_id,
-                session_key=session_chat_id,
+                session_key=admission_session_key,
                 platform=Platform.WEBHOOK.value,
                 chat_id=session_chat_id,
                 thread_id=None,
                 delivery_context=admission_context,
+                legacy_session_key=session_chat_id,
             )
         except DeliveryConflictError:
             logger.warning(
@@ -1235,7 +1309,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 },
                 status=503,
             )
+        duplicate_complete = False
         if admission == ADMISSION_DUPLICATE:
+            duplicate_complete = (
+                await asyncio.to_thread(get_obligation_state, admission_id)
+                != "accepted"
+            )
+        if duplicate_complete:
             logger.info(
                 "[webhook] Durable duplicate route=%s delivery=%s",
                 route_name,
@@ -1251,23 +1331,31 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
 
-        # Build source and event
-        source = self.build_source(
-            chat_id=session_chat_id,
-            chat_name=f"webhook/{route_name}",
-            chat_type="webhook",
-            user_id=f"webhook:{route_name}",
-            user_name=route_name,
-        )
-        if profile and isinstance(profile, str):
-            source.profile = profile
-        event = MessageEvent(
-            text=prompt,
-            message_type=MessageType.TEXT,
-            source=source,
-            raw_message=payload,
-            message_id=delivery_id,
-        )
+        # Admit the actual turn through Hermes' canonical session/transcript
+        # persistence before HTTP 202.  The route ledger remains
+        # privacy-bounded; prompt text lives only where Hermes already stores
+        # conversation turns.  The operation is idempotent by the provider
+        # message id and verifies the SQLite row before returning.
+        try:
+            should_schedule = await admit_turn(
+                event,
+                expected_session_key=admission_session_key,
+            )
+        except Exception:
+            self._seen_deliveries.pop(delivery_id, None)
+            logger.exception(
+                "[webhook] Durable turn admission failed route=%s delivery=%s",
+                route_name,
+                delivery_id,
+            )
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "Callback admission unavailable",
+                    "delivery_id": delivery_id,
+                },
+                status=503,
+            )
 
         logger.info(
             "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",
@@ -1278,21 +1366,31 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
-        # Non-blocking — return 202 Accepted immediately.  The per-delivery
-        # session is closed by the ``on_processing_complete`` override below
-        # once the agent run actually finishes (``handle_message`` itself is
-        # fire-and-forget: it spawns ``_process_message_background`` and
-        # returns before the run starts, so nothing can be closed here).
-        await self.handle_message(event)
+        # Dispatch the already-durable turn through the existing restart
+        # resume path.  The synthetic event carries no prompt: the accepted
+        # prompt is loaded from the persisted transcript and the
+        # non-interactive resume note tells the agent to complete it.
+        if should_schedule:
+            resume_event = MessageEvent(
+                text="",
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+            )
+            await self.handle_message(resume_event)
 
         return web.json_response(
             {
-                "status": "accepted",
+                "status": (
+                    "duplicate"
+                    if admission == ADMISSION_DUPLICATE
+                    else "accepted"
+                ),
                 "route": route_name,
                 "event": event_type,
                 "delivery_id": delivery_id,
             },
-            status=202,
+            status=200 if admission == ADMISSION_DUPLICATE else 202,
         )
 
     async def on_processing_complete(

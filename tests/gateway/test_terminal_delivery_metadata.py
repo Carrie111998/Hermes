@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -21,6 +22,7 @@ from gateway.platform_registry import PlatformEntry, platform_registry
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms.webhook import WebhookAdapter
 from gateway.run import GatewayRunner
+from gateway.session import AsyncSessionStore, SessionStore, build_session_key
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
@@ -43,6 +45,11 @@ def _webhook_adapter(
             target_platform: PlatformConfig(enabled=True, token="test"),
         }
     )
+    runner._session_key_for_source = lambda source: build_session_key(source)
+    runner.admit_webhook_turn = AsyncMock(return_value=True)
+    session_store = MagicMock()
+    session_store.clear_resume_pending = AsyncMock(return_value=True)
+    runner.async_session_store = session_store
     adapter.gateway_runner = runner
     return adapter, target
 
@@ -588,6 +595,43 @@ async def test_http_202_fails_closed_when_durable_admission_fails(
 
 
 @pytest.mark.asyncio
+async def test_http_202_fails_closed_when_turn_admission_fails(
+    monkeypatch,
+) -> None:
+    _fake_web(monkeypatch)
+    adapter, _target = _webhook_adapter()
+    adapter._routes["managed"] = {
+        "secret": "INSECURE_NO_AUTH",
+        "prompt": "{text}",
+        "deliver": "telegram",
+        "deliver_extra": {"chat_id": "{correlation_id}"},
+    }
+    adapter.handle_message = AsyncMock()
+    adapter.gateway_runner.admit_webhook_turn = AsyncMock(
+        side_effect=OSError("synthetic session persistence failure")
+    )
+
+    response = await adapter._handle_webhook(
+        _request(
+            route_name="managed",
+            delivery_id="provider-delivery-1",
+            payload={"text": "private prompt", "correlation_id": "correlation-1"},
+        )
+    )
+
+    assert response.status == 503
+    assert response.payload["status"] == "error"
+    adapter.handle_message.assert_not_awaited()
+    with dl._connect() as conn:
+        row = conn.execute(
+            """SELECT state, content, delivery_context_json
+               FROM delivery_obligations"""
+        ).fetchone()
+    assert row[0:2] == ("accepted", "")
+    assert "private prompt" not in row[2]
+
+
+@pytest.mark.asyncio
 async def test_cross_platform_delivery_strips_untrusted_source_metadata() -> None:
     adapter, target = _webhook_adapter()
     chat_id = _seed_delivery(adapter)
@@ -804,7 +848,23 @@ async def test_admission_restart_restores_route_then_delivers_final(
 ) -> None:
     _fake_web(monkeypatch)
     secret = "admission-signing-secret"
+    config = GatewayConfig(
+        platforms={
+            Platform.WEBHOOK: PlatformConfig(enabled=True),
+            ella_callback_platform: PlatformConfig(enabled=True),
+        }
+    )
     adapter, _ = _webhook_adapter(ella_callback_platform)
+    first_runner = object.__new__(GatewayRunner)
+    first_runner.config = config
+    first_runner.adapters = {Platform.WEBHOOK: adapter}
+    first_runner._profile_adapters = {}
+    first_runner._running_agents = {}
+    first_runner.session_store = SessionStore(config.sessions_dir, config)
+    first_runner._async_session_store = AsyncSessionStore(
+        first_runner.session_store
+    )
+    adapter.gateway_runner = first_runner
     adapter._routes["managed"] = {
         "secret": secret,
         "prompt": "private-prompt-{private_input}",
@@ -817,6 +877,8 @@ async def test_admission_restart_restores_route_then_delivers_final(
             "model_output": "{private_output}",
         },
     }
+    # Model a process that can durably admit and schedule, but is destroyed
+    # before the scheduled adapter task starts.
     adapter.handle_message = AsyncMock()
 
     response = await adapter._handle_webhook(
@@ -836,6 +898,27 @@ async def test_admission_restart_restores_route_then_delivers_final(
     )
 
     assert response.status == 202
+    adapter.handle_message.assert_awaited_once()
+    first_runner.session_store._ensure_loaded()
+    admitted_entries = list(first_runner.session_store._entries.values())
+    assert len(admitted_entries) == 1
+    admitted_entry = admitted_entries[0]
+    admitted_history = first_runner.session_store.load_transcript(
+        admitted_entry.session_id
+    )
+    assert admitted_entry.resume_pending is True
+    assert admitted_entry.resume_reason == "webhook_admitted"
+    admitted_session_key = admitted_entry.session_key
+    assert [
+        (item.get("role"), item.get("content"), item.get("message_id"))
+        for item in admitted_history
+    ] == [
+        (
+            "user",
+            "private-prompt-prompt-private-value",
+            "provider-delivery-admitted",
+        )
+    ]
     with dl._connect() as conn:
         row = conn.execute("SELECT * FROM delivery_obligations").fetchone()
         columns = [
@@ -884,31 +967,61 @@ async def test_admission_restart_restores_route_then_delivers_final(
         )
     )
 
+    # Destroy every process-local route, event and task reference, then boot
+    # a fresh adapter/runner against only the persisted session + ledger.
+    first_runner.session_store._db.close()
+    del first_runner
+    del adapter
+    del admitted_entries
+    del admitted_entry
+    del admitted_history
+
     fresh_adapter, fresh_target = _webhook_adapter(ella_callback_platform)
     runner = object.__new__(GatewayRunner)
     runner.adapters = {
         Platform.WEBHOOK: fresh_adapter,
         ella_callback_platform: fresh_target,
     }
-    runner.config = GatewayConfig(
-        platforms={
-            Platform.WEBHOOK: PlatformConfig(enabled=True),
-            ella_callback_platform: PlatformConfig(enabled=True),
-        }
-    )
+    runner.config = config
+    runner._profile_adapters = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._background_tasks = set()
+    runner._startup_restore_in_progress = False
+    runner._startup_restore_tasks = []
+    runner._session_sources = OrderedDict()
+    runner._session_sources_max = 512
+    runner._persist_active_agents = lambda: None
+    runner._restart_loop_guard_config = lambda: (3, 300)
+    runner._is_user_authorized = lambda _source: True
     fresh_adapter.gateway_runner = runner
-    runner.session_store = None
-    store = MagicMock()
-    store._store = None
-    store.clear_resume_pending = AsyncMock()
-    runner._async_session_store = store
+    runner.session_store = SessionStore(config.sessions_dir, config)
+    runner._async_session_store = AsyncSessionStore(runner.session_store)
+    runner._session_db = None
+
+    async def _recovered_agent(event):
+        assert event.internal is True
+        assert event.text == ""
+        entry = await runner.async_session_store.get_or_create_session(
+            event.source
+        )
+        history = await runner.async_session_store.load_transcript(
+            entry.session_id
+        )
+        assert history[-1]["content"] == "private-prompt-prompt-private-value"
+        return "terminal output generated by recovered turn"
+
+    fresh_adapter.set_message_handler(_recovered_agent)
     monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+    monkeypatch.setattr(
+        "gateway.restart_loop_guard.check_and_record",
+        lambda *_args, **_kwargs: False,
+    )
 
     redelivered = await runner._redeliver_pending_obligations()
 
     assert redelivered == 0
     fresh_target.send.assert_not_awaited()
-    store.clear_resume_pending.assert_not_awaited()
     assert (
         fresh_adapter._delivery_info[
             "webhook:managed:provider-delivery-admitted"
@@ -916,23 +1029,23 @@ async def test_admission_restart_restores_route_then_delivers_final(
         == "opaque-correlation-42"
     )
 
-    result = await fresh_adapter.send(
-        "webhook:managed:provider-delivery-admitted",
-        "terminal output required for callback recovery",
-        metadata=_terminal_metadata(
-            correlation_id="provider-delivery-admitted",
-            delivery_id="provider-delivery-admitted",
-        ),
-    )
+    assert runner._schedule_resume_pending_sessions() == 1
+    recovery_tasks = list(runner._background_tasks)
+    assert len(recovery_tasks) == 1
+    await asyncio.gather(*recovery_tasks)
 
-    assert result.success is True
     fresh_target.send.assert_awaited_once()
     callback = fresh_target.send.await_args
     assert callback.args[:2] == (
         "opaque-correlation-42",
-        "terminal output required for callback recovery",
+        "terminal output generated by recovered turn",
     )
     assert set(callback.kwargs["metadata"]) == {TERMINAL_DELIVERY_METADATA_KEY}
+    runner.session_store._ensure_loaded()
+    recovered_entry = runner.session_store._entries[
+        admitted_session_key
+    ]
+    assert recovered_entry.resume_pending is False
     with dl._connect() as conn:
         terminal_row = conn.execute(
             """SELECT state, content, delivery_metadata_json
@@ -940,7 +1053,7 @@ async def test_admission_restart_restores_route_then_delivers_final(
             (obligation_id,),
         ).fetchone()
     assert terminal_row[0] == "delivered"
-    assert terminal_row[1] == "terminal output required for callback recovery"
+    assert terminal_row[1] == "terminal output generated by recovered turn"
     assert json.loads(terminal_row[2]) == callback.kwargs["metadata"]
 
 
@@ -1217,7 +1330,13 @@ async def test_same_signed_provider_delivery_keeps_identity_across_restart(
     assert first.status == 202
     assert replay.status == 200
     assert replay.payload["status"] == "duplicate"
-    assert restarted_adapter._delivery_info == {}
+    assert (
+        restarted_adapter._delivery_info[
+            "webhook:managed:provider-delivery-1"
+        ]["_hermes_delivery_id"]
+        == first_identity
+    )
+    restarted_adapter.handle_message.assert_awaited_once()
     assert first_identity == durable_context["delivery_id"]
     assert first_identity != "provider-delivery-1"
     assert len(first_identity) == 64

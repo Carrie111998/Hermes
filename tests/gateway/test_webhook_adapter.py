@@ -28,13 +28,14 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.platforms.webhook import (
     WebhookAdapter,
     _INSECURE_NO_AUTH,
     check_webhook_requirements,
 )
+from gateway.session import build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +66,15 @@ def _make_config(
 def _make_adapter(routes=None, **kwargs):
     """Create a WebhookAdapter with sensible defaults for testing."""
     config = _make_config(routes=routes, **kwargs)
-    return WebhookAdapter(config)
+    adapter = WebhookAdapter(config)
+    runner = MagicMock()
+    runner.adapters = {}
+    runner.config = GatewayConfig()
+    runner._session_key_for_source = lambda source: build_session_key(source)
+    runner.admit_webhook_turn = AsyncMock(return_value=True)
+    runner.async_session_store.clear_resume_pending = AsyncMock(return_value=True)
+    adapter.gateway_runner = runner
+    return adapter
 
 
 def _create_app(adapter: WebhookAdapter) -> web.Application:
@@ -747,7 +756,10 @@ class TestPayloadFilters:
 
         await asyncio.sleep(0.05)
         assert len(captured) == 1
-        assert captured[0].text == "Message from chat-2: hello"
+        admitted_event = (
+            adapter.gateway_runner.admit_webhook_turn.await_args.args[0]
+        )
+        assert admitted_event.text == "Message from chat-2: hello"
 
     @pytest.mark.asyncio
     async def test_filter_applies_to_deliver_only_before_delivery(self):
@@ -820,8 +832,11 @@ class TestPayloadFilters:
             assert resp.status == 202
 
         await asyncio.sleep(0.05)
-        assert captured[0].text == "Task: PAY BILLS"
-        assert captured[0].raw_message["body"] == "PAY BILLS"
+        admitted_event = (
+            adapter.gateway_runner.admit_webhook_turn.await_args.args[0]
+        )
+        assert admitted_event.text == "Task: PAY BILLS"
+        assert admitted_event.raw_message["body"] == "PAY BILLS"
 
     @pytest.mark.asyncio
     async def test_script_tilde_hermes_path_resolves_to_active_profile_home(self, tmp_path, monkeypatch):
@@ -861,7 +876,10 @@ class TestPayloadFilters:
             assert resp.status == 202
 
         await asyncio.sleep(0.05)
-        assert captured[0].text == "Task: profile-safe"
+        admitted_event = (
+            adapter.gateway_runner.admit_webhook_turn.await_args.args[0]
+        )
+        assert admitted_event.text == "Task: profile-safe"
 
     @pytest.mark.asyncio
     async def test_script_silent_stdout_ignores_without_idempotency_hit(self, tmp_path, monkeypatch):
@@ -1063,6 +1081,7 @@ class TestIdempotency:
         adapter = _make_adapter(routes=routes)
         adapter._idempotency_ttl = 1  # 1 second TTL for test speed
         adapter.handle_message = AsyncMock()
+        adapter.gateway_runner.admit_webhook_turn.side_effect = [True, False]
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:

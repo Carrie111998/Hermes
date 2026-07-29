@@ -308,6 +308,7 @@ def record_accepted_route(
     chat_id: str,
     thread_id: Optional[str],
     delivery_context: Mapping[str, Any],
+    legacy_session_key: Optional[str] = None,
 ) -> str:
     """Durably admit one privacy-bounded callback route before HTTP 202.
 
@@ -354,6 +355,40 @@ def record_accepted_route(
             ).fetchone()
             if row is None:
                 raise RuntimeError("Accepted callback row disappeared")
+            legacy_route_match = (
+                row[5] == "accepted"
+                and legacy_session_key is not None
+                and row[0] == legacy_session_key
+                and row[1] == platform
+                and row[2] == str(chat_id)
+                and row[3] == _normalized_thread_id(thread_id)
+                and row[4] == context_json
+            )
+            if legacy_route_match:
+                # Heads predating durable work admission stored the synthetic
+                # webhook chat id here.  Upgrade only a still-empty accepted
+                # row whose remaining route identity matches exactly; terminal
+                # and conflict states retain their immutable identity.
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET session_key=?, updated_at=?
+                       WHERE obligation_id=? AND state='accepted'
+                             AND session_key=? AND content=''""",
+                    (
+                        session_key,
+                        time.time(),
+                        obligation_id,
+                        legacy_session_key,
+                    ),
+                )
+                row = (
+                    session_key,
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                    row[5],
+                )
             if not _row_matches_route(
                 row,
                 session_key=session_key,
@@ -373,6 +408,23 @@ def record_accepted_route(
             decision = ADMISSION_DUPLICATE
     _prune()
     return decision
+
+
+def get_obligation_state(obligation_id: str) -> Optional[str]:
+    """Return the durable state for one obligation, if it exists.
+
+    This intentionally exposes only the state machine value.  Callers deciding
+    whether a duplicate accepted webhook still needs session admission must
+    not load terminal content or widen the privacy-bounded route projection.
+    """
+    if not obligation_id:
+        return None
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT state FROM delivery_obligations WHERE obligation_id=?",
+            (obligation_id,),
+        ).fetchone()
+    return str(row[0]) if row is not None else None
 
 
 def begin_terminal_attempt(
