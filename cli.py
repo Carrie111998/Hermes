@@ -1336,6 +1336,57 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
         _single_query_finalize_attempted_session_ids.add(session_id)
 
 
+# Provider-wall detection keywords: patterns that indicate a kanban worker
+# hit a rate-limit / billing wall and should exit with the
+# ``KANBAN_RATE_LIMIT_EXIT_CODE`` sentinel instead of 0 (clean exit → protocol
+# violation).  Used by the exit-code logic in ``main`` and kept in sync with
+# the same-named helper in ``kanban_db.py``.  (#73747)
+_PROVIDER_WALL_KEYWORDS_CLI = (
+    "rate limit",
+    "rate_limit",
+    "rate-limited",
+    "429",
+    "quota",
+    "credit exhausted",
+    "usage limit",
+    "billing error",
+    "billing block",
+    "billing or credits exhausted",
+    "exceeded your quota",
+    "exceeded your current quota",
+)
+
+
+def _is_provider_wall_error(error_text: str) -> bool:
+    """Return True if *error_text* suggests a provider wall.
+
+    Uses regex word-boundary matching and excludes known non-provider-wall
+    phrases (such as the protocol-violation error text that contains
+    ``without rate limit``) to avoid false positives.
+    """
+    if not error_text:
+        return False
+    _lower = error_text.lower()
+    import re
+    _pattern = re.compile(
+        r"\b(?:" + "|".join(re.escape(kw) for kw in _PROVIDER_WALL_KEYWORDS_CLI) + r")\b"
+    )
+    if not _pattern.search(_lower):
+        return False
+    _negations = (
+        "without rate limit",
+    )
+    for match in _pattern.finditer(_lower):
+        span = match.span()
+        is_negated = any(
+            neg in _lower[max(0, span[0] - len(neg)):span[1] + len(neg)]
+            for neg in _negations
+        )
+        if not is_negated:
+            return True
+    return False
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
@@ -17584,6 +17635,34 @@ def main(
                             if os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"
                             ) in ("rate_limit", "billing"):
+                                try:
+                                    from hermes_cli.kanban_db import (
+                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                                    )
+                                    _exit_code = _RL_CODE
+                                except Exception:
+                                    _exit_code = 1
+                        # Provider wall fallback: when the conversation loop's
+                        # outer exception handler caught a rate-limit / billing
+                        # error and the turn ended normally (model produced a
+                        # text response explaining the situation, so
+                        # ``failed`` is falsy), the worker still exited without
+                        # calling ``kanban_complete`` / ``kanban_block``.
+                        # Classify this as a rate-limited exit, not a protocol
+                        # violation, so the dispatcher requeues the card
+                        # without counting a failure.  (#73747)
+                        if (
+                            _exit_code == 0
+                            and os.environ.get("HERMES_KANBAN_TASK")
+                            and isinstance(result, dict)
+                        ):
+                            _fr = result.get("final_response") or ""
+                            _ter = result.get("turn_exit_reason") or ""
+                            # Check both the final_response (model's text
+                            # about being rate-limited) and turn_exit_reason
+                            # (embedded error text for near-max-iterations
+                            # breaks) for provider wall evidence.
+                            if _is_provider_wall_error(_fr) or _is_provider_wall_error(_ter):
                                 try:
                                     from hermes_cli.kanban_db import (
                                         KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,

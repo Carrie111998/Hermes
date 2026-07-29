@@ -6783,6 +6783,68 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
+# Provider-error keywords that distinguish a provider-wall clean exit from a
+# genuine protocol violation.  When a kanban worker exits 0 because every
+# provider returned rate-limit / billing errors, the worker's log contains
+# these patterns; we propagate a truncated excerpt through
+# ``last_failure_error`` so subsequent ``detect_crashed_workers`` calls can
+# recognize the pattern and classify the exit as ``rate_limited`` instead of
+# ``clean_exit``.  (#73747)
+_PROVIDER_WALL_KEYWORDS = (
+    "rate limit",
+    "rate_limit",
+    "rate-limited",
+    "429",
+    "quota",
+    "credit exhausted",
+    "usage limit",
+    "billing error",
+    "billing block",
+    "billing or credits exhausted",
+    "exceeded your quota",
+    "exceeded your current quota",
+)
+
+
+def _is_provider_wall_error(error_text: str) -> bool:
+    """Return True if *error_text* suggests a provider wall (rate limit / billing).
+
+    Uses regex word-boundary matching and excludes known non-provider-wall
+    phrases (such as the protocol-violation error text that contains
+    ``without rate limit``) to avoid false positives.
+
+    Used by ``detect_crashed_workers`` to distinguish a worker that exited 0
+    after exhausting all providers (should be treated as ``rate_limited``) from
+    a worker that exited 0 without calling the terminal tool for other reasons
+    (genuine protocol violation).
+    """
+    if not error_text:
+        return False
+    _lower = error_text.lower()
+    import re
+    # Combine keywords into alternation with word boundaries
+    _pattern = re.compile(
+        r"\b(?:" + "|".join(re.escape(kw) for kw in _PROVIDER_WALL_KEYWORDS) + r")\b"
+    )
+    if not _pattern.search(_lower):
+        return False
+    # Exclude known non-provider-wall phrases that happen to contain a keyword
+    # (e.g. the protocol-violation guidance: "...without rate limit...").
+    _negations = (
+        "without rate limit",
+    )
+    # If ALL matches are inside a negation phrase, return False.
+    for match in _pattern.finditer(_lower):
+        span = match.span()
+        is_negated = any(
+            neg in _lower[max(0, span[0] - len(neg)):span[1] + len(neg)]
+            for neg in _negations
+        )
+        if not is_negated:
+            return True
+    return False
+
+
 def reap_worker_zombies() -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
@@ -7412,7 +7474,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, last_failure_error "
+            "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7443,25 +7506,49 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # a retry usually completes; the corrective sentence below is
                 # surfaced to the retry worker via the prior-attempt error in
                 # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
+                #
+                # Exception: when the worker hit a provider wall (all providers
+                # returned rate-limit / billing errors) and the turn ended
+                # normally with a text response, the worker exits 0.  Detect
+                # this by checking ``last_failure_error`` on the task: if set
+                # and it contains rate-limit or billing evidence, treat the
+                # clean exit as a rate_limited exit so the card stays out of
+                # the protocol-violation cycle.  (#73747)
+                _lfe = row.get("last_failure_error") if "last_failure_error" in row.keys() else None
+                if _lfe and _is_provider_wall_error(_lfe):
+                    protocol_violation = False
+                    rate_limited_exit = True
+                    error_text = (
+                        f"pid {pid} exited cleanly (rc=0) after a provider "
+                        f"wall — requeued without counting a failure (last "
+                        f"failure: {_lfe[:120]})"
+                    )
+                    event_kind = "rate_limited"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_code": code,
+                    }
+                else:
+                    protocol_violation = True
+                    error_text = (
+                        "worker exited cleanly (rc=0) without calling "
+                        "kanban_complete or kanban_block — protocol violation. "
+                        "If the prior run already did the work, verify it and "
+                        "report the result via kanban_complete; a run that ends "
+                        "without a terminal kanban call counts as failed no "
+                        "matter what it did."
+                    )
+                    event_kind = "protocol_violation"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_code": code,
+                        # Durable marker for _protocol_violation_streak: _end_run
+                        # copies this payload into the run metadata, which is how
+                        # the violation-only retry budget is derived later.
+                        "protocol_violation": True,
+                    }
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
