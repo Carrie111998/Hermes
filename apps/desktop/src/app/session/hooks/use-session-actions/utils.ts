@@ -466,22 +466,6 @@ export function appendLiveSessionProjection(
     })
   }
 
-  // Corrections typed while the turn ran. Each is its own bubble, placed after
-  // the original prompt and before the reply they redirected — the same order
-  // the live transcript showed. Skip any the transcript already holds so a
-  // resume doesn't double them.
-  for (const [index, correction] of inflightCorrections.entries()) {
-    if (persistedInLatestRun(correction)) {
-      continue
-    }
-
-    projected.push({
-      id: `user-inflight-correction-${index}-${sessionId}`,
-      role: 'user',
-      parts: [textPart(correction)]
-    })
-  }
-
   // Keep a pending assistant boundary even before the first delta when a
   // queued user turn follows it. This preserves the two distinct turns.
   if (inflightAssistant || inflightStreaming || inflightError || (inflightUser && queuedUser)) {
@@ -491,6 +475,23 @@ export function appendLiveSessionProjection(
       parts: inflightAssistant ? [assistantTextPart(inflightAssistant)] : [],
       pending: inflightStreaming,
       ...(inflightError ? { error: inflightError } : {})
+    })
+  }
+
+  // Corrections are accepted while the assistant bubble is already streaming
+  // in place. Keep that arrival order when rebuilding a live projection so a
+  // resume does not move a newly typed message above assistant output the user
+  // had already seen. Skip any correction the transcript already holds so a
+  // resume does not duplicate it.
+  for (const [index, correction] of inflightCorrections.entries()) {
+    if (persistedInLatestRun(correction)) {
+      continue
+    }
+
+    projected.push({
+      id: `user-inflight-correction-${index}-${sessionId}`,
+      role: 'user',
+      parts: [textPart(correction)]
     })
   }
 

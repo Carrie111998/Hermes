@@ -572,8 +572,9 @@ describe('preserveLocalPendingTurnMessages', () => {
 
 describe('appendLiveSessionProjection', () => {
   // Corrections typed while a turn ran are their own user bubbles on the same
-  // turn. Resume must rebuild the prompt AND every correction, in order.
-  it('projects mid-turn redirect corrections after the prompt that started the turn', () => {
+  // turn. The live renderer appends them after the in-place assistant stream,
+  // so resume must preserve that visible arrival order.
+  it('projects mid-turn corrections after assistant output that predates them', () => {
     const restored = appendLiveSessionProjection([], {
       session_id: 'runtime-1',
       inflight: {
@@ -586,9 +587,9 @@ describe('appendLiveSessionProjection', () => {
 
     expect(restored.map(message => message.parts.map(part => ('text' in part ? part.text : '')).join(''))).toEqual([
       'remove the session counts',
+      'Moving.',
       'hurry up',
-      'and the worktree ones',
-      'Moving.'
+      'and the worktree ones'
     ])
   })
 
