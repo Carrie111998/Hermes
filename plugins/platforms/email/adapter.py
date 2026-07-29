@@ -478,6 +478,10 @@ class EmailAdapter(BasePlatformAdapter):
 
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
+        # Highest UID present when this process connected. The poll search is
+        # bounded to UIDs ABOVE it, so the pre-existing backlog is structurally
+        # out of scope instead of relying on a flag to stay out of the way.
+        self._uid_watermark: int = 0
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
 
@@ -591,6 +595,10 @@ class EmailAdapter(BasePlatformAdapter):
             if status == "OK" and data and data[0]:
                 for uid in data[0].split():
                     self._seen_uids.add(uid)
+                try:
+                    self._uid_watermark = max(int(u) for u in data[0].split())
+                except (ValueError, TypeError):
+                    self._uid_watermark = 0
             # Keep only the most recent UIDs to prevent unbounded growth
             self._trim_seen_uids()
             imap.logout()
@@ -657,7 +665,21 @@ class EmailAdapter(BasePlatformAdapter):
                 _send_imap_id(imap)
                 imap.select("INBOX")
 
-                status, data = imap.uid("search", None, "UNSEEN")
+                # Bounded to UIDs above the connect-time watermark. Without this,
+                # switching the fetch below to BODY.PEEK[] re-arms an unbounded
+                # re-fetch loop: _seen_uids is capped at 2000 and trimmed to the
+                # newest 1000 (see _trim_seen_uids), whose docstring notes that
+                # eviction is only safe because the \\Seen flag keeps evicted mail
+                # out of an UNSEEN search. PEEK stops setting that flag, so on a
+                # mailbox with a large unread backlog every evicted UID would be
+                # re-downloaded in full on every poll, forever. The watermark
+                # restores the same "only process new mail" intent connect()
+                # already states, without depending on mailbox state we mutate.
+                if self._uid_watermark > 0:
+                    criteria = ("UNSEEN", "UID", "%d:*" % (self._uid_watermark + 1))
+                else:
+                    criteria = ("UNSEEN",)
+                status, data = imap.uid("search", None, *criteria)
                 if status != "OK" or not data or not data[0]:
                     return results
 
@@ -669,7 +691,12 @@ class EmailAdapter(BasePlatformAdapter):
                     if len(self._seen_uids) > self._seen_uids_max:
                         self._trim_seen_uids()
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    # BODY.PEEK[] rather than RFC822: a plain RFC822 fetch
+                    # implicitly sets \\Seen (RFC 3501 6.4.5), and this loop runs
+                    # before the sender allowlist is applied at dispatch — so the
+                    # poller marked mail read that the gateway then refused to act
+                    # on.
+                    status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
                     if status != "OK":
                         continue
 
