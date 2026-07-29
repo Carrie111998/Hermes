@@ -187,9 +187,9 @@ def _patch_judge(monkeypatch, verdicts):
     monkeypatch.setattr(goals, "judge_goal", _fake_judge)
 
 
-def test_loop_stops_when_worker_already_completed(monkeypatch):
-    # Worker called kanban_complete on its first turn — no judging needed.
-    _patch_judge(monkeypatch, ["continue"])  # should never be consulted
+def test_loop_stops_when_worker_already_completed_and_judge_agrees(monkeypatch):
+    # Worker called kanban_complete on its first turn AND the judge agrees.
+    _patch_judge(monkeypatch, ["done"])
     turns = []
 
     res = goals.run_kanban_goal_loop(
@@ -204,9 +204,50 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def test_loop_judge_overrides_worker_completion(monkeypatch):
+    """Worker called kanban_complete but judge says continue — override."""
+    _patch_judge(monkeypatch, ["continue", "done"])
+    statuses = iter(["done", "done"])
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "turn",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="done already",
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 1  # one override turn before judge agreed
+
+
+def test_loop_judge_overrides_worker_blocked(monkeypatch):
+    """Worker called kanban_block but judge says continue — override."""
+    _patch_judge(monkeypatch, ["continue", "done"])
+    statuses = iter(["blocked", "done"])
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t2",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "turn",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="blocked already",
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 1  # one override turn before judge agreed
+
+
 def test_loop_continues_then_worker_completes(monkeypatch):
     _patch_judge(monkeypatch, ["continue", "continue"])
-    statuses = iter(["running", "running", "done"])
+    # Status is read on every iteration (quick_status anomalous-task check),
+    # so the iterator must supply enough for all iterations + the final
+    # termination check when judge says "done".
+    statuses = iter(["done", "done", "done"])
     turns = []
 
     res = goals.run_kanban_goal_loop(
@@ -249,6 +290,8 @@ def test_loop_finalize_nudge_when_judge_done_but_open(monkeypatch):
     # Judge says done, but worker never terminated → one finalize nudge,
     # then worker completes.
     _patch_judge(monkeypatch, ["done", "done"])
+    # First iter: judge says "done", quick_status="running" → finalize nudge.
+    # Second iter: judge says "done", quick_status="done" → completed.
     statuses = iter(["running", "done"])
     turns = []
 

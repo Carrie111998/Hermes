@@ -1677,12 +1677,13 @@ def run_kanban_goal_loop(
     first turn has already run by the time this is called; ``first_response``
     is that turn's reply. From here we:
 
-    1. Check whether the worker already terminated the task (called
-       ``kanban_complete`` / ``kanban_block``). If so, stop — nothing to do.
-    2. Otherwise judge the latest response against ``goal_text`` (the card's
-       title + body). ``continue`` → feed a continuation prompt and run
-       another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
-       task is still open → one explicit "call kanban_complete" nudge.
+    1. Judge the latest response against ``goal_text`` (the card's title +
+       body) FIRST, before checking status. Only honor worker self-termination
+       (``kanban_complete`` / ``kanban_block``) when the judge agrees the work
+       is done. A ``continue`` verdict overrides the worker's termination.
+    2. ``continue`` → feed a continuation prompt and run another turn IN THE
+       SAME SESSION via ``run_turn``. ``done`` but the task is still open →
+       one explicit "call kanban_complete" nudge.
     3. When the turn budget is exhausted and the worker still hasn't
        terminated the task, ``block_fn`` is invoked so the card lands in a
        sticky ``blocked`` state for human review (NOT a silent exit).
@@ -1715,25 +1716,10 @@ def run_kanban_goal_loop(
     nudged_to_finalize = False
 
     while True:
-        # Did the worker terminate the task itself this turn?
-        try:
-            status = task_status_fn()
-        except Exception as exc:
-            _log(f"kanban goal loop: status check failed ({exc}); stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": "status check failed"}
-
-        if status == "done":
-            _log(f"kanban goal loop: task {task_id} completed by worker after {turns_used} turn(s)")
-            return {"outcome": "completed_by_worker", "turns_used": turns_used, "reason": "worker completed the task"}
-        if status == "blocked":
-            _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
-            return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
-        if status not in ("running", "ready"):
-            # Reclaimed / archived / unexpected — let the dispatcher own it.
-            _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
-            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
-
-        # Still open — judge whether the latest response satisfies the card.
+        # Judge the latest response FIRST, before checking whether the worker
+        # self-terminated. Previously the status check came first and returned
+        # immediately when the worker called kanban_complete / kanban_block
+        # during its first turn, so the judge was never consulted (issue #73417).
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
@@ -1741,6 +1727,32 @@ def run_kanban_goal_loop(
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        # Check for anomalous task statuses regardless of verdict. If the task
+        # was reclaimed or archived while we were running, stop immediately.
+        try:
+            quick_status = task_status_fn()
+        except Exception:
+            quick_status = None
+        if quick_status not in (None, "done", "blocked", "running", "ready"):
+            _log(f"kanban goal loop: task {task_id} status={quick_status!r}; stopping")
+            return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={quick_status}"}
+
+        # Only honor worker self-termination (done/blocked) when the judge
+        # agrees the work is done. A "continue" verdict overrides the worker's
+        # termination — the judge believes more work is needed regardless of
+        # what the worker reported. "Skipped" (empty goal) is treated like
+        # "done" so the worker's own decision stands.
+        if verdict in ("done", "skipped"):
+            if quick_status == "done":
+                _log(f"kanban goal loop: task {task_id} completed by worker after {turns_used} turn(s)")
+                return {"outcome": "completed_by_worker", "turns_used": turns_used, "reason": "worker completed the task"}
+            if quick_status == "blocked":
+                _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
+                return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
+
+            # Judge says done but the task is still open — fall through to the
+            # finalize nudge or continuation logic below.
 
         if verdict == "done":
             if nudged_to_finalize:
