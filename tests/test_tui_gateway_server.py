@@ -2165,6 +2165,94 @@ def test_history_to_messages_hides_gateway_system_markers():
     ]
 
 
+def test_personality_marker_survives_alternation_repair_merge():
+    # Reproduces #74315: a personality switch appends a role=user marker to
+    # the live history. If the very next turn is also role=user (no
+    # assistant reply landed in between — e.g. the switch happened between
+    # turns, or a crash/resume left the pair adjacent), alternation-repair
+    # merges the two consecutive user rows into one, concatenating the real
+    # prompt onto the marker's content. With the old bare "[System:" text
+    # marker, the hide-projection then dropped the WHOLE merged row —
+    # silently swallowing the real prompt. The fix persists the marker with
+    # structured display_kind/display_metadata (mirrors the model-switch
+    # marker) so repair's merge (which only rewrites `content`) leaves that
+    # metadata intact, and the projection can strip just the marker's own
+    # span.
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    marker = (
+        "[System: The user has changed the assistant's personality. "
+        "From this point forward, adopt the following persona and respond "
+        "accordingly: You are a pirate.]"
+    )
+    history = [
+        {"role": "user", "content": "hello there"},
+        {"role": "assistant", "content": "hi!"},
+        {
+            "role": "user",
+            "content": marker,
+            "display_kind": "personality_switch",
+            "display_metadata": {"marker_text": marker},
+        },
+        {"role": "user", "content": "what's the weather like today?"},
+    ]
+
+    repairs = repair_message_sequence(None, history)
+    assert repairs == 1
+    # The merge concatenated the real prompt onto the marker row in place —
+    # confirms the reproduction matches the bug's actual mechanism.
+    assert len(history) == 3
+    merged = history[-1]
+    assert merged["role"] == "user"
+    assert merged["content"] == marker + "\n\n" + "what's the weather like today?"
+    # display_kind/display_metadata are untouched by the merge (only
+    # `content` is rewritten) — the structural precondition the fix relies on.
+    assert merged["display_kind"] == "personality_switch"
+    assert merged["display_metadata"] == {"marker_text": marker}
+
+    projected = server._history_to_messages(history)
+
+    # The real prompt must still be visible after projection — this is the
+    # exact user-facing symptom from #74315 (the prompt "disappears").
+    texts = [m["text"] for m in projected]
+    assert "what's the weather like today?" in texts
+    # The marker's own text must never leak into a client transcript as
+    # literal "[System: …]" user-bubble text, before or after the merge.
+    assert not any(t.lstrip().startswith("[System:") for t in texts)
+    assert projected == [
+        {"role": "user", "text": "hello there"},
+        {"role": "assistant", "text": "hi!"},
+        {"role": "user", "text": "what's the weather like today?"},
+    ]
+
+
+def test_history_to_messages_hides_bare_personality_marker_without_merge():
+    # When nothing merges onto it (an assistant reply lands before the next
+    # user turn, the normal case), the personality marker is still hidden
+    # entirely — same contract as the model-switch marker.
+    marker = (
+        "[System: The user has cleared the personality overlay. "
+        "From this point forward, respond in your normal default style.]"
+    )
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {
+            "role": "user",
+            "content": marker,
+            "display_kind": "personality_switch",
+            "display_metadata": {"marker_text": marker},
+        },
+        {"role": "assistant", "content": "back to normal"},
+    ]
+
+    assert server._history_to_messages(history) == [
+        {"role": "user", "text": "hi"},
+        {"role": "assistant", "text": "hello"},
+        {"role": "assistant", "text": "back to normal"},
+    ]
+
+
 def test_history_to_messages_drops_display_hidden_scaffolding():
     # A mid-stream steer persists an interrupted-turn checkpoint. When nothing
     # reached the screen the row carries only model-facing scaffolding and is
