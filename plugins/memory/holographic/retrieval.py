@@ -111,6 +111,8 @@ class FactRetriever:
         if results:
             ids = [f["fact_id"] for f in results]
             self.store.increment_retrieval_count(ids)
+            for f in results:
+                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
 
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
@@ -196,6 +198,8 @@ class FactRetriever:
         results = scored[:limit]
         if results:
             self.store.increment_retrieval_count([f["fact_id"] for f in results])
+            for f in results:
+                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
         return results
 
     def related(
@@ -267,6 +271,8 @@ class FactRetriever:
         results = scored[:limit]
         if results:
             self.store.increment_retrieval_count([f["fact_id"] for f in results])
+            for f in results:
+                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
         return results
 
     def reason(
@@ -348,6 +354,8 @@ class FactRetriever:
         results = scored[:limit]
         if results:
             self.store.increment_retrieval_count([f["fact_id"] for f in results])
+            for f in results:
+                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
         return results
 
     def contradict(
@@ -494,6 +502,8 @@ class FactRetriever:
         results = scored[:limit]
         if results:
             self.store.increment_retrieval_count([f["fact_id"] for f in results])
+            for f in results:
+                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
         return results
 
     def _fts_candidates(
