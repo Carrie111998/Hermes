@@ -1954,8 +1954,9 @@ class TestSignalSendMultipleImages:
         adapter._rpc = mock_rpc
         adapter._stop_typing_indicator = AsyncMock()
 
-        await adapter.send_multiple_images(chat_id="+155****4567", images=[])
+        result = await adapter.send_multiple_images(chat_id="+155****4567", images=[])
 
+        assert result.success is True
         assert captured == []
         adapter._stop_typing_indicator.assert_not_awaited()
 
@@ -1967,12 +1968,13 @@ class TestSignalSendMultipleImages:
         adapter._rpc = mock_rpc
         adapter._stop_typing_indicator = AsyncMock()
 
-        await adapter.send_multiple_images(
+        result = await adapter.send_multiple_images(
             chat_id="+155****4567",
             images=[(f"file://{tmp_path}/missing_a.png", ""),
                     (f"file://{tmp_path}/missing_b.png", "")],
         )
 
+        assert result.success is False
         assert captured == []
 
     @pytest.mark.asyncio
@@ -1983,8 +1985,9 @@ class TestSignalSendMultipleImages:
         adapter._stop_typing_indicator = AsyncMock()
 
         images = _make_image_files(tmp_path, 5)
-        await adapter.send_multiple_images(chat_id="+155****4567", images=images)
+        result = await adapter.send_multiple_images(chat_id="+155****4567", images=images)
 
+        assert result.success is True
         assert len(captured) == 1
         params = captured[0]["params"]
         assert params["recipient"] == ["+155****4567"]
@@ -2090,8 +2093,9 @@ class TestSignalSendMultipleImages:
         _patch_scheduler_sleep(monkeypatch, sleep_calls)
 
         images = _make_image_files(tmp_path, 33)  # forces 2 batches
-        await adapter.send_multiple_images(chat_id="+155****4567", images=images)
+        result = await adapter.send_multiple_images(chat_id="+155****4567", images=images)
 
+        assert result.success is False
         # 2 attempts on batch 0 + 1 on batch 1
         assert len(captured) == 3
 

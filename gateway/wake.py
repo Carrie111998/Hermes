@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,8 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    profile: Optional[str] = None,
+    delivery_key: Optional[str] = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -91,11 +94,24 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    wake_kwargs: dict[str, Any] = {
+        "text": text,
+        "session_id": session_id,
+    }
+    if profile:
+        wake_kwargs["profile"] = profile
+    if delivery_key:
+        wake_kwargs["delivery_key"] = delivery_key
+    await _self_post_chat_completion(adapter, **wake_kwargs)
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any,
+    *,
+    text: str,
+    session_id: str,
+    profile: Optional[str] = None,
+    delivery_key: Optional[str] = None,
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -105,7 +121,7 @@ async def _self_post_chat_completion(
     raise loudly rather than run the wake in a fresh fingerprint-derived
     session nobody is looking at.
     """
-    import aiohttp
+    import httpx
 
     host = str(getattr(adapter, "_host", "") or "127.0.0.1")
     if host in ("0.0.0.0", "::", "*"):
@@ -122,11 +138,18 @@ async def _self_post_chat_completion(
 
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"  # bare IPv6 literal
-    url = f"http://{host}:{port}/v1/chat/completions"
+    profile_prefix = (
+        f"/p/{quote(str(profile), safe='')}"
+        if profile and str(profile).strip() not in {"", "default"}
+        else ""
+    )
+    url = f"http://{host}:{port}{profile_prefix}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
     }
+    if delivery_key:
+        headers["Idempotency-Key"] = str(delivery_key)
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
         "messages": [{"role": "user", "content": text}],
@@ -139,35 +162,36 @@ async def _self_post_chat_completion(
         if attempt:
             await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt - 1])
         try:
-            timeout = aiohttp.ClientTimeout(total=WAKE_TURN_TIMEOUT_SECONDS)
-            async with aiohttp.ClientSession(timeout=timeout) as http:
-                async with http.post(url, json=payload, headers=headers) as resp:
-                    if resp.status == 429:
-                        # Global concurrency cap (max_concurrent_runs) —
-                        # transient; back off and retry.
-                        last_err = RuntimeError(
-                            f"wake self-post got HTTP 429 (concurrency cap) "
-                            f"for session {session_id}"
-                        )
-                        logger.warning(
-                            "%s; attempt %d/%d", last_err, attempt + 1, attempts
-                        )
-                        continue
-                    if resp.status >= 400:
-                        body = (await resp.text())[:300]
-                        # Non-transient (auth/validation) — fail immediately.
-                        raise RuntimeError(
-                            f"wake self-post failed for session {session_id}: "
-                            f"HTTP {resp.status}: {body}"
-                        )
-                    await resp.read()
-                    logger.info(
-                        "wake self-post delivered for session %s (attempt %d)",
-                        session_id,
-                        attempt + 1,
+            timeout = httpx.Timeout(WAKE_TURN_TIMEOUT_SECONDS)
+            # This is an authenticated in-process loopback request. Never let
+            # HTTP(S)_PROXY redirect the API key or session id off-host.
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as http:
+                resp = await http.post(url, json=payload, headers=headers)
+                if resp.status_code == 429:
+                    # Global concurrency cap (max_concurrent_runs) —
+                    # transient; back off and retry.
+                    last_err = RuntimeError(
+                        f"wake self-post got HTTP 429 (concurrency cap) "
+                        f"for session {session_id}"
                     )
-                    return
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                    logger.warning(
+                        "%s; attempt %d/%d", last_err, attempt + 1, attempts
+                    )
+                    continue
+                if resp.status_code >= 400:
+                    body = resp.text[:300]
+                    # Non-transient (auth/validation) — fail immediately.
+                    raise RuntimeError(
+                        f"wake self-post failed for session {session_id}: "
+                        f"HTTP {resp.status_code}: {body}"
+                    )
+                logger.info(
+                    "wake self-post delivered for session %s (attempt %d)",
+                    session_id,
+                    attempt + 1,
+                )
+                return
+        except (httpx.RequestError, asyncio.TimeoutError, OSError) as exc:
             last_err = exc
             logger.warning(
                 "wake self-post transient failure for session %s "

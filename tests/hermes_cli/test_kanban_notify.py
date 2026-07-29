@@ -1,4 +1,5 @@
 import asyncio
+import re
 import pytest
 
 from pathlib import Path
@@ -569,6 +570,7 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         chat_type="dm",
         thread_id="20197",
         user_id="u1",
+        profile="writer",
     )
     event = SimpleNamespace(
         text='/kanban --board projx create "hello" --assignee alice',
@@ -592,6 +594,7 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     assert len(subs) == 1
     assert subs[0]["chat_id"] == "chat1"
     assert subs[0]["thread_id"] == "20197"
+    assert subs[0]["notifier_profile"] == "writer"
     assert subs[0]["delivery_metadata"] == {
         "chat_type": "dm",
         "direct_messages_topic_id": "20197",
@@ -603,6 +606,41 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     conn = kb.connect(board="default")
     try:
         assert kb.list_notify_subs(conn) == []
+    finally:
+        conn.close()
+
+
+def test_gateway_create_stamps_effective_source_profile(kanban_home):
+    """A multiplexed source owns both the created task and its subscription."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_notifier_profile = "default"
+    source = SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        chat_id="secondary-chat",
+        thread_id="secondary-thread",
+        user_id="secondary-user",
+        profile="writer",
+    )
+    event = SimpleNamespace(
+        text='/kanban create "source-owned" --assignee reviewer',
+        source=source,
+    )
+
+    output = asyncio.run(GatewayRunner._handle_kanban_command(runner, event))
+    match = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
+    assert match is not None, output
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, match.group(1))
+        assert task is not None
+        assert task.created_by == "writer"
+        subs = kb.list_notify_subs(conn, task.id)
+        assert len(subs) == 1
+        assert subs[0]["notifier_profile"] == "writer"
     finally:
         conn.close()
 

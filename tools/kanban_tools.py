@@ -1208,6 +1208,17 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            try:
+                from gateway.session_context import get_session_env
+
+                session_profile = get_session_env("HERMES_SESSION_PROFILE", "")
+            except Exception:
+                session_profile = os.environ.get("HERMES_SESSION_PROFILE", "")
+            created_by = (
+                session_profile
+                or os.environ.get("HERMES_PROFILE")
+                or "worker"
+            )
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1234,7 +1245,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_by=created_by,
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
@@ -1335,16 +1346,20 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        notifier_profile = (
+        source_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
         )
-        if not notifier_profile:
+        if not source_profile:
             try:
                 from hermes_cli.profiles import get_active_profile_name
-                notifier_profile = get_active_profile_name() or "default"
+                source_profile = get_active_profile_name() or "default"
             except Exception:
-                notifier_profile = "default"
+                source_profile = "default"
+        notifier_profile = (
+            get_session_env("HERMES_SESSION_TRANSPORT_PROFILE", "")
+            or source_profile
+        )
         delivery_metadata: dict[str, Any] = {}
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
@@ -1368,6 +1383,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             platform=platform, chat_id=chat_id,
             chat_type=chat_type,
             thread_id=thread_id, user_id=user_id,
+            source_profile=source_profile,
             notifier_profile=notifier_profile,
             delivery_metadata=delivery_metadata or None,
         )

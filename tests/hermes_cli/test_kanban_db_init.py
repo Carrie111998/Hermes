@@ -176,3 +176,55 @@ def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
         )
         assert isinstance(cursor, int)
         assert isinstance(events, list)
+
+
+def test_existing_delivery_outbox_rows_migrate_as_text_items(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.executescript(
+        """
+        DROP TABLE kanban_notify_deliveries;
+        CREATE TABLE kanban_notify_deliveries (
+            task_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL DEFAULT '',
+            event_id INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            delivery_key TEXT NOT NULL UNIQUE,
+            content TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at INTEGER,
+            acked_at INTEGER,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (task_id, platform, chat_id, thread_id, event_id, chunk_index)
+        );
+        INSERT INTO kanban_notify_deliveries (
+            task_id, platform, chat_id, event_id, chunk_index,
+            delivery_key, content, created_at, updated_at
+        ) VALUES ('task-1', 'telegram', '123', 7, 0, 'stable-key', 'hello', 1, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with kb.connect(db_path) as migrated:
+        columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(kanban_notify_deliveries)")
+        }
+        row = migrated.execute(
+            "SELECT item_kind, delivery_key, content FROM kanban_notify_deliveries"
+        ).fetchone()
+
+    assert "item_kind" in columns
+    assert dict(row) == {
+        "item_kind": "text",
+        "delivery_key": "stable-key",
+        "content": "hello",
+    }

@@ -2417,6 +2417,7 @@ def _sub_index(subs):
                 "user_id": getattr(s, "user_id", None),
                 "delivery_metadata": getattr(s, "delivery_metadata", None),
                 "notifier_profile": getattr(s, "notifier_profile", None),
+                "source_profile": getattr(s, "source_profile", None),
             })
     return out
 
@@ -2480,6 +2481,46 @@ def test_create_subscribes_gateway_session_with_active_profile_when_env_missing(
     subs = _sub_index(_list_subs_for_task(d["task_id"]))
     assert len(subs) == 1
     assert subs[0]["notifier_profile"] == "spanorama"
+
+
+def test_create_stamps_runtime_and_transport_profiles_independently(
+    monkeypatch, worker_env,
+):
+    """A profile-routed runtime may create through the default shared bot."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from gateway.session_context import (
+        _SESSION_PROFILE,
+        _SESSION_TRANSPORT_PROFILE,
+    )
+
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "wrong-process-profile")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "writer-chat")
+
+    profile_token = _SESSION_PROFILE.set("writer")
+    transport_token = _SESSION_TRANSPORT_PROFILE.set("default")
+    try:
+        result = json.loads(
+            kt._handle_create({"title": "profile-owned", "assignee": "peer"})
+        )
+    finally:
+        _SESSION_TRANSPORT_PROFILE.reset(transport_token)
+        _SESSION_PROFILE.reset(profile_token)
+    assert result["ok"] is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, result["task_id"])
+        assert task is not None
+        assert task.created_by == "writer"
+        subs = kb.list_notify_subs(conn, task.id)
+        assert len(subs) == 1
+        assert subs[0]["source_profile"] == "writer"
+        assert subs[0]["notifier_profile"] == "default"
+    finally:
+        conn.close()
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

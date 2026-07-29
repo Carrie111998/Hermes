@@ -15,8 +15,10 @@ from types import SimpleNamespace
 
 from hermes_cli import kanban_db as kb
 from tui_gateway.server import (
+    _ack_kanban_notification,
     _collect_kanban_notifications,
     _format_kanban_event_text,
+    _release_kanban_notification,
 )
 
 SESSION_KEY = "tui-session-key-1"
@@ -57,16 +59,19 @@ class TestCollectKanbanNotifications:
         tid = _create_subscribed_task()
         _complete(tid, summary="shipped the fix")
 
-        texts = _collect_kanban_notifications(_session())
+        records = _collect_kanban_notifications(_session())
+        texts = [record["text"] for record in records]
 
         assert len(texts) == 1
         assert tid in texts[0]
         assert "done" in texts[0]
         assert "shipped the fix" in texts[0]
-        # Task is at a final status -> subscription removed.
+        assert len(_sub_rows(tid)) == 1
+        assert _ack_kanban_notification(records[0])
+        # Task is at a final status -> subscription removed after exact ack.
         assert _sub_rows(tid) == []
 
-    def test_claim_advances_cursor_so_second_poll_is_empty(self):
+    def test_pending_claim_is_leased_without_duplicate_collection(self):
         tid = _create_subscribed_task()
         conn = kb.connect()
         try:
@@ -74,15 +79,40 @@ class TestCollectKanbanNotifications:
         finally:
             conn.close()
 
-        first = _collect_kanban_notifications(_session())
-        second = _collect_kanban_notifications(_session())
+        session = _session()
+        first = _collect_kanban_notifications(session)
+        session["_kanban_pending"] = first
+        second = _collect_kanban_notifications(session)
 
         assert len(first) == 1
-        assert "blocked" in first[0]
-        assert "waiting on review" in first[0]
+        assert "blocked" in first[0]["text"]
+        assert "waiting on review" in first[0]["text"]
         assert second == []
+        assert _ack_kanban_notification(first[0])
         # Blocked is not a final status -> subscription stays alive so a
         # respawned task's next terminal event still reaches the user.
+        assert len(_sub_rows(tid)) == 1
+
+    def test_rejected_event_ack_releases_claim_without_unsubscribing(
+        self, monkeypatch,
+    ):
+        tid = _create_subscribed_task()
+        _complete(tid)
+        calls = {}
+
+        def reject_ack(conn, *, claim, delivery_owner):
+            calls["event_id"] = claim["event"].id
+            calls["owner"] = delivery_owner
+            return False
+
+        monkeypatch.setattr(kb, "ack_notify_delivery_event", reject_ack)
+
+        records = _collect_kanban_notifications(_session())
+        assert len(records) == 1
+        assert not _ack_kanban_notification(records[0])
+        _release_kanban_notification(records[0])
+        assert calls["event_id"] > 0
+        assert calls["owner"].startswith("tui:")
         assert len(_sub_rows(tid)) == 1
 
     def test_ignores_other_sessions_and_platforms(self):
@@ -141,13 +171,16 @@ class TestCollectKanbanNotifications:
         # active while the poller collects (as a profile-bound RPC would set).
         token = set_hermes_home_override(str(other_profile_home))
         try:
-            texts = _collect_kanban_notifications(session)
+            records = _collect_kanban_notifications(session)
         finally:
             reset_hermes_home_override(token)
 
+        texts = [record["text"] for record in records]
         assert len(texts) == 1
         assert tid in texts[0]
         assert "cross-profile delivery" in texts[0]
+        assert len(_sub_rows(tid)) == 1
+        assert _ack_kanban_notification(records[0])
         assert _sub_rows(tid) == []
 
 
@@ -168,6 +201,31 @@ class TestFormatKanbanEventText:
         assert "needs creds" in text
         assert "[main]" in text
         assert "@worker" in text
+
+    def test_scheduled_includes_full_review_brief(self):
+        reason = "\n".join(
+            (
+                "ASK: approve the protected operation",
+                "WHY GATED: human authorization is required",
+                "SCOPE: one reversible operation",
+                "EVIDENCE: exact dry-run output and audit trail",
+                "RISKS: stale credentials may require another review",
+                "WINDOW: 30 minutes",
+                "ROLLBACK: restore the prior snapshot",
+                "REPLY: APPROVE t_abc123 or VETO t_abc123",
+            )
+        )
+        ev = SimpleNamespace(kind="scheduled", payload={"reason": reason})
+
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+
+        assert "scheduled" in text
+        for field in (
+            "ASK:", "WHY GATED:", "SCOPE:", "EVIDENCE:", "RISKS:",
+            "WINDOW:", "ROLLBACK:", "REPLY:",
+        ):
+            assert field in text
+        assert reason in text
 
     def test_completed_prefers_payload_summary(self):
         ev = SimpleNamespace(kind="completed", payload={"summary": "first line\nsecond"})
@@ -252,6 +310,7 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
+        assert _sub_rows(tid) == []
 
     def test_busy_session_buffers_then_flushes_when_idle(self, monkeypatch):
         tid = _create_subscribed_task()
@@ -279,3 +338,4 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True
+        assert _sub_rows(tid) == []
