@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import ast
 import contextvars
 import fnmatch
 import functools
@@ -1502,6 +1503,372 @@ def _read_tool_exec_flag(tool: str, args: list[str]) -> tuple[str, str] | None:
     return None
 
 
+_READ_ONLY_PYTHON_IMPORTS = frozenset({
+    "decimal", "extract_msg", "fitz", "hashlib", "json", "openpyxl", "pathlib", "pypdf", "sqlite3", "yaml",
+})
+_SENSITIVE_PYTHON_PATH_MARKERS = (
+    ".env", ".hermes", ".ssh", "/dev/", "/etc/", "/proc/", "/sys/",
+    "auth.json", "config.yaml", "credentials",
+)
+_PROTECTED_PYTHON_BINDINGS = _READ_ONLY_PYTHON_IMPORTS | frozenset({
+    "Decimal", "Path", "open", "print", "len", "sum", "min", "max",
+    "sorted", "str", "int", "float",
+})
+
+
+def _has_protected_python_binding(names: set[str]) -> bool:
+    return bool(names & _PROTECTED_PYTHON_BINDINGS)
+
+
+def _is_sensitive_python_path(value: str) -> bool:
+    attachment_cache = os.path.expanduser("~/.hermes/cache/documents")
+    if os.path.commonpath((os.path.realpath(os.path.expanduser(value)), attachment_cache)) == attachment_cache:
+        return False
+    return any(marker in value.lower() for marker in _SENSITIVE_PYTHON_PATH_MARKERS)
+
+
+_ZULIP_ATTACHMENT_MSG_RE = re.compile(r"\A/tmp/zulip-attach-[^/]+\.msg\Z")
+
+
+def _is_zulip_attachment_msg_path(value: str) -> bool:
+    return os.path.normpath(value) == value and bool(_ZULIP_ATTACHMENT_MSG_RE.fullmatch(value))
+
+
+def _is_strict_read_only_python_inline(payload: str) -> bool:
+    """Return True only for a small, local read-only Python inline subset."""
+    try:
+        tree = ast.parse(payload, mode="exec")
+    except (SyntaxError, ValueError):
+        return False
+
+    class _ReadOnlyVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.safe = True
+            self.saw_read = False
+            self.extract_msg_messages: set[str] = set()
+            self.zulip_msg_path_lists: set[str] = set()
+            self.zulip_msg_loop_vars: set[str] = set()
+            self.fitz_documents: set[str] = set()
+            self.pypdf_reader_aliases: set[str] = set()
+            self.pypdf_readers: set[str] = set()
+
+        def _literal_path(self, node: ast.AST) -> bool:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return not _is_sensitive_python_path(node.value)
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "Path"
+                and len(node.args) == 1
+                and self._literal_path(node.args[0])
+            )
+
+        def _local_path(self, node: ast.AST) -> bool:
+            value = node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+            if value is None and isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Path" and len(node.args) == 1:
+                return self._local_path(node.args[0])
+            return bool(value) and not _is_sensitive_python_path(value) and not re.match(r"^[a-z][a-z0-9+.-]*://", value, re.I)
+
+        @staticmethod
+        def _dotted_name(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Name):
+                return node.id
+            if isinstance(node, ast.Attribute):
+                base = _ReadOnlyVisitor._dotted_name(node.value)
+                return f"{base}.{node.attr}" if base else None
+            return None
+
+        @staticmethod
+        def _assigned_names(node: ast.AST) -> set[str]:
+            if isinstance(node, ast.Name):
+                return {node.id}
+            if isinstance(node, (ast.Attribute, ast.Subscript)):
+                return _ReadOnlyVisitor._assigned_names(node.value)
+            if isinstance(node, (ast.List, ast.Tuple)):
+                names: set[str] = set()
+                for item in node.elts:
+                    names.update(_ReadOnlyVisitor._assigned_names(item))
+                return names
+            return set()
+
+        def _is_read_only_sqlite_connect(self, node: ast.Call) -> bool:
+            if self._dotted_name(node.func) != "sqlite3.connect" or not node.args:
+                return False
+            uri = next((kw.value for kw in node.keywords if kw.arg == "uri"), None)
+            path = node.args[0]
+            return (
+                isinstance(path, ast.Constant)
+                and isinstance(path.value, str)
+                and path.value.startswith("file:")
+                and "mode=ro" in path.value
+                and isinstance(uri, ast.Constant)
+                and uri.value is True
+                and not _is_sensitive_python_path(path.value)
+            )
+
+        def _is_read_only_sqlite_execute(self, node: ast.Call) -> bool:
+            if not isinstance(node.func, ast.Attribute) or node.func.attr != "execute":
+                return False
+            if (
+                not isinstance(node.func.value, ast.Call)
+                or not self._is_read_only_sqlite_connect(node.func.value)
+                or not node.args
+            ):
+                return False
+            sql = node.args[0]
+            return (
+                isinstance(sql, ast.Constant)
+                and isinstance(sql.value, str)
+                and sql.value.lstrip().upper().startswith(("SELECT", "PRAGMA"))
+            )
+
+        def _is_extract_msg_message(self, node: ast.Call) -> bool:
+            if self._dotted_name(node.func) != "extract_msg.Message" or len(node.args) != 1 or node.keywords:
+                return False
+            path = node.args[0]
+            if isinstance(path, ast.Name):
+                return path.id in self.zulip_msg_loop_vars
+            value = path.value if isinstance(path, ast.Constant) and isinstance(path.value, str) else None
+            if value is None and isinstance(path, ast.Call) and isinstance(path.func, ast.Name) and path.func.id == "Path" and len(path.args) == 1 and not path.keywords:
+                return self._is_extract_msg_message(
+                    ast.Call(func=node.func, args=[path.args[0]], keywords=[])
+                )
+            if value is not None and (value == "/tmp" or value.startswith("/tmp/")):
+                return _is_zulip_attachment_msg_path(value)
+            return self._local_path(path)
+
+        @staticmethod
+        def _is_zulip_msg_path_list(node: ast.AST) -> bool:
+            return (
+                isinstance(node, (ast.List, ast.Tuple))
+                and bool(node.elts)
+                and all(
+                    isinstance(item, ast.Constant)
+                    and isinstance(item.value, str)
+                    and _is_zulip_attachment_msg_path(item.value)
+                    for item in node.elts
+                )
+            )
+
+        def _is_fitz_open(self, node: ast.Call) -> bool:
+            return self._dotted_name(node.func) == "fitz.open" and len(node.args) == 1 and not node.keywords and self._local_path(node.args[0])
+
+        def _is_pypdf_reader(self, node: ast.Call) -> bool:
+            return (
+                self._dotted_name(node.func) == "pypdf.PdfReader" or isinstance(node.func, ast.Name) and node.func.id in self.pypdf_reader_aliases
+            ) and len(node.args) == 1 and not node.keywords and self._local_path(node.args[0])
+
+        def _is_extract_msg_object(self, node: ast.AST) -> bool:
+            return isinstance(node, ast.Name) and node.id in self.extract_msg_messages or isinstance(node, ast.Call) and self._is_extract_msg_message(node)
+
+        def _is_fitz_document(self, node: ast.AST) -> bool:
+            return isinstance(node, ast.Name) and node.id in self.fitz_documents or isinstance(node, ast.Call) and self._is_fitz_open(node)
+
+        def _is_pypdf_reader_object(self, node: ast.AST) -> bool:
+            return isinstance(node, ast.Name) and node.id in self.pypdf_readers or isinstance(node, ast.Call) and self._is_pypdf_reader(node)
+
+        def _is_fitz_page(self, node: ast.AST) -> bool:
+            if isinstance(node, ast.Subscript):
+                return self._is_fitz_document(node.value)
+            return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "load_page" and self._is_fitz_document(node.func.value)
+
+        def _is_pypdf_page(self, node: ast.AST) -> bool:
+            return isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and node.value.attr == "pages" and self._is_pypdf_reader_object(node.value.value)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            if any(alias.name.split(".", 1)[0] not in _READ_ONLY_PYTHON_IMPORTS for alias in node.names):
+                self.safe = False
+            bound_names = {
+                alias.asname or alias.name.split(".", 1)[0]
+                for alias in node.names
+            }
+            if _has_protected_python_binding(bound_names - _READ_ONLY_PYTHON_IMPORTS):
+                self.safe = False
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            root = (node.module or "").split(".", 1)[0]
+            if node.level or root not in _READ_ONLY_PYTHON_IMPORTS:
+                self.safe = False
+            imported_names = {alias.asname or alias.name for alias in node.names}
+            expected_names = {
+                "decimal": {"Decimal"},
+                "pathlib": {"Path"},
+                "pypdf": {"PdfReader"},
+            }.get(node.module, set())
+            if imported_names - expected_names:
+                self.safe = False
+            elif node.module == "pypdf":
+                self.pypdf_reader_aliases.update(
+                    alias.asname or alias.name for alias in node.names if alias.name == "PdfReader"
+                )
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self.generic_visit(node)
+            if any(not isinstance(target, (ast.Name, ast.List, ast.Tuple)) for target in node.targets):
+                self.safe = False
+            names = {target.id for target in node.targets if isinstance(target, ast.Name)}
+            assigned = set().union(*(self._assigned_names(target) for target in node.targets))
+            if _has_protected_python_binding(assigned):
+                self.safe = False
+            self.zulip_msg_path_lists.difference_update(assigned)
+            self.zulip_msg_loop_vars.difference_update(assigned)
+            if self._is_zulip_msg_path_list(node.value):
+                self.zulip_msg_path_lists.update(names)
+            if isinstance(node.value, ast.Call) and self._is_extract_msg_message(node.value):
+                self.extract_msg_messages.update(names)
+            if isinstance(node.value, ast.Call) and self._is_fitz_open(node.value):
+                self.fitz_documents.update(names)
+            if isinstance(node.value, ast.Call) and self._is_pypdf_reader(node.value):
+                self.pypdf_readers.update(names)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self.safe = False
+            assigned = self._assigned_names(node.target)
+            self.zulip_msg_path_lists.difference_update(assigned)
+            self.zulip_msg_loop_vars.difference_update(assigned)
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if not isinstance(node.target, ast.Name):
+                self.safe = False
+            assigned = self._assigned_names(node.target)
+            if _has_protected_python_binding(assigned):
+                self.safe = False
+            self.zulip_msg_path_lists.difference_update(assigned)
+            self.zulip_msg_loop_vars.difference_update(assigned)
+            self.generic_visit(node)
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+            self.safe = False
+            assigned = self._assigned_names(node.target)
+            self.zulip_msg_path_lists.difference_update(assigned)
+            self.zulip_msg_loop_vars.difference_update(assigned)
+            self.generic_visit(node)
+
+        def visit_For(self, node: ast.For) -> None:
+            simple_literal_paths = (
+                isinstance(node.target, ast.Name)
+                and not node.orelse
+                and (
+                    self._is_zulip_msg_path_list(node.iter)
+                    or isinstance(node.iter, ast.Name)
+                    and node.iter.id in self.zulip_msg_path_lists
+                )
+            )
+            if not simple_literal_paths:
+                self.safe = False
+                self.generic_visit(node)
+                return
+            self.visit(node.iter)
+            self.zulip_msg_loop_vars.add(node.target.id)
+            for statement in node.body:
+                self.visit(statement)
+            self.zulip_msg_loop_vars.discard(node.target.id)
+
+        def visit_Attribute(self, node: ast.Attribute) -> None:
+            if self._is_extract_msg_object(node.value) and node.attr not in {"subject", "sender", "body", "date"}:
+                self.safe = False
+            elif self._is_fitz_document(node.value) and node.attr not in {"metadata", "load_page"}:
+                self.safe = False
+            elif self._is_pypdf_reader_object(node.value) and node.attr not in {"metadata", "pages"}:
+                self.safe = False
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            name = self._dotted_name(node.func)
+            allowed = name in {"Decimal", "print", "len", "sum", "min", "max", "sorted", "str", "int", "float"}
+            if name == "Decimal":
+                self.saw_read = True
+            if name == "Path":
+                allowed = len(node.args) == 1 and self._literal_path(node.args[0])
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in {"read_text", "read_bytes"}:
+                allowed = self._literal_path(node.func.value)
+                self.saw_read = self.saw_read or allowed
+            elif name == "open":
+                mode = node.args[1] if len(node.args) > 1 else next((kw.value for kw in node.keywords if kw.arg == "mode"), None)
+                allowed = (
+                    bool(node.args)
+                    and self._literal_path(node.args[0])
+                    and (mode is None or isinstance(mode, ast.Constant) and mode.value in {"r", "rt", "rb"})
+                )
+                self.saw_read = self.saw_read or allowed
+            elif name == "openpyxl.load_workbook":
+                read_only = next((kw.value for kw in node.keywords if kw.arg == "read_only"), None)
+                data_only = next((kw.value for kw in node.keywords if kw.arg == "data_only"), None)
+                allowed = (
+                    bool(node.args)
+                    and self._literal_path(node.args[0])
+                    and (
+                        isinstance(read_only, ast.Constant) and read_only.value is True
+                        or isinstance(data_only, ast.Constant) and data_only.value is True
+                    )
+                )
+                self.saw_read = self.saw_read or allowed
+            elif self._is_extract_msg_message(node):
+                allowed = True
+                self.saw_read = True
+            elif self._is_fitz_open(node):
+                allowed = True
+                self.saw_read = True
+            elif self._is_pypdf_reader(node):
+                allowed = True
+                self.saw_read = True
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "get_text":
+                allowed = self._is_fitz_page(node.func.value) and not node.keywords and (not node.args or len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and node.args[0].value == "text")
+                self.saw_read = self.saw_read or allowed
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "extract_text":
+                allowed = self._is_pypdf_page(node.func.value) and not node.args and not node.keywords
+                self.saw_read = self.saw_read or allowed
+            elif name in {"yaml.safe_load", "yaml.safe_load_all"}:
+                allowed = True
+                self.saw_read = True
+            elif name in {"json.load", "json.loads"}:
+                allowed = True
+            elif name in {"hashlib.md5", "hashlib.sha1", "hashlib.sha256", "hashlib.sha512", "hashlib.blake2b"}:
+                allowed = True
+                self.saw_read = True
+            elif self._is_read_only_sqlite_connect(node):
+                allowed = True
+                self.saw_read = True
+            elif self._is_read_only_sqlite_execute(node):
+                allowed = True
+                self.saw_read = True
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"fetchall", "fetchone", "fetchmany"}
+                and isinstance(node.func.value, ast.Call)
+                and self._is_read_only_sqlite_execute(node.func.value)
+            ):
+                allowed = True
+                self.saw_read = True
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"hexdigest", "digest"}
+                and isinstance(node.func.value, ast.Call)
+                and (self._dotted_name(node.func.value.func) or "").startswith("hashlib.")
+            ):
+                allowed = True
+            if not allowed:
+                self.safe = False
+            self.generic_visit(node)
+
+    visitor = _ReadOnlyVisitor()
+    visitor.visit(tree)
+    return visitor.safe and visitor.saw_read
+
+
+_STRICT_READ_ONLY_PYTHON_HEREDOC_RE = re.compile(
+    r"\A\s*(?:py|python[23]?(?:\.\d+)*)\s+(?:-\s+)?<<\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1[ \t]*\n"
+    r"(?P<body>.*?)(?:\n)?^\2[ \t]*\s*\Z",
+    re.DOTALL | re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _strict_read_only_python_heredoc(command: str) -> bool:
+    match = _STRICT_READ_ONLY_PYTHON_HEREDOC_RE.fullmatch(command)
+    return bool(match and _is_strict_read_only_python_inline(match.group("body")))
+
+
 def _execution_flag_findings(command: str):
     """Yield scoped execution mechanisms and any executable payloads."""
     for segment in _iter_top_level_shell_segments(command):
@@ -1522,9 +1889,14 @@ def _execution_flag_findings(command: str):
             if family:
                 flag = _interpreter_exec_flag(family, tokens[1:])
                 if flag:
+                    payload = tokens[tokens.index(flag) + 1] if flag == "-c" and flag in tokens and tokens.index(flag) + 1 < len(tokens) else None
+                    if family == "python" and payload and _is_strict_read_only_python_inline(payload):
+                        continue
                     yield ("script execution via -e/-c flag", None)
                     continue
                 if any(token.startswith("<<") for token in tokens[1:]):
+                    if family == "python" and _strict_read_only_python_heredoc(command):
+                        continue
                     yield ("script execution via heredoc", None)
                     continue
             if executable_name in {"bash", "sh", "zsh", "ksh"}:
