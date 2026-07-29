@@ -28,6 +28,8 @@ import { mkdirSync, readFileSync, existsSync, readdirSync, unlinkSync } from 'fs
 import { fileURLToPath } from 'url';
 import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
+
+const QR_PNG_PATH = '/tmp/whatsapp-qr.png';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
@@ -426,6 +428,13 @@ async function startSocket() {
         console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
         qrcode.generate(qr, { small: true });
         console.log('\nWaiting for scan...\n');
+        // Also write a PNG for easier scanning on mobile
+        try {
+          execFileSync('qrencode', ['-t', 'PNG', '-o', QR_PNG_PATH, '-s', '10', '-m', '2', qr]);
+          console.log(`🖼 QR image saved: ${QR_PNG_PATH}`);
+        } catch (e) {
+          console.log('⚠ Could not write QR PNG:', e.message);
+        }
       }
     }
 

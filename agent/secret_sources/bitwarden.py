@@ -666,11 +666,17 @@ def _summarize_bws_stderr(raw: str) -> str:
 def _run_bws_list(
     bws: Path, access_token: str, project_id: str, server_url: str = ""
 ) -> Tuple[Dict[str, str], List[str]]:
-    cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
+    cmd = [str(bws), "secret", "list", project_id, "--output", "json", "--color", "no"]
     env = os.environ.copy()
     env["BWS_ACCESS_TOKEN"] = access_token
     # Make sure we're not echoing telemetry / colour codes into json.
-    env.setdefault("NO_COLOR", "1")
+    # NO_COLOR alone is insufficient: an inherited FORCE_COLOR / CLICOLOR_FORCE
+    # overrides it in bws 2.x, which then syntax-highlights the JSON with ANSI
+    # escapes and breaks json.loads at char 0.  Force colour off via the CLI
+    # flag above AND scrub the forcing vars from the child environment.
+    env["NO_COLOR"] = "1"
+    for _cvar in ("FORCE_COLOR", "CLICOLOR_FORCE", "CLICOLOR"):
+        env.pop(_cvar, None)
     # Region / self-hosted support.  bws defaults to https://vault.bitwarden.com
     # (US Cloud); EU Cloud users need https://vault.bitwarden.eu, and
     # self-hosted users need their own URL.  When unset, fall back to whatever

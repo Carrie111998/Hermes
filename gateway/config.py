@@ -1626,6 +1626,11 @@ def load_gateway_config() -> GatewayConfig:
                             for cid, ov_data in raw_overrides.items()
                             if isinstance(ov_data, dict)
                         }
+                # WhatsApp bridge-specific keys; the adapter reads these from config.extra.
+                if plat == Platform.WHATSAPP and "bridge_port" in platform_cfg:
+                    bridged["bridge_port"] = platform_cfg["bridge_port"]
+                if plat == Platform.WHATSAPP and "session_path" in platform_cfg:
+                    bridged["session_path"] = platform_cfg["session_path"]
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit and not has_channel_overrides:
                     continue
