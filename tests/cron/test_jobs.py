@@ -1829,11 +1829,13 @@ class TestClaimDispatch:
             "repeat": {"times": times, "completed": completed},
         }
 
-    def test_claim_increments_and_persists(self, tmp_cron_dir):
+    def test_claim_does_not_increment_completed(self, tmp_cron_dir):
+        """claim_dispatch must NOT increment repeat.completed (fix #73973).
+        The counter is only incremented by mark_job_run after execution."""
         save_jobs([self._oneshot(times=1, completed=0)])
         assert claim_dispatch("os1") is True
-        # Persisted BEFORE any side effect — survives a crash.
-        assert load_jobs()[0]["repeat"]["completed"] == 1
+        # Persisted state is unchanged — the increment happens in mark_job_run.
+        assert load_jobs()[0]["repeat"]["completed"] == 0
 
     def test_already_dispatched_oneshot_is_removed(self, tmp_cron_dir):
         # A prior tick claimed (completed==times) then died before mark_job_run
@@ -1871,14 +1873,16 @@ class TestClaimDispatch:
         save_jobs([])
         assert claim_dispatch("ghost") is True
 
-    def test_mark_job_run_does_not_double_count_preclaimed_oneshot(self, tmp_cron_dir):
-        # Full lifecycle: claim bumps completed to times, then mark_job_run must
-        # NOT increment again — it recognizes the pre-claim and removes the job.
+    def test_mark_job_run_increments_and_removes_oneshot(self, tmp_cron_dir):
+        """mark_job_run always increments completed (claim_dispatch no
+        longer does — fix #73973) and removes the job when the limit is met."""
         save_jobs([self._oneshot(times=1, completed=0)])
+        # claim_dispatch does NOT increment (no pre-claim).
         assert claim_dispatch("os1") is True
-        assert load_jobs()[0]["repeat"]["completed"] == 1
+        assert load_jobs()[0]["repeat"]["completed"] == 0
+        # mark_job_run increments and removes.
         mark_job_run("os1", success=True)
-        assert load_jobs() == []  # completed once, removed — not fired twice
+        assert load_jobs() == []  # completed once, removed
 
     def test_mark_job_run_still_increments_recurring(self, tmp_cron_dir):
         # The double-count guard is one-shot-specific; recurring jobs keep the

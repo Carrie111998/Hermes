@@ -3856,13 +3856,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
     try:
-        # Pre-run dispatch claim (issue #38758): atomically commit a finite
-        # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
-        # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
-        # re-fire the job forever on restart. No-op for recurring jobs (they
-        # use advance_next_run) and infinite/no-repeat jobs. This lives here in
-        # the shared body so BOTH the built-in ticker and the external provider
-        # (Chronos fire_due) get at-most-times semantics.
+        # Pre-run dispatch guard (fix #73973): check whether the finite one-shot
+        # job's dispatch slot has been exhausted (completed >= times) BEFORE the
+        # side effect runs.  The counter itself is incremented by mark_job_run()
+        # AFTER the side effect succeeds — not here — so a scheduler restart
+        # between this check and actual execution does not silently consume the
+        # job's dispatch slot.  No-op for recurring jobs (they use
+        # advance_next_run) and infinite/no-repeat jobs.  This lives here in the
+        # shared body so BOTH the built-in ticker and the external provider
+        # (Chronos fire_due) get the same guard.
         if not claim_dispatch(job["id"]):
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",

@@ -1668,25 +1668,17 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
                 
-                # Increment completed count.  Finite one-shot jobs are
-                # pre-claimed by claim_dispatch() BEFORE the side effect runs
-                # (issue #38758), which already incremented completed — do not
-                # double-count them here.  Recurring jobs and direct callers
-                # with no pre-run claim still get the legacy increment.
+                # Increment completed count.  claim_dispatch() no longer
+                # increments (fix #73973), so we always do it here AFTER
+                # the side effect has run — never before.  Pre-2026-V4
+                # job records left by the old claim_dispatch pre-increment
+                # will have completed >= 1 by the time mark_job_run sees
+                # them and will be handled below (limit reached -> removed).
                 if job.get("repeat"):
                     repeat = job["repeat"]
                     times = repeat.get("times")
-                    completed = repeat.get("completed", 0)
-                    kind = job.get("schedule", {}).get("kind")
-                    preclaimed_oneshot = (
-                        kind == "once"
-                        and times is not None
-                        and times > 0
-                        and completed > 0
-                    )
-                    if not preclaimed_oneshot:
-                        completed += 1
-                        repeat["completed"] = completed
+                    completed = repeat.get("completed", 0) + 1
+                    repeat["completed"] = completed
 
                     # Check if we've hit the repeat limit
                     if times is not None and times > 0 and completed >= times:
@@ -1734,19 +1726,23 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
 
 def claim_dispatch(job_id: str) -> bool:
-    """Atomically claim a finite one-shot job dispatch BEFORE execution.
+    """Check whether a finite one-shot job may be dispatched.
 
-    Increments ``repeat.completed`` under the cross-process jobs lock and
-    persists the claim immediately, so that if the tick dies mid-execution
-    (gateway kill, OOM, segfault, hard-timeout) the dispatch is not lost.
-    This converts finite one-shot jobs from *at-least-once* to *at-most-times*
-    semantics — a job that self-destructs fires at most ``repeat.times`` times
-    instead of infinitely (issue #38758).
+    Checks ``repeat.completed >= repeat.times`` under the cross-process jobs
+    lock.  If the limit is reached (e.g. a stale entry from a prior crash)
+    the job record is removed and ``False`` is returned.  Otherwise the
+    caller may proceed to execute the job.
+
+    .. important::
+       This function does **not** increment ``repeat.completed``.  The
+       counter is incremented by :func:`mark_job_run` AFTER the side effect
+       succeeds, so a scheduler restart between the claim check and actual
+       execution does not silently consume the job's dispatch slot (#73973).
 
     Returns ``True`` if the caller may proceed to run the job, ``False`` if the
     dispatch limit is already reached (in which case the stale job is removed).
 
-    Only claims jobs with ``schedule.kind == "once"`` and ``repeat.times > 0``.
+    Only checks jobs with ``schedule.kind == "once"`` and ``repeat.times > 0``.
     Recurring jobs (they use ``advance_next_run``) and infinite-repeat / no-repeat
     jobs are left unchanged and always allowed to proceed.
     """
@@ -1777,15 +1773,11 @@ def claim_dispatch(job_id: str) -> bool:
                     times,
                 )
                 return False
-            # Claim this dispatch before the side effect runs.
-            repeat["completed"] = completed + 1
-            save_jobs(jobs)
-            logger.debug(
-                "Job '%s': claimed dispatch %d/%d",
-                job.get("name", job.get("id", "?")),
-                repeat["completed"],
-                times,
-            )
+            # Return True so the caller proceeds to execute the job.
+            # The completed counter is incremented by mark_job_run() AFTER
+            # the side effect succeeds — NOT here — so a scheduler restart
+            # between claim and execution does not silently consume the
+            # job's dispatch slot (#73973).
             return True
 
         logger.debug(
