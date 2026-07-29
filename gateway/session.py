@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 _CAPABILITY_EPOCH_PREFIX = "cap_epoch_v1_"
+_RESUME_MARK_EXPECTATION_UNSET = object()
 
 
 class CapabilityEpochRotationBlocked(RuntimeError):
@@ -3048,12 +3049,24 @@ class SessionStore:
                 return True
         return False
 
-    def clear_resume_pending(self, session_key: str) -> bool:
+    def clear_resume_pending(
+        self,
+        session_key: str,
+        *,
+        expected_session_id: Optional[str] = None,
+        expected_last_resume_marked_at: Any = _RESUME_MARK_EXPECTATION_UNSET,
+    ) -> bool:
         """Clear the resume-pending flag after a successful resumed turn.
 
         Called from the gateway after ``run_conversation()`` returns a
         final response for a session that had ``resume_pending=True``,
         signalling that recovery succeeded.
+
+        The optional expectations make post-turn acknowledgement ABA-safe:
+        an older turn must not erase a newer restart marker or a marker on a
+        replacement session. Callers that deliberately perform operator or
+        delivery-ledger cleanup may omit them to retain the historical
+        unconditional behaviour.
 
         Returns True if a flag was cleared.
         """
@@ -3061,6 +3074,18 @@ class SessionStore:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
+                return False
+            if (
+                expected_session_id is not None
+                and entry.session_id != expected_session_id
+            ):
+                return False
+            if (
+                expected_last_resume_marked_at
+                is not _RESUME_MARK_EXPECTATION_UNSET
+                and entry.last_resume_marked_at
+                != expected_last_resume_marked_at
+            ):
                 return False
             entry.resume_pending = False
             entry.resume_reason = None
