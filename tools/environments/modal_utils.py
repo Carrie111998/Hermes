@@ -105,6 +105,7 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
             return self._error_result(f"{self._unexpected_error_prefix}: {exc}")
 
         if start.immediate_result is not None:
+            start.immediate_result.setdefault("cwd", prepared.cwd)
             return start.immediate_result
 
         if start.handle is None:
@@ -128,7 +129,9 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
                     self._cancel_modal_exec(start.handle)
                 except Exception:
                     pass
-                return self._result(self._interrupt_output, 130)
+                result = self._result(self._interrupt_output, 130)
+                result["cwd"] = prepared.cwd
+                return result
 
             try:
                 result = self._poll_modal_exec(start.handle)
@@ -136,6 +139,7 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
                 return self._error_result(f"{self._unexpected_error_prefix}: {exc}")
 
             if result is not None:
+                result.setdefault("cwd", prepared.cwd)
                 return result
 
             if deadline is not None and time.monotonic() >= deadline:
@@ -143,7 +147,9 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
                     self._cancel_modal_exec(start.handle)
                 except Exception:
                     pass
-                return self._timeout_result_for_modal(prepared.timeout)
+                result = self._timeout_result_for_modal(prepared.timeout)
+                result["cwd"] = prepared.cwd
+                return result
 
             # Periodic activity touch so the gateway knows we're alive
             try:

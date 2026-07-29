@@ -1,6 +1,7 @@
 """Regression tests for task/session cwd propagation in terminal_tool."""
 
 import json
+import threading
 from types import SimpleNamespace
 
 import tools.terminal_tool as terminal_tool
@@ -15,6 +16,12 @@ def _minimal_terminal_config(cwd="/default"):
     }
 
 
+def _mark_compatible(env, config, task_id):
+    runtime = terminal_tool.resolve_terminal_runtime_identity(config, raw_task_id=task_id)
+    setattr(env, terminal_tool._ENV_SIGNATURE_ATTR, runtime["signature"])
+    return env
+
+
 def test_foreground_command_uses_registered_task_cwd_for_existing_environment(monkeypatch):
     """ACP can update task cwd after the local env exists; foreground must honor it."""
     calls = []
@@ -27,10 +34,13 @@ def test_foreground_command_uses_registered_task_cwd_for_existing_environment(mo
             return {"output": "ok", "returncode": 0}
 
     task_id = "acp-session-1"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: env})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/acp"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    config = _minimal_terminal_config()
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    _mark_compatible(env, config, task_id)
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
@@ -54,10 +64,13 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
             return {"output": "ok", "returncode": 0}
 
     task_id = "acp-session-1"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: env})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/acp"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    config = _minimal_terminal_config()
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    _mark_compatible(env, config, task_id)
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
@@ -89,13 +102,16 @@ def test_foreground_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
             return {"output": "ok", "returncode": 0}
 
     task_id = "session-live-cwd"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: env})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_session_cwd", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/init"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/init"))
+    config = _minimal_terminal_config(cwd="/workspace/init")
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
     monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+    _mark_compatible(env, config, task_id)
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
@@ -130,13 +146,16 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
 
     registry = FakeRegistry()
     task_id = "session-live-cwd-bg"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: env})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_session_cwd", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/init"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/init"))
+    config = _minimal_terminal_config(cwd="/workspace/init")
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
     monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
+    _mark_compatible(env, config, task_id)
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
@@ -250,12 +269,15 @@ def test_stale_env_cwd_from_different_session_is_ignored(monkeypatch):
             return {"output": "ok", "returncode": 0}
 
     task_id = "session-B"
-    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": FakeEnv()})
+    env = FakeEnv()
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"default": env})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/home/user/src/hermes-agent"))
+    config = _minimal_terminal_config(cwd="/home/user/src/hermes-agent")
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
     monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: "default")
+    _mark_compatible(env, config, task_id)
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
@@ -281,7 +303,7 @@ def test_same_session_recorded_cwd_survives_across_commands(monkeypatch):
 
         def execute(self, command, **kwargs):
             calls.append((command, kwargs))
-            return {"output": "ok", "returncode": 0}
+            return {"output": "ok", "returncode": 0, "cwd": self.cwd}
 
     env = FakeEnv()
     task_id = "session-X"
@@ -289,9 +311,11 @@ def test_same_session_recorded_cwd_survives_across_commands(monkeypatch):
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
     monkeypatch.setattr(terminal_tool, "_session_cwd", {})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/config"))
+    config = _minimal_terminal_config(cwd="/workspace/config")
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
     monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: "default")
+    _mark_compatible(env, config, task_id)
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",
@@ -309,6 +333,91 @@ def test_same_session_recorded_cwd_survives_across_commands(monkeypatch):
     result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
     assert result["exit_code"] == 0
     assert calls[1] == ("pwd", {"timeout": 60, "cwd": "/workspace/deep", "bounded_capture": True})
+
+
+def test_foreground_records_result_cwd_not_shared_cwd_after_concurrent_run(monkeypatch):
+    """A shared backend cwd update after execute must not corrupt this session."""
+    terminal_tool._active_environments.clear()
+    terminal_tool._last_activity.clear()
+    terminal_tool._environment_lease_states.clear()
+    calls = []
+    a_entered = threading.Event()
+    b_finished = threading.Event()
+
+    class FakeEnv:
+        env = {}
+        cwd = "/workspace/shared-stale"
+
+        def execute(self, command, **kwargs):
+            calls.append((command, kwargs))
+            if command == "cmd-a":
+                a_entered.set()
+                assert b_finished.wait(5)
+                self.cwd = "/workspace/b-finished"
+                return {
+                    "output": "a",
+                    "returncode": 0,
+                    "cwd": "/workspace/a-finished",
+                }
+            if command == "cmd-b":
+                assert a_entered.wait(5)
+                self.cwd = "/workspace/b-finished"
+                b_finished.set()
+                return {
+                    "output": "b",
+                    "returncode": 0,
+                    "cwd": "/workspace/b-finished",
+                }
+            raise AssertionError(command)
+
+    config = _minimal_terminal_config(cwd="/workspace/default")
+    env = FakeEnv()
+    signature = terminal_tool._terminal_env_signature(config, task_id="default")
+    terminal_tool._store_active_environment("default", env, signature)
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {
+        "sess-a": {"cwd": "/workspace/a-start"},
+        "sess-b": {"cwd": "/workspace/b-start"},
+    })
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    results = {}
+
+    def run_command(task_id, command):
+        results[task_id] = json.loads(
+            terminal_tool.terminal_tool(command=command, task_id=task_id)
+        )
+
+    thread_a = threading.Thread(target=run_command, args=("sess-a", "cmd-a"))
+    thread_b = threading.Thread(target=run_command, args=("sess-b", "cmd-b"))
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=5)
+    thread_b.join(timeout=5)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert results["sess-a"]["output"] == "a"
+    assert results["sess-b"]["output"] == "b"
+    assert calls[0] == (
+        "cmd-a",
+        {"timeout": 60, "cwd": "/workspace/a-start", "bounded_capture": True},
+    )
+    assert calls[1] == (
+        "cmd-b",
+        {"timeout": 60, "cwd": "/workspace/b-start", "bounded_capture": True},
+    )
+    assert terminal_tool.get_session_cwd("sess-a") == "/workspace/a-finished"
+    assert terminal_tool.get_session_cwd("sess-b") == "/workspace/b-finished"
+    terminal_tool._active_environments.clear()
+    terminal_tool._last_activity.clear()
+    terminal_tool._environment_lease_states.clear()
 
 
 def test_safe_getcwd_returns_real_cwd(monkeypatch):

@@ -75,13 +75,13 @@ class TestPostCommandDualWrite:
 
     def _run(self, monkeypatch, task_id, env):
         import json
+        config = {"env_type": "local", "cwd": "/default", "timeout": 60,
+                  "lifetime_seconds": 3600}
+        signature = tt.resolve_terminal_runtime_identity(config, raw_task_id=task_id)["signature"]
+        setattr(env, tt._ENV_SIGNATURE_ATTR, signature)
         monkeypatch.setattr(tt, "_active_environments", {task_id: env})
         monkeypatch.setattr(tt, "_last_activity", {})
-        monkeypatch.setattr(
-            tt, "_get_env_config",
-            lambda: {"env_type": "local", "cwd": "/default", "timeout": 60,
-                     "lifetime_seconds": 3600},
-        )
+        monkeypatch.setattr(tt, "_get_env_config", lambda: config)
         monkeypatch.setattr(
             tt, "_check_all_guards",
             lambda command, env_type, **kwargs: {"approved": True},
@@ -95,7 +95,7 @@ class TestPostCommandDualWrite:
             def execute(self, command, **kwargs):
                 # Simulate the env's own post-command tracking (marker parse).
                 self.cwd = "/new/dir"
-                return {"output": "", "returncode": 0}
+                return {"output": "", "returncode": 0, "cwd": self.cwd}
 
         result = self._run(monkeypatch, "sess-a", FakeEnv())
         assert result["exit_code"] == 0
@@ -130,7 +130,7 @@ class TestFileToolsReadTheRecord:
         monkeypatch.setattr(tt, "_active_environments", {})
 
         # Each session ran commands that recorded its own cwd. No env alive,
-        # no registered overrides — just the records.
+        # no registered overrides - just the records.
         tt.record_session_cwd("sess-a", str(wt_a))
         tt.record_session_cwd("sess-b", str(wt_b))
 
@@ -139,7 +139,7 @@ class TestFileToolsReadTheRecord:
 
     def test_record_beats_foreign_env_cwd_without_ownership_metadata(self, tmp_path, monkeypatch):
         """The leak-A scenario, solved structurally: the shared env's cwd is
-        never consulted for path resolution — only the session's own record."""
+        never consulted for path resolution - only the session's own record."""
         import tools.file_tools as ft
 
         wt_a = tmp_path / "wt_a"
@@ -223,16 +223,16 @@ class TestCommandCwdReadsTheRecord:
                 self.last_cwd_arg = kwargs.get("cwd")
                 if command.startswith("cd "):
                     self.cwd = command[3:]
-                return {"output": "", "returncode": 0}
+                return {"output": "", "returncode": 0, "cwd": self.cwd}
 
         fake = FakeEnv()
+        config = {"env_type": "local", "cwd": "/default", "timeout": 60,
+                  "lifetime_seconds": 3600}
+        signature = tt.resolve_terminal_runtime_identity(config, raw_task_id="sess-a")["signature"]
+        setattr(fake, tt._ENV_SIGNATURE_ATTR, signature)
         monkeypatch.setattr(tt, "_active_environments", {"sess-a": fake})
         monkeypatch.setattr(tt, "_last_activity", {})
-        monkeypatch.setattr(
-            tt, "_get_env_config",
-            lambda: {"env_type": "local", "cwd": "/default", "timeout": 60,
-                     "lifetime_seconds": 3600},
-        )
+        monkeypatch.setattr(tt, "_get_env_config", lambda: config)
         monkeypatch.setattr(
             tt, "_check_all_guards",
             lambda command, env_type, **kwargs: {"approved": True},

@@ -45,6 +45,7 @@ from tools.code_execution_tool import (
     build_execute_code_schema,
     EXECUTE_CODE_SCHEMA,
     _TOOL_DOC_LINES,
+    _get_or_create_env,
     _execute_remote,
 )
 
@@ -141,6 +142,65 @@ class TestHermesToolsGeneration(unittest.TestCase):
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
+    def test_get_or_create_env_uses_raw_task_id_fallback(self):
+        """execute_code must reuse raw-key envs created before task collapse."""
+        from tools import terminal_tool as tt
+
+        config = {
+            "env_type": "local",
+            "timeout": 30,
+            "cwd": "/workspace/raw",
+            "host_cwd": None,
+            "modal_mode": "auto",
+            "docker_image": "",
+            "singularity_image": "",
+            "modal_image": "",
+            "daytona_image": "",
+            "docker_mount_cwd_to_workspace": False,
+            "docker_volumes": [],
+            "docker_forward_env": [],
+            "docker_env": {},
+            "docker_run_as_host_user": False,
+            "docker_network": True,
+            "docker_extra_args": [],
+            "docker_persist_across_processes": True,
+            "docker_orphan_reaper": True,
+            "container_cpu": 1,
+            "container_memory": 5120,
+            "container_disk": 51200,
+            "container_persistent": True,
+            "ssh_host": "",
+            "ssh_user": "",
+            "ssh_port": 22,
+            "ssh_key": "",
+            "ssh_persistent": True,
+            "local_persistent": False,
+        }
+        task_id = "raw-session-env"
+        cached_env = MagicMock(name="cached_raw_env")
+        setattr(
+            cached_env,
+            tt._ENV_SIGNATURE_ATTR,
+            tt._terminal_env_signature(config, task_id="default"),
+        )
+        tt._active_environments.clear()
+        tt._last_activity.clear()
+        tt._environment_lease_states.clear()
+        tt._active_environments[task_id] = cached_env
+
+        try:
+            with patch("tools.terminal_tool._get_env_config", return_value=config), \
+                 patch("tools.terminal_tool._create_environment") as create_env:
+                env, env_type = _get_or_create_env(task_id)
+        finally:
+            tt._active_environments.clear()
+            tt._last_activity.clear()
+            tt._environment_lease_states.clear()
+
+        self.assertIs(env, cached_env)
+        self.assertEqual(env_type, "local")
+        create_env.assert_not_called()
+
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):
         class FakeEnv:
             def __init__(self):
@@ -161,7 +221,7 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         fake_thread = MagicMock()
 
         with patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5}), \
-             patch("tools.code_execution_tool._get_or_create_env", return_value=(env, "ssh")), \
+             patch("tools.code_execution_tool._get_or_create_env_lease", return_value=(env, "ssh", MagicMock())), \
              patch("tools.code_execution_tool._ship_file_to_remote"), \
              patch("tools.code_execution_tool.threading.Thread", return_value=fake_thread):
             result = json.loads(_execute_remote("print('hello')", "task-1", ["terminal"]))
@@ -202,8 +262,8 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
 
         with patch("tools.code_execution_tool._load_config",
                    return_value={"timeout": 30, "max_tool_calls": 5}), \
-             patch("tools.code_execution_tool._get_or_create_env",
-                   return_value=(env, "ssh")), \
+             patch("tools.code_execution_tool._get_or_create_env_lease",
+                   return_value=(env, "ssh", MagicMock())), \
              patch("tools.code_execution_tool._ship_file_to_remote"), \
              patch("tools.code_execution_tool.threading.Thread",
                    return_value=fake_thread), \
@@ -218,6 +278,29 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         # shlex.quote wraps values containing special characters in single quotes
         self.assertIn("TZ='US/Eastern; echo PWNED'", run_cmd,
                       "TZ value must be wrapped in single quotes by shlex.quote()")
+
+    def test_remote_execution_releases_lease_when_python_missing(self):
+        """Remote execute_code releases its backend lease on early error returns."""
+        class FakeEnv:
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, cwd=None, timeout=None):
+                if "command -v python3" in command:
+                    return {"output": "", "returncode": 1}
+                return {"output": "", "returncode": 0}
+
+        lease = MagicMock()
+
+        with patch("tools.code_execution_tool._load_config",
+                   return_value={"timeout": 30, "max_tool_calls": 5}), \
+             patch("tools.code_execution_tool._get_or_create_env_lease",
+                   return_value=(FakeEnv(), "ssh", lease)):
+            result = json.loads(_execute_remote("print('hello')", "task-1", ["terminal"]))
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Python 3 is not available", result["error"])
+        lease.release.assert_called_once_with()
 
 
 @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
@@ -1041,7 +1124,7 @@ for i in range(15000):
         fake_thread = MagicMock()
 
         with patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5}), \
-             patch("tools.code_execution_tool._get_or_create_env", return_value=(FakeEnv(), "ssh")), \
+             patch("tools.code_execution_tool._get_or_create_env_lease", return_value=(FakeEnv(), "ssh", MagicMock())), \
              patch("tools.code_execution_tool._ship_file_to_remote"), \
              patch("tools.code_execution_tool.threading.Thread", return_value=fake_thread):
             result = json.loads(_execute_remote("print('large')", "task-1", ["terminal"]))
