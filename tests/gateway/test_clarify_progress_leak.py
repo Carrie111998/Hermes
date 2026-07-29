@@ -220,73 +220,42 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_blockers_only_resolves_routine_clarify_without_user_prompt(
+@pytest.mark.parametrize(
+    ("agent_type", "response", "question", "choices"),
+    [
+        (
+            RoutineClarifyAgent,
+            "Proceed",
+            "Should I inspect the patch and run the focused tests?",
+            ["Proceed", "Stop"],
+        ),
+        (
+            DeployClarifyAgent,
+            "Cancel",
+            "Should I merge and deploy this to production?",
+            ["Deploy to production", "Cancel"],
+        ),
+    ],
+)
+async def test_gateway_never_classifies_clarify_question_text(
     monkeypatch,
     tmp_path,
+    agent_type,
+    response,
+    question,
+    choices,
 ):
-    """Gateway config reaches the live callback without mutating agent prompts."""
-
-    from copy import deepcopy
-    from hermes_cli.config import DEFAULT_CONFIG
+    """Every model-authored clarify call reaches the user unchanged."""
 
     adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    adapter.clarify_response = response
     runner = _make_runner(adapter, tmp_path)
     gateway_run = _install_fakes(monkeypatch, "off")
 
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = RoutineClarifyAgent
+    fake_run_agent.AIAgent = agent_type
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    user_config = deepcopy(DEFAULT_CONFIG)
-    user_config["agent"]["clarify_policy"] = "blockers_only"
-    monkeypatch.setattr(
-        gateway_run,
-        "_load_gateway_config",
-        lambda: user_config,
-    )
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-
-    source = SessionSource(
-        platform=Platform.DISCORD,
-        chat_id="C1",
-        chat_type="dm",
-    )
-    result = await runner._run_agent(
-        message="finish the task",
-        context_prompt="",
-        history=[],
-        source=source,
-        session_id="sess-autonomy-clarify",
-        session_key="agent:main:discord:dm:C1",
-    )
-
-    assert "Proceed now" in result["final_response"]
-    assert adapter.clarify_prompts == []
-
-
-@pytest.mark.asyncio
-async def test_blockers_only_keeps_deploy_clarify_interactive_on_discord(
-    monkeypatch,
-    tmp_path,
-):
-    """High-impact production authority still renders a real Discord prompt."""
-
-    from copy import deepcopy
-    from hermes_cli.config import DEFAULT_CONFIG
-    from tools import clarify_gateway
-
-    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
-    adapter.clarify_response = "Cancel"
-    runner = _make_runner(adapter, tmp_path)
-    gateway_run = _install_fakes(monkeypatch, "off")
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = DeployClarifyAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-    user_config = deepcopy(DEFAULT_CONFIG)
-    user_config["agent"]["clarify_policy"] = "blockers_only"
-    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: user_config)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     session_key = "agent:main:discord:dm:C1"
@@ -300,18 +269,20 @@ async def test_blockers_only_keeps_deploy_clarify_interactive_on_discord(
         context_prompt="",
         history=[],
         source=source,
-        session_id="sess-deploy-clarify",
+        session_id="sess-llm-semantic-authority",
         session_key=session_key,
     )
 
-    assert result["final_response"] == "Cancel"
+    assert result["final_response"] == response
     assert adapter.clarify_prompts == [
         {
             "chat_id": "C1",
-            "question": "Should I merge and deploy this to production?",
-            "choices": ["Deploy to production", "Cancel"],
+            "question": question,
+            "choices": choices,
         }
     ]
+    from tools import clarify_gateway
+
     assert clarify_gateway.get_pending_for_session(
         session_key,
         include_choice_prompts=True,

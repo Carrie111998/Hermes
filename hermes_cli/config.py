@@ -1116,15 +1116,6 @@ DEFAULT_CONFIG = {
         # abandoned prompt — lower it if a single session must free up the
         # guard sooner.
         "clarify_timeout": 3600,
-        # Messaging-gateway clarification posture:
-        #   "interactive"   — every clarify tool call reaches the user.
-        #   "blockers_only" — routine, reversible engineering questions are
-        #                     answered with an autonomy instruction; user-only,
-        #                     business, external, and high-impact decisions
-        #                     remain interactive.
-        # This affects only the per-turn clarify callback. It does not rebuild
-        # the system prompt or invalidate the conversation prompt cache.
-        "clarify_policy": "interactive",
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.

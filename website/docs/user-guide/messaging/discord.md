@@ -703,8 +703,6 @@ Click a numbered button to answer, or click **Other** to type a free-form respon
 
 The buttons disable themselves once a choice is made so duplicate clicks don't double-resolve the prompt. Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `3600` seconds). If you don't respond within the timeout, the agent unblocks with a sentinel message and adapts rather than hanging.
 
-By default, `agent.clarify_policy` is `interactive`, so every valid clarify call reaches you. Set it to `blockers_only` when you want Hermes to handle a small, strict set of fully local and reversible engineering questions itself. User-only, business, external, unclassified, and high-impact decisions still render an interactive prompt.
-
 ## Home Channel
 
 You can designate a "home channel" where the bot sends proactive messages (such as cron job output, reminders, and notifications). There are two ways to set it:
@@ -906,4 +904,3 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
