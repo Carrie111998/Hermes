@@ -44,3 +44,54 @@ Bounded backplay remains a diagnostic/recovery replay: every batch is isolated f
 This commit begins writing offset-bearing session timestamps. A source rollback to a pre-fix runtime must not feed those entries to the old naive clock. Before restarting the old runtime, preserve `sessions.json`, then convert each offset-bearing `created_at`, `updated_at`, and `last_resume_marked_at` value to naive UTC (legacy host-local format). The normal forward deploy only restarts the service; `hermes_time` caches timezone resolution per process, so restart is required and is part of the existing deploy path.
 
 No deployment or client-host mutation is included. This commit is held for Edna's pa-agent review/deploy path.
+
+## Ruling compliance (2026-07-30, WB a9ab2ff5)
+
+Teren ruling (2026-07-29 15:52): Christopher runs ONE PERSISTENT SESSION PER
+CHAT THAT AUTOCOMPACTS — no daily reset, no idle reset. The fix above retained
+the 04:00 daily reset; this follow-on closes it.
+
+**Final behavior:** `session_reset: mode: none` is now the committed policy in
+Christopher's generated root config and all three engine-slot configs.
+`SessionResetPolicy` mode "none" never resets on daily boundaries or idle
+gaps; sessions end only through compression-chain rotation, which preserves
+the conversation (compressed history + summary checkpoint) under the same
+session key.
+
+**Compaction reality check (the flip precondition) — proven by test, not
+code-read**, in `tests/gateway/test_mode_none_compaction.py`:
+
+- The real `AIAgent._compress_context` → `ContextCompressor` machinery (only
+  the summariser's LLM network call mocked) compresses an oversized transcript
+  (40 → 6 messages, ~40K → ~18K estimated tokens), inserts a summary
+  checkpoint, and records the compression session chain in SQLite
+  (`end_reason='compression'`, parent link, `get_compression_tip` walk).
+- When summary generation fails outright (aux model down), compression still
+  bounds context via the static fallback marker and surfaces the failure —
+  the last line of defence against unbounded prompt growth under mode "none".
+- Repeated grow → compress cycles stay bounded; the chain remains walkable
+  from root to live tip.
+- On the gateway consumer path (`_handle_message`) with mode "none", a
+  transcript past the hygiene threshold (85% of model context, actual/estimated
+  tokens, plus the 400-message hard valve) is compressed through the real
+  `ContextCompressor`; the turn still completes, the transcript is rewritten
+  smaller with a summary checkpoint, and the session entry follows the
+  compression chain instead of resetting.
+- Cross-04:00-SGT-boundary and multi-day-idle turns REUSE the session under
+  mode "none", with a positive control proving the old "both" policy resets
+  under the same clock jump (the test can detect a reset).
+- Every committed Christopher config (root + 3 slots) carries
+  `session_reset: mode: none` and parses through the real yaml →
+  `default_reset_policy` plumbing to a never-reset policy.
+
+**Enforcement surface** (same as the timezone key): slot builder
+(`build_runtime_slots.py` renders + validates the block), `apply_engine_slot.py`,
+`validate_deployment_spec.py`, `verify_runtime.sh`, `SHA256SUMS` regenerated,
+and the deployment acceptance contract in `client-agent-deployment.yaml`.
+
+The reset-machinery regression tests from the prior commit are retained
+unchanged — they guard the daily/idle machinery for other tenants and the
+timezone-aware clock itself.
+
+No deployment or client-host mutation. Held on `worker/a9ab2ff5-9abdeced` for
+Edna's pa-agent review/deploy path.

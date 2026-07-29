@@ -85,6 +85,7 @@ def _validate_slot(slot_root: Path, slot: str) -> None:
     assert config["pa"]["enabled"] is False
     assert config["group_sessions_per_user"] is False
     assert config["timezone"] == "Asia/Singapore"
+    assert config["session_reset"] == {"mode": "none"}
     assert config["platforms"]["whatsapp"]["enabled"] is False
     assert config["model"]["provider"] == "openai-direct-primary"
     assert config["model"]["default"] == model

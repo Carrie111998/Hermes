@@ -381,6 +381,8 @@ providers:
 # one conversation per group chat (teren-greenlit 2026-06-17) — overrides per-participant default
 group_sessions_per_user: false
 timezone: Asia/Singapore
+session_reset:
+  mode: none
 memory:
   memory_enabled: false
   user_profile_enabled: false

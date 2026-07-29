@@ -328,7 +328,7 @@ spec:
 
   acceptance:
     - deployed file hashes match the selected committed slot manifest
-    - pa.enabled is false, group_sessions_per_user is false, and timezone is Asia/Singapore
+    - pa.enabled is false, group_sessions_per_user is false, timezone is Asia/Singapore, and session_reset mode is none
     - the production consumer remains standby without opening capture state
     - production cursor equals its immutable initial end-of-file boundary
     - production inbox and post-boundary production turn count are zero

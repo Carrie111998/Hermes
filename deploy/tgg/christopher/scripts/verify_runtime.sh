@@ -222,6 +222,7 @@ normalized_config["pa"]["enabled"] = False
 assert normalized_config == slot_config
 assert config["group_sessions_per_user"] is False
 assert config["timezone"] == "Asia/Singapore"
+assert config["session_reset"] == {"mode": "none"}
 assert config["platforms"]["whatsapp"]["enabled"] is False
 assert config["model"]["provider"] == "openai-direct-primary"
 assert config["model"]["default"] == slot_model
