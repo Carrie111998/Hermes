@@ -3,12 +3,23 @@
 import os
 import subprocess
 import sys
+import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ALLOW_UNPACKAGED_ROOT_MODULES = {
+    "mini_swe_runner",  # Standalone RL-training script, intentionally not installed.
+    "setup",  # Build guard loaded by setuptools, not an importable project module.
+}
+
+
+def _load_setuptools_metadata() -> dict:
+    with (PROJECT_ROOT / "pyproject.toml").open("rb") as handle:
+        return tomllib.load(handle)["tool"]["setuptools"]
 
 
 def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.CompletedProcess[str]:
@@ -53,6 +64,20 @@ def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.Compl
     )
 
 
+@pytest.fixture(scope="module")
+def allowed_artifacts(tmp_path_factory):
+    artifacts = {}
+    for kind, artifact_glob in (
+        ("sdist", "hermes_agent-*.tar.gz"),
+        ("wheel", "hermes_agent-*.whl"),
+    ):
+        output_dir = tmp_path_factory.mktemp(f"allowed-{kind}")
+        result = _build_artifact(kind, output_dir, nix_build=True)
+        assert result.returncode == 0, result.stderr
+        artifacts[kind] = next(output_dir.glob(artifact_glob))
+    return artifacts
+
+
 @pytest.mark.parametrize("kind", ["sdist", "wheel"])
 def test_artifact_build_rejects_nix_development_shell_environment(kind, tmp_path):
     result = _build_artifact(kind, tmp_path, nix_build=False)
@@ -65,8 +90,37 @@ def test_artifact_build_rejects_nix_development_shell_environment(kind, tmp_path
     ("kind", "artifact_glob"),
     [("sdist", "hermes_agent-*.tar.gz"), ("wheel", "hermes_agent-*.whl")],
 )
-def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_glob, tmp_path):
-    result = _build_artifact(kind, tmp_path, nix_build=True)
+def test_artifact_build_allows_explicit_nix_package_build_marker(
+    kind, artifact_glob, allowed_artifacts
+):
+    assert allowed_artifacts[kind].match(artifact_glob)
 
-    assert result.returncode == 0, result.stderr
-    assert list(tmp_path.glob(artifact_glob))
+
+def test_py_modules_cover_installable_root_modules():
+    """Every installable top-level source module must be declared explicitly."""
+    setuptools_metadata = _load_setuptools_metadata()
+    py_modules = setuptools_metadata["py-modules"]
+    assert py_modules == sorted(py_modules), "[tool.setuptools].py-modules must stay sorted"
+
+    all_root_modules = {path.stem for path in PROJECT_ROOT.glob("*.py")}
+    assert ALLOW_UNPACKAGED_ROOT_MODULES <= all_root_modules, (
+        "stale unpackaged-module exemptions: "
+        f"{sorted(ALLOW_UNPACKAGED_ROOT_MODULES - all_root_modules)}"
+    )
+    installable_root_modules = all_root_modules - ALLOW_UNPACKAGED_ROOT_MODULES
+    declared_modules = set(py_modules)
+    assert declared_modules == installable_root_modules, (
+        "[tool.setuptools].py-modules must cover every installable root module; "
+        f"missing={sorted(installable_root_modules - declared_modules)}, "
+        f"unexpected={sorted(declared_modules - installable_root_modules)}"
+    )
+
+
+def test_wheel_contains_every_declared_py_module(allowed_artifacts):
+    """The built wheel must contain every module promised by its metadata."""
+    py_modules = _load_setuptools_metadata()["py-modules"]
+    with zipfile.ZipFile(allowed_artifacts["wheel"]) as archive:
+        wheel_members = set(archive.namelist())
+
+    missing = [module for module in py_modules if f"{module}.py" not in wheel_members]
+    assert not missing, f"declared py-modules missing from wheel: {missing}"
