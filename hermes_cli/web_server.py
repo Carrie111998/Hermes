@@ -1392,17 +1392,18 @@ class ModelAssignment(BaseModel):
     provider: str
     model: str
     task: str = ""
-    # Optional OpenAI-compatible endpoint URL. Only honored for custom/local
-    # providers on the main slot — lets the GUI configure a self-hosted endpoint
-    # (vLLM, llama.cpp, Ollama, …) that needs no API key. The runtime resolver
-    # reads model.base_url from config (it ignores OPENAI_BASE_URL), so this is
-    # the path that actually wires a local endpoint into resolution.
+    # Optional OpenAI-compatible endpoint URL. Honored for custom/local
+    # providers on the main slot AND on auxiliary slots — lets the GUI wire a
+    # self-hosted endpoint (vLLM, llama.cpp, Ollama, …) that needs no API key.
+    # The runtime resolvers read model.base_url / auxiliary.<task>.base_url
+    # from config (they ignore OPENAI_BASE_URL), so this is the path that
+    # actually wires a local endpoint into resolution.
     base_url: str = ""
     # Optional API key for a custom/local endpoint. Persisted to
-    # ``model.api_key`` (where the runtime resolver reads it) so a self-hosted
-    # endpoint that requires auth works from the GUI — mirrors the key the
-    # ``hermes model`` custom flow collects. Honored only on the main slot for
-    # custom/local providers.
+    # ``model.api_key`` (main slot) or ``auxiliary.<task>.api_key`` (aux
+    # slots) — where the runtime resolvers read it — so a self-hosted
+    # endpoint that requires auth works from the GUI. Mirrors the key the
+    # ``hermes model`` custom flow collects.
     api_key: str = ""
     confirm_expensive_model: bool = False
     profile: Optional[str] = None
@@ -3695,9 +3696,11 @@ async def get_portal_status():
     cfg = load_config() or {}
     auth: Dict[str, Any] = {}
     try:
-        from hermes_cli.auth import get_nous_auth_status
+        from hermes_cli.auth import get_nous_auth_status_local
 
-        auth = get_nous_auth_status() or {}
+        # Read-only dashboard endpoint: refresh-free snapshot so polling
+        # never performs an OAuth refresh or burns a refresh token.
+        auth = get_nous_auth_status_local() or {}
     except Exception:
         auth = {}
 
@@ -4898,6 +4901,7 @@ def get_sessions(
     archived: str = "exclude",
     order: str = "created",
     source: str = None,
+    sources: str = None,
     exclude_sources: str = None,
     cwd_prefix: str = None,
     full: bool = False,
@@ -4942,12 +4946,15 @@ def get_sessions(
             archived_only = archived == "only"
             include_archived = archived == "include"
             # Optional source scoping: ``source`` includes a single class,
+            # ``sources`` includes any of several comma-separated classes, and
             # ``exclude_sources`` (comma-separated) drops classes. The desktop
             # uses these to split recents (exclude=cron) from the cron-jobs
             # section (source=cron) into two independent lists.
-            exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+            source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+            exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
             sessions = db.list_sessions_rich(
                 source=source or None,
+                sources=source_list or None,
                 exclude_sources=exclude_list or None,
                 cwd_prefix=(cwd_prefix or None),
                 limit=limit,
@@ -4963,6 +4970,7 @@ def get_sessions(
             )
             total = db.session_count(
                 source=source or None,
+                sources=source_list or None,
                 cwd_prefix=(cwd_prefix or None),
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
@@ -5002,6 +5010,7 @@ def get_profiles_sessions(
     order: str = "recent",
     profile: str = "all",
     source: str = None,
+    sources: str = None,
     exclude_sources: str = None,
     full: bool = False,
 ):
@@ -5046,7 +5055,8 @@ def get_profiles_sessions(
     # the cron-jobs section passes source=cron — two independent lists so
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
-    exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+    source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+    exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -5071,6 +5081,7 @@ def get_profiles_sessions(
         try:
             rows = db.list_sessions_rich(
                 source=source_filter,
+                sources=source_list or None,
                 exclude_sources=exclude_list or None,
                 limit=per_profile,
                 offset=0,
@@ -5083,6 +5094,7 @@ def get_profiles_sessions(
             )
             profile_total = db.session_count(
                 source=source_filter,
+                sources=source_list or None,
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
@@ -5247,7 +5259,14 @@ def get_profiles_sessions_sidebar(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] = None):
+async def search_sessions(
+    q: str = "",
+    limit: int = 20,
+    profile: Optional[str] = None,
+    source: str = None,
+    sources: str = None,
+    exclude_sources: str = None,
+):
     """Search sessions by ID plus full-text message content using FTS5.
 
     Direct session-id matches are surfaced first, then FTS message-content
@@ -5264,6 +5283,11 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
         db = _open_session_db_for_profile(profile)
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
+            source_filter = source or None
+            source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
+            include_sources = [source_filter] if source_filter else (source_list or None)
+            exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
+            now = time.time()
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
@@ -5348,15 +5372,52 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
                 if root in seen or len(seen) >= safe_limit:
                     return
                 payload = dict(payload)
-                payload["session_id"] = lineage_tip(root)
+                sid = lineage_tip(root)
+                payload["session_id"] = sid
                 payload["lineage_root"] = root
+                try:
+                    row = db.get_session_rich_row(sid)
+                except Exception:
+                    row = None
+                if row:
+                    payload.update(
+                        {
+                            "id": row.get("id") or sid,
+                            "source": row.get("source"),
+                            "model": row.get("model"),
+                            "title": row.get("title"),
+                            "started_at": row.get("started_at"),
+                            "ended_at": row.get("ended_at"),
+                            "last_active": row.get("last_active") or row.get("started_at"),
+                            "is_active": (
+                                row.get("ended_at") is None
+                                and (now - (row.get("last_active") or row.get("started_at") or 0)) < 300
+                            ),
+                            "message_count": row.get("message_count") or 0,
+                            "tool_call_count": row.get("tool_call_count") or 0,
+                            "input_tokens": row.get("input_tokens") or 0,
+                            "output_tokens": row.get("output_tokens") or 0,
+                            "preview": row.get("preview"),
+                            "parent_session_id": row.get("parent_session_id"),
+                            "archived": bool(row.get("archived")),
+                        }
+                    )
+                else:
+                    payload["id"] = sid
                 seen[root] = payload
 
             # Direct ID matches first: users often paste a session id from CLI,
             # logs, or another Hermes surface. FTS can't find those unless the
             # id happens to appear in message text. search_sessions_by_id is
             # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
+            for row in db.search_sessions_by_id(
+                q,
+                limit=safe_limit,
+                include_archived=True,
+                source=source_filter,
+                sources=source_list or None,
+                exclude_sources=exclude_list or None,
+            ):
                 sid = row.get("id")
                 preview = (row.get("preview") or "").strip()
                 snippet = preview or f"Session ID: {sid}"
@@ -5385,7 +5446,12 @@ async def search_sessions(q: str = "", limit: int = 20, profile: Optional[str] =
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations even when several hits collapse onto one root.
             fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
+            matches = db.search_messages(
+                query=prefix_query,
+                source_filter=include_sources,
+                exclude_sources=exclude_list or None,
+                limit=fetch_limit,
+            )
 
             for m in matches:
                 if len(seen) >= safe_limit:
@@ -5974,24 +6040,38 @@ def _install_memory_provider_pip_dependencies(dependencies: List[str]) -> List[D
             _command_result(kind="pip", name=", ".join(dependencies), status="already_installed")
         ]
 
-    uv_path = shutil.which("uv")
-    if uv_path:
-        command: Any = [uv_path, "pip", "install", "--python", sys.executable, "--quiet", *missing]
-        display = f"uv pip install --python {sys.executable} {' '.join(missing)}"
-    else:
-        command = [sys.executable, "-m", "pip", "install", "--quiet", *missing]
-        display = f"{sys.executable} -m pip install {' '.join(missing)}"
-
+    # Route through the lazy-install pipeline (tools.lazy_deps.install_specs)
+    # instead of shelling out to pip against sys.executable directly. That
+    # pipeline is environment-aware: on hosted/immutable images the agent venv
+    # under /opt/hermes is sealed read-only, and installs must be redirected
+    # to the writable durable target on the data volume
+    # (HERMES_LAZY_INSTALL_TARGET, e.g. /opt/data/lazy-packages) — the same
+    # path every lazy backend already uses. A direct `pip install --python
+    # sys.executable` on those images fails with a permission error (NS-605).
+    # install_specs also activates the target on sys.path post-install so the
+    # availability recheck below sees the new packages without a restart.
     try:
-        completed = _run_setup_command(command, display=display, timeout=240)
+        from tools.lazy_deps import install_specs
+
+        outcome = install_specs(missing, timeout=240)
     except Exception as exc:
         return [
             _command_result(
                 kind="pip",
                 name=", ".join(missing),
                 status="failed",
-                command=display,
                 error=str(exc),
+            )
+        ]
+
+    if outcome.blocked:
+        return [
+            _command_result(
+                kind="pip",
+                name=", ".join(missing),
+                status="failed",
+                command=outcome.command,
+                error=outcome.reason,
             )
         ]
 
@@ -5999,9 +6079,14 @@ def _install_memory_provider_pip_dependencies(dependencies: List[str]) -> List[D
         _command_result(
             kind="pip",
             name=", ".join(missing),
-            status="installed" if completed.returncode == 0 else "failed",
-            command=display,
-            completed=completed,
+            status="installed" if outcome.ok else "failed",
+            command=outcome.command,
+            completed=subprocess.CompletedProcess(
+                args=outcome.command,
+                returncode=0 if outcome.ok else 1,
+                stdout=outcome.stdout,
+                stderr=outcome.stderr,
+            ),
         )
     ]
 
@@ -7252,7 +7337,19 @@ def _apply_model_assignment_sync(
         new_provider = provider.strip().lower()
         slot_cfg["provider"] = provider
         slot_cfg["model"] = model
-        if new_provider != prev_provider and new_provider != "custom":
+        if base_url:
+            # Sibling of the main-slot endpoint handling (#65254): an aux
+            # assignment for a custom/local endpoint must carry its own
+            # base_url, or the slot silently rebinds to whatever
+            # model.base_url happens to hold — and breaks entirely once the
+            # main slot switches away and clears it. The auxiliary resolver
+            # already reads auxiliary.<task>.base_url/api_key
+            # (_resolve_task_provider_model), so persisting them here is
+            # what actually wires the endpoint in.
+            slot_cfg["base_url"] = base_url
+            if api_key:
+                slot_cfg["api_key"] = api_key
+        elif new_provider != prev_provider and new_provider != "custom":
             slot_cfg.pop("base_url", None)
             clear_model_endpoint_credentials(slot_cfg)
         aux[slot] = slot_cfg
@@ -10342,7 +10439,9 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
     try:
         from hermes_cli import auth as hauth
         if provider_id == "nous":
-            raw = hauth.get_nous_auth_status()
+            # Read-only accounts-tab card: refresh-free snapshot so listing
+            # providers never performs an OAuth refresh.
+            raw = hauth.get_nous_auth_status_local()
             return {
                 "logged_in": bool(raw.get("logged_in")),
                 "source": "nous_portal",

@@ -6,8 +6,22 @@ import { createSpectrumRuntime } from "../spectrum-runtime.mjs";
 function runtimeHarness() {
   const imports = [];
   const configs = [];
-  const localIMessage = { config: () => ({ provider: "local" }) };
-  const imessage = { config: () => ({ provider: "cloud" }) };
+  const localIMessage = Object.assign(
+    () => ({ provider: "local-runtime" }),
+    {
+      config: () => ({ provider: "local" }),
+      effect: { message: { confetti: "local-confetti" } },
+    }
+  );
+  const imessage = Object.assign(
+    () => ({ provider: "cloud-runtime" }),
+    {
+      config: () => ({ provider: "cloud" }),
+      effect: { message: { confetti: "cloud-confetti" } },
+    }
+  );
+  const localEffect = Symbol("local-effect");
+  const cloudEffect = Symbol("cloud-effect");
   const core = {
     Spectrum: async (config) => {
       configs.push(config);
@@ -17,18 +31,29 @@ function runtimeHarness() {
     voice: Symbol("voice"),
     text: Symbol("text"),
     markdown: Symbol("markdown"),
+    richlink: Symbol("richlink"),
     typing: Symbol("typing"),
+    poll: Symbol("poll"),
   };
   const modules = {
     "@spectrum-ts/core": core,
-    "@spectrum-ts/imessage-local": { localIMessage },
-    "spectrum-ts/providers/imessage": { imessage },
+    "@spectrum-ts/imessage-local": { localIMessage, effect: localEffect },
+    "spectrum-ts/providers/imessage": { imessage, effect: cloudEffect },
   };
   const importer = async (specifier) => {
     imports.push(specifier);
     return modules[specifier];
   };
-  return { configs, core, importer, imports };
+  return {
+    cloudEffect,
+    configs,
+    core,
+    importer,
+    imports,
+    localEffect,
+    localIMessage,
+    imessage,
+  };
 }
 
 test("local mode selects the dedicated local provider without cloud credentials", async () => {
@@ -52,12 +77,17 @@ test("local mode selects the dedicated local provider without cloud credentials"
     telemetry: false,
   }]);
   assert.equal(runtime.attachment, harness.core.attachment);
+  assert.equal(runtime.provider, harness.localIMessage);
+  assert.equal(runtime.spectrumRichlink, harness.core.richlink);
+  assert.equal(runtime.spectrumPoll, harness.core.poll);
+  assert.equal(runtime.imessageEffect, harness.localEffect);
+  assert.deepEqual(runtime.messageEffects, { confetti: "local-confetti" });
 });
 
 test("cloud mode selects the managed provider and passes project credentials", async () => {
   const harness = runtimeHarness();
 
-  await createSpectrumRuntime({
+  const runtime = await createSpectrumRuntime({
     localMode: false,
     projectId: "project-id",
     projectSecret: "project-secret",
@@ -76,6 +106,9 @@ test("cloud mode selects the managed provider and passes project credentials", a
     projectId: "project-id",
     projectSecret: "project-secret",
   }]);
+  assert.equal(runtime.provider, harness.imessage);
+  assert.equal(runtime.imessageEffect, harness.cloudEffect);
+  assert.deepEqual(runtime.messageEffects, { confetti: "cloud-confetti" });
 });
 
 test("installed Spectrum packages expose both provider APIs", async () => {

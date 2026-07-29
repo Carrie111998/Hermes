@@ -31,10 +31,15 @@ export async function createSpectrumRuntime({
 
   return {
     app: await core.Spectrum(config),
+    provider: imessage,
     attachment: core.attachment,
     voice: core.voice,
     spectrumText: core.text,
     spectrumMarkdown: core.markdown,
+    spectrumRichlink: core.richlink,
     spectrumTyping: core.typing,
+    spectrumPoll: core.poll,
+    imessageEffect: providerModule.effect,
+    messageEffects: imessage?.effect?.message || {},
   };
 }
