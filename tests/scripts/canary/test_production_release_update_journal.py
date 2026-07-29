@@ -116,6 +116,47 @@ def test_nonroot_test_mode_pins_owner_private_parent_group(
     assert journal.load() == []
 
 
+def test_nonroot_test_mode_fails_closed_without_posix_uid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delattr(
+        journal_module.os,
+        "geteuid",
+        raising=False,
+    )
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match="release_update_journal_configuration_invalid",
+    ):
+        journal_module.ReleaseUpdateJournal._for_test(
+            (tmp_path / "transaction").resolve(),
+            authority_record=_authority_record(),
+        )
+
+
+@pytest.mark.parametrize("attribute", ["geteuid", "getegid"])
+def test_production_mode_fails_closed_without_posix_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+) -> None:
+    monkeypatch.setattr(journal_module.sys, "platform", "linux")
+    monkeypatch.delattr(
+        journal_module.os,
+        attribute,
+        raising=False,
+    )
+
+    with pytest.raises(
+        journal_module.ProductionReleaseUpdateJournalError,
+        match="release_update_journal_root_required",
+    ):
+        journal_module.ReleaseUpdateJournal(
+            authority_record=_authority_record(),
+        )
+
+
 def test_production_directory_trust_still_requires_root_group() -> None:
     journal = object.__new__(journal_module.ReleaseUpdateJournal)
     journal._require_root = True

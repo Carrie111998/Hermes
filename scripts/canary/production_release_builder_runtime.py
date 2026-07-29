@@ -29,7 +29,16 @@ import unicodedata
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterable, Mapping, NoReturn, Protocol, Sequence
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Literal,
+    Mapping,
+    NoReturn,
+    Protocol,
+    Sequence,
+)
 
 
 MANIFEST_SCHEMA = "muncho-production-release-whole-tree-manifest.v1"
@@ -93,6 +102,19 @@ class ProductionReleaseBuilderError(RuntimeError):
 def _error(code: str, exc: BaseException | None = None) -> NoReturn:
     del exc
     raise ProductionReleaseBuilderError(code) from None
+
+
+def _read_posix_identity(name: Literal["geteuid", "getegid"]) -> int:
+    reader = getattr(os, name, None)
+    if not callable(reader):
+        _error("production_release_builder_posix_identity_unavailable")
+    try:
+        value = reader()
+    except (OSError, TypeError, ValueError) as exc:
+        _error("production_release_builder_posix_identity_unavailable", exc)
+    if type(value) is not int or value < 0:
+        _error("production_release_builder_posix_identity_unavailable")
+    return value
 
 
 def _canonical(value: Any) -> bytes:
@@ -942,7 +964,7 @@ def materialize_git_tree(
         root_descriptor, _root_identity = _open_child_directory(
             parent_descriptor,
             destination.name,
-            expected_uid=os.geteuid(),
+            expected_uid=_read_posix_identity("geteuid"),
             expected_gid=None,
             allowed_modes=frozenset({0o700}),
         )
@@ -955,7 +977,7 @@ def materialize_git_tree(
             directory_descriptor = _open_relative_directory(
                 root_descriptor,
                 parts[:-1],
-                expected_uid=os.geteuid(),
+                expected_uid=_read_posix_identity("geteuid"),
                 expected_gid=None,
                 create=True,
             )
@@ -986,7 +1008,7 @@ def materialize_git_tree(
             directory_descriptor = _open_relative_directory(
                 root_descriptor,
                 parts,
-                expected_uid=os.geteuid(),
+                expected_uid=_read_posix_identity("geteuid"),
                 expected_gid=None,
                 create=False,
             )
@@ -1204,7 +1226,11 @@ def validate_release_identities(
         != identities.reserved_runtime_gids
     ):
         _error("production_release_builder_identity_contract_invalid")
-    observed_euid = os.geteuid() if effective_uid is None else effective_uid
+    observed_euid = (
+        _read_posix_identity("geteuid")
+        if effective_uid is None
+        else effective_uid
+    )
     if require_effective_root and observed_euid != identities.root_uid:
         _error("production_release_builder_root_authority_required")
     return identities

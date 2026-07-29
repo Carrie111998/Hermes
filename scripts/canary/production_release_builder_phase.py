@@ -28,7 +28,7 @@ import unicodedata
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, NoReturn, Protocol, Sequence
+from typing import Any, Callable, Literal, Mapping, NoReturn, Protocol, Sequence
 
 from scripts.canary import production_release_builder_runtime as builder
 
@@ -218,6 +218,19 @@ class ProductionReleaseBuilderPhaseError(RuntimeError):
 def _fail(code: str, exc: BaseException | None = None) -> NoReturn:
     del exc
     raise ProductionReleaseBuilderPhaseError(code) from None
+
+
+def _read_posix_identity(name: Literal["geteuid", "getegid"]) -> int:
+    reader = getattr(os, name, None)
+    if not callable(reader):
+        _fail("release_builder_phase_posix_identity_unavailable")
+    try:
+        value = reader()
+    except (OSError, TypeError, ValueError) as exc:
+        _fail("release_builder_phase_posix_identity_unavailable", exc)
+    if type(value) is not int or value < 0:
+        _fail("release_builder_phase_posix_identity_unavailable")
+    return value
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -661,8 +674,16 @@ def validate_builder_identity(
     effective_uid: int | None = None,
     effective_gid: int | None = None,
 ) -> Mapping[str, Any]:
-    observed_uid = os.geteuid() if effective_uid is None else effective_uid
-    observed_gid = os.getegid() if effective_gid is None else effective_gid
+    observed_uid = (
+        _read_posix_identity("geteuid")
+        if effective_uid is None
+        else effective_uid
+    )
+    observed_gid = (
+        _read_posix_identity("getegid")
+        if effective_gid is None
+        else effective_gid
+    )
     if observed_uid != BUILDER_UID or observed_gid != BUILDER_GID:
         _fail("release_builder_phase_effective_identity_invalid")
     try:
@@ -1255,18 +1276,22 @@ def _run_builder_phase_for_test(
         physical_builder_gid = BUILDER_GID
     else:
         authority_uid = (
-            os.geteuid() if test_authority_uid is None else test_authority_uid
+            _read_posix_identity("geteuid")
+            if test_authority_uid is None
+            else test_authority_uid
         )
         authority_gid = (
-            os.getegid() if test_authority_gid is None else test_authority_gid
+            _read_posix_identity("getegid")
+            if test_authority_gid is None
+            else test_authority_gid
         )
         physical_builder_uid = (
-            os.geteuid()
+            _read_posix_identity("geteuid")
             if test_physical_builder_uid is None
             else test_physical_builder_uid
         )
         physical_builder_gid = (
-            os.getegid()
+            _read_posix_identity("getegid")
             if test_physical_builder_gid is None
             else test_physical_builder_gid
         )

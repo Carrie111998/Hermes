@@ -117,6 +117,32 @@ def _fail(code: str) -> NoReturn:
     raise ProductionReleaseUpdateStage0Error(code) from None
 
 
+def _posix_effective_uid(*, failure_code: str) -> int:
+    getter = getattr(os, "geteuid", None)
+    if not callable(getter):
+        _fail(failure_code)
+    try:
+        value = getter()
+    except (OSError, TypeError, ValueError):
+        _fail(failure_code)
+    if type(value) is not int or value < 0:
+        _fail(failure_code)
+    return value
+
+
+def _posix_effective_gid(*, failure_code: str) -> int:
+    getter = getattr(os, "getegid", None)
+    if not callable(getter):
+        _fail(failure_code)
+    try:
+        value = getter()
+    except (OSError, TypeError, ValueError):
+        _fail(failure_code)
+    if type(value) is not int or value < 0:
+        _fail(failure_code)
+    return value
+
+
 @dataclass(frozen=True)
 class Stage0Roots:
     """Fixed roots used by stage 0.
@@ -649,7 +675,12 @@ def _verify_stage0(
     if production:
         if (
             not sys.platform.startswith("linux")
-            or os.geteuid() != 0
+            or _posix_effective_uid(
+                failure_code=(
+                    "release_update_stage0_root_authority_required"
+                )
+            )
+            != 0
             or now_unix is not None
             or test_expected_uid is not None
             or test_expected_gid is not None
@@ -663,12 +694,16 @@ def _verify_stage0(
         if now_unix is None or type(now_unix) is not int or now_unix <= 0:
             _fail("release_update_stage0_time_invalid")
         expected_uid = (
-            os.geteuid()
+            _posix_effective_uid(
+                failure_code="release_update_stage0_contract_invalid"
+            )
             if test_expected_uid is None
             else test_expected_uid
         )
         expected_gid = (
-            os.getegid()
+            _posix_effective_gid(
+                failure_code="release_update_stage0_contract_invalid"
+            )
             if test_expected_gid is None
             else test_expected_gid
         )

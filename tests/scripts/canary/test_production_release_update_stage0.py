@@ -647,6 +647,25 @@ def _replace_publication(
     )
 
 
+@pytest.mark.parametrize("attribute", ["geteuid", "getegid"])
+def test_posix_identity_helpers_fail_closed_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+) -> None:
+    monkeypatch.delattr(stage0.os, attribute, raising=False)
+    helper = (
+        stage0._posix_effective_uid
+        if attribute == "geteuid"
+        else stage0._posix_effective_gid
+    )
+
+    with pytest.raises(
+        stage0.ProductionReleaseUpdateStage0Error,
+        match="release_update_stage0_contract_invalid",
+    ):
+        helper(failure_code="release_update_stage0_contract_invalid")
+
+
 def test_stage0_returns_only_held_verified_descriptors(
     tmp_path: Path,
 ) -> None:

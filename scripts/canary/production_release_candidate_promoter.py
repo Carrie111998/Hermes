@@ -35,7 +35,7 @@ import sys
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Mapping, NoReturn, Sequence
+from typing import Any, Callable, Literal, Mapping, NoReturn, Sequence
 
 from scripts.canary import production_release_builder_phase as phase
 from scripts.canary import production_release_builder_runtime as builder
@@ -150,6 +150,19 @@ class ProductionReleaseCandidatePromoterError(RuntimeError):
 def _fail(code: str, exc: BaseException | None = None) -> NoReturn:
     del exc
     raise ProductionReleaseCandidatePromoterError(code) from None
+
+
+def _read_posix_identity(name: Literal["geteuid", "getegid"]) -> int:
+    reader = getattr(os, name, None)
+    if not callable(reader):
+        _fail("candidate_promoter_posix_identity_unavailable")
+    try:
+        value = reader()
+    except (OSError, TypeError, ValueError) as exc:
+        _fail("candidate_promoter_posix_identity_unavailable", exc)
+    if type(value) is not int or value < 0:
+        _fail("candidate_promoter_posix_identity_unavailable")
+    return value
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -2061,7 +2074,7 @@ def _promote_candidate_for_test(
     if production:
         if (
             not sys.platform.startswith("linux")
-            or os.geteuid() != 0
+            or _read_posix_identity("geteuid") != 0
             or any(
                 item is not None
                 for item in (
@@ -2098,43 +2111,47 @@ def _promote_candidate_for_test(
         wrapper_sha256 = PRODUCTION_BUILDER_WRAPPER_SHA256
     else:
         authority_uid = (
-            os.geteuid()
+            _read_posix_identity("geteuid")
             if test_authority_uid is None
             else test_authority_uid
         )
         authority_gid = (
-            os.getegid()
+            _read_posix_identity("getegid")
             if test_authority_gid is None
             else test_authority_gid
         )
         interlock_gid = (
-            os.getegid()
+            _read_posix_identity("getegid")
             if test_interlock_gid is None
             else test_interlock_gid
         )
         source_builder_uid = (
-            os.geteuid()
+            _read_posix_identity("geteuid")
             if test_source_builder_uid is None
             else test_source_builder_uid
         )
         source_builder_gid = (
-            os.getegid()
+            _read_posix_identity("getegid")
             if test_source_builder_gid is None
             else test_source_builder_gid
         )
         staging_uid = (
-            os.geteuid() if test_staging_uid is None else test_staging_uid
+            _read_posix_identity("geteuid")
+            if test_staging_uid is None
+            else test_staging_uid
         )
         staging_gid = (
-            os.getegid() if test_staging_gid is None else test_staging_gid
+            _read_posix_identity("getegid")
+            if test_staging_gid is None
+            else test_staging_gid
         )
         publication_uid = (
-            os.geteuid()
+            _read_posix_identity("geteuid")
             if test_publication_uid is None
             else test_publication_uid
         )
         publication_gid = (
-            os.getegid()
+            _read_posix_identity("getegid")
             if test_publication_gid is None
             else test_publication_gid
         )

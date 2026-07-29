@@ -85,6 +85,36 @@ class ProductionReleaseUpdateJournalError(RuntimeError):
     """Stable, secret-free release-update journal failure."""
 
 
+def _posix_effective_uid(*, failure_code: str) -> int:
+    getter = getattr(os, "geteuid", None)
+    if not callable(getter):
+        raise ProductionReleaseUpdateJournalError(failure_code)
+    try:
+        value = getter()
+    except (OSError, TypeError, ValueError) as exc:
+        raise ProductionReleaseUpdateJournalError(
+            failure_code
+        ) from exc
+    if type(value) is not int or value < 0:
+        raise ProductionReleaseUpdateJournalError(failure_code)
+    return value
+
+
+def _posix_effective_gid(*, failure_code: str) -> int:
+    getter = getattr(os, "getegid", None)
+    if not callable(getter):
+        raise ProductionReleaseUpdateJournalError(failure_code)
+    try:
+        value = getter()
+    except (OSError, TypeError, ValueError) as exc:
+        raise ProductionReleaseUpdateJournalError(
+            failure_code
+        ) from exc
+    if type(value) is not int or value < 0:
+        raise ProductionReleaseUpdateJournalError(failure_code)
+    return value
+
+
 def _checkpoint(_name: str) -> None:
     """Test seam at each durable journal boundary."""
 
@@ -317,8 +347,14 @@ class ReleaseUpdateJournal:
             )
         if require_root and (
             not sys.platform.startswith("linux")
-            or os.geteuid() != 0  # windows-footgun: ok — Linux boundary
-            or os.getegid() != 0  # windows-footgun: ok — Linux boundary
+            or _posix_effective_uid(
+                failure_code="release_update_journal_root_required"
+            )
+            != 0
+            or _posix_effective_gid(
+                failure_code="release_update_journal_root_required"
+            )
+            != 0
         ):
             raise ProductionReleaseUpdateJournalError(
                 "release_update_journal_root_required"
@@ -328,7 +364,15 @@ class ReleaseUpdateJournal:
         self._intent = validated_intent
         self._require_root = require_root
         self._xattr_reader = xattr_reader
-        self._uid = 0 if require_root else os.geteuid()
+        self._uid = (
+            0
+            if require_root
+            else _posix_effective_uid(
+                failure_code=(
+                    "release_update_journal_configuration_invalid"
+                )
+            )
+        )
         if require_root:
             self._gid = 0
         else:
