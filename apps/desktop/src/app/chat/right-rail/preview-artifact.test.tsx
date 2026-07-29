@@ -30,16 +30,18 @@ describe('ArtifactPreview', () => {
     $artifactVersionSelection.set({})
   })
 
-  it('renders html in a scripts-only sandboxed frame the parent app is unreachable from', async () => {
+  it('renders html in an isolated guest process instead of the app renderer', async () => {
     const { artifactId } = register('Dashboard', 'html', '<h1>Hi</h1>')
     await renderArtifact(artifactId)
 
-    const frame = screen.getByTitle('Dashboard') as HTMLIFrameElement
+    const guest = screen.getByTitle('Dashboard')
 
-    expect(frame.getAttribute('sandbox')).toBe('allow-scripts')
-    expect(frame.srcdoc).toContain('<h1>Hi</h1>')
-    // No allow-same-origin: scripts inside cannot reach the renderer's origin.
-    expect(frame.getAttribute('sandbox')).not.toContain('same-origin')
+    expect(guest.tagName).toBe('WEBVIEW')
+    expect(guest.getAttribute('partition')).toBe('hermes-artifact-preview')
+    expect(guest.getAttribute('webpreferences')).toContain('nodeIntegration=no')
+    expect(guest.getAttribute('src')).toMatch(/^data:text\/html;charset=utf-8,/)
+    expect(window.document.querySelector('iframe')).toBeNull()
+    expect(decodeURIComponent(guest.getAttribute('src')!.split(',')[1]!)).toContain('<h1>Hi</h1>')
   })
 
   it('strips scripts out of svg before it renders inline', async () => {
@@ -51,8 +53,8 @@ describe('ArtifactPreview', () => {
 
     await renderArtifact(artifactId)
 
-    expect(document.querySelector('svg')).not.toBeNull()
-    expect(document.querySelector('svg script')).toBeNull()
+    expect(window.document.querySelector('svg')).not.toBeNull()
+    expect(window.document.querySelector('svg script')).toBeNull()
   })
 
   it('offers only the source view for code, which has nothing to render', async () => {
@@ -68,14 +70,14 @@ describe('ArtifactPreview', () => {
     await renderArtifact(artifactId)
 
     expect(screen.getByText('v2 of 2')).toBeTruthy()
-    expect((screen.getByTitle('Dashboard') as HTMLIFrameElement).srcdoc).toContain('v2')
+    expect(decodeURIComponent(screen.getByTitle('Dashboard').getAttribute('src')!.split(',')[1]!)).toContain('v2')
 
     await act(async () => {
       $artifactVersionSelection.set({ [artifactId]: 0 })
     })
 
     expect(screen.getByText('v1 of 2')).toBeTruthy()
-    expect((screen.getByTitle('Dashboard') as HTMLIFrameElement).srcdoc).toContain('v1')
+    expect(decodeURIComponent(screen.getByTitle('Dashboard').getAttribute('src')!.split(',')[1]!)).toContain('v1')
   })
 
   it('hides the stepper for a single-version artifact', async () => {
@@ -93,7 +95,7 @@ describe('ArtifactPreview', () => {
       register('Dashboard', 'html', '<h1>v2</h1>')
     })
 
-    expect((screen.getByTitle('Dashboard') as HTMLIFrameElement).srcdoc).toContain('v2')
+    expect(decodeURIComponent(screen.getByTitle('Dashboard').getAttribute('src')!.split(',')[1]!)).toContain('v2')
   })
 
   it('falls back to an empty state when the registry no longer has the artifact', async () => {
