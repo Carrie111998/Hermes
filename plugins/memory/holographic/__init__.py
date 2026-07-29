@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -151,6 +151,8 @@ class HolographicMemoryProvider(MemoryProvider):
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
+            {"key": "auto_capture", "description": "Auto-capture tool observations via LLM into facts mid-session", "default": "false", "choices": ["true", "false"]},
+            {"key": "capture_interval", "description": "Auto-capture: compress every N turns", "default": "5"},
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -177,6 +179,11 @@ class HolographicMemoryProvider(MemoryProvider):
             hrr_dim=hrr_dim,
         )
         self._session_id = session_id
+
+        # -- Auto-capture config --------------------------------------------------
+        self._auto_capture = is_truthy_value(self._config.get("auto_capture", False))
+        self._capture_interval = int(self._config.get("capture_interval", 5))
+        self._capture = None  # lazily initialized when ctx.llm becomes available
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -217,10 +224,13 @@ class HolographicMemoryProvider(MemoryProvider):
             logger.debug("Holographic prefetch failed: %s", e)
             return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Holographic memory stores explicit facts via tools, not auto-sync.
-        # The on_session_end hook handles auto-extraction if configured.
-        pass
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None) -> None:
+        # Auto-capture: feed turn messages to CaptureEngine
+        if self._auto_capture and self._capture is not None and messages:
+            try:
+                self._capture.observe_turn(messages)
+            except Exception as e:
+                logger.debug("Auto-capture observe_turn failed: %s", e)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
@@ -265,6 +275,24 @@ class HolographicMemoryProvider(MemoryProvider):
                 logger.debug("Holographic shutdown close() failed: %s", e)
         self._store = None
         self._retriever = None
+
+    def init_capture(self, llm: Any) -> None:
+        """Initialize the CaptureEngine once ctx.llm is available.
+
+        Called from register() after ctx is handed to the plugin.
+        Separate from initialize() because ctx.llm is not available
+        until after register() completes.
+        """
+        if not self._auto_capture:
+            return
+        if self._capture is not None:
+            return  # already initialized
+        from .capture import CaptureEngine
+        self._capture = CaptureEngine(
+            store=self._store,
+            llm=llm,
+            interval=self._capture_interval,
+        )
 
     # -- Tool handlers -------------------------------------------------------
 
@@ -459,4 +487,5 @@ def register(ctx) -> None:
     """Register the holographic memory provider with the plugin system."""
     config = _load_plugin_config()
     provider = HolographicMemoryProvider(config=config)
+    provider.init_capture(ctx.llm)  # wire capture engine
     ctx.register_memory_provider(provider)
