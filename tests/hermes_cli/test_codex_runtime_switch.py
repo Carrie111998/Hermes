@@ -102,7 +102,7 @@ class TestApply:
         `openai_runtime: codex_app_server` in config.yaml, then runs
         /codex-runtime codex_app_server expecting the migration. Without
         this, the slash command short-circuits with "already set" and
-        ~/.codex/config.toml never gets the hermes-tools MCP callback
+        the active Codex config never gets the hermes-tools MCP callback
         or plugin migration — silent partial setup.
         """
         cfg = {
@@ -145,6 +145,28 @@ class TestApply:
         # Caller still needs a fresh session for the cached agent to pick
         # up any migration-driven changes.
         assert r.requires_new_session is True
+
+    def test_reapply_uses_codex_home_from_environment(
+        self, tmp_path, monkeypatch
+    ):
+        codex_home = tmp_path / "profile-codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        cfg = {"model": {"openai_runtime": "codex_app_server"}}
+
+        with patch.object(
+            crs, "check_codex_binary_ok", return_value=(True, "0.130.0")
+        ), patch("hermes_cli.codex_runtime_plugin_migration.migrate") as mig:
+            mig.return_value.migrated = ["hermes-tools"]
+            mig.return_value.migrated_plugins = []
+            mig.return_value.plugin_query_error = None
+            mig.return_value.wrote_permissions_default = ":workspace"
+            mig.return_value.errors = []
+            mig.return_value.target_path = codex_home / "config.toml"
+
+            result = crs.apply(cfg, "codex_app_server")
+
+        assert result.success
+        mig.assert_called_once_with(cfg, codex_home=codex_home)
 
     def test_enable_blocked_when_codex_missing(self):
         cfg = {}
@@ -207,7 +229,7 @@ class TestApply:
 
     def test_enable_triggers_mcp_migration(self):
         """Enabling codex_app_server should auto-migrate Hermes mcp_servers
-        to ~/.codex/config.toml so the spawned subprocess sees them."""
+        to the active Codex config so the spawned subprocess sees them."""
         cfg = {
             "mcp_servers": {
                 "filesystem": {"command": "npx", "args": ["-y", "fs-server"]},

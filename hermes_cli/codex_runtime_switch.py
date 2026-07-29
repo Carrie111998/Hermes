@@ -14,7 +14,9 @@ config value. This module just persists the value and reports the change.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -147,7 +149,7 @@ def apply(
     # No-config-change paths. For `auto` we return immediately — disabling
     # doesn't touch ~/.codex/. For `codex_app_server`, we fall through to
     # the migration block below: the config value is already correct, but
-    # the world state (managed block in ~/.codex/config.toml, hermes-tools
+    # the world state (managed block in the active Codex config, hermes-tools
     # MCP callback, plugin discovery) may be stale or missing — common
     # footgun when users pre-set `openai_runtime: codex_app_server` in
     # config.yaml without ever running the slash command. The migration is
@@ -206,13 +208,18 @@ def apply(
         if ok:
             msg_lines.append(f"codex CLI: {ver}")
         # Auto-migrate Hermes' MCP servers + Codex's installed curated
-        # plugins into ~/.codex/config.toml so the spawned codex subprocess
+        # plugins into CODEX_HOME/config.toml (default ~/.codex/config.toml)
+        # so the spawned codex subprocess
         # sees the same tool surface AND can call back into Hermes for
         # browser/web/delegate_task/vision/memory tools (#7 fix).
         # Failures are non-fatal — the runtime change still proceeds.
         try:
             from hermes_cli.codex_runtime_plugin_migration import migrate
-            mig_report = migrate(config)
+            codex_home_raw = os.getenv("CODEX_HOME", "").strip()
+            codex_home = (
+                Path(codex_home_raw).expanduser() if codex_home_raw else None
+            )
+            mig_report = migrate(config, codex_home=codex_home)
             # Tools/MCP servers (excluding the hermes-tools callback,
             # which is internal plumbing — surface separately).
             user_servers = [
