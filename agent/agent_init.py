@@ -39,6 +39,7 @@ from agent.model_metadata import (
     is_local_endpoint,
     query_ollama_num_ctx,
 )
+from agent.network_outage_retry import NetworkOutageRetryPolicy
 from agent.process_bootstrap import _install_safe_stdio
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
@@ -1781,6 +1782,15 @@ def init_agent(
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries
+
+    # Optional second-tier recovery for provider transport outages and explicit
+    # no-byte/no-event provider response watchdog timeouts.
+    # The ordinary API retry budget remains bounded; when this policy is
+    # enabled, status-less connection/stall failures enter a slow fixed-cadence
+    # retry loop instead of terminating the active turn.
+    agent._network_outage_retry_policy = NetworkOutageRetryPolicy.from_config(
+        _agent_section.get("network_outage_retry", {})
+    )
 
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit

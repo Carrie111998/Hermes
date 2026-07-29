@@ -7904,7 +7904,17 @@ class SessionDB:
             content = self._decode_content(row["content"])
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
-            msg = {"role": row["role"], "content": content}
+            # Every row in this projection came from the durable store. Carry the
+            # same intrinsic marker used by AIAgent's append-only flush so a
+            # freshly loaded/adopted snapshot cannot be appended again if list
+            # identity or the separate conversation_history baseline is lost
+            # during an aborted compression attempt. The private underscore key
+            # is stripped by provider transports before the request leaves Hermes.
+            msg = {
+                "role": row["role"],
+                "content": content,
+                "_db_persisted": True,
+            }
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay

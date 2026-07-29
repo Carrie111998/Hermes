@@ -1258,6 +1258,7 @@ def load_gateway_config() -> GatewayConfig:
     """
     _home = get_hermes_home()
     gw_data: dict = {}
+    delivery_outage_retry: dict = {}
 
     # Legacy fallback: gateway.json provides the base layer.
     # config.yaml keys always win when both specify the same setting.
@@ -1288,6 +1289,15 @@ def load_gateway_config() -> GatewayConfig:
             # the messaging gateway. Fail-open via the shared helper.
             from hermes_cli import managed_scope
             yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
+
+            # The same user-facing policy protects both model-provider calls
+            # and safe pre-send platform delivery failures. Platform-local
+            # ``extra.network_outage_retry`` remains an explicit override.
+            agent_section = yaml_cfg.get("agent")
+            if isinstance(agent_section, dict):
+                outage_section = agent_section.get("network_outage_retry")
+                if isinstance(outage_section, dict):
+                    delivery_outage_retry = dict(outage_section)
 
             # Shared nested-fallback source: settings meant to be top-level
             # keys are also accepted when a user nests them under `gateway:`
@@ -1743,6 +1753,12 @@ def load_gateway_config() -> GatewayConfig:
 
     # Override with environment variables
     _apply_env_overrides(config)
+
+    if delivery_outage_retry:
+        for platform_config in config.platforms.values():
+            platform_config.extra.setdefault(
+                "network_outage_retry", dict(delivery_outage_retry)
+            )
     
     # --- Validate loaded values ---
     _validate_gateway_config(config)
