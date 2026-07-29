@@ -562,20 +562,44 @@ class TestCodeDriftBody:
         assert "merge --ff-only master" in body
         assert "ff-only main" not in body
 
-    def test_misconfigured_body_reads_as_a_blind_watcher(self):
-        """state='misconfigured' is the loud replacement for the old silent
-        None. It must NOT read like a healthy or merely-drifting repo."""
+    def test_trunk_missing_body_names_ref_and_is_unmeasurable(self):
         from events.formatting import code_drift_body
         body = code_drift_body({
-            "status": "drifting", "state": "misconfigured",
-            "repo": "C:/Users/diego/.hermes", "repo_name": "hermes",
-            "detail": "configured trunk ref refs/heads/main does not exist",
-            "head": "", "trunk": "",
+            "status": "warn", "state": "trunk_missing",
+            "key": "hermes", "repo": "C:/Users/diego/.hermes",
+            "trunk_ref": "refs/heads/main", "branch": "master",
+            "head": "aaaaaaaaa", "main": "",
         })
-        assert "BLIND" in body
-        assert "refs/heads/main does not exist" in body
-        assert "UNMONITORED" in body or "unmonitored" in body
+        assert "refs/heads/main" in body
+        assert "C:/Users/diego/.hermes" in body
+        assert "UNMEASURABLE" in body
         assert "in sync" not in body
+
+    def test_behind_body_names_branch_trunk_and_executed_files(self):
+        from events.formatting import code_drift_body
+        body = code_drift_body({
+            "status": "drifting", "state": "behind", "key": "hermes",
+            "repo": "C:/Users/diego/.hermes",
+            "trunk_ref": "refs/heads/master",
+            "branch": "feat/manifest-router", "behind_count": 62,
+            "head": "aaaaaaaaa", "main": "bbbbbbbbb",
+            "executed_changed": ["scripts/gateway_watchdog.py"],
+        })
+        assert "feat/manifest-router" in body
+        assert "master" in body
+        assert "62" in body
+        assert "scripts/gateway_watchdog.py" in body
+        assert "re-point" in body
+
+    def test_executed_files_are_capped_at_five(self):
+        from events.formatting import code_drift_body
+        body = code_drift_body({
+            "status": "drifting", "state": "behind", "repo": "x",
+            "trunk_ref": "refs/heads/master", "branch": "master",
+            "behind_count": 9,
+            "executed_changed": [f"scripts/s{i}.py" for i in range(20)],
+        })
+        assert body.count("scripts/s") == 5
 
     def test_resolved_header_dot_is_green(self):
         """A CODE_DRIFT resolution reads as green, mirroring the

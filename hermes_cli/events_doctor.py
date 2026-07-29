@@ -16,8 +16,7 @@ from events.paths import (
     telegram_topics_path, telegram_verbosity_path,
 )
 from events.producers.code_drift_monitor import (
-    DEFAULT_TRUNK_REF, MISCONFIG_HEAD_UNRESOLVED, _agent_src_root,
-    sample_code_drift, watched_repos,
+    DEFAULT_TRUNK_REF, sample_code_drift, watched_repos,
 )
 
 # telegram-mirror retired 2026-04-28 (scribe_daily topic cutover made it
@@ -88,15 +87,18 @@ def check_code_drift(
     policy: the gate is a parameter of the probe, so this surface simply
     declines it.
 
-    Skip vs FAIL, the 2026-07-28 lesson: an ABSENT repo (no .git) degrades
-    to a skip note so the doctor stays usable on boxes without the shared
-    checkout -- that is the ONLY case the sampler returns None for.  A repo
-    that is PRESENT but cannot be evaluated comes back state="misconfigured"
-    and is a FAILURE here, because reporting it quietly is how a watcher
-    ends up certifying an unwatched repo as clean.  ~/.hermes has no `main`
-    branch, so under the old hardcoded ref that was the guaranteed outcome.
+    Skip vs FAIL, the 2026-07-28 lesson: an absent checkout or transient git
+    failure degrades to a skip/no-op so the monitor never fabricates drift or
+    recovery. Once HEAD resolves, a missing configured trunk is unambiguous
+    and returns ``trunk_missing`` as a loud issue.
     """
-    repo = Path(repo_path) if repo_path else _agent_src_root()
+    if repo_path is None:
+        return sum(
+            check_code_drift(watched.path, watched.trunk_ref, label=watched.name)
+            for watched in watched_repos()
+        )
+
+    repo = Path(repo_path)
     trunk_name = trunk_ref.rsplit("/", 1)[-1]
     tag = f"code drift [{label}]" if label else "code drift"
 
@@ -105,22 +107,15 @@ def check_code_drift(
         repo_name=label or "agent-src",
         executed_dirs=(),   # diagnostic: report every divergence, gate nothing
     )
-    # None means the repo is genuinely absent (no .git) -- the one case that
-    # is a skip rather than a finding.
     if sample is None:
-        print(f"[--] {tag} -- skipped ({repo} is not a git checkout)")
+        print(f"[--] {tag} -- skipped (cannot evaluate HEAD in {repo})")
         return 0
 
-    if sample.state == "misconfigured":
-        print(f"[FAIL] {tag}: {sample.detail} in {repo} -- drift CANNOT be "
-              "evaluated, so this repo is effectively UNMONITORED (not clean)")
-        if sample.detail != MISCONFIG_HEAD_UNRESOLVED:
-            # Naming the branch the checkout is ACTUALLY on turns a guess
-            # into a diagnosis: it is usually the trunk name that was meant.
-            on = f" (checkout is on `{sample.branch}`)" if sample.branch else ""
-            print(f"  remediation: check the real trunk name (git -C {repo} "
-                  f"branch --list){on} and fix the watched-repo entry's "
-                  "trunk_ref")
+    if sample.state == "trunk_missing":
+        on = f" (checkout is on `{sample.branch}`)" if sample.branch else ""
+        print(f"[FAIL] {tag}: trunk ref {sample.trunk_ref} does NOT resolve in "
+              f"{repo}{on} -- HEAD resolves, so drift is UNMEASURABLE and the "
+              "repo is UNMONITORED until the watched-repo trunk_ref is corrected")
         return 1
 
     if sample.dirty:

@@ -1,8 +1,9 @@
 # Multi-repo CODE_DRIFT detection — design
 
 **Date:** 2026-07-28
-**Status:** IMPLEMENTED — but not by this document's names. Read the AS-BUILT
-section before treating any identifier below as real.
+**Status:** IMPLEMENTED. Read the AS-BUILT section before treating identifiers
+below as real; the corrective contract note supersedes its earlier HEAD-failure
+adjudication.
 **Supersedes nothing.** Extends `2026-07-21-code-drift-event-producer-design.md`.
 
 ## AS BUILT (reconciled 2026-07-28)
@@ -19,29 +20,29 @@ is kept as the design record, not as an API reference.
 | Repo key | `hermes-home` | **`hermes`** | Incumbent and deployed. `agent-src` is the other key, so `hermes` is already unambiguous in operator-facing text (`code drift [hermes]`). |
 | `WatchedRepo` field | `key` + `label` | **`name`** + `trunk_name` property | `label` was computed but never rendered; `trunk_name` (derived, `main`/`master`) is what remediation text actually needs. |
 | State file | `code_drift_state_hermes_home.json` | **`code_drift_state.hermes.json`** | `code_drift_state_path(repo_name)` slugs on `.`; agent-src keeps the un-suffixed legacy filename so its in-flight episode state survived the cutover. |
-| Unevaluable repo | `state="trunk_missing"`, HEAD-unresolvable → `None` | **`state="misconfigured"` for BOTH**, plus a `detail` string | Adjudicated below. |
+| Unevaluable repo | `state="trunk_missing"`, HEAD-unresolvable → `None` | **Corrected to the specified contract**: an absent configured trunk is `trunk_missing`; operational Git failures are `None` | Prevents transient probe failures from fabricating drift or recovery. |
 | `DriftSample.alertable` | `alertable` | **`alerts`** | Rename only; the load-bearing "never gate an unevaluable repo into silence" clause landed verbatim in spirit (see `DriftSample.alerts`). |
 | `DriftSample.main` | `main` | **`trunk`** | The field holds whatever trunk the repo has; calling it `main` re-imports the hardcoded-`main` assumption this spec exists to remove. |
-| `branch` field | included, emitted | **dropped** | It was computed but never reached a payload — dead weight. |
+| `branch` field | included, emitted | **included and emitted** | Required to distinguish an off-trunk checkout from a same-trunk fast-forward incident and render truthful remediation. |
 
-### Adjudication: `trunk_missing` vs `misconfigured`
+### Corrective contract: `trunk_missing` vs transient Git failure
 
-**`misconfigured` wins, covering both causes.** This spec routed an unresolvable HEAD
-to `None` on the reasoning that "if HEAD resolved, git is demonstrably fine, so only a
-missing trunk is a config error." The inverse does not hold: a repo that is *present*
-(`.git` exists) but whose HEAD will not resolve is equally unevaluable, and returning
-`None` there recreates exactly the fail-silent shape this spec was written to kill —
-"nothing to evaluate" is indistinguishable from "clean" at every downstream surface.
+The initial as-built implementation grouped every present-but-unevaluable checkout into
+`misconfigured`, including an unresolvable HEAD. That was corrected after review because
+the poll loop is edge-triggered: converting a transient Git failure into a sample can
+fabricate a rising edge, shape change, or recovery.
 
-The rule that survived is simpler and has no seam to get wrong:
+The authoritative rule is now:
 
-> **Absent repo (no `.git`) = skip. Present repo we cannot evaluate = shout.**
+> **Operational Git failure = `None`/no-op. HEAD resolves and the exact configured
+> trunk ref is absent = `state="trunk_missing"` and alert loudly.**
 
-Cause is preserved as data rather than as a second state: `DriftSample.detail` carries
-`MISCONFIG_TRUNK_UNRESOLVED` or `MISCONFIG_HEAD_UNRESOLVED`, named constants precisely
-so `events_doctor` can branch on which one it got — the trunk case earns a "fix the
-watched-repo entry's `trunk_ref`" remediation line and the HEAD case must not, since
-that would be wrong advice. One state, two details beats two states.
+The sampler uses `show-ref --verify --quiet` for the exact-ref existence check because
+its return codes distinguish absent (`1`) from operational failure (`>1`). It then
+resolves the ref normally. Branch, status, merge-base, count, and log probe failures all
+return `None`; only merge-base rc `1` is a valid topology negative. `trunk_missing`
+carries `MISCONFIG_TRUNK_UNRESOLVED` and is never suppressed by executed-directory
+gating.
 
 ### Section 9 (`events_doctor` unification) — implemented 2026-07-28
 

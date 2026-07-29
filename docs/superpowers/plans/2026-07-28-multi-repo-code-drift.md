@@ -8,12 +8,12 @@
 > under a **different naming scheme** and regress it.
 >
 > **Naming in this document is stale.** It says `hermes-home`,
-> `code_drift_state_hermes_home.json`, `trunk_missing`, `alertable`, `key`/`label`,
+> `code_drift_state_hermes_home.json`, `alertable`, `key`/`label`,
 > `DriftSample.main`, `build_monitors()`. What exists is `hermes`,
-> `code_drift_state.hermes.json`, `misconfigured` (+ a `detail` constant),
-> `alerts`, `name`, `DriftSample.trunk`, and construction inline in
-> `gateway_integration.startup()`. See the AS-BUILT table in the spec for the full map
-> and the adjudication of `trunk_missing` vs `misconfigured`.
+> `code_drift_state.hermes.json`, `alerts`, `name`, `DriftSample.trunk`, and
+> construction inline in `gateway_integration.startup()`. The planned
+> `trunk_missing`/transient-no-op contract was restored by the corrective pass;
+> see the AS-BUILT table and corrective contract in the spec for the full map.
 >
 > **Retained deliberately** for the reasoning the shipped code does not carry: the
 > empirical pathspec verification (Global Constraints), the ruff/PLW1514 gate note, the

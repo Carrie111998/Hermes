@@ -348,39 +348,50 @@ class TestCodeDrift:
             "the very drift the operator ran the doctor to see"
         )
 
-    def test_unresolvable_HEAD_is_loud_but_omits_trunk_remediation(
+    def test_unresolvable_HEAD_is_a_skip_noop(
         self, tmp_path, monkeypatch, capsys
     ):
-        """Both unevaluable causes FAIL, but the advice must differ.
-
-        Telling the operator to "check the real trunk name" is wrong advice
-        when the trunk resolved fine and HEAD did not, so that remediation
-        line is withheld -- which is why the producer names its two causes
-        as constants instead of prose the doctor greps.
-
-        Stubbed rather than staged from a real repo on purpose:
-        sample_code_drift() verifies the trunk BEFORE HEAD, so an empty
-        checkout reports the trunk cause and this branch is unreachable
-        from any natural repo state.
-        """
-        from events.producers.code_drift_monitor import (
-            DriftSample, MISCONFIG_HEAD_UNRESOLVED,
-        )
+        """Transient HEAD failure must never fabricate drift or recovery."""
         import hermes_cli.events_doctor as doctor
 
-        monkeypatch.setattr(doctor, "sample_code_drift", lambda *a, **k: DriftSample(
-            state="misconfigured", head="", trunk="",
-            detail=MISCONFIG_HEAD_UNRESOLVED,
-        ))
+        monkeypatch.setattr(doctor, "sample_code_drift", lambda *a, **k: None)
 
         issues = check_code_drift(repo_path=tmp_path / "anything")
         out = capsys.readouterr().out
 
-        assert issues == 1
-        assert "[FAIL]" in out
-        assert "UNMONITORED" in out
-        assert "skip" not in out.lower()
-        assert "fix the watched-repo entry" not in out
+        assert issues == 0
+        assert "skip" in out.lower()
+        assert "UNMONITORED" not in out
+
+    def test_no_repo_path_checks_every_registry_entry_with_its_trunk(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from events.producers.code_drift_monitor import DriftSample, WatchedRepo
+        import hermes_cli.events_doctor as doctor
+
+        repos = [
+            WatchedRepo("agent-src", tmp_path / "a", "refs/heads/main"),
+            WatchedRepo("hermes", tmp_path / "b", "refs/heads/master"),
+        ]
+        seen = []
+        monkeypatch.setattr(doctor, "watched_repos", lambda: repos)
+
+        def sample(path, trunk_ref, **kwargs):
+            seen.append((path, trunk_ref, kwargs["executed_dirs"]))
+            return DriftSample(
+                state="in_sync", head="a" * 40, trunk="a" * 40,
+                trunk_ref=trunk_ref,
+            )
+
+        monkeypatch.setattr(doctor, "sample_code_drift", sample)
+
+        assert check_code_drift() == 0
+        out = capsys.readouterr().out
+        assert seen == [
+            (tmp_path / "a", "refs/heads/main", ()),
+            (tmp_path / "b", "refs/heads/master", ()),
+        ]
+        assert "[agent-src]" in out and "[hermes]" in out
 
     def test_run_doctor_surfaces_drift_and_fails(self, tmp_path, monkeypatch, capsys):
         repo = _make_repo(tmp_path)

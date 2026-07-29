@@ -22,9 +22,9 @@ monitor hardcoded `refs/heads/main` and watched agent-src alone. ~/.hermes
 has no `main` branch, so simply adding the path without its trunk name
 would make every probe fail the ref lookup and — under the old code —
 return None, i.e. report "nothing to evaluate" forever. That is why a repo
-whose CONFIGURED trunk ref cannot be resolved is now a loud
-state="misconfigured" event rather than a silent skip: a monitor that is a
-no-op by construction is worse than no monitor, because it is believed.
+whose CONFIGURED trunk ref does not exist is now a loud
+state="trunk_missing" event rather than a silent skip. Operational Git
+failures remain no-ops so the poll loop never fabricates drift or recovery.
 
 Two local layers already surface this (laptop-monitor tray row,
 events_doctor); this producer is the third: drift as an event-bus event so
@@ -70,13 +70,10 @@ _AGENT_SRC_DEFAULT = Path.home() / ".hermes" / "agent-src"
 
 DEFAULT_TRUNK_REF = "refs/heads/main"
 
-# The two ways a PRESENT repo can be unevaluable, as named constants rather
-# than inline prose: hermes_cli.events_doctor renders the SAME sample and has
-# to branch on which one it got, because the remediations differ (fix the
-# watched-repo entry's trunk_ref vs. investigate a broken/empty checkout).
-# A substring match on prose would rot the moment someone reworded a message.
+# A present repo with a resolvable HEAD but no configured trunk ref is a
+# configuration failure, not a transient probe failure. Keep the detail as a
+# named constant because both the producer and doctor render the same sample.
 MISCONFIG_TRUNK_UNRESOLVED = "configured trunk ref {trunk_ref} does not exist"
-MISCONFIG_HEAD_UNRESOLVED = "HEAD does not resolve"
 
 
 def _agent_src_root() -> Path:
@@ -146,7 +143,7 @@ def watched_repos() -> List[WatchedRepo]:
     """The repos whose WORKING TREE is deployed code, newest concern last.
 
     Each entry carries its own trunk ref name. Adding a repo here without
-    its correct trunk name yields a permanently "misconfigured" alert, not
+    its correct trunk name yields a persistent ``trunk_missing`` alert, not
     a silent clean bill of health — see the module docstring.
     """
     return [
@@ -160,7 +157,7 @@ def watched_repos() -> List[WatchedRepo]:
 class DriftSample:
     """Point-in-time relationship of a checkout's HEAD to its trunk ref."""
 
-    state: str  # "in_sync" | "behind" | "ahead" | "diverged" | "misconfigured"
+    state: str  # "in_sync" | "behind" | "ahead" | "diverged" | "trunk_missing"
     head: str
     trunk: str
     behind_count: int = 0
@@ -196,13 +193,13 @@ class DriftSample:
         which is how the 2026-07-28 incident stayed invisible for 3 days.
         The drift is still SAMPLED and logged; it just does not page.
 
-        "misconfigured" is never gated: if the trunk ref does not resolve we
+        "trunk_missing" is never gated: if the trunk ref does not resolve we
         cannot compute an executed diff at all, so silence there would
         recreate the exact fail-silent hole this rewrite closes.
         """
         if self.state == "in_sync":
             return False
-        if self.state == "misconfigured":
+        if self.state == "trunk_missing":
             return True
         if self.executed_gated and not self.executed_changed:
             return False
@@ -212,9 +209,11 @@ class DriftSample:
 def _git(repo: Path, *args: str) -> Tuple[int, str]:
     """Run a read-only git command; returns (returncode, stdout)."""
     try:
+        env = os.environ.copy()
+        env["GIT_OPTIONAL_LOCKS"] = "0"
         proc = subprocess.run(
             ["git", "-C", str(repo), *args],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, env=env,
         )
         return proc.returncode, proc.stdout
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -230,47 +229,55 @@ def sample_code_drift(
 ) -> Optional[DriftSample]:
     """Read-only git probe of HEAD vs ``trunk_ref``.
 
-    Returns None ONLY when the repo is genuinely absent from this box (no
-    .git) — the caller treats None as a no-op so the poll loop never
-    crashes and a missing checkout never fabricates a drift or a recovery.
+    Returns ``None`` when the checkout is absent or any read-only git probe
+    fails transiently. The poll loop treats that as a no-op, preserving an
+    existing episode without fabricating drift or recovery.
 
-    A repo that IS present but whose CONFIGURED trunk ref cannot be
-    resolved returns state="misconfigured" instead, which flows through the
-    normal edge machinery and alerts. That asymmetry is the whole point:
-    before 2026-07-28 an unresolvable trunk ref returned None, so pointing
-    this monitor at a repo whose trunk was not literally named `main`
-    produced a permanently silent "nothing to evaluate" — a watcher that
-    reports clean forever. Absent repo = skip; present repo we cannot
-    evaluate = shout.
+    Once HEAD resolves, a missing configured trunk is not ambiguous: the repo
+    and git are demonstrably usable. That one case returns ``trunk_missing``
+    and alerts loudly instead of becoming a permanently silent watcher.
     """
     repo = Path(repo) if repo is not None else _agent_src_root()
     # .git is a directory in a normal checkout and a file in a worktree.
     if not (repo / ".git").exists():
         return None
 
-    # Resolved BEFORE the misconfigured returns on purpose: an unresolvable
-    # trunk is precisely when "what branch is this checkout on?" is the
-    # operator's next question, and it stays answerable there because only
-    # the TRUNK lookup failed.
-    rc_branch, branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
-    branch = branch.strip() if rc_branch == 0 else ""
+    rc_head, head = _git(repo, "rev-parse", "--verify", "HEAD")
+    if rc_head != 0:
+        return None
+    head = head.strip()
 
-    def _misconfigured(detail: str) -> DriftSample:
-        logger.error("CodeDriftMonitor: %s in %s (on %s) — cannot evaluate drift",
-                     detail, repo, branch or "?")
+    rc_branch, branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if rc_branch != 0:
+        return None
+    branch = branch.strip()
+
+    # show-ref distinguishes an absent exact ref (rc=1) from an operational
+    # failure (rc>1). rev-parse returns 128 for both, which made a timeout or
+    # transport failure indistinguishable from a broken watched-repo config.
+    rc_trunk, _ = _git(repo, "show-ref", "--verify", "--quiet", trunk_ref)
+    if rc_trunk == 1:
+        detail = MISCONFIG_TRUNK_UNRESOLVED.format(trunk_ref=trunk_ref)
+        logger.error(
+            "CodeDriftMonitor: %s in %s (on %s) — cannot evaluate drift",
+            detail, repo, branch,
+        )
         return DriftSample(
-            state="misconfigured", head="", trunk="", detail=detail,
+            state="trunk_missing", head=head, trunk="", detail=detail,
             repo_name=repo_name, trunk_ref=trunk_ref, branch=branch,
         )
+    if rc_trunk != 0:
+        return None
 
-    rc_head, head = _git(repo, "rev-parse", "--verify", "HEAD")
     rc_trunk, trunk = _git(repo, "rev-parse", "--verify", trunk_ref)
     if rc_trunk != 0:
-        return _misconfigured(MISCONFIG_TRUNK_UNRESOLVED.format(trunk_ref=trunk_ref))
-    if rc_head != 0:
-        return _misconfigured(MISCONFIG_HEAD_UNRESOLVED)
-    head, trunk = head.strip(), trunk.strip()
-    dirty = bool(_git(repo, "status", "--porcelain")[1].strip())
+        return None
+    trunk = trunk.strip()
+
+    rc_status, status = _git(repo, "status", "--porcelain")
+    if rc_status != 0:
+        return None
+    dirty = bool(status.strip())
 
     common = dict(repo_name=repo_name, trunk_ref=trunk_ref, branch=branch)
     if head == trunk:
@@ -296,39 +303,57 @@ def sample_code_drift(
                 executed_files=changed[:MISSED_SUBJECTS_CAP],
             )
 
-    def _count(rev_range: str) -> int:
-        out = _git(repo, "rev-list", "--count", rev_range)[1].strip()
+    def _count(rev_range: str) -> Optional[int]:
+        rc, out = _git(repo, "rev-list", "--count", rev_range)
+        if rc != 0:
+            return None
         try:
-            return int(out)
+            return int(out.strip())
         except ValueError:
-            return 0
+            return None
 
-    head_behind = _git(repo, "merge-base", "--is-ancestor",
-                       "HEAD", trunk_ref)[0] == 0
-    head_ahead = _git(repo, "merge-base", "--is-ancestor",
-                      trunk_ref, "HEAD")[0] == 0
+    rc_behind, _ = _git(repo, "merge-base", "--is-ancestor",
+                        "HEAD", trunk_ref)
+    rc_ahead, _ = _git(repo, "merge-base", "--is-ancestor",
+                       trunk_ref, "HEAD")
+    if rc_behind not in (0, 1) or rc_ahead not in (0, 1):
+        return None
+    head_behind = rc_behind == 0
+    head_ahead = rc_ahead == 0
 
     if head_behind:
+        rc_log, log_out = _git(
+            repo, "log", "--format=%h %s", f"-{MISSED_SUBJECTS_CAP}",
+            f"HEAD..{trunk_ref}",
+        )
+        behind_count = _count(f"HEAD..{trunk_ref}")
+        if rc_log != 0 or behind_count is None:
+            return None
         subjects = tuple(
-            line.strip() for line in
-            _git(repo, "log", "--format=%h %s", f"-{MISSED_SUBJECTS_CAP}",
-                 f"HEAD..{trunk_ref}")[1].splitlines()
-            if line.strip()
+            line.strip() for line in log_out.splitlines() if line.strip()
         )
         return DriftSample(
             state="behind", head=head, trunk=trunk,
-            behind_count=_count(f"HEAD..{trunk_ref}"),
-            dirty=dirty, missed_subjects=subjects, **common,
+            behind_count=behind_count, dirty=dirty,
+            missed_subjects=subjects, **common,
         )
     if head_ahead:
+        ahead_count = _count(f"{trunk_ref}..HEAD")
+        if ahead_count is None:
+            return None
         return DriftSample(
             state="ahead", head=head, trunk=trunk,
-            ahead_count=_count(f"{trunk_ref}..HEAD"), dirty=dirty, **common,
+            ahead_count=ahead_count, dirty=dirty, **common,
         )
+
+    behind_count = _count(f"HEAD..{trunk_ref}")
+    ahead_count = _count(f"{trunk_ref}..HEAD")
+    if behind_count is None or ahead_count is None:
+        return None
     return DriftSample(
         state="diverged", head=head, trunk=trunk,
-        behind_count=_count(f"HEAD..{trunk_ref}"),
-        ahead_count=_count(f"{trunk_ref}..HEAD"), dirty=dirty, **common,
+        behind_count=behind_count, ahead_count=ahead_count,
+        dirty=dirty, **common,
     )
 
 
@@ -468,11 +493,14 @@ class CodeDriftMonitor:
         from "pointed at a different branch entirely" (re-point it), and
         those have different remediations.
         """
+        measured_trunk_ref = sample.trunk_ref or self._trunk_ref
+        key = sample.repo_name or self._repo_name
         return {
+            "key": key,
             "repo": self._repo_str(),
-            "repo_name": sample.repo_name or self._repo_name,
-            "trunk_ref": sample.trunk_ref or self._trunk_ref,
-            "trunk_name": (sample.trunk_ref or self._trunk_ref).rsplit("/", 1)[-1],
+            "repo_name": key,  # back-compat alias
+            "trunk_ref": measured_trunk_ref,
+            "trunk_name": measured_trunk_ref.rsplit("/", 1)[-1],
             "trunk": sample.trunk[:9],
             "main": sample.trunk[:9],  # back-compat alias
             "branch": sample.branch,
@@ -492,7 +520,7 @@ class CodeDriftMonitor:
             event_type=EventType.CODE_DRIFT,
             source="system",
             payload={
-                "status": "drifting",
+                "status": "warn" if sample.state == "trunk_missing" else "drifting",
                 "state": sample.state,
                 "head": sample.head[:9],
                 "behind_count": sample.behind_count,
@@ -501,7 +529,8 @@ class CodeDriftMonitor:
                 "missed_subjects": list(sample.missed_subjects),
                 "detail": sample.detail,
                 "executed_gated": sample.executed_gated,
-                "executed_files": list(sample.executed_files),
+                "executed_changed": list(sample.executed_files),
+                "executed_files": list(sample.executed_files),  # back-compat alias
                 **self._identity(sample),
             },
             tags=["code", "drift", sample.state],

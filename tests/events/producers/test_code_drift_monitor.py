@@ -13,6 +13,8 @@ import subprocess
 
 import pytest
 
+import events.producers.code_drift_monitor as drift_module
+
 from events.bus import EventBus
 from events.schema import EventType, Priority
 from events.producers.code_drift_monitor import (
@@ -59,6 +61,23 @@ def repo(tmp_path):
 
 
 class TestSampleCodeDrift:
+    def test_git_probe_disables_optional_locks(self, tmp_path, monkeypatch):
+        """Even read-only commands must not refresh or lock the Git index."""
+        seen = {}
+
+        class Result:
+            returncode = 0
+            stdout = "ok\n"
+
+        def run(*args, **kwargs):
+            seen.update(kwargs)
+            return Result()
+
+        monkeypatch.setattr(drift_module.subprocess, "run", run)
+
+        assert drift_module._git(tmp_path, "status", "--porcelain") == (0, "ok\n")
+        assert seen["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+
     def test_behind_detached_checkout(self, repo):
         s = sample_code_drift(repo)
         assert s.state == "behind"
@@ -81,6 +100,68 @@ class TestSampleCodeDrift:
     def test_missing_repo_returns_none(self, tmp_path):
         """An ABSENT repo is still a silent skip — that half is correct."""
         assert sample_code_drift(tmp_path / "nope") is None
+
+    def test_head_probe_failure_is_a_noop(self, repo, monkeypatch):
+        """A transient HEAD failure must not fabricate drift or recovery."""
+        real_git = drift_module._git
+
+        def failing_head(path, *args):
+            if args == ("rev-parse", "--verify", "HEAD"):
+                return 127, ""
+            return real_git(path, *args)
+
+        monkeypatch.setattr(drift_module, "_git", failing_head)
+        assert sample_code_drift(repo) is None
+
+    def test_branch_probe_failure_is_a_noop(self, repo, monkeypatch):
+        """Branch identity is required for truthful remediation."""
+        real_git = drift_module._git
+
+        def failing_branch(path, *args):
+            if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+                return 127, ""
+            return real_git(path, *args)
+
+        monkeypatch.setattr(drift_module, "_git", failing_branch)
+        assert sample_code_drift(repo) is None
+
+    def test_transient_trunk_probe_failure_is_a_noop(self, repo, monkeypatch):
+        """A transport/timeout failure is not proof that the ref is absent."""
+        real_git = drift_module._git
+
+        def failing_trunk(path, *args):
+            if args == ("show-ref", "--verify", "--quiet", "refs/heads/main"):
+                return 128, ""
+            return real_git(path, *args)
+
+        monkeypatch.setattr(drift_module, "_git", failing_trunk)
+        assert sample_code_drift(repo) is None
+
+    def test_merge_base_operational_failure_is_a_noop(self, repo, monkeypatch):
+        """Only merge-base rc=1 is a normal negative; rc>1 is transient."""
+        real_git = drift_module._git
+
+        def failing_merge_base(path, *args):
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                return 128, ""
+            return real_git(path, *args)
+
+        monkeypatch.setattr(drift_module, "_git", failing_merge_base)
+        assert sample_code_drift(repo) is None
+
+    @pytest.mark.parametrize("failed_command", ["status", "rev-list", "log"])
+    def test_later_git_failure_is_a_noop(
+        self, repo, monkeypatch, failed_command
+    ):
+        real_git = drift_module._git
+
+        def failing_command(path, *args):
+            if args and args[0] == failed_command:
+                return 128, ""
+            return real_git(path, *args)
+
+        monkeypatch.setattr(drift_module, "_git", failing_command)
+        assert sample_code_drift(repo) is None
 
     def test_shape_property(self):
         s = DriftSample(state="behind", head="a" * 9, trunk="b" * 9,
@@ -107,16 +188,12 @@ class TestBranchIdentity:
         assert s.state != "in_sync", "sanity: still off trunk"
 
     def test_branch_survives_an_unresolvable_trunk(self, repo):
-        """The misconfigured path resolves branch BEFORE it bails.
-
-        Only the TRUNK lookup failed, so "which branch is this on?" is still
-        answerable — and it is exactly the operator's next question.
-        """
+        """The trunk-missing path still carries checkout branch identity."""
         _git(repo, "checkout", "-b", "wrong-branch")
         _git(repo, "branch", "-m", "main", "master")   # no `main` ref left
 
         s = sample_code_drift(repo, "refs/heads/main")
-        assert s.state == "misconfigured"
+        assert s.state == "trunk_missing"
         assert s.branch == "wrong-branch"
 
     def test_branch_reaches_the_event_payload(self, bus, tmp_path, repo):
@@ -135,7 +212,7 @@ class TestBranchIdentity:
 class TestTrunkRefIsParameterised:
     """~/.hermes trunk is `master` and it has NO `main` (2026-07-28)."""
 
-    def test_missing_configured_trunk_is_misconfigured_not_none(self, repo):
+    def test_missing_configured_trunk_is_trunk_missing_not_none(self, repo):
         """THE DEFECT, inverted.
 
         Before 2026-07-28 an unresolvable trunk ref returned None, which the
@@ -149,7 +226,7 @@ class TestTrunkRefIsParameterised:
         s = sample_code_drift(repo, "refs/heads/main")
 
         assert s is not None, "a present repo must never silently return None"
-        assert s.state == "misconfigured"
+        assert s.state == "trunk_missing"
         assert "refs/heads/main" in s.detail
         # And it must alert, not sit in the silent in_sync branch.
         assert s.state != "in_sync"
@@ -172,7 +249,7 @@ class TestTrunkRefIsParameterised:
         _git(repo, "checkout", "--detach", "master")
         assert sample_code_drift(repo, "refs/heads/master").state == "in_sync"
 
-    def test_misconfigured_repo_emits_a_loud_event(self, bus, tmp_path, repo):
+    def test_trunk_missing_repo_emits_a_loud_event(self, bus, tmp_path, repo):
         """End-to-end: the misconfiguration reaches the event bus, so it
         reaches Telegram — not just a log line nobody reads."""
         _git(repo, "branch", "-m", "main", "master")
@@ -187,9 +264,11 @@ class TestTrunkRefIsParameterised:
         events = _drift_events(bus)
         assert len(events) == 1
         p = events[0].payload
-        assert p["status"] == "drifting"
-        assert p["state"] == "misconfigured"
-        assert p["repo_name"] == "hermes"
+        assert p["status"] == "warn"
+        assert p["state"] == "trunk_missing"
+        assert p["key"] == "hermes"
+        assert p["repo_name"] == "hermes"  # back-compat alias
+        assert p["trunk_ref"] == "refs/heads/main"
         assert "refs/heads/main" in p["detail"]
 
     def test_watched_repos_pairs_path_with_its_own_trunk(self):
@@ -322,12 +401,12 @@ class TestExecutedDirGate:
         assert s.executed_gated is False
         assert s.alerts is True
 
-    def test_misconfigured_is_never_gated_into_silence(self, gated_repo):
+    def test_trunk_missing_is_never_gated_into_silence(self, gated_repo):
         """If the trunk ref does not resolve we cannot compute an executed
         diff at all — silence there would recreate the fail-silent hole."""
         s = sample_code_drift(gated_repo, "refs/heads/main",
                               repo_name="hermes", executed_dirs=HERMES_DIRS)
-        assert s.state == "misconfigured"
+        assert s.state == "trunk_missing"
         assert s.alerts is True
 
     def test_inert_drift_emits_no_event(self, bus, tmp_path, gated_repo):
@@ -351,7 +430,8 @@ class TestExecutedDirGate:
         p = _drift_events(bus)[0].payload
         assert p["state"] == "behind"
         assert p["executed_gated"] is True
-        assert "ops/deploy.ps1" in p["executed_files"]
+        assert "ops/deploy.ps1" in p["executed_changed"]
+        assert p["executed_files"] == p["executed_changed"]
 
     def test_going_inert_resolves_honestly_not_as_in_sync(self, bus, tmp_path):
         """A gated repo can stop alerting without ever merging. The closure
@@ -390,7 +470,11 @@ def make_monitor(bus, tmp_path, **kw):
 class TestRisingEdge:
     def test_first_drift_emits_full_payload(self, bus, tmp_path):
         m = make_monitor(bus, tmp_path)
-        assert m.evaluate(behind(3), now=1000.0)
+        sample = behind(3)
+        sample = DriftSample(
+            **{**sample.__dict__, "trunk_ref": "refs/heads/measured"}
+        )
+        assert m.evaluate(sample, now=1000.0)
         events = _drift_events(bus)
         assert len(events) == 1
         p = events[0].payload
@@ -399,6 +483,9 @@ class TestRisingEdge:
         assert p["behind_count"] == 3
         assert p["dirty"] is False
         assert len(p["missed_subjects"]) == 3
+        assert p["key"] == "agent-src"
+        assert p["trunk_ref"] == "refs/heads/measured"
+        assert p["executed_changed"] == []
         assert events[0].priority is Priority.HIGH
 
     def test_same_shape_within_cooldown_is_silent(self, bus, tmp_path):
