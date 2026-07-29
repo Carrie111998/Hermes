@@ -1,8 +1,11 @@
 """Tests for topic-aware gateway progress updates."""
 
 import asyncio
+import concurrent.futures
 import importlib
+import queue as queue_module
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -227,6 +230,124 @@ class RetryableOverflowEditProgressAdapter(SmallLimitProgressAdapter):
         return await super().edit_message(chat_id, message_id, content)
 
 
+class RetryableResetSendProgressAdapter(ProgressCaptureAdapter):
+    """Fail the first terminal-reset progress send, then deliver its retry."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.pre_send_attempts = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if "RESET-PRE" in content:
+            self.pre_send_attempts.append(content)
+            if len(self.pre_send_attempts) == 1:
+                return SendResult(
+                    success=False,
+                    error="temporary network failure",
+                    retryable=True,
+                    error_kind="transient",
+                )
+        return await super().send(chat_id, content, reply_to, metadata)
+
+
+class RetryablePartialOverflowProgressAdapter(SmallLimitProgressAdapter):
+    """Raise on one later overflow group so only its pending suffix is retried."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.progress_send_attempts = []
+        self.failed_partial_group = False
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if "OVERFLOW-PRE" in content:
+            self.progress_send_attempts.append(content)
+            if (
+                len(self.progress_send_attempts) == 2
+                and not self.failed_partial_group
+            ):
+                self.failed_partial_group = True
+                raise ConnectionError("temporary network failure")
+        return await super().send(chat_id, content, reply_to, metadata)
+
+
+class RetryableSeparateProgressAdapter(ProgressCaptureAdapter):
+    """Fail the first separate progress send, then confirm its retry."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.first_line_attempts = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        if "first-short" in content:
+            self.first_line_attempts += 1
+            if self.first_line_attempts == 1:
+                return SendResult(
+                    success=False,
+                    error="temporary network failure",
+                    retryable=True,
+                    error_kind="transient",
+                )
+        return await super().send(chat_id, content, reply_to, metadata)
+
+
+class PermanentResetEditProgressAdapter(ProgressCaptureAdapter):
+    """Reject one reset flush edit so the buffer must be sent fresh."""
+
+    base_sent: threading.Event
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.permanent_edit_failures = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(chat_id, content, reply_to, metadata)
+        if "PERMANENT-BASE" in content and "PERMANENT-PENDING" not in content:
+            type(self).base_sent.set()
+        return result
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        if "PERMANENT-PENDING" in content:
+            self.permanent_edit_failures += 1
+            self.edits.append(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "content": content,
+                }
+            )
+            return SendResult(
+                success=False,
+                error="message no longer exists",
+                error_kind="not_found",
+            )
+        return await super().edit_message(chat_id, message_id, content)
+
+
+class LiveResetThrottleProgressAdapter(ProgressCaptureAdapter):
+    """Expose transport ordering for a reset while progress is throttled."""
+
+    pre1_sent: threading.Event
+    post_confirmed: threading.Event
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.transport_events = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(chat_id, content, reply_to, metadata)
+        self.transport_events.append(("send", content))
+        if "LIVE-PRE-1" in content:
+            type(self).pre1_sent.set()
+        if "LIVE-POST" in content:
+            type(self).post_confirmed.set()
+        return result
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        result = await super().edit_message(chat_id, message_id, content)
+        self.transport_events.append(("edit", content))
+        return result
+
+
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
@@ -376,7 +497,7 @@ class ManyProgressLinesAgent:
         assert cb is not None
         cb("tool.started", "terminal", "first-short", {})
         # Let the progress task create the first editable bubble, then enqueue
-        # the rest quickly.  The cancellation drain must roll them into fresh
+        # the rest quickly.  The terminal drain must roll them into fresh
         # editable bubbles instead of trying to edit the first one past limit.
         time.sleep(0.35)
         for idx in range(1, 8):
@@ -387,6 +508,232 @@ class ManyProgressLinesAgent:
             "messages": [],
             "api_calls": 1,
         }
+
+
+class ImmediateManyProgressLinesAgent:
+    """Complete a progress-producing worker before the sender can be scheduled."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", "first-short", {})
+        for idx in range(1, 8):
+            cb(
+                "tool.started",
+                "terminal",
+                f"overflow-line-{idx}-" + "x" * 45,
+                {},
+            )
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class EmptyWaitProgressAgent:
+    """Finish while the sender is inside its observed-empty wait."""
+
+    first_empty: threading.Event
+    second_empty: threading.Event
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        assert type(self).first_empty.wait(timeout=5)
+        cb("tool.started", "terminal", "first-short", {})
+        assert type(self).second_empty.wait(timeout=5)
+        for idx in range(1, 8):
+            cb(
+                "tool.started",
+                "terminal",
+                f"overflow-line-{idx}-" + "x" * 45,
+                {},
+            )
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class StreamResetProgressAgent:
+    """Emit tool progress on both sides of a real streamed content bubble."""
+
+    reset_enqueued: threading.Event
+    pre_progress = ("RESET-PRE",)
+    content = "RESET-CONTENT"
+    post_progress = "RESET-POST"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get(
+            "interim_assistant_callback"
+        )
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        progress_cb = self.tool_progress_callback
+        interim_cb = self.interim_assistant_callback
+        assert progress_cb is not None
+        assert interim_cb is not None
+
+        for preview in type(self).pre_progress:
+            progress_cb("tool.started", "terminal", preview, {})
+        interim_cb(type(self).content, already_streamed=False)
+        assert type(self).reset_enqueued.wait(timeout=5)
+        progress_cb(
+            "tool.started",
+            "terminal",
+            type(self).post_progress,
+            {},
+        )
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class StreamResetOverflowProgressAgent(StreamResetProgressAgent):
+    """Overflow the pre-content buffer before the real stream reset."""
+
+    pre_progress = tuple(
+        f"OVERFLOW-PRE-{idx}-" + "x" * 45
+        for idx in range(8)
+    )
+    content = "OVERFLOW-CONTENT"
+    post_progress = "OVERFLOW-POST"
+
+
+class PermanentEditStreamResetAgent:
+    """Create an editable bubble, then force reset-flush edit fallback."""
+
+    reset_enqueued: threading.Event
+    base_sent: threading.Event
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get(
+            "interim_assistant_callback"
+        )
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        progress_cb = self.tool_progress_callback
+        interim_cb = self.interim_assistant_callback
+        assert progress_cb is not None
+        assert interim_cb is not None
+
+        progress_cb("tool.started", "terminal", "PERMANENT-BASE", {})
+        assert type(self).base_sent.wait(timeout=5)
+        progress_cb("tool.started", "terminal", "PERMANENT-PENDING", {})
+        interim_cb("PERMANENT-CONTENT", already_streamed=False)
+        assert type(self).reset_enqueued.wait(timeout=5)
+        progress_cb("tool.started", "terminal", "PERMANENT-POST", {})
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class LiveThrottleStreamResetProgressAgent:
+    """Keep the producer active while a live reset flushes throttled progress."""
+
+    pre1_sent: threading.Event
+    reset_enqueued: threading.Event
+    post_confirmed: threading.Event
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get(
+            "interim_assistant_callback"
+        )
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        progress_cb = self.tool_progress_callback
+        interim_cb = self.interim_assistant_callback
+        assert progress_cb is not None
+        assert interim_cb is not None
+
+        progress_cb("tool.started", "terminal", "LIVE-PRE-1", {})
+        assert type(self).pre1_sent.wait(timeout=5)
+        progress_cb("tool.started", "terminal", "LIVE-PRE-2", {})
+        interim_cb("LIVE-CONTENT", already_streamed=False)
+        assert type(self).reset_enqueued.wait(timeout=5)
+        progress_cb("tool.started", "terminal", "LIVE-POST", {})
+        # Keep the real executor producer open until the live sender has
+        # crossed the reset and confirmed the post-content progress bubble.
+        assert type(self).post_confirmed.wait(timeout=5)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class ImmediateInterruptedProgressAgent:
+    """Queue progress, then mark the run interrupted before sender startup."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.is_interrupted = False
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", "must-not-render", {})
+        self.is_interrupted = True
+        return {
+            "final_response": "Operation interrupted.",
+            "messages": [],
+            "api_calls": 1,
+            "interrupted": True,
+        }
+
+
+class BlockingProgressAgent:
+    """Hold the producer open so shutdown must use cancellation fallback."""
+
+    started: threading.Event
+    release: threading.Event
+    finished: threading.Event
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        for idx in range(4):
+            cb(
+                "tool.started",
+                "terminal",
+                f"cancel-drain-line-{idx}",
+                {},
+            )
+        type(self).started.set()
+        try:
+            assert type(self).release.wait(timeout=5)
+            return {
+                "final_response": "done",
+                "messages": [],
+                "api_calls": 1,
+            }
+        finally:
+            type(self).finished.set()
 
 
 class DelayedInterimAgent:
@@ -1028,6 +1375,97 @@ class VerboseAgent:
         }
 
 
+def _submit_inline_completed(self, func, *args, **kwargs):
+    """Test executor seam that completes before the event loop can reschedule."""
+    worker_future: concurrent.futures.Future = concurrent.futures.Future()
+    try:
+        worker_future.set_result(func(*args, **kwargs))
+    except BaseException as exc:
+        worker_future.set_exception(exc)
+    return (
+        asyncio.wrap_future(
+            worker_future,
+            loop=asyncio.get_running_loop(),
+        ),
+        worker_future,
+    )
+
+
+def _gate_progress_queue_until_terminal(
+    monkeypatch,
+    reset_enqueued,
+    *,
+    initial_progress_items=0,
+):
+    """Hold the first per-turn queue until its opaque terminal marker arrives."""
+    allow_progress_drain = threading.Event()
+    queue_instances = {"count": 0}
+    real_queue_type = queue_module.Queue
+
+    class TerminalDrainQueue(real_queue_type):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            queue_instances["count"] += 1
+            self.is_progress_queue = queue_instances["count"] == 1
+            self.progress_items_returned = 0
+
+        def put(self, item, block=True, timeout=None):
+            result = super().put(item, block=block, timeout=timeout)
+            if self.is_progress_queue:
+                if item == ("__reset__",):
+                    reset_enqueued.set()
+                elif not isinstance(item, (str, tuple)):
+                    allow_progress_drain.set()
+            return result
+
+        def get_nowait(self):
+            if (
+                self.is_progress_queue
+                and not allow_progress_drain.is_set()
+                and self.progress_items_returned >= initial_progress_items
+            ):
+                raise queue_module.Empty
+            item = super().get_nowait()
+            if self.is_progress_queue:
+                self.progress_items_returned += 1
+            return item
+
+    monkeypatch.setattr(queue_module, "Queue", TerminalDrainQueue)
+
+
+def _hold_second_progress_item_until_reset(monkeypatch, reset_enqueued):
+    """Let PRE1 render, then observe a real stream reset before draining PRE2."""
+    queue_instances = {"count": 0}
+    real_queue_type = queue_module.Queue
+
+    class LiveResetQueue(real_queue_type):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            queue_instances["count"] += 1
+            self.is_progress_queue = queue_instances["count"] == 1
+            self.progress_items_returned = 0
+
+        def put(self, item, block=True, timeout=None):
+            result = super().put(item, block=block, timeout=timeout)
+            if self.is_progress_queue and item == ("__reset__",):
+                reset_enqueued.set()
+            return result
+
+        def get_nowait(self):
+            if (
+                self.is_progress_queue
+                and self.progress_items_returned >= 1
+                and not reset_enqueued.is_set()
+            ):
+                raise queue_module.Empty
+            item = super().get_nowait()
+            if self.is_progress_queue:
+                self.progress_items_returned += 1
+            return item
+
+    monkeypatch.setattr(queue_module, "Queue", LiveResetQueue)
+
+
 async def _run_with_agent(
     monkeypatch,
     tmp_path,
@@ -1041,6 +1479,7 @@ async def _run_with_agent(
     chat_type="group",
     thread_id="17585",
     adapter_cls=ProgressCaptureAdapter,
+    start_only=False,
 ):
     if config_data:
         import yaml
@@ -1079,7 +1518,7 @@ async def _run_with_agent(
             message_id="queued-1",
         )
 
-    result = await runner._run_agent(
+    run_coro = runner._run_agent(
         message="hello",
         context_prompt="",
         history=[],
@@ -1087,6 +1526,9 @@ async def _run_with_agent(
         session_id=session_id,
         session_key=session_key,
     )
+    if start_only:
+        return adapter, asyncio.create_task(run_coro)
+    result = await run_coro
     return adapter, result
 
 
@@ -1118,6 +1560,478 @@ async def test_retryable_progress_edit_keeps_same_message_id(monkeypatch, tmp_pa
     assert any(adapter.edit_outcomes[1:])
     assert {call["message_id"] for call in adapter.edits} == {"progress-1"}
     assert "fourth command" in adapter.edits[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_progress_terminal_drain_when_worker_finishes_before_sender_turn(
+    monkeypatch,
+    tmp_path,
+):
+    """A completed producer is flushed even if the sender never ran first."""
+    gateway_run = importlib.import_module("gateway.run")
+
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_submit_in_executor_with_context",
+        _submit_inline_completed,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ImmediateManyProgressLinesAgent,
+        session_id="sess-progress-worker-before-sender",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+                "tool_preview_length": 60,
+            }
+        },
+        adapter_cls=SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) >= 2
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+    delivered = "\n".join(
+        call["content"] for call in adapter.sent + adapter.edits
+    )
+    assert "overflow-line-7" in delivered
+
+
+@pytest.mark.asyncio
+async def test_progress_terminal_drain_flushes_both_sides_of_stream_reset(
+    monkeypatch,
+    tmp_path,
+):
+    """A real stream reset cannot discard the pre-content progress buffer."""
+    reset_enqueued = threading.Event()
+
+    StreamResetProgressAgent.reset_enqueued = reset_enqueued
+    _gate_progress_queue_until_terminal(monkeypatch, reset_enqueued)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamResetProgressAgent,
+        session_id="sess-progress-stream-reset-terminal-drain",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+            }
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert reset_enqueued.is_set()
+    visible = [call["content"] for call in adapter.sent + adapter.edits]
+    assert sum("RESET-PRE" in content for content in visible) == 1
+    assert sum("RESET-POST" in content for content in visible) == 1
+    assert any(content == "RESET-CONTENT" for content in visible)
+    progress_bubbles = [
+        content
+        for content in visible
+        if "RESET-PRE" in content or "RESET-POST" in content
+    ]
+    assert len(progress_bubbles) == 2
+    assert "RESET-PRE" in progress_bubbles[0]
+    assert "RESET-POST" in progress_bubbles[1]
+
+
+@pytest.mark.asyncio
+async def test_progress_terminal_drain_retries_single_stream_reset_buffer(
+    monkeypatch,
+    tmp_path,
+):
+    """A retryable first send cannot commit and clear the pre-reset buffer."""
+    reset_enqueued = threading.Event()
+    StreamResetProgressAgent.reset_enqueued = reset_enqueued
+    _gate_progress_queue_until_terminal(monkeypatch, reset_enqueued)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamResetProgressAgent,
+        session_id="sess-progress-stream-reset-single-retry",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+            }
+        },
+        adapter_cls=RetryableResetSendProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.pre_send_attempts) == 2
+    assert adapter.pre_send_attempts[0] == adapter.pre_send_attempts[1]
+    visible = [call["content"] for call in adapter.sent + adapter.edits]
+    assert sum("RESET-PRE" in content for content in visible) == 1
+    assert sum("RESET-POST" in content for content in visible) == 1
+
+
+@pytest.mark.asyncio
+async def test_progress_terminal_drain_retries_only_undelivered_overflow_suffix(
+    monkeypatch,
+    tmp_path,
+):
+    """A partial overflow retry cannot duplicate already delivered groups."""
+    reset_enqueued = threading.Event()
+    StreamResetOverflowProgressAgent.reset_enqueued = reset_enqueued
+    _gate_progress_queue_until_terminal(monkeypatch, reset_enqueued)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StreamResetOverflowProgressAgent,
+        session_id="sess-progress-stream-reset-overflow-retry",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+                "tool_preview_length": 60,
+            }
+        },
+        adapter_cls=RetryablePartialOverflowProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.failed_partial_group is True
+    assert len(adapter.progress_send_attempts) >= 3
+    first_group = adapter.progress_send_attempts[0]
+    failed_group = adapter.progress_send_attempts[1]
+    assert adapter.progress_send_attempts.count(first_group) == 1
+    assert adapter.progress_send_attempts.count(failed_group) == 2
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+    visible_sends = [call["content"] for call in adapter.sent]
+    for idx in range(8):
+        assert sum(
+            f"OVERFLOW-PRE-{idx}-" in content
+            for content in visible_sends
+        ) == 1
+    assert sum(
+        "OVERFLOW-POST" in content
+        for content in visible_sends
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_progress_terminal_drain_falls_back_after_permanent_reset_edit(
+    monkeypatch,
+    tmp_path,
+):
+    """A permanent edit failure sends the pending reset buffer as fresh."""
+    reset_enqueued = threading.Event()
+    base_sent = threading.Event()
+    PermanentEditStreamResetAgent.reset_enqueued = reset_enqueued
+    PermanentEditStreamResetAgent.base_sent = base_sent
+    PermanentResetEditProgressAdapter.base_sent = base_sent
+    _gate_progress_queue_until_terminal(
+        monkeypatch,
+        reset_enqueued,
+        initial_progress_items=1,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        PermanentEditStreamResetAgent,
+        session_id="sess-progress-stream-reset-permanent-edit",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+            }
+        },
+        adapter_cls=PermanentResetEditProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.permanent_edit_failures == 1
+    visible_sends = [call["content"] for call in adapter.sent]
+    assert sum("PERMANENT-PENDING" in content for content in visible_sends) == 1
+    assert sum("PERMANENT-POST" in content for content in visible_sends) == 1
+    assert any(
+        "PERMANENT-BASE" in content and "PERMANENT-PENDING" in content
+        for content in visible_sends
+    )
+
+
+@pytest.mark.asyncio
+async def test_progress_live_reset_flushes_throttled_buffer_before_clearing(
+    monkeypatch,
+    tmp_path,
+):
+    """A live reset confirms buffered PRE2 before advancing to POST."""
+    pre1_sent = threading.Event()
+    reset_enqueued = threading.Event()
+    post_confirmed = threading.Event()
+    LiveThrottleStreamResetProgressAgent.pre1_sent = pre1_sent
+    LiveThrottleStreamResetProgressAgent.reset_enqueued = reset_enqueued
+    LiveThrottleStreamResetProgressAgent.post_confirmed = post_confirmed
+    LiveResetThrottleProgressAdapter.pre1_sent = pre1_sent
+    LiveResetThrottleProgressAdapter.post_confirmed = post_confirmed
+    _hold_second_progress_item_until_reset(monkeypatch, reset_enqueued)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        LiveThrottleStreamResetProgressAgent,
+        session_id="sess-progress-live-stream-reset-throttle",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+            }
+        },
+        adapter_cls=LiveResetThrottleProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert pre1_sent.is_set()
+    assert reset_enqueued.is_set()
+    assert post_confirmed.is_set()
+
+    sent_contents = [call["content"] for call in adapter.sent]
+    edited_contents = [call["content"] for call in adapter.edits]
+    assert sum("LIVE-PRE-2" in content for content in sent_contents) == 0
+    assert sum("LIVE-PRE-2" in content for content in edited_contents) == 1
+    assert "LIVE-PRE-1" in next(
+        content for content in edited_contents if "LIVE-PRE-2" in content
+    )
+    post_bubbles = [
+        content for content in sent_contents if "LIVE-POST" in content
+    ]
+    assert len(post_bubbles) == 1
+    assert "LIVE-PRE-1" not in post_bubbles[0]
+    assert "LIVE-PRE-2" not in post_bubbles[0]
+
+    content_send_index = next(
+        index
+        for index, event in enumerate(adapter.transport_events)
+        if event == ("send", "LIVE-CONTENT")
+    )
+    pre2_edit_index = next(
+        index
+        for index, (operation, content) in enumerate(adapter.transport_events)
+        if operation == "edit" and "LIVE-PRE-2" in content
+    )
+    post_send_index = next(
+        index
+        for index, (operation, content) in enumerate(adapter.transport_events)
+        if operation == "send" and "LIVE-POST" in content
+    )
+    assert content_send_index < pre2_edit_index < post_send_index
+
+
+@pytest.mark.asyncio
+async def test_progress_terminal_drain_preserves_separate_message_mode(
+    monkeypatch,
+    tmp_path,
+):
+    """An immediate producer still delivers every separate progress line."""
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_submit_in_executor_with_context",
+        _submit_inline_completed,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ImmediateManyProgressLinesAgent,
+        session_id="sess-progress-worker-before-separate-sender",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "separate",
+                "interim_assistant_messages": False,
+            }
+        },
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 8
+    assert adapter.edits == []
+    assert "first-short" in adapter.sent[0]["content"]
+    assert "overflow-line-7" in adapter.sent[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_progress_terminal_drain_retries_separate_message_line(
+    monkeypatch,
+    tmp_path,
+):
+    """Separate grouping retries a line before advancing to the next one."""
+    _gate_progress_queue_until_terminal(monkeypatch, threading.Event())
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_submit_in_executor_with_context",
+        _submit_inline_completed,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ImmediateManyProgressLinesAgent,
+        session_id="sess-progress-separate-retry",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "separate",
+                "interim_assistant_messages": False,
+            }
+        },
+        adapter_cls=RetryableSeparateProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.first_line_attempts == 2
+    assert len(adapter.sent) == 8
+    assert adapter.edits == []
+    assert sum(
+        "first-short" in call["content"]
+        for call in adapter.sent
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_progress_terminal_drain_discards_interrupted_run_queue(
+    monkeypatch,
+    tmp_path,
+):
+    """Queued progress remains suppressed once the producer is interrupted."""
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_submit_in_executor_with_context",
+        _submit_inline_completed,
+    )
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ImmediateInterruptedProgressAgent,
+        session_id="sess-progress-interrupted-before-sender",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+            }
+        },
+    )
+
+    assert result["interrupted"] is True
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+async def test_progress_cancellation_fallback_drains_open_producer_queue(
+    monkeypatch,
+    tmp_path,
+):
+    """Cancellation drains queued lines without pretending the producer closed."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    BlockingProgressAgent.started = started
+    BlockingProgressAgent.release = release
+    BlockingProgressAgent.finished = finished
+
+    adapter, run_task = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BlockingProgressAgent,
+        session_id="sess-progress-cancel-open-producer",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "separate",
+                "interim_assistant_messages": False,
+            }
+        },
+        start_only=True,
+    )
+
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(run_task, timeout=5)
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+
+    assert len(adapter.sent) == 4
+    assert adapter.edits == []
+    delivered = "\n".join(call["content"] for call in adapter.sent)
+    for idx in range(4):
+        assert f"cancel-drain-line-{idx}" in delivered
+
+
+@pytest.mark.asyncio
+async def test_progress_terminal_drain_while_sender_waits_on_empty_queue(
+    monkeypatch,
+    tmp_path,
+):
+    """Completion during the empty-queue wait must not bypass final drain."""
+    gateway_run = importlib.import_module("gateway.run")
+    real_queue_type = queue_module.Queue
+    first_empty = threading.Event()
+    second_empty = threading.Event()
+
+    class ObservedEmptyQueue(real_queue_type):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.empty_observations = 0
+
+        def get_nowait(self):
+            try:
+                return super().get_nowait()
+            except queue_module.Empty:
+                self.empty_observations += 1
+                if self.empty_observations == 1:
+                    first_empty.set()
+                elif self.empty_observations == 2:
+                    second_empty.set()
+                raise
+
+    EmptyWaitProgressAgent.first_empty = first_empty
+    EmptyWaitProgressAgent.second_empty = second_empty
+    monkeypatch.setattr(queue_module, "Queue", ObservedEmptyQueue)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        EmptyWaitProgressAgent,
+        session_id="sess-progress-complete-during-empty-wait",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="direct",
+        thread_id="1700000000.000100",
+        adapter_cls=RetryableOverflowEditProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert first_empty.is_set()
+    assert second_empty.is_set()
+    assert adapter.retryable_edit_failures == 1
+    assert len(adapter.sent) >= 2
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
 
 
 @pytest.mark.asyncio

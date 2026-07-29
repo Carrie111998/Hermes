@@ -22930,7 +22930,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if a writer or cleanup worker is still alive, skip close entirely and
         let the imminent process hard-exit release SQLite's OS handles.
         """
-        close_executor = self._seal_executor_for_db_close()
+        # ``stop()`` deliberately dispatches this helper through
+        # ``GatewayRunner`` so legacy duck-typed runners keep working without
+        # inheriting every newly-added private method.  Do the same for the
+        # private executor helpers used below.
+        close_executor = GatewayRunner._seal_executor_for_db_close(self)
         unsafe = set(unsafe_reasons)
         # Inspect the complete worker registry independently of the public
         # _running_agents snapshot.  A cancelled/timed-out outer coroutine can
@@ -22991,7 +22995,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pending = set()
                 self._gateway_executor_futures = pending
             pending.add(close_worker_future)
-            close_async_future = self._wrap_tracked_gateway_future(
+            close_async_future = GatewayRunner._wrap_tracked_gateway_future(
+                self,
                 close_worker_future,
                 loop=loop,
             )
@@ -27386,6 +27391,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
+        # The agent worker produces this queue from a real executor thread.
+        # Normal completion publishes a terminal marker only after that worker
+        # is done, making every earlier queue item a closed producer set that
+        # the async sender can drain without scheduler-timing assumptions.
+        _progress_terminal = object()
+        _progress_finish_requested = threading.Event()
+        _progress_abort_requested = threading.Event()
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -27962,20 +27974,82 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _track_progress_result(result)
                 return result
 
-            async def _roll_progress_overflow_if_needed() -> bool:
+            async def _send_progress_text_confirmed(text: str) -> bool:
+                """Retry one fresh progress send until delivery is confirmed."""
+                while True:
+                    try:
+                        result = await _send_progress_text(text)
+                        if result.success:
+                            return True
+                        if not getattr(result, "retryable", False):
+                            return False
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # Retry transport exceptions inside the same bounded
+                        # terminal-drain window as retryable SendResult values.
+                        pass
+                    await asyncio.sleep(0.3)
+
+            async def _send_progress_groups_fresh(groups: list[list]) -> str:
+                """Send groups in order, retaining only an undelivered suffix."""
+                nonlocal progress_msg_id, progress_lines, can_edit
+
+                for index, group in enumerate(groups):
+                    # Advance the retained suffix before the next transport
+                    # await. If that await raises, already confirmed groups
+                    # cannot be replayed on the retry.
+                    progress_lines = [
+                        line
+                        for pending_group in groups[index:]
+                        for line in pending_group
+                    ]
+                    progress_msg_id = None
+                    try:
+                        result = await _send_progress_text(
+                            _progress_text(group)
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        return "retry"
+                    if not result.success:
+                        return (
+                            "retry"
+                            if getattr(result, "retryable", False)
+                            else "failed"
+                        )
+                    if result.message_id:
+                        progress_msg_id = result.message_id
+                    else:
+                        progress_msg_id = None
+                        can_edit = False
+
+                    remaining = groups[index + 1:]
+                    if remaining:
+                        progress_lines = [
+                            line
+                            for pending_group in remaining
+                            for line in pending_group
+                        ]
+
+                if groups:
+                    progress_lines = groups[-1]
+                return "delivered"
+
+            async def _roll_progress_overflow_if_needed() -> str:
                 """Start fresh editable progress bubbles before a bubble exceeds limit.
 
-                Returns True when it delivered/split the current buffer, or when
-                a transient edit failure left the buffer and message identity
-                intact for a later retry.  In either case the caller should skip
-                the normal send/edit path for this tick.
+                Returns ``not_needed``, ``delivered``, ``retry``, or ``failed``.
+                On partial delivery, only the failed and later groups remain in
+                ``progress_lines`` so a retry cannot duplicate earlier groups.
                 """
                 nonlocal progress_msg_id, progress_lines, can_edit
                 if not progress_lines or not can_edit:
-                    return False
+                    return "not_needed"
                 groups = _split_progress_groups(progress_lines)
                 if len(groups) <= 1:
-                    return False
+                    return "not_needed"
 
                 first_text = _progress_text(groups[0])
                 if progress_msg_id is not None:
@@ -27986,28 +28060,233 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "[%s] Transient overflow edit failure — keeping can_edit=True",
                                 adapter.name,
                             )
-                            return True
-                        can_edit = False
-                        # Fall back to the existing non-edit behavior below.
-                        return False
+                            return "retry"
+                        # The editable bubble is no longer usable. A terminal
+                        # flush can still preserve the whole pending buffer by
+                        # sending it as fresh platform-sized groups.
+                        return "fallback"
                 else:
                     result = await _send_progress_text(first_text)
-                    if result.success and result.message_id:
+                    if not result.success:
+                        return (
+                            "retry"
+                            if getattr(result, "retryable", False)
+                            else "failed"
+                        )
+                    if result.message_id:
                         progress_msg_id = result.message_id
+                    else:
+                        progress_msg_id = None
+                        can_edit = False
 
-                for group in groups[1:]:
-                    result = await _send_progress_text(_progress_text(group))
-                    if result.success and result.message_id:
-                        progress_msg_id = result.message_id
+                return await _send_progress_groups_fresh(groups[1:])
 
-                # The newest continuation is now the only mutable bubble.  Keep
-                # just its lines so subsequent edits update it instead of
-                # replaying the full historical transcript into new messages.
-                progress_lines = groups[-1]
-                return True
+            async def _flush_progress_buffer() -> bool:
+                """Publish the current editable buffer after confirmed delivery.
+
+                Retryable failures retain the buffer and retry inside the
+                caller's bounded terminal-drain window.  The outer five-second
+                shutdown wait remains the hard stop.
+                """
+                nonlocal progress_msg_id, can_edit
+
+                if not progress_lines or not can_edit:
+                    return True
+
+                while True:
+                    try:
+                        overflow_outcome = (
+                            await _roll_progress_overflow_if_needed()
+                        )
+                        if overflow_outcome == "delivered":
+                            return True
+                        if overflow_outcome == "failed":
+                            return False
+                        if overflow_outcome == "fallback":
+                            # A permanent edit failure does not prove that the
+                            # buffered content was delivered. Retry the whole
+                            # pending buffer as fresh, platform-sized messages.
+                            progress_msg_id = None
+                            fresh_outcome = (
+                                await _send_progress_groups_fresh(
+                                    _split_progress_groups(progress_lines)
+                                )
+                            )
+                            if fresh_outcome == "delivered":
+                                return True
+                            if fresh_outcome == "failed":
+                                return False
+                            await asyncio.sleep(0.3)
+                            continue
+                        if overflow_outcome == "retry":
+                            await asyncio.sleep(0.3)
+                            continue
+
+                        full_text = _progress_text(progress_lines)
+                        if progress_msg_id:
+                            result = await _edit_progress_message(
+                                progress_msg_id,
+                                full_text,
+                            )
+                        else:
+                            result = await _send_progress_text(full_text)
+
+                        if result.success:
+                            if not progress_msg_id and result.message_id:
+                                progress_msg_id = result.message_id
+                            return True
+                        if not getattr(result, "retryable", False):
+                            if progress_msg_id:
+                                # Permanent edit failure: preserve the pending
+                                # buffer with a fresh send, and clear/reset only
+                                # after that fallback confirms delivery.
+                                progress_msg_id = None
+                                fresh_outcome = (
+                                    await _send_progress_groups_fresh(
+                                        _split_progress_groups(progress_lines)
+                                    )
+                                )
+                                if fresh_outcome == "delivered":
+                                    return True
+                                if fresh_outcome == "retry":
+                                    await asyncio.sleep(0.3)
+                                    continue
+                            return False
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # Transport exceptions are retry-deferred just like a
+                        # retryable SendResult; the bounded outer wait prevents
+                        # an unhealthy adapter from stalling shutdown.
+                        pass
+                    await asyncio.sleep(0.3)
+
+            async def _drain_and_finalize_progress() -> None:
+                """Drain the closed producer queue and publish its final buffer.
+
+                This is shared by the normal terminal-marker path and the
+                cancellation fallback.  Keeping it outside the polling
+                ``try`` means cancellation raised while the sender is sleeping
+                after ``queue.Empty`` cannot bypass the drain.
+                """
+                nonlocal progress_msg_id, progress_lines
+
+                def _delivery_is_suppressed() -> bool:
+                    if not _run_still_current():
+                        return True
+                    try:
+                        agent = agent_holder[0] if agent_holder else None
+                        return bool(
+                            agent is not None
+                            and getattr(agent, "is_interrupted", False)
+                        )
+                    except Exception:
+                        return False
+
+                if _delivery_is_suppressed():
+                    while True:
+                        try:
+                            progress_queue.get_nowait()
+                        except Exception:
+                            break
+                    return
+
+                while True:
+                    try:
+                        raw = progress_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    except Exception:
+                        break
+
+                    if raw is _progress_terminal:
+                        continue
+                    try:
+                        if _delivery_is_suppressed():
+                            while True:
+                                try:
+                                    progress_queue.get_nowait()
+                                except Exception:
+                                    break
+                            return
+
+                        msg = None
+                        msg_already_buffered = False
+                        if (
+                            isinstance(raw, tuple)
+                            and len(raw) == 3
+                            and raw[0] == "__dedup__"
+                        ):
+                            _, base_msg, count = raw
+                            if progress_lines:
+                                progress_lines[-1] = (
+                                    f"{base_msg} (×{count + 1})"
+                                )
+                                msg_already_buffered = True
+                            msg = (
+                                progress_lines[-1]
+                                if progress_lines
+                                else base_msg
+                            )
+                        elif (
+                            isinstance(raw, tuple)
+                            and len(raw) >= 1
+                            and raw[0] == "__reset__"
+                        ):
+                            # Content-bubble marker during drain: close off the
+                            # current progress bubble and start a fresh one for
+                            # any tool lines that arrived after.
+                            if not await _flush_progress_buffer():
+                                return
+                            progress_msg_id = None
+                            progress_lines = []
+                            last_progress_msg[0] = None
+                            repeat_count[0] = 0
+                        else:
+                            msg = raw
+
+                        if msg is None:
+                            continue
+                        if not msg_already_buffered:
+                            # Keep the same buffer semantics as the live path
+                            # even in ``separate`` mode so a following dedup
+                            # marker can update the immediately preceding line.
+                            progress_lines.append(msg)
+                        if can_edit:
+                            overflow_outcome = (
+                                await _roll_progress_overflow_if_needed()
+                            )
+                            # If rollover discovered that successful sends have
+                            # no editable message id, continue in confirmed
+                            # separate-message mode. A delivered rollover
+                            # already included the current line.
+                            if (
+                                not can_edit
+                                and overflow_outcome != "delivered"
+                                and not await _send_progress_text_confirmed(
+                                    str(msg)
+                                )
+                            ):
+                                return
+                        else:
+                            if not await _send_progress_text_confirmed(
+                                str(msg)
+                            ):
+                                return
+                    except Exception:
+                        break
+
+                if not can_edit or not progress_lines:
+                    return
+
+                await _flush_progress_buffer()
 
             while True:
                 try:
+                    if _progress_finish_requested.is_set():
+                        await _drain_and_finalize_progress()
+                        return
+
                     if not _run_still_current():
                         while not progress_queue.empty():
                             try:
@@ -28017,6 +28296,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return
 
                     raw = progress_queue.get_nowait()
+                    if raw is _progress_terminal:
+                        await _drain_and_finalize_progress()
+                        return
 
                     # Drain silently when interrupted: events queued in the
                     # window between tool parse and interrupt processing
@@ -28057,6 +28339,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # order. Mirrors GatewayStreamConsumer.on_segment_break
                         # on the content side. (Issue: tool + content
                         # linearization regression after PR #7885.)
+                        if not await _flush_progress_buffer():
+                            return
                         progress_msg_id = None
                         progress_lines = []
                         last_progress_msg[0] = None
@@ -28066,7 +28350,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         msg = raw
                         progress_lines.append(msg)
 
-                    if await _roll_progress_overflow_if_needed():
+                    _overflow_outcome = (
+                        await _roll_progress_overflow_if_needed()
+                    )
+                    if _overflow_outcome in {"delivered", "retry"}:
                         _last_edit_ts = time.monotonic()
                         await asyncio.sleep(0.3)
                         if _run_still_current():
@@ -28074,6 +28361,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 source.chat_id, metadata=_progress_metadata
                             )
                         continue
+                    if _overflow_outcome in {"fallback", "failed"}:
+                        can_edit = False
 
                     # Throttle edits: batch rapid tool updates into fewer
                     # API calls to avoid hitting Telegram flood control.
@@ -28165,60 +28454,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
                 except queue.Empty:
-                    await asyncio.sleep(0.3)
+                    try:
+                        await asyncio.sleep(0.3)
+                    except asyncio.CancelledError:
+                        if not _progress_abort_requested.is_set():
+                            await _drain_and_finalize_progress()
+                        return
                 except asyncio.CancelledError:
-                    # Drain remaining queued messages
-                    while not progress_queue.empty():
-                        try:
-                            raw = progress_queue.get_nowait()
-                            if (
-                                isinstance(raw, tuple)
-                                and len(raw) == 3
-                                and raw[0] == "__dedup__"
-                            ):
-                                _, base_msg, count = raw
-                                if progress_lines:
-                                    progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                                    await _roll_progress_overflow_if_needed()
-                            elif (
-                                isinstance(raw, tuple)
-                                and len(raw) >= 1
-                                and raw[0] == "__reset__"
-                            ):
-                                # Content-bubble marker during drain: close off
-                                # the current progress bubble and start a fresh
-                                # one for any tool lines that arrived after.
-                                await _roll_progress_overflow_if_needed()
-                                if can_edit and progress_lines and progress_msg_id:
-                                    _pending_text = _progress_text(progress_lines)
-                                    try:
-                                        await _edit_progress_message(
-                                            progress_msg_id, _pending_text
-                                        )
-                                    except Exception:
-                                        pass
-                                progress_msg_id = None
-                                progress_lines = []
-                                last_progress_msg[0] = None
-                                repeat_count[0] = 0
-                            else:
-                                progress_lines.append(raw)
-                                await _roll_progress_overflow_if_needed()
-                        except Exception:
-                            break
-                    # Final edit with all remaining tools (only if editing works)
-                    if can_edit and progress_lines and progress_msg_id:
-                        await _roll_progress_overflow_if_needed()
-                    if can_edit and progress_lines and progress_msg_id:
-                        full_text = _progress_text(progress_lines)
-                        try:
-                            await _edit_progress_message(progress_msg_id, full_text)
-                        except Exception:
-                            pass
+                    if not _progress_abort_requested.is_set():
+                        await _drain_and_finalize_progress()
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
-                    await asyncio.sleep(1)
+                    try:
+                        await asyncio.sleep(1)
+                    except asyncio.CancelledError:
+                        if not _progress_abort_requested.is_set():
+                            await _drain_and_finalize_progress()
+                        return
 
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
@@ -30637,6 +30890,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return False
             return False
 
+        _executor_worker_future: Optional[concurrent.futures.Future] = None
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
@@ -31344,9 +31598,82 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             raise
         finally:
-            # Stop progress sender, interrupt monitor, and notification task
+            # A finished executor is a closed producer: publish one FIFO
+            # terminal marker and give the sender a bounded opportunity to
+            # flush every earlier callback.  Cancelling immediately is racy —
+            # the worker can finish before the sender's first scheduling turn,
+            # or while it sleeps after observing an empty queue.
             if progress_task:
-                progress_task.cancel()
+                _progress_producer_done = bool(
+                    _executor_worker_future is not None
+                    and _executor_worker_future.done()
+                )
+                if (
+                    _progress_producer_done
+                    and progress_queue is not None
+                    and not progress_task.done()
+                ):
+                    _progress_finish_requested.set()
+                    progress_queue.put(_progress_terminal)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(progress_task),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        _progress_abort_requested.set()
+                        logger.warning(
+                            "Progress sender did not finish its terminal drain "
+                            "within 5s; cancelling as a bounded fallback"
+                        )
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as _progress_err:
+                        logger.debug(
+                            "Progress sender terminal drain failed: %s",
+                            _progress_err,
+                        )
+
+                if not progress_task.done():
+                    progress_task.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(progress_task),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        _progress_abort_requested.set()
+                        progress_task.cancel()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as _progress_err:
+                        logger.debug(
+                            "Progress sender cancellation drain failed: %s",
+                            _progress_err,
+                        )
+                if progress_task.done():
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as _progress_err:
+                        logger.debug(
+                            "Progress sender shutdown failed: %s",
+                            _progress_err,
+                        )
+                else:
+                    # asyncio tasks cannot be force-killed.  Do not turn a
+                    # pathological adapter that ignores repeated cancellation
+                    # into an unbounded gateway shutdown wait.
+                    progress_task.add_done_callback(
+                        consume_detached_task_result
+                    )
+                    logger.warning(
+                        "Progress sender ignored bounded shutdown cancellation; "
+                        "detaching the cancelled task"
+                    )
+
+            # Stop the remaining auxiliary tasks.
             if log_task:
                 log_task.cancel()
             interrupt_monitor.cancel()
@@ -31395,7 +31722,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Wait for cancelled tasks
             for task in [
-                progress_task,
                 log_task,
                 interrupt_monitor,
                 tracking_task,
