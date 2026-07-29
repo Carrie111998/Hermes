@@ -170,6 +170,13 @@ class TestNormalizeVoiceRecordKeyForPromptToolkit:
         assert normalize_voice_record_key_for_prompt_toolkit("alt+d") == "a-d"
         assert normalize_voice_record_key_for_prompt_toolkit("alt+l") == "a-l"
 
+    def test_pt_key_to_sequence(self):
+        from hermes_cli.voice import pt_key_to_sequence
+
+        assert pt_key_to_sequence("c-b") == ("c-b",)
+        assert pt_key_to_sequence("a-v") == ("escape", "v")
+        assert pt_key_to_sequence("a-space") == ("escape", "space")
+
 
 class TestVoiceRecordKeyFromConfig:
     """Round-11 Copilot review regression on #19835.
