@@ -2067,6 +2067,39 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
     try:
+        if job.get("inline_card") in {"physique-checkin-morning", "physique-source-review", "nutrition-coaching-tick"}:
+            # A stdout-delivered cron job cannot attach Telegram keyboards.
+            # This narrow profile-gated route instead uses the already-live
+            # adapter and claims the KST day before it attempts delivery.
+            from cron.physique_inline_card import launch_scheduled_card
+            from gateway.config import Platform
+
+            adapter = (adapters or {}).get(Platform.TELEGRAM)
+            launched = launch_scheduled_card(
+                get_hermes_home(),
+                adapter,
+                loop,
+                _hermes_now(),
+                job["inline_card"],
+            )
+            output = f"# Physique inline card: {job['inline_card']}\n\n"
+            if launched.sent:
+                output += "Status: launch card sent\n"
+                mark_job_run(job["id"], True, None)
+            elif launched.duplicate:
+                output += "Status: daily launch already claimed\n"
+                mark_job_run(job["id"], True, None)
+            elif launched.disabled:
+                output += "Status: profile card capability disabled\n"
+                mark_job_run(job["id"], True, None)
+            else:
+                output += "Status: inline-card send failed\n"
+                mark_job_run(job["id"], False, "inline-card send failed")
+            output_file = save_job_output(job["id"], output)
+            if verbose:
+                logger.info("Output saved to: %s", output_file)
+            return True
+
         success, output, final_response, error = run_job(job)
 
         output_file = save_job_output(job["id"], output)

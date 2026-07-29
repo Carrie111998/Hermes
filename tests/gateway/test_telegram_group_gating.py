@@ -2,6 +2,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+import pytest
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.platforms.base import MessageType
@@ -150,6 +151,383 @@ def _bot_command_entity(text, command):
     return SimpleNamespace(type="bot_command", offset=offset, length=len(command))
 
 
+class _FakeNutritionSpaces:
+    def resolve(self, _address):
+        return None
+
+    def owns_space(self, chat_id, topic_id):
+        return (chat_id, topic_id) == ("-100", "77")
+@pytest.mark.parametrize(
+    "category",
+    (
+        "customer_routes",
+        "trainer_routes",
+        "owner_scheduled_routes",
+        "generic_reserved_routes",
+    ),
+)
+def test_review_space_collision_categories_fail_closed(category):
+    from gateway.platforms.nutrition_coaching import validate_review_space_disjoint
+
+    route = ("review-user", "review-chat", "59")
+    with pytest.raises(ValueError, match="review space collides"):
+        validate_review_space_disjoint(
+            route,
+            **{category: (route,)},
+        )
+
+
+def test_adaptive_review_chat_topic_reserves_wrong_user_without_generic_downstream():
+    from gateway.platforms.nutrition_coaching_config import AdaptiveNutritionConfig, AdaptiveReviewOperator
+
+    adapter = _make_adapter(require_mention=False)
+    adapter._adaptive_nutrition_config = AdaptiveNutritionConfig(
+        True,
+        "review-chat",
+        59,
+        False,
+        "review-user",
+        2,
+        AdaptiveReviewOperator("review-user", "review-chat", 59, 2),
+    )
+    service = Mock()
+    service.handle_text.return_value = {
+        "status": "rejected",
+        "text": "이 버튼은 운영자 검토실에서만 사용할 수 있습니다.",
+    }
+    adapter._adaptive_operator_service = service
+    message = _group_message("일반 입력", chat_id="review-chat", from_user_id="wrong-user", thread_id=59)
+    message.reply_text = AsyncMock()
+    update = SimpleNamespace(update_id=2001, message=message, effective_message=message)
+
+    asyncio.run(adapter._handle_text_message(update, SimpleNamespace()))
+
+    service.handle_text.assert_called_once()
+    adapter._message_handler.assert_not_awaited()
+    message.reply_text.assert_awaited_once()
+
+
+def test_adaptive_review_unrelated_callback_is_reserved_before_generic_callbacks():
+    from gateway.platforms.nutrition_coaching_config import AdaptiveNutritionConfig, AdaptiveReviewOperator
+
+    adapter = _make_adapter(require_mention=False)
+    adapter._adaptive_nutrition_config = AdaptiveNutritionConfig(
+        True,
+        "review-chat",
+        59,
+        False,
+        "review-user",
+        1,
+        AdaptiveReviewOperator("review-user", "review-chat", 59, 1),
+    )
+    service = Mock()
+    service.handle_callback.return_value = {
+        "status": "rejected",
+        "text": "이 버튼은 운영자 검토실에서만 사용할 수 없습니다.",
+    }
+    adapter._adaptive_operator_service = service
+    message = _group_message("button", chat_id="review-chat", from_user_id="wrong-user", thread_id=59)
+    query = SimpleNamespace(
+        data="unrelated-callback",
+        message=message,
+        from_user=SimpleNamespace(id="wrong-user", first_name="Wrong"),
+        answer=AsyncMock(),
+    )
+
+    asyncio.run(adapter._handle_callback_query(SimpleNamespace(callback_query=query), SimpleNamespace()))
+
+    service.handle_callback.assert_called_once()
+    adapter._message_handler.assert_not_awaited()
+    query.answer.assert_awaited_once()
+def test_adaptive_customer_selection_renders_explicit_create_button():
+    from gateway.platforms.nutrition_coaching_config import AdaptiveNutritionConfig, AdaptiveReviewOperator
+    from gateway.platforms import telegram as telegram_module
+    telegram_module.InlineKeyboardButton.reset_mock()
+
+    adapter = _make_adapter(require_mention=False)
+    adapter._adaptive_nutrition_config = AdaptiveNutritionConfig(
+        True,
+        "review-chat",
+        59,
+        False,
+        "review-user",
+        1,
+        AdaptiveReviewOperator("review-user", "review-chat", 59, 1),
+    )
+    service = Mock()
+    service.handle_callback.return_value = {
+        "status": "selected",
+        "customer_key": "virtual_customer",
+        "callback_data": "an1:create-token:create",
+    }
+    adapter._adaptive_operator_service = service
+    message = _group_message(
+        "button",
+        chat_id="review-chat",
+        from_user_id="review-user",
+        thread_id=59,
+    )
+    query = SimpleNamespace(
+        data="an1:select-token:select",
+        message=message,
+        from_user=SimpleNamespace(id="review-user", first_name="Owner"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(return_value=message),
+    )
+
+    asyncio.run(
+        adapter._handle_adaptive_review_callback(
+            query,
+            query.data,
+            message,
+        )
+    )
+
+    service.handle_callback.assert_called_once()
+    query.edit_message_text.assert_awaited_once()
+    kwargs = query.edit_message_text.await_args.kwargs
+    assert "초안을 생성" in kwargs["text"]
+    assert kwargs["reply_markup"] is not None
+    telegram_module.InlineKeyboardButton.assert_any_call(
+        "적응형 영양 초안 생성",
+        callback_data="an1:create-token:create",
+    )
+    query.answer.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("state", "notice"),
+    (
+        ("approved", "승인 완료. 다음 단계는 활성화하기입니다."),
+        ("activated", "활성화 완료. 다음 단계는 고객 전송 허용입니다."),
+        ("delivery_enabled", "전송 허용 완료. 다음 단계는 고객에게 전송입니다."),
+    ),
+)
+def test_adaptive_lifecycle_callback_confirms_visible_next_step(state, notice):
+    adapter = _make_adapter(require_mention=False)
+    service = Mock()
+    service.handle_callback.return_value = {
+        "status": "card",
+        "text": f"revision: 7 · state: {state}",
+        "envelope": {"state": state},
+        "buttons": [],
+    }
+    service.mark_publish_pending = Mock()
+    service.mark_published = Mock()
+    adapter._adaptive_operator_service = service
+    message = _group_message(
+        "card",
+        chat_id="review-chat",
+        from_user_id="review-user",
+        thread_id=59,
+    )
+    message.message_id = 150
+    query = SimpleNamespace(
+        data="an1:lifecycle-token:approve",
+        message=message,
+        from_user=SimpleNamespace(id="review-user", first_name="Owner"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(return_value=message),
+    )
+
+    asyncio.run(
+        adapter._handle_adaptive_review_callback(
+            query,
+            query.data,
+            message,
+        )
+    )
+
+    query.edit_message_text.assert_awaited_once()
+    query.answer.assert_awaited_once_with(text=notice)
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "notice", "recovery"),
+    (
+        ("sent_audited", "고객 전송 및 감사 기록 완료.", False),
+        ("delivery_unknown", "전송 결과 확인 불가. 재전송하지 마세요.", False),
+        ("audit_pending", "고객 전송 완료. 감사 기록 복구가 필요합니다.", True),
+    ),
+)
+def test_adaptive_terminal_delivery_replaces_send_card(
+    terminal_state,
+    notice,
+    recovery,
+):
+    adapter = _make_adapter(require_mention=False)
+    service = Mock()
+
+    async def delivery():
+        return {"status": terminal_state, "event_type": terminal_state}
+
+    service.handle_callback.return_value = {
+        "status": "delivery_pending",
+        "delivery": delivery(),
+    }
+    terminal_buttons = (
+        [{"label": "감사 기록 복구", "callback_data": "an1:reconcile-token:reconcile"}]
+        if recovery
+        else []
+    )
+    service.terminal_delivery_card.return_value = {
+        "status": "view",
+        "terminal_state": terminal_state,
+        "text": f"terminal: {terminal_state}",
+        "buttons": terminal_buttons,
+    }
+    adapter._adaptive_operator_service = service
+    message = _group_message(
+        "delivery card",
+        chat_id="review-chat",
+        from_user_id="review-user",
+        thread_id=59,
+    )
+    message.message_id = 150
+    query = SimpleNamespace(
+        data="an1:send-token:send",
+        message=message,
+        from_user=SimpleNamespace(id="review-user", first_name="Owner"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(return_value=message),
+    )
+
+    asyncio.run(
+        adapter._handle_adaptive_review_callback(
+            query,
+            query.data,
+            message,
+        )
+    )
+
+    service.terminal_delivery_card.assert_called_once()
+    query.edit_message_text.assert_awaited_once()
+    markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+    if recovery:
+        assert markup is not None
+    else:
+        assert markup is None
+    query.answer.assert_awaited_once_with(text=notice)
+
+
+def test_adaptive_edit_note_shows_persistent_reply_instruction():
+    adapter = _make_adapter(require_mention=False)
+    service = Mock()
+    service.handle_callback.return_value = {
+        "status": "operator_input_required",
+        "action": "edit_note",
+        "text": "메모 입력 대기 중입니다. 이 검토 카드에 답장으로 수정할 메모를 보내주세요.",
+    }
+    adapter._adaptive_operator_service = service
+    message = _group_message(
+        "review card",
+        chat_id="review-chat",
+        from_user_id="review-user",
+        thread_id=59,
+    )
+    query = SimpleNamespace(
+        data="an1:note-token:edit_note",
+        message=message,
+        from_user=SimpleNamespace(id="review-user", first_name="Owner"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(return_value=message),
+    )
+
+    asyncio.run(
+        adapter._handle_adaptive_review_callback(
+            query,
+            query.data,
+            message,
+        )
+    )
+
+    query.edit_message_text.assert_awaited_once()
+    assert "답장으로 수정할 메모" in query.edit_message_text.await_args.kwargs["text"]
+    query.answer.assert_awaited_once_with(
+        text="메모 입력 대기 중입니다. 이 카드에 답장해 주세요."
+    )
+
+
+def test_adaptive_menu_rebinds_callbacks_to_published_bot_message():
+    from gateway.platforms import telegram as telegram_module
+
+    telegram_module.InlineKeyboardButton.reset_mock()
+    adapter = _make_adapter(require_mention=False)
+    service = Mock()
+    adapter._adaptive_operator_service = service
+    published = SimpleNamespace(message_id=812)
+    message = SimpleNamespace(
+        reply_text=AsyncMock(return_value=published),
+        reply_to_message=None,
+        chat=SimpleNamespace(id="review-chat"),
+    )
+    payload = {
+        "status": "menu",
+        "text": "고객을 선택하세요.",
+        "buttons": [
+            {
+                "label": "가상 테스트 고객",
+                "callback_data": "an1:select-token:select",
+            }
+        ],
+    }
+
+    asyncio.run(adapter._send_adaptive_operator_result(message, payload))
+
+    message.reply_text.assert_awaited_once()
+    service._rebind_card_button_sessions.assert_called_once_with(payload, "812")
+
+
+def test_adaptive_menu_rejects_missing_publication_message_id():
+    adapter = _make_adapter(require_mention=False)
+    service = Mock()
+    adapter._adaptive_operator_service = service
+    message = SimpleNamespace(
+        reply_text=AsyncMock(return_value=SimpleNamespace()),
+        reply_to_message=None,
+        chat=SimpleNamespace(id="review-chat"),
+    )
+    payload = {
+        "status": "menu",
+        "text": "고객을 선택하세요.",
+        "buttons": [
+            {
+                "label": "가상 테스트 고객",
+                "callback_data": "an1:select-token:select",
+            }
+        ],
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="adaptive review menu publication receipt is invalid",
+    ):
+        asyncio.run(adapter._send_adaptive_operator_result(message, payload))
+
+    service._rebind_card_button_sessions.assert_not_called()
+
+
+def test_adaptive_card_with_invalid_grounding_is_not_published():
+    adapter = _make_adapter(require_mention=False)
+    adapter._adaptive_grounding_input = Mock(return_value=None)
+    adapter._humanize_korean_copy = AsyncMock()
+    message = SimpleNamespace(
+        reply_text=AsyncMock(),
+        reply_to_message=SimpleNamespace(edit_text=AsyncMock()),
+        chat=SimpleNamespace(id="review-chat"),
+    )
+    payload = {
+        "status": "card",
+        "text": "stale canonical card",
+        "proposal_digest": "bad",
+        "revision": 1,
+    }
+
+    asyncio.run(adapter._send_adaptive_operator_result(message, payload))
+
+    adapter._humanize_korean_copy.assert_not_awaited()
+    message.reply_to_message.edit_text.assert_not_awaited()
+    message.reply_text.assert_not_awaited()
 def test_group_messages_can_be_opened_via_config():
     adapter = _make_adapter(require_mention=False)
 
@@ -187,6 +565,71 @@ def test_unmentioned_group_messages_can_be_observed_without_dispatching():
         assert store.sources[0].chat_type == "group"
         assert store.sources[0].user_id is None
         assert store.sources[0].user_name is None
+
+    asyncio.run(_run())
+
+
+def test_foreign_sender_in_customer_topic_never_reaches_generic_agent():
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter._enqueue_text_event = Mock()
+        customer_space = _FakeNutritionSpaces()
+        adapter._get_nutrition_coaching = Mock(return_value=customer_space)
+        message = _group_message("일반 대화도 되나요?", from_user_id=9999, thread_id=77)
+        update = SimpleNamespace(update_id=1005, message=message, effective_message=message)
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._enqueue_text_event.assert_not_called()
+        adapter._message_handler.assert_not_awaited()
+
+    asyncio.run(_run())
+
+
+def test_customer_topic_is_reserved_from_all_generic_message_handlers():
+    adapter = _make_adapter(require_mention=False)
+    customer_space = _FakeNutritionSpaces()
+    adapter._get_nutrition_coaching = Mock(return_value=customer_space)
+
+    assert adapter._should_process_message(_group_message("photo caption", thread_id=77)) is False
+
+
+def test_enabled_customer_feature_load_failure_blocks_generic_ingress():
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter.config.extra["nutrition_coaching"] = {
+            "enabled": True,
+            "registry_path": "customers/missing.json",
+        }
+        adapter._get_nutrition_coaching = Mock(return_value=None)
+        adapter._enqueue_text_event = Mock()
+        message = _group_message("건강 관련 자유 메모", thread_id=77)
+        update = SimpleNamespace(update_id=1006, message=message, effective_message=message)
+
+        assert adapter._should_process_message(message) is False
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._enqueue_text_event.assert_not_called()
+        adapter._message_handler.assert_not_awaited()
+
+    asyncio.run(_run())
+
+
+def test_customer_topic_reserves_unknown_callback_namespaces():
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter._get_nutrition_coaching = Mock(return_value=_FakeNutritionSpaces())
+        message = _group_message("button", thread_id=77)
+        message.chat_id = message.chat.id
+        query = SimpleNamespace(
+            data="mx", message=message,
+            from_user=SimpleNamespace(id=9999, first_name="고객"),
+            answer=AsyncMock(),
+        )
+
+        await adapter._handle_callback_query(SimpleNamespace(callback_query=query), SimpleNamespace())
+
+        query.answer.assert_awaited_once_with(text="이 공간에서는 체크인 버튼만 사용할 수 있습니다.")
 
     asyncio.run(_run())
 
@@ -1209,3 +1652,256 @@ def test_unmentioned_unsupported_document_observed_without_caching(monkeypatch):
         assert "unsupported" in message["content"].lower()
 
     asyncio.run(_run())
+def test_review_surface_reserves_contact_edited_and_channel_ingress():
+    from gateway.platforms.nutrition_coaching_config import AdaptiveNutritionConfig, AdaptiveReviewOperator
+
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter._adaptive_nutrition_config = AdaptiveNutritionConfig(
+            True,
+            "review-chat",
+            59,
+            False,
+            "review-user",
+            1,
+            AdaptiveReviewOperator("review-user", "review-chat", 59, 1),
+        )
+        service = Mock()
+        service.handle_text.return_value = {
+            "status": "rejected",
+            "text": "운영자 검토실에서만 사용할 수 있습니다.",
+        }
+        adapter._adaptive_operator_service = service
+        adapter._send_adaptive_operator_result = AsyncMock()
+        message = _group_message("입력", chat_id="review-chat", from_user_id="wrong-user", thread_id=59)
+        contact_data = vars(message).copy()
+        contact_data["text"] = None
+        contact_data["contact"] = SimpleNamespace(phone_number="010")
+        contact = SimpleNamespace(**contact_data)
+        edited = SimpleNamespace(edited_message=message, effective_message=None, message=None)
+        channel = SimpleNamespace(channel_post=message, effective_message=None, message=None)
+        edited_channel = SimpleNamespace(
+            edited_channel_post=message,
+            effective_message=None,
+            message=None,
+        )
+
+        await adapter._handle_contact_message(
+            SimpleNamespace(message=contact, effective_message=contact),
+            SimpleNamespace(),
+        )
+        await adapter._handle_edited_message(edited, SimpleNamespace())
+        await adapter._handle_channel_post(channel, SimpleNamespace())
+        await adapter._handle_edited_channel_post(edited_channel, SimpleNamespace())
+        adapter._message_handler.assert_not_awaited()
+        assert adapter._send_adaptive_operator_result.await_count == 4
+
+    asyncio.run(_run())
+
+@pytest.mark.parametrize(
+    ("handler_name", "update_field"),
+    (
+        ("_handle_text_message", "message"),
+        ("_handle_command", "message"),
+        ("_handle_location_message", "message"),
+        ("_handle_media_message", "message:photo"),
+        ("_handle_media_message", "message:video"),
+        ("_handle_media_message", "message:document"),
+        ("_handle_media_message", "message:audio"),
+        ("_handle_media_message", "message:voice"),
+        ("_handle_media_message", "message:sticker"),
+        ("_handle_contact_message", "message:contact"),
+        ("_handle_edited_message", "edited_message"),
+        ("_handle_channel_post", "channel_post"),
+        ("_handle_edited_channel_post", "edited_channel_post"),
+    ),
+)
+def test_wrong_user_review_space_reserves_every_message_ingress_without_downstream(
+    handler_name,
+    update_field,
+):
+    from gateway.platforms.nutrition_coaching_config import (
+        AdaptiveNutritionConfig,
+        AdaptiveReviewOperator,
+    )
+
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter._adaptive_nutrition_config = AdaptiveNutritionConfig(
+            True,
+            "review-chat",
+            59,
+            False,
+            "review-user",
+            1,
+            AdaptiveReviewOperator("review-user", "review-chat", 59, 1),
+        )
+        service = Mock()
+        service.handle_text.return_value = {
+            "status": "rejected",
+            "text": "운영자 검토실에서만 사용할 수 있습니다.",
+        }
+        adapter._adaptive_operator_service = service
+        adapter._send_adaptive_operator_result = AsyncMock()
+        adapter._send_message_strict_topic = AsyncMock()
+        message = _group_message(
+            "/unknown" if handler_name == "_handle_command" else "입력",
+            chat_id="review-chat",
+            from_user_id="wrong-user",
+            thread_id=59,
+        )
+        field, _, kind = update_field.partition(":")
+        if kind:
+            setattr(message, kind, SimpleNamespace())
+        update_values = {
+            "message": None,
+            "effective_message": None,
+            "edited_message": None,
+            "channel_post": None,
+            "edited_channel_post": None,
+        }
+        update_values[field] = message
+        if field == "message":
+            update_values["effective_message"] = message
+        update = SimpleNamespace(**update_values)
+
+        await getattr(adapter, handler_name)(update, SimpleNamespace())
+
+        service.handle_text.assert_called_once()
+        adapter._message_handler.assert_not_awaited()
+        adapter._send_message_strict_topic.assert_not_awaited()
+        adapter._send_adaptive_operator_result.assert_awaited_once()
+
+    asyncio.run(_run())
+
+
+def test_unconfigured_nutrition_operator_never_probes_coordinator_owner():
+    adapter = _make_adapter()
+    adapter._adaptive_nutrition_config = None
+    coordinator = SimpleNamespace(
+        is_owner=lambda _address: True,
+        owner=SimpleNamespace(key=("u", "c", "59")),
+    )
+    assert adapter._nutrition_operator_actor(
+        SimpleNamespace(key=("u", "c", "59")),
+        coordinator,
+    ) is None
+def test_legacy_nutrition_operator_review_is_not_an_adaptive_ingress():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["nutrition_coaching"] = {
+        "enabled": True,
+        "operator_review": {
+            "user_id": "legacy-user",
+            "chat_id": "legacy-chat",
+            "topic_id": 59,
+        },
+    }
+    adapter._adaptive_nutrition_config = None
+    assert adapter._nutrition_operator_address() is None
+def test_legacy_nutrition_review_triple_routes_coaching_without_adaptive_ingress():
+    adapter = _make_adapter(require_mention=False)
+    adapter.config.extra["nutrition_coaching"] = {
+        "enabled": True,
+        "registry_path": "customers/registry.json",
+        "operator_review": {
+            "user_id": "legacy-user",
+            "chat_id": "legacy-chat",
+            "topic_id": 59,
+        },
+    }
+    adapter._adaptive_nutrition_config = None
+    configured = adapter._nutrition_coaching_review_address()
+    owner = SimpleNamespace(key=("registry-owner", "owner-chat", "owner-topic"))
+
+    assert configured.key == ("legacy-user", "legacy-chat", "59")
+    assert adapter._nutrition_operator_address() is None
+    assert adapter._nutrition_operator_actor(
+        SimpleNamespace(key=configured.key),
+        SimpleNamespace(owner=owner),
+    ) is owner
+    assert adapter._nutrition_operator_actor(
+        SimpleNamespace(key=("wrong-user", "legacy-chat", "59")),
+        SimpleNamespace(owner=owner),
+    ) is None
+
+
+
+def test_trainer_topic_keyboard_is_persistent_and_sent_once():
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        adapter._send_nutrition_topic = AsyncMock()
+
+        await adapter._ensure_trainer_topic_keyboard("-1001", "4")
+        await adapter._ensure_trainer_topic_keyboard("-1001", "4")
+
+        adapter._send_nutrition_topic.assert_awaited_once()
+        kwargs = adapter._send_nutrition_topic.await_args.kwargs
+        assert kwargs["chat_id"] == -1001
+        assert kwargs["topic_id"] == "4"
+        assert kwargs["reply_markup"] is not None
+
+    asyncio.run(_run())
+
+def test_restart_recovery_rebuilds_validated_adaptive_inline_buttons():
+    from gateway.platforms.nutrition_coaching_config import (
+        AdaptiveNutritionConfig,
+        AdaptiveReviewOperator,
+    )
+
+    adapter = _make_adapter(require_mention=False)
+    adapter._adaptive_nutrition_config = AdaptiveNutritionConfig(
+        True,
+        "review-chat",
+        59,
+        False,
+        "review-user",
+        1,
+        AdaptiveReviewOperator("review-user", "review-chat", 59, 1),
+    )
+    nutrition = SimpleNamespace(refresh_live_registry=lambda: True)
+    service = Mock()
+    service.accepts.return_value = True
+    service.validated_inline_buttons.return_value = (
+        ("승인", "an1:" + "a" * 24 + ":approve"),
+    )
+
+    async def recover(publisher):
+        await publisher(
+            {
+                "status": "card",
+                "text": "검토 카드",
+                "buttons": [
+                    {
+                        "label": "승인",
+                        "callback_data": "an1:" + "a" * 24 + ":approve",
+                    }
+                ],
+            }
+        )
+
+    service.recover_pending_cards_async = recover
+    adapter._nutrition_coaching = nutrition
+    adapter._adaptive_operator_service = service
+    adapter._send_message_strict_topic = AsyncMock(
+        return_value=SimpleNamespace(message_id="recovered-1")
+    )
+
+    asyncio.run(adapter._recover_pending_adaptive_cards())
+
+    service.validated_inline_buttons.assert_called_once_with(
+        {
+            "status": "card",
+            "text": "검토 카드",
+            "buttons": [
+                {
+                    "label": "승인",
+                    "callback_data": "an1:" + "a" * 24 + ":approve",
+                }
+            ],
+        },
+        require_sessions=True,
+    )
+    adapter._send_message_strict_topic.assert_awaited_once()
+    kwargs = adapter._send_message_strict_topic.await_args.kwargs
+    assert kwargs["message_thread_id"] == "59"
+    assert kwargs["reply_markup"] is not None
