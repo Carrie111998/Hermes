@@ -279,4 +279,45 @@ describe('watchSessionPins remote pull', () => {
     expect(remainedUnpinned).toBe(true)
     expect(writeCount).toBe(2)
   })
+
+  it('retries the latest failed unpin without re-pinning locally', async () => {
+    patch.mockRejectedValueOnce(new Error('unpin failed'))
+
+    $sessions.set([row('retry-unpin', { pinned: true })])
+    await flush()
+    $pinnedSessionIds.set([])
+    await flush()
+    await flush()
+
+    expect(patch).toHaveBeenCalledTimes(1)
+    expect(patch).toHaveBeenLastCalledWith('retry-unpin', false, undefined)
+
+    $sessions.set([row('retry-unpin', { pinned: true }), row('other')])
+    await flush()
+    await flush()
+
+    expect(patch).toHaveBeenCalledTimes(2)
+    expect(patch).toHaveBeenLastCalledWith('retry-unpin', false, undefined)
+    expect($pinnedSessionIds.get()).not.toContain('retry-unpin')
+  })
+
+  it('retries the latest failed pin without unpinning locally', async () => {
+    patch.mockRejectedValueOnce(new Error('pin failed'))
+
+    $sessions.set([row('retry-pin', { pinned: false })])
+    $pinnedSessionIds.set(['retry-pin'])
+    await flush()
+    await flush()
+
+    expect(patch).toHaveBeenCalledTimes(1)
+    expect(patch).toHaveBeenLastCalledWith('retry-pin', true, undefined)
+
+    $sessions.set([row('retry-pin', { pinned: false }), row('other')])
+    await flush()
+    await flush()
+
+    expect(patch).toHaveBeenCalledTimes(2)
+    expect(patch).toHaveBeenLastCalledWith('retry-pin', true, undefined)
+    expect($pinnedSessionIds.get()).toContain('retry-pin')
+  })
 })

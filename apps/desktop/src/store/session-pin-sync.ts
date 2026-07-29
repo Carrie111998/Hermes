@@ -124,7 +124,12 @@ function reconcile(): void {
     if (!current.has(id)) {
       mirrored.delete(id)
       pending.delete(id)
-      void writePin(id, false, profileFor(id)).catch(() => {})
+      void writePin(id, false, profileFor(id)).catch(() => {
+        // Preserve the unpin intent for the next reconcile. writePin suppresses
+        // failures from superseded generations, so only the latest failed
+        // unpin can restore this retry marker.
+        mirrored.add(id)
+      })
     }
   }
 
