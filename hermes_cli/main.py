@@ -7044,6 +7044,7 @@ def _scan_dashboard_processes(
     """
     patterns = [
         "hermes dashboard",
+        "hermes-dashboard",
         "hermes_cli.main dashboard",
         "hermes_cli/main.py dashboard",
         # The headless backend (`hermes serve`) is the same long-lived server
@@ -7053,6 +7054,7 @@ def _scan_dashboard_processes(
         "hermes_cli.main serve",
         "hermes_cli/main.py serve",
     ]
+    lifecycle_flags = ("--status", "--stop")
     self_pid = os.getpid()
     dashboard_processes: list[tuple[int, str]] = []
 
@@ -7089,6 +7091,10 @@ def _scan_dashboard_processes(
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
                     if (
+                        any(flag in current_cmd for flag in lifecycle_flags)
+                    ):
+                        continue
+                    if (
                         any(p in current_cmd for p in patterns)
                         and int(pid_str) != self_pid
                     ):
@@ -7122,6 +7128,8 @@ def _scan_dashboard_processes(
                     except ValueError:
                         continue
                     command = parts[1]
+                    if any(flag in command for flag in lifecycle_flags):
+                        continue
                     if any(p in command for p in patterns) and pid != self_pid:
                         dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
