@@ -29,6 +29,7 @@ const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/
 
 const isHttpUrl = (value: string) =>
   /^https?:\/\//i.test(value) || value.startsWith('data:') || value.startsWith('file:')
+
 const isAbsPath = (value: string) => /^([A-Za-z]:[\\/]|\\\\|\/)/.test(value)
 
 export function Backdrop() {
