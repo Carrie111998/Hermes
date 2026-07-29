@@ -61,6 +61,8 @@ class TestPrevSessionIdCapture:
         assert entry1.prev_session_id is None  # fresh session, nothing replaced
 
         entry1.last_prompt_tokens = 4000  # had real conversation
+        assert store._db is not None
+        store._db.append_message(entry1.session_id, "user", "prior durable work")
         entry1.updated_at = datetime.now() - timedelta(minutes=5)
         store._save()
 

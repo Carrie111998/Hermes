@@ -2554,9 +2554,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def insert_gateway_routing_entry_if_absent(
+        self, session_key: str, entry_json: str, *, scope: str = ""
+    ) -> str:
+        """Seed a routing key once and return its authoritative stored value.
+
+        The insert and read share one ``BEGIN IMMEDIATE`` transaction so a
+        legacy importer that loses the insert race observes the competing
+        canonical row instead of overwriting it with its stale candidate.
+        """
+        if not session_key or not entry_json:
+            raise ValueError("session_key and entry_json are required")
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(scope, session_key) DO NOTHING""",
+                (scope, session_key, entry_json, time.time()),
+            )
+            row = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("gateway routing insert did not produce a row")
+            return str(row["entry_json"])
+
+        return self._execute_write(_do)
+
     def replace_gateway_routing_entries(
         self, entries: Dict[str, str], *, scope: str = ""
-    ) -> None:
+    ) -> Dict[str, str]:
         """Atomically replace the routing index for *scope* with *entries*.
 
         Mirrors the sessions.json full-rewrite semantics: keys absent from
@@ -2567,15 +2597,354 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         now = time.time()
 
         def _do(conn):
+            # Never resurrect a continuity capsule that an exact-row
+            # acknowledgement already cleared while this caller held an older
+            # in-memory snapshot of the same active session.
+            merged_entries = dict(entries)
+            for key, raw in list(merged_entries.items()):
+                current_row = conn.execute(
+                    "SELECT entry_json FROM gateway_routing "
+                    "WHERE scope = ? AND session_key = ?",
+                    (scope, key),
+                ).fetchone()
+                if current_row is None:
+                    continue
+                try:
+                    current = json.loads(current_row["entry_json"])
+                    incoming = json.loads(raw)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                current_session_id = current.get("session_id")
+                incoming_session_id = incoming.get("session_id")
+                if current_session_id != incoming_session_id:
+                    current_session = conn.execute(
+                        "SELECT parent_session_id, ended_at FROM sessions WHERE id = ?",
+                        (current_session_id,),
+                    ).fetchone()
+                    incoming_session = conn.execute(
+                        "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                        (incoming_session_id,),
+                    ).fetchone()
+                    if (
+                        current_session is not None
+                        and incoming_session is not None
+                        and current_session["parent_session_id"] == incoming_session_id
+                        and current_session["ended_at"] is None
+                        and incoming_session["ended_at"] is not None
+                        and incoming_session["end_reason"]
+                        in {"idle_renewal", "daily_renewal"}
+                    ):
+                        # A pre-renewal whole-index snapshot lost a race with the
+                        # scoped CAS transition. Keep the live linked successor.
+                        merged_entries[key] = str(current_row["entry_json"])
+                        continue
+                if (
+                    current.get("session_id") == incoming.get("session_id")
+                    and not current.get("continuity_capsule")
+                    and incoming.get("continuity_capsule")
+                ):
+                    incoming["continuity_capsule"] = None
+                    incoming["was_auto_reset"] = False
+                    incoming["auto_reset_reason"] = None
+                    merged_entries[key] = json.dumps(incoming)
             conn.execute("DELETE FROM gateway_routing WHERE scope = ?", (scope,))
-            if entries:
+            if merged_entries:
                 conn.executemany(
                     "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
                     "VALUES (?, ?, ?, ?)",
-                    [(scope, k, v, now) for k, v in entries.items() if k and v],
+                    [
+                        (scope, k, v, now)
+                        for k, v in merged_entries.items()
+                        if k and v
+                    ],
                 )
+            return merged_entries
+
+        return self._execute_write(_do)
+
+    def renew_gateway_session(
+        self,
+        *,
+        scope: str,
+        session_key: str,
+        predecessor_session_id: str,
+        successor_session_id: str,
+        successor_entry_json: str,
+        source: str,
+        end_reason: str,
+        user_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        """Atomically advance one scoped gateway route to a linked successor."""
+        if not all(
+            (
+                session_key,
+                predecessor_session_id,
+                successor_session_id,
+                successor_entry_json,
+            )
+        ):
+            raise ValueError("renewal route, predecessor, successor, and entry are required")
+        try:
+            successor_entry = json.loads(successor_entry_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("successor routing entry is invalid") from exc
+        if (
+            successor_entry.get("session_key") != session_key
+            or successor_entry.get("session_id") != successor_session_id
+        ):
+            raise ValueError("successor routing entry does not match the scoped route")
+
+        def _do(conn):
+            route = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+            if route is None:
+                raise RuntimeError("renewal route is missing")
+            try:
+                routed = json.loads(route["entry_json"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("renewal route is invalid") from exc
+            if routed.get("session_id") != predecessor_session_id:
+                raise RuntimeError("renewal route changed concurrently")
+
+            predecessor = conn.execute(
+                "SELECT id, ended_at FROM sessions WHERE id = ?",
+                (predecessor_session_id,),
+            ).fetchone()
+            if predecessor is None or predecessor["ended_at"] is not None:
+                raise RuntimeError("renewal predecessor is not active")
+
+            conn.execute(
+                """INSERT INTO sessions (
+                       id, source, user_id, session_key, chat_id, chat_type,
+                       thread_id, parent_session_id, profile_name, started_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    successor_session_id,
+                    source,
+                    user_id,
+                    session_key,
+                    chat_id,
+                    chat_type,
+                    thread_id,
+                    predecessor_session_id,
+                    profile_name,
+                    time.time(),
+                ),
+            )
+            # Preserve the operator-facing metadata that ordinary linked
+            # session creation inherits. The gateway route CAS below remains
+            # the authoritative publication point for the successor.
+            conn.execute(
+                "UPDATE sessions SET "
+                "display_name = (SELECT display_name FROM sessions WHERE id = ?), "
+                "origin_json = (SELECT origin_json FROM sessions WHERE id = ?), "
+                "cwd = (SELECT cwd FROM sessions WHERE id = ?), "
+                "git_repo_root = (SELECT git_repo_root FROM sessions WHERE id = ?), "
+                "git_branch = (SELECT git_branch FROM sessions WHERE id = ?), "
+                "model = (SELECT model FROM sessions WHERE id = ?), "
+                "model_config = (SELECT model_config FROM sessions WHERE id = ?), "
+                "system_prompt = (SELECT system_prompt FROM sessions WHERE id = ?) "
+                "WHERE id = ?",
+                (
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    predecessor_session_id,
+                    successor_session_id,
+                ),
+            )
+            ended = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                "WHERE id = ? AND ended_at IS NULL",
+                (time.time(), end_reason, predecessor_session_id),
+            )
+            if ended.rowcount != 1:
+                raise RuntimeError("renewal predecessor changed concurrently")
+            advanced = conn.execute(
+                "UPDATE gateway_routing SET entry_json = ?, updated_at = ? "
+                "WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                (
+                    successor_entry_json,
+                    time.time(),
+                    scope,
+                    session_key,
+                    route["entry_json"],
+                ),
+            )
+            if advanced.rowcount != 1:
+                raise RuntimeError("renewal route changed concurrently")
 
         self._execute_write(_do)
+
+    def follow_active_gateway_renewal_successor(
+        self,
+        predecessor_session_id: str,
+        *,
+        scope: str,
+        session_key: str,
+    ) -> Optional[str]:
+        """Atomically repoint a stale alias to an active renewal child."""
+        def _do(conn):
+            alias_route = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+            if alias_route is None:
+                return None
+            try:
+                alias_entry = json.loads(alias_route["entry_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if alias_entry.get("session_id") != predecessor_session_id:
+                return None
+
+            row = conn.execute(
+                """
+                SELECT routing.entry_json
+                FROM sessions AS predecessor
+                JOIN sessions AS successor
+                  ON successor.parent_session_id = predecessor.id
+                 AND successor.ended_at IS NULL
+                JOIN gateway_routing AS routing
+                  ON routing.scope = ?
+                 AND json_extract(routing.entry_json, '$.session_id') = successor.id
+                WHERE predecessor.id = ?
+                  AND predecessor.end_reason IN ('idle_renewal', 'daily_renewal')
+                ORDER BY successor.started_at DESC
+                LIMIT 1
+                """,
+                (scope, predecessor_session_id),
+            ).fetchone()
+            if row is None:
+                return None
+            successor_entry = json.loads(row["entry_json"])
+            successor_entry["session_key"] = session_key
+            updated_json = json.dumps(successor_entry)
+            updated = conn.execute(
+                "UPDATE gateway_routing SET entry_json = ?, updated_at = ? "
+                "WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                (
+                    updated_json,
+                    time.time(),
+                    scope,
+                    session_key,
+                    alias_route["entry_json"],
+                ),
+            )
+            return updated_json if updated.rowcount == 1 else None
+
+        return self._execute_write(_do)
+
+    def acknowledge_gateway_continuity_capsule(
+        self,
+        *,
+        scope: str,
+        session_key: str,
+        session_id: str,
+        expected_capsule: str,
+        message_id: int,
+    ) -> str:
+        """Clear a pending capsule only after its exact durable user row exists."""
+        if not message_id:
+            raise ValueError("exact durable message_id is required")
+
+        def _do(conn):
+            route = conn.execute(
+                "SELECT entry_json FROM gateway_routing "
+                "WHERE scope = ? AND session_key = ?",
+                (scope, session_key),
+            ).fetchone()
+            if route is None:
+                raise RuntimeError("capsule acknowledgement route is missing")
+            try:
+                current = json.loads(route["entry_json"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("capsule acknowledgement route is invalid") from exc
+            if current.get("session_id") != session_id:
+                raise RuntimeError("capsule acknowledgement route changed concurrently")
+            if current.get("continuity_capsule") != expected_capsule:
+                raise RuntimeError("capsule acknowledgement payload changed concurrently")
+
+            durable = conn.execute(
+                "SELECT api_content FROM messages "
+                "WHERE id = ? AND session_id = ? AND role = 'user' AND active = 1 "
+                "AND id = (SELECT MIN(id) FROM messages "
+                "WHERE session_id = ? AND role = 'user' AND active = 1)",
+                (message_id, session_id, session_id),
+            ).fetchone()
+            if durable is None:
+                raise RuntimeError(
+                    "durable user row is not the exact first successor row"
+                )
+            if expected_capsule not in str(durable["api_content"] or ""):
+                raise RuntimeError("exact durable user row does not contain the capsule")
+
+            current["continuity_capsule"] = None
+            current["was_auto_reset"] = False
+            current["auto_reset_reason"] = None
+            current["reset_had_activity"] = False
+            updated_json = json.dumps(current)
+            updated = conn.execute(
+                "UPDATE gateway_routing SET entry_json = ?, updated_at = ? "
+                "WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                (updated_json, time.time(), scope, session_key, route["entry_json"]),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("capsule acknowledgement route changed concurrently")
+            return updated_json
+
+        return self._execute_write(_do)
+
+    def latest_message_id(self, session_id: str) -> int:
+        """Return the durable message high-water mark for one session."""
+        with self._lock:
+            assert self._conn is not None
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS message_id "
+                "FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row["message_id"] if row is not None else 0)
+
+    def find_new_user_message_with_capsule(
+        self,
+        session_id: str,
+        capsule: str,
+        *,
+        after_message_id: int,
+    ) -> Optional[int]:
+        """Return the exact first successor user row iff it carries the capsule.
+
+        The capsule may only be acknowledged by the FIRST user row created after
+        the supplied high-water mark. If that earliest successor row does not
+        contain the capsule, a later matching row cannot clear it — return None
+        so the capsule stays pending.
+        """
+        with self._lock:
+            assert self._conn is not None
+            row = self._conn.execute(
+                "SELECT id, api_content FROM messages "
+                "WHERE session_id = ? AND role = 'user' AND active = 1 AND id > ? "
+                "ORDER BY id ASC LIMIT 1",
+                (session_id, int(after_message_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        if capsule in str(row["api_content"] or ""):
+            return int(row["id"])
+        return None
 
     def load_gateway_routing_entries(self, *, scope: str = "") -> Dict[str, str]:
         """Load routing entries for *scope* as {session_key: entry_json}."""
@@ -4638,13 +5007,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM sessions parent
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
-                      AND parent.end_reason = 'compression'
+                      AND parent.end_reason IN (
+                          'compression', 'idle_renewal', 'daily_renewal'
+                      )
                       AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
                     ORDER BY
                       CASE
-                        WHEN child.end_reason = 'compression' THEN 0
+                        WHEN child.end_reason IN (
+                            'compression', 'idle_renewal', 'daily_renewal'
+                        ) THEN 0
                         WHEN child.ended_at IS NULL THEN 1
                         ELSE 2
                       END,
@@ -4876,7 +5249,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM chain c
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE parent.end_reason IN (
+                        'compression', 'idle_renewal', 'daily_renewal'
+                    )
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
@@ -4993,7 +5368,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if project_compression_tips and not include_children:
             projected = []
             for s in sessions:
-                if s.get("end_reason") != "compression":
+                if s.get("end_reason") not in {
+                    "compression",
+                    "idle_renewal",
+                    "daily_renewal",
+                }:
                     projected.append(s)
                     continue
                 tip_id = self.get_compression_tip(s["id"])
@@ -5013,6 +5392,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
                 ):
                     if key in tip_row:
+                        if key in {"id", "title"} and s.get("end_reason") in {
+                            "idle_renewal",
+                            "daily_renewal",
+                        }:
+                            continue
                         merged[key] = tip_row[key]
                 merged["_lineage_root_id"] = s["id"]
                 projected.append(merged)

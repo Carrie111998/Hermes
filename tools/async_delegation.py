@@ -571,6 +571,22 @@ def active_task_count() -> int:
         return total
 
 
+def has_pending_completion_for_session(session_id: str) -> bool:
+    """Return whether a session owns active or undelivered delegation work."""
+    if not session_id:
+        return False
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            """SELECT 1 FROM async_delegations
+               WHERE (parent_session_id = ? OR origin_session_id = ?)
+                 AND (state IN ('running', 'finalizing')
+                      OR delivery_state = 'pending')
+               LIMIT 1""",
+            (session_id, session_id),
+        ).fetchone()
+    return row is not None
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 

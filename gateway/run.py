@@ -2290,6 +2290,25 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+# Persisted after each gateway turn so continuity renewal remains fail-closed
+# across restarts for runtimes that cannot stamp an exact user-row sidecar.
+_CONTINUITY_CAPSULE_CAPABLE_METADATA = "continuity_capsule_capable"
+
+# api_mode values whose turns durably stamp an exact api_content user-row
+# sidecar, so a bounded continuity capsule can later be acknowledged. This
+# mirrors the persisted-capability verdict (every resolved API mode except
+# ``codex_app_server``, which hands the turn to a subprocess). MoA and proxy
+# are handled separately, and any missing/unknown api_mode is unproven and
+# defers rather than being trusted.
+_CONTINUITY_RENEWAL_SUPPORTED_API_MODES = frozenset(
+    {
+        "chat_completions",
+        "codex_responses",
+        "anthropic_messages",
+        "bedrock_converse",
+    }
+)
+
 # Conversation-scoped per-session state registry.  Every GatewayRunner dict
 # keyed by session_key whose entries must NOT survive a conversation boundary
 # (/new, /resume, auto-reset, expiry finalization, compression-exhausted
@@ -3441,6 +3460,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
+            renewal_defer_fn=self._renewal_should_defer,
         )
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
@@ -5982,6 +6002,107 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return resolve_max_concurrent_sessions(getattr(self, "config", None))
         except Exception:
             return None
+
+    def _renewal_should_defer(self, session_key: str, session_id: str) -> bool:
+        """Detect active work by route key or resolved session-id alias."""
+        running = getattr(self, "_running_agents", {})
+        own = running.get(session_key)
+        if own is not None and own is not _AGENT_PENDING_SENTINEL:
+            return True
+        if session_key in getattr(self, "_pending_messages", {}):
+            return True
+        if session_key in getattr(self, "_pending_steer", {}):
+            return True
+
+        # A second routing key can resolve to this same transcript. Its sentinel
+        # or real agent must defer rotation even before/without lease acquisition.
+        store = getattr(self, "session_store", None)
+        if store is not None:
+            with store._lock:
+                aliases = {
+                    key
+                    for key, entry in store._entries.items()
+                    if entry.session_id == session_id and key != session_key
+                }
+            if any(key in running for key in aliases):
+                return True
+
+        # Once resolved, the per-session turn lease is the authoritative alias
+        # guard. Ignore degraded/released tokens because they hold no work.
+        for token in getattr(self, "_turn_lease_tokens", {}).values():
+            if (
+                getattr(token, "session_id", None) == session_id
+                and not getattr(token, "degraded", False)
+                and not getattr(token, "released", False)
+            ):
+                return True
+
+        # A delegated child can outlive its parent gateway turn. Keep the
+        # routing entry pinned through durable completion delivery so a queued
+        # completion event cannot be stranded on an expired predecessor.
+        try:
+            from tools.async_delegation import has_pending_completion_for_session
+
+            if has_pending_completion_for_session(session_id):
+                return True
+        except Exception:
+            logger.debug("Failed to inspect active delegations before renewal", exc_info=True)
+            return True
+
+        # Proxy mode never writes a local exact api_content sidecar, so it
+        # cannot prove capsule durability safely.
+        if self._get_proxy_url():
+            return True
+
+        if store is None:
+            return True
+        capability = store.get_session_metadata(
+            session_key,
+            _CONTINUITY_CAPSULE_CAPABLE_METADATA,
+            None,
+        )
+        if capability is False:
+            return True
+
+        cached = getattr(self, "_agent_cache", {}).get(session_key)
+        cached_agent = cached[0] if isinstance(cached, tuple) else cached
+        if cached_agent is not None and (
+            getattr(cached_agent, "api_mode", None) == "codex_app_server"
+            or bool(getattr(cached_agent, "moa_config", None))
+        ):
+            # These runtimes deliberately do not stamp an exact api_content
+            # sidecar, so they cannot satisfy capsule acknowledgement safely.
+            return True
+
+        # A cached supported predecessor does NOT prove the successor runtime:
+        # a config change to Codex app-server or MoA must still defer even while
+        # an old supported agent remains cached (proxy is already caught above).
+        # Resolve the runtime that will actually handle the successor — from a
+        # live cache or, after a restart, from persisted session/channel
+        # configuration — and only proceed for a proven-supported api_mode.
+        # A missing/unknown api_mode or an MoA provider is unproven and fails
+        # closed rather than being trusted.
+        try:
+            with store._lock:
+                entry = store._entries.get(session_key)
+                source = entry.origin if entry is not None else None
+            _model, runtime = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to resolve continuity runtime before renewal",
+                exc_info=True,
+            )
+            return True
+        if (
+            runtime.get("api_mode") not in _CONTINUITY_RENEWAL_SUPPORTED_API_MODES
+            or runtime.get("provider") == "moa"
+            or runtime.get("requested_provider") == "moa"
+        ):
+            return True
+        return False
 
     def _active_session_limit_message(self, session_key: str) -> Optional[str]:
         """Return a user-facing rejection when starting a new session exceeds the cap."""
@@ -9370,7 +9491,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # state.db (single write-path, #9006) — also drops
                         # the persisted /model override, since finalization
                         # is a conversation boundary.
-                        await self.async_session_store.set_expiry_finalized(entry)
+                        await self.async_session_store.set_expiry_finalized(
+                            entry,
+                            preserve_for_renewal=True,
+                        )
                         logger.debug(
                             "Session expiry finalized for %s",
                             entry.session_id,
@@ -9386,7 +9510,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 failures, entry.session_id, e,
                             )
                             await self.async_session_store.set_expiry_finalized(
-                                entry, clear_model_override=False
+                                entry,
+                                clear_model_override=False,
+                                preserve_for_renewal=True,
                             )
                             _finalize_failures.pop(entry.session_id, None)
                         else:
@@ -13354,7 +13480,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        session_entry = await self.async_session_store.get_or_create_session(source)
+        event_metadata = getattr(event, "metadata", None) or {}
+        defer_renewal = bool(
+            event_metadata.get("_hermes_queued_followup")
+            or event_metadata.get("_hermes_delegation_completion")
+            or event_metadata.get("_hermes_process_completion")
+            or getattr(event, "media_urls", None)
+        )
+        if defer_renewal:
+            session_entry = await self.async_session_store.get_or_create_session(
+                source,
+                defer_renewal=True,
+            )
+        else:
+            session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
@@ -13428,6 +13567,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
+        _pending_continuity_capsule = getattr(
+            session_entry,
+            "continuity_capsule",
+            None,
+        )
         _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
         if _was_auto_reset:
             # Treat auto-reset as a full conversation boundary — clear every
@@ -13504,11 +13648,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if reset_reason == "suspended":
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
             elif reset_reason == "daily":
-                context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
+                context_note = (
+                    "[System note: The session was renewed by the daily schedule. "
+                    "A bounded untrusted historical capsule follows.]"
+                    if _pending_continuity_capsule
+                    else "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
+                )
             elif reset_reason == "resume_pending_expired":
                 context_note = "[System note: The previous gateway session could not be recovered after a restart (API recovery timed out). This is a fresh conversation — use /resume to restore history if needed.]"
             else:
-                context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
+                context_note = (
+                    "[System note: The session was renewed after inactivity. "
+                    "A bounded untrusted historical capsule follows.]"
+                    if _pending_continuity_capsule
+                    else "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
+                )
             # Slack/Discord channels/threads are long-lived: point the agent at
             # the specific prior same-channel session so it recalls that context
             # via session_search instead of an unrelated recent session.  Returns
@@ -13521,6 +13675,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if continuity_note:
                 context_note = context_note + "\n\n" + continuity_note
             turn_sidecar_notes.append(context_note)
+            if _pending_continuity_capsule:
+                turn_sidecar_notes.append(_pending_continuity_capsule)
 
             # Send a user-facing notification explaining the reset, unless:
             # - notifications are disabled in config
@@ -13580,6 +13736,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # was_auto_reset is already consumed in the cleanup block above
             # (single source of truth); only the reset reason needs clearing here.
             session_entry.auto_reset_reason = None
+
+        elif _pending_continuity_capsule:
+            # A provider or local-persistence failure leaves the durable capsule
+            # pending; retry it on the next actual user request without replaying
+            # the one-shot cleanup/notification side effects.
+            turn_sidecar_notes.append(_pending_continuity_capsule)
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
@@ -14484,6 +14646,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            if _pending_continuity_capsule and self._session_db is not None:
+                try:
+                    prior_capsule_message_id = (
+                        await self._session_db.find_new_user_message_with_capsule(
+                            _run_start_session_id,
+                            _pending_continuity_capsule,
+                            after_message_id=0,
+                        )
+                    )
+                except Exception:
+                    prior_capsule_message_id = None
+                    logger.warning(
+                        "Could not inspect continuity retry transcript tail",
+                        exc_info=True,
+                    )
+                if prior_capsule_message_id is not None:
+                    try:
+                        prior_rows = await self._session_db.get_messages(
+                            _run_start_session_id,
+                            include_inactive=True,
+                        )
+                        prior_attempt_unanswered = not any(
+                            row.get("role") == "assistant"
+                            and int(row.get("id") or 0) > prior_capsule_message_id
+                            for row in prior_rows
+                        )
+                    except Exception:
+                        # Do not claim provider failure unless the transcript
+                        # proves that no assistant followed the capsule row.
+                        prior_attempt_unanswered = False
+                        logger.warning(
+                            "Could not verify prior capsule attempt outcome; "
+                            "retrying without a synthetic failure boundary",
+                            exc_info=True,
+                        )
+                    if prior_attempt_unanswered:
+                        # A failed provider attempt leaves its clean user row
+                        # durable. Persist one explicit failure boundary before
+                        # retry so role repair cannot merge away its sidecar.
+                        retry_boundary = {
+                            "role": "assistant",
+                            "content": (
+                                "[Previous provider attempt ended before an assistant "
+                                "response was produced.]"
+                            ),
+                        }
+                        await self.async_session_store.append_to_transcript(
+                            _run_start_session_id,
+                            retry_boundary,
+                        )
+                        history = [*history, retry_boundary]
+            _capsule_message_highwater: Optional[int] = None
+            if _pending_continuity_capsule and self._session_db is not None:
+                try:
+                    _capsule_message_highwater = await self._session_db.latest_message_id(
+                        _run_start_session_id
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not capture continuity acknowledgement high-water mark",
+                        exc_info=True,
+                    )
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -15026,6 +15250,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+
+            if (
+                _pending_continuity_capsule
+                and self._session_db is not None
+                and not is_context_overflow_failure
+                and not agent_failed_early
+                and not hidden_reasoning_incomplete
+                and _should_clear_resume_pending_after_turn(agent_result)
+                and _capsule_message_highwater is not None
+            ):
+                try:
+                    capsule_message_id = (
+                        await self._session_db.find_new_user_message_with_capsule(
+                            session_entry.session_id,
+                            _pending_continuity_capsule,
+                            # Always prove against the successor's first durable
+                            # user row. A retry must not move acknowledgement
+                            # past an earlier unacknowledged attempt.
+                            after_message_id=0,
+                        )
+                    )
+                    if capsule_message_id is not None:
+                        await self.async_session_store.acknowledge_continuity_capsule(
+                            session_key,
+                            _pending_continuity_capsule,
+                            capsule_message_id,
+                        )
+                except Exception:
+                    # Delivery succeeded but proof of local durability did not;
+                    # keep the capsule pending so the next user turn retries it.
+                    logger.warning(
+                        "Continuity capsule remains pending after acknowledgement failure",
+                        exc_info=True,
+                    )
 
             # Re-baseline the cached agent's message_count snapshot now that
             # ALL of this turn's transcript writes are done — the agent's
@@ -18657,7 +18915,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return False
         try:
-            metadata = {}
+            metadata: Dict[str, Any] = {"_hermes_queued_followup": True}
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
@@ -20880,6 +21138,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            session_store = getattr(self, "session_store", None)
+            set_session_metadata = getattr(
+                session_store, "set_session_metadata", None
+            )
+            if session_key and callable(set_session_metadata):
+                await asyncio.to_thread(
+                    set_session_metadata,
+                    session_key,
+                    _CONTINUITY_CAPSULE_CAPABLE_METADATA,
+                    False,
+                )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -22154,6 +22423,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+
+            session_store = getattr(self, "session_store", None)
+            set_session_metadata = getattr(
+                session_store, "set_session_metadata", None
+            )
+            if session_key and callable(set_session_metadata):
+                # This block already runs in the agent worker thread.
+                set_session_metadata(
+                    session_key,
+                    _CONTINUITY_CAPSULE_CAPABLE_METADATA,
+                    turn_route["runtime"].get("api_mode") != "codex_app_server"
+                    and moa_config is None,
+                )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
