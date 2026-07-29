@@ -665,8 +665,12 @@ def _rpc_server_loop(
                     try:
                         sys.stdout = devnull
                         sys.stderr = devnull
+                        dispatch_kwargs = {"task_id": task_id}
+                        if tool_name == "read_file":
+                            dispatch_kwargs["suppress_read_dedup"] = True
                         result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
+                            tool_name, tool_args,
+                            **dispatch_kwargs,
                         )
                     finally:
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -950,8 +954,12 @@ def _rpc_poll_loop(
                         try:
                             sys.stdout = devnull
                             sys.stderr = devnull
+                            dispatch_kwargs = {"task_id": task_id}
+                            if tool_name == "read_file":
+                                dispatch_kwargs["suppress_read_dedup"] = True
                             tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                                tool_name, tool_args,
+                                **dispatch_kwargs,
                             )
                         finally:
                             sys.stdout, sys.stderr = _real_stdout, _real_stderr
