@@ -55,6 +55,7 @@ def _build_inspection_agent(platform: str) -> Any:
     platform come from the caller so the breakdown matches a real session.
     """
     from run_agent import AIAgent
+    from agent.coding_context import coding_selection
     from hermes_cli.config import load_config
     from hermes_cli.tools_config import _get_platform_tools
 
@@ -62,8 +63,10 @@ def _build_inspection_agent(platform: str) -> Any:
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     model = model_cfg.get("default") or model_cfg.get("model") or ""
 
-    # Resolve platform-specific toolsets the same way the gateway does.
-    enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
+    # Resolve focus-mode toolsets before falling back to the platform defaults.
+    enabled_toolsets = coding_selection(platform=platform, config=cfg)
+    if enabled_toolsets is None:
+        enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
     agent_cfg = cfg.get("agent") or {}
     disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 

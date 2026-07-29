@@ -75,6 +75,37 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
     assert data["system_prompt"]["bytes"] > 0
 
 
+def test_inspection_agent_prefers_coding_selection(monkeypatch):
+    """Inspection forwards the runtime focus selection unchanged."""
+    captured = {}
+
+    class FakeAIAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    cfg = {"model": {"default": "test/model"}}
+    selected = ["coding", "stripe-agent"]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        SimpleNamespace(AIAgent=FakeAIAgent),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.coding_context.coding_selection",
+        lambda *, platform, config: selected,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda passed_cfg, platform: pytest.fail("platform fallback was called"),
+    )
+
+    _build_inspection_agent("cli")
+
+    assert captured["enabled_toolsets"] is selected
+
+
 def test_inspection_agent_uses_resolved_platform_toolsets(monkeypatch):
     """Inspection must match real CLI tool resolution, including disables."""
     captured = {}
@@ -94,6 +125,10 @@ def test_inspection_agent_uses_resolved_platform_toolsets(monkeypatch):
         SimpleNamespace(AIAgent=FakeAIAgent),
     )
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "agent.coding_context.coding_selection",
+        lambda *, platform, config: None,
+    )
     monkeypatch.setattr(
         "hermes_cli.tools_config._get_platform_tools",
         lambda passed_cfg, platform: {"terminal", "file"},
