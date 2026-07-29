@@ -309,6 +309,10 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       return
     }
 
+    // Clear any lingering inline-edit hold from the previous session before
+    // calling stopScroll — otherwise data-editing persists into the new session
+    // and the scroll container stays frozen after the switch.
+    endEditHold()
     stopScroll()
     el.scrollTop = el.scrollHeight
 
@@ -320,6 +324,11 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       const node = scrollRef.current
 
       if (!node) {
+        // Component unmounted while the settle loop was still running.
+        // stopScroll() was already called — hand back to the library so the
+        // scroll container is never left permanently locked if it re-mounts.
+        void scrollToBottom('instant')
+
         return
       }
 
@@ -344,7 +353,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     let rafId = requestAnimationFrame(settle)
 
     return () => cancelAnimationFrame(rafId)
-  }, [scrollRef, scrollToBottom, sessionKey, stopScroll])
+  }, [endEditHold, scrollRef, scrollToBottom, sessionKey, stopScroll])
 
   // Prepend an older page while preserving the on-screen position. The user is
   // scrolled up (reading history) so the stick-to-bottom lock is escaped and
