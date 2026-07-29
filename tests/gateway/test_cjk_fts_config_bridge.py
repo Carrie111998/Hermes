@@ -58,6 +58,40 @@ def test_search_knobs_have_documented_defaults():
     assert DEFAULT_CONFIG["sessions"]["search_slow_ms"] == 1000
 
 
+def test_index_exclude_sources_bridged_from_config(tmp_path, monkeypatch):
+    home = _write_home(tmp_path, {"index_exclude_sources": ["webhook", "cron"]})
+    monkeypatch.setattr(gateway_run, "_hermes_home", home)
+    monkeypatch.delenv("HERMES_FTS_EXCLUDE_SOURCES", raising=False)
+    gateway_run._reload_runtime_env_preserving_config_authority()
+    assert os.environ["HERMES_FTS_EXCLUDE_SOURCES"] == "webhook,cron"
+
+
+def test_config_empty_list_clears_a_stale_exclusion_env(tmp_path, monkeypatch):
+    """config.yaml is authoritative: emptying the list must turn indexing back
+    on, not leave a previous process's carrier in place."""
+    home = _write_home(tmp_path, {"index_exclude_sources": []})
+    monkeypatch.setattr(gateway_run, "_hermes_home", home)
+    monkeypatch.setenv("HERMES_FTS_EXCLUDE_SOURCES", "webhook")
+    gateway_run._reload_runtime_env_preserving_config_authority()
+    assert os.environ["HERMES_FTS_EXCLUDE_SOURCES"] == ""
+
+
+def test_env_survives_when_config_omits_index_exclude_sources(
+    tmp_path, monkeypatch
+):
+    home = _write_home(tmp_path, {"auto_prune": False})
+    monkeypatch.setattr(gateway_run, "_hermes_home", home)
+    monkeypatch.setenv("HERMES_FTS_EXCLUDE_SOURCES", "cron")
+    gateway_run._reload_runtime_env_preserving_config_authority()
+    assert os.environ["HERMES_FTS_EXCLUDE_SOURCES"] == "cron"
+
+
+def test_index_exclude_sources_default_is_index_everything():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["sessions"]["index_exclude_sources"] == []
+
+
 def test_config_false_disables_cjk_semantics(tmp_path, monkeypatch):
     """The bridged 'False' string must parse as OFF in hermes_state."""
     from hermes_state import _cjk_fts_config_enabled

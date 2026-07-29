@@ -16975,6 +16975,22 @@ def main():
         help="Skip the disk-space confirmation prompt",
     )
 
+    sessions_subparsers.add_parser(
+        "prune-index",
+        help="Drop already-indexed messages for sources excluded from search",
+        description=(
+            "Remove messages belonging to sessions.index_exclude_sources from "
+            "the full-text search index. Changing that setting only affects "
+            "messages written afterwards; rows indexed under the previous "
+            "setting stay in the index and keep occupying disk until this "
+            "runs. Only the INDEX is touched — transcripts stay fully stored, "
+            "readable, resumable, and exportable. Runs in bounded chunks so a "
+            "live gateway keeps working, and is safe to interrupt and re-run. "
+            "Freed pages are returned to the filesystem by a later "
+            "`hermes sessions optimize` (VACUUM)."
+        ),
+    )
+
     sessions_repair = sessions_subparsers.add_parser(
         "repair",
         help="Repair a malformed state.db schema so hidden sessions reappear",
@@ -18180,6 +18196,60 @@ def main():
             if result.get("vacuumed") is False:
                 print("  (VACUUM was skipped or failed — run "
                       "`hermes sessions optimize` later to reclaim freed space.)")
+
+        elif action == "prune-index":
+            excluded = db.fts_excluded_sources()
+            if not excluded:
+                print(
+                    "No session sources are excluded from the search index.\n"
+                    "Set sessions.index_exclude_sources in config.yaml first, "
+                    "e.g.:\n"
+                    "  hermes config set sessions.index_exclude_sources "
+                    "webhook,cron,subagent"
+                )
+                db.close()
+                return
+            before_mb = (db.logical_size_bytes() or 0) / (1024 * 1024)
+            print(
+                "Removing already-indexed messages for excluded source(s): "
+                + ", ".join(excluded)
+            )
+            print(
+                "  Transcripts are NOT touched — only the search index. "
+                "Safe to Ctrl-C and re-run."
+            )
+
+            _seen = {"table": None}
+
+            def _prune_progress(info):
+                table = info.get("table")
+                if table != _seen["table"] and _seen["table"] is not None:
+                    print()
+                _seen["table"] = table
+                print(
+                    f"\r  {table}: un-indexed {info.get('removed', 0):,} row(s)",
+                    end="", flush=True,
+                )
+
+            result = db.prune_fts_for_excluded_sources(
+                progress_cb=_prune_progress
+            )
+            print()
+            if not result.get("ok"):
+                print(f"Could not prune: {result.get('reason', 'unknown')}")
+                db.close()
+                return
+            total = sum(result.get("removed", {}).values())
+            after_mb = (db.logical_size_bytes() or 0) / (1024 * 1024)
+            print(f"✓ Un-indexed {total:,} message row(s).")
+            print(
+                f"  Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
+                f"({_size_delta_label(before_mb - after_mb)})"
+            )
+            print(
+                "  Freed pages are reused by new writes. To return them to "
+                "the filesystem, run: hermes sessions optimize"
+            )
 
         elif action == "stats":
             total = db.session_count()

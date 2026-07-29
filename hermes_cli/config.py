@@ -3471,6 +3471,25 @@ DEFAULT_CONFIG = {
         # setting is inert when it isn't. False: never load the extension or
         # serve the cjk index. Bridged to HERMES_CJK_FTS (internal carrier).
         "cjk_fts": True,
+        # Session sources whose messages are NOT written to the full-text
+        # search indexes. Empty list (default) = index everything, which is
+        # the historical behavior.
+        #
+        # The FTS indexes cost ~4-5x the bytes of the text they cover, and on
+        # an install driven by automation (webhook routes, cron jobs,
+        # delegated subagents) those machine transcripts are the large
+        # majority of stored text while being the least likely to be
+        # keyword-searched. Listing them here — e.g.
+        # ["webhook", "cron", "subagent"] — keeps them fully STORED and
+        # readable (session_search by id, browsing, transcript reads, resume
+        # all unaffected) but leaves them out of the index, which is where
+        # the disk goes.
+        #
+        # Changing this only affects messages written from then on. To drop
+        # already-indexed rows for the newly excluded sources and return the
+        # space, run `hermes sessions prune-index`. Bridged to
+        # HERMES_FTS_EXCLUDE_SOURCES (internal carrier).
+        "index_exclude_sources": [],
         # Slow session-search log threshold in milliseconds: searches at or
         # above it log one INFO line with the routing path taken (fts_cjk /
         # fts5 / trigram / like_scan) so latency regressions stay
@@ -7611,6 +7630,29 @@ def load_config() -> Dict[str, Any]:
     ``get_provider_request_timeout`` which is called once per API turn.
     """
     return _load_config_impl(want_deepcopy=True)
+
+
+def join_index_exclude_sources(value: Any) -> str:
+    """Render ``sessions.index_exclude_sources`` for its env carrier.
+
+    Accepts the configured list (or a comma string, which users hand-editing
+    the YAML do write) and returns the comma-separated form
+    ``HERMES_FTS_EXCLUDE_SOURCES`` carries. Entries containing a comma are
+    dropped — the carrier is comma-delimited, so one would silently split into
+    two bogus source names.
+    """
+    if isinstance(value, str):
+        parts = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        parts = list(value)
+    else:
+        return ""
+    out: list = []
+    for part in parts:
+        src = str(part).strip()
+        if src and "," not in src and src not in out:
+            out.append(src)
+    return ",".join(out)
 
 
 def load_config_readonly() -> Dict[str, Any]:
