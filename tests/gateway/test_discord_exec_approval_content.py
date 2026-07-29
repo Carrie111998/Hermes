@@ -49,7 +49,14 @@ async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason
 
 
 @pytest.mark.asyncio
-async def test_exec_approval_prompt_truncates_long_command_in_content():
+async def test_exec_approval_prompt_splits_long_command_across_messages():
+    """A long command must be shown in FULL, spread over several messages.
+
+    Previously the content was hard-truncated with ``... [truncated]``, which
+    asked the user to approve a command they could only partially read — a
+    security footgun. The payload now spills into additional messages and the
+    buttons hang off the last one.
+    """
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     sent = _capture_channel(adapter)
 
@@ -62,7 +69,8 @@ async def test_exec_approval_prompt_truncates_long_command_in_content():
     )
 
     assert result.success is True
+    # Every individual message respects the platform cap...
     assert len(sent["content"]) <= adapter.MAX_MESSAGE_LENGTH
-    assert "... [truncated]" in sent["content"]
+    # ...but nothing is clipped away.
+    assert "... [truncated]" not in sent["content"]
     assert "long generated shell command" in sent["content"]
-    assert len(sent["embed"].description) > len(sent["content"])
