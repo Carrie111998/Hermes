@@ -15465,6 +15465,8 @@ def _(rid, params: dict) -> dict:
             COMMAND_REGISTRY,
             SUBCOMMANDS,
             _build_description,
+            _localized_category,
+            _localized_extension_description,
         )
 
         all_pairs: list[list[str]] = []
@@ -15485,7 +15487,7 @@ def _(rid, params: dict) -> dict:
             desc = _build_description(cmd)
             all_pairs.append([c, desc])
 
-            cat = cmd.category
+            cat = _localized_category(cmd.category)
             if cat not in cat_map:
                 cat_map[cat] = []
                 cat_order.append(cat)
@@ -15498,6 +15500,8 @@ def _(rid, params: dict) -> dict:
             # advertises). The registry entry is canonical.
             if name.lower() in canon:
                 continue
+            desc = _localized_extension_description("tui_descriptions", name, desc)
+            cat = _localized_category(cat)
             canon[name.lower()] = name
             all_pairs.append([name, desc])
             if cat not in cat_map:
@@ -15546,6 +15550,7 @@ def _(rid, params: dict) -> dict:
 
             for k, info in sorted(scan_skill_commands().items()):
                 d = str(info.get("description", "Skill"))
+                d = _localized_extension_description("skill_descriptions", k, d)
                 all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
                 name = str(info.get("name") or k.lstrip("/"))
                 skills[k] = {"usage": usage(name), "origin": origin_of(name)}
@@ -16810,7 +16815,10 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"items": []})
 
     try:
-        from hermes_cli.commands import SlashCommandCompleter
+        from hermes_cli.commands import (
+            SlashCommandCompleter,
+            _localized_extension_description,
+        )
         from prompt_toolkit.document import Document
         from prompt_toolkit.formatted_text import to_plain_text
 
@@ -16876,6 +16884,9 @@ def _(rid, params: dict) -> dict:
             },
         ]
         for extra in extras:
+            extra["meta"] = _localized_extension_description(
+                "tui_descriptions", extra["text"], extra["meta"]
+            )
             if extra["text"].startswith(text_lower) and not any(
                 item["text"] == extra["text"] for item in items
             ):

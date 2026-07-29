@@ -302,18 +302,71 @@ def resolve_command(name: str) -> CommandDef | None:
     return _COMMAND_LOOKUP.get(name.lower().lstrip("/"))
 
 
+def _localized_registry_text(key: str, fallback: str) -> str:
+    """Resolve optional localized slash-registry text with a safe fallback."""
+    try:
+        from agent.i18n import t
+
+        value = t(key)
+        return fallback if value == key else value
+    except Exception:
+        return fallback
+
+
+def _localized_description(cmd: CommandDef) -> str:
+    """Return the active-language description for *cmd*."""
+    return _localized_registry_text(
+        f"slash_commands.descriptions.{cmd.name}", cmd.description
+    )
+
+
+def _localized_category(category: str) -> str:
+    """Return the active-language slash-command category label."""
+    key_name = category.lower().replace(" & ", "_").replace(" ", "_")
+    return _localized_registry_text(f"slash_commands.categories.{key_name}", category)
+
+
+def _localized_extension_description(
+    namespace: str, command_name: str, fallback: str
+) -> str:
+    """Localize dynamic skill, bundle, or plugin completion metadata.
+
+    These commands are discovered at runtime, so missing catalog entries must
+    safely retain the description supplied by the extension.
+    """
+    key_name = command_name.lower().lstrip("/")
+    return _localized_registry_text(
+        f"slash_commands.{namespace}.{key_name}", fallback
+    )
+
+
 def _build_description(cmd: CommandDef) -> str:
-    """Build a CLI-facing description string including usage hint."""
+    """Build a localized CLI-facing description including usage hint."""
+    description = _localized_description(cmd)
+    if cmd.args_hint:
+        usage = _localized_registry_text("slash_commands.usage_label", "usage")
+        return f"{description} ({usage}: /{cmd.name} {cmd.args_hint})"
+    return description
+
+
+def _build_default_description(cmd: CommandDef) -> str:
+    """Build the stable English registry description used by legacy lookups."""
     if cmd.args_hint:
         return f"{cmd.description} (usage: /{cmd.name} {cmd.args_hint})"
     return cmd.description
+
+
+def _build_alias_description(cmd: CommandDef) -> str:
+    """Build a localized alias description."""
+    alias_for = _localized_registry_text("slash_commands.alias_for", "alias for")
+    return f"{_localized_description(cmd)} ({alias_for} /{cmd.name})"
 
 
 # Backwards-compatible flat dict: "/command" -> description
 COMMANDS: dict[str, str] = {}
 for _cmd in COMMAND_REGISTRY:
     if not _cmd.gateway_only:
-        COMMANDS[f"/{_cmd.name}"] = _build_description(_cmd)
+        COMMANDS[f"/{_cmd.name}"] = _build_default_description(_cmd)
         for _alias in _cmd.aliases:
             COMMANDS[f"/{_alias}"] = f"{_cmd.description} (alias for /{_cmd.name})"
 
@@ -1451,7 +1504,15 @@ class SlashCommandCompleter(Completer):
         for cmd, info in self._iter_skill_commands().items():
             if cmd in seen or not cmd.startswith(word_key):
                 continue
-            description = str(info.get("description", "Skill command"))
+            fallback = str(
+                info.get("description")
+                or _localized_registry_text(
+                    "slash_commands.skill_command_fallback", "Skill command"
+                )
+            )
+            description = _localized_extension_description(
+                "skill_descriptions", cmd, fallback
+            )
             short_desc = description[:50] + ("..." if len(description) > 50 else "")
             # Exact match: append a trailing space so the dropdown stays
             # visible and the next stacked token can be typed immediately
@@ -2045,6 +2106,13 @@ class SlashCommandCompleter(Completer):
                 continue
             cmd_name = cmd[1:]
             if cmd_name.startswith(word):
+                command_def = resolve_command(cmd_name)
+                if command_def is not None:
+                    desc = (
+                        _build_description(command_def)
+                        if cmd_name == command_def.name
+                        else _build_alias_description(command_def)
+                    )
                 yield Completion(
                     self._completion_text(cmd_name, word),
                     start_position=-len(word),
@@ -2055,7 +2123,15 @@ class SlashCommandCompleter(Completer):
         for cmd, info in self._iter_skill_bundles().items():
             cmd_name = cmd[1:]
             if cmd_name.startswith(word):
-                description = str(info.get("description", "Skill bundle"))
+                fallback = str(
+                    info.get("description")
+                    or _localized_registry_text(
+                        "slash_commands.skill_bundle_fallback", "Skill bundle"
+                    )
+                )
+                description = _localized_extension_description(
+                    "skill_bundle_descriptions", cmd, fallback
+                )
                 short_desc = description[:50] + ("..." if len(description) > 50 else "")
                 skill_count = len(info.get("skills", []))
                 yield Completion(
@@ -2068,7 +2144,15 @@ class SlashCommandCompleter(Completer):
         for cmd, info in self._iter_skill_commands().items():
             cmd_name = cmd[1:]
             if cmd_name.startswith(word):
-                description = str(info.get("description", "Skill command"))
+                fallback = str(
+                    info.get("description")
+                    or _localized_registry_text(
+                        "slash_commands.skill_command_fallback", "Skill command"
+                    )
+                )
+                description = _localized_extension_description(
+                    "skill_descriptions", cmd, fallback
+                )
                 short_desc = description[:50] + ("..." if len(description) > 50 else "")
                 yield Completion(
                     self._completion_text(cmd_name, word),
@@ -2082,7 +2166,15 @@ class SlashCommandCompleter(Completer):
             from hermes_cli.plugins import get_plugin_commands
             for cmd_name, cmd_info in get_plugin_commands().items():
                 if cmd_name.startswith(word):
-                    desc = str(cmd_info.get("description", "Plugin command"))
+                    fallback = str(
+                        cmd_info.get("description")
+                        or _localized_registry_text(
+                            "slash_commands.plugin_command_fallback", "Plugin command"
+                        )
+                    )
+                    desc = _localized_extension_description(
+                        "plugin_descriptions", cmd_name, fallback
+                    )
                     short_desc = desc[:50] + ("..." if len(desc) > 50 else "")
                     yield Completion(
                         self._completion_text(cmd_name, word),

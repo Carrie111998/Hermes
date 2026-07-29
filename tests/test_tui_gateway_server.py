@@ -5868,6 +5868,25 @@ def test_complete_slash_includes_tui_details_command():
     assert any(item["text"] == "/details" for item in resp["result"]["items"])
 
 
+def test_complete_slash_localizes_tui_only_description(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    from agent.i18n import reset_language_cache
+
+    reset_language_cache()
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "complete.slash", "params": {"text": "/det"}}
+        )
+        assert resp is not None
+        details = next(
+            item for item in resp["result"]["items"] if item["text"] == "/details"
+        )
+        assert details["meta"] == "控制代理详细信息的显示方式"
+    finally:
+        monkeypatch.setenv("HERMES_LANGUAGE", "en")
+        reset_language_cache()
+
+
 def test_complete_slash_includes_tui_mouse_command():
     resp = server.handle_request(
         {"id": "1", "method": "complete.slash", "params": {"text": "/mou"}}
@@ -7637,6 +7656,33 @@ def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
     advertised = {name for name, _ in resp["result"]["pairs"]}
     assert set(skills) <= advertised
     assert resp["result"]["skill_count"] == len(skills)
+
+
+def test_commands_catalog_localizes_skill_descriptions(monkeypatch):
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    from agent.i18n import reset_language_cache
+
+    reset_language_cache()
+    monkeypatch.setattr(
+        "agent.skill_commands.scan_skill_commands",
+        lambda: {
+            "/obsidian": {
+                "name": "obsidian",
+                "description": "Read, search, create, and edit notes in the Obsidian vault.",
+            }
+        },
+    )
+
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "commands.catalog", "params": {}}
+        )
+        assert resp is not None
+        pairs = dict(resp["result"]["pairs"])
+        assert pairs["/obsidian"] == "读取、搜索、创建和编辑 Obsidian 知识库中的笔记"
+    finally:
+        monkeypatch.setenv("HERMES_LANGUAGE", "en")
+        reset_language_cache()
 
 
 def test_commands_catalog_survives_an_unreadable_usage_sidecar(monkeypatch):
