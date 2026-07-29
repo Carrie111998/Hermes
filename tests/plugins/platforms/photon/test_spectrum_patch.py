@@ -84,7 +84,20 @@ def _write_sidecar_fixture(tmp_path: Path, *, sdk_available: bool) -> Path:
         encoding="utf-8",
     )
     (package / "providers" / "imessage.js").write_text(
-        "export function imessage() { return {}; }\nimessage.config = () => ({});\n",
+        textwrap.dedent(
+            """
+            export function imessage() {
+              return {
+                space: {
+                  get: async () => ({
+                    getMessage: async () => undefined,
+                  }),
+                },
+              };
+            }
+            imessage.config = () => ({});
+            """
+        ).lstrip(),
         encoding="utf-8",
     )
     return sidecar
@@ -127,6 +140,56 @@ def test_sidecar_patch_failure_still_reaches_health_endpoint(tmp_path: Path) -> 
         _, stderr = proc.communicate(timeout=5)
 
     assert "forced patch failure" in stderr
+
+
+def test_successful_probe_keeps_a_quiet_stream_healthy(tmp_path: Path) -> None:
+    """A unary round-trip proves channel liveness, not event-stream failure.
+
+    Spectrum's message iterator emits real events rather than heartbeats, so a
+    healthy shared line can stay quiet indefinitely. A successful synthetic
+    getMessage probe must therefore leave stream health unchanged.
+    """
+    sidecar = _write_sidecar_fixture(tmp_path, sdk_available=True)
+    port = _free_port()
+    proc = subprocess.Popen(
+        ["node", "index.mjs"],
+        cwd=sidecar,
+        env=_sidecar_env(port),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    def _post(path: str) -> dict[str, object]:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}",
+            data=b"{}",
+            headers={"X-Hermes-Sidecar-Token": "test-token"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=1) as response:
+            return json.load(response)
+
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                health = _post("/healthz")
+                break
+            except OSError:
+                if proc.poll() is not None or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+
+        probe = _post("/probe")
+        health = _post("/healthz")
+
+        assert probe["alive"] is True
+        assert health["stream"]["ok"] is True  # type: ignore[index]
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.communicate(timeout=5)
 
 
 def test_sidecar_missing_sdk_remains_fatal_after_patch_failure(tmp_path: Path) -> None:
