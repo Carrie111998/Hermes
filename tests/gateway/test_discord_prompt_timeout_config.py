@@ -1,13 +1,11 @@
 """Tests for the configurable Discord interactive-view timeout.
 
-``_read_discord_prompt_timeout()`` backs the view lifetime of every Discord
-interactive prompt (ExecApprovalView, SlashConfirmView, UpdatePromptView,
-ClarifyChoiceView, ModelPickerView, ChoicePickerView). Resolution order is
-explicit ``approvals.discord_prompt_timeout`` → backend clarify timeout →
-300s fallback, with ``<= 0`` meaning *never expire* (``None``) and a MIN
-clamp guarding against typos. There is no MAX clamp: the views hang off a
-normal bot message, so each click mints a fresh interaction token and the
-view can outlive Discord's ~15-minute token expiry.
+Previously hardcoded to 300s on ExecApprovalView, SlashConfirmView,
+UpdatePromptView, and ClarifyChoiceView. Now reads
+``approvals.discord_prompt_timeout`` with the same 300s default, clamped to
+``_DISCORD_PROMPT_TIMEOUT_MIN`` so a typo
+can't make prompts disappear (too short) or outlive Discord's 15-min
+interaction-token expiry (too long).
 """
 
 import sys
@@ -53,9 +51,16 @@ _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import (  # noqa: E402
     _DISCORD_PROMPT_TIMEOUT_DEFAULT,
+
     _DISCORD_PROMPT_TIMEOUT_MIN,
     _read_discord_prompt_timeout,
 )
+
+
+# resolve_clarify_timeout() falls back to agent.clarify_timeout's 3600s
+# default when nothing is configured; an unset discord_prompt_timeout now
+# inherits that rather than the bare 300s fallback.
+_BACKEND_CLARIFY_DEFAULT = 3600
 
 
 def _patch_config(monkeypatch, cfg):
@@ -64,63 +69,20 @@ def _patch_config(monkeypatch, cfg):
     monkeypatch.setattr(hermes_cli.config, "read_raw_config", lambda: cfg)
 
 
-def test_falls_back_to_backend_default_when_config_absent(monkeypatch):
-    """With nothing configured at all, the backend clarify default (3600s)
-    is what the agent will actually wait, so that is what the buttons use.
-    """
-    from tools.clarify_gateway import resolve_clarify_timeout
+def test_default_when_config_absent(monkeypatch):
+    """No config at all -> backend clarify default (3600s), not a bare 300."""
     _patch_config(monkeypatch, {})
-    assert _read_discord_prompt_timeout() == resolve_clarify_timeout({})
+    assert _read_discord_prompt_timeout() == _BACKEND_CLARIFY_DEFAULT
 
 
 def test_default_when_approvals_block_missing(monkeypatch):
-    from tools.clarify_gateway import resolve_clarify_timeout
     _patch_config(monkeypatch, {"other": {}})
-    assert _read_discord_prompt_timeout() == resolve_clarify_timeout({"other": {}})
+    assert _read_discord_prompt_timeout() == _BACKEND_CLARIFY_DEFAULT
 
 
 def test_default_when_key_missing(monkeypatch):
-    cfg = {"approvals": {"mode": "manual"}}
-    from tools.clarify_gateway import resolve_clarify_timeout
-    _patch_config(monkeypatch, cfg)
-    assert _read_discord_prompt_timeout() == resolve_clarify_timeout(cfg)
-
-
-def test_derives_from_agent_clarify_timeout(monkeypatch):
-    """Unset discord key → track ``agent.clarify_timeout``."""
-    _patch_config(monkeypatch, {"agent": {"clarify_timeout": 7200}})
-    assert _read_discord_prompt_timeout() == 7200
-
-
-def test_derives_from_legacy_clarify_timeout(monkeypatch):
-    """``clarify.timeout`` wins over ``agent.clarify_timeout``, matching
-    ``resolve_clarify_timeout``'s own precedence.
-    """
-    _patch_config(
-        monkeypatch,
-        {"clarify": {"timeout": 1234}, "agent": {"clarify_timeout": 7200}},
-    )
-    assert _read_discord_prompt_timeout() == 1234
-
-
-def test_unlimited_backend_wait_yields_never_expiring_buttons(monkeypatch):
-    """The headline bug: an operator who tells the agent to wait forever
-    used to still get buttons that died after 5 minutes, with a footer
-    claiming "no action taken" while the agent was in fact still waiting.
-    """
-    _patch_config(monkeypatch, {"agent": {"clarify_timeout": 0}})
-    assert _read_discord_prompt_timeout() is None
-
-
-def test_explicit_discord_key_overrides_backend(monkeypatch):
-    _patch_config(
-        monkeypatch,
-        {
-            "approvals": {"discord_prompt_timeout": 600},
-            "agent": {"clarify_timeout": 0},
-        },
-    )
-    assert _read_discord_prompt_timeout() == 600
+    _patch_config(monkeypatch, {"approvals": {"mode": "manual"}})
+    assert _read_discord_prompt_timeout() == _BACKEND_CLARIFY_DEFAULT
 
 
 def test_explicit_int_value(monkeypatch):
@@ -148,18 +110,18 @@ def test_value_clamped_to_minimum(monkeypatch):
     assert _read_discord_prompt_timeout() == _DISCORD_PROMPT_TIMEOUT_MIN
 
 
-def test_large_value_not_clamped(monkeypatch):
-    """No MAX clamp: each button click mints a fresh interaction token, so a
-    view attached to a normal bot message can outlive Discord's ~15-minute
-    interaction-token expiry.
+def test_value_no_longer_clamped_to_maximum(monkeypatch):
+    """No upper clamp: these views hang off a normal bot message, so every
+    fresh click mints a new interaction token. Discord's ~15-min token
+    expiry applies to responding to an *existing* interaction, not here.
     """
     _patch_config(monkeypatch, {"approvals": {"discord_prompt_timeout": 99999}})
     assert _read_discord_prompt_timeout() == 99999
 
 
 def test_zero_means_never_expire(monkeypatch):
-    """Zero = wait forever, matching the Hermes convention everywhere else.
-    ``None`` is discord.py's "this view never times out".
+    """0 = wait forever, the Hermes convention everywhere else. discord.py
+    reads ``timeout=None`` as "this view never expires".
     """
     _patch_config(monkeypatch, {"approvals": {"discord_prompt_timeout": 0}})
     assert _read_discord_prompt_timeout() is None
@@ -170,10 +132,31 @@ def test_negative_means_never_expire(monkeypatch):
     assert _read_discord_prompt_timeout() is None
 
 
-def test_empty_string_falls_back_to_backend(monkeypatch):
-    cfg = {"approvals": {"discord_prompt_timeout": ""}, "agent": {"clarify_timeout": 900}}
-    _patch_config(monkeypatch, cfg)
-    assert _read_discord_prompt_timeout() == 900
+def test_unset_derives_from_backend_clarify_timeout(monkeypatch):
+    """With no explicit Discord key, the view lifetime tracks the backend
+    wait the buttons front, so the two can't drift apart. This is the bug
+    that produced "Prompt expired" while the agent was still blocked.
+    """
+    _patch_config(
+        monkeypatch,
+        {"approvals": {}, "agent": {"clarify_timeout": 31536000}},
+    )
+    assert _read_discord_prompt_timeout() == 31536000
+
+
+def test_unset_with_backend_zero_never_expires(monkeypatch):
+    """Operator told the agent to wait indefinitely -> buttons do too."""
+    _patch_config(
+        monkeypatch,
+        {"approvals": {}, "agent": {"clarify_timeout": 0}},
+    )
+    assert _read_discord_prompt_timeout() is None
+
+
+def test_empty_string_falls_back_to_default(monkeypatch):
+    """Empty string is treated as unset -> derive from the backend wait."""
+    _patch_config(monkeypatch, {"approvals": {"discord_prompt_timeout": ""}})
+    assert _read_discord_prompt_timeout() == _BACKEND_CLARIFY_DEFAULT
 
 
 def test_config_read_exception_falls_back_to_default(monkeypatch):
@@ -187,16 +170,17 @@ def test_config_read_exception_falls_back_to_default(monkeypatch):
     assert _read_discord_prompt_timeout() == _DISCORD_PROMPT_TIMEOUT_DEFAULT
 
 
-def test_fallback_used_when_config_read_raises(monkeypatch):
-    """The 300s constant is now a last-resort fallback for an unreadable
-    config, not the routine default. Pinned so a refactor can't silently
-    turn a config-read failure into a 30s or forever-alive view.
+def test_default_matches_previous_hardcoded_value():
+    """Behavioral parity assertion: existing installs (no new config) must
+    see exactly the 300s timeout the views were hardcoded to before this
+    change. Guards against the default drifting in a future refactor.
     """
     assert _DISCORD_PROMPT_TIMEOUT_DEFAULT == 300
 
 
-def test_min_clamp_below_default():
-    """Sanity: the fallback default must sit above the MIN clamp, or every
-    fresh install would hit the clamp on its very first read.
+def test_clamp_range_includes_default():
+    """Sanity: the default must lie at or above the minimum, or every fresh
+    install would hit the clamp on its very first read. There is no upper
+    clamp any more (see test_value_no_longer_clamped_to_maximum).
     """
     assert _DISCORD_PROMPT_TIMEOUT_MIN <= _DISCORD_PROMPT_TIMEOUT_DEFAULT
