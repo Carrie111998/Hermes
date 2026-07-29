@@ -6249,13 +6249,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or bool(getattr(event, "media_urls", None))
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
-            merge_pending_message_event(
+            # A False return means the head slot belongs to a different sender:
+            # the event is still ours, so fall through to the FIFO and give it
+            # its own turn instead of splicing it into someone else's album.
+            if merge_pending_message_event(
                 adapter._pending_messages,
                 session_key,
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
-            )
-            return
+            ):
+                return
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -11959,7 +11962,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    if not merge_pending_message_event(adapter._pending_messages, _quick_key, event):
+                        # Cross-sender: never splice into another sender's album.
+                        adapter._defer_refused_pending_event(_quick_key, event)
                 return None
 
             _telegram_followup_grace = float(
@@ -11984,12 +11989,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if self._busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
-                        merge_pending_message_event(
+                        if not merge_pending_message_event(
                             adapter._pending_messages,
                             _quick_key,
                             event,
                             merge_text=True,
-                        )
+                        ):
+                            adapter._defer_refused_pending_event(_quick_key, event)
                 return None
 
             _ra_state = self._peek_session_state(_quick_key)
@@ -12005,12 +12011,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(
+                    if not merge_pending_message_event(
                         adapter._pending_messages,
                         _quick_key,
                         event,
                         merge_text=True,
-                    )
+                    ):
+                        adapter._defer_refused_pending_event(_quick_key, event)
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
@@ -24120,7 +24127,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        if not merge_pending_message_event(adapter._pending_messages, session_key, pending_event):
+                            adapter._defer_refused_pending_event(session_key, pending_event)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}

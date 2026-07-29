@@ -745,7 +745,8 @@ class RaftAdapter(BasePlatformAdapter):
 
         if session_key in self._active_sessions:
             logger.debug("[raft] Wake queued for busy session %s", session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event)
+            if not merge_pending_message_event(self._pending_messages, session_key, event):
+                self._defer_refused_pending_event(session_key, event)
             return
 
         await super().handle_message(event)

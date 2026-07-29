@@ -2432,13 +2432,63 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _pending_merge_sender_identity(event: Optional[MessageEvent]) -> Optional[str]:
+    """Identity used to attribute a pending turn to a human.
+
+    Prefers ``source.user_id_alt`` — the stable per-human id on platforms where
+    ``user_id`` varies per message (Signal UUID, Feishu union_id) — and falls
+    back to ``source.user_id``.  Returns ``None`` when neither is available,
+    which callers must treat as "unknown", never as "different".
+
+    Mirrors the identity rule already used by
+    :meth:`BasePlatformAdapter._can_merge_text_debounce_events`, which gates the
+    text debounce buffer on the same ``user_id_alt or user_id`` precedence.
+    """
+    source = getattr(event, "source", None)
+    if source is None:
+        return None
+    sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
+    return str(sender) if sender else None
+
+
+def pending_merge_sender_conflict(
+    existing: Optional[MessageEvent],
+    event: Optional[MessageEvent],
+) -> bool:
+    """True when two events for one pending slot came from *different* humans.
+
+    Shared sessions (a group/channel without ``isolate_user``) put several
+    senders on one ``session_key``.  Merging across senders splices one human's
+    words or media into another human's pending turn, which is then rendered
+    under a single ``[Verified sender: ...]`` envelope — the turn claims an
+    author it does not have.
+
+    The guard is deliberately conservative: a conflict is only reported when
+    BOTH sides resolve to an identity and those identities differ.  Missing
+    identity on either side means "unknown", so the merge proceeds exactly as
+    it did before.  A refusal must never cost a message, and an unknown sender
+    must never be mistaken for a foreign one.
+
+    In per-user/DM sessions the guard is unreachable by construction:
+    ``build_session_key`` appends ``user_id_alt or user_id`` when ``isolate_user``
+    is in effect, so two distinct senders cannot share a ``session_key``.
+    """
+    existing_sender = _pending_merge_sender_identity(existing)
+    if existing_sender is None:
+        return False
+    incoming_sender = _pending_merge_sender_identity(event)
+    if incoming_sender is None:
+        return False
+    return existing_sender != incoming_sender
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
     event: MessageEvent,
     *,
     merge_text: bool = False,
-) -> None:
+) -> bool:
     """Store or merge a pending event for a session.
 
     Photo bursts/albums often arrive as multiple near-simultaneous PHOTO
@@ -2449,8 +2499,21 @@ def merge_pending_message_event(
     instead of replacing the pending turn. This is used for Telegram bursty
     follow-ups so a multi-part user thought is not silently truncated to only
     the last queued fragment.
+
+    Returns ``True`` when *event* was absorbed (stored into an empty slot or
+    merged into the existing turn) and ``False`` when the merge was REFUSED
+    because the pending turn belongs to a different sender
+    (see :func:`pending_merge_sender_conflict`).
+
+    A ``False`` return transfers ownership of *event* back to the caller, which
+    MUST queue it as its own turn.  Ignoring a ``False`` return silently drops
+    a user's message.
     """
     existing = pending_messages.get(session_key)
+    if existing is not None and pending_merge_sender_conflict(existing, event):
+        # Cross-sender: refuse. The caller owns the event and must give it its
+        # own turn so attribution stays 1:1 with content.
+        return False
     if existing:
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
@@ -2463,7 +2526,7 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if existing_has_media or incoming_has_media:
             if incoming_has_media:
@@ -2482,7 +2545,7 @@ def merge_pending_message_event(
             ):
                 existing.message_type = event.message_type
             _invalidate_pending_stt_cache(existing)
-            return
+            return True
 
         if (
             merge_text
@@ -2491,9 +2554,10 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            return
+            return True
 
     pending_messages[session_key] = event
+    return True
 
 
 # Error substrings that indicate a transient *connection* failure worth retrying.
@@ -2633,6 +2697,12 @@ class BasePlatformAdapter(ABC):
     - Sending messages/responses
     - Handling media
     """
+
+    # Hard cap on cross-sender pending-merge refusals parked per session by
+    # ``_defer_refused_pending_event``.  Mirrors the intent of
+    # ``GatewayRunner._BUSY_QUEUE_MAX_PENDING``: far beyond any realistic
+    # conversational backlog, small enough to never threaten memory.
+    _REFUSED_PENDING_MAX = 32
 
     # Whether this platform renders triple-backtick fenced code blocks (i.e.
     # ``format_message`` translates/preserves markdown fences into a real code
@@ -2807,6 +2877,9 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        # Cross-sender pending-merge refusals parked until the pending slot is
+        # drained (see ``_defer_refused_pending_event``). Keyed by session_key.
+        self._refused_pending_events: Dict[str, List[MessageEvent]] = {}
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -5179,6 +5252,8 @@ class BasePlatformAdapter(ABC):
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
+                    # Same-sender by the check above, so the cross-sender guard
+                    # in merge_pending_message_event cannot refuse here.
                     merge_pending_message_event(
                         self._pending_messages,
                         session_key,
@@ -5252,6 +5327,8 @@ class BasePlatformAdapter(ABC):
         state = store.pop(session_key, None)
         if state is None:
             return False
+        # Guarded above: the pending slot is either empty or same-sender, so the
+        # cross-sender refusal path in merge_pending_message_event is unreachable.
         merge_pending_message_event(
             self._pending_messages,
             session_key,
@@ -5680,7 +5757,13 @@ class BasePlatformAdapter(ABC):
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-                merge_pending_message_event(self._pending_messages, session_key, event)
+                if not merge_pending_message_event(self._pending_messages, session_key, event):
+                    # Cross-sender refusal at an adapter-level site with no FIFO
+                    # to fall back on. Keep the pending turn's attribution intact
+                    # and re-dispatch this event as its own turn once the active
+                    # run finishes, so the refusal costs attribution accuracy but
+                    # never the message itself.
+                    self._defer_refused_pending_event(session_key, event)
                 return  # Don't interrupt now - will run after current task completes
 
             if self._is_queue_text_debounce_candidate(event):
@@ -5699,12 +5782,13 @@ class BasePlatformAdapter(ABC):
                     self.name,
                     session_key,
                 )
-                merge_pending_message_event(
+                if not merge_pending_message_event(
                     self._pending_messages,
                     session_key,
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
-                )
+                ):
+                    self._defer_refused_pending_event(session_key, event)
             return  # Don't process now - will be handled after current task finishes
         
         # Mark session as active BEFORE spawning background task to close
@@ -6524,10 +6608,62 @@ class BasePlatformAdapter(ABC):
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""
         return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
-    
+
+    def _refused_pending_store(self) -> Dict[str, List[MessageEvent]]:
+        store = getattr(self, "_refused_pending_events", None)
+        if store is None:
+            store = {}
+            self._refused_pending_events = store
+        return store
+
+    def _defer_refused_pending_event(self, session_key: str, event: MessageEvent) -> None:
+        """Hold a cross-sender-refused event until the pending slot frees up.
+
+        ``merge_pending_message_event`` returns False when the pending turn
+        belongs to a different sender.  At adapter-level sites there is no FIFO
+        to append to, so the event is parked here and promoted into the slot by
+        :meth:`get_pending_message` once the current pending turn is consumed.
+        This keeps sender attribution 1:1 with content WITHOUT ever dropping a
+        message — the refusal only costs ordering within the session, not the
+        user's words.
+
+        Bounded by ``_REFUSED_PENDING_MAX`` so a stuck run plus rapid-fire
+        cross-sender traffic cannot grow this unboundedly.
+        """
+        queue = self._refused_pending_store().setdefault(session_key, [])
+        if len(queue) >= self._REFUSED_PENDING_MAX:
+            logger.warning(
+                "[%s] Dropping cross-sender follow-up for session %s — "
+                "deferred queue at cap (%d).",
+                self.name,
+                session_key,
+                self._REFUSED_PENDING_MAX,
+            )
+            return
+        queue.append(event)
+        logger.debug(
+            "[%s] Deferred cross-sender follow-up for session %s (depth=%d) — "
+            "pending turn belongs to another sender",
+            self.name,
+            session_key,
+            len(queue),
+        )
+
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        event = self._pending_messages.pop(session_key, None)
+        store = self._refused_pending_store()
+        queue = store.get(session_key)
+        if queue:
+            # A cross-sender event was refused earlier. Now that the slot is
+            # free it becomes its own turn, under its own sender's envelope.
+            if event is None:
+                event = queue.pop(0)
+            else:
+                self._pending_messages[session_key] = queue.pop(0)
+            if not queue:
+                store.pop(session_key, None)
+        return event
     
     def build_source(
         self,
