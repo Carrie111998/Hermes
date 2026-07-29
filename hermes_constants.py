@@ -412,13 +412,49 @@ def _heal_managed_node_windows() -> bool:
             if extracted is None or not extracted.is_dir():
                 return False
             target = home / "node"
-            if target.exists():
-                shutil.rmtree(target)
-            shutil.move(str(extracted), str(target))
+            target.mkdir(parents=True, exist_ok=True)
+            _install_extracted_node_tree(extracted, target)
     except OSError:
         return False
 
     return node_tool_runnable(str(target / "node.exe"))
+
+
+def _install_extracted_node_tree(extracted: Path, target: Path) -> None:
+    """Install *extracted* into *target* additively, never gutting the tree.
+
+    ``rmtree(target)`` + ``move`` leaves a half-deleted tree (e.g. a bare
+    ``node.exe`` with no npm) when any file is locked by a running process,
+    and that gutted tree then shadows system Node forever. Instead copy
+    file-by-file over the existing tree. A locked destination cannot be
+    overwritten on Windows but can be renamed, so it is renamed aside and
+    replaced; a file that cannot be updated at all is left as-is, keeping
+    the tree complete either way.
+    """
+    for source in sorted(extracted.rglob("*")):
+        dest = target / source.relative_to(extracted)
+        if source.is_dir():
+            dest.mkdir(parents=True, exist_ok=True)
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        staged = dest.with_name(dest.name + ".hermes-heal-new")
+        shutil.copy2(source, staged)
+        try:
+            os.replace(staged, dest)
+        except PermissionError:
+            aside = dest.with_name(dest.name + ".hermes-heal-old")
+            try:
+                if aside.exists():
+                    aside.unlink()
+                os.replace(dest, aside)
+                os.replace(staged, dest)
+            except OSError:
+                staged.unlink(missing_ok=True)
+    for stale in target.rglob("*.hermes-heal-old"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
 
 def heal_hermes_managed_node() -> bool:
@@ -463,18 +499,8 @@ def heal_hermes_managed_node() -> bool:
 def find_hermes_node_executable(command: str) -> str | None:
     """Return a Hermes-managed Node/npm executable path, healing broken trees."""
     names = _candidate_node_command_names(command)
-    broken_present = False
-    for directory in iter_hermes_node_dirs():
-        for name in names:
-            candidate = directory / name
-            if candidate.is_file() and (
-                sys.platform == "win32" or os.access(candidate, os.X_OK)
-            ):
-                resolved = str(candidate)
-                if node_tool_runnable(resolved):
-                    return resolved
-                broken_present = True
-    if broken_present and heal_hermes_managed_node():
+
+    def _resolve() -> str | None:
         for directory in iter_hermes_node_dirs():
             for name in names:
                 candidate = directory / name
@@ -484,6 +510,18 @@ def find_hermes_node_executable(command: str) -> str | None:
                     resolved = str(candidate)
                     if node_tool_runnable(resolved):
                         return resolved
+        return None
+
+    resolved = _resolve()
+    if resolved:
+        return resolved
+    # Heal whether the command is present-but-broken or missing entirely from
+    # the managed tree (a gutted tree with node.exe but no npm would otherwise
+    # never heal, yet still suppresses the PATH fallback in
+    # find_node_executable). heal_hermes_managed_node() itself no-ops when no
+    # managed tree exists at all.
+    if heal_hermes_managed_node():
+        return _resolve()
     return None
 
 
