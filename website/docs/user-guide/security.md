@@ -58,6 +58,40 @@ The full set of keys:
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
 :::
 
+### Cross-surface Desktop approvals (optional)
+
+Desktop and messaging runs normally own separate approval queues. To mirror
+Desktop approval prompts to a configured Telegram home channel and allow an
+authorized Telegram button press to resolve the original Desktop gate:
+
+```yaml
+approvals:
+  cross_surface:
+    enabled: true
+    target: telegram
+    process_notifications: true
+```
+
+Run `/sethome` in the intended Telegram chat before enabling this. The bridge
+uses a profile-local mode-0600 SQLite mailbox containing only redacted prompt
+text and opaque, expiring, single-use tokens. Raw commands and Desktop session
+keys are not persisted. Telegram's normal allowlist/pairing authorization is
+checked before a button response is accepted. `process_notifications` also
+mirrors generic Desktop background-process completion/watch status; command
+text, watch patterns, and process output are never included. Set it to `false`
+if only approval prompts should be forwarded.
+
+Delivery uses expiring leases and persistent deduplication. As with most
+messaging APIs, a gateway crash after Telegram accepts a message but before the
+local acknowledgement is committed can rarely produce a duplicate prompt. The
+opaque decision remains single-use, so duplicate buttons cannot approve twice.
+
+:::warning
+This grants authorized users in the configured Telegram home chat the same
+command-approval power they have at the Desktop prompt. Keep that chat and the
+bot allowlist owner-only.
+:::
+
 ### YOLO Mode
 
 YOLO mode bypasses **all** dangerous command approval prompts for the current session. It can be activated three ways:

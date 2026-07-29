@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -2154,11 +2155,12 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "request_id", "result", "reason")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
+        self.request_id = secrets.token_urlsafe(32)
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
@@ -2168,6 +2170,21 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_ALLOWED_GATEWAY_CHOICES = frozenset({"once", "session", "always", "deny"})
+
+
+def _entry_allowed_choices(entry: _ApprovalEntry) -> set[str]:
+    """Return the exact choices allowed by a pending approval prompt."""
+    explicit = entry.data.get("choices")
+    if isinstance(explicit, (list, tuple, set)):
+        return {str(choice) for choice in explicit} & _ALLOWED_GATEWAY_CHOICES
+    if entry.data.get("smart_denied"):
+        return {"once", "deny"}
+    if entry.data.get("allow_session") is False:
+        return {"once", "deny"}
+    if entry.data.get("allow_permanent") is False:
+        return {"once", "session", "deny"}
+    return set(_ALLOWED_GATEWAY_CHOICES)
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2222,13 +2239,52 @@ def resolve_gateway_approval(session_key: str, choice: str,
             targets = [queue.pop(0)]
         if not queue:
             _gateway_queues.pop(session_key, None)
+        # Publish the result and wake the waiter while still holding the same
+        # lock used by timeout cleanup. Otherwise the waiter can remove/read the
+        # entry in the gap and report a timeout after this function returned 1.
+        for entry in targets:
+            entry.result = choice
+            if reason:
+                entry.reason = reason
+            entry.event.set()
+    return len(targets)
 
-    for entry in targets:
+
+def resolve_gateway_approval_by_id(
+    session_key: str,
+    request_id: str,
+    choice: str,
+    reason: Optional[str] = None,
+) -> int:
+    """Resolve one exact pending approval, never the FIFO head by accident.
+
+    Cross-process transports must use this request-targeted resolver.  The
+    caller still needs the process-local ``session_key`` and the opaque ID must
+    belong to that session. Invalid, stale, replayed, or disallowed choices
+    fail closed and return zero.
+    """
+    if not session_key or not request_id or choice not in _ALLOWED_GATEWAY_CHOICES:
+        return 0
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return 0
+        entry = next((item for item in queue if item.request_id == request_id), None)
+        if (
+            entry is None
+            or choice not in _entry_allowed_choices(entry)
+            or float(entry.data.get("expires_at", 0)) <= time.time()
+        ):
+            return 0
+        queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+        # This transition must be atomic with _drop_entry()/timeout observation.
         entry.result = choice
         if reason:
             entry.reason = reason
         entry.event.set()
-    return len(targets)
+    return 1
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -3262,22 +3318,34 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
+    approval_data = dict(approval_data)
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
+    timeout = _get_approval_timeout()
 
     entry = _ApprovalEntry(approval_data)
+    approval_data["request_id"] = entry.request_id
+    approval_data["expires_at"] = time.time() + max(timeout, 0)
+    entry.data = approval_data
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
 
-    def _drop_entry() -> None:
+    def _drop_entry() -> Optional[str]:
+        """Atomically arbitrate response versus timeout and return the choice.
+
+        If timeout cleanup removes the entry first, a concurrent resolver can no
+        longer report success. If resolution removes it first, its result is
+        already visible under this same lock.
+        """
         with _lock:
             queue = _gateway_queues.get(session_key, [])
             if entry in queue:
                 queue.remove(entry)
             if not queue:
                 _gateway_queues.pop(session_key, None)
+            return entry.result
 
     # Notify plugins that an approval is being requested. Fires before the
     # gateway notify callback so observers get the event in real time.
@@ -3296,16 +3364,34 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         notify_cb(approval_data)
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
-        _drop_entry()
-        return {"resolved": False, "choice": None, "notify_failed": True}
+        # The notifier may have delivered/resolved the request before raising
+        # (effect-then-failure). Arbitrate under the same queue lock and honor a
+        # choice that already committed; only a genuinely unresolved send is a
+        # notify failure.
+        committed_choice = _drop_entry()
+        if committed_choice is None:
+            return {"resolved": False, "choice": None, "notify_failed": True}
+        _fire_approval_hook(
+            "post_approval_response",
+            command=command,
+            description=description,
+            pattern_key=primary_key,
+            pattern_keys=list(all_keys),
+            session_key=session_key,
+            surface=surface,
+            choice=committed_choice,
+        )
+        return {
+            "resolved": True,
+            "choice": committed_choice,
+            "reason": entry.reason,
+        }
 
     # Block until the user responds or the canonical approval timeout elapses
     # (default 300s). Poll in short slices so we can fire activity heartbeats
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
-
     try:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover
@@ -3329,9 +3415,24 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 "returning deny for session %s",
                 session_key,
             )
-            entry.result = "deny"
-            entry.event.set()
-            resolved = True
+            # Arbitrate cancellation against every local/remote resolver under
+            # the queue lock. Whichever transition removes this entry first is
+            # authoritative; interrupt must never overwrite a completed remote
+            # decision, and a later remote decision must never overwrite deny.
+            with _lock:
+                queue = _gateway_queues.get(session_key, [])
+                if entry in queue:
+                    queue.remove(entry)
+                    if not queue:
+                        _gateway_queues.pop(session_key, None)
+                    entry.result = "deny"
+                    entry.event.set()
+                    resolved = True
+                    break
+                if entry.result is not None:
+                    resolved = True
+                    break
+            # Session cleanup may have removed the entry without a decision.
             break
         _remaining = _deadline - time.monotonic()
         if _remaining <= 0:
@@ -3342,9 +3443,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         if touch_activity_if_due is not None:
             touch_activity_if_due(_activity_state, "waiting for user approval")
 
-    _drop_entry()
-
-    choice = entry.result
+    choice = _drop_entry()
+    resolved = choice is not None
     # Normalize outcome for the post hook. Unresolved (timeout) and None both
     # mean the user never responded; report that explicitly so plugins can
     # distinguish timeout from explicit deny.

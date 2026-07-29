@@ -965,6 +965,12 @@ def _close_sessions_for_transport(
 
 def _shutdown_sessions() -> None:
     try:
+        from gateway.cross_surface_bridge import stop_local_resolver
+
+        stop_local_resolver()
+    except Exception:
+        logger.debug("cross-surface resolver shutdown failed", exc_info=True)
+    try:
         _release_gateway_wake_owner()
     except Exception:
         pass
@@ -1604,11 +1610,31 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
             payload["choices"] = ["once", "session", "deny"]
         elif "allow_permanent" in payload:
             payload["choices"] = ["once", "session", "always", "deny"]
-    if "command" in payload:
+    if "command" in payload or "description" in payload:
         from gateway.run import _redact_approval_command
 
-        payload["command"] = _redact_approval_command(payload.get("command"))
+        if "command" in payload:
+            payload["command"] = _redact_approval_command(payload.get("command"))
+        if "description" in payload:
+            payload["description"] = _redact_approval_command(
+                payload.get("description")
+            )
     _emit("approval.request", sid, payload)
+
+    # Optional cross-surface bridge: mirror the already-redacted prompt to the
+    # configured messaging home channel.  The opaque token is mapped to the
+    # Desktop session key only in this process; neither the raw command nor the
+    # session key is persisted in the bridge mailbox.
+    try:
+        from gateway.cross_surface_bridge import publish_approval
+
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            session_key = str((session or {}).get("session_key") or "")
+        if _session_source(session) == "desktop":
+            publish_approval(session_key, payload)
+    except Exception:
+        logger.warning("Could not publish cross-surface Desktop approval", exc_info=True)
 
 
 def _status_update(sid: str, kind: str, text: str | None = None):
@@ -8311,6 +8337,50 @@ def _notification_event_requires_owner(evt: dict) -> bool:
     )
 
 
+def _publish_cross_surface_process_notification(
+    evt: dict, *, profile_home: str | None = None
+) -> None:
+    """Mirror only bounded status metadata; never command/output/watch text."""
+    try:
+        from gateway.cross_surface_bridge import publish_notification
+
+        evt_type = str(evt.get("type") or "completion")
+        if evt_type == "completion":
+            return_code = evt.get("returncode", evt.get("exit_code"))
+            suffix = (
+                f" (exit code {int(return_code)})"
+                if isinstance(return_code, int) and not isinstance(return_code, bool)
+                else ""
+            )
+            text = f"Desktop background process completed{suffix}."
+        elif evt_type == "watch_match":
+            text = "Desktop background process matched a notification watch."
+        elif evt_type.startswith("watch_overflow_"):
+            text = "Desktop background process watch notifications were rate-limited."
+        elif evt_type == "watch_disabled":
+            text = "Desktop background process watch notifications were disabled."
+        elif evt_type == "async_delegation":
+            text = "Desktop background task completed."
+        else:
+            text = "Desktop background process status changed."
+
+        # The mailbox dedupe key is intentionally built only from opaque/status
+        # identity fields; raw command, output, pattern, and message text stay local.
+        safe_key = (
+            str(evt.get("session_id") or evt.get("delegation_id") or ""),
+            evt_type,
+            str(evt.get("message_id") or ""),
+        )
+        home_scope = set_hermes_home_override(profile_home) if profile_home else None
+        try:
+            publish_notification(text, dedupe_key="process:" + repr(safe_key))
+        finally:
+            if home_scope is not None:
+                reset_hermes_home_override(home_scope)
+    except Exception:
+        logger.warning("Could not publish cross-surface process notification", exc_info=True)
+
+
 def _notification_event_dedup_key(evt: dict) -> tuple:
     """Return the UI-emission identity for a process notification event.
 
@@ -8614,6 +8684,10 @@ def _notification_poller_loop(
         _dedup_key = _notification_event_dedup_key(evt)
         if _dedup_key not in _emitted:
             _emit("status.update", sid, {"kind": "process", "text": text})
+            if _session_source(session) == "desktop":
+                _publish_cross_surface_process_notification(
+                    evt, profile_home=session.get("profile_home")
+                )
             _emitted.add(_dedup_key)
 
         _requeued = False
@@ -8700,6 +8774,10 @@ def _notification_poller_loop(
         _dedup_key = _notification_event_dedup_key(evt)
         if _dedup_key not in _emitted:
             _emit("status.update", sid, {"kind": "process", "text": text})
+            if _session_source(session) == "desktop":
+                _publish_cross_surface_process_notification(
+                    evt, profile_home=session.get("profile_home")
+                )
             _emitted.add(_dedup_key)
 
         with session["history_lock"]:

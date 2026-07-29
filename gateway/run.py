@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import site
 import sys
@@ -8929,6 +8930,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.error("Recovered watcher setup error: %s", e)
 
+        # Start the profile-local Desktop → messaging bridge after adapters and
+        # their home channels are ready. It is inert unless explicitly enabled.
+        self._spawn_supervised(
+            self._cross_surface_bridge_watcher,
+            "cross_surface_bridge_watcher",
+        )
+
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
@@ -9016,6 +9024,124 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.info("Press Ctrl+C to stop")
         
         return True
+
+    async def _cross_surface_bridge_watcher(self) -> None:
+        """Deliver Desktop approvals/notifications to a configured home channel."""
+        from gateway.cross_surface_bridge import (
+            claim_events,
+            cleanup_old_events,
+            enabled as bridge_enabled,
+            mark_delivered,
+            release_claim,
+            target_platform,
+        )
+
+        owner = f"gateway:{os.getpid()}:{secrets.token_hex(8)}"
+        last_cleanup = 0.0
+        while self._running:
+            if not bridge_enabled():
+                await asyncio.sleep(2.0)
+                continue
+            target_name = target_platform()
+            if target_name != "telegram":
+                logger.error(
+                    "Cross-surface approvals currently support only Telegram; got %s",
+                    target_name,
+                )
+                await asyncio.sleep(5.0)
+                continue
+            try:
+                platform = Platform(target_name)
+            except ValueError:
+                logger.error("Cross-surface bridge target is unsupported: %s", target_name)
+                await asyncio.sleep(5.0)
+                continue
+            adapter = self.adapters.get(platform)
+            home = self.config.get_home_channel(platform)
+            if adapter is None or home is None or not home.chat_id:
+                await asyncio.sleep(2.0)
+                continue
+
+            events = claim_events(target_name, owner, limit=20, lease_seconds=120.0)
+            if not events:
+                await asyncio.sleep(0.5)
+            for event in events:
+                token = str(event.get("token") or "")
+                payload = event.get("payload") or {}
+                try:
+                    if event.get("kind") == "approval":
+                        send_exec_approval = getattr(adapter, "send_exec_approval", None)
+                        if send_exec_approval is None:
+                            raise RuntimeError(
+                                f"{target_name} adapter does not support interactive approvals"
+                            )
+                        result = await send_exec_approval(
+                            chat_id=home.chat_id,
+                            command=str(payload.get("command") or ""),
+                            session_key=f"xsurf:{token}",
+                            description=str(payload.get("description") or "dangerous command"),
+                            metadata=(
+                                {"thread_id": str(home.thread_id)}
+                                if home.thread_id is not None
+                                else None
+                            ),
+                            allow_permanent=payload.get("allow_permanent", True),
+                            allow_session=payload.get("allow_session", True),
+                            smart_denied=payload.get("smart_denied", False),
+                        )
+                    else:
+                        result = await adapter.send(
+                            home.chat_id,
+                            "🖥 Desktop notification\n\n" + str(payload.get("text") or ""),
+                            metadata=(
+                                {"thread_id": str(home.thread_id)}
+                                if home.thread_id is not None
+                                else None
+                            ),
+                        )
+                    if getattr(result, "success", False):
+                        recorded = mark_delivered(
+                            token,
+                            owner,
+                            getattr(result, "message_id", None),
+                            chat_id=str(home.chat_id),
+                            thread_id=(
+                                str(home.thread_id) if home.thread_id is not None else None
+                            ),
+                            user_id=(
+                                str(home.user_id) if home.user_id is not None else None
+                            ),
+                        )
+                        if recorded:
+                            logger.info(
+                                "Cross-surface %s delivered to %s:%s token=%s…",
+                                event.get("kind"), target_name, home.chat_id, token[:8],
+                            )
+                        else:
+                            logger.error(
+                                "Cross-surface delivery succeeded but lease acknowledgement "
+                                "was lost for token=%s…; duplicate delivery is possible",
+                                token[:8],
+                            )
+                    else:
+                        release_claim(token, owner)
+                        logger.warning(
+                            "Cross-surface %s delivery failed: %s",
+                            event.get("kind"), getattr(result, "error", "unknown error"),
+                        )
+                except asyncio.CancelledError:
+                    release_claim(token, owner)
+                    raise
+                except Exception:
+                    release_claim(token, owner)
+                    logger.warning("Cross-surface bridge delivery failed", exc_info=True)
+
+            now = time.time()
+            if now - last_cleanup > 3600:
+                cleanup_old_events()
+                last_cleanup = now
+
+        return None
 
     _MAX_SUPERVISED_RESTARTS = 5
     # A task that ran at least this long before crashing is treated as having
