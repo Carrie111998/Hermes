@@ -172,6 +172,47 @@ def test_inprocess_provider_ticks_and_stops():
     assert calls[0].get("sync") is False
 
 
+def test_inprocess_provider_waits_for_next_wall_clock_boundary(tmp_path, monkeypatch):
+    """Tick work must not accumulate into the next minute.
+
+    A cycle ending 0.25s before the next 60s boundary waits 0.25s, not another
+    full 60s.  The same timing contract applies to single-profile and
+    multiplex schedulers.
+    """
+    import cron.scheduler_provider as sp
+
+    class RecordingStop:
+        def __init__(self):
+            self.waits = []
+
+        def is_set(self):
+            return bool(self.waits)
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            return True
+
+    class FakeTime:
+        @staticmethod
+        def time():
+            return 119.75
+
+    profile_home = tmp_path / "profile"
+    (profile_home / "cron").mkdir(parents=True)
+    monkeypatch.setattr(sp, "time", FakeTime, raising=False)
+
+    for profile_homes in (None, [("default", profile_home)]):
+        stop = RecordingStop()
+        provider = sp.InProcessCronScheduler()
+        with patch.object(provider, "recover_interrupted", return_value=0), \
+             patch("cron.scheduler.tick", return_value=0), \
+             patch("cron.jobs.record_ticker_heartbeat"), \
+             patch("cron.jobs.clear_ticker_error"):
+            provider.start(stop, interval=60, profile_homes=profile_homes)
+
+        assert stop.waits == [0.25]
+
+
 def test_inprocess_provider_skips_dispatch_while_draining():
     """A drain pause keeps due work pending until dispatch is re-enabled."""
     from cron.scheduler_provider import InProcessCronScheduler
