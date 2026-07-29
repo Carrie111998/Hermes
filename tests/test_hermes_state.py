@@ -512,6 +512,31 @@ class TestSessionLifecycle:
         assert session["billing_provider"] == "openai-codex"
         assert session["api_call_count"] == 2
 
+
+    def test_recent_cross_session_messages_excludes_active_and_bounds_content(self, db):
+        now = time.time()
+        db.create_session(session_id="active", source="cli")
+        db.append_message("active", "user", "do not include", timestamp=now)
+        db.create_session(session_id="telegram-session", source="telegram", chat_id="group-1", chat_type="group")
+        db.append_message("telegram-session", "user", "research product alpha", timestamp=now - 20)
+        db.append_message("telegram-session", "assistant", "Alpha result " + ("x" * 200), timestamp=now - 10)
+        db.create_session(session_id="old", source="discord")
+        db.append_message("old", "user", "too old", timestamp=now - 100000)
+
+        rows = db.get_recent_cross_session_messages(
+            current_session_id="active",
+            lookback_seconds=3600,
+            max_sessions=5,
+            max_messages_per_session=2,
+            max_chars_per_message=40,
+        )
+
+        assert [row["session"]["id"] for row in rows] == ["telegram-session"]
+        assert [msg["role"] for msg in rows[0]["messages"]] == ["user", "assistant"]
+        assert rows[0]["messages"][0]["content"] == "research product alpha"
+        assert rows[0]["messages"][1]["content"].endswith("...")
+        assert len(rows[0]["messages"][1]["content"]) <= 80
+
     def test_update_token_counts_preserves_existing_model(self, db):
         db.create_session(session_id="s1", source="cli", model="anthropic/claude-opus-4.6")
         db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")
@@ -3504,8 +3529,8 @@ class TestBulkDeleteSessions:
         bulk-delete CLI / web flows don't leak files."""
         db.create_session(session_id="s1", source="cli")
         db.create_session(session_id="s2", source="cli")
-        (tmp_path / "s1.jsonl").write_text("")
-        (tmp_path / "s2.json").write_text("{}")
+        (tmp_path / "s1.jsonl").write_text("", encoding="utf-8")
+        (tmp_path / "s2.json").write_text("{}", encoding="utf-8")
 
         deleted = db.delete_sessions(["s1", "s2"], sessions_dir=tmp_path)
         assert deleted == 2
@@ -3619,9 +3644,9 @@ class TestDeleteEmptySessions:
         db.end_session("empty_with_dump", end_reason="done")
 
         dump = tmp_path / "request_dump_empty_with_dump_0.json"
-        dump.write_text("{}")
+        dump.write_text("{}", encoding="utf-8")
         transcript = tmp_path / "empty_with_dump.jsonl"
-        transcript.write_text("")
+        transcript.write_text("", encoding="utf-8")
 
         deleted = db.delete_empty_sessions(sessions_dir=tmp_path)
         assert deleted == 1
@@ -5783,10 +5808,10 @@ class TestAutoMaintenance:
         db.create_session(session_id="new", source="cli")  # active
 
         # Transcript files mimicking real gateway/CLI layout
-        (sessions_dir / "old1.json").write_text("{}")
-        (sessions_dir / "old1.jsonl").write_text("{}\n")
-        (sessions_dir / "old2.jsonl").write_text("{}\n")
-        (sessions_dir / "request_dump_old1_001.json").write_text("{}")
+        (sessions_dir / "old1.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / "old1.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "old2.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "request_dump_old1_001.json").write_text("{}", encoding="utf-8")
         (sessions_dir / "new.jsonl").write_text("{}\n")  # active, must survive
 
         result = db.maybe_auto_prune_and_vacuum(
@@ -5820,7 +5845,7 @@ class TestAutoMaintenance:
         )
         db.end_session("long-lived", end_reason="agent_close")
         transcript = sessions_dir / "long-lived.jsonl"
-        transcript.write_text('{"role":"user","content":"recent"}\n')
+        transcript.write_text('{"role":"user","content":"recent"}\n', encoding="utf-8")
 
         result = db.maybe_auto_prune_and_vacuum(
             retention_days=90,
@@ -5840,7 +5865,7 @@ class TestAutoMaintenance:
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
         self._make_old_ended(db, "old", days_old=100)
-        (sessions_dir / "old.jsonl").write_text("{}\n")
+        (sessions_dir / "old.jsonl").write_text("{}\n", encoding="utf-8")
 
         result = db.maybe_auto_prune_and_vacuum(retention_days=90)
         assert result["pruned"] == 1
@@ -5853,8 +5878,8 @@ class TestAutoMaintenance:
         sessions_dir.mkdir()
         self._make_old_ended(db, "old", days_old=100)
         db.create_session(session_id="active", source="cli")  # not ended
-        (sessions_dir / "old.jsonl").write_text("{}\n")
-        (sessions_dir / "active.jsonl").write_text("{}\n")
+        (sessions_dir / "old.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "active.jsonl").write_text("{}\n", encoding="utf-8")
 
         count = db.prune_sessions(older_than_days=90, sessions_dir=sessions_dir)
         assert count == 1
@@ -8013,9 +8038,6 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
-
-
-
 class TestGatewayRoutingPkHeal:
     """Legacy gateway_routing tables (session_key-only PK) get rebuilt on open.
 
