@@ -152,6 +152,93 @@ export async function scanVenvBlockers(
 }
 
 // ---------------------------------------------------------------------------
+// Orphan reaper
+// ---------------------------------------------------------------------------
+
+/**
+ * Dependency-injected kill function (mirrors main.ts' forceKillProcessTree).
+ * Receives a positive PID; must be synchronous and best-effort (never throw).
+ */
+export type KillProcessTreeFn = (pid: number) => void
+
+export interface ReapVenvOrphansDeps {
+  scan: (updateRoot: string) => Promise<ScanOutcome>
+  kill: KillProcessTreeFn
+  now?: () => number
+  sleep?: (ms: number) => Promise<void>
+}
+
+export interface ReapVenvOrphansOptions {
+  /** Total deadline for the reap loop, in ms. */
+  deadlineMs?: number
+  /** Pause between a kill pass and the re-scan, in ms. */
+  pollMs?: number
+}
+
+export interface ReapVenvOrphansResult {
+  /** Number of orphan PIDs signalled across all passes. */
+  reaped: number
+  /** Outcome of the final scan pass (clear / blocked / probe-failure). */
+  final: ScanOutcome
+}
+
+/**
+ * Reap orphaned venv processes left behind after the desktop's own backend
+ * tree was torn down.
+ *
+ * `releaseBackendLock` tree-kills every backend PID it tracks and waits for
+ * the `hermes.exe` shim to become writable.  But the backend's grandchildren
+ * — a detached gateway `python.exe`, pty `bash.exe` sessions — can escape
+ * `taskkill /T` once they re-parent off the dying backend PID.  They do not
+ * hold `hermes.exe`, so the shim lock probe reports "unlocked" even though
+ * they still map venv `.pyd` files.  Left unchecked they abort the preflight
+ * venv-blocker scan on every update attempt, or worse, brick the dependency
+ * sync mid-update with access-denied on a locked `.pyd`.
+ *
+ * This function runs a bounded scan-and-kill loop: each pass scans the venv
+ * for live processes, tree-kills everything it finds, and re-scans until the
+ * venv is clear or the deadline expires.  It is the caller's responsibility
+ * (the preflight scan in `applyUpdates`) to make the final abort/proceed
+ * decision; this reaper only reduces orphan noise so legitimate updates are
+ * not perpetually blocked by the desktop's own dead children.  A probe-failure
+ * (broken scan module / missing psutil) short-circuits to a clear result so
+ * the strict preflight — not this best-effort reaper — is the authority.
+ */
+export async function reapVenvOrphans(
+  updateRoot: string,
+  deps: ReapVenvOrphansDeps,
+  options: ReapVenvOrphansOptions = {}
+): Promise<ReapVenvOrphansResult> {
+  const now = deps.now || Date.now
+  const sleep = deps.sleep || (ms => new Promise<void>(r => setTimeout(r, ms)))
+  const deadlineMs = options.deadlineMs ?? 8000
+  const pollMs = options.pollMs ?? 400
+
+  let reaped = 0
+  let outcome: ScanOutcome = { kind: 'clear', result: { blocked: false, processes: [] } }
+
+  const deadline = now() + deadlineMs
+
+  while (now() < deadline) {
+    outcome = await deps.scan(updateRoot)
+
+    if (outcome.kind !== 'blocked') {
+      break
+    }
+
+    for (const proc of outcome.result.processes) {
+      deps.kill(proc.pid)
+    }
+
+    reaped += outcome.result.processes.length
+
+    await sleep(pollMs)
+  }
+
+  return { reaped, final: outcome }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers (exported for testing)
 // ---------------------------------------------------------------------------
 

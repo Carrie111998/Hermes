@@ -199,7 +199,7 @@ import {
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
-import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
+import { formatBlockerMessage, formatProbeFailedMessage, reapVenvOrphans, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import {
   computeWindowOptions,
@@ -2767,11 +2767,12 @@ async function releaseBackendLock(updateRoot, tag) {
   const shim = venvHermesShimPath(updateRoot)
   const deadlineMs = Date.now() + 15000
 
+  let shimUnlocked = false
+
   while (Date.now() < deadlineMs) {
     if (!isShimLocked(shim)) {
-      rememberLog(`[${tag}] venv shim unlocked; safe to proceed`)
-
-      return { unlocked: true }
+      shimUnlocked = true
+      break
     }
 
     // A supervised backend can respawn between kill and check (grandchildren,
@@ -2798,18 +2799,43 @@ async function releaseBackendLock(updateRoot, tag) {
     await new Promise(r => setTimeout(r, 300))
   }
 
-  // Do NOT proceed past a held lock: handing off to the updater while another
-  // process (a second desktop window, a user terminal, an unkillable child)
-  // still maps the venv's files guarantees a half-updated venv — the updater's
-  // dependency sync dies on access-denied partway through uninstalls, leaving
-  // imports broken (the July 2026 brotlicffi/_sodium.pyd incidents). Failing
-  // the update loudly and keeping the app running is strictly better than a
-  // bricked install that needs manual venv surgery.
-  rememberLog(
-    `[${tag}] venv shim still locked after 15s; aborting hand-off (something outside this app holds the venv)`
-  )
+  if (!shimUnlocked) {
+    // Do NOT proceed past a held lock: handing off to the updater while another
+    // process (a second desktop window, a user terminal, an unkillable child)
+    // still maps the venv's files guarantees a half-updated venv - the updater's
+    // dependency sync dies on access-denied partway through uninstalls, leaving
+    // imports broken (the July 2026 brotlicffi/_sodium.pyd incidents). Failing
+    // the update loudly and keeping the app running is strictly better than a
+    // bricked install that needs manual venv surgery.
+    rememberLog(
+      `[${tag}] venv shim still locked after 15s; aborting hand-off (something outside this app holds the venv)`
+    )
 
-  return { unlocked: false }
+    return { unlocked: false }
+  }
+
+  // Shim is writable, so the desktop's direct backend tree is gone. But its
+  // orphaned grandchildren - a detached gateway `python.exe`, pty `bash.exe`
+  // sessions - can escape `taskkill /T` once they re-parent off the dying
+  // backend PID. They do not hold `hermes.exe`, so the shim probe is clean,
+  // yet they still map venv `.pyd` files. Left unchecked they abort the
+  // preflight venv-blocker scan on every update attempt (the "must be
+  // stopped before updating" loop) or brick the dependency sync mid-update.
+  // Reap them with a bounded scan-and-kill pass; the strict preflight scan
+  // in applyUpdates() remains the final authority, so a genuinely external
+  // holder (a second window / user terminal) still aborts safely.
+  const orphanReap = await reapVenvOrphans(updateRoot, {
+    scan: (root) => scanVenvBlockers(root),
+    kill: forceKillProcessTree
+  })
+
+  if (orphanReap.reaped > 0) {
+    rememberLog(`[${tag}] reaped ${orphanReap.reaped} orphan venv process(es) after shim unlock`)
+  }
+
+  rememberLog(`[${tag}] venv shim unlocked; safe to proceed`)
+
+  return { unlocked: true }
 }
 
 // applyUpdates — hand off to the installer's --update flow, then exit.

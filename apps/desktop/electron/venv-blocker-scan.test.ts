@@ -18,9 +18,11 @@ import {
   formatBlockerMessage,
   formatProbeFailedMessage,
   parseVenvBlockerScanOutput,
+  reapVenvOrphans,
   resolveVenvPython,
   scanVenvBlockers
 } from './venv-blocker-scan'
+import type { ScanOutcome } from './venv-blocker-scan'
 
 // ---------------------------------------------------------------------------
 // resolveVenvPython
@@ -214,5 +216,88 @@ describe('scanVenvBlockers', () => {
     assert.equal(c.cwd, '/update/root')
     assert.equal(typeof c.timeout, 'number')
     assert.ok(c.timeout > 0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// reapVenvOrphans — orphan reaper with injection
+// ---------------------------------------------------------------------------
+
+describe('reapVenvOrphans', () => {
+  const clear: ScanOutcome = { kind: 'clear', result: { blocked: false, processes: [] } }
+  const blocked1: ScanOutcome = {
+    kind: 'blocked',
+    result: { blocked: true, processes: [{ pid: 100, name: 'python.exe', cmdline: 'gateway' }] }
+  }
+  const blocked2: ScanOutcome = {
+    kind: 'blocked',
+    result: { blocked: true, processes: [{ pid: 200, name: 'bash.exe', cmdline: 'pty' }] }
+  }
+
+  function makeScan(seq: ScanOutcome[]) {
+    let i = 0
+    return () => {
+      const v = seq[Math.min(i, seq.length - 1)]
+      i++
+      return Promise.resolve(v)
+    }
+  }
+
+  function makeKill() {
+    const killed: number[] = []
+    const fn = (pid: number) => { killed.push(pid) }
+    return { fn, killed }
+  }
+
+  function makeClock(start: number) {
+    let t = start
+    return {
+      now: () => t,
+      advance: (ms: number) => { t += ms }
+    }
+  }
+
+  it('returns reaped=0 and clear when the first scan is clear', async () => {
+    const scan = makeScan([clear])
+    const kill = makeKill()
+    const res = await reapVenvOrphans('/r', { scan: scan as any, kill: kill.fn })
+    assert.equal(res.reaped, 0)
+    assert.equal(res.final.kind, 'clear')
+    assert.deepEqual(kill.killed, [])
+  })
+
+  it('kills blocked PIDs and re-scans until clear', async () => {
+    const scan = makeScan([blocked1, blocked2, clear])
+    const kill = makeKill()
+    const res = await reapVenvOrphans('/r', { scan: scan as any, kill: kill.fn })
+    assert.equal(res.reaped, 2)
+    assert.equal(res.final.kind, 'clear')
+    assert.deepEqual(kill.killed, [100, 200])
+  })
+
+  it('stops reaping when the deadline expires', async () => {
+    const scan = makeScan([blocked1, blocked1, blocked1, blocked1])
+    const kill = makeKill()
+    const clock = makeClock(0)
+    // deadlineMs=2500, pollMs=1000 => at most ~2 passes fit before deadline
+    const res = await reapVenvOrphans('/r', {
+      scan: scan as any,
+      kill: kill.fn,
+      now: clock.now,
+      sleep: async () => { clock.advance(1000) }
+    }, { deadlineMs: 2500, pollMs: 1000 })
+    assert.ok(res.reaped >= 2)
+    assert.equal(res.final.kind, 'blocked')
+    assert.ok(kill.killed.length >= 2)
+  })
+
+  it('treats a probe-failure as terminal (stops, does not kill)', async () => {
+    const probeFail: ScanOutcome = { kind: 'probe-failure', error: 'boom' }
+    const scan = makeScan([probeFail])
+    const kill = makeKill()
+    const res = await reapVenvOrphans('/r', { scan: scan as any, kill: kill.fn })
+    assert.equal(res.reaped, 0)
+    assert.equal(res.final.kind, 'probe-failure')
+    assert.deepEqual(kill.killed, [])
   })
 })
