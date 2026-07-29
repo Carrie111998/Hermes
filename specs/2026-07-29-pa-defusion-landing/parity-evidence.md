@@ -62,6 +62,8 @@ verified the 578-file runtime set.
 
 ## Cross-provider review
 
-Pending at this evidence checkpoint. The review artifact will be recorded at
-`evidence/cross-provider-review.md`; this held stack does not satisfy terminal
-review clearance until that file says `CLEAR`.
+PASS. Claude/Opus returned `CLEAR` after reviewing the final patch, parity
+artifacts, manifest proof, broad-suite baseline comparison, and the explicit
+D1-23 supersession. The first review's two blocking evidence gaps and their
+resolution remain at `evidence/cross-provider-review-attempt1.md`; the clearing
+verdict is `evidence/cross-provider-review.md`.
