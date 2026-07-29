@@ -290,6 +290,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("GMI_API_KEY",),
         base_url_env_var="GMI_BASE_URL",
     ),
+    "hetzner": ProviderConfig(
+        id="hetzner",
+        name="Hetzner Inference",
+        auth_type="api_key",
+        inference_base_url="https://inference.hetzner.com/api/v1",
+        api_key_env_vars=("HETZNER_API_KEY",),
+        base_url_env_var="HETZNER_BASE_URL",
+    ),
     "minimax": ProviderConfig(
         id="minimax",
         name="MiniMax",
