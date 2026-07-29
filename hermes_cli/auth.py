@@ -1530,6 +1530,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    skip_merge: bool = False,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1548,6 +1549,13 @@ def write_credential_pool(
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
+
+    Pass ``skip_merge=True`` to write the caller's entries verbatim without
+    merging on-disk cooldown state back in.  This is used by
+    ``CredentialPool.reset_statuses`` which intentionally clears exhaustion
+    flags; the default merge would resurrect the just-cleared state because
+    the on-disk ``last_status_at`` timestamp is more recent than the reset
+    entry's (None → 0) (issue #73748).
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
@@ -1577,7 +1585,7 @@ def write_credential_pool(
             _merge_disk_cooldown_state(
                 entry, existing_by_id.get(entry.get("id")), provider_id
             )
-            if isinstance(entry, dict)
+            if isinstance(entry, dict) and not skip_merge
             else entry
             for entry in sanitized_entries
         ]
