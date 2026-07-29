@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -3258,6 +3259,60 @@ class TestSendViaAdapterStandaloneFallback:
         assert recorded["chat_id"] == "alerts-channel"
         assert recorded["content"] == "done"
         assert recorded["metadata"] == {"publish_topic": "alerts-channel"}
+
+    @pytest.mark.asyncio
+    async def test_live_adapter_send_runs_on_gateway_owner_loop(self, monkeypatch):
+        """A cron/tool worker must not drive a loop-bound adapter on its loop."""
+        from tools.send_message_tool import _send_via_adapter
+
+        platform = Platform.DISCORD
+        gateway_loop = asyncio.new_event_loop()
+        gateway_thread = threading.Thread(
+            target=gateway_loop.run_forever,
+            name="test-gateway-loop",
+        )
+        gateway_thread.start()
+        observed = {}
+
+        class Adapter:
+            async def send(self, *, chat_id, content, metadata=None):
+                observed["loop"] = asyncio.get_running_loop()
+                if observed["loop"] is not gateway_loop:
+                    raise RuntimeError(
+                        "Timeout context manager should be used inside a task"
+                    )
+                observed["chat_id"] = chat_id
+                observed["content"] = content
+                observed["metadata"] = metadata
+                return SimpleNamespace(success=True, message_id="discord-id")
+
+        runner = SimpleNamespace(
+            adapters={platform: Adapter()},
+            _gateway_loop=gateway_loop,
+        )
+        fake_gateway_run = ModuleType("gateway.run")
+        fake_gateway_run._gateway_runner_ref = lambda: runner
+        monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+
+        try:
+            caller_loop = asyncio.get_running_loop()
+            result = await _send_via_adapter(
+                platform,
+                SimpleNamespace(extra={}),
+                "1504852355588423801",
+                "cron delivery",
+            )
+        finally:
+            gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+            gateway_thread.join(timeout=5)
+            gateway_loop.close()
+
+        assert result == {"success": True, "message_id": "discord-id"}
+        assert observed["loop"] is gateway_loop
+        assert observed["loop"] is not caller_loop
+        assert observed["chat_id"] == "1504852355588423801"
+        assert observed["content"] == "cron delivery"
+        assert observed["metadata"] is None
 
     @pytest.mark.asyncio
     async def test_standalone_sender_fn_called_when_no_adapter(self, monkeypatch):

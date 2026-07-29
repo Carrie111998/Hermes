@@ -759,39 +759,81 @@ async def _send_via_adapter(
         except Exception:
             adapter = None
         if adapter is not None:
-            try:
+            async def _send_with_live_adapter():
                 if (
                     platform_name == "discord"
                     and media_files
                     and callable(getattr(adapter, "send_media_files", None))
                 ):
-                    result = await adapter.send_media_files(
+                    return await adapter.send_media_files(
                         chat_id,
                         chunk,
                         media_files,
                         thread_id=thread_id,
                         caption=caption,
                     )
+
+                metadata = {}
+                if thread_id:
+                    metadata["thread_id"] = thread_id
+                if platform_name == "ntfy" and chat_id:
+                    metadata["publish_topic"] = chat_id
+                if not metadata:
+                    metadata = None
+                return await adapter.send(
+                    chat_id=chat_id,
+                    content=chunk,
+                    metadata=metadata,
+                )
+
+            try:
+                current_loop = asyncio.get_running_loop()
+                gateway_loop = getattr(runner, "_gateway_loop", None)
+                if (
+                    gateway_loop is not None
+                    and gateway_loop is not current_loop
+                ):
+                    # Gateway adapters own loop-bound clients (discord.py's
+                    # aiohttp session, Matrix E2EE state, etc.). Tool and cron
+                    # workers intentionally run their own event loops, so
+                    # awaiting the live adapter directly from one of those
+                    # loops raises errors such as aiohttp's "Timeout context
+                    # manager should be used inside a task". Schedule the send
+                    # on the adapter-owning gateway loop instead.
+                    if not gateway_loop.is_running():
+                        adapter = None
+                    else:
+                        from agent.async_utils import safe_schedule_threadsafe
+
+                        future = safe_schedule_threadsafe(
+                            _send_with_live_adapter(),
+                            gateway_loop,
+                            logger=logger,
+                            log_message=(
+                                f"Failed to schedule live {platform_name} send "
+                                "on the gateway loop"
+                            ),
+                        )
+                        if future is None:
+                            adapter = None
+                        else:
+                            result = await asyncio.wrap_future(future)
                 else:
-                    metadata = {}
-                    if thread_id:
-                        metadata["thread_id"] = thread_id
-                    if platform_name == "ntfy" and chat_id:
-                        metadata["publish_topic"] = chat_id
-                    if not metadata:
-                        metadata = None
-                    result = await adapter.send(
-                        chat_id=chat_id,
-                        content=chunk,
-                        metadata=metadata,
-                    )
+                    result = await _send_with_live_adapter()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
-            if result.success:
-                return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {result.error}"}
+
+            if adapter is not None:
+                if result.success:
+                    return {"success": True, "message_id": result.message_id}
+                return {"error": f"Adapter send failed: {result.error}"}
+
+            # A registered adapter whose owner loop has stopped (or refused
+            # scheduling during shutdown) is not live. Fall through to the
+            # plugin's standalone sender; safe_schedule_threadsafe closes the
+            # unaccepted coroutine, so this cannot duplicate a dispatched send.
 
     entry = None
     try:

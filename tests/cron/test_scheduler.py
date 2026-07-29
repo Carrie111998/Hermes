@@ -711,6 +711,82 @@ class TestDeliverResultWrapping:
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
 
+    def test_worker_fallback_dispatches_live_adapter_on_gateway_loop(self):
+        """External/no-loop cron dispatch must preserve the adapter's loop."""
+        import asyncio
+        import threading
+        from types import SimpleNamespace
+
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        gateway_loop = asyncio.new_event_loop()
+        gateway_thread = threading.Thread(
+            target=gateway_loop.run_forever,
+            name="test-cron-gateway-loop",
+        )
+        gateway_thread.start()
+        observed = {}
+
+        class Adapter:
+            async def send(self, *, chat_id, content, metadata=None):
+                observed["loop"] = asyncio.get_running_loop()
+                if observed["loop"] is not gateway_loop:
+                    raise RuntimeError(
+                        "Timeout context manager should be used inside a task"
+                    )
+                observed["chat_id"] = chat_id
+                observed["content"] = content
+                observed["metadata"] = metadata
+                return SimpleNamespace(
+                    success=True,
+                    message_id="discord-cron-id",
+                    error=None,
+                )
+
+        runner = SimpleNamespace(
+            adapters={Platform.DISCORD: Adapter()},
+            _gateway_loop=gateway_loop,
+        )
+        config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(enabled=True, token="test-token")
+            }
+        )
+        observation = {}
+        job = {
+            "id": "discord-loop-regression",
+            "name": "Daily report",
+            "deliver": "discord:1504852355588423801",
+        }
+
+        try:
+            with (
+                patch("gateway.config.load_gateway_config", return_value=config),
+                patch(
+                    "cron.scheduler.load_config",
+                    return_value={"cron": {"wrap_response": False}},
+                ),
+                patch("gateway.run._gateway_runner_ref", return_value=runner),
+            ):
+                result = _deliver_result(
+                    job,
+                    "cron delivery",
+                    adapters=None,
+                    loop=None,
+                    delivery_observation=observation,
+                )
+        finally:
+            gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+            gateway_thread.join(timeout=5)
+            gateway_loop.close()
+
+        assert result is None
+        assert observation["confirmed"] is True
+        assert observed["loop"] is gateway_loop
+        assert observed["chat_id"] == "1504852355588423801"
+        assert observed["content"] == "cron delivery"
+        assert observed["metadata"] is None
+
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
         from gateway.config import Platform
