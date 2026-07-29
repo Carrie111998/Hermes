@@ -186,3 +186,109 @@ def test_deploy_staging_dependency_package_is_final_address_bound():
         timeout=10,
     )
     assert syntax.returncode == 0, syntax.stderr
+
+
+def test_deploy_reinstalls_and_attests_entrypoints_at_final_address():
+    helper = RUNTIME / "muncho-auto-deploy-release"
+    source = helper.read_text(encoding="utf-8")
+    run_deploy = source[source.index("run_deploy() {") : source.index("main() {")]
+
+    publish = run_deploy.index('mv "$tmp" "$new"')
+    identity = run_deploy.index('release_identity_matches "$new" "$sha"')
+    final_install = run_deploy.index(
+        'install_target_release_wheel "$new" "$new"',
+        identity,
+    )
+    entrypoint_attest = run_deploy.index(
+        'attest_target_release_entrypoints "$new"',
+        final_install,
+    )
+    venv_attest = run_deploy.index(
+        'attest_target_release_venv "$new" "$new"',
+        entrypoint_attest,
+    )
+    cutover_attest = run_deploy.index(
+        'cutover_artifacts_match "$new" "$sha"',
+        venv_attest,
+    )
+    activate = run_deploy.index('ln -sfn "$new" "$ACTIVE_LINK.next"')
+
+    assert (
+        publish
+        < identity
+        < final_install
+        < entrypoint_attest
+        < venv_attest
+        < cutover_attest
+        < activate
+    )
+    assert '"$new" != "$active"' in run_deploy
+    assert '\\"stage\\": \\"final_address_wheel_install\\"' in run_deploy
+    assert "blocked_target_release_entrypoints_invalid" in run_deploy
+
+
+def _run_entrypoint_attestation(helper: Path, release: Path) -> subprocess.CompletedProcess:
+    owner = subprocess.run(
+        ["id", "-un"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    script = r'''
+set -euo pipefail
+source "$1"
+OWNER="$2"
+release="$3"
+sudo() {
+  if [ "$1" = "-n" ] && [ "$2" = "-u" ]; then
+    shift 3
+  fi
+  command "$@"
+}
+attest_target_release_entrypoints "$release"
+'''
+    return subprocess.run(
+        ["bash", "-c", script, "entrypoint-attest", str(helper), owner, str(release)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def test_release_entrypoint_attestation_rejects_staging_shebang_after_rename(
+    tmp_path,
+):
+    helper = RUNTIME / "muncho-auto-deploy-release"
+    staging = tmp_path / ".hermes-agent-deadbeef0000.tmp.123"
+    release = tmp_path / "hermes-agent-deadbeef0000"
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(staging / ".venv")],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    bin_dir = staging / ".venv" / "bin"
+    stale_shebang = f"#!{bin_dir / 'python'}\n"
+    for name in ("hermes", "hermes-acp", "hermes-agent", "muncho-ops"):
+        path = bin_dir / name
+        path.write_text(stale_shebang + "raise SystemExit(0)\n", encoding="utf-8")
+        path.chmod(0o755)
+    staging.rename(release)
+
+    rejected = _run_entrypoint_attestation(helper, release)
+
+    assert rejected.returncode != 0
+    assert "BLOCKED_RELEASE_ENTRYPOINT_INVALID:hermes" in rejected.stderr
+
+    final_shebang = f"#!{release / '.venv/bin/python'}\n"
+    for name in ("hermes", "hermes-acp", "hermes-agent", "muncho-ops"):
+        path = release / ".venv" / "bin" / name
+        path.write_text(final_shebang + "raise SystemExit(0)\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    accepted = _run_entrypoint_attestation(helper, release)
+
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stdout.strip() == "target_release_entrypoints=ok"
