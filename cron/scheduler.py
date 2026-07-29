@@ -3001,6 +3001,26 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+    # Inject a timestamp prefix into the cron prompt when timestamps are
+    # enabled.  Per-job ``timestamps`` field overrides the global
+    # ``gateway.message_timestamps.enabled`` (first decisive value wins,
+    # mirroring the ``attach_to_session`` / ``cron.mirror_delivery`` pattern).
+    # ``render_user_content_with_timestamp`` strips any pre-existing timestamp
+    # first, so there is no double-prefix even if the prompt already carries one.
+    try:
+        from gateway.message_timestamps import (
+            message_timestamps_enabled as _cron_ts_enabled,
+            render_user_content_with_timestamp as _cron_render_ts,
+        )
+        per_job_timestamps = job.get("timestamps")
+        if isinstance(per_job_timestamps, bool):
+            _should_inject = per_job_timestamps
+        else:
+            _should_inject = _cron_ts_enabled()
+        if _should_inject:
+            prompt = _cron_render_ts(prompt, ts_value=time.time())
+    except Exception:
+        logger.debug("Job '%s': timestamp injection skipped", job_name, exc_info=True)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)

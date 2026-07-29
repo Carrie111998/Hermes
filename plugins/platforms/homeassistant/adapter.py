@@ -300,6 +300,20 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         if not message:
             return
 
+        # Inject a timestamp prefix when ``gateway.message_timestamps.enabled``
+        # is opted in, giving the agent temporal context for HA events.
+        # ``render_user_content_with_timestamp`` strips any pre-existing
+        # timestamp first, preventing double-prefixing.
+        try:
+            from gateway.message_timestamps import (
+                message_timestamps_enabled as _ha_ts_enabled,
+                render_user_content_with_timestamp as _ha_render_ts,
+            )
+            if _ha_ts_enabled():
+                message = _ha_render_ts(message, ts_value=time.time())
+        except Exception:
+            logger.debug("HA adapter: timestamp injection skipped", exc_info=True)
+
         # Build MessageEvent and forward to handler
         source = self.build_source(
             chat_id="ha_events",
