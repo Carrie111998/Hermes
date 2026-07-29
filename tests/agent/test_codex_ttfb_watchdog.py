@@ -96,6 +96,7 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
         elapsed = time.time() - t0
         assert "TTFB" in str(excinfo.value)
         assert "codex_ttfb_kill" in closes
+        assert agent._consecutive_stale_streams == 1
         # ~1s cutoff + 2s join grace; must be far under the 60s stale timeout.
         assert elapsed < 15, f"TTFB watchdog took {elapsed:.1f}s"
     finally:
@@ -312,6 +313,7 @@ def test_event_idle_kills_after_first_event_then_silence(tmp_path, monkeypatch):
         assert "after first byte" in str(excinfo.value)
         assert "codex_stream_idle_kill" in closes
         assert "codex_ttfb_kill" not in closes
+        assert agent._consecutive_stale_streams == 1
     finally:
         stop["flag"] = True
 
