@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type ComponentProps, type MouseEvent, type ReactNode, useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 
+import { $artifactsPaneOpen, toggleArtifactsPane } from '@/app/artifacts/pane-state'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
 import { resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
@@ -100,6 +101,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const location = useLocation()
   const modHeld = useModifierHeld()
   const hapticsMuted = useStore($hapticsMuted)
+  const artifactsPaneOpen = useStore($artifactsPaneOpen)
   const fileBrowserOpen = useStore($fileBrowserOpen)
   const sidebarOpen = useStore($sidebarOpen)
 
@@ -160,6 +162,16 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
 
   // Static system tools — always pinned to the screen's right edge.
   const systemTools: TitlebarTool[] = [
+    {
+      active: artifactsPaneOpen,
+      icon: <Codicon name="files" />,
+      id: 'artifacts',
+      label: t.artifacts.paneTitle,
+      onSelect: () => {
+        triggerHaptic(artifactsPaneOpen ? 'tap' : 'open')
+        toggleArtifactsPane()
+      }
+    },
     {
       className: 'group/tool',
       // Hover + held ⌘/Ctrl morphs the glyph into its reset form (see

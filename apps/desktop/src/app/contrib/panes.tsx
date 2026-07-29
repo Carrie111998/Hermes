@@ -13,6 +13,7 @@ import { useQuery } from '@tanstack/react-query'
 import { atom } from 'nanostores'
 import type { CSSProperties } from 'react'
 
+import { ArtifactsPane } from '@/app/artifacts/pane'
 import { ChatPreviewRail } from '@/app/chat/right-rail/preview'
 import { RightSidebarPane } from '@/app/right-sidebar'
 import { ReviewPane } from '@/app/right-sidebar/review'
@@ -123,6 +124,14 @@ export function FilesPane() {
   return (
     <div className={ZONE_CONTENT}>
       <RightSidebarPane onActivateFile={previewFile} onActivateFolder={previewFile} />
+    </div>
+  )
+}
+
+export function ArtifactsPaneContent() {
+  return (
+    <div className={ZONE_CONTENT}>
+      <ArtifactsPane />
     </div>
   )
 }

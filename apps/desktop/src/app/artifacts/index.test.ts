@@ -3,7 +3,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { $connection } from '@/store/session'
 import type { SessionInfo, SessionMessage } from '@/types/hermes'
 
-import { artifactImageSrc, collectArtifactsForSession } from './artifact-utils'
+import type { SidebarProjectTree } from '../chat/sidebar/projects/workspace-groups'
+
+import {
+  artifactImageSrc,
+  artifactSessionsForProject,
+  collectArtifactsForSession,
+  preferredArtifactProjectId
+} from './artifact-utils'
 
 function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
@@ -87,5 +94,72 @@ describe('collectArtifactsForSession', () => {
     expect(api).toHaveBeenCalledWith({
       path: '/api/fs/read-data-url?path=%2FUsers%2Fme%2F.hermes%2Fskills%2Fwork-esab%2Freferences%2Fimages%2Fmanual-step03.jpeg'
     })
+  })
+})
+
+describe('project artifact model', () => {
+  const project = (overrides: Partial<SidebarProjectTree> = {}): SidebarProjectTree => ({
+    id: 'project-1',
+    label: 'Hermes',
+    path: '/work/hermes',
+    repos: [],
+    sessionCount: 0,
+    previewSessions: [],
+    ...overrides
+  })
+
+  it('uses backend-provided project sessions and deduplicates overview previews', () => {
+    const recent = makeSession({ id: 'recent', last_active: 30 })
+    const older = makeSession({ id: 'older', last_active: 10 })
+
+    const sessions = artifactSessionsForProject(
+      project({
+        previewSessions: [recent],
+        repos: [
+          {
+            groups: [{ id: 'main', label: 'main', path: '/work/hermes', sessions: [older, recent] }],
+            id: 'repo',
+            label: 'hermes',
+            path: '/work/hermes',
+            sessionCount: 2
+          }
+        ]
+      })
+    )
+
+    expect(sessions.map(session => session.id)).toEqual(['recent', 'older'])
+  })
+
+  it('prefers explicit project scope and otherwise resolves the current authoritative path', () => {
+    const projects = [project(), project({ id: 'project-2', label: 'Desktop', path: '/work/hermes/apps/desktop' })]
+
+    expect(
+      preferredArtifactProjectId({
+        currentCwd: '/work/hermes/apps/desktop/src',
+        projectScope: '__all_projects__',
+        projects
+      })
+    ).toBe('project-2')
+    expect(
+      preferredArtifactProjectId({
+        currentCwd: '/work/hermes/apps/desktop/src',
+        projectScope: 'project-1',
+        projects
+      })
+    ).toBe('project-1')
+  })
+
+  it('matches Windows project paths without falling back to the first project', () => {
+    const projects = [
+      project({ id: 'project-1', path: 'C:\\work\\hermes' }),
+      project({ id: 'project-2', path: 'C:\\work\\hermes\\apps\\desktop' })
+    ]
+
+    expect(
+      preferredArtifactProjectId({
+        currentCwd: 'C:\\work\\hermes\\apps\\desktop\\src',
+        projects
+      })
+    ).toBe('project-2')
   })
 })
