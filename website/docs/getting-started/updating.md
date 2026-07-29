@@ -1,7 +1,7 @@
 ---
 sidebar_position: 3
-title: "Updating & Uninstalling"
-description: "How to update Hermes Agent to the latest version or uninstall it"
+title: 'Updating & Uninstalling'
+description: 'How to update Hermes Agent to the latest version or uninstall it'
 ---
 
 # Updating & Uninstalling
@@ -51,7 +51,7 @@ When the update runs **without a terminal** — from the desktop/chat app's "Upd
 ```yaml
 # ~/.hermes/config.yaml
 updates:
-  non_interactive_local_changes: stash   # default: keep + auto-restore
+  non_interactive_local_changes: stash # default: keep + auto-restore
   # non_interactive_local_changes: discard  # throw local source edits away
 ```
 
@@ -81,6 +81,14 @@ updates:
 ```
 
 `updates.pre_update_backup` is a single knob with three modes: `quick` (default — the lightweight state snapshot described above), `full` (the quick snapshot plus a complete `HERMES_HOME` zip; can add minutes on large homes), and `off` (no pre-update backup at all — `--no-backup` does the same for a single run). Legacy boolean values still work: `true` means `full`, `false` means `off`.
+
+### Skip building the web UI: `--skip-webui`
+
+```bash
+hermes update --skip-webui
+```
+
+If you run hermes agent without the webui, use `--skip-webui` to avoid the build step.
 
 ### Windows: another `hermes.exe` is running
 
@@ -257,9 +265,11 @@ rm -rf ~/.hermes            # Optional — keep if you plan to reinstall
 
 :::info
 If you installed the gateway as a system service, stop and disable it first:
+
 ```bash
 hermes gateway stop
 # Linux: systemctl --user disable hermes-gateway
 # macOS: launchctl remove ai.hermes.gateway
 ```
+
 :::

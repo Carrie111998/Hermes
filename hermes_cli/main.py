@@ -12753,7 +12753,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _refresh_active_memory_provider_dependencies()
 
         node_failures = _update_node_dependencies()
-        _build_web_ui(PROJECT_ROOT / "web")
+        if args.skip_webui:
+            print("→ Skipping web UI build...")
+        else:
+            _build_web_ui(PROJECT_ROOT / "web")
 
         # Rebuild the desktop app if the source tree changed since the last
         # build.  ``hermes desktop --build-only`` uses the content-hash stamp
