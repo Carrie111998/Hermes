@@ -934,13 +934,16 @@ def _terminate_venv_holders(
 
     Returns the subset of ``matches`` that survived the kill window — caller
     re-checks via ``_detect_venv_python_processes()`` to confirm. Never raises
-    (psutil failures degrade to an empty survivor list with a logged warning).
+    (psutil import failures degrade to the original matches list with a logged
+    warning, so the caller bails out conservatively rather than silently
+    proceeding through an unverified state).
     """
     if not matches:
         return []
     try:
         import psutil
-    except Exception:
+    except Exception as exc:
+        logger.warning("psutil unavailable during venv-holder kill: %s", exc)
         return list(matches)
 
     # Build the (pid -> name, cmdline) lookup up front so we can log *what*
@@ -991,14 +994,16 @@ def _terminate_venv_holders(
         survivors = list(skipped_access_denied)
     else:
         # Poll for process exit so the OS releases the file handles BEFORE we
-        # hand control back to the renamer. psutil.wait_procs gives us the
-        # popen-style "gone + returncode" with a single timeout.
+        # hand control back to the renamer. psutil.wait_procs returns the
+        # ``(gone, alive)`` tuple that psutil uses everywhere — we want the
+        # ``gone`` half (Process objects whose ``.returncode`` was set during
+        # the wait), and any surviving pid is a holder we couldn't release.
         gone: set[int] = set()
         try:
             procs = [psutil.Process(pid) for pid in killed]
-            for proc in psutil.wait_procs(procs, timeout=timeout_seconds):
-                if proc.returncode is not None or not proc.is_running():
-                    gone.add(int(proc.pid))
+            gone_procs, _alive_procs = psutil.wait_procs(procs, timeout=timeout_seconds)
+            for proc in gone_procs:
+                gone.add(int(proc.pid))
         except Exception as exc:
             logger.warning("wait_procs after venv-holder kill failed: %s", exc)
 

@@ -1396,7 +1396,9 @@ class TestTerminateVenvHolders:
             @staticmethod
             def wait_procs(procs, timeout):
                 # Pretend every process we asked about exited within the timeout.
-                return [SimpleNamespace(pid=p.pid, returncode=0, is_running=lambda: False) for p in procs]
+                # psutil.wait_procs returns the (gone, alive) tuple.
+                gone = [SimpleNamespace(pid=p.pid, returncode=0, is_running=lambda: False) for p in procs]
+                return gone, []
 
         monkeypatch.setitem(_sys.modules, "psutil", _FakePsutil())
 
@@ -1426,7 +1428,10 @@ class TestTerminateVenvHolders:
             @staticmethod
             def wait_procs(procs, timeout):
                 # Pretend PID 1234 died, PID 5678 is still alive.
-                return [SimpleNamespace(pid=1234, returncode=0, is_running=lambda: False)]
+                # psutil.wait_procs returns the (gone, alive) tuple.
+                gone = [SimpleNamespace(pid=1234, returncode=0, is_running=lambda: False)]
+                alive = [SimpleNamespace(pid=5678, returncode=None, is_running=lambda: True)]
+                return gone, alive
 
         monkeypatch.setitem(_sys.modules, "psutil", _FakePsutil())
 
@@ -1458,7 +1463,10 @@ class TestTerminateVenvHolders:
             NoSuchProcess = _NoSuchProcess
             @staticmethod
             def wait_procs(procs, timeout):
-                return []
+                # psutil.wait_procs returns the (gone, alive) tuple; nothing
+                # we asked about here is real anyway, since every Process()
+                # raised AccessDenied above.
+                return [], []
 
         monkeypatch.setitem(_sys.modules, "psutil", _FakePsutil())
 
@@ -1483,7 +1491,10 @@ class TestTerminateVenvHolders:
 
             @staticmethod
             def wait_procs(procs, timeout):
-                return []
+                # psutil.wait_procs returns the (gone, alive) tuple; nothing
+                # we asked about here is real anyway, since every Process()
+                # raised NoSuchProcess above.
+                return [], []
 
         monkeypatch.setitem(_sys.modules, "psutil", _FakePsutil())
         holders = [(1, "a", "b"), (2, "c", "d")]
@@ -1491,6 +1502,55 @@ class TestTerminateVenvHolders:
         # Every match raises NoSuchProcess on lookup -- the process is gone,
         # so the helper skips it (not killed, not retained as survivor).
         assert survivors == []
+
+    def test_wait_procs_uses_gone_tuple_correctly(self, monkeypatch):
+        """Regression test: psutil.wait_procs returns (gone, alive) — the
+        production code must consume the ``gone`` half (Process objects with
+        ``.pid``) instead of iterating over the tuple as if it were a flat
+        list of Process objects.
+
+        Previously the production code did::
+
+            for proc in psutil.wait_procs(procs, timeout=...):
+                if proc.returncode is not None or not proc.is_running():
+                    gone.add(int(proc.pid))
+
+        which iterates over the (gone_list, alive_list) tuple, raising
+        ``AttributeError: 'list' object has no attribute 'returncode'`` on
+        the first loop iteration. This test asserts the fixed path returns
+        survivors that match the ``alive`` half, not a swallowed exception.
+        """
+        from hermes_cli import managed_uv
+        import sys as _sys
+
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+            def kill(self):
+                pass
+
+        class _FakePsutil:
+            Process = FakeProc
+            NoSuchProcess = Exception
+            AccessDenied = Exception
+            @staticmethod
+            def wait_procs(procs, timeout):
+                # Pretend PID 1001 is alive (didn't terminate in window),
+                # PID 1002 is gone. psutil.wait_procs returns (gone, alive).
+                gone = [SimpleNamespace(pid=1002, returncode=0, is_running=lambda: False)]
+                alive = [SimpleNamespace(pid=1001, returncode=None, is_running=lambda: True)]
+                return gone, alive
+
+        monkeypatch.setitem(_sys.modules, "psutil", _FakePsutil())
+
+        survivors = managed_uv._terminate_venv_holders(
+            [(1001, "python.exe", "stuck"), (1002, "uv.exe", "exited")]
+        )
+        survivor_pids = [s[0] for s in survivors]
+        # The fix: the gone half is consumed, so 1002 is NOT a survivor.
+        # The alive half is left as a survivor (PID 1001).
+        assert 1001 in survivor_pids, f"expected 1001 in survivors, got {survivor_pids}"
+        assert 1002 not in survivor_pids, f"expected 1002 NOT in survivors, got {survivor_pids}"
 
 
 # ---------------------------------------------------------------------------
