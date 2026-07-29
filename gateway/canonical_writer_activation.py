@@ -332,7 +332,10 @@ def _host_activation_lock():
             raise RuntimeError(
                 "another writer activation lifecycle is running"
             ) from exc
-        yield
+        # Internal callers that compose more than one activation primitive
+        # need the exact open file description, not a second open of the same
+        # path.  Existing callers deliberately ignore the yielded value.
+        yield descriptor
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)

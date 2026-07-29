@@ -1,0 +1,1 @@
+f /run/lock/muncho-release-builder-promotion.lock 0440 root muncho-release-builder -

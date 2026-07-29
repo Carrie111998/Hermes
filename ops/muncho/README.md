@@ -34,6 +34,10 @@ the core:
   exact model-sovereignty config delta. Mutation is digest-bound, requires the
   gateway to be stopped, publishes crash-safe exact backups, and returns a
   stable receipt without interpreting task meaning.
+- `release-updater/` contains the fail-closed Stage C builder foundation. It
+  has no installer or activation path and is intentionally unable to build a
+  production candidate until the real update entrypoint, recovery gate, host
+  mutations, and Linux power-loss E2E land together.
 
 Cloud integration keeps the mutable wrappers outside the active release:
 
