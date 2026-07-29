@@ -529,10 +529,26 @@ def test_public_boundaries_are_fixed_and_have_no_override_surface() -> None:
         )
         == []
     )
+    assert (
+        list(
+            inspect.signature(
+                registry.recover_existing_active_transaction
+            ).parameters
+        )
+        == []
+    )
+    assert list(
+        inspect.signature(
+            registry.retire_active_transaction
+        ).parameters
+    ) == ["authority_record"]
     assert "root" not in registry.__all__
     assert "_create_or_replay_for_test" not in registry.__all__
     assert "_read_for_test" not in registry.__all__
-    assert not any("retire" in name for name in registry.__all__)
+    assert "_recover_existing_for_test" not in registry.__all__
+    assert "_retire_for_test" not in registry.__all__
+    assert "recover_existing_active_transaction" in registry.__all__
+    assert "retire_active_transaction" in registry.__all__
 
 
 @pytest.mark.parametrize("attribute", ["geteuid", "getegid"])
@@ -974,3 +990,490 @@ def test_registry_path_replacement_during_publication_is_detected(
         match=r"^release_active_transaction_directory_changed$",
     ):
         _create(root)
+
+
+def test_existing_normalization_is_idle_without_creating_a_missing_root(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    before = sorted(tmp_path.iterdir())
+
+    assert registry._recover_existing_for_test(root) is None
+
+    assert sorted(tmp_path.iterdir()) == before
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    registry.EXISTING_NORMALIZATION_DURABLE_BOUNDARIES,
+)
+@pytest.mark.parametrize("marker_present", [False, True])
+def test_clean_existing_normalization_retries_every_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    boundary: str,
+    marker_present: bool,
+) -> None:
+    root = _root(tmp_path)
+    root.mkdir(mode=registry.DIRECTORY_MODE)
+    root.chmod(registry.DIRECTORY_MODE)
+    expected = _create(root) if marker_present else None
+
+    def crash(name: str) -> None:
+        if name == boundary:
+            raise SimulatedCrash
+
+    monkeypatch.setattr(registry, "_checkpoint", crash)
+    with pytest.raises(SimulatedCrash):
+        registry._recover_existing_for_test(root)
+
+    monkeypatch.setattr(registry, "_checkpoint", lambda _name: None)
+    assert registry._recover_existing_for_test(root) == expected
+    assert _marker_path(root).exists() is marker_present
+    assert not _pending_path(root).exists()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    registry.UNCOMMITTED_RECOVERY_DURABLE_BOUNDARIES,
+)
+def test_existing_normalization_discards_unpublished_pending_at_every_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    root = _root(tmp_path)
+
+    def crash_publication(name: str) -> None:
+        if name == "active_pending_directory_fsynced":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(registry, "_checkpoint", crash_publication)
+    with pytest.raises(SimulatedCrash):
+        _create(root)
+    assert _pending_path(root).stat().st_nlink == 1
+    assert not _marker_path(root).exists()
+
+    def crash_recovery(name: str) -> None:
+        if name == boundary:
+            raise SimulatedCrash
+
+    monkeypatch.setattr(registry, "_checkpoint", crash_recovery)
+    with pytest.raises(SimulatedCrash):
+        registry._recover_existing_for_test(root)
+
+    monkeypatch.setattr(registry, "_checkpoint", lambda _name: None)
+    assert registry._recover_existing_for_test(root) is None
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    registry.LINKED_RECOVERY_DURABLE_BOUNDARIES,
+)
+def test_existing_normalization_finishes_linked_marker_at_every_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    root = _root(tmp_path)
+
+    def crash_publication(name: str) -> None:
+        if name == "active_final_linked":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(registry, "_checkpoint", crash_publication)
+    with pytest.raises(SimulatedCrash):
+        _create(root)
+    assert _pending_path(root).stat().st_nlink == 2
+    assert _marker_path(root).stat().st_nlink == 2
+
+    def crash_recovery(name: str) -> None:
+        if name == boundary:
+            raise SimulatedCrash
+
+    monkeypatch.setattr(registry, "_checkpoint", crash_recovery)
+    with pytest.raises(SimulatedCrash):
+        registry._recover_existing_for_test(root)
+
+    monkeypatch.setattr(registry, "_checkpoint", lambda _name: None)
+    recovered = registry._recover_existing_for_test(root)
+    assert recovered is not None
+    assert recovered["authority_record"] == _authority_record()
+    assert _marker_path(root).stat().st_nlink == 1
+    assert not _pending_path(root).exists()
+
+
+def test_exact_retirement_removes_only_active_pointer_and_keeps_namespaces(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    created = _create(root)
+    transactions = root / "transactions"
+    transactions.mkdir(mode=0o700)
+    transactions.chmod(0o700)
+    audit = transactions / "immutable-audit"
+    audit.mkdir(mode=0o700)
+
+    registry._retire_for_test(
+        root,
+        authority_record=_authority_record(),
+    )
+
+    assert not _marker_path(root).exists()
+    assert not _pending_path(root).exists()
+    assert audit.is_dir()
+    assert registry._recover_existing_for_test(root) is None
+    assert created["authority_record"] == _authority_record()
+
+
+def test_exact_retirement_rejects_other_authority_without_deleting_marker(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    expected = _create(root)
+    before = _marker_path(root).read_bytes()
+
+    with pytest.raises(
+        registry.ProductionReleaseActiveTransactionError,
+        match=r"^release_active_transaction_conflict$",
+    ):
+        registry._retire_for_test(
+            root,
+            authority_record=_other_authority_record(),
+        )
+
+    assert _marker_path(root).read_bytes() == before
+    assert registry._read_for_test(root) == expected
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    registry.RETIREMENT_DURABLE_BOUNDARIES,
+)
+def test_exact_retirement_has_safe_replay_at_every_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    root = _root(tmp_path)
+    _create(root)
+
+    def crash(name: str) -> None:
+        if name == boundary:
+            raise SimulatedCrash
+
+    monkeypatch.setattr(registry, "_checkpoint", crash)
+    with pytest.raises(SimulatedCrash):
+        registry._retire_for_test(
+            root,
+            authority_record=_authority_record(),
+        )
+
+    monkeypatch.setattr(registry, "_checkpoint", lambda _name: None)
+    if boundary == "active_retirement_binding_validated":
+        registry._retire_for_test(
+            root,
+            authority_record=_authority_record(),
+        )
+    else:
+        # Unlink is already visible.  Normalization fsyncs that idle directory
+        # so an interrupted deletion converges without inventing a tombstone.
+        assert registry._recover_existing_for_test(root) is None
+    assert not _marker_path(root).exists()
+    assert not _pending_path(root).exists()
+
+
+def test_retirement_unlink_failure_preserves_exact_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    expected = _create(root)
+    original_unlink = registry.os.unlink
+
+    def fail_marker_unlink(
+        path: Any,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path == registry.ACTIVE_MARKER_NAME:
+            raise OSError("injected unlink failure")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(registry.os, "unlink", fail_marker_unlink)
+    with pytest.raises(
+        registry.ProductionReleaseActiveTransactionError,
+        match=r"^release_active_transaction_retirement_invalid$",
+    ):
+        registry._retire_for_test(
+            root,
+            authority_record=_authority_record(),
+        )
+
+    assert registry._read_for_test(root) == expected
+
+
+def test_retirement_directory_fsync_failure_converges_as_idle_after_unlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _create(root)
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(registry.os, "fsync", fail_fsync)
+    with pytest.raises(
+        registry.ProductionReleaseActiveTransactionError,
+        match=r"^release_active_transaction_retirement_invalid$",
+    ):
+        registry._retire_for_test(
+            root,
+            authority_record=_authority_record(),
+        )
+
+    monkeypatch.undo()
+    assert registry._recover_existing_for_test(root) is None
+    assert not _marker_path(root).exists()
+
+
+def test_retirement_registry_path_swap_is_detected_before_unlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _create(root)
+    detached = tmp_path / "detached-retirement-registry"
+
+    def replace_root(name: str) -> None:
+        if name != "active_retirement_binding_validated":
+            return
+        root.rename(detached)
+        root.mkdir(mode=registry.DIRECTORY_MODE)
+        root.chmod(registry.DIRECTORY_MODE)
+
+    monkeypatch.setattr(registry, "_checkpoint", replace_root)
+    with pytest.raises(
+        registry.ProductionReleaseActiveTransactionError,
+        match=r"^release_active_transaction_directory_changed$",
+    ):
+        registry._retire_for_test(
+            root,
+            authority_record=_authority_record(),
+        )
+
+    assert _marker_path(detached).exists()
+    assert not _marker_path(root).exists()
+
+
+def test_retirement_pins_validated_inode_against_same_bytes_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _create(root)
+    marker = _marker_path(root)
+    payload = marker.read_bytes()
+    original_status = marker.stat()
+    detached = tmp_path / "detached-original-marker"
+    original_open = registry.os.open
+    marker_descriptors: list[int] = []
+
+    def track_marker_descriptor(
+        path: Any,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if dir_fd is None:
+            descriptor = original_open(path, flags, mode)
+        else:
+            descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == registry.ACTIVE_MARKER_NAME:
+            marker_descriptors.append(descriptor)
+        return descriptor
+
+    def replace_after_validation(name: str) -> None:
+        if name != "active_retirement_binding_validated":
+            return
+        assert len(marker_descriptors) == 1
+        pinned = os.fstat(marker_descriptors[0])
+        assert (pinned.st_dev, pinned.st_ino) == (
+            original_status.st_dev,
+            original_status.st_ino,
+        )
+        marker.rename(detached)
+        marker.write_bytes(payload)
+        marker.chmod(registry.FILE_MODE)
+
+    monkeypatch.setattr(registry.os, "open", track_marker_descriptor)
+    monkeypatch.setattr(registry, "_checkpoint", replace_after_validation)
+    with pytest.raises(
+        registry.ProductionReleaseActiveTransactionError,
+        match=r"^release_active_transaction_file_changed$",
+    ):
+        registry._retire_for_test(
+            root,
+            authority_record=_authority_record(),
+        )
+
+    replacement_status = marker.stat()
+    assert detached.read_bytes() == marker.read_bytes() == payload
+    assert (detached.stat().st_dev, detached.stat().st_ino) == (
+        original_status.st_dev,
+        original_status.st_ino,
+    )
+    assert (replacement_status.st_dev, replacement_status.st_ino) != (
+        original_status.st_dev,
+        original_status.st_ino,
+    )
+    with pytest.raises(OSError):
+        os.fstat(marker_descriptors[0])
+
+
+def test_retirement_open_pin_prevents_aba_inode_reuse_before_unlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    _create(root)
+    marker = _marker_path(root)
+    payload = marker.read_bytes()
+    original_status = marker.stat()
+    original_open = registry.os.open
+    marker_descriptors: list[int] = []
+
+    def track_marker_descriptor(
+        path: Any,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if dir_fd is None:
+            descriptor = original_open(path, flags, mode)
+        else:
+            descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if path == registry.ACTIVE_MARKER_NAME:
+            marker_descriptors.append(descriptor)
+        return descriptor
+
+    def force_replacement_pressure(name: str) -> None:
+        if name != "active_retirement_binding_validated":
+            return
+        assert len(marker_descriptors) == 1
+        marker.unlink()
+        pinned = os.fstat(marker_descriptors[0])
+        assert pinned.st_nlink == 0
+        assert (pinned.st_dev, pinned.st_ino) == (
+            original_status.st_dev,
+            original_status.st_ino,
+        )
+        for index in range(256):
+            candidate = tmp_path / f"inode-reuse-pressure-{index}"
+            candidate.write_bytes(payload)
+            candidate.chmod(registry.FILE_MODE)
+            candidate_status = candidate.stat()
+            assert (candidate_status.st_dev, candidate_status.st_ino) != (
+                original_status.st_dev,
+                original_status.st_ino,
+            )
+            candidate.unlink()
+        marker.write_bytes(payload)
+        marker.chmod(registry.FILE_MODE)
+
+    monkeypatch.setattr(registry.os, "open", track_marker_descriptor)
+    monkeypatch.setattr(registry, "_checkpoint", force_replacement_pressure)
+    with pytest.raises(
+        registry.ProductionReleaseActiveTransactionError,
+        match=r"^release_active_transaction_file_changed$",
+    ):
+        registry._retire_for_test(
+            root,
+            authority_record=_authority_record(),
+        )
+
+    assert marker.read_bytes() == payload
+    assert (marker.stat().st_dev, marker.stat().st_ino) != (
+        original_status.st_dev,
+        original_status.st_ino,
+    )
+    with pytest.raises(OSError):
+        os.fstat(marker_descriptors[0])
+
+
+def test_retirement_rejects_linked_publication_until_normalized(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+
+    def crash(name: str) -> None:
+        if name == "active_final_linked":
+            raise SimulatedCrash
+
+    monkeypatch.setattr(registry, "_checkpoint", crash)
+    with pytest.raises(SimulatedCrash):
+        _create(root)
+    monkeypatch.setattr(registry, "_checkpoint", lambda _name: None)
+
+    with pytest.raises(
+        registry.ProductionReleaseActiveTransactionError,
+        match=r"^release_active_transaction_recovery_required$",
+    ):
+        registry._retire_for_test(
+            root,
+            authority_record=_authority_record(),
+        )
+
+    assert _marker_path(root).stat().st_nlink == 2
+    assert _pending_path(root).stat().st_nlink == 2
+
+
+def test_retirement_rejects_hardlink_or_extended_metadata_without_deletion(
+    tmp_path: Path,
+) -> None:
+    hardlink_parent = tmp_path / "hardlink-retirement"
+    hardlink_parent.mkdir(mode=0o700)
+    hardlink_root = _root(hardlink_parent)
+    _create(hardlink_root)
+    outside = hardlink_parent / "outside-marker-link"
+    os.link(_marker_path(hardlink_root), outside)
+
+    with pytest.raises(
+        registry.ProductionReleaseActiveTransactionError,
+        match=r"^release_active_transaction_file_invalid$",
+    ):
+        registry._retire_for_test(
+            hardlink_root,
+            authority_record=_authority_record(),
+        )
+    assert outside.exists()
+    assert _marker_path(hardlink_root).exists()
+
+    metadata_parent = tmp_path / "metadata-retirement"
+    metadata_parent.mkdir(mode=0o700)
+    metadata_root = _root(metadata_parent)
+    _create(metadata_root)
+
+    def xattrs(descriptor: int) -> tuple[str, ...]:
+        return (
+            ("user.injected",)
+            if stat.S_ISREG(os.fstat(descriptor).st_mode)
+            else ()
+        )
+
+    with pytest.raises(
+        registry.ProductionReleaseActiveTransactionError,
+        match=r"^release_active_transaction_extended_metadata_invalid$",
+    ):
+        registry._retire_for_test(
+            metadata_root,
+            authority_record=_authority_record(),
+            xattr_reader=xattrs,
+        )
+    assert _marker_path(metadata_root).exists()

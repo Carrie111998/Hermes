@@ -16,6 +16,17 @@ operational updater**:
 - no production runner, recovery-gate unit, boot scanner, or installer is
   shipped.
 
+One fixed-root recovery coordinator now exists as a dormant library boundary.
+It has no arguments and no activation surface.  While holding the global
+authority lock, it can only normalize an already-existing active marker, open
+the exact already-existing journal named by that marker, ask the runtime to
+recover and live-revalidate a terminal state, and retire that exact marker.
+An absent marker is idle and creates nothing.  Any journal, runtime, or
+revalidation failure before retirement leaves the marker in place for a later
+retry.  Exact marker retirement is crash-convergent after unlink and never
+deletes the immutable transaction journal.  No caller can use this boundary to
+create a transaction or begin fresh execution.
+
 Do not install or activate these assets as a release updater until the complete
 host mutation set, fixed production entrypoint, recovery gate, and disposable
 Linux power-loss/restart E2E suite land together.  The missing entrypoint is an
@@ -49,4 +60,4 @@ preauthorization; finalization consumes the exact persisted preauthorization
 without consulting wall-clock freshness again.  An append-only
 activation-begin marker is published immediately before the first live write,
 and permanently forbids abort even if rollback restores the predecessor.  No
-runtime caller or updater activation path is shipped yet.
+fresh-execution runtime caller or updater activation path is shipped yet.

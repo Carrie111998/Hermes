@@ -169,6 +169,7 @@ def test_simulated_expiry_aborts_before_application_mutation_and_revalidates() -
     assert backend.calls == [
         "preapplication_cleanup",
         "aborted_revalidated",
+        "aborted_revalidated",
     ]
 
 

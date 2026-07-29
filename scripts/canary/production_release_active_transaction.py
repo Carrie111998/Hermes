@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Durable root-owned registry for the one active release transaction.
 
-The registry is deliberately a dormant storage primitive.  It has no caller,
-entrypoint, timer, unit, recovery policy, or retirement operation.  A future
-boot recovery gate can use it to discover the exact signed runtime authority
-that owns the sole active transaction.
+The registry is deliberately a dormant storage primitive.  It has no
+entrypoint, timer, unit, or boot activation policy.  The recovery coordinator
+can normalize an interrupted publication, discover the exact signed runtime
+authority that owns the sole active transaction, and retire that exact marker
+only after the transaction runtime has revalidated a terminal host state.
 
 Publication is create-only: a private pending inode is written and fsynced,
 then hard-linked without replacement to the canonical marker, the directory
@@ -65,6 +66,16 @@ LINKED_RECOVERY_DURABLE_BOUNDARIES = (
     "active_recovery_pending_unlinked",
     "active_recovery_cleanup_directory_fsynced",
     "active_recovery_readback_validated",
+)
+EXISTING_NORMALIZATION_DURABLE_BOUNDARIES = (
+    "active_existing_directory_fsynced",
+    "active_existing_readback_validated",
+)
+RETIREMENT_DURABLE_BOUNDARIES = (
+    "active_retirement_binding_validated",
+    "active_retirement_marker_unlinked",
+    "active_retirement_directory_fsynced",
+    "active_retirement_absence_validated",
 )
 
 _MARKER_FIELDS = frozenset(
@@ -650,13 +661,13 @@ class _ActiveTransactionRegistry:
             ACTIVE_PENDING_NAME in names,
         )
 
-    def _read_marker_file(
+    def _open_marker_file(
         self,
         root_fd: int,
         name: str,
         *,
         expected_links: int,
-    ) -> tuple[bytes, Mapping[str, Any]]:
+    ) -> tuple[int, bytes, Mapping[str, Any], os.stat_result]:
         descriptor: int | None = None
         try:
             before = os.stat(
@@ -702,12 +713,17 @@ class _ActiveTransactionRegistry:
                 xattr_reader=self._xattr_reader,
             )
         except ProductionReleaseActiveTransactionError:
-            raise
-        except OSError:
-            _fail("release_active_transaction_file_invalid")
-        finally:
             if descriptor is not None:
                 os.close(descriptor)
+            raise
+        except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
+            _fail("release_active_transaction_file_invalid")
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
         if (
             _identity(before) != _identity(opened)
             or _identity(opened) != _identity(after)
@@ -718,8 +734,91 @@ class _ActiveTransactionRegistry:
             )
             or len(raw) != opened.st_size
         ):
+            if descriptor is not None:
+                os.close(descriptor)
             _fail("release_active_transaction_file_invalid")
-        return raw, _validate_marker(_decode_canonical(raw))
+        try:
+            marker = _validate_marker(_decode_canonical(raw))
+        except BaseException:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        if descriptor is None:
+            _fail("release_active_transaction_file_invalid")
+        return descriptor, raw, marker, after
+
+    def _read_marker_file(
+        self,
+        root_fd: int,
+        name: str,
+        *,
+        expected_links: int,
+    ) -> tuple[bytes, Mapping[str, Any], os.stat_result]:
+        descriptor, raw, marker, status = self._open_marker_file(
+            root_fd,
+            name,
+            expected_links=expected_links,
+        )
+        try:
+            return raw, marker, status
+        finally:
+            os.close(descriptor)
+
+    def _revalidate_pinned_marker(
+        self,
+        root_fd: int,
+        descriptor: int,
+        *,
+        pinned_status: os.stat_result,
+        expected_raw: bytes,
+        expected_marker: Mapping[str, Any],
+    ) -> None:
+        try:
+            before = os.fstat(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks = bytearray()
+            while len(chunks) <= MAX_MARKER_BYTES:
+                chunk = os.read(
+                    descriptor,
+                    min(
+                        1024 * 1024,
+                        MAX_MARKER_BYTES + 1 - len(chunks),
+                    ),
+                )
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+            raw = bytes(chunks)
+            after = os.fstat(descriptor)
+            reached = os.stat(
+                ACTIVE_MARKER_NAME,
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+            _assert_no_extended_metadata(
+                descriptor,
+                xattr_reader=self._xattr_reader,
+            )
+        except ProductionReleaseActiveTransactionError:
+            raise
+        except OSError:
+            _fail("release_active_transaction_file_changed")
+        if (
+            _identity(pinned_status) != _identity(before)
+            or _identity(before) != _identity(after)
+            or _identity(after) != _identity(reached)
+            or not _same_inode(pinned_status, before, after, reached)
+            or not self._trusted_file(after, expected_links=1)
+            or len(raw) != after.st_size
+        ):
+            _fail("release_active_transaction_file_changed")
+        marker = _validate_marker(_decode_canonical(raw))
+        self._assert_expected(
+            raw,
+            marker,
+            expected_raw=expected_raw,
+            expected_marker=expected_marker,
+        )
 
     def _assert_pending_shape(
         self,
@@ -845,12 +944,12 @@ class _ActiveTransactionRegistry:
             != (final_status.st_dev, final_status.st_ino)
         ):
             _fail("release_active_transaction_recovery_invalid")
-        pending_raw, pending = self._read_marker_file(
+        pending_raw, pending, _pending_status = self._read_marker_file(
             root_fd,
             ACTIVE_PENDING_NAME,
             expected_links=2,
         )
-        final_raw, final = self._read_marker_file(
+        final_raw, final, _final_status = self._read_marker_file(
             root_fd,
             ACTIVE_MARKER_NAME,
             expected_links=2,
@@ -886,7 +985,7 @@ class _ActiveTransactionRegistry:
             raise
         except OSError:
             _fail("release_active_transaction_recovery_invalid")
-        final_raw, final = self._read_marker_file(
+        final_raw, final, _final_status = self._read_marker_file(
             root_fd,
             ACTIVE_MARKER_NAME,
             expected_links=1,
@@ -996,7 +1095,7 @@ class _ActiveTransactionRegistry:
         final_present, pending_present = self._inventory(root_fd)
         if not final_present or pending_present:
             _fail("release_active_transaction_inventory_invalid")
-        raw, marker = self._read_marker_file(
+        raw, marker, _marker_status = self._read_marker_file(
             root_fd,
             ACTIVE_MARKER_NAME,
             expected_links=1,
@@ -1053,7 +1152,7 @@ class _ActiveTransactionRegistry:
                     )
                 )
             if final_present:
-                raw, marker = self._read_marker_file(
+                raw, marker, _marker_status = self._read_marker_file(
                     root_fd,
                     ACTIVE_MARKER_NAME,
                     expected_links=1,
@@ -1076,6 +1175,93 @@ class _ActiveTransactionRegistry:
                     expected_marker=expected_marker,
                 )
             )
+        finally:
+            os.close(root_fd)
+            os.close(parent_fd)
+
+    def recover_existing(self) -> Mapping[str, Any] | None:
+        """Normalize and discover existing publication state without creating.
+
+        A one-link pending inode has never been published and is discarded.
+        A two-link pending/final pair is the exact committed marker whose
+        directory durability and cleanup barriers are replayed.  A clean final
+        marker is fsynced before it is returned so recovery never begins from a
+        publication whose last directory barrier may have been interrupted.
+        """
+
+        opened = self._open_root(create=False)
+        if opened is None:
+            return None
+        parent_fd, root_fd = opened
+        try:
+            final_present, pending_present = self._inventory(root_fd)
+            self._verify_binding(parent_fd, root_fd)
+            if pending_present and final_present:
+                pending_raw, pending, _pending_status = self._read_marker_file(
+                    root_fd,
+                    ACTIVE_PENDING_NAME,
+                    expected_links=2,
+                )
+                final_raw, marker, _marker_status = self._read_marker_file(
+                    root_fd,
+                    ACTIVE_MARKER_NAME,
+                    expected_links=2,
+                )
+                if pending_raw != final_raw or pending != marker:
+                    _fail("release_active_transaction_recovery_invalid")
+                return deepcopy(
+                    self._recover_linked_pending(
+                        parent_fd,
+                        root_fd,
+                        expected_raw=final_raw,
+                        expected_marker=marker,
+                    )
+                )
+            if pending_present:
+                self._discard_uncommitted_pending(
+                    parent_fd,
+                    root_fd,
+                )
+                self._verify_binding(parent_fd, root_fd)
+                if self._inventory(root_fd) != (False, False):
+                    _fail("release_active_transaction_inventory_invalid")
+                return None
+            try:
+                os.fsync(root_fd)
+                self._boundary(
+                    "active_existing_directory_fsynced",
+                    parent_fd,
+                    root_fd,
+                )
+            except ProductionReleaseActiveTransactionError:
+                raise
+            except OSError:
+                _fail("release_active_transaction_recovery_invalid")
+            if not final_present:
+                if self._inventory(root_fd) != (False, False):
+                    _fail("release_active_transaction_inventory_invalid")
+                self._boundary(
+                    "active_existing_readback_validated",
+                    parent_fd,
+                    root_fd,
+                )
+                return None
+            raw, marker, _marker_status = self._read_marker_file(
+                root_fd,
+                ACTIVE_MARKER_NAME,
+                expected_links=1,
+            )
+            self._verify_binding(parent_fd, root_fd)
+            if self._inventory(root_fd) != (True, False):
+                _fail("release_active_transaction_inventory_invalid")
+            self._boundary(
+                "active_existing_readback_validated",
+                parent_fd,
+                root_fd,
+            )
+            if raw != canonical_json_bytes(marker):
+                _fail("release_active_transaction_marker_invalid")
+            return deepcopy(marker)
         finally:
             os.close(root_fd)
             os.close(parent_fd)
@@ -1113,12 +1299,12 @@ class _ActiveTransactionRegistry:
                     != (final_status.st_dev, final_status.st_ino)
                 ):
                     _fail("release_active_transaction_recovery_invalid")
-                pending_raw, pending = self._read_marker_file(
+                pending_raw, pending, _pending_status = self._read_marker_file(
                     root_fd,
                     ACTIVE_PENDING_NAME,
                     expected_links=2,
                 )
-                final_raw, marker = self._read_marker_file(
+                final_raw, marker, _marker_status = self._read_marker_file(
                     root_fd,
                     ACTIVE_MARKER_NAME,
                     expected_links=2,
@@ -1129,7 +1315,7 @@ class _ActiveTransactionRegistry:
                 if self._inventory(root_fd) != (True, True):
                     _fail("release_active_transaction_inventory_invalid")
                 return deepcopy(marker)
-            _raw, marker = self._read_marker_file(
+            _raw, marker, _marker_status = self._read_marker_file(
                 root_fd,
                 ACTIVE_MARKER_NAME,
                 expected_links=1,
@@ -1139,6 +1325,105 @@ class _ActiveTransactionRegistry:
                 _fail("release_active_transaction_inventory_invalid")
             return deepcopy(marker)
         finally:
+            os.close(root_fd)
+            os.close(parent_fd)
+
+    def retire_exact(
+        self,
+        *,
+        authority_record: Mapping[str, Any],
+    ) -> None:
+        """Retire only the exact clean marker selected by ``authority_record``.
+
+        The caller owns the outer activation lock and must prove terminal host
+        state before entering this destructive boundary.  The immutable
+        transaction journal remains the audit record; only its active pointer
+        is removed.
+        """
+
+        expected_marker = _build_marker(authority_record)
+        expected_raw = canonical_json_bytes(expected_marker)
+        opened = self._open_root(create=False)
+        if opened is None:
+            _fail("release_active_transaction_not_found")
+        parent_fd, root_fd = opened
+        marker_fd: int | None = None
+        try:
+            final_present, pending_present = self._inventory(root_fd)
+            self._verify_binding(parent_fd, root_fd)
+            if not final_present:
+                if pending_present:
+                    _fail("release_active_transaction_recovery_required")
+                _fail("release_active_transaction_not_found")
+            if pending_present:
+                _fail("release_active_transaction_recovery_required")
+            marker_fd, raw, marker, pinned_status = self._open_marker_file(
+                root_fd,
+                ACTIVE_MARKER_NAME,
+                expected_links=1,
+            )
+            self._assert_expected(
+                raw,
+                marker,
+                expected_raw=expected_raw,
+                expected_marker=expected_marker,
+            )
+            self._boundary(
+                "active_retirement_binding_validated",
+                parent_fd,
+                root_fd,
+            )
+            self._verify_binding(parent_fd, root_fd)
+            if self._inventory(root_fd) != (True, False):
+                _fail("release_active_transaction_inventory_invalid")
+            # Re-read after every other pre-unlink check and immediately before
+            # the unlink so a path replacement cannot turn validation of one
+            # marker into retirement of another.
+            self._revalidate_pinned_marker(
+                root_fd,
+                marker_fd,
+                pinned_status=pinned_status,
+                expected_raw=expected_raw,
+                expected_marker=expected_marker,
+            )
+            try:
+                os.unlink(ACTIVE_MARKER_NAME, dir_fd=root_fd)
+                unlinked = os.fstat(marker_fd)
+                if (
+                    not _same_inode(pinned_status, unlinked)
+                    or unlinked.st_nlink != 0
+                    or not stat.S_ISREG(unlinked.st_mode)
+                    or stat.S_IMODE(unlinked.st_mode) != FILE_MODE
+                    or unlinked.st_uid != self._uid
+                    or unlinked.st_gid != self._gid
+                    or unlinked.st_size != pinned_status.st_size
+                ):
+                    _fail("release_active_transaction_retirement_invalid")
+                self._boundary(
+                    "active_retirement_marker_unlinked",
+                    parent_fd,
+                    root_fd,
+                )
+                os.fsync(root_fd)
+                self._boundary(
+                    "active_retirement_directory_fsynced",
+                    parent_fd,
+                    root_fd,
+                )
+            except ProductionReleaseActiveTransactionError:
+                raise
+            except OSError:
+                _fail("release_active_transaction_retirement_invalid")
+            if self._inventory(root_fd) != (False, False):
+                _fail("release_active_transaction_retirement_invalid")
+            self._boundary(
+                "active_retirement_absence_validated",
+                parent_fd,
+                root_fd,
+            )
+        finally:
+            if marker_fd is not None:
+                os.close(marker_fd)
             os.close(root_fd)
             os.close(parent_fd)
 
@@ -1166,6 +1451,31 @@ def read_active_transaction() -> Mapping[str, Any]:
         xattr_reader=_read_descriptor_xattrs,
     )
     return registry.read()
+
+
+def recover_existing_active_transaction() -> Mapping[str, Any] | None:
+    """Normalize and return existing production state without creating it."""
+
+    registry = _ActiveTransactionRegistry(
+        root=PRODUCTION_REGISTRY_ROOT,
+        require_root=True,
+        xattr_reader=_read_descriptor_xattrs,
+    )
+    return registry.recover_existing()
+
+
+def retire_active_transaction(
+    *,
+    authority_record: Mapping[str, Any],
+) -> None:
+    """Retire the exact production marker after external terminal proof."""
+
+    registry = _ActiveTransactionRegistry(
+        root=PRODUCTION_REGISTRY_ROOT,
+        require_root=True,
+        xattr_reader=_read_descriptor_xattrs,
+    )
+    registry.retire_exact(authority_record=authority_record)
 
 
 def _create_or_replay_for_test(
@@ -1203,20 +1513,59 @@ def _read_for_test(
     return registry.read()
 
 
+def _recover_existing_for_test(
+    root: Path,
+    *,
+    xattr_reader: _XattrReader | None = None,
+) -> Mapping[str, Any] | None:
+    registry = _ActiveTransactionRegistry(
+        root=root,
+        require_root=False,
+        xattr_reader=(
+            (lambda _descriptor: ())
+            if xattr_reader is None
+            else xattr_reader
+        ),
+    )
+    return registry.recover_existing()
+
+
+def _retire_for_test(
+    root: Path,
+    *,
+    authority_record: Mapping[str, Any],
+    xattr_reader: _XattrReader | None = None,
+) -> None:
+    registry = _ActiveTransactionRegistry(
+        root=root,
+        require_root=False,
+        xattr_reader=(
+            (lambda _descriptor: ())
+            if xattr_reader is None
+            else xattr_reader
+        ),
+    )
+    registry.retire_exact(authority_record=authority_record)
+
+
 __all__ = [
     "ACTIVE_MARKER_NAME",
     "ACTIVE_MARKER_SCHEMA",
     "ACTIVE_PENDING_NAME",
     "ALLOWED_SIBLING_DIRECTORIES",
     "DIRECTORY_MODE",
+    "EXISTING_NORMALIZATION_DURABLE_BOUNDARIES",
     "FILE_MODE",
     "LINKED_RECOVERY_DURABLE_BOUNDARIES",
     "MAX_MARKER_BYTES",
     "PRODUCTION_REGISTRY_ROOT",
     "PUBLICATION_DURABLE_BOUNDARIES",
     "ProductionReleaseActiveTransactionError",
+    "RETIREMENT_DURABLE_BOUNDARIES",
     "UNCOMMITTED_RECOVERY_DURABLE_BOUNDARIES",
     "canonical_json_bytes",
     "create_or_replay_active_transaction",
     "read_active_transaction",
+    "recover_existing_active_transaction",
+    "retire_active_transaction",
 ]
