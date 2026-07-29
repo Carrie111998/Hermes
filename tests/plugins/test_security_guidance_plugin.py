@@ -89,7 +89,8 @@ class TestScanContent:
         mod = _load_plugin_init()
         findings = mod._scan_content("/tmp/foo.py", "result = eval(user_input)")
         assert len(findings) >= 1
-        rule, severity, reminder = findings[0]
+        rule, severity, reminder, fpath = findings[0]
+        assert fpath == "/tmp/foo.py"
         assert rule == "eval_injection"
         assert severity == "critical"
 
@@ -101,7 +102,7 @@ class TestScanContent:
         )
         names = {f[0] for f in findings}
         assert "script_src_without_sri" in names
-        for name, severity, _ in findings:
+        for name, severity, _r, _p in findings:
             if name == "script_src_without_sri":
                 assert severity == "medium"
 
@@ -109,6 +110,61 @@ class TestScanContent:
         mod = _load_plugin_init()
         findings = mod._scan_content("", "eval(x)")
         assert any(f[0] == "eval_injection" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# Session isolation of the advisory buffer (review comment #2)
+# ---------------------------------------------------------------------------
+
+class TestAdvisorySessionIsolation:
+    def test_concurrent_sessions_do_not_cross_contaminate(self, monkeypatch):
+        mod = _load_plugin_init()
+        mod._TURN_ADVISORIES.clear()
+        args_a = {"path": "/tmp/a.py", "content": "eval(x)\n"}
+        args_b = {"path": "/tmp/b.py", "content": "pickle.load(f)\n"}
+        mod._on_post_tool_call(
+            tool_name="write_file", args=args_a, result='{"ok": true}',
+            session_id="sess-A",
+        )
+        mod._on_post_tool_call(
+            tool_name="write_file", args=args_b, result='{"ok": true}',
+            session_id="sess-B",
+        )
+        # Each session has only its own findings
+        a_rules = {a["ruleName"] for a in mod._TURN_ADVISORIES["sess-A"]}
+        b_rules = {b["ruleName"] for b in mod._TURN_ADVISORIES["sess-B"]}
+        assert a_rules == {"eval_injection"}
+        assert b_rules == {"pickle_deserialization"}
+
+    def test_pre_llm_call_flushes_only_calling_session(self, monkeypatch):
+        mod = _load_plugin_init()
+        mod._TURN_ADVISORIES.clear()
+        args = {"path": "/tmp/a.py", "content": "eval(x)\n"}
+        mod._on_post_tool_call(
+            tool_name="write_file", args=args, result='{"ok": true}',
+            session_id="sess-A",
+        )
+        # sess-B flush returns nothing despite sess-A having buffered findings
+        assert mod._on_pre_llm_call(system_message="x", session_id="sess-B") is None
+        # sess-A still has its buffered findings
+        assert "sess-A" in mod._TURN_ADVISORIES
+        ctx = mod._on_pre_llm_call(system_message="x", session_id="sess-A")
+        assert ctx is not None and "CRITICAL" in ctx["context"]
+        # Flushed session entry removed
+        assert "sess-A" not in mod._TURN_ADVISORIES
+
+    def test_empty_session_id_is_its_own_bucket(self, monkeypatch):
+        mod = _load_plugin_init()
+        mod._TURN_ADVISORIES.clear()
+        args = {"path": "/tmp/a.py", "content": "eval(x)\n"}
+        mod._on_post_tool_call(
+            tool_name="write_file", args=args, result='{"ok": true}',
+            session_id="",
+        )
+        assert "" in mod._TURN_ADVISORIES
+        ctx = mod._on_pre_llm_call(system_message="x", session_id="")
+        assert ctx is not None and "CRITICAL" in ctx["context"]
+        assert "" not in mod._TURN_ADVISORIES
 
 
 # ---------------------------------------------------------------------------
@@ -192,21 +248,28 @@ class TestPostToolCallBuffer:
         mod = _load_plugin_init()
         mod._TURN_ADVISORIES.clear()
         args = {"path": "/tmp/foo.py", "content": "eval(x)\n"}
-        mod._on_post_tool_call(tool_name="write_file", args=args, result='{"ok": true}')
-        assert len(mod._TURN_ADVISORIES) >= 1
-        advisory = mod._flush_advisories()
+        mod._on_post_tool_call(
+            tool_name="write_file", args=args, result='{"ok": true}',
+            session_id="sess-A",
+        )
+        # Buffer is keyed by session_id
+        assert "sess-A" in mod._TURN_ADVISORIES
+        assert len(mod._TURN_ADVISORIES["sess-A"]) >= 1
+        advisory = mod._flush_advisories(session_id="sess-A")
         assert "Security Guidance" in advisory
         assert "CRITICAL" in advisory
+        # Flushing removes the session's entry (memory bounded)
+        assert "sess-A" not in mod._TURN_ADVISORIES
 
     def test_pre_llm_call_returns_advisory(self, monkeypatch):
         mod = _load_plugin_init()
         mod._TURN_ADVISORIES.clear()
-        mod._TURN_ADVISORIES.append({
+        mod._TURN_ADVISORIES["sess-B"] = [{
             "ruleName": "eval_injection",
             "severity": "critical",
             "reminder": "eval is dangerous",
-        })
-        ctx = mod._on_pre_llm_call(system_message="test")
+        }]
+        ctx = mod._on_pre_llm_call(system_message="test", session_id="sess-B")
         assert ctx is not None
         assert "context" in ctx
         assert "CRITICAL" in ctx["context"]
@@ -214,7 +277,7 @@ class TestPostToolCallBuffer:
     def test_pre_llm_call_returns_none_when_empty(self, monkeypatch):
         mod = _load_plugin_init()
         mod._TURN_ADVISORIES.clear()
-        assert mod._on_pre_llm_call(system_message="test") is None
+        assert mod._on_pre_llm_call(system_message="test", session_id="sess-C") is None
 
 
 class TestExecuteCodeAndTerminalCoverage:
@@ -224,6 +287,8 @@ class TestExecuteCodeAndTerminalCoverage:
             "execute_code", {"code": "eval(x)\n"}
         )
         assert any(f[0] == "eval_injection" for f in findings)
+        # 4-tuple: (ruleName, severity, reminder, path)
+        assert all(len(f) == 4 for f in findings)
 
     def test_terminal_command_scanned_by_scan_args(self):
         mod = _load_plugin_init()
@@ -262,6 +327,8 @@ class TestSecurityScanTool:
         result = mod.security_scan({"target": str(tmp_path), "scope": "directory"})
         assert "eval_injection" in result
         assert "CRITICAL" in result
+        # Directory findings now preserve the matched file path
+        assert "a.py" in result
 
     def test_scan_returns_clean_message_when_no_findings(self):
         mod = _load_plugin_init()

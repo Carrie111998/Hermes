@@ -110,30 +110,36 @@ def _plugin_disabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# In-memory per-turn advisory buffer (used by post_tool_call → pre_llm_call)
+# In-memory per-turn advisory buffer keyed by session_id (post_tool_call → pre_llm_call)
 # ---------------------------------------------------------------------------
 
-_TURN_ADVISORIES: List[Dict[str, Any]] = []
+# Keyed by session_id so concurrent sessions never cross-contaminate each
+# other's advisories.  post_tool_call receives ``session_id`` and buffers here;
+# pre_llm_call receives ``session_id`` and flushes (and removes) the entry.
+_TURN_ADVISORIES: Dict[str, List[Dict[str, Any]]] = {}
 
 
-def _add_advisory(rule_name: str, reminder: str) -> None:
-    _TURN_ADVISORIES.append({
+def _add_advisory(rule_name: str, reminder: str, session_id: str = "") -> None:
+    _TURN_ADVISORIES.setdefault(session_id, []).append({
         "ruleName": rule_name,
         "severity": _RULE_SEVERITY.get(rule_name, "medium"),
         "reminder": reminder,
     })
 
 
-def _flush_advisories() -> str:
-    """Build a concise markdown advisory for injection into the LLM prompt."""
-    if not _TURN_ADVISORIES:
+def _flush_advisories(session_id: str = "") -> str:
+    """Build a concise markdown advisory for injection into the LLM prompt.
+
+    Findings are buffered per-session in ``_TURN_ADVISORIES`` so concurrent
+    sessions don't cross-contaminate each other's advisories.  Flushing the
+    session's entry also removes it (``pop``), bounding memory growth.
+    """
+    items = _TURN_ADVISORIES.pop(session_id, None)
+    if not items:
         return ""
 
     lines: List[str] = ["", "🔒 Security Guidance — findings from this turn:", ""]
-    for item in sorted(
-        _TURN_ADVISORIES,
-        key=lambda x: _SEVERITY_ORDER.get(x["severity"], 99),
-    ):
+    for item in sorted(items, key=lambda x: _SEVERITY_ORDER.get(x["severity"], 99)):
         sev = item["severity"]
         emoji = _SEVERITY_EMOJI.get(sev, "ℹ️")
         lines.append(f"{emoji} **{sev.upper()}** — ``{item['ruleName']}``")
@@ -145,7 +151,6 @@ def _flush_advisories() -> str:
         "context, briefly document why in a code comment and continue. Otherwise, "
         "fix the code before moving on."
     )
-    _TURN_ADVISORIES.clear()
     return "\n".join(lines)
 
 
@@ -177,15 +182,16 @@ for _rule in _patterns.SECURITY_PATTERNS:
     _COMPILED.append(_entry)
 
 
-def _scan_content(path: str, content: str) -> List[Tuple[str, str, str]]:
-    """Return [(ruleName, severity, reminder), ...] for every pattern that matches.
+def _scan_content(path: str, content: str) -> List[Tuple[str, str, str, str]]:
+    """Return [(ruleName, severity, reminder, path), ...] for every pattern that matches.
 
-    ``path`` is used by per-rule path filters (path_filter / path_check).
-    Each rule fires at most once per call.
+    ``path`` is used by per-rule path filters (path_filter / path_check) and is
+    preserved in each finding so callers (e.g. directory scans) can report
+    which file matched.  Each rule fires at most once per call.
     """
     if not content or len(content.encode("utf-8", errors="ignore")) > _MAX_SCAN_BYTES:
         return []
-    hits: List[Tuple[str, str, str]] = []
+    hits: List[Tuple[str, str, str, str]] = []
     for entry in _COMPILED:
         path_check = entry.get("path_check")
         if path_check is not None:
@@ -195,6 +201,7 @@ def _scan_content(path: str, content: str) -> List[Tuple[str, str, str]]:
                         entry["ruleName"],
                         entry["severity"],
                         entry["reminder"],
+                        path or "",
                     ))
             except Exception:
                 pass
@@ -219,6 +226,7 @@ def _scan_content(path: str, content: str) -> List[Tuple[str, str, str]]:
                 entry["ruleName"],
                 entry["severity"],
                 entry["reminder"],
+                path or "",
             ))
     return hits
 
@@ -240,21 +248,21 @@ def _extract_path_and_content(tool_name: str, args: Any) -> List[Tuple[str, str]
     return out
 
 
-def _format_warning_block(findings: List[Tuple[str, str, str]]) -> str:
+def _format_warning_block(findings: List[Tuple[str, str, str, str]]) -> str:
     """Render findings into a Markdown block appended to the tool result."""
     # Sort by severity (critical first)
     findings = sorted(
         findings,
         key=lambda x: _SEVERITY_ORDER.get(x[1], 99),
     )
-    names = ", ".join(name for name, _, _ in findings)
+    names = ", ".join(name for name, _, _, _ in findings)
     lines = [
         "",
         "---",
         f"⚠️ Security guidance — {len(findings)} pattern{'s' if len(findings) != 1 else ''} matched ({names})",
         "",
     ]
-    for rule_name, severity, reminder in findings:
+    for rule_name, severity, reminder, _path in findings:
         emoji = _SEVERITY_EMOJI.get(severity, "ℹ️")
         lines.append(f"{emoji} **{severity.upper()}** — ``{rule_name}``")
         lines.append(reminder)
@@ -271,11 +279,11 @@ def _format_warning_block(findings: List[Tuple[str, str, str]]) -> str:
 # Hooks
 # ---------------------------------------------------------------------------
 
-def _scan_args(tool_name: str, args: Any) -> List[Tuple[str, str, str]]:
+def _scan_args(tool_name: str, args: Any) -> List[Tuple[str, str, str, str]]:
     """Common scan path used by hooks."""
     if _plugin_disabled():
         return []
-    findings: List[Tuple[str, str, str]] = []
+    findings: List[Tuple[str, str, str, str]] = []
     for path, content in _extract_path_and_content(tool_name, args):
         findings.extend(_scan_content(path, content))
     return findings
@@ -331,23 +339,29 @@ def _on_post_tool_call(
     tool_name: str = "",
     args: Any = None,
     result: Any = None,
+    session_id: str = "",
     **_: Any,
 ) -> None:
-    """Buffer findings so they can be injected via pre_llm_call."""
+    """Buffer findings so they can be injected via pre_llm_call.
+
+    Findings are keyed by ``session_id`` so concurrent sessions never see
+    each other's advisories.
+    """
     if _block_mode_enabled() or _plugin_disabled():
         return
-    for rule_name, severity, reminder in _scan_args(tool_name, args):
-        _add_advisory(rule_name, reminder)
+    for rule_name, severity, reminder, _path in _scan_args(tool_name, args):
+        _add_advisory(rule_name, reminder, session_id=session_id)
 
 
 def _on_pre_llm_call(
     *,
     messages: Optional[List[Dict[str, Any]]] = None,
     system_message: Optional[str] = None,
+    session_id: str = "",
     **_: Any,
 ) -> Optional[Dict[str, Any]]:
     """Inject accumulated advisories into the prompt context before the LLM call."""
-    advisory = _flush_advisories()
+    advisory = _flush_advisories(session_id=session_id)
     if not advisory:
         return None
     return {"context": advisory}
@@ -397,7 +411,7 @@ def security_scan(args: Dict[str, Any], **kwargs: Any) -> str:
         else:
             scope = "text"
 
-    findings: List[Tuple[str, str, str]] = []
+    findings: List[Tuple[str, str, str, str]] = []
 
     if scope == "file":
         path = Path(target)
@@ -430,7 +444,7 @@ def security_scan(args: Dict[str, Any], **kwargs: Any) -> str:
 
     lines = [f"# Security Scan Report — {target}", ""]
     summary: Dict[str, int] = {}
-    for rule_name, severity, _ in findings:
+    for _rule, severity, _r, _p in findings:
         summary[severity] = summary.get(severity, 0) + 1
 
     lines.append("## Summary")
@@ -441,11 +455,14 @@ def security_scan(args: Dict[str, Any], **kwargs: Any) -> str:
     lines.append("")
 
     lines.append("## Findings")
-    for rule_name, severity, reminder in sorted(
+    for rule_name, severity, reminder, fpath in sorted(
         findings, key=lambda x: _SEVERITY_ORDER.get(x[1], 99)
     ):
         emoji = _SEVERITY_EMOJI.get(severity, "ℹ️")
-        lines.append(f"### {emoji} ``{rule_name}`` ({severity.upper()})")
+        heading = f"### {emoji} ``{rule_name}`` ({severity.upper()})"
+        if fpath and fpath != "input_text":
+            heading += f" — ``{fpath}``"
+        lines.append(heading)
         lines.append(reminder)
         lines.append("")
 
@@ -459,26 +476,30 @@ def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_tool(
         name="security_scan",
-        description=(
-            "Scan files, directories, or raw text for known-dangerous code patterns. "
-            "Supports SQL injection, XSS, command injection, hardcoded secrets, unsafe eval, "
-            "path traversal, SSRF, insecure deserialization, and more. "
-            "Args: target (str) — path or text; scope (str, optional) — file | directory | text."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "target": {
-                    "type": "string",
-                    "description": "File path, directory path, or raw text to scan.",
+        toolset="security",
+        schema={
+            "name": "security_scan",
+            "description": (
+                "Scan files, directories, or raw text for known-dangerous code patterns. "
+                "Supports SQL injection, XSS, command injection, hardcoded secrets, unsafe eval, "
+                "path traversal, SSRF, insecure deserialization, and more. "
+                "Args: target (str) — path or text; scope (str, optional) — file | directory | text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "File path, directory path, or raw text to scan.",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["file", "directory", "text"],
+                        "description": "Optional: 'file', 'directory', or 'text'. Auto-inferred if omitted.",
+                    },
                 },
-                "scope": {
-                    "type": "string",
-                    "enum": ["file", "directory", "text"],
-                    "description": "Optional: 'file', 'directory', or 'text'. Auto-inferred if omitted.",
-                },
+                "required": ["target"],
             },
-            "required": ["target"],
         },
         handler=security_scan,
     )
