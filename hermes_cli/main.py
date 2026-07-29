@@ -437,6 +437,7 @@ from hermes_cli.subcommands.sync import build_sync_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
 from hermes_cli.subcommands.model import build_model_parser
+from hermes_cli.subcommands.subagent import build_subagent_parser
 from hermes_cli.subcommands.setup import build_setup_parser
 
 from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
@@ -4531,6 +4532,69 @@ def cmd_status(args):
     from hermes_cli.status import show_status
 
     show_status(args)
+
+
+def cmd_subagent(args):
+    """Inspect or pin the subagent model.
+
+    Dispatches on ``args.subagent_command``:
+
+        hermes subagent                     # status
+        hermes subagent model               # interactive picker
+        hermes subagent model <model>       # validated direct selection
+        hermes subagent model --reset       # inherit parent
+    """
+    from hermes_cli.subagent_model import (
+        get_subagent_model_status,
+        reset_subagent_model,
+        select_subagent_model_interactively,
+        set_subagent_model,
+    )
+
+    sub = getattr(args, "subagent_command", None)
+    if sub in {None, ""}:
+        _print_subagent_status(get_subagent_model_status())
+        return
+    if sub == "model":
+        if getattr(args, "reset", False):
+            _print_subagent_status(reset_subagent_model(), action="Reset")
+            return
+        model_arg = getattr(args, "model", None)
+        if model_arg:
+            status = set_subagent_model(
+                model_arg,
+                provider=getattr(args, "provider", None) or None,
+            )
+            _print_subagent_status(status, action="Pinned")
+            return
+        _require_tty("subagent model")
+        status = select_subagent_model_interactively(
+            refresh=bool(getattr(args, "refresh", False))
+        )
+        _print_subagent_status(status, action="Selected")
+        return
+
+    print("usage: hermes subagent [model [<model>|--reset|--refresh]]")
+
+
+def _print_subagent_status(status, action=None):
+    """Render a SubagentModelStatus to stdout.
+
+    `action` is a one-word prefix shown only on mutating operations
+    (e.g. "Pinned", "Reset") so the user sees what just happened.
+    Status display uses no prefix.
+    """
+    if status.inherits_parent:
+        label = "inherits parent"
+    else:
+        label = status.model or "(none)"
+        if status.provider:
+            label = f"{label} (provider: {status.provider})"
+
+    if action:
+        print(f"  {action} subagent model: {label}")
+    else:
+        print(f"  Subagent model: {label}")
 
 
 def cmd_cron(args):
@@ -11085,6 +11149,11 @@ def main():
     # model command  (parser built in hermes_cli/subcommands/model.py)
     # =========================================================================
     build_model_parser(subparsers, cmd_model=cmd_model)
+
+    # =========================================================================
+    # subagent command — inspect/pin the subagent model
+    # =========================================================================
+    build_subagent_parser(subparsers, cmd_subagent=cmd_subagent)
 
     from hermes_cli.moa_cmd import cmd_moa
 

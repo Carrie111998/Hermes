@@ -7,6 +7,7 @@ import { isSectionName, nextDetailsMode, parseDetailsMode, SECTION_NAMES } from 
 import type {
   ConfigGetValueResponse,
   ConfigSetResponse,
+  DelegationModelResponse,
   SessionSaveResponse,
   SessionStatusResponse,
   SessionSteerResponse,
@@ -764,6 +765,79 @@ export const coreCommands: SlashCommand[] = [
           ctx.transcript.send(last)
         })
       )
+    }
+  },
+
+  {
+    help: 'select the model used by delegated subagents',
+    name: 'subagent',
+    aliases: ['sa'],
+    run: (arg, ctx) => {
+      const format = (r: DelegationModelResponse) =>
+        r?.inherits_parent
+          ? 'inherits parent'
+          : `${r?.model ?? '(none)'}${r?.provider ? ` (provider: ${r.provider})` : ''}`
+
+      const raw = arg.trim()
+
+      if (!raw) {
+        ctx.gateway
+          .rpc<DelegationModelResponse>('delegation.model', {})
+          .then(ctx.guarded<DelegationModelResponse>(r => ctx.transcript.sys(`subagent model: ${format(r)}`)))
+          .catch(ctx.guardedErr)
+
+        return
+      }
+
+      const [verb = '', ...tail] = raw.split(/\s+/)
+
+      if (verb.toLowerCase() !== 'model') {
+        ctx.transcript.sys('usage: /subagent model [model|reset] [--provider name] [--refresh]')
+
+        return
+      }
+
+      const parts = tail.filter(part => !['--session', '--global'].includes(part.toLowerCase()))
+      const reset = new Set(['reset', 'clear', 'default']).has((parts[0] ?? '').toLowerCase())
+
+      if (reset) {
+        ctx.gateway
+          .rpc<DelegationModelResponse>('delegation.model', { reset: true })
+          .then(ctx.guarded<DelegationModelResponse>(r => ctx.transcript.sys(`subagent model reset → ${format(r)}`)))
+          .catch(ctx.guardedErr)
+
+        return
+      }
+
+      const refresh = parts.includes('--refresh')
+      const providerIdx = parts.indexOf('--provider')
+      const provider = providerIdx >= 0 ? parts[providerIdx + 1] : undefined
+
+      const model = parts.find((part, index) => {
+        if (part.startsWith('--')) {
+          return false
+        }
+
+        if (providerIdx >= 0 && index === providerIdx + 1) {
+          return false
+        }
+
+        return true
+      })
+
+      if (!model) {
+        patchOverlayState({ modelPicker: { refresh, target: 'subagent' } })
+
+        return
+      }
+
+      ctx.gateway
+        .rpc<DelegationModelResponse>('delegation.model', {
+          model,
+          ...(provider ? { provider } : {})
+        })
+        .then(ctx.guarded<DelegationModelResponse>(r => ctx.transcript.sys(`subagent model pinned → ${format(r)}`)))
+        .catch(ctx.guardedErr)
     }
   }
 ]

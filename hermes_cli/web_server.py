@@ -6076,6 +6076,73 @@ def get_model_info(profile: Optional[str] = None):
         return dict(_EMPTY_MODEL_INFO)
 
 
+@app.get("/api/model/delegate")
+def get_delegate_model_info(profile: Optional[str] = None):
+    """Return the current subagent model override status.
+
+    When ``delegation.model`` / ``delegation.provider`` are unset,
+    ``inherits_parent`` is true and subagents run on whatever the parent
+    is using.  New children read this on every spawn — no restart needed.
+    """
+    try:
+        with _profile_scope(profile):
+            from hermes_cli.subagent_model import get_subagent_model_status
+
+            status = get_subagent_model_status()
+            return {
+                "model": status.model,
+                "provider": status.provider,
+                "inherits_parent": status.inherits_parent,
+            }
+    except Exception:
+        _log.exception("GET /api/model/delegate failed")
+        return {"model": None, "provider": None, "inherits_parent": True}
+
+
+@app.post("/api/model/delegate")
+def set_delegate_model(
+    body: dict,
+    profile: Optional[str] = None,
+):
+    """Pin or reset the subagent model override.
+
+    Body shapes:
+      - {"model": "sonnet", "provider": "anthropic"} → pin
+      - {"reset": true}                               → remove override
+    """
+    try:
+        with _profile_scope(profile):
+            reset = bool(body.get("reset"))
+            model = str(body.get("model") or "").strip()
+            provider = str(body.get("provider") or "").strip()
+
+            if reset:
+                from hermes_cli.subagent_model import reset_subagent_model
+
+                status = reset_subagent_model()
+            elif model:
+                from hermes_cli.subagent_model import set_subagent_model
+
+                status = set_subagent_model(model, provider=provider or None)
+            else:
+                from hermes_cli.subagent_model import get_subagent_model_status
+
+                status = get_subagent_model_status()
+
+            return {
+                "model": status.model,
+                "provider": status.provider,
+                "inherits_parent": status.inherits_parent,
+            }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        _log.exception("POST /api/model/delegate failed")
+        raise HTTPException(status_code=500, detail="Failed to update subagent model")
+
+
 # ---------------------------------------------------------------------------
 # Model assignment — pick provider+model for main slot or auxiliary slots.
 # Mirrors the model.options JSON-RPC from tui_gateway but uses REST so the

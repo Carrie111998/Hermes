@@ -568,6 +568,12 @@ export interface DelegationStatusResponse {
   paused?: boolean
 }
 
+export interface DelegationModelResponse {
+  model: null | string
+  provider: null | string
+  inherits_parent: boolean
+}
+
 export interface DelegationPauseResponse {
   paused?: boolean
 }

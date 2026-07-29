@@ -2798,6 +2798,36 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"paused": set_spawn_paused(paused)})
 
 
+@method("delegation.model")
+def _(rid, params: dict) -> dict:
+    """Read, set, or reset the shared subagent model override."""
+    if bool(params.get("reset")):
+        from hermes_cli.subagent_model import reset_subagent_model
+
+        status = reset_subagent_model()
+    elif str(params.get("model") or "").strip():
+        from hermes_cli.subagent_model import set_subagent_model
+
+        provider = str(params.get("provider") or "").strip() or None
+        try:
+            status = set_subagent_model(str(params["model"]), provider=provider)
+        except ValueError as exc:
+            return _err(rid, 4000, str(exc))
+    else:
+        from hermes_cli.subagent_model import get_subagent_model_status
+
+        status = get_subagent_model_status()
+
+    return _ok(
+        rid,
+        {
+            "model": status.model,
+            "provider": status.provider,
+            "inherits_parent": status.inherits_parent,
+        },
+    )
+
+
 @method("subagent.interrupt")
 def _(rid, params: dict) -> dict:
     from tools.delegate_tool import interrupt_subagent

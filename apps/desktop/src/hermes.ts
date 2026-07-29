@@ -20,6 +20,7 @@ import type {
   CustomEndpointUpdate,
   CustomEndpointValidationResponse,
   DebugShareResponse,
+  DelegateModelResponse,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
   HermesConfig,
@@ -154,6 +155,7 @@ export type {
   CustomEndpointUpdate,
   CustomEndpointValidationResponse,
   DebugShareResponse,
+  DelegateModelResponse,
   ElevenLabsVoice,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
@@ -1519,6 +1521,27 @@ export function setModelAssignment(body: ModelAssignmentRequest): Promise<ModelA
   return window.hermesDesktop.api<ModelAssignmentResponse>({
     ...profileScoped(),
     path: '/api/model/set',
+    method: 'POST',
+    body
+  })
+}
+
+export function getDelegateModelInfo(): Promise<DelegateModelResponse> {
+  return window.hermesDesktop.api<DelegateModelResponse>({
+    ...profileScoped(),
+    path: '/api/model/delegate',
+    timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+  })
+}
+
+export function setDelegateModel(body: {
+  model?: string
+  provider?: string
+  reset?: boolean
+}): Promise<DelegateModelResponse> {
+  return window.hermesDesktop.api<DelegateModelResponse>({
+    ...profileScoped(),
+    path: '/api/model/delegate',
     method: 'POST',
     body
   })

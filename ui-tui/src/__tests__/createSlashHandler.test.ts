@@ -40,6 +40,25 @@ describe('createSlashHandler', () => {
     expect(getOverlayState().sessions).toBe(true)
   })
 
+  it('opens the shared model picker for /subagent model', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/subagent model')).toBe(true)
+    expect(getOverlayState().modelPicker).toEqual({ refresh: false, target: 'subagent' })
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+  })
+
+  it('resets the subagent override through delegation.model', async () => {
+    const rpc = vi.fn(() => Promise.resolve({ model: null, provider: null, inherits_parent: true }))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/subagent model reset')).toBe(true)
+    expect(rpc).toHaveBeenCalledWith('delegation.model', { reset: true })
+    await vi.waitFor(() => {
+      expect(ctx.transcript.sys).toHaveBeenCalledWith('subagent model reset → inherits parent')
+    })
+  })
+
   it('resumes a prior session by id when /resume has an argument', () => {
     const ctx = buildCtx()
 

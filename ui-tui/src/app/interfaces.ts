@@ -292,7 +292,7 @@ export interface OverlayState {
   /** Modal widget app — owns input, blocks the composer. */
   widget: ActiveWidget | null
   journey: boolean
-  modelPicker: boolean | { refresh?: boolean }
+  modelPicker: boolean | { refresh?: boolean; target?: 'main' | 'subagent' }
   pager: null | PagerState
   petPicker: boolean
   pluginsHub: boolean
@@ -549,6 +549,7 @@ export interface AppLayoutActions {
   newLiveSession: () => void
   newPromptSession: (prompt: string, modelArg?: string) => void
   onModelSelect: (value: string) => void
+  onSubagentModelSelect: (value: string) => void
   resumeById: (id: string) => void
   setStickyPrompt: (value: string) => void
 }
@@ -610,6 +611,7 @@ export interface AppOverlaysProps {
   onActiveSessionSelect: (sessionId: string) => void
   onActiveSessionClose: (sessionId: string) => Promise<null | SessionCloseResponse>
   onModelSelect: (value: string) => void
+  onSubagentModelSelect: (value: string) => void
   onNewLiveSession: () => void
   onNewPromptSession: (prompt: string, modelArg?: string) => void
   onResumeSelect: (sessionId: string) => void

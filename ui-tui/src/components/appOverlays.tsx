@@ -169,6 +169,7 @@ export function FloatingOverlays({
   onActiveSessionSelect,
   onActiveSessionClose,
   onModelSelect,
+  onSubagentModelSelect,
   onNewLiveSession,
   onNewPromptSession,
   onResumeSelect,
@@ -181,6 +182,7 @@ export function FloatingOverlays({
   | 'onActiveSessionSelect'
   | 'onActiveSessionClose'
   | 'onModelSelect'
+  | 'onSubagentModelSelect'
   | 'onNewLiveSession'
   | 'onNewPromptSession'
   | 'onResumeSelect'
@@ -242,17 +244,19 @@ export function FloatingOverlays({
 
   if (overlay.modelPicker) {
     const initialRefresh = typeof overlay.modelPicker === 'object' && overlay.modelPicker.refresh === true
+    const subagentTarget = typeof overlay.modelPicker === 'object' && overlay.modelPicker.target === 'subagent'
 
     widgets.push({
       id: 'model-picker',
       render: width => (
         <FloatBox color={theme.color.border}>
           <ModelPicker
+            allowPersistGlobal={!subagentTarget}
             gw={gw}
             initialRefresh={initialRefresh}
             maxWidth={width}
             onCancel={() => patchOverlayState({ modelPicker: false })}
-            onSelect={onModelSelect}
+            onSelect={subagentTarget ? onSubagentModelSelect : onModelSelect}
             sessionId={sid}
             t={theme}
           />

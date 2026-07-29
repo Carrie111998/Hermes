@@ -16,6 +16,8 @@ const getGlobalModelInfo = vi.fn()
 const getGlobalModelOptions = vi.fn()
 const getAuxiliaryModels = vi.fn()
 const getMoaModels = vi.fn()
+const getDelegateModelInfo = vi.fn()
+const setDelegateModel = vi.fn()
 const setModelAssignment = vi.fn()
 const getRecommendedDefaultModel = vi.fn()
 const saveMoaModels = vi.fn()
@@ -32,6 +34,8 @@ vi.mock('@/hermes', () => ({
   getGlobalModelOptions: () => getGlobalModelOptions(),
   getAuxiliaryModels: () => getAuxiliaryModels(),
   getMoaModels: () => getMoaModels(),
+  getDelegateModelInfo: () => getDelegateModelInfo(),
+  setDelegateModel: (body: unknown) => setDelegateModel(body),
   setModelAssignment: (body: unknown) => setModelAssignment(body),
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
   saveMoaModels: (body: unknown) => saveMoaModels(body),
@@ -71,6 +75,12 @@ beforeEach(() => {
     tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
   })
   getMoaModels.mockResolvedValue(null)
+  getDelegateModelInfo.mockResolvedValue({ model: null, provider: null, inherits_parent: true })
+  setDelegateModel.mockImplementation(async (body: { model?: string; provider?: string; reset?: boolean }) =>
+    body.reset
+      ? { model: null, provider: null, inherits_parent: true }
+      : { model: body.model ?? null, provider: body.provider ?? null, inherits_parent: false }
+  )
   setModelAssignment.mockResolvedValue({ provider: 'nous', model: 'hermes-4', gateway_tools: [] })
   getRecommendedDefaultModel.mockResolvedValue({ provider: 'nous', model: 'hermes-4', free_tier: null })
   setEnvVar.mockResolvedValue({ ok: true })
@@ -113,6 +123,22 @@ describe('ModelSettings', () => {
     // "Nous" shows in both the trigger and the open list.
     expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
     expect(screen.queryByText(/DeepSeek/)).toBeNull()
+  })
+
+  it('selects and resets the subagent model from the shared catalog', async () => {
+    await renderModelSettings()
+
+    const inheritLabel = await screen.findByText('Inherit parent model')
+    const trigger = inheritLabel.closest('button')
+    expect(trigger).not.toBeNull()
+    fireEvent.click(trigger!)
+    fireEvent.click(await screen.findByText('Nous — hermes-4-mini'))
+
+    await waitFor(() =>
+      expect(setDelegateModel).toHaveBeenCalledWith({ provider: 'nous', model: 'hermes-4-mini' })
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Inherit parent' }))
+    await waitFor(() => expect(setDelegateModel).toHaveBeenCalledWith({ reset: true }))
   })
 
   it.each(['custom', 'local', 'custom:lab'])(

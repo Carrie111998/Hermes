@@ -151,7 +151,13 @@ delegation:
   provider: "openrouter"              # Optional: route subagents to a different provider
 ```
 
-If omitted, subagents use the same model as the parent.
+If omitted, subagents use the same model as the parent. You can manage the same two keys without editing YAML:
+
+- Shell: `hermes subagent model` opens the authenticated provider/model picker; `hermes subagent model --reset` restores inheritance.
+- Classic CLI and TUI: `/subagent model` opens their existing model picker; `/subagent model reset` restores inheritance.
+- Desktop: **Settings → Model → Subagent model** uses the same provider/model catalog and includes an **Inherit parent model** option.
+
+Every surface resolves aliases, provider credentials, and provider-specific model names through the same model-switch core before atomically saving `delegation.model` and `delegation.provider`. Changes apply to newly spawned children; existing subagents keep the model they started with.
 
 ## Inherited Tool Access
 

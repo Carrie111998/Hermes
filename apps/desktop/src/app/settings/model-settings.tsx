@@ -7,17 +7,20 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import {
   getAuxiliaryModels,
+  getDelegateModelInfo,
   getGlobalModelInfo,
   getGlobalModelOptions,
   getMoaModels,
   getRecommendedDefaultModel,
   saveHermesConfig,
   saveMoaModels,
+  setDelegateModel,
   setEnvVar,
   setModelAssignment
 } from '@/hermes'
 import type {
   AuxiliaryModelsResponse,
+  DelegateModelResponse,
   MoaConfigResponse,
   MoaModelSlot,
   ModelOptionProvider,
@@ -118,6 +121,7 @@ const AUX_TASKS: readonly AuxTaskMeta[] = [
 ]
 
 const NO_PROVIDERS: readonly ModelOptionProvider[] = [{ name: '—', slug: '', models: [] }]
+const DELEGATE_INHERIT_VALUE = '__inherit_parent__'
 
 // Radix <Select> renders a blank trigger when `value` matches no <SelectItem>.
 // A custom model (e.g. one added via config that isn't in the provider's
@@ -195,6 +199,9 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   const [moa, setMoa] = useState<MoaConfigResponse | null>(null)
   const [selectedMoaPreset, setSelectedMoaPreset] = useState('')
   const [newMoaPresetName, setNewMoaPresetName] = useState('')
+  // Subagent model override (delegation.model / delegation.provider).
+  // Blank = inherits parent. Loaded alongside the main model catalog.
+  const [delegateModel, setDelegateModelState] = useState<DelegateModelResponse | null>(null)
   // agent.* defaults round-trip through the shared config cache (read → write
   // back the whole record), so a save here shows in the MCP/config surfaces.
   const { data: config } = useHermesConfigRecord()
@@ -229,11 +236,12 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     setError('')
 
     try {
-      const [modelInfo, modelOptions, auxiliaryModels, moaModels] = await Promise.all([
+      const [modelInfo, modelOptions, auxiliaryModels, moaModels, delegateInfo] = await Promise.all([
         getGlobalModelInfo(),
         getGlobalModelOptions(),
         getAuxiliaryModels(),
-        getMoaModels().catch(() => null)
+        getMoaModels().catch(() => null),
+        getDelegateModelInfo().catch(() => null)
       ])
 
       if (profileEpoch.current !== epoch) {
@@ -242,6 +250,9 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
 
       setMainModel({ model: modelInfo.model, provider: modelInfo.provider })
       setProviders(modelOptions.providers || [])
+      if (delegateInfo) {
+        setDelegateModelState(delegateInfo)
+      }
 
       if (replaceSelection) {
         setSelectedProvider(modelInfo.provider)
@@ -285,11 +296,43 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     // truth. Ordinary same-profile refreshes still preserve in-progress edits.
     setSelectedProvider('')
     setSelectedModel('')
+    setDelegateModelState(null)
     setApiKeyDraft('')
     void refresh({ replaceSelection: true })
   })
 
   const providerOptions = providers.length ? providers : NO_PROVIDERS
+  const delegateModelOptions = useMemo(() => {
+    const options = providers
+      .filter(provider => isProviderReady(provider))
+      .flatMap(provider =>
+        (provider.models ?? []).map(model => ({
+          label: `${provider.name || provider.slug} — ${model}`,
+          model,
+          provider: provider.slug,
+          value: JSON.stringify([provider.slug, model])
+        }))
+      )
+    if (
+      delegateModel &&
+      !delegateModel.inherits_parent &&
+      delegateModel.model &&
+      delegateModel.provider &&
+      !options.some(option => option.model === delegateModel.model && option.provider === delegateModel.provider)
+    ) {
+      options.unshift({
+        label: `${delegateModel.provider} — ${delegateModel.model}`,
+        model: delegateModel.model,
+        provider: delegateModel.provider,
+        value: JSON.stringify([delegateModel.provider, delegateModel.model])
+      })
+    }
+    return options
+  }, [delegateModel, providers])
+  const delegateModelValue =
+    delegateModel && !delegateModel.inherits_parent && delegateModel.model && delegateModel.provider
+      ? JSON.stringify([delegateModel.provider, delegateModel.model])
+      : DELEGATE_INHERIT_VALUE
 
   // Radix renders a blank trigger when the controlled value has no matching
   // item. Keep a missing saved provider visible in the main selector while
@@ -471,6 +514,40 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
   }, [])
 
   const auxiliaryTaskLabel = useCallback((key: string) => m.tasks[key]?.label ?? key, [m.tasks])
+
+  const resetDelegateModel = useCallback(async () => {
+    const epoch = profileEpoch.current
+    setApplying(true)
+    setError('')
+    try {
+      const result = await setDelegateModel({ reset: true })
+      if (profileEpoch.current !== epoch) {
+        return
+      }
+      setDelegateModelState(result)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setApplying(false)
+    }
+  }, [])
+
+  const applyDelegateModel = useCallback(async (provider: string, model: string) => {
+    const epoch = profileEpoch.current
+    setApplying(true)
+    setError('')
+    try {
+      const result = await setDelegateModel({ provider, model })
+      if (profileEpoch.current !== epoch) {
+        return
+      }
+      setDelegateModelState(result)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setApplying(false)
+    }
+  }, [])
 
   // Persistent mismatch: any aux slot pinned to a provider different from the
   // current main, regardless of whether the user just switched. Catches the
@@ -879,6 +956,50 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             />
           </div>
         )}
+      </section>
+
+      <section>
+        <div className="mb-2.5 flex items-center justify-between">
+          <SectionHeading icon={Cpu} title={m.delegateTitle} />
+          {delegateModel && !delegateModel.inherits_parent && (
+            <Button
+              disabled={applying}
+              onClick={() => void resetDelegateModel()}
+              size="sm"
+              variant="textStrong"
+            >
+              {m.delegateReset}
+            </Button>
+          )}
+        </div>
+        <p className="mb-2 text-xs text-muted-foreground">{m.delegateDesc}</p>
+
+        <Select
+          disabled={applying || !delegateModel}
+          onValueChange={value => {
+            if (value === DELEGATE_INHERIT_VALUE) {
+              void resetDelegateModel()
+              return
+            }
+            const option = delegateModelOptions.find(row => row.value === value)
+            if (option) {
+              void applyDelegateModel(option.provider, option.model)
+            }
+          }}
+          value={delegateModelValue}
+        >
+          <SelectTrigger className={cn('w-full max-w-xl', CONTROL_TEXT)}>
+            <SelectValue placeholder={m.model} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={DELEGATE_INHERIT_VALUE}>{m.delegateInheritsParent}</SelectItem>
+            {delegateModelOptions.map(option => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </section>
 
       <section>
