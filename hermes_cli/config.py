@@ -2478,6 +2478,7 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        "inherit_memory": True,
         "max_iterations": 50,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
@@ -5452,6 +5453,12 @@ def _normalize_custom_provider_entry(
                 base_url = candidate
                 break
             parsed = urlparse(candidate)
+            # Allow known non-HTTP schemes (cursor://agent, moa://local, etc.)
+            # These are handled specially at runtime and don't need HTTP scheme+host
+            known_non_http_schemes = ("cursor://", "moa://")
+            if any(candidate.strip().lower().startswith(s) for s in known_non_http_schemes):
+                base_url = candidate
+                break
             if parsed.scheme and parsed.netloc:
                 base_url = candidate
                 break
