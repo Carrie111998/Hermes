@@ -52,6 +52,7 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
+_DISCORD_FULL_OPTION_THRESHOLD_UTF16_UNITS = 40
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
@@ -7020,6 +7021,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     value="Pick one below, or click ✏️ Other to type a custom answer.",
                     inline=False,
                 )
+                if any(
+                    utf16_len(choice) > _DISCORD_FULL_OPTION_THRESHOLD_UTF16_UNITS
+                    for choice in clean_choices
+                ):
+                    embed.add_field(
+                        name="Full options",
+                        value="\n".join(
+                            f"{index}. {choice}"
+                            for index, choice in enumerate(clean_choices, start=1)
+                        ),
+                        inline=False,
+                    )
                 view = ClarifyChoiceView(
                     choices=clean_choices,
                     clarify_id=clarify_id,

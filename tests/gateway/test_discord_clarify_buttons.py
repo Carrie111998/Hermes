@@ -361,11 +361,12 @@ class TestDiscordSendClarify:
         sent_msg.id = 123456
         channel.send = AsyncMock(return_value=sent_msg)
         adapter._client.get_channel = MagicMock(return_value=channel)
+        long_choice = "x" * 41
 
         result = await adapter.send_clarify(
             chat_id="9001",
             question="Pick a color",
-            choices=["red", "green", "blue"],
+            choices=["red", long_choice, "blue"],
             clarify_id="cidM",
             session_key="sk-M",
         )
@@ -380,6 +381,15 @@ class TestDiscordSendClarify:
         assert isinstance(kwargs["view"], ClarifyChoiceView)
         # 3 choice buttons + 1 Other
         assert len(kwargs["view"].children) == 4
+        fields = {f["name"]: f["value"] for f in kwargs["embed"].fields}
+        assert (
+            fields["Choices"]
+            == "Pick one below, or click ✏️ Other to type a custom answer."
+        )
+        assert fields["Full options"] == f"1. red\n2. {long_choice}\n3. blue"
+        assert kwargs["view"].children[0].label == "1. red"
+        assert kwargs["view"].children[1].label == f"2. {long_choice}"
+        assert kwargs["view"].children[2].label == "3. blue"
 
     @pytest.mark.asyncio
     async def test_open_ended_omits_view(self):
@@ -458,6 +468,8 @@ class TestDiscordSendClarify:
         )
         kwargs = channel.send.call_args.kwargs
         view = kwargs["view"]
+        fields = {f["name"]: f["value"] for f in kwargs["embed"].fields}
+        assert "Full options" not in fields
         # Only 1 real choice + 1 Other = 2 children
         assert len(view.children) == 2
         assert "real-choice" in view.children[0].label
