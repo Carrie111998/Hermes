@@ -2957,6 +2957,19 @@ DEFAULT_CONFIG = {
         "allow_lazy_installs": True,
     },
 
+    # Anthropic-specific resolution options. The only setting today is
+    # ``force_env_token``, an escape hatch for users who set ANTHROPIC_TOKEN
+    # (or CLAUDE_CODE_OAUTH_TOKEN) explicitly in .env but find Hermes
+    # silently swapping it for a stale Claude Code credential from
+    # ``~/.claude/.credentials.json``. With ``force_env_token: true``, the
+    # user's .env token is always respected — no silent substitution.
+    # Default false to preserve the existing refresh-prefer behavior, which
+    # is the right call for the common case where a stale setup token would
+    # otherwise shadow a refreshable Claude Code credential.
+    "anthropic": {
+        "force_env_token": False,
+    },
+
     "cron": {
         # Fail closed when an unpinned job's current global model/provider
         # differs from its creation-time snapshot. This prevents unattended
