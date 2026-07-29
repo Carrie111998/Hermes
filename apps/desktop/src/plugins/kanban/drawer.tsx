@@ -474,7 +474,7 @@ function AttachmentsSection({
               </button>
               <Button
                 aria-label={k.downloadAttachment}
-                className="shrink-0 opacity-0 group-hover/att:opacity-100 focus-visible:opacity-100"
+                className="shrink-0 opacity-0 group-hover/att:opacity-100 group-focus-within/att:opacity-100"
                 onClick={() => onDownload(attachment)}
                 size="icon-xs"
                 title={k.downloadAttachment}
