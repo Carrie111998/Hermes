@@ -1735,11 +1735,20 @@ def test_install_exact_rolls_back_substituted_destination_inode(
             dir_fd=directory_fd,
         )
         try:
-            os.write(descriptor, b'{"attacker":true}')
+            os.write(descriptor, payload)
             os.fchmod(descriptor, 0o400)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        substituted = os.stat(
+            source.name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        assert (
+            substituted.st_dev,
+            substituted.st_ino,
+        ) != expected_identity
         os.rename(
             source.name,
             destination.name,

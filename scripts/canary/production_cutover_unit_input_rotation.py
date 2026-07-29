@@ -915,6 +915,7 @@ def _install_exact(
     created = False
     descriptor: int | None = None
     directory_descriptor: int | None = None
+    temporary_descriptor: int | None = None
     temporary_identity: tuple[int, int] | None = None
     checkpoint_prefix = f"install_exact:{path.name}"
     try:
@@ -981,12 +982,30 @@ def _install_exact(
                 raise UnitInputRotationError(
                     "unit_input_rotation_conflict"
                 )
+            temporary_flags = os.O_RDONLY | getattr(
+                os,
+                "O_CLOEXEC",
+                0,
+            )
+            temporary_flags |= getattr(os, "O_NOFOLLOW", 0)
+            temporary_descriptor = os.open(
+                temporary.name,
+                temporary_flags,
+                dir_fd=directory_descriptor,
+            )
+            temporary_opened = os.fstat(temporary_descriptor)
+            if _identity(temporary_opened) != _identity(temporary_state):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_conflict"
+                )
             # The canonical activation lock plus this owner-only 0700
             # directory is the writer concurrency boundary.  The retained
-            # dirfd anchors both names; bind the source inode immediately
-            # before publication and require the destination to be that same
-            # inode.  A violated boundary is rolled back without accepting the
-            # substituted destination.
+            # dirfd anchors both names, while the retained source descriptor
+            # prevents an unlinked source inode from being reused during
+            # publication.  Bind the source immediately before publication
+            # and require the destination to be that same inode.  A violated
+            # boundary is rolled back without accepting the substituted
+            # destination.
             created = _rename_noreplace(
                 temporary,
                 path,
@@ -1078,6 +1097,8 @@ def _install_exact(
     finally:
         if descriptor is not None:
             os.close(descriptor)
+        if temporary_descriptor is not None:
+            os.close(temporary_descriptor)
         if directory_descriptor is not None:
             os.close(directory_descriptor)
     return created
