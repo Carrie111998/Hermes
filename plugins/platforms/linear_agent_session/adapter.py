@@ -311,6 +311,152 @@ class LinearAgentSessionAdapter(BasePlatformAdapter):
             )
             return False
 
+    # Linear team key prefix -> Paperclip company UUID
+    _PAPERCLIP_COMPANY_BY_PREFIX = {
+        "HEA": "32375bd0-2a89-4a27-ad4a-e2050459224b",  # Healify
+        "AUR": "c8435d96-f0c6-40c3-a6a0-53c0c5030707",  # Aurora Capital Group
+        "SFB": "667127de-7bae-4941-8477-d8c2815908ea",  # Sam Feldt
+        "HFT": "bd535bed-c589-40ef-a334-88cda5db85b9",  # Heartfeldt
+    }
+
+    async def _ensure_paperclip_issue(
+        self,
+        issue_identifier: str,
+        issue_title: str,
+        issue: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Find or create the Paperclip SSOT for a delegated Linear issue.
+
+        Runs off the webhook hot path (background task). Uses paperclipai CLI
+        so it shares the same identity/routing as the rest of the fleet.
+        """
+        import asyncio
+        import re
+        import subprocess
+
+        prefix = (issue_identifier or "").split("-", 1)[0].upper()
+        company = self._PAPERCLIP_COMPANY_BY_PREFIX.get(prefix)
+        if not company:
+            # Default to Healify for unknown product teams; Aurora for AUR-ish
+            company = self._PAPERCLIP_COMPANY_BY_PREFIX["HEA"]
+            logger.info(
+                "[linear_agent_session] No company map for %s — using Healify",
+                issue_identifier,
+            )
+
+        def _run(cmd: list) -> tuple[int, str]:
+            try:
+                out = subprocess.check_output(
+                    cmd, stderr=subprocess.STDOUT, timeout=25, text=True
+                )
+                return 0, out
+            except subprocess.CalledProcessError as e:
+                return e.returncode, (e.output or "")[:4000]
+            except Exception as e:
+                return 1, str(e)
+
+        # 1) Prefer existing open Paperclip issue matching linear:HEA-N
+        match_key = issue_identifier
+        code, out = await asyncio.to_thread(
+            _run,
+            [
+                "paperclipai",
+                "issue",
+                "list",
+                "-C",
+                company,
+                "--match",
+                match_key,
+                "--json",
+            ],
+        )
+        if code == 0 and out.strip():
+            try:
+                items = json.loads(out)
+            except json.JSONDecodeError:
+                items = []
+            if isinstance(items, list):
+                for it in items:
+                    body = (it.get("description") or "") + "\n" + (it.get("title") or "")
+                    if (
+                        f"linear:{issue_identifier}" in body
+                        or issue_identifier in (it.get("title") or "")
+                    ) and (it.get("status") or "") not in {
+                        "done",
+                        "cancelled",
+                        "canceled",
+                    }:
+                        ident = it.get("identifier")
+                        logger.info(
+                            "[linear_agent_session] Reusing Paperclip %s for %s",
+                            ident,
+                            issue_identifier,
+                        )
+                        return ident
+
+        # 2) Create
+        # Title convention: Paperclip linked to Linear = [{linear_id}] {semantic}
+        semantic = issue_title or issue_identifier
+        # Strip existing [TEST]/… prefixes from Linear title carefully
+        semantic = re.sub(r"^(\[[^\]]+\]\s*)+", "", semantic).strip() or issue_identifier
+        title = f"[{issue_identifier}] {semantic}"[:240]
+        description = (
+            f"linear:{issue_identifier}\n"
+            f"mirror:linear\n"
+            f"origin:linear-agent-session\n\n"
+            f"Delegated from Linear {issue_identifier}: {issue_title}\n"
+        )
+        if issue and issue.get("url"):
+            description += f"\nOriginal Linear Issue: {issue.get('url')}\n"
+        elif issue_identifier and issue_identifier != "?":
+            description += (
+                f"\nOriginal Linear Issue: "
+                f"https://linear.app/lifecycle-innovations/issue/{issue_identifier}\n"
+            )
+
+        code, out = await asyncio.to_thread(
+            _run,
+            [
+                "paperclipai",
+                "issue",
+                "create",
+                "-C",
+                company,
+                "--title",
+                title,
+                "--description",
+                description,
+                "--status",
+                "todo",
+                "--priority",
+                "medium",
+                "--json",
+            ],
+        )
+        if code != 0:
+            logger.error(
+                "[linear_agent_session] paperclip create failed for %s: %s",
+                issue_identifier,
+                out[:500],
+            )
+            return None
+        try:
+            created = json.loads(out)
+        except json.JSONDecodeError:
+            logger.error(
+                "[linear_agent_session] paperclip create non-JSON for %s: %s",
+                issue_identifier,
+                out[:300],
+            )
+            return None
+        ident = created.get("identifier")
+        logger.info(
+            "[linear_agent_session] Created Paperclip %s for Linear %s",
+            ident,
+            issue_identifier,
+        )
+        return ident
+
     # ------------------------------------------------------------------
     # Inbound: Linear webhook -> Hermes agent turn
     # ------------------------------------------------------------------
@@ -394,23 +540,18 @@ class LinearAgentSessionAdapter(BasePlatformAdapter):
         issue_identifier = issue.get("identifier", "?")
         issue_title = issue.get("title", "")
 
+        prompt_context = agent_session.get("promptContext", "")
         if action == "created":
             # Deterministic first activity — satisfies the 10s SLA regardless
             # of how long the dispatched agent turn takes to produce output.
             await self._create_activity(
                 agent_session_id, "thought", "Claimed, starting work."
             )
-            prompt_context = agent_session.get("promptContext", "")
-            text = (
-                f"You have been delegated Linear issue {issue_identifier}: "
-                f"{issue_title}\n\n"
-                "Resolve or create the linked Paperclip issue for this "
-                "(via your Paperclip MCP/CLI tools), claim it, and begin "
-                "work now. Report meaningful progress as you go — each "
-                "response you send back becomes a live activity in this "
-                "Linear thread.\n\n"
-                f"Linear-provided context:\n{prompt_context}"
-            )
+            # Paperclip SSOT is ensured in the background task *before* the
+            # agent turn so create is not dependent on model/tool thrash
+            # (AUR-1757 criterion a). Webhook returns 202 immediately.
+            text = None  # built after ensure_paperclip in background
+            bg_kind = "created"
         elif action == "prompted":
             activity = payload.get("agentActivity", {}) or {}
             body = (activity.get("content", {}) or {}).get("body", "")
@@ -427,6 +568,7 @@ class LinearAgentSessionAdapter(BasePlatformAdapter):
                     f"{issue_identifier} (continue the SAME session/task "
                     f"you were already working on):\n\n{body}"
                 )
+            bg_kind = "prompted"
         else:
             # created/prompted are the two documented actions as of the
             # 2026-07-25 Developer Preview docs; anything else is logged and
@@ -437,21 +579,6 @@ class LinearAgentSessionAdapter(BasePlatformAdapter):
             )
             return web.json_response({"status": "ignored", "action": action})
 
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_name=f"linear/{issue_identifier}",
-            chat_type="linear_agent_session",
-            user_id=f"linear-agent-session:{agent_session_id}",
-            user_name=issue_identifier,
-        )
-        event = MessageEvent(
-            text=text,
-            message_type=MessageType.TEXT,
-            source=source,
-            raw_message=payload,
-            message_id=f"{delivery_id}:{action}",
-        )
-
         logger.info(
             "[linear_agent_session] action=%s issue=%s session=%s",
             action,
@@ -459,7 +586,55 @@ class LinearAgentSessionAdapter(BasePlatformAdapter):
             agent_session_id,
         )
 
-        task = self._create_background_task(self.handle_message(event))
+        async def _dispatch():
+            nonlocal text
+            paperclip_ident = None
+            if bg_kind == "created":
+                paperclip_ident = await self._ensure_paperclip_issue(
+                    issue_identifier, issue_title, issue
+                )
+                if paperclip_ident:
+                    await self._create_activity(
+                        agent_session_id,
+                        "thought",
+                        f"Paperclip SSOT ready: {paperclip_ident}",
+                    )
+                pc_line = (
+                    f"Linked Paperclip issue: {paperclip_ident}. Claim it and "
+                    f"continue work there (do not create a duplicate).\n\n"
+                    if paperclip_ident
+                    else (
+                        "Could not auto-create/find Paperclip SSOT — create "
+                        f"one yourself for linear:{issue_identifier}, claim "
+                        "it, then begin work.\n\n"
+                    )
+                )
+                text = (
+                    f"You have been delegated Linear issue {issue_identifier}: "
+                    f"{issue_title}\n\n"
+                    f"{pc_line}"
+                    "Begin work now. Report meaningful progress as you go — "
+                    "each response you send back becomes a live activity in "
+                    "this Linear thread.\n\n"
+                    f"Linear-provided context:\n{prompt_context}"
+                )
+            source = self.build_source(
+                chat_id=chat_id,
+                chat_name=f"linear/{issue_identifier}",
+                chat_type="linear_agent_session",
+                user_id=f"linear-agent-session:{agent_session_id}",
+                user_name=issue_identifier,
+            )
+            event = MessageEvent(
+                text=text or "",
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=payload,
+                message_id=f"{delivery_id}:{action}",
+            )
+            await self.handle_message(event)
+
+        self._create_background_task(_dispatch())
         return web.json_response(
             {"status": "accepted", "action": action, "session": agent_session_id},
             status=202,
