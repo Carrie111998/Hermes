@@ -243,9 +243,13 @@ class HolographicMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        # is_truthy_value: the config schema declares auto_extract as a string
-        # enum ("false"/"true"), and a plain truthiness check treats the string
-        # "false" as enabled (#57682).
+        # Flush any remaining capture buffer before session ends
+        if self._auto_capture and self._capture is not None:
+            try:
+                self._capture.compress_and_store()
+            except Exception as e:
+                logger.debug("Auto-capture session-end flush failed: %s", e)
+        # Existing auto-extraction logic...
         if not is_truthy_value(self._config.get("auto_extract", False)):
             return
         if not self._store or not messages:
