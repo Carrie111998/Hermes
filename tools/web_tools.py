@@ -545,6 +545,9 @@ def _truncate_with_footer(
 
     total = len(content)
     stored_path = _store_full_text(url, content)
+    if stored_path is not None:
+        from tools.credential_files import to_agent_visible_cache_path
+        stored_path = to_agent_visible_cache_path(stored_path)
     shown = len(head) + len(tail)
 
     footer_lines = [
