@@ -167,6 +167,7 @@ class LSPService:
         self._idle_timeout = idle_timeout
 
         self._loop = _BackgroundLoop()
+        self._reaper_handle: Optional[Any] = None
         if self._enabled:
             self._loop.start()
 
@@ -182,6 +183,14 @@ class LSPService:
         # out anything in the baseline so the agent only sees errors
         # introduced by the current edit.
         self._delta_baseline: Dict[str, List[Dict[str, Any]]] = {}
+
+        # Start background reaper to reclaim idle LSP subprocesses.
+        if self._enabled and self._idle_timeout > 0:
+            _bg_loop = getattr(self._loop, "_loop", None)
+            if _bg_loop is not None:
+                self._reaper_handle = asyncio.run_coroutine_threadsafe(
+                    self._reaper_loop(), _bg_loop
+                )
 
     @classmethod
     def create_from_config(cls) -> Optional["LSPService"]:
@@ -449,6 +458,9 @@ class LSPService:
         """Tear down all clients and stop the background loop."""
         if not self._enabled:
             return
+        if self._reaper_handle is not None:
+            self._reaper_handle.cancel()
+            self._reaper_handle = None
         try:
             self._loop.run(self._shutdown_async(), timeout=10.0)
         except Exception as e:  # noqa: BLE001
@@ -596,6 +608,44 @@ class LSPService:
         finally:
             with self._state_lock:
                 self._spawning.pop(key, None)
+
+    async def _reaper_loop(self) -> None:
+        """Background coroutine that reaps idle LSP subprocesses.
+
+        Runs on the service's ``_BackgroundLoop`` and checks every
+        ``_idle_timeout / 2`` seconds.  Clients that have not been
+        touched for longer than ``_idle_timeout`` are shut down and
+        removed from the registry.
+        """
+        interval = max(self._idle_timeout / 2, 30.0)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await self._reap_idle()
+        except asyncio.CancelledError:
+            return
+
+    async def _reap_idle(self) -> None:
+        """Shut down clients that have been idle for too long."""
+        now = time.time()
+        to_reap: List[Tuple[Tuple[str, str], LSPClient]] = []
+        with self._state_lock:
+            for key, client in list(self._clients.items()):
+                last = self._last_used.get(key, 0.0)
+                if now - last > self._idle_timeout and client.is_running:
+                    to_reap.append((key, client))
+        for key, client in to_reap:
+            logger.debug(
+                "Reaping idle LSP client %s/%s (idle %.0fs)",
+                key[0], key[1], now - self._last_used.get(key, 0.0),
+            )
+            try:
+                await asyncio.wait_for(client.shutdown(), timeout=5.0)
+            except Exception:  # noqa: BLE001
+                pass
+            with self._state_lock:
+                self._clients.pop(key, None)
+                self._last_used.pop(key, None)
 
     async def _shutdown_async(self) -> None:
         with self._state_lock:
