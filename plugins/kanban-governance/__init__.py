@@ -15,7 +15,7 @@ from typing import Any, Callable, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from tools.approval import (
     shell_command_argvs,
     shell_command_has_redirection,
@@ -790,7 +790,10 @@ def _effective_targets(
 
 
 def _governance(path: Path) -> Optional[dict]:
-    with pdb.connect() as conn:
+    # Always the root projects DB: workers run under a profile-scoped
+    # HERMES_HOME (`hermes -p <assignee>`), and the profile's projects.db
+    # does not know the board's projects — governance is a root concern.
+    with pdb.connect(get_default_hermes_root() / "projects.db") as conn:
         return pdb.governance_for_path(conn, str(path))
 
 
