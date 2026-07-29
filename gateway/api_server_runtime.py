@@ -953,20 +953,17 @@ class RuntimeBridgeSession:
                 self.argument_correction_failures.pop(name, None)
             return json.dumps(result.get("result"), ensure_ascii=False, separators=(",", ":"))
         failure = _failed_tool_result_projection(result)
-        error = failure["error"]
+        error = failure["error"]  # same dict; recovery added below stays in failure
         code = str(error.get("code") or "invalid_tool_result")
         if code == "invalid_tool_arguments":
             with self.lock:
                 correction_count = self.argument_correction_failures.get(name, 0) + 1
                 self.argument_correction_failures[name] = correction_count
             if correction_count <= _MAX_ARGUMENT_CORRECTIONS:
-                error = {
-                    **error,
-                    "recovery": {
-                        "action": "correct_arguments",
-                        "remaining_attempts": _MAX_ARGUMENT_CORRECTIONS - correction_count + 1,
-                        "same_arguments_allowed": False,
-                    },
+                error["recovery"] = {
+                    "action": "correct_arguments",
+                    "remaining_attempts": _MAX_ARGUMENT_CORRECTIONS - correction_count + 1,
+                    "same_arguments_allowed": False,
                 }
             else:
                 message = (
@@ -980,11 +977,11 @@ class RuntimeBridgeSession:
                     message,
                     correction_count,
                 )
-                error = {
+                failure["error"] = error = {
                     "code": "argument_correction_exhausted",
                     "message": message,
                     "retryable": False,
-                    "cause": error,
+                    "cause": dict(error),
                 }
                 code = "argument_correction_exhausted"
         else:
