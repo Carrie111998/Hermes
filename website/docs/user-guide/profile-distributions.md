@@ -240,11 +240,12 @@ research-bot/
 
 ### Distribution-owned vs user-owned
 
-When an installer updates to a new version, some things get replaced (author's domain) and some things stay put (installer's domain). Defaults:
+When an installer updates to a new version, some things are updated from the distribution (author's domain) and some things stay put (installer's domain). Distribution-owned directories are merged so installer-added entries under `skills/` and `cron/` survive, while distribution-shipped files are refreshed.
 
 | Category | Paths | On update |
 |---|---|---|
-| **Distribution-owned** | `SOUL.md`, `config.yaml`, `mcp.json`, `skills/`, `cron/`, `distribution.yaml` | Replaced from the new clone |
+| **Distribution-owned files** | `SOUL.md`, `mcp.json`, `distribution.yaml`, and distribution-shipped files under `skills/` and `cron/` | Updated from the new clone |
+| **Merged distribution-owned directories** | `skills/`, `cron/` | Merged recursively: distribution-shipped entries are updated, but installer-added skills and cron jobs are preserved. A distribution-shipped skill root that contains `SKILL.md` is replaced as that distribution's skill. |
 | **Config override** | `config.yaml` | Actually preserved by default — the installer may have tuned model or provider. Pass `--force-config` on update to reset. |
 | **User-owned** | `memories/`, `sessions/`, `state.db*`, `auth.json`, `.env`, `logs/`, `workspace/`, `plans/`, `home/`, `*_cache/`, `local/` | Never touched |
 
@@ -382,7 +383,7 @@ hermes profile update research-bot
 What happens:
 
 1. Re-clones the repo from the recorded source URL.
-2. Replaces distribution-owned files (SOUL, skills, cron, mcp.json).
+2. Updates distribution-owned files (`SOUL.md`, `mcp.json`, `distribution.yaml`) and merges distribution-owned directories (`skills/`, `cron/`): shipped entries are refreshed while skills or cron jobs you added locally remain in place.
 3. **Preserves** your `config.yaml` — you may have tuned the model, temperature, or other settings. Pass `--force-config` to overwrite.
 4. **Never touches** user data: memories, sessions, auth, `.env`, logs, state.
 
