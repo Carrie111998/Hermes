@@ -29,6 +29,10 @@ from tests.scripts.canary.test_production_cutover_owner_launcher import (
     _unit_input_payload,
 )
 
+_LEGACY_RELEASE_FINALIZED_RECEIPT_SCHEMA = (
+    "muncho-production-release-unit-input-rotation-receipt.v3"
+)
+
 
 def _live_triplet() -> dict[str, bytes]:
     return {
@@ -99,7 +103,7 @@ def _release_rotation_state(
     evidence = (tmp_path / "evidence").resolve()
     evidence.mkdir(mode=0o700)
     evidence.chmod(0o700)
-    os.chown(evidence, os.geteuid(), os.getegid())
+    os.chown(evidence, os.geteuid(), os.getegid())  # windows-footgun: ok
     staged = evidence / "staged"
     _patch_staged_paths(monkeypatch, staged)
     monkeypatch.setattr(cutover, "EVIDENCE_ROOT", evidence)
@@ -200,6 +204,133 @@ def _finalize_release(
             lock_factory=nullcontext,
         )
     )
+
+
+def _preauthorize_release(
+    documents: dict[str, Any],
+    trusted: dict[str, Any],
+    prepared: dict[str, Any],
+    *,
+    now: int,
+) -> dict[str, Any]:
+    return dict(
+        rotation._preauthorize_prepared_release_unit_input_authority_rotation(
+            documents["publication"],
+            documents["update_publication"],
+            prepared,
+            trusted_predecessor=trusted,
+            expected_predecessor_trust_sha256=trusted["trust_sha256"],
+            expected_transaction_sha256=prepared["transaction_sha256"],
+            require_root=False,
+            clock=lambda: now,
+            lock_factory=nullcontext,
+        )
+    )
+
+
+def _finalize_preauthorized_release(
+    documents: dict[str, Any],
+    trusted: dict[str, Any],
+    prepared: dict[str, Any],
+    preauthorization: dict[str, Any],
+) -> dict[str, Any]:
+    return dict(
+        rotation._finalize_preauthorized_release_unit_input_authority_rotation(
+            documents["publication"],
+            documents["update_publication"],
+            prepared,
+            preauthorization,
+            trusted_predecessor=trusted,
+            expected_predecessor_trust_sha256=trusted["trust_sha256"],
+            expected_transaction_sha256=prepared["transaction_sha256"],
+            require_root=False,
+            lock_factory=nullcontext,
+        )
+    )
+
+
+def _abort_preauthorized_release(
+    documents: dict[str, Any],
+    trusted: dict[str, Any],
+    prepared: dict[str, Any],
+    preauthorization: dict[str, Any],
+) -> dict[str, Any]:
+    return dict(
+        rotation._abort_preauthorized_release_unit_input_authority_rotation(
+            documents["publication"],
+            documents["update_publication"],
+            prepared,
+            preauthorization,
+            trusted_predecessor=trusted,
+            expected_predecessor_trust_sha256=trusted["trust_sha256"],
+            expected_transaction_sha256=prepared["transaction_sha256"],
+            require_root=False,
+            lock_factory=nullcontext,
+        )
+    )
+
+
+def _tree_snapshot(
+    root: Path,
+) -> dict[str, tuple[str, int, bytes | None]]:
+    paths = [root, *sorted(root.rglob("*"))]
+    snapshot: dict[str, tuple[str, int, bytes | None]] = {}
+    for path in paths:
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        observed = path.lstat()
+        if stat.S_ISDIR(observed.st_mode):
+            snapshot[relative] = (
+                "directory",
+                stat.S_IMODE(observed.st_mode),
+                None,
+            )
+        else:
+            snapshot[relative] = (
+                "file",
+                stat.S_IMODE(observed.st_mode),
+                path.read_bytes(),
+            )
+    return snapshot
+
+
+def _downgrade_finalized_release_evidence_to_legacy_v4(
+    prepared: dict[str, Any],
+) -> dict[str, Any]:
+    transaction = Path(prepared["audit_transaction_path"])
+    activation_path = transaction / rotation.ACTIVATION_BEGIN_FILE_NAME
+    receipt_path = transaction / rotation.RECEIPT_FILE_NAME
+    current = json.loads(receipt_path.read_bytes())
+    assert current["schema"] == rotation.RELEASE_FINALIZED_RECEIPT_SCHEMA
+    assert activation_path.exists()
+
+    activation_path.unlink()
+    legacy = {
+        name: item
+        for name, item in current.items()
+        if name not in {"activation_begin_sha256", "receipt_sha256"}
+    }
+    legacy["schema"] = _LEGACY_RELEASE_FINALIZED_RECEIPT_SCHEMA
+    legacy["receipt_sha256"] = hashlib.sha256(
+        _canonical(legacy)
+    ).hexdigest()
+    receipt_path.unlink()
+    receipt_path.write_bytes(_canonical(legacy))
+    receipt_path.chmod(0o400)
+
+    assert set(legacy) == (
+        rotation._RELEASE_FINALIZED_RECEIPT_FIELDS
+        - {"activation_begin_sha256"}
+    )
+    assert legacy["receipt_sha256"] == hashlib.sha256(
+        _canonical(
+            {
+                name: item
+                for name, item in legacy.items()
+                if name != "receipt_sha256"
+            }
+        )
+    ).hexdigest()
+    return legacy
 
 
 def test_prepare_persists_exact_authorization_without_live_mutation(
@@ -633,8 +764,8 @@ def test_release_v3_to_v4_prepare_and_finalize_bind_exact_authorities(
         ),
     ):
         observed = path.stat()
-        assert observed.st_uid == os.geteuid()
-        assert observed.st_gid == os.getegid()
+        assert observed.st_uid == os.geteuid()  # windows-footgun: ok
+        assert observed.st_gid == os.getegid()  # windows-footgun: ok
         assert stat.S_IMODE(observed.st_mode) == mode
     assert rotation.validate_release_rotation_receipt(
         receipt,
@@ -648,12 +779,21 @@ def test_release_v3_to_v4_prepare_and_finalize_bind_exact_authorities(
                 transaction / rotation.MUTATION_BEGIN_FILE_NAME
             ).read_bytes()
         ),
+        activation_begin=json.loads(
+            (
+                transaction / rotation.ACTIVATION_BEGIN_FILE_NAME
+            ).read_bytes()
+        ),
     ) == receipt
 
 
 @pytest.mark.parametrize(
     "forged_link",
-    ("prepared_receipt_sha256", "mutation_begin_sha256"),
+    (
+        "prepared_receipt_sha256",
+        "mutation_begin_sha256",
+        "activation_begin_sha256",
+    ),
 )
 def test_release_final_receipt_rejects_rehashed_forged_evidence_links(
     monkeypatch: pytest.MonkeyPatch,
@@ -671,6 +811,9 @@ def test_release_final_receipt_rejects_rehashed_forged_evidence_links(
     transaction = Path(prepared["audit_transaction_path"])
     mutation = json.loads(
         (transaction / rotation.MUTATION_BEGIN_FILE_NAME).read_bytes()
+    )
+    activation = json.loads(
+        (transaction / rotation.ACTIVATION_BEGIN_FILE_NAME).read_bytes()
     )
     forged = {**receipt, forged_link: "ff" * 32}
     unsigned = {
@@ -694,6 +837,7 @@ def test_release_final_receipt_rejects_rehashed_forged_evidence_links(
             expected_predecessor_trust_sha256=trusted["trust_sha256"],
             prepared_receipt=prepared,
             mutation_begin=mutation,
+            activation_begin=activation,
         )
 
 
@@ -767,6 +911,238 @@ def test_release_v4_to_v4_rotation_and_v3_downgrade_fail_closed(
         )
 
 
+def test_release_v5_ignores_immutable_legacy_v4_finalized_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    private, _predecessor, trusted, first = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    v5_root_name = rotation.RELEASE_AUDIT_DIRECTORY_NAME
+    assert v5_root_name != rotation.LEGACY_RELEASE_AUDIT_DIRECTORY_NAME
+    monkeypatch.setattr(
+        rotation,
+        "RELEASE_AUDIT_DIRECTORY_NAME",
+        rotation.LEGACY_RELEASE_AUDIT_DIRECTORY_NAME,
+    )
+    first_prepared = _prepare_release(first, trusted, now=now)
+    first_preauthorization = _preauthorize_release(
+        first,
+        trusted,
+        first_prepared,
+        now=now,
+    )
+    _finalize_preauthorized_release(
+        first,
+        trusted,
+        first_prepared,
+        first_preauthorization,
+    )
+    legacy_receipt = _downgrade_finalized_release_evidence_to_legacy_v4(
+        first_prepared
+    )
+    legacy_root = (
+        cutover.EVIDENCE_ROOT
+        / rotation.LEGACY_RELEASE_AUDIT_DIRECTORY_NAME
+    )
+    assert (
+        Path(first_prepared["audit_transaction_path"]).parent
+        == legacy_root
+    )
+    assert (
+        legacy_receipt["schema"]
+        == _LEGACY_RELEASE_FINALIZED_RECEIPT_SCHEMA
+    )
+    legacy_before = _tree_snapshot(legacy_root)
+
+    monkeypatch.setattr(
+        rotation,
+        "RELEASE_AUDIT_DIRECTORY_NAME",
+        v5_root_name,
+    )
+    next_trusted = dict(
+        release_update.build_predecessor_trust(
+            release_revision=first["plan"]["release_revision"],
+            authority_plan_sha256=first["plan"]["plan_sha256"],
+            authority_approval_sha256=first["approval"][
+                "approval_sha256"
+            ],
+            fixed_inputs_sha256=first["fixed"]["fixed_inputs_sha256"],
+            activation_receipt_sha256="24" * 32,
+            owner_subject_sha256=first["plan"]["owner_subject_sha256"],
+            owner_public_key_ed25519_hex=first["plan"][
+                "owner_public_key_ed25519_hex"
+            ],
+            owner_key_id=first["plan"]["owner_key_id"],
+        )
+    )
+    second = _release_documents(
+        monkeypatch,
+        private_key=private,
+        trusted_predecessor=next_trusted,
+        target_revision="c" * 40,
+        now=now,
+    )
+
+    second_prepared = _prepare_release(second, next_trusted, now=now)
+    second_preauthorization = _preauthorize_release(
+        second,
+        next_trusted,
+        second_prepared,
+        now=now,
+    )
+    second_receipt = _finalize_preauthorized_release(
+        second,
+        next_trusted,
+        second_prepared,
+        second_preauthorization,
+    )
+
+    assert (
+        Path(second_prepared["audit_transaction_path"]).parent
+        == cutover.EVIDENCE_ROOT / v5_root_name
+    )
+    assert second_receipt["schema"] == (
+        rotation.RELEASE_FINALIZED_RECEIPT_SCHEMA
+    )
+    assert second_receipt["successor"]["revision"] == "c" * 40
+    assert _tree_snapshot(legacy_root) == legacy_before
+
+
+def test_release_v5_ignores_immutable_legacy_v4_partial_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    private, _predecessor, trusted, first = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    second = _release_documents(
+        monkeypatch,
+        private_key=private,
+        trusted_predecessor=trusted,
+        target_revision="c" * 40,
+        now=now,
+    )
+    v5_root_name = rotation.RELEASE_AUDIT_DIRECTORY_NAME
+    monkeypatch.setattr(
+        rotation,
+        "RELEASE_AUDIT_DIRECTORY_NAME",
+        rotation.LEGACY_RELEASE_AUDIT_DIRECTORY_NAME,
+    )
+    legacy_prepared = _prepare_release(first, trusted, now=now)
+    legacy_preauthorization = _preauthorize_release(
+        first,
+        trusted,
+        legacy_prepared,
+        now=now,
+    )
+    legacy_transaction = Path(
+        legacy_prepared["audit_transaction_path"]
+    )
+    assert (
+        legacy_transaction / rotation.MUTATION_BEGIN_FILE_NAME
+    ).read_bytes() == _canonical(legacy_preauthorization)
+    assert not (
+        legacy_transaction / rotation.ACTIVATION_BEGIN_FILE_NAME
+    ).exists()
+    assert not (legacy_transaction / rotation.RECEIPT_FILE_NAME).exists()
+    legacy_root = (
+        cutover.EVIDENCE_ROOT
+        / rotation.LEGACY_RELEASE_AUDIT_DIRECTORY_NAME
+    )
+    legacy_before = _tree_snapshot(legacy_root)
+
+    monkeypatch.setattr(
+        rotation,
+        "RELEASE_AUDIT_DIRECTORY_NAME",
+        v5_root_name,
+    )
+    second_prepared = _prepare_release(second, trusted, now=now)
+    second_preauthorization = _preauthorize_release(
+        second,
+        trusted,
+        second_prepared,
+        now=now,
+    )
+    second_receipt = _finalize_preauthorized_release(
+        second,
+        trusted,
+        second_prepared,
+        second_preauthorization,
+    )
+
+    assert (
+        Path(second_prepared["audit_transaction_path"]).parent
+        == cutover.EVIDENCE_ROOT / v5_root_name
+    )
+    assert second_receipt["successor"]["revision"] == "c" * 40
+    assert _tree_snapshot(legacy_root) == legacy_before
+
+
+def test_release_v5_ignores_legacy_evidence_but_rejects_mixed_live_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    private, _predecessor, trusted, first = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    second = _release_documents(
+        monkeypatch,
+        private_key=private,
+        trusted_predecessor=trusted,
+        target_revision="c" * 40,
+        now=now,
+    )
+    v5_root_name = rotation.RELEASE_AUDIT_DIRECTORY_NAME
+    monkeypatch.setattr(
+        rotation,
+        "RELEASE_AUDIT_DIRECTORY_NAME",
+        rotation.LEGACY_RELEASE_AUDIT_DIRECTORY_NAME,
+    )
+    legacy_prepared = _prepare_release(first, trusted, now=now)
+    _preauthorize_release(
+        first,
+        trusted,
+        legacy_prepared,
+        now=now,
+    )
+    legacy_root = (
+        cutover.EVIDENCE_ROOT
+        / rotation.LEGACY_RELEASE_AUDIT_DIRECTORY_NAME
+    )
+    legacy_before = _tree_snapshot(legacy_root)
+    monkeypatch.setattr(
+        rotation,
+        "RELEASE_AUDIT_DIRECTORY_NAME",
+        v5_root_name,
+    )
+
+    package.FIXED_UNIT_INPUTS_PATH.unlink()
+    package.FIXED_UNIT_INPUTS_PATH.write_bytes(
+        _canonical(first["fixed"]) + b"\n"
+    )
+    package.FIXED_UNIT_INPUTS_PATH.chmod(package.FIXED_UNIT_INPUTS_MODE)
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_predecessor_invalid",
+    ):
+        _prepare_release(second, trusted, now=now)
+
+    v5_root = cutover.EVIDENCE_ROOT / v5_root_name
+    assert not v5_root.exists() or list(v5_root.iterdir()) == []
+    assert _tree_snapshot(legacy_root) == legacy_before
+
+
 @pytest.mark.parametrize(
     "crash_stage",
     (
@@ -812,6 +1188,7 @@ def test_release_prepare_recovers_every_durable_checkpoint(
 @pytest.mark.parametrize(
     "crash_stage",
     (
+        "v4_live_activation_begun",
         "audit_prepared",
         "predecessor_fixed_inputs_removed",
         "predecessor_approval_removed",
@@ -1072,14 +1449,16 @@ def test_release_finalize_rejects_persisted_publication_tamper(
 
 
 def test_release_public_root_api_has_no_clock_lock_or_identity_override() -> None:
-    prepare = inspect.signature(
-        rotation.prepare_release_unit_input_authority_rotation
-    ).parameters
-    finalize = inspect.signature(
-        rotation.finalize_prepared_release_unit_input_authority_rotation
-    ).parameters
+    apis = (
+        rotation.prepare_release_unit_input_authority_rotation,
+        rotation.preauthorize_prepared_release_unit_input_authority_rotation,
+        rotation.finalize_preauthorized_release_unit_input_authority_rotation,
+        rotation.abort_preauthorized_release_unit_input_authority_rotation,
+        rotation.finalize_prepared_release_unit_input_authority_rotation,
+    )
 
-    for parameters in (prepare, finalize):
+    for api in apis:
+        parameters = inspect.signature(api).parameters
         assert "now_unix" not in parameters
         assert "clock" not in parameters
         assert "lock_factory" not in parameters
@@ -1089,14 +1468,29 @@ def test_release_public_root_api_has_no_clock_lock_or_identity_override() -> Non
 def test_release_public_root_api_fixes_clock_lock_and_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observed: list[dict[str, Any]] = []
+    observed: list[tuple[str, dict[str, Any]]] = []
 
     def prepare(*_args: Any, **kwargs: Any) -> dict[str, bool]:
-        observed.append(kwargs)
+        observed.append(("prepare", kwargs))
+        return {"ok": True}
+
+    def preauthorize(*_args: Any, **kwargs: Any) -> dict[str, bool]:
+        observed.append(("preauthorize", kwargs))
+        return {"ok": True}
+
+    def finalize_preauthorized(
+        *_args: Any,
+        **kwargs: Any,
+    ) -> dict[str, bool]:
+        observed.append(("finalize_preauthorized", kwargs))
+        return {"ok": True}
+
+    def abort(*_args: Any, **kwargs: Any) -> dict[str, bool]:
+        observed.append(("abort", kwargs))
         return {"ok": True}
 
     def finalize(*_args: Any, **kwargs: Any) -> dict[str, bool]:
-        observed.append(kwargs)
+        observed.append(("finalize", kwargs))
         return {"ok": True}
 
     monkeypatch.setattr(
@@ -1112,6 +1506,47 @@ def test_release_public_root_api_fixes_clock_lock_and_identity(
     )
     monkeypatch.setattr(
         rotation,
+        "_preauthorize_prepared_release_unit_input_authority_rotation",
+        preauthorize,
+    )
+    rotation.preauthorize_prepared_release_unit_input_authority_rotation(
+        {},
+        {},
+        {},
+        trusted_predecessor={},
+        expected_predecessor_trust_sha256="a" * 64,
+        expected_transaction_sha256="b" * 64,
+    )
+    monkeypatch.setattr(
+        rotation,
+        "_finalize_preauthorized_release_unit_input_authority_rotation",
+        finalize_preauthorized,
+    )
+    rotation.finalize_preauthorized_release_unit_input_authority_rotation(
+        {},
+        {},
+        {},
+        {},
+        trusted_predecessor={},
+        expected_predecessor_trust_sha256="a" * 64,
+        expected_transaction_sha256="b" * 64,
+    )
+    monkeypatch.setattr(
+        rotation,
+        "_abort_preauthorized_release_unit_input_authority_rotation",
+        abort,
+    )
+    rotation.abort_preauthorized_release_unit_input_authority_rotation(
+        {},
+        {},
+        {},
+        {},
+        trusted_predecessor={},
+        expected_predecessor_trust_sha256="a" * 64,
+        expected_transaction_sha256="b" * 64,
+    )
+    monkeypatch.setattr(
+        rotation,
         "_finalize_prepared_release_unit_input_authority_rotation",
         finalize,
     )
@@ -1124,11 +1559,14 @@ def test_release_public_root_api_fixes_clock_lock_and_identity(
         expected_transaction_sha256="b" * 64,
     )
 
-    assert len(observed) == 2
-    for kwargs in observed:
+    assert len(observed) == 5
+    for name, kwargs in observed:
         assert kwargs["require_root"] is True
-        assert kwargs["clock"] is rotation._production_clock
         assert kwargs["lock_factory"] is None
+        if name in {"prepare", "preauthorize", "finalize"}:
+            assert kwargs["clock"] is rotation._production_clock
+        else:
+            assert "clock" not in kwargs
 
 
 def test_release_expired_prepared_transaction_cannot_begin_live_mutation(
@@ -1161,49 +1599,7 @@ def test_release_expired_prepared_transaction_cannot_begin_live_mutation(
     assert _live_triplet() == before
 
 
-def test_release_expired_replay_after_marker_but_before_live_mutation_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    now = 1_900_000_000
-    _private, _predecessor, trusted, documents = _release_rotation_state(
-        monkeypatch,
-        tmp_path,
-        now=now,
-    )
-    prepared = _prepare_release(documents, trusted, now=now)
-
-    def crash(stage: str) -> None:
-        if stage == "v4_live_mutation_begun":
-            raise KeyboardInterrupt
-
-    monkeypatch.setattr(rotation, "_checkpoint", crash)
-    with pytest.raises(KeyboardInterrupt):
-        _finalize_release(documents, trusted, prepared, now=now)
-    transaction = Path(prepared["audit_transaction_path"])
-    mutation = json.loads(
-        (transaction / rotation.MUTATION_BEGIN_FILE_NAME).read_bytes()
-    )
-    assert mutation["live_mutation_write_ahead_committed"] is True
-    assert mutation["freshness_checked_at_unix"] == now
-
-    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
-    before = _live_triplet()
-    with pytest.raises(
-        rotation.UnitInputRotationError,
-        match="unit_input_rotation_publication_expired",
-    ):
-        _finalize_release(
-            documents,
-            trusted,
-            prepared,
-            now=now + 4_000,
-        )
-    assert _live_triplet() == before
-    assert not (transaction / rotation.RECEIPT_FILE_NAME).exists()
-
-
-def test_release_rechecks_freshness_after_marker_before_first_live_mutation(
+def test_release_preauthorization_checks_freshness_under_canonical_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1217,16 +1613,18 @@ def test_release_rechecks_freshness_after_marker_before_first_live_mutation(
     before = _live_triplet()
     observed = [now]
 
-    def advance_after_marker(stage: str) -> None:
-        if stage == "v4_live_mutation_begun":
+    class ExpireWhileWaiting:
+        def __enter__(self):
             observed[0] = now + 4_000
 
-    monkeypatch.setattr(rotation, "_checkpoint", advance_after_marker)
+        def __exit__(self, *_args: Any) -> bool:
+            return False
+
     with pytest.raises(
         rotation.UnitInputRotationError,
         match="unit_input_rotation_publication_expired",
     ):
-        rotation._finalize_prepared_release_unit_input_authority_rotation(
+        rotation._preauthorize_prepared_release_unit_input_authority_rotation(
             documents["publication"],
             documents["update_publication"],
             prepared,
@@ -1235,11 +1633,188 @@ def test_release_rechecks_freshness_after_marker_before_first_live_mutation(
             expected_transaction_sha256=prepared["transaction_sha256"],
             require_root=False,
             clock=lambda: observed[0],
+            lock_factory=ExpireWhileWaiting,
+        )
+
+    transaction = Path(prepared["audit_transaction_path"])
+    assert not (transaction / rotation.MUTATION_BEGIN_FILE_NAME).exists()
+    assert _live_triplet() == before
+
+
+def test_release_backward_clock_cannot_poison_preauthorization_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    transaction = Path(prepared["audit_transaction_path"])
+    before_live = _live_triplet()
+    before_inventory = {
+        path.name: path.read_bytes()
+        for path in transaction.iterdir()
+        if path.is_file()
+    }
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_clock_invalid",
+    ):
+        _preauthorize_release(
+            documents,
+            trusted,
+            prepared,
+            now=now - 1,
+        )
+
+    assert {
+        path.name: path.read_bytes()
+        for path in transaction.iterdir()
+        if path.is_file()
+    } == before_inventory
+    assert not (transaction / rotation.MUTATION_BEGIN_FILE_NAME).exists()
+    assert not any(
+        path.name.startswith(
+            f".{rotation.MUTATION_BEGIN_FILE_NAME}.rotate."
+        )
+        for path in transaction.iterdir()
+    )
+    assert _live_triplet() == before_live
+
+    preauthorization = _preauthorize_release(
+        documents,
+        trusted,
+        prepared,
+        now=now,
+    )
+    receipt = _finalize_preauthorized_release(
+        documents,
+        trusted,
+        prepared,
+        preauthorization,
+    )
+    assert receipt["mutation_begin_sha256"] == preauthorization[
+        "mutation_begin_sha256"
+    ]
+
+
+def test_release_expired_after_preauthorization_finalizes_without_clock_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    before = _live_triplet()
+    transaction = Path(prepared["audit_transaction_path"])
+
+    def crash(stage: str) -> None:
+        if stage == "v4_live_mutation_begun":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(rotation, "_checkpoint", crash)
+    with pytest.raises(KeyboardInterrupt):
+        _preauthorize_release(
+            documents,
+            trusted,
+            prepared,
+            now=now,
+        )
+    preauthorization = json.loads(
+        (transaction / rotation.MUTATION_BEGIN_FILE_NAME).read_bytes()
+    )
+    assert _live_triplet() == before
+    assert not (transaction / rotation.RECEIPT_FILE_NAME).exists()
+    assert not (transaction / rotation.ACTIVATION_BEGIN_FILE_NAME).exists()
+    assert preauthorization["freshness_checked_at_unix"] == now
+    assert (
+        transaction / rotation.MUTATION_BEGIN_FILE_NAME
+    ).read_bytes() == _canonical(preauthorization)
+    assert rotation.validate_release_preauthorization_receipt(
+        preauthorization,
+        unit_input_publication=documents["publication"],
+        release_update_publication=documents["update_publication"],
+        trusted_predecessor=trusted,
+        expected_predecessor_trust_sha256=trusted["trust_sha256"],
+        prepared_receipt=prepared,
+    ) == preauthorization
+
+    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    replay = _preauthorize_release(
+        documents,
+        trusted,
+        prepared,
+        now=now + 4_000,
+    )
+    receipt = _finalize_preauthorized_release(
+        documents,
+        trusted,
+        prepared,
+        replay,
+    )
+
+    assert replay == preauthorization
+    assert receipt["mutation_begin_sha256"] == preauthorization[
+        "mutation_begin_sha256"
+    ]
+    assert (transaction / rotation.ACTIVATION_BEGIN_FILE_NAME).exists()
+    assert package.FIXED_UNIT_INPUTS_PATH.read_bytes() == (
+        _canonical(documents["fixed"]) + b"\n"
+    )
+
+
+def test_release_unpreauthorized_finalize_fails_without_live_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    before = _live_triplet()
+    transaction = rotation._release_receipt_transaction(prepared)
+    successor = rotation._release_successor(
+        documents["publication"],
+        documents["update_publication"],
+        trusted,
+        expected_predecessor_trust_sha256=trusted["trust_sha256"],
+        now_unix=now,
+    )
+    unpersisted = rotation._release_mutation_begin_value(
+        transaction,
+        successor,
+        freshness_checked_at_unix=now,
+    )
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_finalize_authorization_invalid",
+    ):
+        rotation._finalize_preauthorized_release_unit_input_authority_rotation(
+            documents["publication"],
+            documents["update_publication"],
+            prepared,
+            unpersisted,
+            trusted_predecessor=trusted,
+            expected_predecessor_trust_sha256=trusted["trust_sha256"],
+            expected_transaction_sha256=prepared["transaction_sha256"],
+            require_root=False,
             lock_factory=nullcontext,
         )
 
     transaction = Path(prepared["audit_transaction_path"])
-    assert (transaction / rotation.MUTATION_BEGIN_FILE_NAME).exists()
+    assert not (transaction / rotation.MUTATION_BEGIN_FILE_NAME).exists()
     assert not (transaction / rotation.RECEIPT_FILE_NAME).exists()
     assert _live_triplet() == before
 
@@ -1281,6 +1856,321 @@ def test_release_expired_replay_allowed_after_actual_live_mutation(
     assert package.FIXED_UNIT_INPUTS_PATH.read_bytes() == (
         _canonical(documents["fixed"]) + b"\n"
     )
+
+
+def test_release_preauthorization_abort_is_terminal_exact_and_replayable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    before = _live_triplet()
+    preauthorization = _preauthorize_release(
+        documents,
+        trusted,
+        prepared,
+        now=now,
+    )
+
+    def crash(stage: str) -> None:
+        if stage == "v4_preauthorization_aborted":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(rotation, "_checkpoint", crash)
+    with pytest.raises(KeyboardInterrupt):
+        _abort_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    aborted = _abort_preauthorized_release(
+        documents,
+        trusted,
+        prepared,
+        preauthorization,
+    )
+    replay = _abort_preauthorized_release(
+        documents,
+        trusted,
+        prepared,
+        preauthorization,
+    )
+
+    transaction = Path(prepared["audit_transaction_path"])
+    assert replay == aborted
+    assert aborted["schema"] == rotation.RELEASE_ABORTED_RECEIPT_SCHEMA
+    assert aborted["live_predecessor_unchanged"] is True
+    assert aborted["live_mutation_performed"] is False
+    assert (
+        transaction / rotation.ABORT_RECEIPT_FILE_NAME
+    ).read_bytes() == _canonical(aborted)
+    assert rotation.validate_release_rotation_abort_receipt(
+        aborted,
+        unit_input_publication=documents["publication"],
+        release_update_publication=documents["update_publication"],
+        trusted_predecessor=trusted,
+        expected_predecessor_trust_sha256=trusted["trust_sha256"],
+        prepared_receipt=prepared,
+        preauthorization_receipt=preauthorization,
+    ) == aborted
+    assert _live_triplet() == before
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_preauthorization_aborted",
+    ):
+        _finalize_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+
+
+def test_release_same_successor_retry_after_abort_remains_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    preauthorization = _preauthorize_release(
+        documents,
+        trusted,
+        prepared,
+        now=now,
+    )
+    aborted = _abort_preauthorized_release(
+        documents,
+        trusted,
+        prepared,
+        preauthorization,
+    )
+    root = (
+        cutover.EVIDENCE_ROOT / rotation.RELEASE_AUDIT_DIRECTORY_NAME
+    )
+    before_directories = sorted(path.name for path in root.iterdir())
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_preauthorization_aborted",
+    ):
+        _preauthorize_release(
+            documents,
+            trusted,
+            prepared,
+            now=now + 4_000,
+        )
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_successor_conflict",
+    ):
+        _prepare_release(documents, trusted, now=now)
+
+    assert sorted(path.name for path in root.iterdir()) == before_directories
+    assert (
+        Path(prepared["audit_transaction_path"])
+        / rotation.ABORT_RECEIPT_FILE_NAME
+    ).read_bytes() == _canonical(aborted)
+
+
+@pytest.mark.parametrize("state", ("partial_live_mutation", "finalized"))
+def test_release_preauthorization_cannot_abort_after_live_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    state: str,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    preauthorization = _preauthorize_release(
+        documents,
+        trusted,
+        prepared,
+        now=now,
+    )
+    if state == "partial_live_mutation":
+
+        def crash(stage: str) -> None:
+            if stage == "predecessor_fixed_inputs_removed":
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(rotation, "_checkpoint", crash)
+        with pytest.raises(KeyboardInterrupt):
+            _finalize_preauthorized_release(
+                documents,
+                trusted,
+                prepared,
+                preauthorization,
+            )
+        monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    else:
+        _finalize_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_abort_authorization_invalid",
+    ):
+        _abort_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+
+    transaction = Path(prepared["audit_transaction_path"])
+    assert not (transaction / rotation.ABORT_RECEIPT_FILE_NAME).exists()
+
+
+def test_release_activation_marker_survives_runtime_error_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    _private, _predecessor, trusted, documents = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    prepared = _prepare_release(documents, trusted, now=now)
+    before = _live_triplet()
+    preauthorization = _preauthorize_release(
+        documents,
+        trusted,
+        prepared,
+        now=now,
+    )
+
+    def fail_after_first_live_write(stage: str) -> None:
+        if stage == "predecessor_fixed_inputs_removed":
+            raise RuntimeError("synthetic activation failure")
+
+    monkeypatch.setattr(
+        rotation,
+        "_checkpoint",
+        fail_after_first_live_write,
+    )
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_failed",
+    ):
+        _finalize_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+
+    transaction = Path(prepared["audit_transaction_path"])
+    activation = json.loads(
+        (transaction / rotation.ACTIVATION_BEGIN_FILE_NAME).read_bytes()
+    )
+    assert activation["live_activation_write_ahead_committed"] is True
+    assert _live_triplet() == before
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_abort_authorization_invalid",
+    ):
+        _abort_preauthorized_release(
+            documents,
+            trusted,
+            prepared,
+            preauthorization,
+        )
+    assert not (transaction / rotation.ABORT_RECEIPT_FILE_NAME).exists()
+
+    monkeypatch.setattr(rotation, "_checkpoint", lambda _stage: None)
+    receipt = _finalize_preauthorized_release(
+        documents,
+        trusted,
+        prepared,
+        preauthorization,
+    )
+    assert receipt["activation_begin_sha256"] == activation[
+        "activation_begin_sha256"
+    ]
+
+
+def test_release_aborted_history_allows_different_prepared_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    now = 1_900_000_000
+    private, _predecessor, trusted, first = _release_rotation_state(
+        monkeypatch,
+        tmp_path,
+        now=now,
+    )
+    second = _release_documents(
+        monkeypatch,
+        private_key=private,
+        trusted_predecessor=trusted,
+        target_revision="c" * 40,
+        now=now,
+    )
+    first_prepared = _prepare_release(first, trusted, now=now)
+    first_preauthorization = _preauthorize_release(
+        first,
+        trusted,
+        first_prepared,
+        now=now,
+    )
+    first_abort = _abort_preauthorized_release(
+        first,
+        trusted,
+        first_prepared,
+        first_preauthorization,
+    )
+
+    second_prepared = _prepare_release(second, trusted, now=now)
+    second_preauthorization = _preauthorize_release(
+        second,
+        trusted,
+        second_prepared,
+        now=now,
+    )
+    second_final = _finalize_preauthorized_release(
+        second,
+        trusted,
+        second_prepared,
+        second_preauthorization,
+    )
+    historical_replay = _abort_preauthorized_release(
+        first,
+        trusted,
+        first_prepared,
+        first_preauthorization,
+    )
+
+    assert first_prepared["transaction_sha256"] != second_prepared[
+        "transaction_sha256"
+    ]
+    assert historical_replay == first_abort
+    assert Path(
+        first_prepared["audit_transaction_path"]
+    ).joinpath(rotation.ABORT_RECEIPT_FILE_NAME).read_bytes() == _canonical(
+        first_abort
+    )
+    assert second_final["successor"]["revision"] == "c" * 40
 
 
 @pytest.mark.parametrize("location", ("transaction", "predecessor"))

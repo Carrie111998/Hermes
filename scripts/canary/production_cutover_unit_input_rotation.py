@@ -2,11 +2,19 @@
 """Rotate the fixed production unit-input authority without ad-hoc deletion.
 
 The existing public stager and fixed-input bootstrap are deliberately
-create-only.  This root-only edge transaction can first persist a complete
-authorization and predecessor archive without changing any live input, then
-finalize that exact prepared transaction after its caller crosses a separate
-commit boundary.  The legacy one-call rotation remains available for existing
-callers and receipts.
+create-only.  This root-only edge transaction first persists a prepared
+successor, then durably preauthorizes that exact transaction while the signed
+approvals are fresh.  Finalization after a separate caller commit consumes the
+durable preauthorization without consulting wall-clock freshness again.  A
+preauthorization can instead receive an append-only terminal abort before any
+live input mutation.  Finalization publishes a separate append-only activation
+marker immediately before the first live write, so a rollback can never make
+that transaction abort-eligible again.  The legacy one-call rotation remains
+available for existing callers and receipts.
+
+The activation-marker protocol and its final receipt use a distinct v5 audit
+root.  Historical v4-root evidence is immutable and is never scanned, migrated,
+or deleted by this implementation.
 
 The transaction is identified by the predecessor plan and successor
 publication digests.  Every durable file is create-or-exact-resume, so the
@@ -52,13 +60,22 @@ RELEASE_PREPARED_RECEIPT_SCHEMA = (
     "muncho-production-release-unit-input-rotation-prepared.v2"
 )
 RELEASE_FINALIZED_RECEIPT_SCHEMA = (
-    "muncho-production-release-unit-input-rotation-receipt.v3"
+    "muncho-production-release-unit-input-rotation-receipt.v4"
 )
 RELEASE_MUTATION_BEGIN_SCHEMA = (
     "muncho-production-release-unit-input-rotation-mutation-begin.v1"
 )
+RELEASE_ACTIVATION_BEGIN_SCHEMA = (
+    "muncho-production-release-unit-input-rotation-activation-begin.v1"
+)
+RELEASE_ABORTED_RECEIPT_SCHEMA = (
+    "muncho-production-release-unit-input-rotation-aborted.v1"
+)
 AUDIT_DIRECTORY_NAME = "unit-input-authority-rotations"
-RELEASE_AUDIT_DIRECTORY_NAME = "release-unit-input-authority-rotations-v4"
+LEGACY_RELEASE_AUDIT_DIRECTORY_NAME = (
+    "release-unit-input-authority-rotations-v4"
+)
+RELEASE_AUDIT_DIRECTORY_NAME = "release-unit-input-authority-rotations-v5"
 TRANSACTION_FILE_NAME = "transaction.json"
 PUBLICATION_FILE_NAME = "successor-publication.json"
 RELEASE_UPDATE_PUBLICATION_FILE_NAME = (
@@ -67,6 +84,8 @@ RELEASE_UPDATE_PUBLICATION_FILE_NAME = (
 PREDECESSOR_TRUST_FILE_NAME = "predecessor-trust.json"
 PREPARED_RECEIPT_FILE_NAME = "prepared-receipt.json"
 MUTATION_BEGIN_FILE_NAME = "mutation-begin.json"
+ACTIVATION_BEGIN_FILE_NAME = "activation-begin.json"
+ABORT_RECEIPT_FILE_NAME = "rotation-abort-receipt.json"
 RECEIPT_FILE_NAME = "rotation-receipt.json"
 PREDECESSOR_DIRECTORY_NAME = "predecessor"
 PRODUCTION_STAGED_ROOT = Path("/var/lib/muncho-production-legacy-cutover/staged")
@@ -213,6 +232,7 @@ _RELEASE_FINALIZED_RECEIPT_FIELDS = frozenset(
         "fixed_inputs_path",
         "successor_triplet_complete",
         "mutation_begin_sha256",
+        "activation_begin_sha256",
         "prepared_receipt_sha256",
         "secret_material_recorded",
         "secret_digest_recorded",
@@ -231,6 +251,37 @@ _RELEASE_MUTATION_BEGIN_FIELDS = frozenset(
         "secret_material_recorded",
         "secret_digest_recorded",
         "mutation_begin_sha256",
+    }
+)
+_RELEASE_ACTIVATION_BEGIN_FIELDS = frozenset(
+    {
+        "schema",
+        "transaction_sha256",
+        "mutation_begin_sha256",
+        "successor_publication_sha256",
+        "release_update_publication_sha256",
+        "successor_fixed_inputs_sha256",
+        "live_activation_write_ahead_committed",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "activation_begin_sha256",
+    }
+)
+_RELEASE_ABORTED_RECEIPT_FIELDS = frozenset(
+    {
+        "schema",
+        "transaction_sha256",
+        "successor_publication_sha256",
+        "release_update_publication_sha256",
+        "successor_fixed_inputs_sha256",
+        "audit_transaction_path",
+        "prepared_receipt_sha256",
+        "mutation_begin_sha256",
+        "live_predecessor_unchanged",
+        "live_mutation_performed",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "receipt_sha256",
     }
 )
 
@@ -3525,6 +3576,8 @@ def _require_release_transaction_inventory(
         PREDECESSOR_TRUST_FILE_NAME: 0o400,
         PREPARED_RECEIPT_FILE_NAME: 0o400,
         MUTATION_BEGIN_FILE_NAME: 0o400,
+        ACTIVATION_BEGIN_FILE_NAME: 0o400,
+        ABORT_RECEIPT_FILE_NAME: 0o400,
         RECEIPT_FILE_NAME: 0o400,
     }
     try:
@@ -3608,6 +3661,19 @@ def _require_release_transaction_inventory(
                 *base,
                 PREPARED_RECEIPT_FILE_NAME,
                 MUTATION_BEGIN_FILE_NAME,
+                ACTIVATION_BEGIN_FILE_NAME,
+            },
+            {
+                *base,
+                PREPARED_RECEIPT_FILE_NAME,
+                MUTATION_BEGIN_FILE_NAME,
+                ABORT_RECEIPT_FILE_NAME,
+            },
+            {
+                *base,
+                PREPARED_RECEIPT_FILE_NAME,
+                MUTATION_BEGIN_FILE_NAME,
+                ACTIVATION_BEGIN_FILE_NAME,
                 RECEIPT_FILE_NAME,
             },
         ]
@@ -3619,6 +3685,26 @@ def _require_release_transaction_inventory(
             raise UnitInputRotationError(
                 "unit_input_rotation_audit_invalid"
             )
+
+
+def _release_logical_file_present(path: Path, name: str) -> bool:
+    if os.path.lexists(path / name):
+        return True
+    prefix = f".{name}.rotate."
+    try:
+        children = path.iterdir()
+        return any(
+            child.name.startswith(prefix)
+            and _TEMPORARY_SUFFIX.fullmatch(
+                child.name[len(prefix) :]
+            )
+            is not None
+            for child in children
+        )
+    except OSError as exc:
+        raise UnitInputRotationError(
+            "unit_input_rotation_audit_invalid"
+        ) from exc
 
 
 def _release_transaction_directories(
@@ -3963,6 +4049,7 @@ def _release_finalized_receipt(
     transaction: Mapping[str, Any],
     prepared_receipt: Mapping[str, Any],
     mutation_begin: Mapping[str, Any],
+    activation_begin: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     unsigned = {
         "schema": RELEASE_FINALIZED_RECEIPT_SCHEMA,
@@ -3984,6 +4071,9 @@ def _release_finalized_receipt(
         "successor_triplet_complete": True,
         "mutation_begin_sha256": mutation_begin[
             "mutation_begin_sha256"
+        ],
+        "activation_begin_sha256": activation_begin[
+            "activation_begin_sha256"
         ],
         "prepared_receipt_sha256": prepared_receipt["receipt_sha256"],
         "secret_material_recorded": False,
@@ -4077,6 +4167,7 @@ def validate_release_rotation_receipt(
     expected_predecessor_trust_sha256: str,
     prepared_receipt: Mapping[str, Any],
     mutation_begin: Mapping[str, Any],
+    activation_begin: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     """Validate one completed Stage C v4 unit-input rotation receipt."""
 
@@ -4126,6 +4217,12 @@ def validate_release_rotation_receipt(
             transaction=transaction,
             successor=successor,
         )
+        validated_activation = _validate_release_activation_begin(
+            activation_begin,
+            transaction=transaction,
+            successor=successor,
+            preauthorization_receipt=validated_mutation,
+        )
     except UnitInputRotationError as exc:
         raise UnitInputRotationError(
             "unit_input_rotation_receipt_invalid"
@@ -4140,6 +4237,11 @@ def validate_release_rotation_receipt(
         freshness_checked_at_unix=validated_mutation[
             "freshness_checked_at_unix"
         ],
+    )
+    expected_activation = _release_activation_begin_value(
+        transaction,
+        successor,
+        validated_mutation,
     )
     unsigned = {
         name: item
@@ -4165,8 +4267,11 @@ def validate_release_rotation_receipt(
         or value.get("successor_triplet_complete") is not True
         or validated_prepared != expected_prepared
         or validated_mutation != expected_mutation
+        or validated_activation != expected_activation
         or value.get("mutation_begin_sha256")
         != validated_mutation["mutation_begin_sha256"]
+        or value.get("activation_begin_sha256")
+        != validated_activation["activation_begin_sha256"]
         or value.get("prepared_receipt_sha256")
         != validated_prepared["receipt_sha256"]
         or value.get("secret_material_recorded") is not False
@@ -4327,6 +4432,284 @@ def _load_release_mutation_begin(
     return value
 
 
+def validate_release_preauthorization_receipt(
+    value: Any,
+    *,
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    prepared_receipt: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate one exact durable release-rotation preauthorization."""
+
+    try:
+        prepared = validate_release_prepared_rotation_receipt(
+            prepared_receipt,
+            unit_input_publication=unit_input_publication,
+            release_update_publication=release_update_publication,
+            trusted_predecessor=trusted_predecessor,
+            expected_predecessor_trust_sha256=(
+                expected_predecessor_trust_sha256
+            ),
+        )
+        transaction = _release_receipt_transaction(prepared)
+        successor = _release_successor(
+            unit_input_publication,
+            release_update_publication,
+            trusted_predecessor,
+            expected_predecessor_trust_sha256=(
+                expected_predecessor_trust_sha256
+            ),
+            now_unix=transaction["authorization_checked_at_unix"],
+        )
+        preauthorization = _validate_release_mutation_begin(
+            value,
+            transaction=transaction,
+            successor=successor,
+        )
+    except UnitInputRotationError as exc:
+        raise UnitInputRotationError(
+            "unit_input_rotation_preauthorization_invalid"
+        ) from exc
+    expected = _release_mutation_begin_value(
+        transaction,
+        successor,
+        freshness_checked_at_unix=preauthorization[
+            "freshness_checked_at_unix"
+        ],
+    )
+    if preauthorization != expected:
+        raise UnitInputRotationError(
+            "unit_input_rotation_preauthorization_invalid"
+        )
+    return preauthorization
+
+
+def _release_activation_begin_value(
+    transaction: Mapping[str, Any],
+    successor: _ReleaseSuccessor,
+    preauthorization_receipt: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    unsigned = {
+        "schema": RELEASE_ACTIVATION_BEGIN_SCHEMA,
+        "transaction_sha256": transaction["transaction_sha256"],
+        "mutation_begin_sha256": preauthorization_receipt[
+            "mutation_begin_sha256"
+        ],
+        "successor_publication_sha256": successor.publication[
+            "publication_sha256"
+        ],
+        "release_update_publication_sha256": (
+            successor.release_update_publication["publication_sha256"]
+        ),
+        "successor_fixed_inputs_sha256": successor.fixed_inputs[
+            "fixed_inputs_sha256"
+        ],
+        "live_activation_write_ahead_committed": True,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    return {
+        **unsigned,
+        "activation_begin_sha256": _sha(_canonical(unsigned)),
+    }
+
+
+def _validate_release_activation_begin(
+    value: Any,
+    *,
+    transaction: Mapping[str, Any],
+    successor: _ReleaseSuccessor,
+    preauthorization_receipt: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _RELEASE_ACTIVATION_BEGIN_FIELDS
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_activation_begin_invalid"
+        )
+    expected = _release_activation_begin_value(
+        transaction,
+        successor,
+        preauthorization_receipt,
+    )
+    if value != expected:
+        raise UnitInputRotationError(
+            "unit_input_rotation_activation_begin_invalid"
+        )
+    return dict(value)
+
+
+def _load_release_activation_begin(
+    transaction_path: Path,
+    *,
+    transaction: Mapping[str, Any],
+    successor: _ReleaseSuccessor,
+    preauthorization_receipt: Mapping[str, Any],
+    uid: int,
+    gid: int,
+) -> Mapping[str, Any] | None:
+    path = transaction_path / ACTIVATION_BEGIN_FILE_NAME
+    if not os.path.lexists(path):
+        return None
+    value = _validate_release_activation_begin(
+        _decode(_read_exact(path, uid=uid, gid=gid, mode=0o400)),
+        transaction=transaction,
+        successor=successor,
+        preauthorization_receipt=preauthorization_receipt,
+    )
+    expected = _release_activation_begin_value(
+        transaction,
+        successor,
+        preauthorization_receipt,
+    )
+    if value != expected:
+        raise UnitInputRotationError(
+            "unit_input_rotation_activation_begin_invalid"
+        )
+    return value
+
+
+def _release_aborted_receipt(
+    transaction_path: Path,
+    transaction: Mapping[str, Any],
+    prepared_receipt: Mapping[str, Any],
+    preauthorization_receipt: Mapping[str, Any],
+    successor: _ReleaseSuccessor,
+) -> Mapping[str, Any]:
+    unsigned = {
+        "schema": RELEASE_ABORTED_RECEIPT_SCHEMA,
+        "transaction_sha256": transaction["transaction_sha256"],
+        "successor_publication_sha256": successor.publication[
+            "publication_sha256"
+        ],
+        "release_update_publication_sha256": (
+            successor.release_update_publication["publication_sha256"]
+        ),
+        "successor_fixed_inputs_sha256": successor.fixed_inputs[
+            "fixed_inputs_sha256"
+        ],
+        "audit_transaction_path": str(transaction_path),
+        "prepared_receipt_sha256": prepared_receipt["receipt_sha256"],
+        "mutation_begin_sha256": preauthorization_receipt[
+            "mutation_begin_sha256"
+        ],
+        "live_predecessor_unchanged": True,
+        "live_mutation_performed": False,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    return {**unsigned, "receipt_sha256": _sha(_canonical(unsigned))}
+
+
+def validate_release_rotation_abort_receipt(
+    value: Any,
+    *,
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    prepared_receipt: Mapping[str, Any],
+    preauthorization_receipt: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate one append-only terminal release-rotation abort."""
+
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _RELEASE_ABORTED_RECEIPT_FIELDS
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_receipt_invalid"
+        )
+    try:
+        prepared = validate_release_prepared_rotation_receipt(
+            prepared_receipt,
+            unit_input_publication=unit_input_publication,
+            release_update_publication=release_update_publication,
+            trusted_predecessor=trusted_predecessor,
+            expected_predecessor_trust_sha256=(
+                expected_predecessor_trust_sha256
+            ),
+        )
+        transaction = _release_receipt_transaction(prepared)
+        successor = _release_successor(
+            unit_input_publication,
+            release_update_publication,
+            trusted_predecessor,
+            expected_predecessor_trust_sha256=(
+                expected_predecessor_trust_sha256
+            ),
+            now_unix=transaction["authorization_checked_at_unix"],
+        )
+        preauthorization = validate_release_preauthorization_receipt(
+            preauthorization_receipt,
+            unit_input_publication=unit_input_publication,
+            release_update_publication=release_update_publication,
+            trusted_predecessor=trusted_predecessor,
+            expected_predecessor_trust_sha256=(
+                expected_predecessor_trust_sha256
+            ),
+            prepared_receipt=prepared,
+        )
+    except UnitInputRotationError as exc:
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_receipt_invalid"
+        ) from exc
+    transaction_path = Path(prepared["audit_transaction_path"])
+    expected = _release_aborted_receipt(
+        transaction_path,
+        transaction,
+        prepared,
+        preauthorization,
+        successor,
+    )
+    if value != expected:
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_receipt_invalid"
+        )
+    return dict(value)
+
+
+def _load_release_abort_receipt(
+    transaction_path: Path,
+    *,
+    transaction: Mapping[str, Any],
+    successor: _ReleaseSuccessor,
+    prepared_receipt: Mapping[str, Any],
+    preauthorization_receipt: Mapping[str, Any],
+    uid: int,
+    gid: int,
+) -> Mapping[str, Any] | None:
+    path = transaction_path / ABORT_RECEIPT_FILE_NAME
+    if not os.path.lexists(path):
+        return None
+    receipt = validate_release_rotation_abort_receipt(
+        _decode(_read_exact(path, uid=uid, gid=gid, mode=0o400)),
+        unit_input_publication=successor.publication,
+        release_update_publication=successor.release_update_publication,
+        trusted_predecessor=successor.trusted_predecessor,
+        expected_predecessor_trust_sha256=transaction[
+            "predecessor_trust_sha256"
+        ],
+        prepared_receipt=prepared_receipt,
+        preauthorization_receipt=preauthorization_receipt,
+    )
+    expected = _release_aborted_receipt(
+        transaction_path,
+        transaction,
+        prepared_receipt,
+        preauthorization_receipt,
+        successor,
+    )
+    if receipt != expected:
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_receipt_invalid"
+        )
+    return receipt
+
+
 def _publish_release_mutation_begin(
     transaction_path: Path,
     transaction: Mapping[str, Any],
@@ -4345,6 +4728,8 @@ def _publish_release_mutation_begin(
     _validate_live_predecessor(predecessor, uid=uid, gid=gid)
     checked = clock()
     if type(checked) is not int or checked <= 0:
+        raise UnitInputRotationError("unit_input_rotation_clock_invalid")
+    if checked < transaction["authorization_checked_at_unix"]:
         raise UnitInputRotationError("unit_input_rotation_clock_invalid")
     fresh = _release_successor(
         successor.publication,
@@ -4376,6 +4761,17 @@ def _publish_release_mutation_begin(
         successor,
         freshness_checked_at_unix=checked,
     )
+    if (
+        _validate_release_mutation_begin(
+            value,
+            transaction=transaction,
+            successor=successor,
+        )
+        != value
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_mutation_begin_invalid"
+        )
     _install_exact(
         transaction_path / MUTATION_BEGIN_FILE_NAME,
         _canonical(value),
@@ -4405,6 +4801,114 @@ def _publish_release_mutation_begin(
     if persisted is None:
         raise UnitInputRotationError(
             "unit_input_rotation_mutation_begin_invalid"
+        )
+    return persisted
+
+
+def _publish_release_abort_receipt(
+    transaction_path: Path,
+    transaction: Mapping[str, Any],
+    predecessor: _ReleaseAuthorityTriplet,
+    successor: _ReleaseSuccessor,
+    prepared_receipt: Mapping[str, Any],
+    preauthorization_receipt: Mapping[str, Any],
+    *,
+    uid: int,
+    gid: int,
+) -> Mapping[str, Any]:
+    if (
+        _release_logical_file_present(
+            transaction_path,
+            ACTIVATION_BEGIN_FILE_NAME,
+        )
+        or _release_logical_file_present(
+            transaction_path,
+            RECEIPT_FILE_NAME,
+        )
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_authorization_invalid"
+        )
+    _release_require_live_triplet_no_extended_metadata(
+        uid=uid,
+        gid=gid,
+        require_complete=False,
+    )
+    if _release_live_mutation_started(
+        predecessor,
+        successor,
+        uid=uid,
+        gid=gid,
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_authorization_invalid"
+        )
+    _release_require_live_triplet_no_extended_metadata(
+        uid=uid,
+        gid=gid,
+        require_complete=True,
+    )
+    _validate_live_predecessor(predecessor, uid=uid, gid=gid)
+    receipt = _release_aborted_receipt(
+        transaction_path,
+        transaction,
+        prepared_receipt,
+        preauthorization_receipt,
+        successor,
+    )
+    _install_exact(
+        transaction_path / ABORT_RECEIPT_FILE_NAME,
+        _canonical(receipt),
+        uid=uid,
+        gid=gid,
+        mode=0o400,
+    )
+    _checkpoint("v4_preauthorization_aborted")
+    if (
+        _release_logical_file_present(
+            transaction_path,
+            ACTIVATION_BEGIN_FILE_NAME,
+        )
+        or _release_logical_file_present(
+            transaction_path,
+            RECEIPT_FILE_NAME,
+        )
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_authorization_invalid"
+        )
+    if _release_live_mutation_started(
+        predecessor,
+        successor,
+        uid=uid,
+        gid=gid,
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_authorization_invalid"
+        )
+    _release_require_live_triplet_no_extended_metadata(
+        uid=uid,
+        gid=gid,
+        require_complete=True,
+    )
+    _validate_live_predecessor(predecessor, uid=uid, gid=gid)
+    _require_release_transaction_inventory(
+        transaction_path,
+        uid=uid,
+        gid=gid,
+    )
+    persisted = _load_release_abort_receipt(
+        transaction_path,
+        transaction=transaction,
+        successor=successor,
+        prepared_receipt=prepared_receipt,
+        preauthorization_receipt=preauthorization_receipt,
+        uid=uid,
+        gid=gid,
+    )
+    if persisted is None:
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_receipt_invalid"
         )
     return persisted
 
@@ -4471,6 +4975,94 @@ def _release_live_mutation_started(
     return observed != predecessor_values
 
 
+def _publish_release_activation_begin(
+    transaction_path: Path,
+    transaction: Mapping[str, Any],
+    predecessor: _ReleaseAuthorityTriplet,
+    successor: _ReleaseSuccessor,
+    preauthorization_receipt: Mapping[str, Any],
+    *,
+    uid: int,
+    gid: int,
+) -> Mapping[str, Any]:
+    if (
+        _release_logical_file_present(
+            transaction_path,
+            ABORT_RECEIPT_FILE_NAME,
+        )
+        or _release_logical_file_present(
+            transaction_path,
+            RECEIPT_FILE_NAME,
+        )
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_activation_begin_invalid"
+        )
+    _release_require_live_triplet_no_extended_metadata(
+        uid=uid,
+        gid=gid,
+        require_complete=False,
+    )
+    if _release_live_mutation_started(
+        predecessor,
+        successor,
+        uid=uid,
+        gid=gid,
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_activation_begin_invalid"
+        )
+    _release_require_live_triplet_no_extended_metadata(
+        uid=uid,
+        gid=gid,
+        require_complete=True,
+    )
+    _validate_live_predecessor(predecessor, uid=uid, gid=gid)
+    value = _release_activation_begin_value(
+        transaction,
+        successor,
+        preauthorization_receipt,
+    )
+    if (
+        _validate_release_activation_begin(
+            value,
+            transaction=transaction,
+            successor=successor,
+            preauthorization_receipt=preauthorization_receipt,
+        )
+        != value
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_activation_begin_invalid"
+        )
+    _install_exact(
+        transaction_path / ACTIVATION_BEGIN_FILE_NAME,
+        _canonical(value),
+        uid=uid,
+        gid=gid,
+        mode=0o400,
+    )
+    _checkpoint("v4_live_activation_begun")
+    _require_release_transaction_inventory(
+        transaction_path,
+        uid=uid,
+        gid=gid,
+    )
+    persisted = _load_release_activation_begin(
+        transaction_path,
+        transaction=transaction,
+        successor=successor,
+        preauthorization_receipt=preauthorization_receipt,
+        uid=uid,
+        gid=gid,
+    )
+    if persisted is None:
+        raise UnitInputRotationError(
+            "unit_input_rotation_activation_begin_invalid"
+        )
+    return persisted
+
+
 def _load_release_final_receipt(
     transaction_path: Path,
     *,
@@ -4478,6 +5070,7 @@ def _load_release_final_receipt(
     successor: _ReleaseSuccessor,
     prepared_receipt: Mapping[str, Any],
     mutation_begin: Mapping[str, Any],
+    activation_begin: Mapping[str, Any],
     uid: int,
     gid: int,
 ) -> Mapping[str, Any] | None:
@@ -4494,12 +5087,14 @@ def _load_release_final_receipt(
         ],
         prepared_receipt=prepared_receipt,
         mutation_begin=mutation_begin,
+        activation_begin=activation_begin,
     )
     if receipt != _release_finalized_receipt(
         transaction_path,
         transaction,
         prepared_receipt,
         mutation_begin,
+        activation_begin,
     ):
         raise UnitInputRotationError(
             "unit_input_rotation_receipt_invalid"
@@ -4553,6 +5148,7 @@ def _publish_release_final_receipt(
     successor: _ReleaseSuccessor,
     prepared_receipt: Mapping[str, Any],
     mutation_begin: Mapping[str, Any],
+    activation_begin: Mapping[str, Any],
     *,
     uid: int,
     gid: int,
@@ -4589,11 +5185,21 @@ def _publish_release_final_receipt(
         uid=uid,
         gid=gid,
     )
+    persisted_activation = _load_release_activation_begin(
+        transaction_path,
+        transaction=transaction,
+        successor=successor,
+        preauthorization_receipt=mutation_begin,
+        uid=uid,
+        gid=gid,
+    )
     if (
         persisted_prepared is None
         or persisted_prepared != prepared_receipt
         or persisted_mutation is None
         or persisted_mutation != mutation_begin
+        or persisted_activation is None
+        or persisted_activation != activation_begin
         or transaction["predecessor"]
         != _release_predecessor_record(predecessor)
     ):
@@ -4605,6 +5211,7 @@ def _publish_release_final_receipt(
         transaction,
         persisted_prepared,
         mutation_begin,
+        persisted_activation,
     )
     _install_exact(
         transaction_path / RECEIPT_FILE_NAME,
@@ -4625,6 +5232,7 @@ def _publish_release_final_receipt(
         successor=successor,
         prepared_receipt=persisted_prepared,
         mutation_begin=mutation_begin,
+        activation_begin=persisted_activation,
         uid=uid,
         gid=gid,
     )
@@ -4721,6 +5329,57 @@ def _prepare_release_unit_input_authority_rotation(
                     gid=gid,
                 )
                 if (
+                    transaction is not None
+                    and os.path.lexists(
+                        directory / ABORT_RECEIPT_FILE_NAME
+                    )
+                ):
+                    persisted = _persisted_release_successor(
+                        directory,
+                        transaction,
+                        uid=uid,
+                        gid=gid,
+                    )
+                    _release_validate_archived_predecessor(
+                        directory,
+                        transaction,
+                        persisted,
+                        uid=uid,
+                        gid=gid,
+                    )
+                    prepared = _load_release_prepared_receipt(
+                        directory,
+                        transaction=transaction,
+                        successor=persisted,
+                        uid=uid,
+                        gid=gid,
+                    )
+                    preauthorization = _load_release_mutation_begin(
+                        directory,
+                        transaction=transaction,
+                        successor=persisted,
+                        uid=uid,
+                        gid=gid,
+                    )
+                    if prepared is None or preauthorization is None:
+                        raise UnitInputRotationError(
+                            "unit_input_rotation_abort_receipt_invalid"
+                        )
+                    aborted = _load_release_abort_receipt(
+                        directory,
+                        transaction=transaction,
+                        successor=persisted,
+                        prepared_receipt=prepared,
+                        preauthorization_receipt=preauthorization,
+                        uid=uid,
+                        gid=gid,
+                    )
+                    if aborted is None:
+                        raise UnitInputRotationError(
+                            "unit_input_rotation_abort_receipt_invalid"
+                        )
+                    continue
+                if (
                     transaction is None
                     or not os.path.lexists(directory / RECEIPT_FILE_NAME)
                 ):
@@ -4761,12 +5420,25 @@ def _prepare_release_unit_input_authority_rotation(
                     raise UnitInputRotationError(
                         "unit_input_rotation_receipt_invalid"
                     )
+                activation_begin = _load_release_activation_begin(
+                    directory,
+                    transaction=transaction,
+                    successor=persisted,
+                    preauthorization_receipt=mutation_begin,
+                    uid=uid,
+                    gid=gid,
+                )
+                if activation_begin is None:
+                    raise UnitInputRotationError(
+                        "unit_input_rotation_receipt_invalid"
+                    )
                 final = _load_release_final_receipt(
                     directory,
                     transaction=transaction,
                     successor=persisted,
                     prepared_receipt=prepared,
                     mutation_begin=mutation_begin,
+                    activation_begin=activation_begin,
                     uid=uid,
                     gid=gid,
                 )
@@ -5008,7 +5680,104 @@ def _prepare_release_unit_input_authority_rotation(
         raise UnitInputRotationError("unit_input_rotation_failed") from exc
 
 
-def _finalize_prepared_release_unit_input_authority_rotation(
+def _release_require_other_transactions_terminal(
+    root: Path,
+    transaction_path: Path,
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    for directory in _release_transaction_directories(
+        root,
+        uid=uid,
+        gid=gid,
+    ):
+        if directory == transaction_path:
+            continue
+        transaction = _load_release_transaction(
+            directory,
+            uid=uid,
+            gid=gid,
+        )
+        if transaction is None:
+            raise UnitInputRotationError(
+                "unit_input_rotation_recovery_ambiguous"
+            )
+        successor = _persisted_release_successor(
+            directory,
+            transaction,
+            uid=uid,
+            gid=gid,
+        )
+        _release_validate_archived_predecessor(
+            directory,
+            transaction,
+            successor,
+            uid=uid,
+            gid=gid,
+        )
+        prepared = _load_release_prepared_receipt(
+            directory,
+            transaction=transaction,
+            successor=successor,
+            uid=uid,
+            gid=gid,
+        )
+        preauthorization = _load_release_mutation_begin(
+            directory,
+            transaction=transaction,
+            successor=successor,
+            uid=uid,
+            gid=gid,
+        )
+        if prepared is None or preauthorization is None:
+            raise UnitInputRotationError(
+                "unit_input_rotation_recovery_ambiguous"
+            )
+        if os.path.lexists(directory / ABORT_RECEIPT_FILE_NAME):
+            aborted = _load_release_abort_receipt(
+                directory,
+                transaction=transaction,
+                successor=successor,
+                prepared_receipt=prepared,
+                preauthorization_receipt=preauthorization,
+                uid=uid,
+                gid=gid,
+            )
+            if aborted is None:
+                raise UnitInputRotationError(
+                    "unit_input_rotation_abort_receipt_invalid"
+                )
+            continue
+        activation_begin = _load_release_activation_begin(
+            directory,
+            transaction=transaction,
+            successor=successor,
+            preauthorization_receipt=preauthorization,
+            uid=uid,
+            gid=gid,
+        )
+        if activation_begin is None:
+            raise UnitInputRotationError(
+                "unit_input_rotation_recovery_ambiguous"
+            )
+        final = _load_release_final_receipt(
+            directory,
+            transaction=transaction,
+            successor=successor,
+            prepared_receipt=prepared,
+            mutation_begin=preauthorization,
+            activation_begin=activation_begin,
+            uid=uid,
+            gid=gid,
+        )
+        if final is None:
+            raise UnitInputRotationError(
+                "unit_input_rotation_recovery_ambiguous"
+            )
+
+
+def _preauthorize_prepared_release_unit_input_authority_rotation(
     unit_input_publication: Mapping[str, Any],
     release_update_publication: Mapping[str, Any],
     prepared_receipt: Mapping[str, Any],
@@ -5020,7 +5789,7 @@ def _finalize_prepared_release_unit_input_authority_rotation(
     clock: Callable[[], int],
     lock_factory: Callable[[], Any] | None,
 ) -> Mapping[str, Any]:
-    """Finalize only the exact persisted Stage C prepared transaction."""
+    """Durably authorize one exact prepared rotation without live mutation."""
 
     uid, gid = _rotation_identity(require_root=require_root)
     supplied = validate_release_prepared_rotation_receipt(
@@ -5038,7 +5807,7 @@ def _finalize_prepared_release_unit_input_authority_rotation(
         != expected_transaction_sha256
     ):
         raise UnitInputRotationError(
-            "unit_input_rotation_finalize_authorization_invalid"
+            "unit_input_rotation_preauthorization_invalid"
         )
     incoming = _release_candidate_envelope(
         unit_input_publication,
@@ -5087,20 +5856,14 @@ def _finalize_prepared_release_unit_input_authority_rotation(
                 != expected_transaction_sha256
             ):
                 raise UnitInputRotationError(
-                    "unit_input_rotation_finalize_authorization_invalid"
+                    "unit_input_rotation_preauthorization_invalid"
                 )
-            for directory in _release_transaction_directories(
+            _release_require_other_transactions_terminal(
                 root,
+                transaction_path,
                 uid=uid,
                 gid=gid,
-            ):
-                if (
-                    directory != transaction_path
-                    and not os.path.lexists(directory / RECEIPT_FILE_NAME)
-                ):
-                    raise UnitInputRotationError(
-                        "unit_input_rotation_recovery_ambiguous"
-                    )
+            )
             successor = _release_successor_from_transaction(
                 transaction_path,
                 transaction,
@@ -5127,38 +5890,58 @@ def _finalize_prepared_release_unit_input_authority_rotation(
                 or persisted_prepared != supplied
             ):
                 raise UnitInputRotationError(
-                    "unit_input_rotation_finalize_authorization_invalid"
+                    "unit_input_rotation_preauthorization_invalid"
                 )
-            mutation_begin = _load_release_mutation_begin(
+            preauthorization = _load_release_mutation_begin(
                 transaction_path,
                 transaction=transaction,
                 successor=successor,
                 uid=uid,
                 gid=gid,
             )
-            final = (
-                None
-                if mutation_begin is None
-                else _load_release_final_receipt(
+            if _release_logical_file_present(
+                transaction_path,
+                ABORT_RECEIPT_FILE_NAME,
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_preauthorization_aborted"
+                )
+            final = None
+            activation_begin = None
+            if preauthorization is not None:
+                activation_begin = _load_release_activation_begin(
                     transaction_path,
                     transaction=transaction,
                     successor=successor,
-                    prepared_receipt=persisted_prepared,
-                    mutation_begin=mutation_begin,
+                    preauthorization_receipt=preauthorization,
                     uid=uid,
                     gid=gid,
                 )
-            )
+                if activation_begin is not None:
+                    final = _load_release_final_receipt(
+                        transaction_path,
+                        transaction=transaction,
+                        successor=successor,
+                        prepared_receipt=persisted_prepared,
+                        mutation_begin=preauthorization,
+                        activation_begin=activation_begin,
+                        uid=uid,
+                        gid=gid,
+                    )
             if final is not None:
+                if preauthorization is None:
+                    raise UnitInputRotationError(
+                        "unit_input_rotation_preauthorization_invalid"
+                    )
                 _validate_live_successor(successor, uid=uid, gid=gid)
                 _release_require_live_triplet_no_extended_metadata(
                     uid=uid,
                     gid=gid,
                     require_complete=True,
                 )
-                return final
-            if mutation_begin is None:
-                mutation_begin = _publish_release_mutation_begin(
+                return preauthorization
+            if preauthorization is None:
+                return _publish_release_mutation_begin(
                     transaction_path,
                     transaction,
                     predecessor,
@@ -5167,31 +5950,217 @@ def _finalize_prepared_release_unit_input_authority_rotation(
                     uid=uid,
                     gid=gid,
                 )
-            if not _release_live_mutation_started(
+            if _release_live_mutation_started(
                 predecessor,
                 successor,
                 uid=uid,
                 gid=gid,
             ):
-                checked = clock()
-                if type(checked) is not int or checked <= 0:
-                    raise UnitInputRotationError(
-                        "unit_input_rotation_clock_invalid"
-                    )
-                if checked < mutation_begin["freshness_checked_at_unix"]:
-                    raise UnitInputRotationError(
-                        "unit_input_rotation_clock_invalid"
-                    )
-                fresh = _release_successor(
-                    successor.publication,
-                    successor.release_update_publication,
-                    successor.trusted_predecessor,
-                    expected_predecessor_trust_sha256=transaction[
-                        "predecessor_trust_sha256"
-                    ],
-                    now_unix=checked,
+                return preauthorization
+            _release_require_live_triplet_no_extended_metadata(
+                uid=uid,
+                gid=gid,
+                require_complete=True,
+            )
+            _validate_live_predecessor(predecessor, uid=uid, gid=gid)
+            return preauthorization
+    except UnitInputRotationError:
+        raise
+    except (
+        OSError,
+        RuntimeError,
+        package.PackagingError,
+        release_inputs_v4.ProductionReleaseUnitInputsV4Error,
+        release_update.ProductionReleaseUpdateContractError,
+    ) as exc:
+        raise UnitInputRotationError("unit_input_rotation_failed") from exc
+
+
+def _finalize_preauthorized_release_unit_input_authority_rotation(
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    prepared_receipt: Mapping[str, Any],
+    preauthorization_receipt: Mapping[str, Any],
+    *,
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    expected_transaction_sha256: str,
+    require_root: bool,
+    lock_factory: Callable[[], Any] | None,
+) -> Mapping[str, Any]:
+    """Finalize only the supplied exact durable preauthorization."""
+
+    uid, gid = _rotation_identity(require_root=require_root)
+    supplied_prepared = validate_release_prepared_rotation_receipt(
+        prepared_receipt,
+        unit_input_publication=unit_input_publication,
+        release_update_publication=release_update_publication,
+        trusted_predecessor=trusted_predecessor,
+        expected_predecessor_trust_sha256=(
+            expected_predecessor_trust_sha256
+        ),
+    )
+    supplied_preauthorization = (
+        validate_release_preauthorization_receipt(
+            preauthorization_receipt,
+            unit_input_publication=unit_input_publication,
+            release_update_publication=release_update_publication,
+            trusted_predecessor=trusted_predecessor,
+            expected_predecessor_trust_sha256=(
+                expected_predecessor_trust_sha256
+            ),
+            prepared_receipt=supplied_prepared,
+        )
+    )
+    if (
+        _SHA256.fullmatch(str(expected_transaction_sha256 or "")) is None
+        or supplied_prepared["transaction_sha256"]
+        != expected_transaction_sha256
+        or supplied_preauthorization["transaction_sha256"]
+        != expected_transaction_sha256
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_finalize_authorization_invalid"
+        )
+    incoming_raw = _release_candidate_envelope(
+        unit_input_publication,
+        release_update_publication,
+        trusted_predecessor,
+        expected_predecessor_trust_sha256=(
+            expected_predecessor_trust_sha256
+        ),
+    )[:3]
+    try:
+        context = authority_lock.authority_activation_lock(
+            require_root=require_root,
+            lock_factory=lock_factory,
+        )
+        with context:
+            staged_root = package.STAGED_UNIT_INPUT_PLAN_PATH.parent
+            _require_directory(staged_root, uid=uid, gid=gid)
+            _release_require_live_triplet_no_extended_metadata(
+                uid=uid,
+                gid=gid,
+                require_complete=False,
+            )
+            root = cutover.EVIDENCE_ROOT / RELEASE_AUDIT_DIRECTORY_NAME
+            _require_directory(root, uid=uid, gid=gid)
+            _release_require_no_extended_metadata(
+                cutover.EVIDENCE_ROOT,
+                uid=uid,
+                gid=gid,
+            )
+            _release_require_no_extended_metadata(
+                root,
+                uid=uid,
+                gid=gid,
+            )
+            transaction_path = Path(
+                supplied_prepared["audit_transaction_path"]
+            )
+            _require_directory(transaction_path, uid=uid, gid=gid)
+            transaction = _load_release_transaction(
+                transaction_path,
+                uid=uid,
+                gid=gid,
+            )
+            if (
+                transaction is None
+                or transaction["transaction_sha256"]
+                != expected_transaction_sha256
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_finalize_authorization_invalid"
                 )
-                _release_require_same_successor(transaction, fresh)
+            _release_require_other_transactions_terminal(
+                root,
+                transaction_path,
+                uid=uid,
+                gid=gid,
+            )
+            successor = _release_successor_from_transaction(
+                transaction_path,
+                transaction,
+                incoming_raw,
+                uid=uid,
+                gid=gid,
+            )
+            predecessor = _release_validate_archived_predecessor(
+                transaction_path,
+                transaction,
+                successor,
+                uid=uid,
+                gid=gid,
+            )
+            persisted_prepared = _load_release_prepared_receipt(
+                transaction_path,
+                transaction=transaction,
+                successor=successor,
+                uid=uid,
+                gid=gid,
+            )
+            persisted_preauthorization = _load_release_mutation_begin(
+                transaction_path,
+                transaction=transaction,
+                successor=successor,
+                uid=uid,
+                gid=gid,
+            )
+            if (
+                persisted_prepared is None
+                or persisted_prepared != supplied_prepared
+                or persisted_preauthorization is None
+                or persisted_preauthorization
+                != supplied_preauthorization
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_finalize_authorization_invalid"
+                )
+            if _release_logical_file_present(
+                transaction_path,
+                ABORT_RECEIPT_FILE_NAME,
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_preauthorization_aborted"
+                )
+            activation_begin = _load_release_activation_begin(
+                transaction_path,
+                transaction=transaction,
+                successor=successor,
+                preauthorization_receipt=persisted_preauthorization,
+                uid=uid,
+                gid=gid,
+            )
+            final = None
+            if activation_begin is not None:
+                final = _load_release_final_receipt(
+                    transaction_path,
+                    transaction=transaction,
+                    successor=successor,
+                    prepared_receipt=persisted_prepared,
+                    mutation_begin=persisted_preauthorization,
+                    activation_begin=activation_begin,
+                    uid=uid,
+                    gid=gid,
+                )
+            if final is not None:
+                _validate_live_successor(successor, uid=uid, gid=gid)
+                _release_require_live_triplet_no_extended_metadata(
+                    uid=uid,
+                    gid=gid,
+                    require_complete=True,
+                )
+                return final
+            if activation_begin is None:
+                activation_begin = _publish_release_activation_begin(
+                    transaction_path,
+                    transaction,
+                    predecessor,
+                    successor,
+                    persisted_preauthorization,
+                    uid=uid,
+                    gid=gid,
+                )
             _activate_successor_triplet(
                 predecessor,
                 successor,
@@ -5204,7 +6173,8 @@ def _finalize_prepared_release_unit_input_authority_rotation(
                 predecessor,
                 successor,
                 persisted_prepared,
-                mutation_begin,
+                persisted_preauthorization,
+                activation_begin,
                 uid=uid,
                 gid=gid,
             )
@@ -5222,6 +6192,229 @@ def _finalize_prepared_release_unit_input_authority_rotation(
         release_update.ProductionReleaseUpdateContractError,
     ) as exc:
         raise UnitInputRotationError("unit_input_rotation_failed") from exc
+
+
+def _abort_preauthorized_release_unit_input_authority_rotation(
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    prepared_receipt: Mapping[str, Any],
+    preauthorization_receipt: Mapping[str, Any],
+    *,
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    expected_transaction_sha256: str,
+    require_root: bool,
+    lock_factory: Callable[[], Any] | None,
+) -> Mapping[str, Any]:
+    """Append one terminal abort before any live triplet mutation."""
+
+    uid, gid = _rotation_identity(require_root=require_root)
+    supplied_prepared = validate_release_prepared_rotation_receipt(
+        prepared_receipt,
+        unit_input_publication=unit_input_publication,
+        release_update_publication=release_update_publication,
+        trusted_predecessor=trusted_predecessor,
+        expected_predecessor_trust_sha256=(
+            expected_predecessor_trust_sha256
+        ),
+    )
+    supplied_preauthorization = (
+        validate_release_preauthorization_receipt(
+            preauthorization_receipt,
+            unit_input_publication=unit_input_publication,
+            release_update_publication=release_update_publication,
+            trusted_predecessor=trusted_predecessor,
+            expected_predecessor_trust_sha256=(
+                expected_predecessor_trust_sha256
+            ),
+            prepared_receipt=supplied_prepared,
+        )
+    )
+    if (
+        _SHA256.fullmatch(str(expected_transaction_sha256 or "")) is None
+        or supplied_prepared["transaction_sha256"]
+        != expected_transaction_sha256
+        or supplied_preauthorization["transaction_sha256"]
+        != expected_transaction_sha256
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_abort_authorization_invalid"
+        )
+    incoming_raw = _release_candidate_envelope(
+        unit_input_publication,
+        release_update_publication,
+        trusted_predecessor,
+        expected_predecessor_trust_sha256=(
+            expected_predecessor_trust_sha256
+        ),
+    )[:3]
+    try:
+        context = authority_lock.authority_activation_lock(
+            require_root=require_root,
+            lock_factory=lock_factory,
+        )
+        with context:
+            root = cutover.EVIDENCE_ROOT / RELEASE_AUDIT_DIRECTORY_NAME
+            _require_directory(root, uid=uid, gid=gid)
+            _release_require_no_extended_metadata(
+                cutover.EVIDENCE_ROOT,
+                uid=uid,
+                gid=gid,
+            )
+            _release_require_no_extended_metadata(
+                root,
+                uid=uid,
+                gid=gid,
+            )
+            transaction_path = Path(
+                supplied_prepared["audit_transaction_path"]
+            )
+            _require_directory(transaction_path, uid=uid, gid=gid)
+            transaction = _load_release_transaction(
+                transaction_path,
+                uid=uid,
+                gid=gid,
+            )
+            if (
+                transaction is None
+                or transaction["transaction_sha256"]
+                != expected_transaction_sha256
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_abort_authorization_invalid"
+                )
+            successor = _release_successor_from_transaction(
+                transaction_path,
+                transaction,
+                incoming_raw,
+                uid=uid,
+                gid=gid,
+            )
+            predecessor = _release_validate_archived_predecessor(
+                transaction_path,
+                transaction,
+                successor,
+                uid=uid,
+                gid=gid,
+            )
+            persisted_prepared = _load_release_prepared_receipt(
+                transaction_path,
+                transaction=transaction,
+                successor=successor,
+                uid=uid,
+                gid=gid,
+            )
+            persisted_preauthorization = _load_release_mutation_begin(
+                transaction_path,
+                transaction=transaction,
+                successor=successor,
+                uid=uid,
+                gid=gid,
+            )
+            if (
+                persisted_prepared is None
+                or persisted_prepared != supplied_prepared
+                or persisted_preauthorization is None
+                or persisted_preauthorization
+                != supplied_preauthorization
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_abort_authorization_invalid"
+                )
+            aborted = _load_release_abort_receipt(
+                transaction_path,
+                transaction=transaction,
+                successor=successor,
+                prepared_receipt=persisted_prepared,
+                preauthorization_receipt=persisted_preauthorization,
+                uid=uid,
+                gid=gid,
+            )
+            if aborted is not None:
+                return aborted
+            _release_require_other_transactions_terminal(
+                root,
+                transaction_path,
+                uid=uid,
+                gid=gid,
+            )
+            if (
+                _release_logical_file_present(
+                    transaction_path,
+                    ACTIVATION_BEGIN_FILE_NAME,
+                )
+                or _release_logical_file_present(
+                    transaction_path,
+                    RECEIPT_FILE_NAME,
+                )
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_abort_authorization_invalid"
+                )
+            return _publish_release_abort_receipt(
+                transaction_path,
+                transaction,
+                predecessor,
+                successor,
+                persisted_prepared,
+                persisted_preauthorization,
+                uid=uid,
+                gid=gid,
+            )
+    except UnitInputRotationError:
+        raise
+    except (
+        OSError,
+        RuntimeError,
+        package.PackagingError,
+        release_inputs_v4.ProductionReleaseUnitInputsV4Error,
+        release_update.ProductionReleaseUpdateContractError,
+    ) as exc:
+        raise UnitInputRotationError("unit_input_rotation_failed") from exc
+
+
+def _finalize_prepared_release_unit_input_authority_rotation(
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    prepared_receipt: Mapping[str, Any],
+    *,
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    expected_transaction_sha256: str,
+    require_root: bool,
+    clock: Callable[[], int],
+    lock_factory: Callable[[], Any] | None,
+) -> Mapping[str, Any]:
+    """Compatibility composition of durable preauthorization and finalize."""
+
+    preauthorization = (
+        _preauthorize_prepared_release_unit_input_authority_rotation(
+            unit_input_publication,
+            release_update_publication,
+            prepared_receipt,
+            trusted_predecessor=trusted_predecessor,
+            expected_predecessor_trust_sha256=(
+                expected_predecessor_trust_sha256
+            ),
+            expected_transaction_sha256=expected_transaction_sha256,
+            require_root=require_root,
+            clock=clock,
+            lock_factory=lock_factory,
+        )
+    )
+    return _finalize_preauthorized_release_unit_input_authority_rotation(
+        unit_input_publication,
+        release_update_publication,
+        prepared_receipt,
+        preauthorization,
+        trusted_predecessor=trusted_predecessor,
+        expected_predecessor_trust_sha256=(
+            expected_predecessor_trust_sha256
+        ),
+        expected_transaction_sha256=expected_transaction_sha256,
+        require_root=require_root,
+        lock_factory=lock_factory,
+    )
 
 
 def _production_clock() -> int:
@@ -5250,6 +6443,86 @@ def prepare_release_unit_input_authority_rotation(
     )
 
 
+def preauthorize_prepared_release_unit_input_authority_rotation(
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    prepared_receipt: Mapping[str, Any],
+    *,
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    expected_transaction_sha256: str,
+) -> Mapping[str, Any]:
+    """Root-only durable authorization before an outer commit boundary."""
+
+    return _preauthorize_prepared_release_unit_input_authority_rotation(
+        unit_input_publication,
+        release_update_publication,
+        prepared_receipt,
+        trusted_predecessor=trusted_predecessor,
+        expected_predecessor_trust_sha256=(
+            expected_predecessor_trust_sha256
+        ),
+        expected_transaction_sha256=expected_transaction_sha256,
+        require_root=True,
+        clock=_production_clock,
+        lock_factory=None,
+    )
+
+
+def finalize_preauthorized_release_unit_input_authority_rotation(
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    prepared_receipt: Mapping[str, Any],
+    preauthorization_receipt: Mapping[str, Any],
+    *,
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    expected_transaction_sha256: str,
+) -> Mapping[str, Any]:
+    """Root-only exact finalizer with no current-time freshness gate."""
+
+    return _finalize_preauthorized_release_unit_input_authority_rotation(
+        unit_input_publication,
+        release_update_publication,
+        prepared_receipt,
+        preauthorization_receipt,
+        trusted_predecessor=trusted_predecessor,
+        expected_predecessor_trust_sha256=(
+            expected_predecessor_trust_sha256
+        ),
+        expected_transaction_sha256=expected_transaction_sha256,
+        require_root=True,
+        lock_factory=None,
+    )
+
+
+def abort_preauthorized_release_unit_input_authority_rotation(
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    prepared_receipt: Mapping[str, Any],
+    preauthorization_receipt: Mapping[str, Any],
+    *,
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    expected_transaction_sha256: str,
+) -> Mapping[str, Any]:
+    """Root-only append-only abort before any live triplet mutation."""
+
+    return _abort_preauthorized_release_unit_input_authority_rotation(
+        unit_input_publication,
+        release_update_publication,
+        prepared_receipt,
+        preauthorization_receipt,
+        trusted_predecessor=trusted_predecessor,
+        expected_predecessor_trust_sha256=(
+            expected_predecessor_trust_sha256
+        ),
+        expected_transaction_sha256=expected_transaction_sha256,
+        require_root=True,
+        lock_factory=None,
+    )
+
+
 def finalize_prepared_release_unit_input_authority_rotation(
     unit_input_publication: Mapping[str, Any],
     release_update_publication: Mapping[str, Any],
@@ -5259,7 +6532,7 @@ def finalize_prepared_release_unit_input_authority_rotation(
     expected_predecessor_trust_sha256: str,
     expected_transaction_sha256: str,
 ) -> Mapping[str, Any]:
-    """Root-only finalizer; freshness is observed at mutation commit."""
+    """Root-only compatibility composition of preauthorize and finalize."""
 
     return _finalize_prepared_release_unit_input_authority_rotation(
         unit_input_publication,
