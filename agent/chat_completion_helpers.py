@@ -64,6 +64,17 @@ def _context_thread_target(callback):
     return lambda: context.run(callback)
 
 
+def _stream_chunk_carries_content(chunk: Any) -> bool:
+    """Return ``True`` if a streaming chunk carries real content (not a heartbeat).
+
+    Heartbeat / keep-alive SSE frames (``data: {}`` with no ``choices``)
+    keep the TCP connection alive but deliver no model output.  They must
+    not reset the stale-stream timer, otherwise a provider that pings
+    without producing content will hang the agent indefinitely (#73872).
+    """
+    return bool(getattr(chunk, "choices", None))
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -3044,8 +3055,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Record provider activity before Relay processes the chunk. This
             # prevents the stale watchdog from cancelling a live stream while
             # an interceptor or codec is still handling an already-received
-            # event.
-            last_chunk_time["t"] = time.time()
+            # event.  Only content-bearing chunks refresh the stale timer;
+            # heartbeat frames must not, or a provider that pings without
+            # producing content hangs the agent indefinitely (#73872).
+            if _stream_chunk_carries_content(_chunk):
+                last_chunk_time["t"] = time.time()
             return True
 
         def _relay_final_response() -> dict[str, Any]:
@@ -3098,8 +3112,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # ownership of closing the underlying provider stream.
             _set_request_stream_handle(stream)
         for chunk in stream:
-            last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
+            # Only refresh the stale-stream timer for chunks that carry
+            # actual content.  Heartbeat/keep-alive SSE frames (events
+            # with no ``choices``) keep the connection open but deliver
+            # no data; if they reset the timer a provider that pings
+            # without producing content hangs the agent indefinitely. (#73872)
+            if _stream_chunk_carries_content(chunk):
+                last_chunk_time["t"] = time.time()
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
@@ -3548,8 +3568,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         try:
             for event in stream:
                 saw_stream_event = True
-                last_chunk_time["t"] = time.time()
                 agent._touch_activity("receiving stream response")
+                # Only refresh the stale-stream timer for content/progress
+                # events.  Anthropic ``ping`` events are keep-alive frames
+                # that deliver no data; resetting the timer on them defeats
+                # the stale detector, same bug class as OpenAI heartbeat
+                # chunks. (#73872)
+                if getattr(event, "type", None) != "ping":
+                    last_chunk_time["t"] = time.time()
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
