@@ -288,6 +288,7 @@ from plugins.platforms.telegram.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from plugins.platforms.telegram.telegram_network import _SEED_FALLBACK_IPS
 from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -3709,7 +3710,26 @@ class TelegramAdapter(BasePlatformAdapter):
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
                 logger.warning("[%s] Discovering Telegram API fallback IPs via DNS-over-HTTPS…", self.name)
-                fallback_ips = await discover_fallback_ips()
+                # Bound DoH discovery with the same wall-clock deadline as
+                # initialize() — a wedged system resolver inside
+                # discover_fallback_ips can block the event loop and prevent
+                # the "Connecting to Telegram" retry ladder from ever running
+                # (#74140). The DoH client has its own timeout, but the
+                # system-DNS leg (asyncio.to_thread(socket.getaddrinfo)) can
+                # hang for minutes on broken VPN/DNS configs.
+                _doh_timeout = _env_float("HERMES_TELEGRAM_INIT_TIMEOUT", 30.0)
+                try:
+                    fallback_ips = await _await_with_thread_deadline(
+                        discover_fallback_ips(),
+                        timeout=_doh_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] DoH fallback-IP discovery timed out after %.0fs — "
+                        "using seed fallback IPs",
+                        self.name, _doh_timeout,
+                    )
+                    fallback_ips = list(_SEED_FALLBACK_IPS)
                 logger.info(
                     "[%s] Auto-discovered Telegram fallback IPs: %s",
                     self.name,
