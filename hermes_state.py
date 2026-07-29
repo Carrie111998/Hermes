@@ -3569,6 +3569,108 @@ class SessionDB:
         )
         cursor.execute("DROP TABLE gateway_routing_legacy_pk")
 
+    def _heal_session_model_usage_pk(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild ``session_model_usage`` when its PRIMARY KEY lacks ``task``.
+
+        Installs whose ``state.db`` reached ``schema_version >= 22`` before
+        the ``task`` dimension was added carry a 5-column PRIMARY KEY
+        ``(session_id, model, billing_provider, billing_base_url,
+        billing_mode)``.  The reconciler ADDs the ``task`` column as a bare
+        nullable, but SQLite cannot ALTER a primary key, so the composite
+        6-column PK never lands.  Every upsert in ``_record_model_usage()``
+        then fails with "ON CONFLICT clause does not match any PRIMARY KEY
+        or UNIQUE constraint" — silently killing all token *and* cost
+        accounting (the failed upsert aborts the enclosing transaction).
+
+        This healer is idempotent and runs unconditionally on every open.
+        On healthy databases it is a no-op (the ``task`` column is already
+        in the PK).  On affected installs it rebuilds the table once,
+        preserving existing rows with ``task = ''``.
+        """
+        try:
+            rows = cursor.execute(
+                "SELECT COUNT(*) FROM pragma_table_info('session_model_usage') "
+                "WHERE name = 'task' AND pk > 0"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Table doesn't exist yet — will be created by SCHEMA_SQL.
+            return
+        if rows and rows[0]:
+            # task is already in the PK — healthy.
+            return
+
+        # Verify the table exists before attempting a rebuild.
+        try:
+            exists = cursor.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='session_model_usage'"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            return
+        if not exists:
+            return
+
+        logger.info(
+            "session_model_usage has legacy 5-column primary key "
+            "(missing task); rebuilding with composite 6-column key"
+        )
+        try:
+            cursor.execute(
+                "ALTER TABLE session_model_usage "
+                "RENAME TO session_model_usage_legacy_pk"
+            )
+            cursor.execute(
+                """CREATE TABLE session_model_usage (
+                       session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                       model TEXT NOT NULL,
+                       billing_provider TEXT NOT NULL DEFAULT '',
+                       billing_base_url TEXT NOT NULL DEFAULT '',
+                       billing_mode TEXT NOT NULL DEFAULT '',
+                       task TEXT NOT NULL DEFAULT '',
+                       api_call_count INTEGER NOT NULL DEFAULT 0,
+                       input_tokens INTEGER NOT NULL DEFAULT 0,
+                       output_tokens INTEGER NOT NULL DEFAULT 0,
+                       cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                       cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                       reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                       estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                       actual_cost_usd REAL NOT NULL DEFAULT 0,
+                       cost_status TEXT,
+                       cost_source TEXT,
+                       first_seen REAL,
+                       last_seen REAL,
+                       PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
+                   )"""
+            )
+            cursor.execute(
+                """INSERT OR IGNORE INTO session_model_usage (
+                       session_id, model, billing_provider, billing_base_url,
+                       billing_mode, task, api_call_count, input_tokens,
+                       output_tokens, cache_read_tokens, cache_write_tokens,
+                       reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+                       cost_status, cost_source, first_seen, last_seen
+                   )
+                   SELECT session_id, model, billing_provider, billing_base_url,
+                          billing_mode, '', api_call_count, input_tokens,
+                          output_tokens, cache_read_tokens, cache_write_tokens,
+                          reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+                          cost_status, cost_source, first_seen, last_seen
+                   FROM session_model_usage_legacy_pk"""
+            )
+            cursor.execute("DROP TABLE session_model_usage_legacy_pk")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_model_usage_session "
+                "ON session_model_usage(session_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_model_usage_model "
+                "ON session_model_usage(model)"
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug(
+                "session_model_usage PK heal skipped: %s", exc,
+            )
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -3597,6 +3699,11 @@ class SessionDB:
         # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is
         # the one table-shape repair reconciliation can't express.
         self._heal_gateway_routing_pk(cursor)
+
+        # Rebuild session_model_usage if its PRIMARY KEY lacks the ``task``
+        # column (5-column PK from pre-v22 installs).  Same PK-rebuild
+        # constraint as gateway_routing above.
+        self._heal_session_model_usage_pk(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
