@@ -4218,6 +4218,7 @@ def _try_main_agent_model_fallback(
     task: str = None,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
@@ -4244,11 +4245,26 @@ def _try_main_agent_model_fallback(
       the shared credentials/account are broken, so the main model on the
       same provider cannot help either.
 
+    When ``main_runtime`` is provided (a normalized runtime snapshot from
+    the active session), its provider, model, base_url, and api_key are used
+    instead of re-reading static configuration.  This ensures the safety net
+    routes to the provider/model currently serving the conversation rather
+    than the one stored in config.yaml at startup (issue #73283).
+
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
-    main_provider = (_read_main_provider() or "").strip()
-    main_model = (_read_main_model() or "").strip()
+    runtime = _normalize_main_runtime(main_runtime)
+    runtime_provider = str(runtime.get("provider") or "").strip()
+    runtime_model = str(runtime.get("model") or "").strip()
+    runtime_base_url = str(runtime.get("base_url") or "").strip()
+    runtime_api_key = runtime.get("api_key", "")
+
+    # Prefer the active runtime snapshot when available; fall back to
+    # static config readers (_read_main_provider / _read_main_model) which
+    # check the ContextVar override and then config.yaml on disk.
+    main_provider = runtime_provider or (_read_main_provider() or "").strip()
+    main_model = runtime_model or (_read_main_model() or "").strip()
     if main_provider.lower() == "moa":
         # MoA virtual provider: fall back to the preset's aggregator — the
         # acting model — instead of the unreachable "moa"/<preset-name> pair.
@@ -4284,6 +4300,8 @@ def _try_main_agent_model_fallback(
     try:
         client, resolved_model = resolve_provider_client(
             provider=main_provider, model=main_model,
+            explicit_base_url=runtime_base_url or None,
+            explicit_api_key=runtime_api_key or None,
         )
     except Exception:
         client, resolved_model = None, None
@@ -8260,7 +8278,8 @@ def call_llm(
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                        failed_model=_chain_failed_model,
+                        main_runtime=main_runtime)
 
             if fb_client is not None:
                 fb_resp = _call_fallback_candidate_sync(
@@ -8806,7 +8825,8 @@ async def async_call_llm(
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                        failed_model=_chain_failed_model,
+                        main_runtime=main_runtime)
 
             if fb_client is not None:
                 # Convert sync fallback client to async
