@@ -1,214 +1,238 @@
-"""Tests for ``hermes cron audit-models`` command."""
+"""Tests for ``hermes cron audit-models``."""
 
 from __future__ import annotations
 
+import argparse
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from hermes_cli.cron_audit import audit_cron_models
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def mock_global_config():
-    """Mock the global config and model snapshot resolution."""
-    with patch("hermes_cli.config.load_config") as mock_load_config, \
-         patch("cron.jobs._resolve_default_model_snapshot") as mock_resolve:
-        mock_load_config.return_value = {
-            "model": {
-                "default": "gpt-4o",
-                "provider": "openai",
-            }
-        }
-        mock_resolve.return_value = "gpt-4o"
-        yield mock_load_config, mock_resolve
-
-
-def _make_job(
-    job_id: str = "test123",
-    name: str = "Test Job",
+def _job(
+    job_id="job-1",
+    *,
     model=None,
     provider=None,
+    model_snapshot=None,
+    provider_snapshot=None,
     no_agent=False,
+    enabled=True,
 ):
-    """Build a minimal job record matching the shape ``load_jobs`` returns."""
-    job = {
-        "id": job_id,
-        "name": name,
-        "enabled": True,
-    }
-    if model is not None:
-        job["model"] = model
-    if provider is not None:
-        job["provider"] = provider
+    result = {"id": job_id, "name": f"Job {job_id}", "enabled": enabled}
+    for key, value in (
+        ("model", model),
+        ("provider", provider),
+        ("model_snapshot", model_snapshot),
+        ("provider_snapshot", provider_snapshot),
+    ):
+        if value is not None:
+            result[key] = value
     if no_agent:
-        job["no_agent"] = True
-    return job
+        result["no_agent"] = True
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Status classification tests
-# ---------------------------------------------------------------------------
-
-class TestAuditStatusClassification:
-    """Verify the audit correctly classifies each pinning state."""
-
-    def test_pinned_job(self, mock_global_config):
-        """Both model and provider set → status 'pinned'."""
-        jobs = [_make_job(model="claude-3", provider="anthropic")]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)
-        assert data["jobs"][0]["status"] == "pinned"
-
-    def test_inherited_job(self, mock_global_config):
-        """Neither model nor provider set → status 'inherited'."""
-        jobs = [_make_job()]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)
-        assert data["jobs"][0]["status"] == "inherited"
-        assert data["jobs"][0]["model"] == "(inherited)"
-        assert data["jobs"][0]["provider"] == "(inherited)"
-
-    def test_script_only_job(self, mock_global_config):
-        """no_agent=True → status 'script-only'."""
-        jobs = [_make_job(no_agent=True)]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)
-        assert data["jobs"][0]["status"] == "script-only"
-        assert data["jobs"][0]["no_agent"] is True
-
-    def test_partial_job_model_only(self, mock_global_config):
-        """Model set but provider not → status 'partial'."""
-        jobs = [_make_job(model="claude-3")]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)
-        assert data["jobs"][0]["status"] == "partial"
-
-    def test_partial_job_provider_only(self, mock_global_config):
-        """Provider set but model not → status 'partial'."""
-        jobs = [_make_job(provider="anthropic")]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)
-        assert data["jobs"][0]["status"] == "partial"
-
-    def test_script_only_takes_precedence_over_model(self, mock_global_config):
-        """no_agent=True with model set → still 'script-only'."""
-        jobs = [_make_job(model="claude-3", provider="anthropic", no_agent=True)]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)
-        assert data["jobs"][0]["status"] == "script-only"
+def _audit(jobs, config, *, resolved_model="global-model", resolved_provider="global-provider"):
+    with (
+        patch("cron.jobs.load_jobs", return_value=jobs),
+        patch("hermes_cli.config.load_config", return_value=config),
+        patch("cron.jobs._resolve_default_model_snapshot", return_value=resolved_model),
+        patch(
+            "cron.jobs._compute_provider_model_snapshots",
+            return_value=(resolved_provider, None),
+        ),
+    ):
+        return json.loads(audit_cron_models(json_output=True))
 
 
-# ---------------------------------------------------------------------------
-# JSON output tests
-# ---------------------------------------------------------------------------
-
-class TestJsonOutput:
-    """Verify the JSON output structure."""
-
-    def test_json_is_valid(self, mock_global_config):
-        jobs = [_make_job(job_id="abc123", name="My Job", model="x", provider="y")]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)  # should not raise
-        assert "global_model" in data
-        assert "global_provider" in data
-        assert "jobs" in data
-        assert isinstance(data["jobs"], list)
-
-    def test_json_global_model_and_provider(self, mock_global_config):
-        with patch("cron.jobs.load_jobs", return_value=[]):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)
-        assert data["global_model"] == "gpt-4o"
-        assert data["global_provider"] == "openai"
-
-    def test_json_job_fields(self, mock_global_config):
-        jobs = [_make_job(job_id="j1", name="Job One", model="m1", provider="p1")]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)
-        job = data["jobs"][0]
-        assert job["id"] == "j1"
-        assert job["name"] == "Job One"
-        assert job["model"] == "m1"
-        assert job["provider"] == "p1"
-        assert job["status"] == "pinned"
-        assert job["no_agent"] is False
-
-    def test_json_empty_jobs(self, mock_global_config):
-        with patch("cron.jobs.load_jobs", return_value=[]):
-            result = audit_cron_models(json_output=True)
-        data = json.loads(result)
-        assert data["jobs"] == []
+@pytest.mark.parametrize(
+    ("job", "status"),
+    [
+        (_job(model="m", provider="p"), "pinned"),
+        (_job(model="m"), "partial"),
+        (_job(provider="p"), "partial"),
+        (_job(), "inherited"),
+        (_job(model="m", provider="p", no_agent=True), "script-only"),
+    ],
+)
+def test_pinning_status_is_separate_from_drift(job, status):
+    data = _audit([job], {"model": {"default": "global-model", "provider": "global-provider"}})
+    assert data["jobs"][0]["status"] == status
 
 
-# ---------------------------------------------------------------------------
-# Table output tests
-# ---------------------------------------------------------------------------
+def test_inherited_job_with_matching_snapshots_is_guarded_not_at_risk():
+    data = _audit(
+        [_job(model_snapshot="global-model", provider_snapshot="global-provider")],
+        {"model": {"default": "global-model", "provider": "global-provider"}},
+    )
+    result = data["jobs"][0]
+    assert result["guarded_axes"] == ["model", "provider"]
+    assert result["drifted_axes"] == []
+    assert result["at_risk"] is False
 
-class TestTableOutput:
-    """Verify the human-readable table output."""
 
-    def test_table_contains_header(self, mock_global_config):
-        with patch("cron.jobs.load_jobs", return_value=[]):
-            result = audit_cron_models(json_output=False)
-        assert "Cron Model Audit" in result
-        assert "Global model:" in result
-        assert "Global provider:" in result
+def test_drifted_snapshot_is_reported_as_scheduler_skip_risk():
+    data = _audit(
+        [_job(model_snapshot="old-model", provider_snapshot="old-provider")],
+        {"model": {"default": "new-model", "provider": "new-provider"}},
+        resolved_model="new-model",
+        resolved_provider="new-provider",
+    )
+    result = data["jobs"][0]
+    assert result["drifted_axes"] == ["model", "provider"]
+    assert result["at_risk"] is True
 
-    def test_table_contains_column_headers(self, mock_global_config):
-        with patch("cron.jobs.load_jobs", return_value=[]):
-            result = audit_cron_models(json_output=False)
-        assert "ID" in result
-        assert "Name" in result
-        assert "Model" in result
-        assert "Provider" in result
-        assert "Status" in result
 
-    def test_table_contains_summary(self, mock_global_config):
-        jobs = [
-            _make_job(job_id="a", name="A", model="m", provider="p"),
-            _make_job(job_id="b", name="B"),
-            _make_job(job_id="c", name="C", no_agent=True),
+def test_disabled_guard_does_not_claim_job_will_fail():
+    data = _audit(
+        [_job(model_snapshot="old-model", provider_snapshot="old-provider")],
+        {
+            "model": {"default": "new-model", "provider": "new-provider"},
+            "cron": {"model_drift_guard": False},
+        },
+        resolved_model="new-model",
+        resolved_provider="new-provider",
+    )
+    result = data["jobs"][0]
+    assert result["at_risk"] is False
+    assert result["unprotected_axes"] == ["model", "provider"]
+
+
+def test_pre_snapshot_job_is_unprotected_not_claimed_to_fail():
+    data = _audit(
+        [_job()],
+        {"model": {"default": "new-model", "provider": "new-provider"}},
+        resolved_model="new-model",
+        resolved_provider="new-provider",
+    )
+    result = data["jobs"][0]
+    assert result["at_risk"] is False
+    assert result["unprotected_axes"] == ["model", "provider"]
+
+
+def test_cron_fleet_defaults_cover_unpinned_axes_and_provider_precedence():
+    data = _audit(
+        [_job(model_snapshot="old-model", provider_snapshot="old-provider")],
+        {
+            "model": {"default": "chat-model", "provider": "chat-provider"},
+            "cron": {"model": "cron-model", "model_provider": "cron-provider"},
+        },
+    )
+    result = data["jobs"][0]
+    assert data["effective_default_model"] == "cron-model"
+    assert data["effective_default_provider"] == "cron-provider"
+    assert result["effective_model"] == "cron-model"
+    assert result["effective_provider"] == "cron-provider"
+    assert result["guarded_axes"] == []
+    assert result["at_risk"] is False
+
+
+def test_pinned_axis_is_not_evaluated_for_drift():
+    data = _audit(
+        [_job(model="pinned", model_snapshot="old", provider_snapshot="global-provider")],
+        {"model": {"default": "new", "provider": "global-provider"}},
+        resolved_model="new",
+    )
+    result = data["jobs"][0]
+    assert "model" not in result["guarded_axes"]
+    assert result["effective_model"] == "pinned"
+
+
+def test_json_has_machine_readable_safety_fields_without_icons():
+    data = _audit([_job()], {"model": {"default": "m", "provider": "p"}}, resolved_model="m", resolved_provider="p")
+    result = data["jobs"][0]
+    assert "status_icon" not in result
+    assert set(
+        [
+            "effective_model",
+            "effective_provider",
+            "model_snapshot",
+            "provider_snapshot",
+            "guarded_axes",
+            "drifted_axes",
+            "unprotected_axes",
+            "at_risk",
         ]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=False)
-        assert "Summary:" in result
-        assert "1 pinned" in result
-        assert "1 inherited" in result
-        assert "1 script-only" in result
+    ).issubset(result)
 
-    def test_table_warning_for_inherited(self, mock_global_config):
-        jobs = [_make_job(job_id="x", name="Inherited Job")]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=False)
-        assert "silently fail" in result
-        assert "hermes cron update" in result
 
-    def test_table_no_warning_when_all_pinned(self, mock_global_config):
-        jobs = [_make_job(job_id="x", name="Pinned", model="m", provider="p")]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=False)
-        assert "silently fail" not in result
+def test_table_uses_real_edit_command_and_precise_warning():
+    with (
+        patch("cron.jobs.load_jobs", return_value=[_job(model_snapshot="old")]),
+        patch(
+            "hermes_cli.config.load_config",
+            return_value={"model": {"default": "new", "provider": "p"}},
+        ),
+        patch("cron.jobs._resolve_default_model_snapshot", return_value="new"),
+        patch(
+            "cron.jobs._compute_provider_model_snapshots",
+            return_value=("p", None),
+        ),
+    ):
+        text = audit_cron_models()
+    assert "would skip" in text.lower()
+    assert "hermes cron edit <id>" in text
+    assert "silently fail" not in text
+    assert "hermes cron update" not in text
 
-    def test_table_shows_job_data(self, mock_global_config):
-        jobs = [_make_job(job_id="abc123def456", name="My Test Job", model="claude-3", provider="anthropic")]
-        with patch("cron.jobs.load_jobs", return_value=jobs):
-            result = audit_cron_models(json_output=False)
-        assert "abc123def456"[:12] in result
-        assert "My Test Job" in result
-        assert "claude-3" in result
-        assert "anthropic" in result
-        assert "pinned" in result
+
+def test_real_profile_store_and_config_resolution(tmp_path, monkeypatch):
+    """Exercise actual config + jobs resolution from a temporary HERMES_HOME."""
+    home = tmp_path / "profile"
+    (home / "cron").mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {"default": "chat-model", "provider": "chat-provider"},
+                "cron": {
+                    "model": "cron-model",
+                    "model_provider": "cron-provider",
+                    "model_drift_guard": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (home / "cron" / "jobs.json").write_text(
+        json.dumps(
+            [
+                _job(
+                    "real-job",
+                    model_snapshot="old-model",
+                    provider_snapshot="old-provider",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    data = json.loads(audit_cron_models(json_output=True))
+    assert data["effective_default_model"] == "cron-model"
+    assert data["effective_default_provider"] == "cron-provider"
+    assert data["jobs"][0]["id"] == "real-job"
+    assert data["jobs"][0]["at_risk"] is False
+
+
+def test_parser_and_handler_dispatch(capsys):
+    from hermes_cli.cron import cron_command
+    from hermes_cli.subcommands.cron import build_cron_parser
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_cron_parser(subparsers, cmd_cron=lambda _args: None)
+    args = parser.parse_args(["cron", "audit-models", "--json"])
+    assert args.cron_command == "audit-models"
+    assert args.json_output is True
+
+    with patch(
+        "hermes_cli.cron_audit.audit_cron_models", return_value='{"jobs": []}'
+    ) as audit:
+        assert cron_command(args) == 0
+    assert json.loads(capsys.readouterr().out) == {"jobs": []}
+    audit.assert_called_once_with(json_output=True)
