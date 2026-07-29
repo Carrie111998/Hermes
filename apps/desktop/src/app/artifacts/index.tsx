@@ -1,5 +1,5 @@
 import type * as React from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import { ZoomableImage } from '@/components/chat/zoomable-image'
@@ -21,6 +21,15 @@ import { getSessionMessages, listAllProfileSessions } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { ExternalLink, ExternalLinkIcon, hostPathLabel, urlSlugTitleLabel, useLinkTitle } from '@/lib/external-link'
 import { FileImage, FileText, FolderOpen, Link2, Loader2, Pencil, Box, RefreshCw } from '@/lib/icons'
+import { resolveBrandIcon } from '@/lib/brand-icon'
+import {
+  ExternalLink,
+  ExternalLinkIcon,
+  hostPathLabel,
+  shortHostLabel,
+  urlSlugTitleLabel,
+  useLinkTitle
+} from '@/lib/external-link'
 import { downloadGatewayMediaFile, isRemoteGateway } from '@/lib/media'
 import { normalize } from '@/lib/text'
 import { fmtDayTime } from '@/lib/time'
@@ -29,8 +38,8 @@ import { notifyError } from '@/store/notifications'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
+import { openSession } from '../open-session'
 import { PageSearchShell } from '../page-search-shell'
-import { sessionRoute } from '../routes'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import {
@@ -88,7 +97,7 @@ type CellCtx = {
 }
 
 interface ArtifactColumn {
-  Cell: (props: { artifact: ArtifactRecord; ctx: CellCtx }) => React.ReactElement
+  Cell: React.ComponentType<{ artifact: ArtifactRecord; ctx: CellCtx }>
   bodyClassName: string
   header: (filter: ArtifactFilter, a: Translations['artifacts']) => string
   id: 'location' | 'primary' | 'session'
@@ -270,10 +279,12 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     })
   }, [])
 
-  const cellCtx: CellCtx = {
-    onOpen: openArtifact,
-    onOpenChat: sessionId => navigate(sessionRoute(sessionId))
-  }
+  // Stable ctx: recreating it (or its onOpenChat closure) every render made
+  // every artifact cell re-render whenever the page did — and a link cell's
+  // async title fetch re-rendered the page repeatedly. openArtifact is already
+  // a useCallback; navigate is stable, so onOpenChat can be too.
+  const openChat = useCallback((sessionId: string) => openSession(sessionId, navigate), [navigate])
+  const cellCtx: CellCtx = useMemo(() => ({ onOpen: openArtifact, onOpenChat: openChat }), [openArtifact, openChat])
 
   return (
     <PageSearchShell
@@ -337,7 +348,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
                       failedImage={failedImageIds.has(artifact.id)}
                       key={artifact.id}
                       onImageError={markImageFailed}
-                      onOpenChat={sessionId => navigate(sessionRoute(sessionId))}
+                      onOpenChat={sessionId => openSession(sessionId, navigate)}
                     />
                   ))}
                 </div>
@@ -541,9 +552,10 @@ function ArtifactCellAction({
   )
 }
 
-function PrimaryCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx }) {
+const PrimaryCell = memo(function PrimaryCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx }) {
   const isLink = artifact.kind === 'link'
-  const Icon = isLink ? Link2 : fileTypeIcon(artifact.value)
+  const brand = isLink ? resolveBrandIcon(shortHostLabel(artifact.href)) : null
+  const Icon = brand ?? (isLink ? Link2 : FileText)
   const fetchedTitle = useLinkTitle(isLink ? artifact.href : null)
   const label = isLink ? fetchedTitle || urlSlugTitleLabel(artifact.href) : artifact.label
 
@@ -562,7 +574,7 @@ function PrimaryCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx
       </span>
     </ArtifactCellAction>
   )
-}
+})
 
 // Distinct glyph per diagram-source type so .excalidraw / .drawio / .mermaid
 // attachments read as diagrams in the artifacts list (not a generic file).
@@ -578,6 +590,7 @@ function fileTypeIcon(path: string): typeof FileText {
 }
 
 function LocationCell({ artifact }: { artifact: ArtifactRecord; ctx: CellCtx }) {
+const LocationCell = memo(function LocationCell({ artifact }: { artifact: ArtifactRecord; ctx: CellCtx }) {
   const { t } = useI18n()
   const isLink = artifact.kind === 'link'
   const value = isLink ? hostPathLabel(artifact.value) : artifact.value
@@ -606,9 +619,9 @@ function LocationCell({ artifact }: { artifact: ArtifactRecord; ctx: CellCtx }) 
       />
     </div>
   )
-}
+})
 
-function SessionCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx }) {
+const SessionCell = memo(function SessionCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx }) {
   return (
     <ArtifactCellAction onClick={() => ctx.onOpenChat(artifact.sessionId)} title={artifact.sessionTitle}>
       <span className="flex min-w-0 flex-col">
@@ -619,7 +632,7 @@ function SessionCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx
       </span>
     </ArtifactCellAction>
   )
-}
+})
 
 const ARTIFACT_COLUMNS: readonly ArtifactColumn[] = [
   {

@@ -1,18 +1,13 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 
+import { useSessionView } from '@/app/chat/session-view'
 import { useI18n } from '@/i18n'
 import { Box, MonitorPlay, Pencil } from '@/lib/icons'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { previewName } from '@/lib/preview-targets'
 import { notifyError } from '@/store/notifications'
-import {
-  $previewTarget,
-  dismissPreviewTarget,
-  type PreviewRecordSource,
-  setCurrentSessionPreviewTarget
-} from '@/store/preview'
-import { $currentCwd } from '@/store/session'
+import { $previewTabSources, closePreviewForSource, openPreview, type PreviewRecordSource } from '@/store/preview'
 
 // Diagram-source attachments get a type-specific glyph instead of the generic
 // preview icon, matching the artifacts-panel treatment.
@@ -29,21 +24,22 @@ function attachmentIcon(target: string) {
 
 export function PreviewAttachment({ source = 'manual', target }: { source?: PreviewRecordSource; target: string }) {
   const { t } = useI18n()
-  const cwd = useStore($currentCwd)
-  const activePreview = useStore($previewTarget)
+  // This link lives in one session's transcript; resolve it against THAT
+  // session's cwd, not the primary chat's.
+  const cwd = useStore(useSessionView().$cwd)
+  const openSources = useStore($previewTabSources)
   const [opening, setOpening] = useState(false)
-  const activePreviewRef = useRef(activePreview)
   const cwdRef = useRef(cwd)
   const mountedRef = useRef(false)
   const requestTokenRef = useRef(0)
   const targetRef = useRef(target)
   const name = previewName(target)
-  const isActive = activePreview?.source === target
+  const isActive = openSources.includes(target)
 
-  activePreviewRef.current = activePreview
   cwdRef.current = cwd
   targetRef.current = target
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     mountedRef.current = true
 
@@ -53,6 +49,7 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
     }
   }, [])
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     requestTokenRef.current += 1
     setOpening(false)
@@ -64,7 +61,7 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
     }
 
     if (isActive) {
-      dismissPreviewTarget()
+      closePreviewForSource(target)
 
       return
     }
@@ -91,13 +88,7 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
         throw new Error(`Could not open preview target: ${requestTarget}`)
       }
 
-      const currentPreview = activePreviewRef.current
-
-      if (currentPreview?.source === preview.source && currentPreview.url === preview.url) {
-        return
-      }
-
-      setCurrentSessionPreviewTarget(preview, source, requestTarget)
+      openPreview(preview, source)
     } catch (error) {
       if (
         !mountedRef.current ||
