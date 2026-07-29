@@ -239,6 +239,10 @@ class MemoryStore:
     ) -> list[dict]:
         """Full-text search over facts using FTS5.
 
+        .. note::
+            This method has zero callers in the plugin. ``FactRetriever.search()``
+            is the active retrieval path. Retained for API completeness.
+
         Returns a list of fact dicts ordered by FTS5 rank, then trust_score
         descending. Also increments retrieval_count for matched facts.
         """
@@ -278,13 +282,7 @@ class MemoryStore:
             results = [self._row_to_dict(r) for r in rows]
 
             if results:
-                ids = [r["fact_id"] for r in results]
-                placeholders = ",".join("?" * len(ids))
-                self._conn.execute(
-                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE fact_id IN ({placeholders})",
-                    ids,
-                )
-                self._conn.commit()
+                self.increment_retrieval_count([r["fact_id"] for r in results])
 
             return results
 
@@ -439,6 +437,24 @@ class MemoryStore:
                 "new_trust":    new_trust,
                 "helpful_count": row["helpful_count"] + helpful_increment,
             }
+
+    def increment_retrieval_count(self, fact_ids: list[int]) -> None:
+        """Increment retrieval_count for one or more facts under the shared lock.
+
+        Used by FactRetriever.search() after returning results. Centralizes
+        the counter SQL so it lives in one place instead of duplicating in
+        both search_facts() and FactRetriever.
+        """
+        if not fact_ids:
+            return
+        with self._lock:
+            placeholders = ",".join("?" * len(fact_ids))
+            self._conn.execute(
+                f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                f"WHERE fact_id IN ({placeholders})",
+                fact_ids,
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Entity helpers

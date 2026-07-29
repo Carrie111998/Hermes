@@ -106,6 +106,12 @@ class FactRetriever:
         # Sort by score descending, return top limit
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
+
+        # Increment retrieval_count for returned facts
+        if results:
+            ids = [f["fact_id"] for f in results]
+            self.store.increment_retrieval_count(ids)
+
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
@@ -187,7 +193,10 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        if results:
+            self.store.increment_retrieval_count([f["fact_id"] for f in results])
+        return results
 
     def related(
         self,
@@ -255,7 +264,10 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        if results:
+            self.store.increment_retrieval_count([f["fact_id"] for f in results])
+        return results
 
     def reason(
         self,
@@ -333,7 +345,10 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        if results:
+            self.store.increment_retrieval_count([f["fact_id"] for f in results])
+        return results
 
     def contradict(
         self,
@@ -476,7 +491,10 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        if results:
+            self.store.increment_retrieval_count([f["fact_id"] for f in results])
+        return results
 
     def _fts_candidates(
         self,
