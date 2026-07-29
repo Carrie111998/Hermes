@@ -355,25 +355,43 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
             "X-Title": "Hermes Agent",
         }
         last_error: Optional[Dict[str, Any]] = None
+        # OpenRouter uses the dedicated images API; other backends (Nous Portal)
+        # use the chat-completions + modalities protocol.
+        is_openrouter = self._name == "openrouter"
         for i, model_id in enumerate(model_chain):
-            # Build input_references for the dedicated images API
-            input_refs: List[Dict[str, Any]] = []
-            for ref in references[:_MAX_REFERENCE_IMAGES]:
-                part = _to_image_url_part(ref)
-                if part:
-                    input_refs.append({"type": "image_url", "image_url": {"url": part}})
-
-            payload: Dict[str, Any] = {
-                "model": model_id,
-                "prompt": prompt,
-                "aspect_ratio": or_aspect,
-            }
-            if input_refs:
-                payload["input_references"] = input_refs
+            if is_openrouter:
+                # Dedicated images API: prompt + aspect_ratio + input_references
+                input_refs: List[Dict[str, Any]] = []
+                for ref in references[:_MAX_REFERENCE_IMAGES]:
+                    part = _to_image_url_part(ref)
+                    if part:
+                        input_refs.append({"type": "image_url", "image_url": {"url": part}})
+                payload: Dict[str, Any] = {
+                    "model": model_id,
+                    "prompt": prompt,
+                    "aspect_ratio": or_aspect,
+                }
+                if input_refs:
+                    payload["input_references"] = input_refs
+                endpoint = "images/generations"
+            else:
+                # Chat-completions protocol: modalities + messages + image_config
+                content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+                for ref in references[:_MAX_REFERENCE_IMAGES]:
+                    part = _to_image_url_part(ref)
+                    if part:
+                        content.append({"type": "image_url", "image_url": {"url": part}})
+                payload = {
+                    "model": model_id,
+                    "modalities": ["image", "text"],
+                    "messages": [{"role": "user", "content": content}],
+                    "image_config": {"aspect_ratio": or_aspect},
+                }
+                endpoint = "chat/completions"
             is_last = i == len(model_chain) - 1
             try:
                 response = requests.post(
-                    f"{base_url}/images/generations",
+                    f"{base_url}/{endpoint}",
                     headers=headers,
                     json=payload,
                     timeout=_REQUEST_TIMEOUT,
