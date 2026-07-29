@@ -102,8 +102,21 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     text = (error or "unknown error").strip()
     lower = text.lower()
 
+    # The provider-shaped branches below are substring heuristics written for
+    # agent runs. A ``no_agent`` job never touches a provider — the script IS
+    # the job — so there is no fallback chain to exhaust and no auth to fail.
+    # Its errors come from the script runner ("Script timed out after 12600s:
+    # /path/to/x.sh", "Script exited with code 1"), and those strings trip the
+    # timeout heuristic: operators were told a shell-script timeout was a
+    # "provider timeout" and went debugging fallback chains. Script-job errors
+    # skip straight to the generic cleaned-message path, which reports the real
+    # failure. Jobs with a ``script`` but no ``no_agent`` still run an agent
+    # (the script is pre-run data collection whose failure is injected into the
+    # prompt, never returned as the job error), so they keep the provider wording.
+    uses_provider = not job.get("no_agent")
+
     # Provider/API failures are the common noisy path. Keep these short.
-    if "429" in text or "rate limit" in lower or "usage limit" in lower:
+    if uses_provider and ("429" in text or "rate limit" in lower or "usage limit" in lower):
         reason = "rate limit"
         if "weekly usage limit" in lower:
             reason = "weekly usage limit"
@@ -115,7 +128,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
-    if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
+    if uses_provider and ("readtimeout" in lower or "timed out" in lower or "timeout" in lower):
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
             "Fallback chain was exhausted or unavailable. "
@@ -125,7 +138,9 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # Match authentication/authorization wording at a word boundary and the
     # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
     # not trip a misleading auth message.
-    if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
+    if uses_provider and (
+        re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text)
+    ):
         return (
             f"⚠️ Cron '{job_name}' failed: provider authentication error. "
             "Full details saved in cron output."
