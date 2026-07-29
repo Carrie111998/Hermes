@@ -37,7 +37,7 @@ import os
 import sys
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
-_ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
+_ROOT_NODE = {".nvmrc", "package.json", "package-lock.json"}  # shifts every package's runtime/tree
 _DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
@@ -71,7 +71,7 @@ def _is_docs(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
-    return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
+    return _is_docs(p) or p in _ROOT_NODE or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
 
 
 def _is_scan(p: str) -> bool:
@@ -101,7 +101,7 @@ def classify(files: list[str]) -> dict[str, bool]:
     ret = {
         "python": any(not _py_irrelevant(f) for f in files),
         "docker_meta":  any(f.startswith(_DOCKER_META) for f in files),
-        "frontend": any(f.startswith(_FRONTEND) or f in _ROOT_NPM for f in files),
+        "frontend": any(f.startswith(_FRONTEND) or f in _ROOT_NODE for f in files),
         "site": any(f.startswith(_SITE) for f in files),
         "scan": any(_is_scan(f) for f in files),
         "deps": any(f == "pyproject.toml" for f in files),
