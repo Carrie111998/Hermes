@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -379,16 +380,21 @@ class TestWebToolPolicy:
         # The per-URL website-policy gate moved into the firecrawl plugin's
         # extract() during the web-provider migration. Patch it at the new
         # location.
-        monkeypatch.setattr(
-            firecrawl_provider,
-            "check_website_access",
-            lambda url: {
+        def block_all(_url):
+            return {
                 "host": "blocked.test",
                 "rule": "blocked.test",
                 "source": "config",
                 "message": "Blocked by website policy",
-            },
+            }
+
+        monkeypatch.setattr(firecrawl_provider, "check_website_access", block_all)
+        monkeypatch.setattr(
+            web_tools,
+            "async_validate_provider_final_url",
+            AsyncMock(side_effect=lambda url: url),
         )
+        monkeypatch.setattr(web_tools, "check_website_access", block_all)
         monkeypatch.setattr(
             firecrawl_provider,
             "_get_firecrawl_client",
@@ -400,8 +406,17 @@ class TestWebToolPolicy:
 
         result = json.loads(await web_tools.web_extract_tool(["https://blocked.test"]))
 
-        assert result["results"][0]["url"] == "https://blocked.test"
-        assert "Blocked by website policy" in result["results"][0]["error"]
+        assert result["results"][0] == {
+            "url": "",
+            "title": "",
+            "content": "",
+            "error": "Blocked by website policy",
+            "blocked_by_policy": {
+                "host": "blocked.test",
+                "rule": "blocked.test",
+                "source": "config",
+            },
+        }
 
     @pytest.mark.asyncio
     async def test_web_extract_blocks_redirected_final_url(self, monkeypatch):
@@ -413,7 +428,16 @@ class TestWebToolPolicy:
             return True
 
         monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_ssrf)
-        monkeypatch.setattr(firecrawl_provider, "is_safe_url", lambda url: True)
+        monkeypatch.setattr(
+            firecrawl_provider,
+            "async_validate_provider_final_url",
+            AsyncMock(side_effect=lambda url: url),
+        )
+        monkeypatch.setattr(
+            web_tools,
+            "async_validate_provider_final_url",
+            AsyncMock(side_effect=lambda url: url),
+        )
 
         def fake_check(url):
             if url == "https://allowed.test":
@@ -438,21 +462,32 @@ class TestWebToolPolicy:
                 }
 
         # After the web-provider migration, the per-URL gate + firecrawl client
-        # live in the plugin. Patch both at the plugin location.
+        # live in the plugin. Patch both at the plugin location and enforce the
+        # same policy independently at the shared result sink.
         monkeypatch.setattr(firecrawl_provider, "check_website_access", fake_check)
+        monkeypatch.setattr(web_tools, "check_website_access", fake_check)
         monkeypatch.setattr(firecrawl_provider, "_get_firecrawl_client", lambda: FakeFirecrawlClient())
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
         monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
 
         result = json.loads(await web_tools.web_extract_tool(["https://allowed.test"]))
 
-        assert result["results"][0]["url"] == "https://blocked.test/final"
-        assert result["results"][0]["content"] == ""
-        assert result["results"][0]["blocked_by_policy"]["rule"] == "blocked.test"
+        assert result["results"][0] == {
+            "url": "",
+            "title": "",
+            "content": "",
+            "error": "Blocked by website policy",
+            "blocked_by_policy": {
+                "host": "blocked.test",
+                "rule": "blocked.test",
+                "source": "config",
+            },
+        }
 
     @pytest.mark.asyncio
     async def test_web_extract_blocks_firecrawl_unsafe_final_url(self, monkeypatch):
         from tools import web_tools
+        from tools.url_safety import PROVIDER_FINAL_URL_ERROR
         from plugins.web.firecrawl import provider as firecrawl_provider
 
         async def _allow_ssrf(_url: str) -> bool:
@@ -461,8 +496,14 @@ class TestWebToolPolicy:
         monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_ssrf)
         monkeypatch.setattr(
             firecrawl_provider,
-            "is_safe_url",
-            lambda url: url != "http://169.254.169.254/latest/meta-data/",
+            "async_validate_provider_final_url",
+            AsyncMock(
+                side_effect=lambda url: (
+                    None
+                    if url == "http://169.254.169.254/latest/meta-data/"
+                    else url
+                )
+            ),
         )
 
         checked_urls = []
@@ -491,9 +532,17 @@ class TestWebToolPolicy:
         result = json.loads(await web_tools.web_extract_tool(["https://allowed.test"]))
 
         assert checked_urls == ["https://allowed.test"]
-        assert result["results"][0]["url"] == "http://169.254.169.254/latest/meta-data/"
-        assert result["results"][0]["content"] == ""
-        assert "private or internal network" in result["results"][0]["error"]
+        blocked = result["results"][0]
+        assert blocked["url"] == ""
+        assert blocked["title"] == ""
+        assert blocked["content"] == ""
+        assert blocked.get("raw_content", "") == ""
+        assert blocked.get("metadata") in (None, {})
+        assert blocked["error"] == PROVIDER_FINAL_URL_ERROR
+        serialized = json.dumps(blocked)
+        assert "http://169.254.169.254/latest/meta-data/" not in serialized
+        assert "metadata credentials" not in serialized
+        assert "Metadata" not in serialized
 
 
 def test_check_website_access_fails_open_on_malformed_config(tmp_path, monkeypatch):

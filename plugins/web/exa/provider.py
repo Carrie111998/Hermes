@@ -29,6 +29,8 @@ import os
 from typing import Any, Dict, List
 
 from agent.web_search_provider import WebSearchProvider
+from tools.url_safety import PROVIDER_FINAL_URL_ERROR, validate_provider_final_url
+from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
@@ -173,10 +175,39 @@ class ExaWebSearchProvider(WebSearchProvider):
             response = _get_exa_client().get_contents(urls, text=True)
 
             results: List[Dict[str, Any]] = []
-            for result in response.results or []:
+            for result in (response.results or [])[: len(urls)]:
                 content = result.text or ""
-                url = result.url or ""
+                reported_url = result.url
+                url = validate_provider_final_url(reported_url)
                 title = result.title or ""
+                if url is None:
+                    results.append(
+                        {
+                            "url": "",
+                            "title": "",
+                            "content": "",
+                            "raw_content": "",
+                            "error": PROVIDER_FINAL_URL_ERROR,
+                        }
+                    )
+                    continue
+                final_blocked = check_website_access(url)
+                if final_blocked:
+                    results.append(
+                        {
+                            "url": url,
+                            "title": title,
+                            "content": "",
+                            "raw_content": "",
+                            "error": final_blocked["message"],
+                            "blocked_by_policy": {
+                                "host": final_blocked["host"],
+                                "rule": final_blocked["rule"],
+                                "source": final_blocked["source"],
+                            },
+                        }
+                    )
+                    continue
                 results.append(
                     {
                         "url": url,

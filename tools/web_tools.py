@@ -97,7 +97,14 @@ from tools.tool_backend_helpers import (  # noqa: F401
     nous_tool_gateway_unavailable_message,
     prefers_gateway,
 )
-from tools.url_safety import async_is_safe_url, normalize_url_for_request, sensitive_query_param_name
+from tools.url_safety import (
+    PROVIDER_FINAL_URL_ERROR,
+    async_is_safe_url,
+    async_validate_provider_final_url,
+    normalize_url_for_request,
+    sensitive_query_param_name,
+)
+from tools.website_policy import check_website_access
 import sys
 
 logger = logging.getLogger(__name__)
@@ -943,25 +950,112 @@ async def web_extract_tool(
                     provider.extract, safe_urls, format=format
                 )
 
-        # Reconstruct the original input order across invalid, blocked, and
-        # provider-processed entries. Providers are expected to preserve the
-        # order of the safe URL list they receive.
-        if invalid_urls or ssrf_blocked:
-            safe_results = {
-                index: (
-                    results[position]
-                    if position < len(results)
-                    else {
-                        "url": safe_urls[position],
+        # Correlate provider output to the request before any DNS-backed
+        # validation. Providers return one result per safe URL; excess records
+        # are untrusted amplification and must not consume resolver work.
+        results = results[: len(safe_urls)]
+
+        # Provider responses cross a second trust boundary after dispatch.
+        # Validate every reported final URL before any provider-controlled
+        # fields reach reconstruction, content processing, or output trimming.
+        validated_results = []
+        correlation_urls = []
+        for result in results:
+            final_url = await async_validate_provider_final_url(
+                result.get("url") if isinstance(result, dict) else None
+            )
+            if final_url is None:
+                correlation_urls.append(None)
+                validated_results.append(
+                    {
+                        "url": "",
                         "title": "",
                         "content": "",
-                        "error": "Extract backend returned no result for this URL",
+                        "raw_content": "",
+                        "error": PROVIDER_FINAL_URL_ERROR,
                     }
                 )
-                for position, index in enumerate(safe_indices)
-            }
-            by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
-            results = [by_index[index] for index in range(len(urls))]
+                continue
+
+            blocked = check_website_access(final_url)
+            if blocked:
+                correlation_urls.append(final_url)
+                validated_results.append(
+                    {
+                        "url": "",
+                        "title": "",
+                        "content": "",
+                        "raw_content": "",
+                        "error": blocked["message"],
+                        "blocked_by_policy": {
+                            "host": blocked["host"],
+                            "rule": blocked["rule"],
+                            "source": blocked["source"],
+                        },
+                    }
+                )
+                continue
+
+            correlation_urls.append(final_url)
+            validated_result = dict(result)
+            validated_result["url"] = final_url
+            validated_results.append(validated_result)
+        results = validated_results
+
+        # Reconstruct every original input. Exact authoritative-URL matches
+        # establish correlation independent of provider ordering. A single
+        # redirect can be assigned only when one request and one result remain;
+        # ambiguous redirects fail closed instead of guessing. Unsafe records
+        # contain no provider content and may safely occupy remaining slots.
+        open_positions = {}
+        for position, safe_url in enumerate(safe_urls):
+            open_positions.setdefault(safe_url, []).append(position)
+
+        correlated_results = {}
+        generic_failures = []
+        unmatched_redirects = []
+        for correlation_url, result in zip(correlation_urls, results):
+            positions = open_positions.get(correlation_url, [])
+            if positions:
+                correlated_results[positions.pop(0)] = result
+            elif correlation_url is None:
+                generic_failures.append(result)
+            elif correlation_url not in open_positions:
+                unmatched_redirects.append(result)
+
+        remaining_positions = [
+            position
+            for position in range(len(safe_urls))
+            if position not in correlated_results
+        ]
+        for result, position in zip(generic_failures, remaining_positions):
+            correlated_results[position] = result
+        remaining_positions = [
+            position
+            for position in remaining_positions
+            if position not in correlated_results
+        ]
+        if (
+            len(unmatched_redirects) == 1
+            and len(remaining_positions) == 1
+            and not generic_failures
+        ):
+            correlated_results[remaining_positions[0]] = unmatched_redirects[0]
+
+        safe_results = {
+            index: correlated_results.get(
+                position,
+                {
+                    "url": safe_urls[position],
+                    "title": "",
+                    "content": "",
+                    "error": "Extract backend returned no result for this URL",
+                },
+            )
+            for position, index in enumerate(safe_indices)
+        }
+        by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
+        results = [by_index[index] for index in range(len(urls))]
 
         response = {"results": results}
         

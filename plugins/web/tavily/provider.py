@@ -28,6 +28,8 @@ import os
 from typing import Any, Dict, List
 
 from agent.web_search_provider import WebSearchProvider
+from tools.url_safety import PROVIDER_FINAL_URL_ERROR, validate_provider_final_url
+from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,9 @@ def _normalize_tavily_search_results(response: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _normalize_tavily_documents(
-    response: Dict[str, Any], fallback_url: str = ""
+    response: Dict[str, Any],
+    fallback_url: str = "",
+    max_results: int | None = None,
 ) -> List[Dict[str, Any]]:
     """Map Tavily ``/extract`` response to standard documents.
 
@@ -87,10 +91,52 @@ def _normalize_tavily_documents(
 
     Failures (``failed_results``, ``failed_urls``) become result entries
     with an ``error`` field rather than raising.
+
+    ``fallback_url`` is retained for call compatibility but intentionally
+    ignored: provider content requires its own safe authoritative final URL.
     """
     documents: List[Dict[str, Any]] = []
-    for result in response.get("results", []):
-        url = result.get("url", fallback_url)
+    successes = response.get("results", [])
+    failed_results = response.get("failed_results", [])
+    failed_urls = response.get("failed_urls", [])
+    budget = (
+        max_results
+        if max_results is not None
+        else len(successes) + len(failed_results) + len(failed_urls)
+    )
+    successes = successes[:budget]
+    budget -= len(successes)
+    for result in successes:
+        reported_url = result.get("url")
+        url = validate_provider_final_url(reported_url)
+        if url is None:
+            documents.append(
+                {
+                    "url": "",
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": PROVIDER_FINAL_URL_ERROR,
+                }
+            )
+            continue
+        final_blocked = check_website_access(url)
+        if final_blocked:
+            documents.append(
+                {
+                    "url": url,
+                    "title": result.get("title", ""),
+                    "content": "",
+                    "raw_content": "",
+                    "error": final_blocked["message"],
+                    "blocked_by_policy": {
+                        "host": final_blocked["host"],
+                        "rule": final_blocked["rule"],
+                        "source": final_blocked["source"],
+                    },
+                }
+            )
+            continue
         raw = result.get("raw_content", "") or result.get("content", "")
         documents.append(
             {
@@ -101,27 +147,87 @@ def _normalize_tavily_documents(
                 "metadata": {"sourceURL": url, "title": result.get("title", "")},
             }
         )
-    for fail in response.get("failed_results", []):
+    failed_results = failed_results[:budget]
+    budget -= len(failed_results)
+    for fail in failed_results:
+        reported_fail_url = fail.get("url")
+        fail_url = validate_provider_final_url(reported_fail_url)
+        if fail_url is None:
+            documents.append(
+                {
+                    "url": "",
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": PROVIDER_FINAL_URL_ERROR,
+                }
+            )
+            continue
+        final_blocked = check_website_access(fail_url)
+        if final_blocked:
+            documents.append(
+                {
+                    "url": fail_url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": final_blocked["message"],
+                    "blocked_by_policy": {
+                        "host": final_blocked["host"],
+                        "rule": final_blocked["rule"],
+                        "source": final_blocked["source"],
+                    },
+                }
+            )
+            continue
         documents.append(
             {
-                "url": fail.get("url", fallback_url),
+                "url": fail_url,
                 "title": "",
                 "content": "",
                 "raw_content": "",
                 "error": fail.get("error", "extraction failed"),
-                "metadata": {"sourceURL": fail.get("url", fallback_url)},
+                "metadata": {"sourceURL": fail_url},
             }
         )
-    for fail_url in response.get("failed_urls", []):
-        url_str = fail_url if isinstance(fail_url, str) else str(fail_url)
+    for reported_fail_url in failed_urls[:budget]:
+        fail_url = validate_provider_final_url(reported_fail_url)
+        if fail_url is None:
+            documents.append(
+                {
+                    "url": "",
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": PROVIDER_FINAL_URL_ERROR,
+                }
+            )
+            continue
+        final_blocked = check_website_access(fail_url)
+        if final_blocked:
+            documents.append(
+                {
+                    "url": fail_url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": final_blocked["message"],
+                    "blocked_by_policy": {
+                        "host": final_blocked["host"],
+                        "rule": final_blocked["rule"],
+                        "source": final_blocked["source"],
+                    },
+                }
+            )
+            continue
         documents.append(
             {
-                "url": url_str,
+                "url": fail_url,
                 "title": "",
                 "content": "",
                 "raw_content": "",
                 "error": "extraction failed",
-                "metadata": {"sourceURL": url_str},
+                "metadata": {"sourceURL": fail_url},
             }
         )
     return documents
@@ -198,7 +304,9 @@ class TavilyWebSearchProvider(WebSearchProvider):
                 },
             )
             return _normalize_tavily_documents(
-                raw, fallback_url=urls[0] if urls else ""
+                raw,
+                fallback_url=urls[0] if urls else "",
+                max_results=len(urls),
             )
         except ValueError as exc:
             return [{"url": u, "title": "", "content": "", "error": str(exc)} for u in urls]
