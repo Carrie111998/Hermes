@@ -1,0 +1,159 @@
+name: Release Gate (v1.0.0 Admissibility)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'hermes_cli/postgres_authority.py'
+      - 'hermes_cli/authority_bridge.py'
+      - 'tests/test_release_admissibility.py'
+      - 'tests/test_postgres_runtime_integration.py'
+      - '.github/workflows/release-gate.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'hermes_cli/postgres_authority.py'
+      - 'hermes_cli/authority_bridge.py'
+      - 'tests/test_release_admissibility.py'
+      - 'tests/test_postgres_runtime_integration.py'
+      - '.github/workflows/release-gate.yml'
+  workflow_dispatch:
+
+jobs:
+  release-admissibility:
+    name: Release Admissibility Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: charterforge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.0"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra postgres
+
+      - name: Record environment
+        id: env
+        run: |
+          echo "python_version=$(uv run python --version)" >> "$GITHUB_OUTPUT"
+          echo "postgres_version=$(psql -h localhost -U test -d charterforge_test -tAc 'SELECT version();' || echo 'unknown')" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+        env:
+          PGPASSWORD: test
+
+      - name: Run release-admissibility test (MUST NOT be skipped)
+        id: admissibility
+        env:
+          AUTHORITY_POSTGRES_TEST_URL: postgresql://test:test@localhost:5432/charterforge_test
+        run: |
+          uv run pytest tests/test_release_admissibility.py \
+            -v --tb=long --no-header \
+            --junit-xml=release-admissibility-results.xml \
+            2>&1 | tee admissibility-output.txt
+
+          # Extract test counts from pytest output
+          COLLECTED=$(grep -oP 'collected \K\d+' admissibility-output.txt || echo "0")
+          PASSED=$(grep -oP '\d+(?= passed)' admissibility-output.txt || echo "0")
+
+          echo "collected=$COLLECTED" >> "$GITHUB_OUTPUT"
+          echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
+
+          # HARD FAIL if zero tests collected (skip/deselect = release blocked)
+          if [ "$COLLECTED" -eq 0 ]; then
+            echo "::error::Release gate BLOCKED: zero tests collected. The admissibility test was skipped or deselected."
+            exit 1
+          fi
+
+          if [ "$PASSED" -ne "$COLLECTED" ]; then
+            echo "::error::Release gate BLOCKED: $PASSED/$COLLECTED tests passed."
+            exit 1
+          fi
+
+      - name: Run runtime integration tests
+        id: integration
+        env:
+          AUTHORITY_POSTGRES_TEST_URL: postgresql://test:test@localhost:5432/charterforge_test
+        run: |
+          uv run pytest tests/test_postgres_runtime_integration.py \
+            -v --tb=long --no-header \
+            --junit-xml=integration-results.xml
+
+      - name: Run migration tests
+        id: migration
+        env:
+          AUTHORITY_POSTGRES_TEST_URL: postgresql://test:test@localhost:5432/charterforge_test
+        run: |
+          uv run pytest tests/test_postgres_authority.py \
+            -v --tb=long --no-header \
+            --junit-xml=migration-results.xml \
+            || true
+
+      - name: Build package
+        id: build
+        run: |
+          uv build --wheel --sdist
+          WHEEL=$(ls dist/*.whl)
+          SDIST=$(ls dist/*.tar.gz)
+          echo "wheel=$WHEEL" >> "$GITHUB_OUTPUT"
+          echo "sdist=$SDIST" >> "$GITHUB_OUTPUT"
+          echo "wheel_sha256=$(sha256sum $WHEEL | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "sdist_sha256=$(sha256sum $SDIST | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release evidence
+        if: always()
+        run: |
+          cat <<EVIDENCE > release-evidence.json
+          {
+            "commit_sha": "${{ steps.env.outputs.commit_sha }}",
+            "workflow_run_id": "${{ github.run_id }}",
+            "postgres_version": "${{ steps.env.outputs.postgres_version }}",
+            "python_version": "${{ steps.env.outputs.python_version }}",
+            "command": "uv run pytest tests/test_release_admissibility.py -v",
+            "admissibility_collected": ${{ steps.admissibility.outputs.collected || 0 }},
+            "admissibility_passed": ${{ steps.admissibility.outputs.passed || 0 }},
+            "admissibility_result": "${{ steps.admissibility.outcome }}",
+            "integration_result": "${{ steps.integration.outcome }}",
+            "migration_result": "${{ steps.migration.outcome }}",
+            "build_result": "${{ steps.build.outcome }}",
+            "wheel_sha256": "${{ steps.build.outputs.wheel_sha256 }}",
+            "sdist_sha256": "${{ steps.build.outputs.sdist_sha256 }}"
+          }
+          EVIDENCE
+          cat release-evidence.json
+
+      - name: Upload release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence
+          path: |
+            release-evidence.json
+            release-admissibility-results.xml
+            integration-results.xml
+            migration-results.xml
+            admissibility-output.txt
+          retention-days: 90
