@@ -2126,24 +2126,35 @@ def _format_async_delegation(evt: dict) -> str:
     dispatched_at = evt.get("dispatched_at")
     completed_at = evt.get("completed_at") or _time.time()
 
-    # ----- Batch (fan-out) completion: consolidated multi-task block -----
-    # A whole delegate_task fan-out dispatched as one background unit finishes
-    # together and carries a per-task `results` list. Render every subagent's
-    # summary in one block so the model gets the consolidated outcome at once.
+    # ----- Batch result: aggregate after_turn or per-child inject block -----
+    # Aggregate events carry every result; inject child events carry one result
+    # plus its original batch index. Both use the same stable formatter.
     batch_results = evt.get("results")
     if evt.get("is_batch") or isinstance(batch_results, list):
         results = batch_results or []
         goals = evt.get("goals") or []
-        n = len(results) if results else len(goals)
+        child_event = str(evt.get("delivery_event_key") or "").startswith("task:")
+        n = int(evt.get("batch_size") or 0) if child_event else 0
+        if n <= 0:
+            n = len(results) if results else len(goals)
         total_dur = evt.get("total_duration_seconds", duration)
-        lines = [
-            f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
-            f"A background fan-out of {n} subagent(s) you dispatched earlier "
-            "has finished. All ran in parallel and waited on each other; their "
-            "consolidated results are below. You may have moved on since "
-            "dispatching — act on these or re-dispatch if things have changed.",
-            "",
-        ]
+        if child_event:
+            child_idx = int(evt.get("task_index") or 0)
+            lines = [
+                f"[ASYNC DELEGATION RESULT READY — {deleg_id} — TASK {child_idx + 1}/{n}]",
+                "A background subagent result is ready. It was requested for "
+                "same-turn reconciliation; use it before continuing the current work.",
+                "",
+            ]
+        else:
+            lines = [
+                f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
+                f"A background fan-out of {n} subagent(s) you dispatched earlier "
+                "has finished. All ran in parallel and waited on each other; their "
+                "consolidated results are below. You may have moved on since "
+                "dispatching — act on these or re-dispatch if things have changed.",
+                "",
+            ]
         if isinstance(dispatched_at, (int, float)):
             ts = _time.strftime("%Y-%m-%d %H:%M:%S", _time.localtime(dispatched_at))
             age = f" ({_format_age(completed_at - dispatched_at)} ago)"

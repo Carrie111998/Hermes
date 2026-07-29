@@ -20934,7 +20934,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
-            return (evt_type, producer_id, "") if producer_id else None
+            event_key = str(evt.get("delivery_event_key") or "")
+            return (evt_type, producer_id, event_key) if producer_id else None
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
             started_at = evt.get("started_at")
@@ -21013,12 +21014,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import claim_event_delivery
 
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    ):
+                    durable_claim_id = claim_event_delivery(
+                        evt, f"gateway:{id(self)}"
+                    ) or ""
+                    if not durable_claim_id:
                         return None
                 except Exception as exc:
                     logger.warning(
@@ -21044,11 +21045,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if durable_claim_id:
                         try:
-                            from tools.async_delegation import drop_completion_delivery
+                            from tools.async_delegation import drop_event_delivery
 
-                            drop_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
+                            drop_event_delivery(evt, durable_claim_id)
                         except Exception:
                             logger.debug(
                                 "Could not drop durable completion claim",
@@ -21058,11 +21057,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if verdict == "retry":
                     if durable_claim_id:
                         try:
-                            from tools.async_delegation import release_completion_delivery
+                            from tools.async_delegation import release_event_delivery
 
-                            release_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
+                            release_event_delivery(evt, durable_claim_id)
                         except Exception:
                             logger.debug(
                                 "Could not release durable completion claim",
@@ -21100,11 +21097,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after adapter acceptance; this gateway keeps no parallel ledger.
             if durable_claim_id:
                 try:
-                    from tools.async_delegation import complete_completion_delivery
+                    from tools.async_delegation import complete_event_delivery
 
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
+                    complete_event_delivery(evt, durable_claim_id)
                 except Exception as exc:
                     logger.warning(
                         "Could not acknowledge durable async completion %s: %s",
@@ -21117,11 +21112,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._completion_deliveries_inflight.discard(identity)
             if durable_claim_id and not accepted:
                 try:
-                    from tools.async_delegation import release_completion_delivery
+                    from tools.async_delegation import release_event_delivery
 
-                    release_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
+                    release_event_delivery(evt, durable_claim_id)
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
 
@@ -21182,6 +21175,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
+                    # Gateway busy-session deferral for 'inject' events:
+                    # if the parent session is currently running another
+                    # turn, leave the inject queued so the conversation
+                    # loop's safe-boundary drain can pick it up when the
+                    # turn finishes. This keeps inject from being claimed
+                    # away from the active parent. 'after_turn' events are
+                    # always delivered here (the legacy path).
+                    _rd = str(evt.get("result_delivery") or "after_turn").strip().lower()
+                    if _rd == "inject":
+                        _route_key = str(evt.get("session_key") or "").strip()
+                        _event_turn_id = str(evt.get("parent_turn_id") or "")
+                        _running_parent = self._running_agents.get(_route_key)
+                        if _running_parent is _AGENT_PENDING_SENTINEL:
+                            _pr.completion_queue.put(evt)
+                            continue
+                        if (
+                            _running_parent is not None
+                            and _event_turn_id
+                            and str(
+                                getattr(_running_parent, "_active_turn_id", "") or ""
+                            )
+                            == _event_turn_id
+                        ):
+                            _pr.completion_queue.put(evt)
+                            continue
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue

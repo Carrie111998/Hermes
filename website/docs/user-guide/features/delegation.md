@@ -8,7 +8,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
 
-Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
+Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue. The model chooses how the result comes back with `result_delivery`: the backward-compatible default, `after_turn`, posts a separate synthetic turn; `inject` lets an auditor or dependency re-enter the still-running parent turn at its next safe model boundary. An orchestrator subagent still waits for its own workers so it can synthesize their results before returning.
 
 ## Single Task
 
@@ -30,6 +30,37 @@ delegate_task(tasks=[
     {"goal": "Fix the build", "context": "Project root: /home/user/project"}
 ])
 ```
+
+## Result Delivery
+
+`delegate_task` is always asynchronous at the top level and never waits for a
+running child. `result_delivery` controls only when an already-completed result
+is shown to the parent model:
+
+- **`after_turn` (default):** preserves the existing behavior. A single result,
+  or one consolidated batch result, is delivered as a separate synthetic turn
+  after the foreground turn ends.
+- **`inject`:** intended for auditors, reviewers, and dependent work that can
+  change what the parent should do now. Each ready child is appended to the
+  conversation at the next safe boundary, after all tool results from the
+  current assistant message and before the next model request. Batch children
+  do not wait for slower siblings. If a child finishes after its originating
+  turn has ended, it falls back to a separate synthetic turn instead of being
+  spliced into an unrelated later turn.
+
+```python
+delegate_task(
+    goal="Audit the patch for correctness and race conditions",
+    context="Project: /home/user/project; review the current uncommitted diff",
+    result_delivery="inject",
+)
+```
+
+Injection is append-only: Hermes never rewrites earlier history or interrupts a
+tool-call/result sequence. Multiple results already ready at one boundary are
+coalesced into one synthetic user message, then the parent model receives a
+reconciliation request. If no result is ready, the foreground turn finalizes
+normally; Hermes does not poll or extend it just to wait for a subagent.
 
 ## How Subagent Context Works
 
@@ -115,7 +146,7 @@ delegate_task(
 
 ## Batch Mode Details
 
-When a top-level agent provides a `tasks` array, Hermes returns one background handle, runs the subagents in parallel, and posts one consolidated result after every child finishes. An orchestrator subagent waits for its batch in the current turn so it can synthesize the results.
+When a top-level agent provides a `tasks` array, Hermes returns one background handle and runs the subagents in parallel. With the default `after_turn` delivery it posts one consolidated result after every child finishes. With `inject`, each child summary can re-enter independently as soon as it is ready. An orchestrator subagent waits for its batch in the current turn so it can synthesize the results.
 
 - **Maximum concurrency:** 3 tasks by default (configurable via `delegation.max_concurrent_children` or the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var; floor of 1, no hard ceiling). Batches larger than the limit return a tool error rather than being silently truncated.
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers
@@ -128,11 +159,13 @@ Synchronous single-task delegation from an orchestrator runs directly without th
 ### Durable background completions
 
 When a background delegation finishes, Hermes stores its completion event in
-the active profile's `state.db` before publishing it to the normal fresh-turn
-queue. If Hermes restarts after completion but before delivery, the pending
-event is restored and routed through the same ownership checks. Competing
-consumers use a durable claim, so only the consumer that successfully accepts
-the synthetic turn acknowledges delivery; failed attempts release the claim for
+the active profile's `state.db` before publishing it to the shared completion
+queue. `inject` batches use one execution record plus independently claimable
+child-delivery records; `after_turn` keeps one aggregate delivery record. If
+Hermes restarts after completion but before delivery, pending events are
+restored and routed through the same ownership checks. Competing consumers use
+a durable claim, so only the consumer that successfully appends or accepts the
+synthetic turn acknowledges each event; failed attempts release the claim for
 retry.
 
 This does not resume child execution after a crash. A delegation whose owner

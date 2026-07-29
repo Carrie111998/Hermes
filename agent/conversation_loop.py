@@ -1179,6 +1179,10 @@ def run_conversation(
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
     turn_id = _ctx.turn_id
+    # delegate_task snapshots this id at dispatch. A late inject result whose
+    # originating turn already ended must stay on the normal synthetic-turn
+    # path instead of leaking into a later user turn.
+    agent._active_turn_id = turn_id
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
@@ -1256,6 +1260,16 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # Safe boundary: the previous assistant tool-call block (if any) and
+        # every corresponding tool result have already been appended. Drain
+        # only already-ready results from this foreground turn.
+        try:
+            from agent.delegation_inject import drain_ready_injects
+
+            drain_ready_injects(agent, messages, turn_id)
+        except Exception:
+            logger.debug("Same-turn delegation inject drain failed", exc_info=True)
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -6304,6 +6318,16 @@ def run_conversation(
                 # gateway kills the session before the next activity
                 # touch fires (#69559, #69131).
                 agent._touch_activity(f"tool results posted, continuing iteration #{api_call_count}")
+                # Safe boundary even when this was the nominal last iteration:
+                # every tool result is present and post-tool compression is done.
+                # Drain once without waiting; a ready inject grants exactly one
+                # reconciliation call only if the normal budget is exhausted.
+                try:
+                    from agent.delegation_inject import drain_ready_injects
+
+                    drain_ready_injects(agent, messages, turn_id)
+                except Exception:
+                    logger.debug("Post-tool delegation inject drain failed", exc_info=True)
                 # Continue loop for next response
                 continue
             
@@ -6911,8 +6935,28 @@ def run_conversation(
                     final_response = None
                     continue
 
-                messages.append(final_msg)
-                
+                # Treat this answer as provisional until one final
+                # non-blocking inject drain has run. If an auditor/dependency
+                # completed at this boundary, append its report after the
+                # provisional assistant message and reconcile once more.
+                try:
+                    from agent.delegation_inject import reconcile_provisional_final
+
+                    _ready_injects = reconcile_provisional_final(
+                        agent, messages, final_msg, turn_id=turn_id
+                    )
+                except Exception:
+                    logger.debug("Final delegation inject drain failed", exc_info=True)
+                    # Preserve the original final even if the optional drain
+                    # machinery itself fails before appending it.
+                    if not messages or messages[-1] is not final_msg:
+                        messages.append(final_msg)
+                    _ready_injects = False
+                if _ready_injects:
+                    final_response = None
+                    agent._session_messages = messages
+                    continue
+
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
@@ -7017,6 +7061,7 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
+
     return finalize_turn(
         agent,
         final_response=final_response,
