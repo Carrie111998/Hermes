@@ -1,0 +1,22 @@
+name: unity-cli
+version: 0.1.0
+description: Manage Unity CLI — install, check, and run commands.
+author: Hermes
+kind: standalone
+platforms:
+  - windows
+provides_tools:
+  - unity_cli_status
+  - unity_cli_install
+  - unity_cli_run
+  - unity_cli_upgrade
+config:
+  binary_path:
+    type: string
+    default: ""
+    description: "Override path to unity.exe. Empty = auto-detect under %LOCALAPPDATA%\\Unity\\bin\\unity.exe"
+  default_channel:
+    type: string
+    default: ""
+    description: "Default channel for install (stable|beta|alpha). Empty = stable."
+requires_env: []

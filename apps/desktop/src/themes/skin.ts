@@ -109,9 +109,13 @@ export function skinToDesktopTheme(skin: HermesSkin): DesktopTheme | null {
     name,
     label: titleCase(name),
     description: 'Hermes skin',
-    // Single palette in both slots: a skin is one-mode, so the light/dark toggle
+    // Single palette in both slots: a skin is single-mode, so the light/dark toggle
     // shouldn't invert it. renderedModeFor still paints `.dark` from luminance.
     colors: palette,
-    darkColors: palette
+    darkColors: palette,
+    backgroundImage: (skin.background_image ?? '').trim() || undefined,
+    backgroundImageFit: (skin.background_image_fit ?? 'cover').trim() || 'cover',
+    backgroundImagePosition: (skin.background_image_position ?? 'center').trim() || 'center',
+    backgroundOverlay: (skin.background_overlay ?? '').trim() || undefined
   }
 }

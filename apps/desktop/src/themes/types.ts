@@ -98,4 +98,9 @@ export interface DesktopTheme {
   terminal?: DesktopTerminalPalette
   /** Dark-variant terminal ANSI palette. Falls back to `terminal`. */
   darkTerminal?: DesktopTerminalPalette
+  /** Optional desktop wallpaper (absolute path, file URL, or data URL). */
+  backgroundImage?: string
+  backgroundImageFit?: string
+  backgroundImagePosition?: string
+  backgroundOverlay?: string
 }

@@ -107,4 +107,10 @@ export interface HermesSkin {
   banner_hero?: string
   tool_prefix?: string
   help_header?: string
+  /** Desktop wallpaper filename under `$HERMES_HOME/skins/` or absolute path. */
+  background_image?: string
+  background_image_fit?: 'cover' | 'contain' | 'fill' | 'scale-down' | string
+  background_image_position?: string
+  /** 6/8-digit hex overlay color for text contrast over busy wallpapers. */
+  background_overlay?: string
 }

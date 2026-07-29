@@ -2857,6 +2857,32 @@ def _clear_pending(sid: str | None = None) -> None:
 # ── Agent factory ────────────────────────────────────────────────────
 
 
+
+def _resolve_skin_background_image(raw: str) -> str:
+    """Resolve a skin wallpaper path to an absolute filesystem path when possible."""
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    # Already absolute / URL / data URI — pass through.
+    if value.startswith(("http://", "https://", "data:", "file:")):
+        return value
+    candidate = Path(value)
+    if candidate.is_absolute() and candidate.is_file():
+        return str(candidate)
+    # Relative filenames live next to the skin YAML under HERMES_HOME/skins/.
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = Path(get_hermes_home())
+    except Exception:
+        home = Path.home() / ".hermes"
+    for base in (home / "skins", home):
+        hit = (base / value).resolve()
+        if hit.is_file():
+            return str(hit)
+    return value
+
+
 def resolve_skin() -> dict:
     try:
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin
@@ -2875,6 +2901,17 @@ def resolve_skin() -> dict:
             "banner_hero": skin.banner_hero,
             "tool_prefix": skin.tool_prefix,
             "help_header": (skin.branding or {}).get("help_header", ""),
+            # Desktop wallpaper (absolute path preferred so the GUI can load it).
+            "background_image": _resolve_skin_background_image(
+                getattr(skin, "background_image", "") or ""
+            ),
+            "background_image_fit": getattr(skin, "background_image_fit", "cover")
+            or "cover",
+            "background_image_position": getattr(
+                skin, "background_image_position", "center"
+            )
+            or "center",
+            "background_overlay": getattr(skin, "background_overlay", "") or "",
         }
     except Exception:
         return {}

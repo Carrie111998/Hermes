@@ -175,6 +175,11 @@ class SkinConfig:
     tool_emojis: Dict[str, str] = field(default_factory=dict)  # per-tool emoji overrides
     banner_logo: str = ""    # Rich-markup ASCII art logo (replaces HERMES_AGENT_LOGO)
     banner_hero: str = ""    # Rich-markup hero art (replaces HERMES_CADUCEUS)
+    # Optional desktop wallpaper (filename under ~/.hermes/skins/ or absolute path).
+    background_image: str = ""
+    background_image_fit: str = "cover"
+    background_image_position: str = "center"
+    background_overlay: str = ""
 
     def get_color(self, key: str, fallback: str = "") -> str:
         """Get a color value with fallback."""
@@ -844,18 +849,24 @@ def _build_skin_config(data: Dict[str, Any]) -> SkinConfig:
     dark_colors = _mapping_or_empty(data.get("dark_colors"), section="dark_colors", skin_name=skin_name)
 
     return SkinConfig(
-        name=skin_name,
-        description=data.get("description", ""),
-        colors=colors,
-        light_colors=light_colors,
-        dark_colors=dark_colors,
-        spinner=spinner,
-        branding=branding,
-        tool_prefix=data.get("tool_prefix", default.get("tool_prefix", "┊")),
-        tool_emojis=emoji_overrides,
-        banner_logo=data.get("banner_logo", ""),
-        banner_hero=data.get("banner_hero", ""),
-    )
+            name=skin_name,
+            description=data.get("description", ""),
+            colors=colors,
+            light_colors=light_colors,
+            dark_colors=dark_colors,
+            spinner=spinner,
+            branding=branding,
+            tool_prefix=data.get("tool_prefix", default.get("tool_prefix", "┊")),
+            tool_emojis=emoji_overrides,
+            banner_logo=data.get("banner_logo", ""),
+            banner_hero=data.get("banner_hero", ""),
+            background_image=str(data.get("background_image", "") or ""),
+            background_image_fit=str(data.get("background_image_fit", "cover") or "cover"),
+            background_image_position=str(
+                data.get("background_image_position", "center") or "center"
+            ),
+            background_overlay=str(data.get("background_overlay", "") or ""),
+        )
 
 
 def list_skins() -> List[Dict[str, str]]:

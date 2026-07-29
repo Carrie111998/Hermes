@@ -1,0 +1,16 @@
+name: buzz
+version: 0.2.0
+description: >
+  Buzz relay integration for Hermes Agent swarms — Kind 9 channel messages,
+  encrypted observer frames (Kind 24200 / NIP-44), and workflow triggers.
+kind: tool
+platforms: [windows, linux, macos]
+config:
+  buzz_bin:
+    type: string
+    default: ""
+    description: Optional path to buzz.exe; auto-discovered when empty.
+  buzz_relay_url:
+    type: string
+    default: "http://localhost:8080"
+    description: Relay base URL (BUZZ_RELAY_URL).
