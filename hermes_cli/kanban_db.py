@@ -8704,11 +8704,17 @@ def _end_run(
         )
     except (TypeError, ValueError):
         active_metadata = {}
+    dispatcher_metadata_conflicts: dict[str, dict[str, Any]] = {}
     if isinstance(active_metadata, dict):
         for key in ("review_base_sha", "review_head_sha", "executor"):
             value = active_metadata.get(key)
             if value is not None:
-                final_metadata.setdefault(key, value)
+                if key in final_metadata and final_metadata[key] != value:
+                    dispatcher_metadata_conflicts[key] = {
+                        "dispatcher": value,
+                        "worker": final_metadata[key],
+                    }
+                final_metadata[key] = value
     closed = conn.execute(
         """
         UPDATE task_runs
@@ -8746,6 +8752,14 @@ def _end_run(
     )
     if closed.rowcount != 1 or cleared.rowcount != 1:
         return None
+    if dispatcher_metadata_conflicts:
+        _append_event(
+            conn,
+            task_id,
+            "dispatcher_metadata_conflict",
+            {"conflicts": dispatcher_metadata_conflicts},
+            run_id=run_id,
+        )
     return run_id
 
 
