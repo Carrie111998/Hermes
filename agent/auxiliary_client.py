@@ -6277,10 +6277,50 @@ def resolve_vision_provider_client(
     # The Anthropic wire rejects max_tokens on multimodal calls (error 1210),
     # while the OpenAI wire handles it correctly.
     if requested == "zai" and not resolved_base_url:
-        zai_openai_urls = [
+        zai_openai_urls = []
+        # Honor the endpoint auto-detected at setup time (auth.json
+        # providers.zai.detected_endpoint) ahead of the hardcoded fallbacks.
+        # Coding Lite / Coding Plan keys are only valid on
+        # /api/coding/paas/v4; the generic /api/paas/v4 URL returns
+        # "insufficient balance" (error 1113) even though the account is in
+        # good standing on its plan endpoint.  The credential pool already
+        # seeds this URL for the main chat model; this extends it to vision.
+        _active_key = (resolved_api_key or "").strip()
+        try:
+            if not _active_key:
+                # Use the canonical auth resolver for env-var ordering and its
+                # credential-pool fallback, but only extract the key.  Calling
+                # resolve_api_key_provider_credentials() here would also run
+                # Z.AI endpoint detection and could trigger live probes.
+                from hermes_cli.auth import PROVIDER_REGISTRY, _resolve_api_key_provider_secret
+                _pconfig = PROVIDER_REGISTRY.get("zai")
+                if _pconfig is not None:
+                    _active_key, _ = _resolve_api_key_provider_secret("zai", _pconfig)
+                    _active_key = str(_active_key or "").strip()
+            if _active_key and _AUTH_JSON_PATH.is_file():
+                _auth_data = json.loads(_AUTH_JSON_PATH.read_text(encoding="utf-8"))
+                _detected = (_auth_data.get("providers", {})
+                             .get("zai", {})
+                             .get("detected_endpoint", {}))
+                if isinstance(_detected, dict):
+                    _detected_url = str(_detected.get("base_url", "")).strip()
+                    _detected_hash = str(_detected.get("key_hash", "")).strip()
+                    # Only trust the cache when it was recorded for the key
+                    # we'll actually use — otherwise a stale endpoint from a
+                    # previous key poisons resolution.  Mirrors the
+                    # key_hash guard in _resolve_zai_base_url (auth.py).
+                    if (_detected_url
+                            and _detected_hash == hashlib.sha256(
+                                _active_key.encode()).hexdigest()[:16]
+                            and _detected_url not in zai_openai_urls):
+                        zai_openai_urls.append(_detected_url)
+        except Exception:
+            logger.debug("Could not read zai detected_endpoint from auth.json",
+                         exc_info=True)
+        zai_openai_urls.extend([
             "https://open.bigmodel.cn/api/paas/v4",
             "https://api.z.ai/api/paas/v4",
-        ]
+        ])
         for _zai_url in zai_openai_urls:
             client, final_model = _get_cached_client(
                 requested, resolved_model, async_mode,
