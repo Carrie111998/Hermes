@@ -1,6 +1,6 @@
 ---
 name: trustboost-pii-sanitizer
-description: Redact PII via the TrustBoost API before LLM calls.
+description: Redact PII from text using TrustBoost's hosted API.
 license: MIT
 compatibility: Requires internet access to reach the TrustBoost API. No local dependencies. Compatible with any agent that can make HTTP POST requests. No authentication required.
 metadata:
