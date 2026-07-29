@@ -9292,17 +9292,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Shut down memory provider and close tool resources
                         # on the cached agent.  Idle agents live in
                         # _agent_cache (not _running_agents), so look there.
+                        # Do NOT fall back to _running_agents: an agent
+                        # still in _running_agents is actively mid-turn
+                        # and cleaning it up would crash the in-flight
+                        # request by tearing down its terminal sandbox,
+                        # browser daemon, and httpx clients.
                         _cached_agent = None
                         _cache_lock = getattr(self, "_agent_cache_lock", None)
                         if _cache_lock is not None:
                             with _cache_lock:
                                 _cached = self._agent_cache.get(key)
                                 _cached_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
-                        # Fall back to _running_agents in case the agent is
-                        # still mid-turn when the expiry fires.
-                        if _cached_agent is None:
-                            _cached_agent = self._running_agents.get(key)
-                        if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
+                        if _cached_agent is not None and _cached_agent is not _AGENT_PENDING_SENTINEL:
                             await self._cleanup_agent_resources_off_loop(
                                 _cached_agent, context="session expiry"
                             )
