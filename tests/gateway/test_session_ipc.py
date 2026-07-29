@@ -18,7 +18,12 @@ import pytest
 from gateway import run as gateway_run
 from gateway import session_ipc
 from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    _new_gateway_session_ipc_event,
+)
 from gateway.run import GatewayRunner
 from gateway.session import Platform, SessionEntry, SessionSource, build_session_key
 from gateway.session_ipc import (
@@ -270,12 +275,11 @@ def test_concurrent_user_and_ipc_admission_never_exceeds_busy_queue_cap(monkeypa
         message_type=MessageType.TEXT,
         source=_source(),
     )
-    ipc_event = MessageEvent(
+    ipc_event = _new_gateway_session_ipc_event(
         text="concurrent IPC follow-up",
         message_type=MessageType.TEXT,
         source=_source(),
         internal=True,
-        metadata={"gateway_session_ipc_task": True},
     )
     admission_barrier = threading.Barrier(2)
     original_depth = runner._queue_depth
@@ -316,12 +320,11 @@ def test_concurrent_user_and_ipc_admission_never_exceeds_busy_queue_cap(monkeypa
 
 def test_trusted_slash_task_survives_drain_as_inert_text_while_user_slash_is_blocked():
     runner, adapter = _runner(_entry())
-    trusted = MessageEvent(
+    trusted = _new_gateway_session_ipc_event(
         text="/restart trusted task",
         message_type=MessageType.TEXT,
         source=_source(),
         internal=True,
-        metadata={"gateway_session_ipc_task": True},
     )
     user = MessageEvent(
         text="/restart",
@@ -402,13 +405,12 @@ async def test_trusted_internal_task_is_never_command_coerced_or_dispatched_as_c
     adapter._busy_text_hard_cap_seconds = 0.0
     adapter._topic_recovery_fn = None
 
-    event = MessageEvent(
+    event = _new_gateway_session_ipc_event(
         text=task_text,
         message_type=MessageType.TEXT,
         source=_source(),
         internal=True,
         metadata={
-            "gateway_session_ipc_task": True,
             "gateway_session_key": SESSION_KEY,
             "gateway_session_id": SESSION_ID,
         },

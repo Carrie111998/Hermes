@@ -2126,7 +2126,7 @@ class MessageEvent:
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
-        if self.internal and self.metadata.get("gateway_session_ipc_task") is True:
+        if is_gateway_session_ipc_task(self):
             return False
         return (self.text or "").lstrip().startswith("/")
     
@@ -2200,13 +2200,26 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
         return
 
 
+_GATEWAY_SESSION_IPC_CAPABILITY = object()
+
+
+class _GatewaySessionIPCEvent(MessageEvent):
+    """Private event subtype constructible only with the in-process capability."""
+
+    def __init__(self, capability: object, **kwargs: Any) -> None:
+        if capability is not _GATEWAY_SESSION_IPC_CAPABILITY:
+            raise TypeError("trusted gateway session IPC events require server capability")
+        super().__init__(**kwargs)
+
+
+def _new_gateway_session_ipc_event(**kwargs: Any) -> MessageEvent:
+    """Create a server-owned IPC event; not part of the adapter/plugin API."""
+    return _GatewaySessionIPCEvent(_GATEWAY_SESSION_IPC_CAPABILITY, **kwargs)
+
+
 def is_gateway_session_ipc_task(event: "MessageEvent") -> bool:
-    """Return whether *event* is the dedicated non-command IPC task type."""
-    metadata = getattr(event, "metadata", None) or {}
-    return bool(
-        getattr(event, "internal", False)
-        and metadata.get("gateway_session_ipc_task") is True
-    )
+    """Return whether *event* carries the unforgeable in-process IPC type."""
+    return isinstance(event, _GatewaySessionIPCEvent)
 
 
 @dataclass
