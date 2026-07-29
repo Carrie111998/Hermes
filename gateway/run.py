@@ -10947,7 +10947,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await adapter.send(source.chat_id, content, metadata=metadata)
 
     def _validate_whatsapp_inbox_sweep_target(self, adapter: Any) -> bool:
-        if not getattr(adapter, "_inbox_sweep_enabled", False):
+        if getattr(adapter, "_inbox_sweep_enabled", False) is not True:
             return True
         target_name = str(getattr(adapter, "_inbox_sweep_delivery_platform", "") or "").strip().lower()
         try:
@@ -11066,7 +11066,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         raw_receipt_id = str(event.message_id or int(time.time()))
         receipt_id = re.sub(r"[^A-Za-z0-9_.:-]", "_", raw_receipt_id)[:128]
 
-        def run_sync():
+        def run_triage_sync():
             agent = AIAgent(
                 model=turn_route["model"],
                 **turn_route["runtime"],
@@ -11105,7 +11105,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._cleanup_agent_resources(agent)
 
         try:
-            result = await self._run_in_executor_with_context(run_sync)
+            result = await self._run_in_executor_with_context(run_triage_sync)
         except Exception as exc:
             logger.warning("WhatsApp inbox sweep triage failed: %s", exc)
             return self._whatsapp_inbox_sweep_fallback(event), True
