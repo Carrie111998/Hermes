@@ -73,6 +73,11 @@ def _unit_paths(tmp_path: Path) -> dict[str, Path]:
             / "etc/systemd/system/hermes-cloud-gateway.service.d"
             / "20-canonical-gcloud-config.conf"
         ),
+        "shutdown_timing_drop_in": (
+            tmp_path
+            / "etc/systemd/system/hermes-cloud-gateway.service.d"
+            / "30-shutdown-timing.conf"
+        ),
         "plan": tmp_path / "cutover/staged/cutover-plan.json",
         "releases": tmp_path / "releases",
         "active": tmp_path / "active",
@@ -199,6 +204,7 @@ def _write_legacy_topology(
     paths: dict[str, Path],
     *,
     canonical_gcloud_drop_in: bool = False,
+    shutdown_timing_drop_in: bool = False,
 ) -> None:
     fragment = paths["fragment"]
     fragment.parent.mkdir(parents=True)
@@ -220,20 +226,31 @@ def _write_legacy_topology(
         encoding="utf-8",
     )
     fragment.chmod(0o644)
-    loaded_drop_in = None
+    loaded_drop_ins = []
     if canonical_gcloud_drop_in:
-        loaded_drop_in = paths["canonical_gcloud_drop_in"]
-        loaded_drop_in.parent.mkdir(parents=True, exist_ok=True)
-        loaded_drop_in.write_text(
+        canonical = paths["canonical_gcloud_drop_in"]
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(
             "[Service]\n"
             "RuntimeDirectory=hermes-canonical-gcloud\n"
             "RuntimeDirectoryMode=0700\n"
             "Environment=CLOUDSDK_CONFIG=/run/hermes-canonical-gcloud\n",
             encoding="utf-8",
         )
-        loaded_drop_in.chmod(0o644)
+        canonical.chmod(0o644)
+        loaded_drop_ins.append(canonical)
+    if shutdown_timing_drop_in:
+        timing = paths["shutdown_timing_drop_in"]
+        timing.parent.mkdir(parents=True, exist_ok=True)
+        timing.write_text(
+            "[Service]\n"
+            "TimeoutStopSec=255s\n",
+            encoding="utf-8",
+        )
+        timing.chmod(0o644)
+        loaded_drop_ins.append(timing)
     paths["show"].write_text(
-        _systemd_show(fragment, loaded_drop_in),
+        _systemd_show(fragment, loaded_drop_ins or None),
         encoding="utf-8",
     )
 
@@ -286,6 +303,9 @@ def _fake_commands(paths: dict[str, Path]) -> dict[str, str]:
         "TEST_CANONICAL_GCLOUD_DROP_IN": str(
             paths["canonical_gcloud_drop_in"]
         ),
+        "TEST_SHUTDOWN_TIMING_DROP_IN": str(
+            paths["shutdown_timing_drop_in"]
+        ),
         "TEST_PLAN": str(paths["plan"]),
         "TEST_RELEASES": str(paths["releases"]),
         "TEST_ACTIVE": str(paths["active"]),
@@ -314,6 +334,7 @@ source "$DEPLOY_HELPER"
 GATEWAY_FRAGMENT="$TEST_FRAGMENT"
 GATEWAY_CONNECTOR_DROP_IN="$TEST_DROP_IN"
 GATEWAY_CANONICAL_GCLOUD_DROP_IN="$TEST_CANONICAL_GCLOUD_DROP_IN"
+GATEWAY_SHUTDOWN_TIMING_DROP_IN="$TEST_SHUTDOWN_TIMING_DROP_IN"
 CUTOVER_PLAN_PATH="$TEST_PLAN"
 RELEASES="$TEST_RELEASES"
 ACTIVE_LINK="$TEST_ACTIVE"
@@ -757,26 +778,112 @@ def test_trusted_legacy_topology_accepts_exact_canonical_gcloud_drop_in(
     assert "systemctl:restart" not in operations
 
 
+def test_trusted_legacy_topology_accepts_exact_gcloud_and_shutdown_timing_drop_ins(
+    tmp_path: Path,
+) -> None:
+    paths = _unit_paths(tmp_path)
+    _write_legacy_topology(
+        paths,
+        canonical_gcloud_drop_in=True,
+        shutdown_timing_drop_in=True,
+    )
+
+    classified = _run_shell(paths, "gateway_deploy_topology_json")
+
+    assert classified.returncode == 0, classified.stderr
+    observed = json.loads(classified.stdout)
+    assert observed["classification"] == "legacy"
+    assert observed["reason_code"] == "trusted_legacy_symlink_topology"
+    for prefix, path_name in (
+        ("canonical_gcloud", "canonical_gcloud_drop_in"),
+        ("shutdown_timing", "shutdown_timing_drop_in"),
+    ):
+        ancillary = paths[path_name]
+        assert observed[f"{prefix}_drop_in_path"] == str(ancillary)
+        assert observed[f"{prefix}_drop_in_sha256"] == hashlib.sha256(
+            ancillary.read_bytes()
+        ).hexdigest()
+
+    start_paths = _unit_paths(tmp_path / "start")
+    _write_legacy_topology(
+        start_paths,
+        canonical_gcloud_drop_in=True,
+        shutdown_timing_drop_in=True,
+    )
+    started = _run_shell(
+        start_paths,
+        'start_unit "$TEST_SHA" "$TEST_PR"',
+    )
+
+    assert started.returncode == 0, started.stderr
+    receipt = _receipt(start_paths)
+    assert receipt["status"] == "deploy_unit_started"
+    operations = start_paths["operations"].read_text(encoding="utf-8")
+    assert "systemd-run:--unit=muncho-auto-deploy-aaaaaaaaaaaa-pr101" in operations
+    assert "systemctl:restart" not in operations
+
+
 @pytest.mark.parametrize(
-    ("mutation", "reason"),
+    ("drop_in_name", "mutation", "reason"),
     (
-        ("content", "legacy_ancillary_drop_in_drifted"),
-        ("mode", "trusted_file_identity_invalid"),
+        (
+            "canonical_gcloud_drop_in",
+            "content",
+            "legacy_ancillary_drop_in_drifted",
+        ),
+        (
+            "canonical_gcloud_drop_in",
+            "mode",
+            "trusted_file_identity_invalid",
+        ),
+        (
+            "shutdown_timing_drop_in",
+            "content",
+            "legacy_ancillary_drop_in_drifted",
+        ),
+        (
+            "shutdown_timing_drop_in",
+            "mode",
+            "trusted_file_identity_invalid",
+        ),
+        (
+            "shutdown_timing_drop_in",
+            "symlink",
+            "trusted_file_identity_invalid",
+        ),
+        (
+            "shutdown_timing_drop_in",
+            "hardlink",
+            "trusted_file_identity_invalid",
+        ),
     ),
 )
-def test_drifted_canonical_gcloud_drop_in_is_not_accepted_as_legacy(
+def test_drifted_trusted_ancillary_drop_in_is_not_accepted_as_legacy(
     tmp_path: Path,
+    drop_in_name: str,
     mutation: str,
     reason: str,
 ) -> None:
     paths = _unit_paths(tmp_path)
-    _write_legacy_topology(paths, canonical_gcloud_drop_in=True)
-    ancillary = paths["canonical_gcloud_drop_in"]
+    _write_legacy_topology(
+        paths,
+        canonical_gcloud_drop_in=True,
+        shutdown_timing_drop_in=(
+            drop_in_name == "shutdown_timing_drop_in"
+        ),
+    )
+    ancillary = paths[drop_in_name]
     if mutation == "content":
         with ancillary.open("a", encoding="utf-8") as handle:
             handle.write("# drift\n")
-    else:
+    elif mutation == "mode":
         ancillary.chmod(0o666)
+    elif mutation == "symlink":
+        target = ancillary.with_suffix(".target")
+        ancillary.replace(target)
+        ancillary.symlink_to(target)
+    else:
+        os.link(ancillary, ancillary.with_suffix(".hardlink"))
 
     completed = _run_shell(
         paths,
@@ -788,6 +895,29 @@ def test_drifted_canonical_gcloud_drop_in_is_not_accepted_as_legacy(
     assert receipt["status"] == "blocked_gateway_deploy_topology_ambiguous"
     assert receipt["gateway_topology"]["classification"] == "ambiguous"
     assert receipt["gateway_topology"]["reason_code"] == reason
+    operations = paths["operations"].read_text(encoding="utf-8")
+    assert "systemd-run:" not in operations
+    assert "systemctl:restart" not in operations
+
+
+def test_shutdown_timing_drop_in_without_canonical_gcloud_remains_pinned_signal(
+    tmp_path: Path,
+) -> None:
+    paths = _unit_paths(tmp_path)
+    _write_legacy_topology(paths, shutdown_timing_drop_in=True)
+
+    completed = _run_shell(
+        paths,
+        'start_unit "$TEST_SHA" "$TEST_PR"',
+    )
+
+    assert completed.returncode == 8
+    receipt = _receipt(paths)
+    assert receipt["status"] == "blocked_gateway_deploy_topology_ambiguous"
+    assert (
+        receipt["gateway_topology"]["reason_code"]
+        == "pinned_topology_cutover_plan_missing"
+    )
     operations = paths["operations"].read_text(encoding="utf-8")
     assert "systemd-run:" not in operations
     assert "systemctl:restart" not in operations
