@@ -2352,6 +2352,9 @@ DEFAULT_CONFIG = {
             "auto_join_on_user_join": False,
             "auto_join_users": [],
             "auto_join_voice_channels": [],
+            # Text channel used as the session anchor for auto-joined VC turns.
+            # Empty falls back to Discord home/free-response configuration.
+            "auto_join_text_channel_id": "",
         },
     },
 

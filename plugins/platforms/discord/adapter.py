@@ -1507,7 +1507,14 @@ class DiscordAdapter(BasePlatformAdapter):
                             )
                             if not already_here:
                                 try:
-                                    await adapter_self.join_voice_channel(after.channel)
+                                    success = await adapter_self.join_voice_channel(after.channel)
+                                    if not success:
+                                        logger.warning(
+                                            "[%s] Auto-join voice channel %s returned failure",
+                                            adapter_self.name,
+                                            getattr(after.channel, "name", "unknown"),
+                                        )
+                                        return
 
                                     # Auto-join does not originate from a slash command, so
                                     # there is no event.source to bind as the text/session

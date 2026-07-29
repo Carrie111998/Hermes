@@ -397,6 +397,7 @@ discord:
     auto_join_on_user_join: true       # default: false — opt-in only
     auto_join_users: []                # optional IDs/usernames; scalar also accepted
     auto_join_voice_channels: []       # optional channel IDs/names; empty = any
+    auto_join_text_channel_id: ""      # text/session anchor for transcripts and replies
 ```
 
 | Key | Default | Description |
@@ -404,6 +405,7 @@ discord:
 | `auto_join_on_user_join` | `false` | When `true`, the bot calls the same join logic as `/voice join` as soon as a qualifying user enters a voice channel it isn't already in. |
 | `auto_join_users` | `[]` | Optional Discord user ID or username, or a list of them. Empty means any user who already passes `DISCORD_ALLOWED_USERS` / `DISCORD_ALLOWED_ROLES` can trigger auto-join. Non-empty restricts triggering to those users (they must still pass the existing allowlist). |
 | `auto_join_voice_channels` | `[]` | Optional voice channel ID or name, or a list of them. Empty allows any voice channel. Assigning channels per profile prevents every profile from following the same user into the same VC. |
+| `auto_join_text_channel_id` | `""` | Text channel used as the session anchor for auto-joined transcripts and replies. If empty, Hermes falls back to `DISCORD_HOME_CHANNEL`, then the first `DISCORD_FREE_RESPONSE_CHANNELS` entry. Auto-joined speech cannot be routed without one of these anchors. |
 
 Notes:
 

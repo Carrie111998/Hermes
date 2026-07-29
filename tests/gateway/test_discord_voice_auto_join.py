@@ -292,6 +292,35 @@ async def test_auto_join_ignores_unconfigured_voice_channel(monkeypatch, adapter
 
 
 @pytest.mark.asyncio
+async def test_auto_join_failure_does_not_install_routing_state(monkeypatch, adapter):
+    adapter._voice_auto_join_cfg = {
+        "auto_join_on_user_join": True,
+        "auto_join_users": ["42"],
+        "auto_join_voice_channels": ["General"],
+        "auto_join_text_channel_id": "123456789",
+    }
+    adapter._allowed_user_ids = {"42"}
+    bot = await _connect_adapter(monkeypatch, adapter)
+    adapter.join_voice_channel = AsyncMock(return_value=False)
+
+    guild = SimpleNamespace(id=1)
+    member = _make_member(42, guild)
+    channel = SimpleNamespace(id=99, name="General")
+
+    await bot._events["on_voice_state_update"](
+        member,
+        _make_voice_state(None),
+        _make_voice_state(channel),
+    )
+
+    adapter.join_voice_channel.assert_awaited_once_with(channel)
+    assert guild.id not in adapter._voice_text_channels
+    assert guild.id not in adapter._voice_sources
+    assert "123456789" not in adapter._auto_tts_enabled_chats
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_auto_join_accepts_scalar_user_and_channel_config(monkeypatch, adapter):
     adapter._voice_auto_join_cfg = {
         "auto_join_on_user_join": True,
