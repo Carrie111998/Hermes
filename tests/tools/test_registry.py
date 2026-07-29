@@ -136,6 +136,75 @@ class TestRegisterAndDispatch:
         assert result["tool"] == name
         assert result["result_type"] == "NoneType"
 
+    def test_dispatch_converts_system_exit_without_leaking_payload(self, caplog):
+        reg = ToolRegistry()
+        secret_payload = "secret-provider-detail-must-not-leak"
+
+        def cli_oriented_handler(args, **kw):
+            raise SystemExit(secret_payload)
+
+        reg.register(
+            name="cli_backed",
+            toolset="core",
+            schema=_make_schema("cli_backed"),
+            handler=cli_oriented_handler,
+        )
+
+        with caplog.at_level("ERROR"):
+            raw = reg.dispatch("cli_backed", {})
+
+        result = json.loads(raw)
+        assert result == {
+            "error": "Tool execution aborted at the protected process boundary",
+            "error_type": "tool_system_exit",
+            "tool": "cli_backed",
+        }
+        assert secret_payload not in raw
+        assert secret_payload not in caplog.text
+
+    def test_system_exit_error_survives_model_tools_pipeline(self):
+        from model_tools import handle_function_call, registry
+
+        name = "test_system_exit_registry_boundary"
+        registry.register(
+            name=name,
+            toolset="core",
+            schema=_make_schema(name),
+            handler=lambda args, **kw: (_ for _ in ()).throw(
+                SystemExit("sensitive-helper-detail")
+            ),
+        )
+        try:
+            raw = handle_function_call(
+                name,
+                {},
+                task_id="system-exit-test",
+                skip_pre_tool_call_hook=True,
+            )
+        finally:
+            registry.deregister(name)
+
+        result = json.loads(raw)
+        assert result["error_type"] == "tool_system_exit"
+        assert result["tool"] == name
+        assert "sensitive-helper-detail" not in raw
+
+    def test_dispatch_does_not_swallow_keyboard_interrupt(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="interrupt",
+            toolset="core",
+            schema=_make_schema("interrupt"),
+            handler=lambda args, **kw: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+
+        try:
+            reg.dispatch("interrupt", {})
+        except KeyboardInterrupt:
+            pass
+        else:  # pragma: no cover - failure branch
+            raise AssertionError("KeyboardInterrupt must cross the tool boundary")
+
 
 class TestGetDefinitions:
     def test_returns_openai_format(self):

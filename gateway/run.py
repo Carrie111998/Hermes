@@ -4060,8 +4060,61 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if not isinstance(agent_result, dict):
         return False
     if agent_result.get("canonical_workspace_recovery_incomplete"):
-        return False
+        # Canonical task recovery is a logical sidecar outcome, while
+        # resume_pending is transport recovery state. A host-generated
+        # settlement receipt proves the underlying resumed model turn
+        # completed and produced its one terminal response even though the
+        # optional workspace read remained incomplete. Do not let a later
+        # delivery/edit uncertainty reuse that receipt.
+        return bool(
+            agent_result.get("resume_recovery_attempt_settled") is True
+            and not agent_result.get("failed")
+            and not agent_result.get("interrupted")
+            and not agent_result.get("error")
+            and not agent_result.get("incomplete_reason")
+        )
     return normalize_terminal_outcome(agent_result).completed
+
+
+def _build_resume_recovery_settlement_receipt(
+    *,
+    was_resume_pending: bool,
+    canonical_workspace_recovery_incomplete: bool,
+    underlying_agent_result: dict,
+) -> bool:
+    """Return a host-only receipt for one settled degraded recovery attempt.
+
+    The model cannot author this receipt: ``_run_agent`` constructs it from
+    runtime-observed resume state and the canonical terminal outcome before
+    the workspace sidecar marks the outer result incomplete.
+    """
+    return bool(
+        was_resume_pending
+        and canonical_workspace_recovery_incomplete
+        and normalize_terminal_outcome(underlying_agent_result).completed
+    )
+
+
+def _resume_ack_session_id(
+    run_start_session_id: str,
+    agent_result: dict,
+) -> str:
+    """Return the host-reported binding that may acknowledge resume recovery.
+
+    Context compression can legitimately rotate the session while the turn is
+    running. ``_run_agent`` reports that effective child id after attempting
+    the identity-guarded routing update. The SessionStore guard remains the
+    authority: if that update did not land, the returned child id will not
+    match the live binding and acknowledgement is a no-op.
+    """
+    result_session_id = (
+        agent_result.get("session_id")
+        if isinstance(agent_result, dict)
+        else None
+    )
+    if isinstance(result_session_id, str) and result_session_id:
+        return result_session_id
+    return run_start_session_id
 
 
 def _classify_agent_processing_outcome(agent_result: dict) -> ProcessingOutcome:
@@ -15366,10 +15419,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug(
                         "Failed to record Telegram topic binding", exc_info=True
                     )
-        # Capture and immediately consume was_auto_reset so it does not
-        # re-fire on subsequent messages — preventing the cleanup from
+        # Claim reset markers durably before any hook, notification, Canonical
+        # lookup, or model call. If this process exits later in the turn, the
+        # next gateway boot must not replay the same reset banner indefinitely.
+        _reset_markers = await self.async_session_store.consume_reset_markers(
+            session_key,
+            session_entry.session_id,
+            session_entry.capability_epoch,
+        )
+
+        # Capture was_auto_reset from the immutable durable claim so it does
+        # not re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
-        _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
+        _was_auto_reset = _reset_markers.was_auto_reset
         if _was_auto_reset:
             # Treat auto-reset as a full conversation boundary — clear every
             # conversation-scoped per-session dict in one funnel call so the
@@ -15385,14 +15447,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compaction summaries. Mirrors /reset and the compression-exhausted
             # path (#9893). Covers daily/idle/suspended auto-reset.
             self._evict_cached_agent(session_key)
+            # The store claim above is authoritative. Keep the live object
+            # explicitly consumed as a defence-in-depth invariant for callers
+            # that retain this exact SessionEntry reference.
             session_entry.was_auto_reset = False
 
         # Capture the one-shot manual/involuntary reset cause before consuming
         # it.  Canonical Task Workspace recovery uses only these exact session
         # lifecycle facts — never authored text — to distinguish an explicit
         # /new choice boundary from involuntary recovery.
-        _was_fresh_reset = bool(getattr(session_entry, "is_fresh_reset", False))
-        _fresh_reset_reason = getattr(session_entry, "fresh_reset_reason", None)
+        _was_fresh_reset = _reset_markers.was_fresh_reset
+        _fresh_reset_reason = _reset_markers.fresh_reset_reason
 
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -15470,7 +15535,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # If the previous session expired and was auto-reset, deliver a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if _was_auto_reset:
-            reset_reason = getattr(session_entry, "auto_reset_reason", None) or "idle"
+            reset_reason = _reset_markers.auto_reset_reason or "idle"
             if reset_reason == "suspended":
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
             elif reset_reason == "daily":
@@ -15502,7 +15567,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_type=getattr(source, "chat_type", "dm"),
                 )
                 platform_name = source.platform.value if source.platform else ""
-                had_activity = getattr(session_entry, 'reset_had_activity', False)
+                had_activity = _reset_markers.reset_had_activity
                 # Suspended and restart-recovery-expired sessions always notify
                 # regardless of policy.notify — the user had an active session
                 # that was silently replaced, so they need to know they can
@@ -15554,10 +15619,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
 
-            # was_auto_reset is already consumed in the cleanup block above
-            # (single source of truth); only the reset reason needs clearing here.
-            session_entry.auto_reset_reason = None
-
         _routeback_context_prompt = ""
         try:
             from gateway.canonical_brain_routeback_context import (
@@ -15573,8 +15634,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 timeout=15.0,
             )
-        except Exception as exc:
-            logger.warning("Canonical Brain route-back context prompt failed: %s", exc)
+        except (Exception, SystemExit) as exc:
+            # The privileged helper uses SystemExit for a hard CLI boundary.
+            # A non-critical route-back read must never inherit that process
+            # exit semantic and take the messaging gateway down. Do not log
+            # the exception text: helper failures can originate at a secret
+            # access boundary.
+            logger.warning(
+                "Canonical Brain route-back context prompt failed soft (%s)",
+                type(exc).__name__,
+            )
             try:
                 from gateway.canonical_brain_routeback_context import (
                     build_routeback_context_incomplete_prompt,
@@ -16561,6 +16630,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _run_start_resume_marked_at = session_entry.last_resume_marked_at
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -16580,6 +16650,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _delivery_lifecycle_event=event,
             )
             agent_result = _canonicalize_agent_result(agent_result)
+            _run_end_session_id = _resume_ack_session_id(
+                _run_start_session_id,
+                agent_result,
+            )
             event.logical_processing_outcome = _classify_agent_processing_outcome(
                 agent_result
             )
@@ -16676,7 +16750,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
                 self._clear_restart_failure_count(session_key)
                 try:
-                    await self.async_session_store.clear_resume_pending(session_key)
+                    await self.async_session_store.clear_resume_pending(
+                        session_key,
+                        expected_session_id=_run_end_session_id,
+                        expected_last_resume_marked_at=(
+                            _run_start_resume_marked_at
+                        ),
+                    )
                 except Exception as _e:
                     logger.debug(
                         "clear_resume_pending failed for %s: %s",
@@ -29322,6 +29402,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _api_run_message, **_conversation_kwargs
                 )
                 result = _canonicalize_agent_result(result)
+                _resume_recovery_attempt_settled = (
+                    _build_resume_recovery_settlement_receipt(
+                        was_resume_pending=_is_resume_pending,
+                        canonical_workspace_recovery_incomplete=(
+                            _canonical_workspace_recovery_incomplete
+                        ),
+                        underlying_agent_result=result,
+                    )
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -29514,6 +29603,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "canonical_workspace_recovery_incomplete": (
+                        _canonical_workspace_recovery_incomplete
+                    ),
+                    "resume_recovery_attempt_settled": (
+                        _resume_recovery_attempt_settled
+                    ),
                 }
 
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -29700,6 +29795,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 "canonical_workspace_recovery_incomplete": (
                     _canonical_workspace_recovery_incomplete
+                ),
+                "resume_recovery_attempt_settled": (
+                    _resume_recovery_attempt_settled
                 ),
             }
 

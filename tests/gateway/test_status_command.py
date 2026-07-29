@@ -11,7 +11,12 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session import (
+    ConsumedResetMarkers,
+    SessionEntry,
+    SessionSource,
+    build_session_key,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -96,6 +101,13 @@ def _make_runner(
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
+    runner.session_store.consume_reset_markers.return_value = ConsumedResetMarkers(
+        False,
+        None,
+        False,
+        False,
+        None,
+    )
     runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_any_sessions.return_value = True

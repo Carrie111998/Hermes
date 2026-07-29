@@ -640,8 +640,10 @@ class ToolRegistry:
         * Async handlers are bridged automatically via ``_run_async()``.
         * Handler results are normalized to a string or supported multimodal
           envelope before leaving the registry.
-        * All exceptions are caught and returned as ``{"error": "..."}``
-          for consistent error format.
+        * Handler exceptions, including ``SystemExit`` raised by CLI-oriented
+          helpers, are caught and returned as ``{"error": "..."}`` for a
+          consistent error format. Process-control signals such as
+          ``KeyboardInterrupt`` are intentionally not swallowed.
         """
         entry = self.get_entry(name)
         if not entry:
@@ -653,6 +655,25 @@ class ToolRegistry:
             else:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
+        except SystemExit:
+            # Tool implementations sometimes reuse CLI helpers whose failure
+            # contract is ``raise SystemExit(...)``. A model-invoked tool is
+            # hosted inside a long-lived CLI/gateway process, so that contract
+            # must stop at the tool boundary instead of terminating the host.
+            #
+            # Do not include the exception text or traceback: CLI helpers may
+            # embed secret-provider diagnostics in the SystemExit payload.
+            # Catch SystemExit specifically so KeyboardInterrupt,
+            # GeneratorExit, and cancellation semantics remain intact.
+            logger.error(
+                "Tool %s raised SystemExit; converted to a protected tool error",
+                name,
+            )
+            return json.dumps({
+                "error": "Tool execution aborted at the protected process boundary",
+                "error_type": "tool_system_exit",
+                "tool": name,
+            })
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences

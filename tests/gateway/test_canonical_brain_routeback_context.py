@@ -215,6 +215,29 @@ def test_enabled_context_surfaces_lookup_failure_as_incomplete_blocker(monkeypat
     assert "do not create a duplicate case" in prompt
 
 
+def test_system_exit_from_privileged_helper_fails_soft_without_secret_leak(
+    monkeypatch,
+    caplog,
+):
+    import gateway.canonical_brain_routeback_context as ctx
+
+    secret_marker = "must-not-appear-in-log"
+    monkeypatch.setattr(ctx, "_routeback_context_enabled", lambda: True)
+    monkeypatch.setattr(ctx, "_helper_available", lambda: True)
+    monkeypatch.setattr(
+        ctx,
+        "lookup_routeback_context_for_thread",
+        lambda thread_id: (_ for _ in ()).throw(SystemExit(secret_marker)),
+    )
+
+    prompt = build_routeback_context_prompt_for_session(_discord_session_context())
+
+    assert "INCOMPLETE/BLOCKED" in prompt
+    assert "exact route-back context lookup failed" in prompt
+    assert secret_marker not in caplog.text
+    assert "SystemExit" in caplog.text
+
+
 def test_compatibility_posture_is_configured_but_not_privileged(monkeypatch):
     import gateway.canonical_writer_boundary as boundary
 

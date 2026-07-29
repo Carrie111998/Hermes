@@ -424,8 +424,16 @@ def build_routeback_context_prompt_for_session(context: SessionContext) -> str:
         return "\n\n".join(
             fragment for fragment in (posture_prompt, context_prompt) if fragment
         )
-    except Exception as exc:
-        logger.warning("Canonical Brain route-back context lookup failed: %s", exc)
+    except (Exception, SystemExit) as exc:
+        # The privileged writer helper is also a CLI and deliberately signals
+        # hard boundary failures with SystemExit. Route-back context is a
+        # bounded current-turn enhancement, so that signal must fail soft here
+        # rather than terminate the long-lived gateway. Avoid the exception
+        # text because the failure may originate at a secret access boundary.
+        logger.warning(
+            "Canonical Brain route-back context lookup failed soft (%s)",
+            type(exc).__name__,
+        )
         return build_routeback_context_incomplete_prompt(
             "the exact route-back context lookup failed"
         )

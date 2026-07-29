@@ -26,6 +26,7 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import json
 import time
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -40,9 +41,11 @@ from gateway.run import (
     _canonicalize_agent_result,
     _coerce_gateway_timestamp,
     _canonical_workspace_failure_result,
+    _build_resume_recovery_settlement_receipt,
     _classify_agent_processing_outcome,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
+    _resume_ack_session_id,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
@@ -82,6 +85,64 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
         "final_response": "Brain unavailable",
         "canonical_workspace_recovery_incomplete": True,
     }) is False
+    assert _should_clear_resume_pending_after_turn({
+        "final_response": "Brain unavailable",
+        "canonical_workspace_recovery_incomplete": True,
+        "resume_recovery_attempt_settled": True,
+    }) is True
+    assert _should_clear_resume_pending_after_turn({
+        "final_response": "Brain unavailable",
+        "canonical_workspace_recovery_incomplete": True,
+        "resume_recovery_attempt_settled": True,
+        "incomplete_reason": "transformed_stream_edit_dispatch_uncertain",
+    }) is False
+    assert _should_clear_resume_pending_after_turn({
+        "canonical_workspace_recovery_incomplete": True,
+        "resume_recovery_attempt_settled": True,
+        "interrupted": True,
+    }) is False
+
+
+@pytest.mark.parametrize(
+    ("was_pending", "workspace_incomplete", "agent_result", "expected"),
+    [
+        (True, True, {"completed": True}, True),
+        (True, True, {"final_response": "settled"}, True),
+        (False, True, {"completed": True}, False),
+        (True, False, {"completed": True}, False),
+        (True, True, {"partial": True}, False),
+        (True, True, {"interrupted": True}, False),
+        (True, True, {"failed": True, "error": "boom"}, False),
+    ],
+)
+def test_resume_recovery_settlement_receipt_is_host_derived(
+    was_pending,
+    workspace_incomplete,
+    agent_result,
+    expected,
+):
+    assert _build_resume_recovery_settlement_receipt(
+        was_resume_pending=was_pending,
+        canonical_workspace_recovery_incomplete=workspace_incomplete,
+        underlying_agent_result=agent_result,
+    ) is expected
+
+
+@pytest.mark.parametrize(
+    ("run_start_session_id", "agent_result", "expected"),
+    [
+        ("parent", {"session_id": "compressed-child"}, "compressed-child"),
+        ("parent", {"session_id": ""}, "parent"),
+        ("parent", {"session_id": None}, "parent"),
+        ("parent", {}, "parent"),
+    ],
+)
+def test_resume_ack_uses_host_reported_effective_session_id(
+    run_start_session_id,
+    agent_result,
+    expected,
+):
+    assert _resume_ack_session_id(run_start_session_id, agent_result) == expected
 
 
 @pytest.mark.parametrize(
@@ -397,6 +458,147 @@ class TestClearResumePending:
         assert e.resume_pending is False
         assert e.resume_reason is None
         assert e.last_resume_marked_at is None
+
+    def test_matching_expectations_clear_exact_marker(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        store.mark_resume_pending(entry.session_key)
+        marked_at = store._entries[entry.session_key].last_resume_marked_at
+
+        assert store.clear_resume_pending(
+            entry.session_key,
+            expected_session_id=entry.session_id,
+            expected_last_resume_marked_at=marked_at,
+        ) is True
+
+    def test_guarded_clear_is_durable_in_primary_and_legacy_mirror(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            db_path=db_path,
+        )
+        entry = store.get_or_create_session(_make_source())
+        store.mark_resume_pending(entry.session_key)
+        marked_at = store._entries[entry.session_key].last_resume_marked_at
+
+        assert store.clear_resume_pending(
+            entry.session_key,
+            expected_session_id=entry.session_id,
+            expected_last_resume_marked_at=marked_at,
+        ) is True
+
+        reloaded = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            db_path=db_path,
+        )
+        reloaded._ensure_loaded()
+        durable_entry = reloaded._entries[entry.session_key]
+        assert durable_entry.resume_pending is False
+        assert durable_entry.resume_reason is None
+        assert durable_entry.last_resume_marked_at is None
+
+        mirror = json.loads((tmp_path / "sessions.json").read_text())
+        mirrored_entry = mirror[entry.session_key]
+        assert mirrored_entry["resume_pending"] is False
+        assert mirrored_entry["resume_reason"] is None
+        assert mirrored_entry["last_resume_marked_at"] is None
+
+    def test_compression_child_can_acknowledge_parent_recovery_turn(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        parent_session_id = entry.session_id
+        store.mark_resume_pending(entry.session_key)
+        marked_at = store._entries[entry.session_key].last_resume_marked_at
+
+        compressed_child_id = "compressed-child"
+        with store._lock:
+            store._entries[entry.session_key].session_id = compressed_child_id
+            store._save()
+
+        expected_session_id = _resume_ack_session_id(
+            parent_session_id,
+            {"session_id": compressed_child_id},
+        )
+        assert store.clear_resume_pending(
+            entry.session_key,
+            expected_session_id=expected_session_id,
+            expected_last_resume_marked_at=marked_at,
+        ) is True
+        assert store._entries[entry.session_key].resume_pending is False
+
+    def test_settled_degraded_compressed_turn_clears_exact_marker(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        parent_session_id = entry.session_id
+        store.mark_resume_pending(entry.session_key)
+        marked_at = store._entries[entry.session_key].last_resume_marked_at
+
+        underlying = _canonicalize_agent_result(
+            {"final_response": "Canonical Brain unavailable; continued safely."}
+        )
+        receipt = _build_resume_recovery_settlement_receipt(
+            was_resume_pending=True,
+            canonical_workspace_recovery_incomplete=True,
+            underlying_agent_result=underlying,
+        )
+        compressed_child_id = "compressed-child"
+        with store._lock:
+            store._entries[entry.session_key].session_id = compressed_child_id
+            store._save()
+        outer_result = _canonicalize_agent_result(
+            {
+                "final_response": underlying["final_response"],
+                "session_id": compressed_child_id,
+                "canonical_workspace_recovery_incomplete": True,
+                "resume_recovery_attempt_settled": receipt,
+            }
+        )
+
+        assert outer_result["status"] == "partial"
+        assert _should_clear_resume_pending_after_turn(outer_result) is True
+        assert store.clear_resume_pending(
+            entry.session_key,
+            expected_session_id=_resume_ack_session_id(
+                parent_session_id,
+                outer_result,
+            ),
+            expected_last_resume_marked_at=marked_at,
+        ) is True
+        assert store._entries[entry.session_key].resume_pending is False
+
+    def test_session_id_mismatch_does_not_clear_new_session_marker(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        store.mark_resume_pending(entry.session_key)
+        old_session_id = entry.session_id
+        marked_at = store._entries[entry.session_key].last_resume_marked_at
+        store._entries[entry.session_key].session_id = "replacement-session"
+
+        assert store.clear_resume_pending(
+            entry.session_key,
+            expected_session_id=old_session_id,
+            expected_last_resume_marked_at=marked_at,
+        ) is False
+        assert store._entries[entry.session_key].resume_pending is True
+
+    def test_newer_marker_timestamp_is_not_cleared_by_old_turn(self, tmp_path):
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        store.mark_resume_pending(entry.session_key)
+        old_marked_at = store._entries[entry.session_key].last_resume_marked_at
+        new_marked_at = old_marked_at + timedelta(seconds=1)
+        store._entries[entry.session_key].last_resume_marked_at = new_marked_at
+
+        assert store.clear_resume_pending(
+            entry.session_key,
+            expected_session_id=entry.session_id,
+            expected_last_resume_marked_at=old_marked_at,
+        ) is False
+        current = store._entries[entry.session_key]
+        assert current.resume_pending is True
+        assert current.last_resume_marked_at == new_marked_at
 
     def test_returns_false_when_not_pending(self, tmp_path):
         store = _make_store(tmp_path)
@@ -1173,6 +1375,39 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
 # ---------------------------------------------------------------------------
 # Gateway startup auto-resume
 # ---------------------------------------------------------------------------
+
+
+def test_durable_clear_prevents_repeat_auto_resume_across_reloads(tmp_path):
+    db_path = tmp_path / "state.db"
+    source = make_restart_source(chat_id="settled-recovery")
+    store = SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(),
+        db_path=db_path,
+    )
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key)
+    marked_at = store._entries[entry.session_key].last_resume_marked_at
+    assert store.clear_resume_pending(
+        entry.session_key,
+        expected_session_id=entry.session_id,
+        expected_last_resume_marked_at=marked_at,
+    ) is True
+
+    runner, adapter = make_restart_runner()
+    runner._isolated_runtime = False
+    adapter.handle_message = AsyncMock()
+    for _ in range(2):
+        reloaded = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            db_path=db_path,
+        )
+        reloaded._ensure_loaded()
+        runner.session_store = reloaded
+        assert runner._schedule_resume_pending_sessions() == 0
+
+    adapter.handle_message.assert_not_called()
 
 
 @pytest.mark.asyncio

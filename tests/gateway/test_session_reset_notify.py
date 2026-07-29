@@ -8,6 +8,7 @@ Verifies that:
 - resume_pending_expired auto-reset sets the correct reason and DB end_reason
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -322,6 +323,212 @@ class TestSessionEntryAutoResetRoundtrip:
         assert reloaded.was_auto_reset is False
         assert reloaded.auto_reset_reason is None
         assert reloaded.reset_had_activity is False
+
+
+class TestConsumeResetMarkers:
+    def test_consumption_is_durable_across_store_restart(self, tmp_path):
+        config = GatewayConfig()
+        config.default_reset_policy = SessionResetPolicy(
+            mode="idle",
+            idle_minutes=1,
+        )
+        sessions_dir = tmp_path / "sessions"
+        db_path = tmp_path / "state.db"
+        store = SessionStore(
+            sessions_dir=sessions_dir,
+            config=config,
+            db_path=db_path,
+        )
+        source = _make_source()
+        old_entry = store.get_or_create_session(source)
+        old_entry.last_prompt_tokens = 1000
+        old_entry.updated_at = datetime.now() - timedelta(minutes=5)
+        store._save()
+
+        reset_entry = store.get_or_create_session(source)
+        claimed = store.consume_reset_markers(
+            reset_entry.session_key,
+            reset_entry.session_id,
+            reset_entry.capability_epoch,
+        )
+
+        assert claimed.was_auto_reset is True
+        assert claimed.auto_reset_reason == "idle"
+        assert claimed.reset_had_activity is True
+
+        restarted = SessionStore(
+            sessions_dir=sessions_dir,
+            config=config,
+            db_path=db_path,
+        )
+        reloaded = restarted.get_or_create_session(source)
+        assert reloaded.session_id == reset_entry.session_id
+        assert reloaded.was_auto_reset is False
+        assert reloaded.auto_reset_reason is None
+
+        second_claim = restarted.consume_reset_markers(
+            reloaded.session_key,
+            reloaded.session_id,
+            reloaded.capability_epoch,
+        )
+        assert second_claim.was_auto_reset is False
+        assert second_claim.auto_reset_reason is None
+
+    def test_concurrent_consumers_get_exactly_one_reset_claim(self, tmp_path):
+        store = _make_store(tmp_path=tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        entry.was_auto_reset = True
+        entry.auto_reset_reason = "daily"
+        entry.reset_had_activity = True
+        store._save()
+
+        def _claim():
+            return store.consume_reset_markers(
+                entry.session_key,
+                entry.session_id,
+                entry.capability_epoch,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            claims = list(pool.map(lambda _: _claim(), range(2)))
+
+        assert sum(claim.was_auto_reset for claim in claims) == 1
+        assert sorted(claim.auto_reset_reason or "" for claim in claims) == [
+            "",
+            "daily",
+        ]
+
+    def test_fresh_reset_marker_is_durably_consumed(self, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        db_path = tmp_path / "state.db"
+        config = GatewayConfig()
+        store = SessionStore(
+            sessions_dir=sessions_dir,
+            config=config,
+            db_path=db_path,
+        )
+        source = _make_source()
+        original = store.get_or_create_session(source)
+        reset_entry = store.reset_session(original.session_key)
+
+        claimed = store.consume_reset_markers(
+            reset_entry.session_key,
+            reset_entry.session_id,
+            reset_entry.capability_epoch,
+        )
+
+        assert claimed.was_fresh_reset is True
+        assert claimed.fresh_reset_reason == "explicit_new"
+
+        restarted = SessionStore(
+            sessions_dir=sessions_dir,
+            config=config,
+            db_path=db_path,
+        )
+        reloaded = restarted.get_or_create_session(source)
+        assert reloaded.session_id == reset_entry.session_id
+        assert reloaded.is_fresh_reset is False
+        assert reloaded.fresh_reset_reason is None
+
+    def test_session_identity_mismatch_does_not_consume(self, tmp_path):
+        store = _make_store(tmp_path=tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        entry.was_auto_reset = True
+        entry.auto_reset_reason = "idle"
+        store._save()
+
+        try:
+            store.consume_reset_markers(
+                entry.session_key,
+                "stale-session-id",
+                entry.capability_epoch,
+            )
+        except RuntimeError as exc:
+            assert "session changed" in str(exc)
+        else:
+            raise AssertionError("stale handler must not consume reset markers")
+
+        assert entry.was_auto_reset is True
+        assert entry.auto_reset_reason == "idle"
+
+    def test_rotated_capability_epoch_blocks_same_session_id_aba(self, tmp_path):
+        store = _make_store(tmp_path=tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        stale_epoch = entry.capability_epoch
+        entry.was_auto_reset = True
+        entry.auto_reset_reason = "daily"
+        # Model an A -> B -> A route switch: transcript id is unchanged, but
+        # the live capability generation is intentionally fresh.
+        entry.capability_epoch = SessionEntry(
+            session_key=entry.session_key,
+            session_id=entry.session_id,
+            created_at=entry.created_at,
+            updated_at=entry.updated_at,
+        ).capability_epoch
+        store._save()
+
+        try:
+            store.consume_reset_markers(
+                entry.session_key,
+                entry.session_id,
+                stale_epoch,
+            )
+        except RuntimeError as exc:
+            assert "session changed" in str(exc)
+        else:
+            raise AssertionError("stale capability epoch must not claim markers")
+
+        assert entry.was_auto_reset is True
+        assert entry.auto_reset_reason == "daily"
+
+    def test_primary_write_failure_does_not_acknowledge_or_clear_claim(
+        self,
+        tmp_path,
+    ):
+        config = GatewayConfig()
+        sessions_dir = tmp_path / "sessions"
+        db_path = tmp_path / "state.db"
+        store = SessionStore(
+            sessions_dir=sessions_dir,
+            config=config,
+            db_path=db_path,
+        )
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        entry.was_auto_reset = True
+        entry.auto_reset_reason = "idle"
+        store._save()
+
+        with patch.object(
+            store._db,
+            "replace_gateway_routing_entries",
+            side_effect=RuntimeError("synthetic primary failure"),
+        ):
+            try:
+                store.consume_reset_markers(
+                    entry.session_key,
+                    entry.session_id,
+                    entry.capability_epoch,
+                )
+            except RuntimeError as exc:
+                assert "primary save failed" in str(exc)
+            else:
+                raise AssertionError("failed primary claim must not be acknowledged")
+
+        assert entry.was_auto_reset is True
+        assert entry.auto_reset_reason == "idle"
+
+        restarted = SessionStore(
+            sessions_dir=sessions_dir,
+            config=config,
+            db_path=db_path,
+        )
+        reloaded = restarted.get_or_create_session(source)
+        assert reloaded.was_auto_reset is True
+        assert reloaded.auto_reset_reason == "idle"
 
 
 # ---------------------------------------------------------------------------
