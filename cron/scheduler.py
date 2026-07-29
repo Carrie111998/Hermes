@@ -3952,7 +3952,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # it down here so a failed run never leaks its async resources
             # (#10200), then re-raise into the outer handler. BaseException
             # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run
-            # still triggers teardown before propagating.
+            # still triggers teardown before propagating. Reconciling the
+            # claim_dispatch() commit for a non-Exception BaseException is the
+            # outermost `except BaseException` clause's job (below) — this
+            # inner handler stays teardown-only so it can never double-mark
+            # the run alongside the outer `except Exception` handler.
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
@@ -4034,6 +4038,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             mark_job_run(job["id"], False, str(e))
         finish_execution(execution_id, success=False, error=str(e))
         return False
+    except BaseException as e:
+        # CancelledError / KeyboardInterrupt / SystemExit are NOT Exception
+        # subclasses (issue #73973 demonstrates this for CancelledError as of
+        # Python 3.8+), so they miss the `except Exception` above entirely.
+        # claim_dispatch() already committed this one-shot's repeat.completed
+        # before run_job() started (issue #38758's at-most-times contract), so
+        # skipping reconciliation here would leave the job wedged: completed
+        # >= times but last_run_at still null, run_claim blocking re-dispatch
+        # until its TTL, and the dispatch-limit guard then discarding it with
+        # no recorded outcome at all. Record the same failure the Exception
+        # handler above would, then re-raise unchanged — cancellation and
+        # shutdown semantics are not altered by this handler existing.
+        logger.error("Job %s aborted: %s", job["id"], type(e).__name__)
+        if not _consume_interrupted_flag(job["id"]):
+            mark_job_run(job["id"], False, f"Aborted by {type(e).__name__} during execution.")
+        finish_execution(execution_id, success=False, error=f"Aborted by {type(e).__name__}")
+        raise
 
 
 def _notify_provider_jobs_changed() -> None:

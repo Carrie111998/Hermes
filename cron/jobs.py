@@ -272,6 +272,12 @@ def _jobs_lock():
     Nested calls in the same thread reuse the held lock so legacy callers that
     invoke save_jobs() inside a broader mutation section don't deadlock or try
     to reacquire the advisory file lock.
+
+    Also what makes claim_dispatch()'s pre-run commit and the discard sites'
+    retirement (#73973) safe against a concurrent tick: both read-modify-write
+    the same job record under this lock, so a second process can't read a
+    stale ``repeat.completed`` and race a duplicate claim or a duplicate
+    retirement in.
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
@@ -1020,7 +1026,15 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage. Caller must hold _jobs_lock()."""
+    """Save all jobs to storage. Caller must hold _jobs_lock().
+
+    Writes to a temp file, fsyncs it, then ``atomic_replace``s it over
+    ``jobs_file`` (rename is atomic on both POSIX and Windows) so a reader
+    never observes a partially-written or truncated store. This is what
+    makes ``_retire_unconfirmed_oneshot_dispatch`` (#73973) trustworthy: the
+    retirement write itself can't be torn or lost mid-write the same way the
+    old delete-on-discard path silently lost the job record.
+    """
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged
@@ -1740,6 +1754,28 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
+def _retire_unconfirmed_oneshot_dispatch(job: Dict[str, Any], reason: str) -> None:
+    """Transition an unconfirmed one-shot dispatch to a terminal, auditable error.
+
+    A finite one-shot's dispatch is committed by ``claim_dispatch()`` BEFORE its
+    side effect runs (issue #38758), so a scheduler that dies before
+    ``mark_job_run()`` runs leaves ``completed >= times`` with no recorded
+    outcome. Both discard sites for that state (the stale-entry guard in
+    ``_get_due_jobs_locked`` and the dispatch-limit guard in
+    ``claim_dispatch``) used to delete the job record outright, silently
+    erasing the only evidence the dispatch ever happened (#73973). Retire it
+    in place instead — disabled, terminal ``error`` state, ``run_claim``/
+    ``fire_claim`` cleared — so it stays visible via ``get_job`` / ``cronjob
+    list --all`` instead of vanishing once its TTL expires.
+    """
+    job["enabled"] = False
+    job["state"] = "error"
+    job["last_status"] = "error"
+    job["last_error"] = reason
+    job["run_claim"] = None
+    job["fire_claim"] = None
+
+
 def claim_dispatch(job_id: str) -> bool:
     """Atomically claim a finite one-shot job dispatch BEFORE execution.
 
@@ -1773,12 +1809,22 @@ def claim_dispatch(job_id: str) -> bool:
             completed = repeat.get("completed", 0)
             if completed >= times:
                 # Already dispatched the max number of times (e.g. a prior
-                # tick claimed then died before mark_job_run could remove it).
-                # Clean up so it stops appearing as due on every tick.
-                jobs.pop(i)
+                # tick claimed then died before mark_job_run could record an
+                # outcome). Retire it as an unconfirmed error instead of
+                # deleting the record (#73973) — it stops appearing as due on
+                # every tick, but the fact that a dispatch was lost stays
+                # auditable instead of silently vanishing.
+                _retire_unconfirmed_oneshot_dispatch(
+                    job,
+                    "One-shot dispatch was claimed but the scheduler stopped "
+                    "before completion could be recorded; execution/delivery "
+                    "outcome is unknown.",
+                )
                 save_jobs(jobs)
-                logger.info(
-                    "Job '%s': dispatch limit reached (%d/%d) — removing",
+                logger.warning(
+                    "Job '%s': dispatch limit reached (%d/%d) but no "
+                    "completion was ever recorded — retiring as unconfirmed "
+                    "error instead of removing",
                     job.get("name", job.get("id", "?")),
                     completed,
                     times,
@@ -2237,16 +2283,23 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                                     times,
                                 )
                                 continue
-                            logger.info(
+                            logger.warning(
                                 "Job '%s': one-shot dispatch limit reached (%d/%d) "
-                                "— removing stale due entry",
+                                "but no completion was ever recorded — retiring "
+                                "as unconfirmed error instead of removing",
                                 job.get("name", job.get("id", "?")),
                                 completed,
                                 times,
                             )
                             for rj in raw_jobs:
                                 if rj["id"] == job["id"]:
-                                    raw_jobs.remove(rj)
+                                    _retire_unconfirmed_oneshot_dispatch(
+                                        rj,
+                                        "One-shot dispatch was claimed but the "
+                                        "scheduler stopped before completion "
+                                        "could be recorded; execution/delivery "
+                                        "outcome is unknown.",
+                                    )
                                     needs_save = True
                                     break
                             continue
