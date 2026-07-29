@@ -3183,6 +3183,43 @@ def test_cli_show_renders_skills(kanban_home):
     assert "translation" in shown
 
 
+def test_cli_show_review_lane_dependency_warning_no_crash(kanban_home):
+    """Regression: show must not crash with closed-DB error when a review
+    lane dependency warning is present (t_f1632591). The diagnostics
+    section calls review_lane_dependency_warnings which opens the task
+    and looks up parents/comments — if conn is closed, it crashes with
+    sqlite3.ProgrammingError."""
+    import json as _json
+    conn = kb.connect()
+    try:
+        source = kb.create_task(conn, title="ship feature", assignee="worker")
+        kb.block_task(conn, source, reason="review-required: needs guardian eyes")
+        review = kb.create_task(
+            conn,
+            title="REVIEW: feature",
+            body=f"Source {source}; post REVIEW_VERDICT=APPROVE.",
+            assignee="os-reviewer",
+            parents=[source],
+        )
+    finally:
+        conn.close()
+    # show on the review task — this was crashing because diagnostics ran
+    # after the connect_closing() block had already closed the connection.
+    shown = run_slash(f"show {review}")
+    # Must not contain error text from a crash.
+    assert "error:" not in shown, f"show crashed with closed-DB error: {shown!r}"
+    # Should render the task header.
+    assert "REVIEW: feature" in shown
+    # Should include the diagnostics section when a warning fires.
+    assert "Diagnostics" in shown, (
+        f"expected 'Diagnostics' in show output for review-lane dependency, got:\n{shown}"
+    )
+    # Should mention "review_lane" or "review task" in the diagnostic text.
+    assert "review" in shown.casefold(), (
+        f"expected review-related diagnostic text, got:\n{shown}"
+    )
+
+
 def test_legacy_db_without_skills_column_migrates(tmp_path):
     """_migrate_add_optional_columns is idempotent and adds skills
     when absent. Run it twice on a pared-down schema to confirm."""

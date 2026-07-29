@@ -160,6 +160,60 @@ def _assert_not_delegated_child_mutation() -> None:
             "delegate_task child contexts cannot mutate Kanban tasks or boards"
         )
 
+# Review-lane diagnostics deliberately recognise only reviewer-ish lanes.  A
+# blocked implementation/landing/remediation parent is a real dependency gate;
+# the deadlock pattern we want to surface is a reviewer child parented to the
+# blocked source it is supposed to review.
+REVIEW_LANE_ASSIGNEE_MARKERS = (
+    "reviewer",
+    "guardian",
+    "review",
+)
+REVIEW_LANE_TEXT_MARKERS = (
+    "review",
+    "review_verdict",
+    "approve_with_notes",
+    "changes_requested",
+    "guardian",
+)
+
+ACTIVE_SERVICE_GATE_STATUSES = {
+    "todo",
+    "scheduled",
+    "ready",
+    "running",
+    "blocked",
+    "review",
+}
+SERVICE_GATE_APPROVAL_STATUSES = ACTIVE_SERVICE_GATE_STATUSES | {"done"}
+TRUE_CRITICAL_LIST_MARKERS = (
+    "credential",
+    "credentials",
+    "secret",
+    "secrets",
+    "money",
+    "payment",
+    "payments",
+    "live trading",
+    "production deploy",
+    "prod deploy",
+    "irreversible data",
+    "drop table",
+    "mass delete",
+    "new spend",
+    "gateway restart",
+    "runtime activation",
+    "workforce-scaler",
+    "workforce scaler",
+    "dynamic-spawning activation",
+    "dynamic spawning activation",
+    "guardrail weakening",
+    "guardrail disable",
+    "disable guardrail",
+    "auth/tenant",
+    "tenant live-data",
+)
+
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
@@ -3051,6 +3105,24 @@ def create_task(
         if row:
             return row["id"]
 
+    service_gate_source = _parse_service_gate_source_and_family(title, body)
+    if service_gate_source is not None:
+        source_task_id, gate_family, candidate_text = service_gate_source
+        decision = service_gate_dedupe_decision(
+            conn,
+            source_task_id=source_task_id,
+            gate_family=gate_family,
+            candidate_text=candidate_text,
+        )
+        if not decision["create_escalation"]:
+            add_comment(
+                conn,
+                source_task_id,
+                created_by or "kanban-service-gate",
+                decision["pointer_comment"],
+            )
+            return decision["active_lane"]["task_id"]
+
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3188,6 +3260,16 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # When the task was created with ``initial_status='blocked'``,
+                # emit a ``blocked`` event so ``_has_sticky_block()``
+                # recognises it as sticky — without this the dispatcher's
+                # ``recompute_ready`` would promote it to ``ready`` on the
+                # next tick (t_fc1fdf31).
+                if initial_status == "blocked":
+                    _append_event(
+                        conn, task_id, "blocked",
+                        {"reason": "initial_status"},
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -3552,6 +3634,270 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
         )
         for r in rows
     ]
+
+
+def _task_search_text(task: Task, comments: Iterable[Comment] = ()) -> str:
+    parts = [task.id, task.title or "", task.body or "", task.assignee or "", task.block_kind or ""]
+    parts.extend(c.body or "" for c in comments)
+    return "\n".join(parts).casefold()
+
+
+def _task_is_review_lane(task: Task) -> bool:
+    assignee = (task.assignee or "").casefold()
+    title_body = f"{task.title or ''}\n{task.body or ''}".casefold()
+    return (
+        any(marker in assignee for marker in REVIEW_LANE_ASSIGNEE_MARKERS)
+        and any(marker in title_body for marker in REVIEW_LANE_TEXT_MARKERS)
+    ) or (
+        (task.title or "").strip().casefold().startswith("review")
+        and any(marker in title_body for marker in REVIEW_LANE_TEXT_MARKERS)
+    )
+
+
+def _task_is_review_required_source(
+    conn: sqlite3.Connection,
+    task: Task,
+    comments: Iterable[Comment],
+) -> bool:
+    if task.status != "blocked":
+        return False
+    text = _task_search_text(task, comments)
+    event_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind IN "
+        "('blocked', 'dependency_wait', 'block_loop_detected')",
+        (task.id,),
+    ).fetchall()
+    for row in event_rows:
+        text += "\n" + (row["payload"] or "")
+    for run in list_runs(conn, task.id):
+        text += "\n" + (run.summary or "")
+        text += "\n" + (run.error or "")
+    text = text.casefold()
+    return (
+        "review-required" in text
+        or "review required" in text
+        or "review_verdict" in text
+        or "guardian review" in text
+        or "os-reviewer" in text
+    )
+
+
+def review_lane_dependency_warning(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Return a warning payload for reviewer children parented to blocked sources.
+
+    The kernel must continue rejecting tasks with unfinished parents.  This
+    helper is read-only advisory logic for dashboards/dry-runs: when a
+    reviewer-looking task's only unfinished parent is the blocked source named
+    in its own review body, the graph likely inverted the review dependency.
+    Implementation/landing/remediation children are intentionally ignored.
+    """
+    task = get_task(conn, task_id)
+    if task is None or not _task_is_review_lane(task):
+        return None
+    parents = parent_ids(conn, task_id)
+    if not parents:
+        return None
+    unfinished: list[Task] = []
+    for parent_id in parents:
+        parent = get_task(conn, parent_id)
+        if parent is not None and parent.status not in ("done", "archived"):
+            unfinished.append(parent)
+    if len(unfinished) != 1:
+        return None
+    source = unfinished[0]
+    source_comments = list_comments(conn, source.id)
+    if not _task_is_review_required_source(conn, source, source_comments):
+        return None
+    task_text = _task_search_text(task)
+    if source.id not in task_text and "source" not in task_text:
+        return None
+    return {
+        "source_task_id": source.id,
+        "source_status": source.status,
+        "source_assignee": source.assignee,
+        "message": (
+            "review task is parented to the blocked review-required source it "
+            "is meant to inspect; create an independent reviewer lane or remove "
+            "the inverted parent edge after checking for duplicate reviews"
+        ),
+    }
+
+
+def review_lane_dependency_warnings(
+    conn: sqlite3.Connection, task_ids: Optional[Iterable[str]] = None,
+) -> dict[str, dict]:
+    ids = list(task_ids) if task_ids is not None else [
+        r["id"] for r in conn.execute("SELECT id FROM tasks WHERE status != 'archived'")
+    ]
+    out: dict[str, dict] = {}
+    for task_id in ids:
+        warning = review_lane_dependency_warning(conn, task_id)
+        if warning:
+            out[task_id] = warning
+    return out
+
+
+def _contains_any_marker(text: str, markers: Iterable[str]) -> bool:
+    folded = text.casefold()
+    return any(marker in folded for marker in markers)
+
+
+def _gate_family_matches(text: str, gate_family: str) -> bool:
+    family = (gate_family or "").strip().casefold()
+    if not family:
+        return True
+    folded = text.casefold()
+    tokens = {family, family.replace("_", "-"), family.replace("-", "_")}
+    return any(
+        token and re.search(rf"(?<![a-z0-9_-]){re.escape(token)}(?![a-z0-9_-])", folded)
+        for token in tokens
+    )
+
+
+def _parse_service_gate_source_and_family(
+    title: Optional[str], body: Optional[str]
+) -> Optional[tuple[str, str, str]]:
+    """Extract source task and gate family from a service-gate task candidate."""
+    candidate_text = f"{title or ''}\n{body or ''}".strip()
+    if not candidate_text or "service-gate" not in candidate_text.casefold():
+        return None
+
+    source_match = re.search(
+        r"\b(?:source|source_task|source_task_id)\s*[:=]\s*(t_[0-9a-fA-F]+)\b",
+        candidate_text,
+    )
+    if source_match is None:
+        source_match = re.search(r"\bsource\s+(t_[0-9a-fA-F]+)\b", candidate_text, re.I)
+    family_match = re.search(
+        r"\bSERVICE-GATE\s+([a-zA-Z0-9][a-zA-Z0-9_-]*)\b",
+        candidate_text,
+        re.I,
+    )
+    if source_match is None or family_match is None:
+        return None
+    return source_match.group(1), family_match.group(1), candidate_text
+
+
+def source_has_true_critical_marker(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    *,
+    extra_text: str = "",
+) -> bool:
+    source = get_task(conn, source_task_id)
+    if source is None:
+        raise ValueError(f"unknown source task {source_task_id}")
+    text = _task_search_text(source, list_comments(conn, source_task_id)) + "\n" + (extra_text or "")
+    return _contains_any_marker(text, TRUE_CRITICAL_LIST_MARKERS)
+
+
+def find_active_service_gate_lane(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    gate_family: str,
+    include_terminal_approval: bool = False,
+    require_approval_packet: bool = False,
+) -> Optional[dict]:
+    """Find an existing active lane for ``source_task_id`` + gate family.
+
+    This is intentionally conservative: a lane must mention the exact source id
+    and the requested gate family in title/body/comments.  It does not infer from
+    assignee or age, which prevents unrelated critical blockers from being
+    hidden behind a broad de-dup match.
+    """
+    statuses = SERVICE_GATE_APPROVAL_STATUSES if include_terminal_approval else ACTIVE_SERVICE_GATE_STATUSES
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE status != 'archived' AND id != ? ORDER BY created_at DESC, id DESC",
+        (source_task_id,),
+    ).fetchall()
+    for row in rows:
+        task = Task.from_row(row)
+        if task.status not in statuses:
+            continue
+        comments = list_comments(conn, task.id)
+        text = _task_search_text(task, comments)
+        if source_task_id not in text:
+            continue
+        if not _gate_family_matches(text, gate_family):
+            continue
+        if require_approval_packet and not (
+            "approval packet" in text
+            or "approval-packet" in text
+            or "operator approval" in text
+        ):
+            continue
+        return {
+            "task_id": task.id,
+            "status": task.status,
+            "assignee": task.assignee,
+            "title": task.title,
+        }
+    return None
+
+
+def service_gate_dedupe_decision(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    gate_family: str,
+    candidate_text: str = "",
+) -> dict:
+    """Plan whether a service-gate scan should create another escalation.
+
+    Returns a small, serialisable decision packet.  ``create_escalation=False``
+    means callers should add ``pointer_comment`` to the source instead of
+    creating a duplicate card.  True critical-list blockers are never suppressed
+    silently: if no matching approval packet exists, the action is
+    ``create_approval_packet`` rather than generic de-dup suppression.
+    """
+    source = get_task(conn, source_task_id)
+    if source is None:
+        raise ValueError(f"unknown source task {source_task_id}")
+
+    critical = source_has_true_critical_marker(
+        conn, source_task_id, extra_text=candidate_text,
+    )
+    active = find_active_service_gate_lane(
+        conn,
+        source_task_id=source_task_id,
+        gate_family=gate_family,
+        include_terminal_approval=critical,
+        require_approval_packet=critical,
+    )
+    if active:
+        decision = "hold_for_existing_approval_packet" if critical else "dedupe_to_active_lane"
+        pointer = (
+            f"delegated: SERVICE-GATE-DEDUPE source={source_task_id} "
+            f"active_lane={active['task_id']} lane_status={active['status']} "
+            f"owner={active.get('assignee') or '-'} decision=watch "
+            f"next_evidence=follow existing {gate_family} lane "
+            "no_duplicate_escalation=true"
+        )
+        return {
+            "create_escalation": False,
+            "decision": decision,
+            "critical_list_blocker": critical,
+            "active_lane": active,
+            "pointer_comment": pointer,
+        }
+
+    if critical:
+        return {
+            "create_escalation": True,
+            "decision": "create_approval_packet",
+            "critical_list_blocker": True,
+            "active_lane": None,
+            "pointer_comment": None,
+        }
+
+    return {
+        "create_escalation": True,
+        "decision": "create_triage_or_service_gate_lane",
+        "critical_list_blocker": False,
+        "active_lane": None,
+        "pointer_comment": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4021,17 +4367,28 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, block_kind "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+            row_block_kind = row["block_kind"] if "block_kind" in row.keys() else None
+            if cur_status == "blocked":
+                if _has_sticky_block(conn, task_id):
+                    # Worker / operator asked for human review — do not
+                    # silently auto-recover.  ``unblock_task`` is the only
+                    # legitimate exit (it emits ``"unblocked"`` which flips
+                    # this predicate back).
+                    continue
+                # Blind-spot guard (t_6009ccaa): status='blocked' with no
+                # 'blocked' event row (direct status write / verdict-router
+                # hold / approval-hold hook without a blocked event). Must
+                # NOT be silently auto-promoted to 'ready' when parents are
+                # done. The circuit-breaker case (failures ≥ limit set by
+                # _record_task_failure) is also caught here and stays blocked,
+                # preserving the existing fall-through behaviour at lines
+                # 4062-4069 (both paths agree: stay blocked).
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -4063,6 +4420,19 @@ def recompute_ready(
                         (task_id,),
                     )
                 else:
+                    # ``todo`` rows whose block_kind is NOT ``dependency``
+                    # got there via a non-dependency routing path (triage
+                    # reset, approval-auto-clear, direct status write). If the
+                    # card was ever sticky-blocked, honour that gate here too
+                    # — otherwise a blocked→todo reset escapes the sticky
+                    # guard and the dispatcher reclaims it (live evidence:
+                    # t_jarvis_autopromote_20260728, 2026-07-28 20:26Z and the
+                    # 6-wake loop that followed). ``dependency`` kind is the
+                    # intentional auto-recovery path and is exempt.
+                    if row_block_kind != "dependency" and _has_sticky_block(
+                        conn, task_id
+                    ):
+                        continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
@@ -4070,6 +4440,107 @@ def recompute_ready(
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
+
+
+# Approval markers recognised by the fleet relapse detector
+# (~/.hermes/scripts/kanban-approve-block-lockgate.py) -- kept in sync.
+_APPROVAL_NEGATED_RE = re.compile(
+    r"\b(no|not|without|don't|do not)\b[^\n]{0,40}REVIEW_VERDICT",
+    re.IGNORECASE,
+)
+_APPROVAL_REOPEN_RE = re.compile(
+    r"REVIEW_VERDICT=(CHANGES_REQUESTED|REJECT)|\bre-?open(ed)?\b",
+    re.IGNORECASE,
+)
+
+
+def apply_approvals(conn: sqlite3.Connection) -> list:
+    """Auto-clear approved-but-stuck cards (t_6009ccaa).
+
+    Scans tasks in (``blocked``, ``review``, ``scheduled``). A card
+    auto-clears to ``todo`` (``recompute_ready`` then promotes it to
+    ``ready`` once parents are done) when ALL hold:
+
+    * a non-negated approval marker comment exists
+      (``REVIEW_VERDICT=APPROVED`` / ``REVIEW_VERDICT: APPROVED``);
+    * no reviewer re-open (CHANGES_REQUESTED / REJECT / re-open) comment
+      was posted AFTER that approval;
+    * the approval comment has not already auto-cleared this card once
+      (idempotence — see below);
+    * no open parent dependency.
+
+    Idempotence (t_jarvis_autopromote_20260728): an approval verdict
+    addresses the thing it reviewed (usually code correctness). A card
+    that re-blocks afterwards for a DIFFERENT reason (e.g. a 24h soak
+    gate, a needs_input/capability park) must NOT be re-cleared by the
+    same stale approval comment — otherwise every post-approval block
+    is defeated ~instantly on the next dispatch tick, which is exactly
+    the auto-promote-defeats-gates class of bug this family of fixes
+    exists to close. We therefore skip an approval comment_id that has
+    already produced an ``approval-auto-clear`` unblocked event on this
+    card. A NEW approval comment posted after the re-block (fresh
+    verdict on the new state) has a new comment_id and clears normally.
+
+    Appends an ``unblocked`` event with reason ``approval-auto-clear`` so
+    :func:`_has_sticky_block` flips off durably. Returns cleared task ids.
+    """
+    cleared = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, status FROM tasks "
+            "WHERE status IN ('blocked', 'review', 'scheduled')"
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            approval = conn.execute(
+                "SELECT id, body FROM task_comments WHERE task_id = ? AND ("
+                "body LIKE '%REVIEW_VERDICT=APPROVED%' "
+                "OR body LIKE '%REVIEW_VERDICT: APPROVED%') "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if approval is None:
+                continue
+            if _APPROVAL_NEGATED_RE.search(approval["body"] or ""):
+                continue  # "No REVIEW_VERDICT=APPROVED..." is a denial
+            already_fired = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'unblocked' "
+                "AND json_extract(payload, '$.reason') = 'approval-auto-clear' "
+                "AND json_extract(payload, '$.comment_id') = ? LIMIT 1",
+                (task_id, approval["id"]),
+            ).fetchone()
+            if already_fired is not None:
+                continue  # same approval already cleared this card once;
+                # a later re-block is a new gate the stale verdict must not defeat
+            reopen = conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ? AND id > ?",
+                (task_id, approval["id"]),
+            ).fetchall()
+            if any(_APPROVAL_REOPEN_RE.search(r["body"] or "") for r in reopen):
+                continue  # reviewer re-opened after the approval
+            undone = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if undone is not None:
+                continue  # open parent dep -- leave for parent gating
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', current_run_id = NULL, "
+                "consecutive_failures = 0, last_failure_error = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status IN ('blocked', 'review', 'scheduled')",
+                (task_id,),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "unblocked",
+                {"reason": "approval-auto-clear", "comment_id": approval["id"]},
+            )
+            cleared.append(task_id)
+    return cleared
 
 
 # ---------------------------------------------------------------------------
@@ -6665,6 +7136,13 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_reviewer_incapable: list[str] = field(default_factory=list)
+    """Review / REWORK / RISK-VERDICT task ids skipped because their assignee
+    is a real Hermes profile but lacks the ``terminal`` toolset, so it cannot
+    run the verification work the card requires. Distinct from
+    skipped_nonspawnable (assignee is not a Hermes profile at all) and from
+    skipped_unassigned (no assignee). Operator-actionable ONLY as a routing
+    signal: reassign the card to a terminal-capable reviewer (t_a2ef2ea2)."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -6699,6 +7177,12 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    skipped_block_gate: list[str] = field(default_factory=list)
+    """Ready task ids skipped because the task has an unresolved block gate
+    (t_fc1fdf31). A task that was worker/operator-blocked but somehow
+    reached the ready queue (manual DB edit, missed event, code-path bug)
+    is caught here: an audit event is logged and no spawn is attempted.
+    This is the defense-in-depth guard for the dispatch tick."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -8193,6 +8677,11 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Approval auto-clear (t_6009ccaa): promote approved-but-stuck cards out
+    # of blocked/review/scheduled BEFORE dependency promotion, so a card
+    # carrying REVIEW_VERDICT=APPROVED can never strand in ``blocked`` while
+    # the fleet lock-gate flags it as a relapse every tick.
+    apply_approvals(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -8269,6 +8758,23 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+
+        # Block-gate audit (t_fc1fdf31): defense-in-depth — if a ready
+        # task has an unresolved block gate (worker/operator ``kanban_block``
+        # without a subsequent unblock), something went wrong: manual DB
+        # edit, missed event, or a code-path bug. Log an audit event and
+        # skip the spawn so no claim is sent for a blocked card.
+        if _has_sticky_block(conn, row["id"]):
+            result.skipped_block_gate.append(row["id"])
+            if not dry_run:
+                at = _claimer_id()
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "block_gate_audit",
+                        {"origin": at, "task_id": row["id"]},
+                    )
+            continue
+
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -8469,6 +8975,26 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Terminal-capability gate (t_a2ef2ea2): a review card needs a
+        # worker that can actually run the verification (pytest/psql/gh).
+        # The pre-existing profile_exists() check is blind to capability; a
+        # real-but-terminal-less reviewer would spawn, fail on capability,
+        # and re-block (fleet health 2026-07-28, Defect #1). Refuse and
+        # emit an audit event instead.
+        try:
+            from hermes_cli.profiles import profile_has_terminal
+        except Exception:
+            profile_has_terminal = None  # type: ignore[assignment]
+        if profile_has_terminal is not None and not profile_has_terminal(row["assignee"]):
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "reviewer_capability",
+                        {"assignee": row["assignee"],
+                         "reason": "review card assigned to non-terminal profile"},
+                    )
+            result.skipped_reviewer_incapable.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))

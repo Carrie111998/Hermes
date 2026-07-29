@@ -1638,6 +1638,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        # Pre-compute diagnostics while conn is still open.
+        # Must happen inside the with-block because review_lane_dependency_warnings
+        # calls get_task and other conn-dependent helpers.
+        from hermes_cli import kanban_diagnostics as kd
+        _diag_config = {
+            "review_lane_parent_warnings": kb.review_lane_dependency_warnings(
+                conn, [task.id],
+            )
+        }
+        _diags = kd.compute_task_diagnostics(task, events, runs, config=_diag_config)
 
     if getattr(args, "json", False):
         payload = {
@@ -1713,9 +1723,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     # Diagnostics section — surface active distress signals at the top
     # of show output so CLI users see them before scrolling through
-    # comments / runs.
-    from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs)
+    # comments / runs. Pre-computed inside the connect_closing() block above.
+    diags = _diags
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")
@@ -1872,6 +1881,11 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     diag_config = kd.config_from_runtime_config(load_config())
 
     with kb.connect_closing() as conn:
+        diag_config = dict(diag_config)
+        seed_ids = [args.task] if getattr(args, "task", None) else None
+        diag_config["review_lane_parent_warnings"] = (
+            kb.review_lane_dependency_warnings(conn, seed_ids)
+        )
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
