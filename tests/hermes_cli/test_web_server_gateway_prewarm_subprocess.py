@@ -64,8 +64,9 @@ def test_desktop_lifespan_spawns_prewarm_subprocess_and_health_stays_fast():
 
 
 def test_desktop_lifespan_terminates_prewarm_subprocess_on_shutdown():
-    """A still-running prewarm subprocess must be terminated when the
-    lifespan shuts down, so it doesn't leak past the backend's lifetime."""
+    """A still-running prewarm subprocess must be terminated AND reaped when
+    the lifespan shuts down — terminate() alone leaves a zombie/defunct
+    process on POSIX until something calls wait() on it."""
     from fastapi.testclient import TestClient
 
     mock_proc = MagicMock()
@@ -77,6 +78,7 @@ def test_desktop_lifespan_terminates_prewarm_subprocess_on_shutdown():
                 pass
 
     mock_proc.terminate.assert_called_once()
+    mock_proc.wait.assert_called_once()
 
 
 def test_desktop_lifespan_does_not_terminate_prewarm_subprocess_that_already_exited():

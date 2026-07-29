@@ -255,6 +255,10 @@ async def _lifespan(app: "FastAPI"):
             cron_stop.set()
         if gateway_prewarm_proc is not None and gateway_prewarm_proc.poll() is None:
             gateway_prewarm_proc.terminate()
+            try:
+                await asyncio.to_thread(gateway_prewarm_proc.wait, timeout=2)
+            except Exception:
+                pass
 
 
 def _get_event_state(app: "FastAPI"):
