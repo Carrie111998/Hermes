@@ -42,6 +42,7 @@ import {
   buildTextSendPayload,
   createBoundedMessageStore,
   extractBridgeEvent,
+  inboundReadReceiptKeys,
   inferMediaType,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
@@ -77,6 +78,12 @@ const FORWARD_OWNER_MESSAGES =
   process.env &&
   typeof process.env.WHATSAPP_FORWARD_OWNER_MESSAGES === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_FORWARD_OWNER_MESSAGES.toLowerCase());
+
+const SEND_READ_RECEIPTS =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_SEND_READ_RECEIPTS === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_SEND_READ_RECEIPTS.toLowerCase());
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
@@ -126,7 +133,7 @@ const INBOX_SWEEP_WINDOW_MS = 3_000;
 let inboxSweep = null;
 // A locally initiated sweep close can use the interval; a remote 428 must
 // retain normal quick reconnect despite sharing the same status code.
-let intentionalSweepDisconnect = false;
+const intentionalSweepSockets = new WeakSet();
 
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
@@ -439,13 +446,17 @@ if (INBOX_SWEEP_ENABLED) {
     windowMs: INBOX_SWEEP_WINDOW_MS,
     closeSocket: () => {
       if (sock && connectionState === 'connected') {
-        intentionalSweepDisconnect = true;
-        sock.end(new Boom('Inbox sweep window complete', { statusCode: 428 }));
+        const sweepSocket = sock;
+        intentionalSweepSockets.add(sweepSocket);
+        sweepSocket.end(new Boom('Inbox sweep window complete', { statusCode: 428 }));
       }
     },
     reconnect: () => { reconnectScheduler.schedule(0); },
   });
-  inboxSweepReceiptBuffer = createInboxReceiptBuffer({ deliver: enqueueGatewayEvent });
+  inboxSweepReceiptBuffer = createInboxReceiptBuffer({
+    deliver: enqueueGatewayEvent,
+    onDeliveryError: (error) => logger.warn({ error }, 'Inbox sweep receipt delivery failed'),
+  });
 }
 
 function emitPairEvent(event) {
@@ -459,7 +470,7 @@ async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const version = await resolveBaileysVersion();
 
-  sock = makeWASocket({
+  const activeSocket = makeWASocket({
     version,
     auth: state,
     logger,
@@ -475,10 +486,15 @@ async function startSocket() {
       return { conversation: '' };
     },
   });
+  sock = activeSocket;
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  activeSocket.ev.on('creds.update', () => {
+    if (sock !== activeSocket) return;
+    saveCreds();
+    lidToPhone = buildLidMap();
+  });
 
-  sock.ev.on('connection.update', (update) => {
+  activeSocket.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -492,9 +508,9 @@ async function startSocket() {
     }
 
     if (connection === 'close') {
+      if (sock !== activeSocket) return;
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const wasIntentionalSweepDisconnect = intentionalSweepDisconnect;
-      intentionalSweepDisconnect = false;
+      const wasIntentionalSweepDisconnect = intentionalSweepSockets.delete(activeSocket);
       connectionState = 'disconnected';
       if (inboxSweepReceiptBuffer) inboxSweepReceiptBuffer.release();
 
@@ -528,11 +544,12 @@ async function startSocket() {
         }
       }
     } else if (connection === 'open') {
+      if (sock !== activeSocket) return;
       connectionState = 'connected';
-      const connectedUser = sock?.user
+      const connectedUser = activeSocket?.user
         ? {
-            id: sock.user.id || null,
-            name: sock.user.name || sock.user.verifiedName || null,
+            id: activeSocket.user.id || null,
+            name: activeSocket.user.name || activeSocket.user.verifiedName || null,
           }
         : null;
       emitPairEvent({ event: 'connected', user: connectedUser });
@@ -552,7 +569,8 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.update', async (updates) => {
+  activeSocket.ev.on('messages.update', async (updates) => {
+    if (sock !== activeSocket) return;
     for (const { key, update } of updates || []) {
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
@@ -603,7 +621,8 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  activeSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (sock !== activeSocket) return;
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
@@ -1135,6 +1154,31 @@ app.post('/typing', async (req, res) => {
   }
 });
 
+// Mark an inbound message as read only after the Python adapter has accepted
+// it through the authoritative DM/group/mention intake policy.
+app.post('/read', async (req, res) => {
+  if (rejectInboxSweepOutbound(res)) return;
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected' });
+  }
+
+  const receiptKeys = inboundReadReceiptKeys({
+    key: req.body?.key,
+    enabled: SEND_READ_RECEIPTS,
+  });
+  if (receiptKeys.length === 0) {
+    return res.json({ success: true, marked: false });
+  }
+
+  try {
+    await sock.readMessages(receiptKeys);
+    return res.json({ success: true, marked: true });
+  } catch (err) {
+    console.warn('[bridge] failed to send read receipt:', err.message);
+    return res.status(500).json({ error: 'Failed to send read receipt' });
+  }
+});
+
 // Chat info
 app.get('/chat/:id', async (req, res) => {
   const chatId = req.params.id;
@@ -1167,6 +1211,7 @@ app.get('/health', (req, res) => {
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    sendReadReceipts: SEND_READ_RECEIPTS,
   });
 });
 

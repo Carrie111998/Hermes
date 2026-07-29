@@ -66,7 +66,11 @@ export function createInboxSweepController({
 }
 
 /** Hold bounded sweep receipts until the socket has actually closed. */
-export function createInboxReceiptBuffer({ deliver, maxEntries = 100 }) {
+export function createInboxReceiptBuffer({
+  deliver,
+  maxEntries = 100,
+  onDeliveryError = () => {},
+}) {
   if (typeof deliver !== 'function') throw new TypeError('deliver must be a function');
   if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) {
     throw new TypeError('maxEntries must be a positive safe integer');
@@ -80,7 +84,15 @@ export function createInboxReceiptBuffer({ deliver, maxEntries = 100 }) {
     },
     release() {
       const receipts = pending.splice(0);
-      for (const receipt of receipts) deliver(receipt);
+      for (const receipt of receipts) {
+        try {
+          deliver(receipt);
+        } catch (error) {
+          try {
+            onDeliveryError(error, receipt);
+          } catch {}
+        }
+      }
     },
     get size() { return pending.length; },
   };
