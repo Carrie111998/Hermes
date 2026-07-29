@@ -578,7 +578,8 @@ def _apply_profile_override() -> None:
             profile_index = None
 
     # 1.5 If HERMES_HOME is already set and no explicit flag was given, trust it
-    # only when it already points to a specific profile directory.  The
+    # when the Desktop managed runtime owns profile routing, or when it already
+    # points to a specific profile directory. The
     # distinguishing heuristic: a profile path has "profiles" as its immediate
     # parent directory name (e.g. ~/.hermes/profiles/coder or
     # /opt/data/profiles/coder).  If HERMES_HOME points to the hermes root
@@ -588,7 +589,16 @@ def _apply_profile_override() -> None:
     # See issue #22502.
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env:
-        if Path(hermes_home_env).parent.name == "profiles":
+        # Desktop stops and respawns the dashboard with the target profile's
+        # exact HERMES_HOME. During a named -> default switch, the old sticky
+        # active_profile is intentionally cleared only after the replacement
+        # dashboard is ready so failed boots can recover cleanly. Letting this
+        # startup path consult that stale file redirects the new default process
+        # straight back to the old named profile.
+        if (
+            os.environ.get("HERMES_DESKTOP_MANAGED") == "1"
+            or Path(hermes_home_env).parent.name == "profiles"
+        ):
             return
 
     # 2. If no flag, check active_profile in the hermes root.
