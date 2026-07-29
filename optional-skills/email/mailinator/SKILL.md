@@ -141,17 +141,23 @@ fi
 
 ```python
 # Add this to your Hermes skill or agent tool.
-# SECURITY: never interpolate dynamic values straight into a shell string.
-# Quote every dynamic component with the supported shell_quote helper so a
-# quote, space, or command substitution ($(...), backticks) in inbox_name /
-# message_id cannot escape the URL and execute arbitrary commands.
+# TWO independent safety layers, applied per dynamic component:
+#   1. urllib.parse.quote(...) percent-encodes each value so slashes, query
+#      params, spaces, '#', '&', etc. cannot alter the URL's structure
+#      (path traversal / injected query string). safe="" encodes everything.
+#   2. shell_quote(...) then quotes the fully-built command so nothing can
+#      escape into the shell that runs curl.
+# Encode the variables INDIVIDUALLY before inserting them; never quote the
+# whole assembled URL as a substitute for encoding its parts.
+from urllib.parse import quote
 from hermes_tools import terminal, shell_quote, json_parse
 
 BASE = "https://www.mailinator.com/api/v2/domains/public/inboxes"
 
 def fetch_inbox(inbox_name: str) -> dict:
     """Fetch emails from a Mailinator inbox."""
-    url = f"{BASE}/{inbox_name}"
+    inbox = quote(inbox_name, safe="")
+    url = f"{BASE}/{inbox}"
     cmd = f"curl -s {shell_quote(url)}"
     result = terminal(command=cmd)
     if result["exit_code"] == 0:
@@ -160,7 +166,11 @@ def fetch_inbox(inbox_name: str) -> dict:
 
 def fetch_email(inbox_name: str, message_id: str) -> dict:
     """Fetch a specific email's content."""
-    url = f"{BASE}/{inbox_name}/messages/{message_id}?format=raw"
+    inbox = quote(inbox_name, safe="")
+    msg_id = quote(message_id, safe="")
+    # format=raw is a literal query param WE control, appended after the
+    # encoded path so an encoded component cannot inject its own query string.
+    url = f"{BASE}/{inbox}/messages/{msg_id}?format=raw"
     cmd = f"curl -s {shell_quote(url)}"
     result = terminal(command=cmd)
     if result["exit_code"] == 0:
