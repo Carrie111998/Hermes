@@ -1059,8 +1059,9 @@ def test_lazy_deps_ensurepip_hides_console_window(monkeypatch):
 
 
 def test_suppress_platform_ver_console_posix_noop(monkeypatch):
-    """On POSIX the helper must do nothing at all and never raise."""
+    """With IS_WINDOWS off, the helper must do nothing at all and never raise."""
     import platform
+    import sys
 
     from hermes_cli import _subprocess_compat
 
@@ -1070,8 +1071,15 @@ def test_suppress_platform_ver_console_posix_noop(monkeypatch):
     _subprocess_compat.suppress_platform_ver_console()
 
     assert platform._syscmd_ver is original
-    # win32_ver stays functional (returns empty fields off Windows).
-    assert platform.win32_ver() == ("", "", "", "")
+    # win32_ver stays functional — the helper must not have broken it.
+    version = platform.win32_ver()
+    assert isinstance(version, tuple) and len(version) == 4
+    # The emptiness of those fields is a property of the *host* OS, not of the
+    # helper: off Windows they are blank, on a real Windows host they carry the
+    # actual release. monkeypatching IS_WINDOWS does not change what
+    # platform.win32_ver() reads, so only assert emptiness where it holds.
+    if sys.platform != "win32":
+        assert version == ("", "", "", "")
 
 
 def test_suppress_platform_ver_console_stubs_syscmd_ver(monkeypatch):
