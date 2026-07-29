@@ -2659,6 +2659,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         for conn in read_conns:
             try:
                 conn.close()
+            except sqlite3.ProgrammingError as exc:
+                # Same-thread-only connections (missing check_same_thread=False)
+                # raise here when drained from the owner thread. Swallowing this
+                # silently hid an FD leak class that compounded into EMFILE on
+                # gateway/dashboard thread pools — keep the process alive but
+                # make the failure mode visible.
+                logger.warning(
+                    "SessionDB.close() could not close a per-thread read "
+                    "connection (likely missing check_same_thread=False): %s",
+                    exc,
+                )
             except Exception:
                 pass
         self._read_local.conn = None

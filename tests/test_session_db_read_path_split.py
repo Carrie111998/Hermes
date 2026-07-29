@@ -131,16 +131,11 @@ def test_anchored_view_and_around_use_read_path(db):
         db._lock.release()
 
 
-def _count_state_db_fds(db_path) -> int:
-    """Count open fds whose path is this DB or its WAL/SHM sidecars."""
+def _process_num_fds() -> int:
+    """Process-wide open FD count (reliable on macOS where path probes lie)."""
     import psutil
 
-    root = str(db_path)
-    return sum(
-        1
-        for f in psutil.Process().open_files()
-        if f.path == root or f.path.startswith(root + "-")
-    )
+    return psutil.Process().num_fds()
 
 
 @pytest.mark.requires_wal
@@ -151,18 +146,25 @@ def test_read_conn_closeable_from_owner_thread(tmp_path):
     SessionDB.close() on the owner thread raised ProgrammingError for every
     worker-created read conn, swallowed it, and leaked .db/.wal/.shm fds.
     Under gateway/dashboard thread pools this accumulated into EMFILE.
+
+    Primary guard is cross-thread close succeeding (platform-independent).
+    Secondary guard is process num_fds dropping on close — macOS
+    ``open_files()`` path matching under-reports SQLite fds and would pass
+    even pre-fix, so we deliberately do not assert on it.
     """
+    import sqlite3
+
     d = SessionDB(db_path=tmp_path / "state.db")
     try:
         d.create_session(session_id="s1", source="cli", model="m")
         d.append_message("s1", role="user", content="fd leak probe")
 
-        barriers = []
         errors = []
 
         def worker(i):
             try:
-                assert d.get_session("s1")["id"] == "s1"
+                session = d.get_session("s1")
+                assert session is not None and session["id"] == "s1"
                 # Keep the thread alive long enough for close() to run while
                 # the connection objects still exist (registered in _read_conns).
                 barriers[i].wait(timeout=5.0)
@@ -186,14 +188,18 @@ def test_read_conn_closeable_from_owner_thread(tmp_path):
         assert not errors
         assert len(d._read_conns) >= n_threads
 
-        # Cross-thread close of a worker-created read conn must succeed
-        # (would raise ProgrammingError without check_same_thread=False).
+        # Primary regression guard: owner-thread close of a worker-created
+        # read conn must succeed. Pre-fix this raised ProgrammingError.
         sample = next(iter(d._read_conns))
-        sample.close()
+        try:
+            sample.close()
+        except sqlite3.ProgrammingError as exc:
+            pytest.fail(
+                "worker-created read conn not closeable from owner thread "
+                f"(missing check_same_thread=False?): {exc}"
+            )
 
-        fds_before_close = _count_state_db_fds(d.db_path)
-        assert fds_before_close > 0
-
+        fds_before = _process_num_fds()
         d.close()
         # Release barriers so workers exit cleanly after close.
         for b in barriers:
@@ -204,12 +210,15 @@ def test_read_conn_closeable_from_owner_thread(tmp_path):
         for t in threads:
             t.join(timeout=5.0)
 
-        fds_after = _count_state_db_fds(d.db_path)
-        assert fds_after == 0, (
-            f"SessionDB.close() left {fds_after} state.db fds open "
-            f"(had {fds_before_close} before close); threaded read conns leaked"
+        fds_after = _process_num_fds()
+        # Secondary: process FD table must drop. Pre-fix reclaim was ~1
+        # (writer only); fixed reclaim drops the bulk of worker read conns.
+        assert fds_after < fds_before, (
+            f"SessionDB.close() did not reclaim process FDs "
+            f"(before={fds_before}, after={fds_after}); threaded read conns leaked"
         )
         assert len(d._read_conns) == 0
+        assert d._conn is None
     finally:
         # Idempotent if already closed above.
         try:
@@ -221,6 +230,7 @@ def test_read_conn_closeable_from_owner_thread(tmp_path):
 @pytest.mark.requires_wal
 def test_close_after_threadpool_reads_reclaims_fds(tmp_path):
     """Thread-pool style reads (gateway/dashboard) must not leave FDs behind."""
+    import sqlite3
     from concurrent.futures import ThreadPoolExecutor
 
     d = SessionDB(db_path=tmp_path / "pool.db")
@@ -230,15 +240,37 @@ def test_close_after_threadpool_reads_reclaims_fds(tmp_path):
             d.append_message("s1", role="user", content=f"msg {i}")
 
         def read_once(_):
-            return d.get_session("s1")["id"]
+            session = d.get_session("s1")
+            assert session is not None
+            return session["id"]
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(read_once, range(32)))
         assert results == ["s1"] * 32
         assert len(d._read_conns) >= 1
 
+        # Primary: every worker-created read conn must close from this thread.
+        for conn in list(d._read_conns):
+            try:
+                conn.close()
+            except sqlite3.ProgrammingError as exc:
+                pytest.fail(
+                    "threadpool read conn not closeable from owner thread "
+                    f"(missing check_same_thread=False?): {exc}"
+                )
+
+        # Re-open pool once more so close() has live read conns to drain.
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(read_once, range(16)))
+        assert len(d._read_conns) >= 1
+
+        fds_before = _process_num_fds()
         d.close()
-        assert _count_state_db_fds(d.db_path) == 0
+        fds_after = _process_num_fds()
+        assert fds_after < fds_before, (
+            f"SessionDB.close() did not reclaim process FDs "
+            f"(before={fds_before}, after={fds_after})"
+        )
         assert d._conn is None
         assert len(d._read_conns) == 0
     finally:
