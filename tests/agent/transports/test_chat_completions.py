@@ -691,6 +691,33 @@ class TestChatCompletionsKimi:
         # Kimi requires reasoning_effort as a top-level parameter
         assert kw["reasoning_effort"] == "high"
 
+    @pytest.mark.parametrize("effort", ["xhigh", "max"])
+    def test_kimi_legacy_xhigh_max_clamps_to_high_on_k2(self, transport, effort):
+        """Legacy (unregistered-profile) Kimi path clamps Hermes-only top
+        tiers to the K2-era "high" ceiling instead of flattening to the
+        default medium."""
+        kw = transport.build_kwargs(
+            model="kimi-k2", messages=[{"role": "user", "content": "Hi"}],
+            is_kimi=True,
+            reasoning_config={"enabled": True, "effort": effort},
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+        )
+        assert kw["reasoning_effort"] == "high"
+
+    @pytest.mark.parametrize("effort", ["xhigh", "max"])
+    @pytest.mark.parametrize("model", ["k3", "kimi-k3", "kimi-k3-cot"])
+    def test_kimi_legacy_xhigh_max_clamps_to_max_on_k3(self, transport, effort, model):
+        """K3's documented effort ceiling is "max" (platform.kimi.ai
+        thinking-model guide) — clamping to the K2-era "high" would
+        undershoot the model's top tier."""
+        kw = transport.build_kwargs(
+            model=model, messages=[{"role": "user", "content": "Hi"}],
+            is_kimi=True,
+            reasoning_config={"enabled": True, "effort": effort},
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+        )
+        assert kw["reasoning_effort"] == "max"
+
     def test_kimi_reasoning_effort_omitted_when_thinking_disabled(self, transport):
         kw = transport.build_kwargs(
             model="kimi-k2", messages=[{"role": "user", "content": "Hi"}],

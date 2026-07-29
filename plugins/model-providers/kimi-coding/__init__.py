@@ -87,7 +87,22 @@ class KimiProfile(ProviderProfile):
         # Enabled: prefer an explicit effort; only fall back to extra_body
         # thinking when no recognized effort is requested.
         effort = (reasoning_config.get("effort") or "").strip().lower()
-        if effort in {"low", "medium", "high"}:
+        if effort in {"low", "medium", "high", "xhigh", "max"}:
+            # Hermes-only top tiers clamp to the model family's documented
+            # ceiling — "max" for K3 (platform.kimi.ai thinking-model guide:
+            # low/high/max, default max), "high" for K2-era slugs — so the
+            # configured tier is honoured at the strongest level the model
+            # accepts instead of being silently dropped to the binary
+            # thinking toggle.
+            if effort in {"xhigh", "max"}:
+                # Lazy import: a top-level import of agent.model_metadata
+                # here circularly breaks plugin discovery (model_metadata's
+                # own import chain triggers provider-plugin loading).
+                from agent.model_metadata import is_kimi_k3_family
+
+                effort = (
+                    "max" if is_kimi_k3_family(context.get("model")) else "high"
+                )
             top_level["reasoning_effort"] = effort
         else:
             extra_body["thinking"] = {"type": "enabled"}

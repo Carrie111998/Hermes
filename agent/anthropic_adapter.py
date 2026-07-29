@@ -2457,11 +2457,21 @@ def _manage_thinking_signatures(
 
     Signatures are Anthropic-proprietary.  Third-party endpoints (MiniMax,
     Azure AI Foundry, AWS Bedrock, self-hosted proxies) cannot validate them
-    and will reject them outright.  Kimi's /coding and DeepSeek's /anthropic
-    endpoints speak the Anthropic protocol upstream but require unsigned
-    thinking blocks (synthesised from ``reasoning_content``) to round-trip on
-    replayed assistant tool-call messages.  See hermes-agent#13848 (Kimi) and
-    hermes-agent#16748 (DeepSeek).
+    and will reject them outright.  DeepSeek's /anthropic endpoint speaks the
+    Anthropic protocol upstream but requires unsigned thinking blocks
+    (synthesised from ``reasoning_content``) to round-trip on replayed
+    assistant tool-call messages.  See hermes-agent#16748 (DeepSeek).
+
+    Kimi is NOT signature-blind (this docstring said otherwise until
+    2026-07-28 — corrected): Kimi signs its own thinking blocks — the
+    signature carries the encrypted reasoning — and validates them on
+    replay, so the Kimi branch below replays as-is.  Verbatim round-trip is
+    required for K3 preserved-thinking continuity (platform.kimi.ai
+    thinking-model guide); stripping Kimi's own signed blocks amputates K3's
+    reasoning history and measurably destabilises multi-turn tool loops.
+    Unsigned blocks synthesised from ``reasoning_content`` remain the
+    fallback for Kimi messages whose thinking was never captured.  See
+    hermes-agent#13848 (Kimi).
 
     Nous Portal's ``/v1/messages`` route is the exception among third-party
     hosts: it proxies Claude to Anthropic/Vertex/Bedrock and validates the

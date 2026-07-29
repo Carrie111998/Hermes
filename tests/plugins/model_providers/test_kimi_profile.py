@@ -60,7 +60,36 @@ class TestKimiReasoningWireShape:
         assert extra_body == {"thinking": {"type": "enabled"}}
         assert top_level == {}
 
-    @pytest.mark.parametrize("effort", ["", "garbage", "xhigh", "max"])
+    @pytest.mark.parametrize("effort", ["xhigh", "max"])
+    @pytest.mark.parametrize(
+        "model", [None, "kimi-k2", "kimi-k2.5", "kimi-k2-turbo-preview"]
+    )
+    def test_hermes_top_tier_effort_clamps_to_high_on_k2(
+        self, kimi_profile, effort, model
+    ):
+        """K2-era ceiling is ``high``: Hermes-only tiers above it clamp down
+        instead of being silently dropped to the thinking toggle."""
+        extra_body, top_level = kimi_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort}, model=model
+        )
+        assert top_level == {"reasoning_effort": "high"}
+        assert "thinking" not in extra_body
+
+    @pytest.mark.parametrize("effort", ["xhigh", "max"])
+    @pytest.mark.parametrize("model", ["k3", "kimi-k3", "kimi-k3-cot"])
+    def test_hermes_top_tier_effort_clamps_to_max_on_k3(
+        self, kimi_profile, effort, model
+    ):
+        """K3's documented effort set is low/high/max (default ``max`` —
+        platform.kimi.ai thinking-model guide), so Hermes-only top tiers
+        clamp to ``max``, not the K2-era ``high``."""
+        extra_body, top_level = kimi_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort}, model=model
+        )
+        assert top_level == {"reasoning_effort": "max"}
+        assert "thinking" not in extra_body
+
+    @pytest.mark.parametrize("effort", ["", "garbage"])
     def test_unrecognized_effort_falls_back_to_thinking(self, kimi_profile, effort):
         """Unknown/strong efforts aren't in Moonshot's low|medium|high set, so
         we drop to the thinking toggle rather than sending an invalid effort."""

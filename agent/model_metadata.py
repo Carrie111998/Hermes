@@ -550,6 +550,22 @@ def _is_known_provider_base_url(base_url: str) -> bool:
     return _infer_provider_from_url(base_url) is not None
 
 
+def is_kimi_k3_family(model: Optional[str]) -> bool:
+    """Return True for Kimi K3-family model slugs.
+
+    Kimi Coding serves K3 under the bare slug ``k3`` plus the public-facing
+    aliases ``kimi-k3`` / ``kimi-k3-cot`` (see
+    ``_endpoint_scoped_context_length``).  The distinction matters for
+    ``reasoning_effort``: K3's documented effort set is low/high/max
+    (default ``max`` — platform.kimi.ai thinking-model guide), while the
+    K2 era tops out at ``high``.
+    """
+    if not model:
+        return False
+    m = model.strip().lower().split("/")[-1]
+    return m == "k3" or m.startswith("kimi-k3")
+
+
 def _endpoint_scoped_context_length(model: str, base_url: str) -> Optional[int]:
     """Return metadata confirmed only for the Kimi Coding endpoint.
 

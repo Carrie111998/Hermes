@@ -2075,3 +2075,21 @@ class TestMoAContextLength:
 
         assert ctx == 999_999
         endpoint_probe.assert_not_called()
+
+
+class TestIsKimiK3Family:
+    """K3-family slug detection drives the reasoning_effort clamp ceiling
+    ("max" on K3, "high" on the K2 era)."""
+
+    @pytest.mark.parametrize("model", ["k3", "K3", "kimi-k3", "kimi-k3-cot",
+                                       "kimi-k3-thinking", "moonshotai/kimi-k3"])
+    def test_k3_slugs_match(self, model):
+        from agent.model_metadata import is_kimi_k3_family
+        assert is_kimi_k3_family(model)
+
+    @pytest.mark.parametrize("model", [None, "", "kimi-k2", "kimi-k2.5",
+                                       "kimi-k2-turbo-preview", "k30", "k3s",
+                                       "moonshot-v1-8k", "kimi-latest"])
+    def test_non_k3_slugs_do_not_match(self, model):
+        from agent.model_metadata import is_kimi_k3_family
+        assert not is_kimi_k3_family(model)
