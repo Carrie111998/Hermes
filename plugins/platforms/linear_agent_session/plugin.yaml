@@ -1,0 +1,42 @@
+name: linear-agent-session
+label: Linear Agent Session
+kind: platform
+version: 1.0.0
+description: >
+  Real-time Linear "Agent Session" delegate adapter for Hermes Agent.
+  Receives Linear's AgentSessionEvent webhook (created on delegation,
+  prompted on user follow-up in the issue thread) and turns each Linear
+  Agent Session into a persistent Hermes chat session keyed by
+  agentSession.id — so a user reply in the Linear thread resumes the SAME
+  running agent turn instead of spawning a fresh one. Agent output is
+  streamed back into the Linear thread via the agentActivityCreate
+  mutation (thought/action/response/error), matching Linear's Developer
+  Preview Agent Interaction contract as of 2026-07.
+
+  Replaces the previous 15/20-min periodic Linear<->Paperclip cron sync
+  for this integration: assignment (delegation) is now the sole trigger,
+  and Paperclip issue creation/claiming happens inline as part of the
+  agent's own first turn (via its existing Paperclip MCP/CLI tools), not
+  as a separate pre-step in this adapter.
+
+  See: ~/Projects/LINEAR-AGENT-SESSION-LIVE-SYNC-PLAN-20260725T2159Z.md
+  Paperclip tracker: AUR-1752 (parent), AUR-1754 (this phase)
+author: argo-hermes
+requires_env:
+  - name: LINEAR_AGENTCORE_TOKEN
+    description: "Linear OAuth app token for the AgentCore/Paperclip delegate app (already configured for the existing bridge)"
+    prompt: "Linear AgentCore app token"
+    password: true
+  - name: LINEAR_WEBHOOK_SECRET
+    description: "Shared secret for verifying the Linear-Signature header on inbound AgentSessionEvent webhooks. Must match the secret entered in Linear Settings -> API -> Webhooks (workspace admin only)."
+    prompt: "Linear webhook signing secret"
+    password: true
+optional_env:
+  - name: LINEAR_AGENT_SESSION_HOST
+    description: "Bind host for the webhook HTTP server (default: loopback only, 127.0.0.1). Set to a non-loopback address only behind a reverse proxy/tunnel that terminates TLS and forwards Linear's real source."
+    prompt: "Bind host (default 127.0.0.1)"
+    password: false
+  - name: LINEAR_AGENT_SESSION_PORT
+    description: "Port for the webhook HTTP server (default: 8645, one above the generic webhook adapter's 8644)"
+    prompt: "Bind port (default 8645)"
+    password: false

@@ -14302,8 +14302,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 turn_sidecar_notes.append(_intro_note)
         
         # One-time prompt if no home channel is set for this platform
-        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.).
+        # Skip Linear Agent Session too: synthetic per-delegation chats have no
+        # human to run /sethome, and the notice pollutes the Linear activity
+        # thread as a false "agent response" (AUR-1757 E2E, 2026-07-29).
+        if (
+            not history
+            and source.platform
+            and source.platform != Platform.LOCAL
+            and source.platform != Platform.WEBHOOK
+            and source.platform.value != "linear_agent_session"
+        ):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             # Multiplex: home channel may live only in the profile secret
