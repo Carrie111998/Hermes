@@ -341,6 +341,92 @@ def test_codex_dashboard_worker_persists_inside_session_profile(tmp_path, monkey
         ws._oauth_sessions.pop(sid, None)
 
 
+def test_codex_dashboard_worker_aborts_after_cancel(tmp_path, monkeypatch):
+    """DELETE /api/providers/oauth/sessions/{id} must stop the codex poll
+    worker before it exchanges the device code and writes tokens.
+
+    Regression for issue #74308: cancelling mid-poll used to leave the
+    background worker running to completion, and — since the session dict
+    entry had already been popped — the eventual token write resolved its
+    target profile as ``None`` and fell back to whatever profile happened
+    to be "current" instead of the profile the session actually targeted.
+    """
+    from hermes_cli import auth as auth_mod
+    from hermes_cli import web_server as ws
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    save_calls = []
+    monkeypatch.setattr(
+        auth_mod,
+        "_save_codex_tokens",
+        lambda tokens: save_calls.append(tokens),
+    )
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            if url.endswith("/deviceauth/usercode"):
+                return _Resp(200, {
+                    "device_auth_id": "device-auth-id",
+                    "interval": 3,
+                    "user_code": "CODEX-1234",
+                })
+            if url.endswith("/deviceauth/token"):
+                # The user "approves" on the very first poll — if the worker
+                # doesn't check cancellation, this looks like a success.
+                return _Resp(200, {
+                    "authorization_code": "authorization-code",
+                    "code_verifier": "code-verifier",
+                })
+            return _Resp(200, {
+                "access_token": "codex-access-should-not-be-saved",
+                "refresh_token": "codex-refresh-should-not-be-saved",
+            })
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+
+    sid, _ = ws._new_oauth_session("openai-codex", "device_code", profile="coder")
+
+    # Cancel the session the moment the worker calls time.sleep() inside the
+    # poll loop — simulates the user clicking "Cancel" while the worker is
+    # paused between poll attempts, published device code already in hand.
+    def fake_sleep(_seconds):
+        resp = client.delete(
+            f"/api/providers/oauth/sessions/{sid}", headers=HEADERS,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["ok"] is True
+
+    monkeypatch.setattr(ws.time, "sleep", fake_sleep)
+
+    try:
+        ws._codex_full_login_worker(sid)
+    finally:
+        ws._oauth_sessions.pop(sid, None)
+
+    # Cancellation must have removed the session before the worker exits.
+    assert sid not in ws._oauth_sessions
+    # And the worker must have aborted BEFORE persisting any credentials.
+    assert save_calls == []
+
+
 def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
     from hermes_cli import web_server as ws
 

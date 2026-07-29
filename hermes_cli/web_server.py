@@ -10588,6 +10588,9 @@ def _new_oauth_session(
         "created_at": time.time(),
         "status": "pending",  # pending | approved | denied | expired | error
         "error_message": None,
+        # Set by DELETE /api/providers/oauth/sessions/{id}; background
+        # pollers check this to abort without writing credentials.
+        "cancel_event": threading.Event(),
     }
     with _oauth_sessions_lock:
         _oauth_sessions[sid] = sess
@@ -11263,6 +11266,17 @@ def _codex_full_login_worker(session_id: str) -> None:
     single function — we need to surface the user_code to the dashboard the
     moment we receive it, well before polling completes.
     """
+    with _oauth_sessions_lock:
+        sess = _oauth_sessions.get(session_id)
+        if sess is None:
+            return
+        cancel_event: threading.Event = sess["cancel_event"]
+        # Pin the target profile now, while the session entry still exists.
+        # Cancellation pops the session from _oauth_sessions, so resolving
+        # the profile lazily at write time would silently fall back to
+        # whatever profile happens to be "current" (see _oauth_session_profile).
+        target_profile = sess.get("profile")
+
     try:
         import httpx
         from hermes_cli.auth import (
@@ -11303,7 +11317,11 @@ def _codex_full_login_worker(session_id: str) -> None:
         code_resp = None
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
             while time.monotonic() < deadline:
+                if cancel_event.is_set():
+                    return
                 time.sleep(poll_interval)
+                if cancel_event.is_set():
+                    return
                 poll = client.post(
                     f"{issuer}/api/accounts/deviceauth/token",
                     json={"device_auth_id": device_auth_id, "user_code": user_code},
@@ -11315,6 +11333,9 @@ def _codex_full_login_worker(session_id: str) -> None:
                 if poll.status_code in {403, 404}:
                     continue  # user hasn't authorized yet
                 raise RuntimeError(f"deviceauth/token poll returned {poll.status_code}")
+
+        if cancel_event.is_set():
+            return
 
         if code_resp is None:
             with _oauth_sessions_lock:
@@ -11349,7 +11370,14 @@ def _codex_full_login_worker(session_id: str) -> None:
 
         from hermes_cli.auth import _save_codex_tokens
 
-        with _profile_scope(_oauth_session_profile(session_id)):
+        # Refuse to write if cancellation raced past the checks above.
+        if cancel_event.is_set():
+            _log.info(
+                "oauth/device: openai-codex session %s cancelled before token write", session_id,
+            )
+            return
+
+        with _profile_scope(target_profile):
             _save_codex_tokens({
                 "access_token": access_token,
                 "refresh_token": refresh_token,
@@ -11456,6 +11484,10 @@ async def cancel_oauth_session(
     _require_token(request)
     with _oauth_sessions_lock:
         sess = _oauth_sessions.pop(session_id, None)
+        if sess is not None:
+            cancel_event = sess.get("cancel_event")
+            if cancel_event is not None:
+                cancel_event.set()
     if sess is None:
         return {"ok": False, "message": "session not found"}
     return {"ok": True, "session_id": session_id}
