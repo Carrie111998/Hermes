@@ -20,7 +20,7 @@
 | **P-005** | `hermes_cli/web_server.py` | 增加 `GET /api/mcp-servers` 只读 MCP 列表 | desktop 健康检查需要 MCP 数量，但不能泄露 command/args/env | 可考虑上游 |
 | **P-006** | `hermes_cli/config.py` | 为 CN provider 注册 `OPTIONAL_ENV_VARS` | 模型设置页需要展示 ARK、QIANFAN、HUNYUAN、SiliconFlow 等密钥项 | CN 专属，通常不向上游提交 |
 | **P-007** | `tui_gateway/ws.py` | 捕获并记录 gateway dispatch 异常，返回 JSON-RPC error | 否则前端只看到 WebSocket closed，缺少诊断信息 | 建议上游 |
-| **P-008** | `hermes_cli/web_server.py` | 增加 `GET/PUT /api/profiles/active` | desktop profile 切换器需要读写 sticky active profile | 建议上游 |
+| **P-008** | `hermes_cli/web_server.py`、`hermes_cli/main.py`、档案相关定向测试 | 保留 `GET/PUT /api/profiles/active` 兼容层，并让 Desktop 托管启动信任显式 `HERMES_HOME`，避免命名档案切回默认档案时被旧 sticky 档案重新劫持 | desktop 切换器需要兼容读写 sticky active profile；实时切回默认档案时，旧 `active_profile` 会保留到替换进程就绪，Core 不能把新进程重新导向旧档案 | 上游已提供 GET/POST；其余为 Desktop 兼容与重启语义 |
 | **P-009** | `hermes_cli/web_server.py`, `tui_gateway/sse.py` | 增加 `/api/v2/events` SSE 和 `/api/v2/rpc` POST transport | ~~desktop 默认使用 EventSource + POST~~ → desktop ≥ 0.4 已改用原生 `/api/ws` WebSocket（与官方桌面端一致），此 transport 只服务旧版外壳 | **已弃用** —— 为 ≤ 0.3.x 旧外壳保留（外壳无自更新而 runtime 热更新），旧外壳 EOL 后移除。不上游。 |
 | **P-010** | `hermes_cli/config.py` | 注册 `LONGCAT_API_KEY` | CN 模型设置需要 LongCat 密钥入口 | CN 专属，除非上游支持 LongCat |
 | **P-011** | `tui_gateway/server.py` | 给 `model.options` 增加 `slug_filter`，并增加 `provider.probe` RPC | desktop 需要过滤模型选择器，并轻量探测 provider 状态 | 可考虑上游 |
@@ -286,6 +286,8 @@
 - `PUT /api/profiles/active` 接收 `{name}` 并写入 sticky 设置。
 
 **风险和约束**：该接口只影响下次启动默认 profile，不改变当前 dashboard 进程正在使用的 `HERMES_HOME`。desktop 需要提示用户重启。
+
+**Desktop 托管的命名档案→默认档案重启修复**：Desktop 为保证失败可恢复，会先启动替换 dashboard，确认就绪后才清除 `active_profile`。旧逻辑在替换进程启动时读取这个尚未清除的 sticky 文件，把 Desktop 显式传入的根 `HERMES_HOME` 又改回 `profiles/<旧档案>`。现在当 `HERMES_DESKTOP_MANAGED=1` 且没有显式 `--profile` 时，`_apply_profile_override()` 以 Desktop 传入的 `HERMES_HOME` 为准；显式 `--profile` 仍然优先，独立 CLI/systemd 的 sticky 行为不变。回归覆盖见 `tests/hermes_cli/test_apply_profile_override.py`。
 
 **是否上游**：建议上游，属于明显的 API 对称性缺口。
 

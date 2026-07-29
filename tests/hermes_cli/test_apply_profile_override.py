@@ -103,6 +103,28 @@ class TestApplyProfileOverrideHermesHomeGuard:
             f"Expected HERMES_HOME to end with 'coder', got: {result!r}"
         )
 
+    def test_desktop_managed_root_home_does_not_follow_sticky_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """A managed Desktop restart pins the target profile via HERMES_HOME.
+
+        Switching from a named profile back to default starts the replacement
+        dashboard with HERMES_HOME at the Hermes root before Desktop clears the
+        old active_profile file. The replacement must stay on the explicit root
+        instead of being redirected back to that stale named profile.
+        """
+        hermes_root = _hermes_root_for_test(tmp_path)
+        monkeypatch.setenv("HERMES_DESKTOP_MANAGED", "1")
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(hermes_root),
+            active_profile="coder",
+            argv=["hermes", "dashboard", "--no-open"],
+        )
+
+        assert result == str(hermes_root)
+
     def test_hermes_home_already_profile_dir_is_trusted(self, tmp_path, monkeypatch):
         """HERMES_HOME=.../profiles/coder must not be overridden even when
         active_profile says something different.
@@ -348,4 +370,3 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
-
