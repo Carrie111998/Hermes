@@ -21815,6 +21815,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             logger.debug("Reusing cached agent for session %s", session_key)
                             reused_cached_agent = True
 
+                        # Session-id mismatch: the cached agent was created with
+                        # a different session_id than the current one (e.g. after
+                        # a compression rotation).  Update agent.session_id and
+                        # notify the context engine so plugin engines (e.g. LCM)
+                        # rebind their internal session state instead of retaining
+                        # the stale parent session.
+                        if _session_id_mismatch and agent is not None and session_id:
+                            try:
+                                _caught_old_sid = agent.session_id
+                                agent.session_id = session_id
+                                _caught_engine = getattr(agent, "context_compressor", None)
+                                if _caught_engine is not None:
+                                    if hasattr(_caught_engine, "bind_session_state"):
+                                        _caught_engine.bind_session_state(
+                                            getattr(agent, "_session_db", None),
+                                            session_id,
+                                        )
+                                    elif hasattr(_caught_engine, "on_session_start"):
+                                        _caught_engine.on_session_start(
+                                            session_id,
+                                            boundary_reason="session_switch",
+                                            old_session_id=_caught_old_sid,
+                                        )
+                            except Exception:
+                                logger.debug(
+                                    "Context engine session-id rebind failed for %s: "
+                                    "old=%s new=%s",
+                                    session_key, _caught_old_sid, session_id,
+                                    exc_info=True,
+                                )
+
             # Lock released — refresh the fallback chain from disk for the
             # reused agent OUTSIDE the cache lock (config.yaml read is disk
             # I/O; the idle-sweep watcher contends on this lock and stalls
