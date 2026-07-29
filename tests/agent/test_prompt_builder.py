@@ -1228,6 +1228,150 @@ class TestEnvironmentHints:
                 f"info is suppressed in the system prompt"
             )
 
+    def test_probe_uses_create_environment_with_default_task_id(self, monkeypatch):
+        """Regression for #74053.
+
+        The probe must use the `_create_environment` factory (which is
+        the only way to construct an env with a controlled task_id) and
+        pass `task_id="default"`. Before this fix the probe called a
+        non-existent `get_environment` re-export, so the import failed
+        silently and the probe never ran — the system prompt silently
+        lost backend info for every container backend.
+
+        The test forces the probe to its "happy path" by intercepting
+        the lazy import inside the function and asserts the
+        constructed env was passed task_id="default" (not a per-probe
+        label that would create a second container).
+        """
+        import agent.prompt_builder as _pb
+        # Force the probe path by setting a remote backend and clearing
+        # the cache.
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+        # Build a fake env that records the kwargs it was constructed with.
+        captured_kwargs: dict = {}
+        class FakeEnv:
+            def execute(self, command: str, timeout: int = 4) -> dict:
+                return {
+                    "returncode": 0,
+                    "output": "os=Linux\nkernel=6.8.0\nhome=/root\ncwd=/workspace\nuser=root\n",
+                }
+        def fake_create_env(*, env_type, image, cwd, timeout, **kwargs):
+            captured_kwargs.update(kwargs)
+            return FakeEnv()
+        def fake_get_env_config():
+            return {
+                "env_type": "docker",
+                "image": "localhost/hermes-terminal:latest",
+                "cwd": "/root",
+                "ssh_config": None,
+                "container_config": {"container_persistent": True},
+                "local_config": None,
+                "host_cwd": None,
+            }
+        # The probe does `from tools.terminal_tool import _get_env_config,
+        # _create_environment` lazily. We can't patch those names in the
+        # prompt_builder namespace (they're not bound there until the
+        # import runs), so we patch the source module so the lazy
+        # import resolves to our fakes.
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(_tt, "_create_environment", fake_create_env)
+        monkeypatch.setattr(_tt, "_get_env_config", fake_get_env_config)
+        # Run the probe.
+        result = _pb._probe_remote_backend("docker")
+        # The probe must succeed (return non-None) — this is the
+        # regression check: with the broken import, the probe
+        # returned None silently.
+        assert result is not None, (
+            "Probe returned None — the import is probably still broken. "
+            "See #74053."
+        )
+        # The probe must have been constructed with task_id="default"
+        # so it attaches to the same container the agent uses, not a
+        # second container.
+        assert captured_kwargs.get("task_id") == "default", (
+            f"Probe created env with task_id={captured_kwargs.get('task_id')!r}; "
+            f"expected 'default' to avoid a second container. See #74053."
+        )
+
+    def test_probe_swallows_import_failure_safely(self, monkeypatch):
+        """If the import fails for ANY reason, the probe must return None
+        and not crash. Catches future regressions where the import
+        path changes and silently breaks the probe.
+        """
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+        # Force the import to fail.
+        import builtins
+        real_import = builtins.__import__
+        def fake_import(name, *args, **kwargs):
+            if "terminal_tool" in name:
+                raise ImportError("simulated import failure")
+            return real_import(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        result = _pb._probe_remote_backend("docker")
+        assert result is None  # Failure is logged, not raised.
+        # And the cache is populated with empty so we don't retry.
+        assert _pb._BACKEND_PROBE_CACHE[("docker", "")] == ""
+
+    def test_build_environment_hints_contains_remote_probe_output(self, monkeypatch):
+        """User-facing regression for #74053.
+
+        The original bug was that the probe's import was broken, so
+        `build_environment_hints` silently lost the live probe output
+        for every remote backend (docker / singularity / modal /
+        daytona). The system prompt would fall through to the static
+        "inside a docker container" wording, with no OS / user / cwd
+        info — even though the probe was supposed to provide it.
+
+        This test verifies the user-visible outcome: when the probe
+        runs successfully, its output IS in the system prompt. The
+        test fails on the pre-fix code because the import is broken
+        (probe returns None → static fallback is used).
+        """
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        # Don't monkeypatch the probe — let it actually run with fake
+        # fakes for the env so we exercise the real code path.
+        fake_config = {
+            "env_type": "docker",
+            "image": "localhost/hermes-terminal:latest",
+            "cwd": "/root",
+            "ssh_config": None,
+            "container_config": {"container_persistent": True},
+            "local_config": None,
+            "host_cwd": None,
+        }
+        class FakeEnv:
+            def execute(self, command, timeout=4):
+                return {
+                    "returncode": 0,
+                    "output": "os=Linux\nkernel=6.8.0\nhome=/root\ncwd=/workspace\nuser=root\n",
+                }
+        def fake_create_env(*, env_type, image, cwd, timeout, **kwargs):
+            return FakeEnv()
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(_tt, "_get_env_config", lambda: fake_config)
+        monkeypatch.setattr(_tt, "_create_environment", fake_create_env)
+        _pb._clear_backend_probe_cache()
+        result = _pb.build_environment_hints()
+        # The static fallback says "inside" a container, but the
+        # user-facing output should ALSO contain the live probe's data
+        # (the OS, the user, the cwd). Without the fix, only the
+        # static fallback is in the output.
+        assert "Linux 6.8.0" in result, (
+            f"Live probe output missing from build_environment_hints.\n"
+            f"This is the user-facing regression: the system prompt "
+            f"omits OS / user / cwd for remote backends.\n"
+            f"Got: {result!r}"
+        )
+        assert "/workspace" in result
+        assert "User: root" in result
+
     def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
         """HERMES_ENVIRONMENT_HINT lets an embedder describe the runtime env."""
         import agent.prompt_builder as _pb

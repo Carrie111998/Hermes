@@ -925,9 +925,13 @@ def _probe_remote_backend(env_type: str) -> str | None:
 
     try:
         # Import locally: tools/ imports are heavy and only relevant when a
-        # non-local backend is actually configured.
-        from tools.terminal_tool import _get_env_config  # type: ignore
-        from tools.environments import get_environment  # type: ignore
+        # non-local backend is actually configured. We call the private
+        # factory directly rather than going through a (missing)
+        # `get_environment` re-export, which was the original bug
+        # reported in #74053: the broken re-export meant the probe
+        # never actually ran, so the system prompt silently lost
+        # backend info for docker/singularity/modal/daytona users.
+        from tools.terminal_tool import _get_env_config, _create_environment  # type: ignore
     except Exception as e:
         logger.debug("Backend probe unavailable (import failed): %s", e)
         _BACKEND_PROBE_CACHE[cache_key] = ""
@@ -935,7 +939,28 @@ def _probe_remote_backend(env_type: str) -> str | None:
 
     try:
         config = _get_env_config()
-        env = get_environment(config)
+        # Use task_id="default" so the probe attaches to the same
+        # container the agent's real work uses. Without this, the
+        # probe would mint its own container labeled
+        # `hermes-task-id=prompt-backend-probe`, doubling the
+        # container footprint on container hosts (the original
+        # reproduction in #74053).
+        # Filter out None values so the strict-typed _create_environment
+        # accepts them (it expects `dict = None` not `dict | None`).
+        env_kwargs = {k: v for k, v in {
+            "ssh_config": config.get("ssh_config"),
+            "container_config": config.get("container_config"),
+            "local_config": config.get("local_config"),
+            "host_cwd": config.get("host_cwd"),
+        }.items() if v is not None}
+        env = _create_environment(
+            env_type=config["env_type"],
+            image=config["image"],
+            cwd=config["cwd"],
+            timeout=4,
+            task_id="default",
+            **env_kwargs,
+        )
         # Single-line POSIX probe — works on any Unixy backend. Wrapped in
         # `2>/dev/null` so a missing binary doesn't pollute the output.
         probe_cmd = (
