@@ -1,4 +1,4 @@
-import { atom } from 'nanostores'
+import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { artifactContentHash, type ArtifactDetection, type ArtifactKind, artifactSlug } from '@/lib/artifact-detect'
 
@@ -72,6 +72,13 @@ export const $artifactRegistry = atom<ArtifactRegistry>({})
 /** Per-artifact selected version index; absent = newest. */
 export const $artifactVersionSelection = atom<Record<string, number>>({})
 
+// A mounted preview cares about one artifact, not the whole cross-session
+// registry. Cached derived atoms preserve the selected record's identity on an
+// unrelated artifact update, so a streaming message cannot rebuild a live
+// preview (or its guest renderer) merely because another artifact registered.
+const artifactRecordCache = new Map<string, ReadableAtom<ArtifactRecord | null>>()
+const artifactVersionSelectionCache = new Map<string, ReadableAtom<number | undefined>>()
+
 /** Lookup against a registry value, for components that already subscribe to
  *  the atom and need the record to change identity when it does. */
 export function findArtifact(registry: ArtifactRegistry, artifactId: string): ArtifactRecord | null {
@@ -88,6 +95,28 @@ export function findArtifact(registry: ArtifactRegistry, artifactId: string): Ar
 
 export function getArtifact(artifactId: string): ArtifactRecord | null {
   return findArtifact($artifactRegistry.get(), artifactId)
+}
+
+export function $artifactRecord(artifactId: string): ReadableAtom<ArtifactRecord | null> {
+  let cached = artifactRecordCache.get(artifactId)
+
+  if (!cached) {
+    cached = computed($artifactRegistry, registry => findArtifact(registry, artifactId))
+    artifactRecordCache.set(artifactId, cached)
+  }
+
+  return cached
+}
+
+export function $artifactSelectedVersion(artifactId: string): ReadableAtom<number | undefined> {
+  let cached = artifactVersionSelectionCache.get(artifactId)
+
+  if (!cached) {
+    cached = computed($artifactVersionSelection, selection => selection[artifactId])
+    artifactVersionSelectionCache.set(artifactId, cached)
+  }
+
+  return cached
 }
 
 export function artifactsForSession(sessionId: string | null | undefined): ArtifactRecord[] {
@@ -223,5 +252,7 @@ export function selectArtifactVersion(artifactId: string, versionIndex: number) 
 export function clearArtifactRegistry() {
   $artifactRegistry.set({})
   $artifactVersionSelection.set({})
+  artifactRecordCache.clear()
+  artifactVersionSelectionCache.clear()
   closeArtifactPreviewTabs()
 }
