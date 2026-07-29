@@ -4321,7 +4321,9 @@ def _reconfigure_provider(
     for var in env_vars:
         existing = get_env_value(var["key"])
         if existing:
-            _print_info(f"  {var['key']}: configured ({existing[:8]}...)")
+            from agent.redact import mask_secret
+
+            _print_info(f"  {var['key']}: configured ({mask_secret(existing)})")
         url = var.get("url", "")
         if url:
             _print_info(f"  Get yours at: {url}")
@@ -4378,7 +4380,9 @@ def _reconfigure_simple_requirements(ts_key: str):
     for var, url in requirements:
         existing = get_env_value(var)
         if existing:
-            _print_info(f"  {var}: configured ({existing[:8]}...)")
+            from agent.redact import mask_secret
+
+            _print_info(f"  {var}: configured ({mask_secret(existing)})")
         if url:
             _print_info(f"  Get key at: {url}")
         value = _prompt(f"    {var} (Enter to keep current)", password=True)

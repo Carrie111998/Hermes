@@ -1865,14 +1865,19 @@ def _normalize_model_version(model: str) -> str:
     return model.replace(".", "-")
 
 
-def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
+def _query_anthropic_context_length(
+    model: str,
+    base_url: str,
+    api_key: object,
+) -> Optional[int]:
     """Query Anthropic's /v1/models endpoint for context length.
 
-    Only works with regular ANTHROPIC_API_KEY (sk-ant-api*).
-    OAuth tokens (sk-ant-oat*) from Claude Code return 401.
+    Only works with regular string ANTHROPIC_API_KEY values (sk-ant-api*).
+    OAuth tokens (sk-ant-oat*) cannot access /v1/models, and callable token
+    providers must never be invoked by a metadata probe.
     """
-    if not api_key or api_key.startswith("sk-ant-oat"):
-        return None  # OAuth tokens can't access /v1/models
+    if not isinstance(api_key, str) or not api_key or api_key.startswith("sk-ant-oat"):
+        return None  # OAuth/callable credentials can't access this endpoint
     try:
         base = base_url.rstrip("/")
         if base.endswith("/v1"):
@@ -2160,7 +2165,7 @@ def _resolve_nous_context_length(
 def get_model_context_length(
     model: str,
     base_url: str = "",
-    api_key: str = "",
+    api_key: object = "",
     config_context_length: int | None = None,
     provider: str = "",
     custom_providers: list | None = None,
@@ -2655,7 +2660,7 @@ def get_model_context_length(
 async def get_model_context_length_async(
     model: str,
     base_url: str = "",
-    api_key: str = "",
+    api_key: object = "",
     config_context_length: int | None = None,
     provider: str = "",
     custom_providers: list | None = None,

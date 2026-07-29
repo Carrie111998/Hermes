@@ -18,6 +18,7 @@ from unittest.mock import patch, MagicMock
 
 from agent.model_metadata import (
     CONTEXT_PROBE_TIERS,
+    _query_anthropic_context_length,
     DEFAULT_CONTEXT_LENGTHS,
     DEFAULT_FALLBACK_CONTEXT,
     _strip_provider_prefix,
@@ -167,6 +168,92 @@ class TestEstimateRequestTokensRough:
             mm._estimate_tools_tokens_rough(tools)
             assert len(mm._TOOLS_TOKENS_CACHE) <= cap
         assert len(mm._TOOLS_TOKENS_CACHE) == cap
+
+
+class TestAnthropicContextProbeCredentials:
+    def test_callable_token_provider_skips_string_only_probe_without_invocation(self):
+        calls = 0
+
+        def token_provider() -> str:
+            nonlocal calls
+            calls += 1
+            return "credential-that-must-not-be-resolved-by-metadata"
+
+        with patch("agent.model_metadata.requests.get") as request_get:
+            result = _query_anthropic_context_length(
+                "test-model",
+                "https://api.anthropic.com",
+                token_provider,
+            )
+
+        assert result is None
+        assert calls == 0
+        request_get.assert_not_called()
+
+    @pytest.mark.parametrize("api_key", [None, "", object()])
+    def test_non_string_or_empty_credentials_skip_probe(self, api_key):
+        with patch("agent.model_metadata.requests.get") as request_get:
+            result = _query_anthropic_context_length(
+                "test-model",
+                "https://api.anthropic.com",
+                api_key,
+            )
+
+        assert result is None
+        request_get.assert_not_called()
+
+    def test_anthropic_oauth_token_skips_models_probe(self):
+        with patch("agent.model_metadata.requests.get") as request_get:
+            result = _query_anthropic_context_length(
+                "test-model",
+                "https://api.anthropic.com",
+                "sk-ant-oat-test-token",
+            )
+
+        assert result is None
+        request_get.assert_not_called()
+
+    def test_regular_string_key_preserves_models_probe(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "data": [{"id": "test-model", "max_input_tokens": 123_456}]
+        }
+
+        with patch("agent.model_metadata.requests.get", return_value=response) as request_get:
+            result = _query_anthropic_context_length(
+                "test-model",
+                "https://api.anthropic.com/v1",
+                "regular-api-key-value",
+            )
+
+        assert result == 123_456
+        request_get.assert_called_once()
+        _, kwargs = request_get.call_args
+        assert kwargs["headers"]["x-api-key"] == "regular-api-key-value"
+
+    def test_public_context_lookup_accepts_callable_without_invocation(self):
+        calls = 0
+
+        def token_provider() -> str:
+            nonlocal calls
+            calls += 1
+            return "credential-that-must-not-be-resolved-by-metadata"
+
+        with patch(
+            "agent.model_metadata._query_anthropic_context_length",
+            wraps=_query_anthropic_context_length,
+        ) as probe:
+            context_length = get_model_context_length(
+                "claude-sonnet-4-5",
+                base_url="https://api.anthropic.com",
+                api_key=token_provider,
+                provider="anthropic",
+            )
+
+        assert context_length > 0
+        assert calls == 0
+        probe.assert_called_once()
 
 
 # =========================================================================
