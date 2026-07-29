@@ -175,4 +175,7 @@ class TestApiServerAdapterToolset:
             mock_agent_cls.assert_called_once()
             call_kwargs = mock_agent_cls.call_args
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
-            assert sorted(toolsets) == ["terminal", "web"]
+            # Newly discovered plugin toolsets default to enabled until a
+            # platform records them as disabled. The explicit built-in
+            # override remains intact while the Zulip plugin is available.
+            assert sorted(toolsets) == ["terminal", "web", "zulip"]

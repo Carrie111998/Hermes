@@ -1571,8 +1571,10 @@ def _has_protected_python_binding(names: set[str]) -> bool:
 
 
 def _is_sensitive_python_path(value: str) -> bool:
-    attachment_cache = os.path.expanduser("~/.hermes/cache/documents")
-    if os.path.commonpath((os.path.realpath(os.path.expanduser(value)), attachment_cache)) == attachment_cache:
+    normalized = os.path.realpath(os.path.expanduser(value))
+    # Only the documents subtree is safe outside the active profile home.
+    attachment_marker = f"{os.sep}.hermes{os.sep}cache{os.sep}documents"
+    if normalized.endswith(attachment_marker) or attachment_marker + os.sep in normalized:
         return False
     return any(marker in value.lower() for marker in _SENSITIVE_PYTHON_PATH_MARKERS)
 
