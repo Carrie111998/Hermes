@@ -93,6 +93,7 @@ def _make_adapter(bot_authored_root: bool = False):
     adapter._team_bot_user_ids = {}
     adapter._bot_message_ts = set()
     adapter._mentioned_threads = set()
+    adapter._MENTIONED_THREADS_MAX = 5000
     adapter._thread_context_cache = {}
 
     adapter._has_active_session_for_thread = lambda **kw: False
@@ -327,3 +328,48 @@ async def test_bot_authored_thread_root_uses_per_team_bot_id():
         adapter, CHANNEL_ID, THREAD_TS, team_id="T2"
     )
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_bot_authored_root_cache_does_not_cross_workspaces():
+    """A warm cache entry from T1 must not decide T2's wake policy."""
+    adapter = _make_adapter()
+    adapter._team_bot_user_ids = {"T_ONE": "U_BOT_T1", "T_TWO": "U_BOT_T2"}
+    adapter._thread_context_cache = {
+        f"{CHANNEL_ID}:{THREAD_TS}:T_ONE": _ThreadContextCache(
+            content="ctx",
+            # Deliberately equals T_TWO's bot id. A prefix-only cache lookup
+            # will read this first and falsely classify T_TWO's human root.
+            parent_user_id="U_BOT_T2",
+        ),
+        f"{CHANNEL_ID}:{THREAD_TS}:T_TWO": _ThreadContextCache(
+            content="ctx",
+            parent_user_id="U_HUMAN_T2",
+        ),
+    }
+
+    assert await SlackAdapter._bot_authored_thread_root(
+        adapter, CHANNEL_ID, THREAD_TS, team_id="T_TWO"
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_parent_mention_rehydration_records_workspace_marker():
+    """Restart recovery must not create a globally shared bare thread marker."""
+    adapter = _make_adapter(bot_authored_root=False)
+    adapter._team_bot_user_ids = {"T_TWO": "U_BOT_T2"}
+    adapter._fetch_thread_parent_text = AsyncMock(
+        return_value="<@U_BOT_T2> continue after the restart"
+    )
+
+    wake = await adapter._should_wake_on_unmentioned_message(
+        event_thread_ts=THREAD_TS,
+        channel_id=CHANNEL_ID,
+        user_id=USER_ID,
+        is_thread_reply=True,
+        team_id="T_TWO",
+    )
+
+    assert wake is True
+    assert ("T_TWO", THREAD_TS) in adapter._mentioned_threads
+    assert THREAD_TS not in adapter._mentioned_threads

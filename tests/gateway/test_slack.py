@@ -3542,6 +3542,40 @@ class TestMessageRouting:
 
         adapter.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_processed_edit_guard_is_scoped_per_workspace(self, adapter):
+        """The same Slack-local message ts in another team is independent."""
+        original = {
+            "text": "<@U_BOT> workspace one",
+            "user": "U_USER",
+            "channel": "C_SHARED",
+            "channel_type": "mpim",
+            "team": "T_ONE",
+            "ts": "1234567890.000001",
+        }
+        await adapter._handle_slack_message(original)
+        adapter.handle_message.assert_awaited_once()
+        adapter.handle_message.reset_mock()
+
+        edited_in_other_workspace = {
+            "subtype": "message_changed",
+            "channel": "C_SHARED",
+            "channel_type": "mpim",
+            "team": "T_TWO",
+            "message": {
+                "text": "<@U_BOT> workspace two edit",
+                "user": "U_USER",
+                "channel": "C_SHARED",
+                "ts": "1234567890.000001",
+                "edited": {"user": "U_USER", "ts": "1234567899.000002"},
+            },
+        }
+        await adapter._handle_slack_message(edited_in_other_workspace)
+
+        adapter.handle_message.assert_awaited_once()
+        delivered = adapter.handle_message.await_args.args[0]
+        assert delivered.source.scope_id == "T_TWO"
+
 
 # ---------------------------------------------------------------------------
 # TestSendTyping — assistant.threads.setStatus
@@ -5084,7 +5118,10 @@ class TestThreadReplyHandling:
         # Cold-start context carries the parent so the agent sees the ask.
         assert "check this and ask me for run" in msg_event.channel_context
         # Thread remembered so later replies skip the parent fetch.
-        assert "123.000" in adapter_with_session_store._mentioned_threads
+        assert (
+            "T_TEAM",
+            "123.000",
+        ) in adapter_with_session_store._mentioned_threads
 
     @pytest.mark.asyncio
     async def test_top_level_mention_registers_thread_for_replies(

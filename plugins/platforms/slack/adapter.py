@@ -975,12 +975,20 @@ class SlackAdapter(BasePlatformAdapter):
         self._agent_view_contexts: Dict[Tuple[str, str], Dict[str, str]] = {}
         self._AGENT_VIEW_CONTEXTS_MAX = 5000
         # Status-bubble dedup (issue #30045, extended to Slack): remember the
-        # message ts of the last status bubble per (channel, thread, status
-        # key) so repeated progress callbacks (compression retries, fallback
+        # message ts of the last status bubble per (workspace, channel, thread,
+        # status key) so repeated progress callbacks (compression retries, fallback
         # switches, ...) edit ONE message in place instead of appending a new
         # bubble per event — long retry loops used to spam threads with
         # dozens of out-of-order status messages.
-        self._status_message_ids: Dict[Tuple[str, str, str], str] = {}
+        self._status_message_ids: Dict[Tuple[str, str, str, str], str] = {}
+        # Status callbacks are scheduled independently from the agent worker.
+        # Serialize each workspace/thread/key so a retry burst cannot race
+        # several empty-cache reads into several visible Slack posts.
+        # Fixed lock striping bounds memory even when sends fail before an id
+        # can be cached. Hash collisions only serialize unrelated statuses.
+        self._status_message_locks: Tuple[asyncio.Lock, ...] = tuple(
+            asyncio.Lock() for _ in range(64)
+        )
         self._STATUS_MESSAGE_IDS_MAX = 2000
         # Cache for _fetch_thread_context results: cache_key → _ThreadContextCache
         self._thread_context_cache: Dict[str, _ThreadContextCache] = {}
@@ -2453,6 +2461,9 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
+        preserve_live_status = bool(
+            isinstance(metadata, dict) and metadata.get("non_conversational")
+        )
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
@@ -2464,7 +2475,15 @@ class SlackAdapter(BasePlatformAdapter):
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id, team_id)
+            # Intermediate progress/status output must not consume the
+            # response_url reserved for the slash command's final private
+            # reply; doing so can make that final response fall through to a
+            # public channel post.
+            slash_ctx = (
+                None
+                if preserve_live_status
+                else self._pop_slash_context(chat_id, team_id)
+            )
             if slash_ctx:
                 ephemeral_result = await self._send_slash_ephemeral(
                     slash_ctx,
@@ -2475,7 +2494,8 @@ class SlackAdapter(BasePlatformAdapter):
                     # Slack never auto-clears the Assistant status for them.
                     # Clear it explicitly or a command run inside an
                     # assistant thread leaves "is thinking..." forever.
-                    await self._clear_thread_status_quietly(chat_id, metadata)
+                    if not preserve_live_status:
+                        await self._clear_thread_status_quietly(chat_id, metadata)
                     return ephemeral_result
                 # response_url delivery failed (#19688): fall back to
                 # chat.postEphemeral — an independent API path that keeps
@@ -2494,7 +2514,8 @@ class SlackAdapter(BasePlatformAdapter):
                     content,
                 )
                 if fallback_result.success:
-                    await self._clear_thread_status_quietly(chat_id, metadata)
+                    if not preserve_live_status:
+                        await self._clear_thread_status_quietly(chat_id, metadata)
                     return fallback_result
                 # Both ephemeral paths failed — surface the failure instead
                 # of leaking the reply publicly. The user still has the
@@ -2518,7 +2539,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # produced no visible text (e.g. "(empty)" final responses
                 # are filtered upstream), the assistant thread status must
                 # not stay stuck on "is thinking..." (#24117).
-                await self._clear_thread_status_quietly(chat_id, metadata)
+                if not preserve_live_status:
+                    await self._clear_thread_status_quietly(chat_id, metadata)
                 return SendResult(success=True)
 
             # Split long messages, preserving code block boundaries
@@ -2571,7 +2593,7 @@ class SlackAdapter(BasePlatformAdapter):
                         raise
 
             # Clear Slack Assistant status as soon as the final message is posted.
-            if thread_ts:
+            if thread_ts and not preserve_live_status:
                 await self.stop_typing(chat_id, metadata=metadata)
 
             # Track the sent message ts so we can auto-respond to thread
@@ -2600,7 +2622,8 @@ class SlackAdapter(BasePlatformAdapter):
             # resolution): stop_typing falls back to metadata / the uniquely
             # tracked status for this channel, so a failed turn cannot leave
             # "is thinking..." visible (#24117).
-            await self._clear_thread_status_quietly(chat_id, metadata)
+            if not preserve_live_status:
+                await self._clear_thread_status_quietly(chat_id, metadata)
             logger.error("[Slack] Send error: %s", e, exc_info=True)
             _retryable = self._is_retryable_upload_error(e)
             _retry_after = None
@@ -2678,34 +2701,61 @@ class SlackAdapter(BasePlatformAdapter):
         (context-pressure, compression retries, model fallback, lifecycle)
         used to append a fresh bubble on every call, spamming threads during
         long retry loops. The first call posts and the message ts is
-        remembered; subsequent calls with the same (channel, thread,
-        status_key) edit that message in place via ``chat.update``. If the
-        edit fails (message deleted, too old, ...) the cached ts is dropped
-        and a fresh message is sent.
+        remembered; subsequent calls with the same (workspace, channel,
+        thread, status_key) edit that message in place via ``chat.update``.
+        If a permanent edit fails (message deleted, too old, ...) the cached
+        ts is dropped and a fresh message is sent.
         """
-        thread_ts = self._resolve_thread_ts(None, metadata) or ""
-        key = (str(chat_id), str(thread_ts), str(status_key))
-        cached_id = self._status_message_ids.get(key)
-        if cached_id is not None:
-            result = await self.edit_message(
-                chat_id, cached_id, content, finalize=False, metadata=metadata,
+        status_metadata = dict(metadata or {})
+        # A status bubble is intermediate output. Sending it must not clear the
+        # live Assistant status or reset its elapsed-time heartbeat.
+        status_metadata["non_conversational"] = True
+        thread_ts = self._resolve_thread_ts(None, status_metadata) or ""
+        team_id = self._metadata_team_id(status_metadata)
+        key = (str(team_id), str(chat_id), str(thread_ts), str(status_key))
+        lock = self._status_message_locks[
+            hash(key) % len(self._status_message_locks)
+        ]
+
+        async with lock:
+            cached_id = self._status_message_ids.get(key)
+            if cached_id is not None:
+                result = await self.edit_message(
+                    chat_id,
+                    cached_id,
+                    content,
+                    finalize=False,
+                    metadata=status_metadata,
+                )
+                if result.success:
+                    if result.message_id:
+                        self._status_message_ids[key] = str(result.message_id)
+                    return result
+                if result.retryable:
+                    # chat.update is idempotent but its timeout is ambiguous:
+                    # preserve the existing id so the next callback catches up
+                    # instead of posting a duplicate status bubble.
+                    return result
+                # Permanent edit failure (deleted/too old): replace the bubble.
+                self._status_message_ids.pop(key, None)
+
+            result = await self.send(
+                chat_id,
+                content,
+                metadata=status_metadata,
             )
-            if result.success:
-                if result.message_id:
-                    self._status_message_ids[key] = str(result.message_id)
-                return result
-            # Edit failed — clear the cached ts and fall through to a fresh send.
-            self._status_message_ids.pop(key, None)
-        result = await self.send(chat_id, content, metadata=metadata)
-        if result.success and result.message_id:
-            if len(self._status_message_ids) >= self._STATUS_MESSAGE_IDS_MAX:
-                # Simple FIFO trim: drop the oldest half to bound memory.
-                for stale in list(self._status_message_ids)[
-                    : self._STATUS_MESSAGE_IDS_MAX // 2
-                ]:
-                    self._status_message_ids.pop(stale, None)
-            self._status_message_ids[key] = str(result.message_id)
-        return result
+            if result.success and result.message_id:
+                if len(self._status_message_ids) >= self._STATUS_MESSAGE_IDS_MAX:
+                    # Same-key updates share a stripe; evicting another key's
+                    # cached id is safe because that task restores it after a
+                    # successful edit.
+                    candidates = [
+                        stale for stale in self._status_message_ids if stale != key
+                    ]
+                    for stale in candidates[: self._STATUS_MESSAGE_IDS_MAX // 2]:
+                        self._status_message_ids.pop(stale, None)
+                self._status_message_ids[key] = str(result.message_id)
+            return result
 
     async def edit_message(
         self,
@@ -5121,14 +5171,28 @@ class SlackAdapter(BasePlatformAdapter):
             return False
 
         def _cached_parent_matches() -> Optional[bool]:
-            # Cache keys are "{channel_id}:{thread_ts}:{team_id}"; team_id may
-            # be empty at some call sites, so match on the channel+thread
-            # prefix rather than guessing the exact key.
-            for cached_key, cached_entry in self._thread_context_cache.items():
-                if cached_key.startswith(f"{channel_id}:{thread_ts}:"):
+            # Cache keys are workspace-scoped. Slack Connect can expose the
+            # same channel/thread ids in two teams, so a prefix match can read
+            # another workspace's root author and wake (or silence) this one.
+            exact_key = f"{channel_id}:{thread_ts}:{team_id}"
+            cached_entry = self._thread_context_cache.get(exact_key)
+            if cached_entry is not None:
+                return bool(
+                    cached_entry.parent_user_id
+                    and cached_entry.parent_user_id == bot_uid
+                )
+            if not team_id:
+                # Legacy/team-less callers may use a uniquely identifiable
+                # workspace cache entry, but ambiguity must fail closed.
+                matches = [
+                    entry
+                    for key, entry in self._thread_context_cache.items()
+                    if key.startswith(f"{channel_id}:{thread_ts}:")
+                ]
+                if len(matches) == 1:
                     return bool(
-                        cached_entry.parent_user_id
-                        and cached_entry.parent_user_id == bot_uid
+                        matches[0].parent_user_id
+                        and matches[0].parent_user_id == bot_uid
                     )
             return None
 
@@ -5218,7 +5282,9 @@ class SlackAdapter(BasePlatformAdapter):
                 if parent_text and f"<@{bot_uid}>" in parent_text:
                     # Remember the thread so later replies skip the fetch.
                     if not self._slack_strict_mention():
-                        self._register_mentioned_thread(event_thread_ts)
+                        self._register_mentioned_thread(
+                            event_thread_ts, team_id=team_id
+                        )
                     return True
         return False
 
@@ -5254,9 +5320,13 @@ class SlackAdapter(BasePlatformAdapter):
                 return
 
             original_message_ts = str(updated_message.get("ts") or "")
+            edit_team_id = self._event_team_id(event, payload)
+            processed_marker = self._workspace_event_id(
+                edit_team_id, original_message_ts
+            )
             if (
                 original_message_ts
-                and original_message_ts in self._processed_message_ts
+                and processed_marker in self._processed_message_ts
             ):
                 return
             edited = updated_message.get("edited")
@@ -6330,7 +6400,9 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         if ts:
-            self._processed_message_ts[ts] = time.time()
+            self._processed_message_ts[
+                self._workspace_event_id(team_id, ts)
+            ] = time.time()
             if len(self._processed_message_ts) > self._PROCESSED_MESSAGE_TS_MAX:
                 newest_items = sorted(
                     self._processed_message_ts.items(),
