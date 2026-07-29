@@ -1,5 +1,4 @@
 import { cleanup, render, screen } from '@testing-library/react'
-<<<<<<< HEAD
 import { atom } from 'nanostores'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -184,58 +183,23 @@ describe('SidebarSessionRow', () => {
     const avatar = container.querySelector('span[aria-hidden="true"]')
     expect(avatar).toBeTruthy()
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
-=======
-import { afterEach, describe, expect, it, vi } from 'vitest'
+  })
+})
 
-import { I18nProvider } from '@/i18n'
-import { $attentionSessionIds } from '@/store/session'
-import type { SessionInfo } from '@/types/hermes'
-
-import { SidebarSessionRow } from './session-row'
-
-function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
-  return {
-    archived: false,
-    cwd: '/Users/example/Workspaces/hermes-agent',
-    ended_at: null,
-    id: '20260612_100000_row01',
-    input_tokens: 0,
-    is_active: false,
-    last_active: 1_000,
-    message_count: 2,
-    model: 'claude',
-    output_tokens: 0,
-    preview: 'Fix shared session row labels',
-    source: 'webhook',
-    started_at: 1_000,
-    title: 'Shared channel session',
-    tool_call_count: 0,
-    ...overrides
-  }
-}
-
-function renderRow(session: SessionInfo) {
-  return render(
-    <I18nProvider configClient={null}>
+describe('SidebarSessionRow shared-channel origin', () => {
+  const renderRow = (session: SessionInfo) =>
+    render(
       <SidebarSessionRow
         isPinned={false}
         isSelected={false}
         isWorking={false}
-        onArchive={vi.fn()}
-        onDelete={vi.fn()}
-        onPin={vi.fn()}
-        onResume={vi.fn()}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={noop}
         session={session}
       />
-    </I18nProvider>
-  )
-}
-
-describe('SidebarSessionRow', () => {
-  afterEach(() => {
-    cleanup()
-    $attentionSessionIds.set([])
-  })
+    )
 
   it('renders safe shared-channel origin labels below the title', () => {
     renderRow(
@@ -247,7 +211,8 @@ describe('SidebarSessionRow', () => {
           display_name: 'Build Room',
           has_thread: true,
           platform: 'webhook'
-        }
+        },
+        title: 'Shared channel session'
       })
     )
 
@@ -256,10 +221,9 @@ describe('SidebarSessionRow', () => {
   })
 
   it('keeps ordinary sessions to the title-only row', () => {
-    renderRow(makeSession({ channel_origin: null }))
+    renderRow(makeSession({ channel_origin: null, title: 'Shared channel session' }))
 
     expect(screen.getByText('Shared channel session')).toBeTruthy()
     expect(screen.queryByText(/Build Room/)).toBeNull()
->>>>>>> 9782c39b1 (Refresh on upstream/main: resolve conflicts (no behavior change))
   })
 })

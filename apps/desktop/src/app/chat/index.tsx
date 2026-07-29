@@ -21,11 +21,8 @@ import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
-<<<<<<< HEAD
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
-=======
 import { sessionChannelOriginLabel } from '@/lib/session-channel-origin'
->>>>>>> 9782c39b1 (Refresh on upstream/main: resolve conflicts (no behavior change))
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
@@ -160,28 +157,18 @@ export function ChatHeader({
           sideOffset={8}
           title={title}
         >
-<<<<<<< HEAD
-          <TitleMenuTrigger>{title}</TitleMenuTrigger>
-=======
-          <Button
-            className={cn(
-              'pointer-events-auto flex min-w-0 max-w-full gap-1 overflow-hidden border border-transparent bg-transparent px-2 py-0 text-(--ui-text-secondary) hover:border-(--ui-stroke-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground data-[state=open]:border-(--ui-stroke-tertiary) data-[state=open]:bg-(--ui-control-active-background) [-webkit-app-region:no-drag]',
-              channelLabel ? 'h-8 items-center' : 'h-6'
-            )}
-            type="button"
-            variant="ghost"
-          >
-            <span className="min-w-0 flex-1 text-left">
-              <h2 className="truncate text-[0.75rem] font-medium leading-none">{title}</h2>
-              {channelLabel ? (
+          <TitleMenuTrigger className={channelLabel ? 'h-8 items-center' : undefined}>
+            {channelLabel ? (
+              <span className="block whitespace-normal text-left">
+                <span className="block truncate text-[0.75rem] font-medium leading-none">{title}</span>
                 <span className="mt-0.5 block truncate text-[0.625rem] font-normal leading-none text-(--ui-text-tertiary)">
                   {channelLabel}
                 </span>
-              ) : null}
-            </span>
-            <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="chevron-down" size="0.8125rem" />
-          </Button>
->>>>>>> 9782c39b1 (Refresh on upstream/main: resolve conflicts (no behavior change))
+              </span>
+            ) : (
+              title
+            )}
+          </TitleMenuTrigger>
         </SessionActionsMenu>
       </div>
     </header>
