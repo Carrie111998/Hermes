@@ -168,6 +168,28 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     provider.start(stop_event, interval=interval)
 
 
+def _spawn_gateway_prewarm_subprocess() -> "subprocess.Popen | None":
+    """Warm hermes_cli.gateway's cold-import cost in an isolated subprocess.
+
+    A worker thread shares this process's GIL, so a thread importing the
+    (large) gateway module tree can still stall the event loop while CPython
+    compiles bytecode or Defender scans new .pyc files — that's what caused
+    the #71226 desktop boot loop. A subprocess has its own GIL: it can
+    pre-compile .pyc and warm the OS page cache with zero risk of starving
+    this process's event loop. Best-effort only — if spawning fails, the
+    cold import just happens lazily on first real use (e.g. the first
+    /api/status call) instead. See issue #73830.
+    """
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-c", "import hermes_cli.gateway"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+
+
 def _resolve_restart_drain_timeout() -> float:
     try:
         from hermes_cli.gateway import _get_restart_drain_timeout
@@ -193,6 +215,7 @@ async def _lifespan(app: "FastAPI"):
     # dashboard` is unaffected — it relies on its own gateway.
     cron_stop: "threading.Event | None" = None
     cron_thread: "threading.Thread | None" = None
+    gateway_prewarm_proc: "subprocess.Popen | None" = None
     if os.getenv("HERMES_DESKTOP") == "1":
         cron_stop = threading.Event()
         cron_thread = threading.Thread(
@@ -202,6 +225,13 @@ async def _lifespan(app: "FastAPI"):
             name="desktop-cron-ticker",
         )
         cron_thread.start()
+
+        # Warm hermes_cli.gateway's cold-import cost (.pyc compile + OS page
+        # cache) in an isolated subprocess so the first /api/status call
+        # doesn't have to pay it. Desktop-only: this targets the cold fresh-
+        # Windows-install scenario that caused #71226; gating it here also
+        # keeps it off `hermes serve`/dashboard boots and the test suite.
+        gateway_prewarm_proc = _spawn_gateway_prewarm_subprocess()
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
@@ -223,6 +253,8 @@ async def _lifespan(app: "FastAPI"):
         await PTY_REGISTRY.close_all()
         if cron_stop is not None:
             cron_stop.set()
+        if gateway_prewarm_proc is not None and gateway_prewarm_proc.poll() is None:
+            gateway_prewarm_proc.terminate()
 
 
 def _get_event_state(app: "FastAPI"):
