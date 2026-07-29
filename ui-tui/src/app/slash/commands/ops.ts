@@ -280,6 +280,10 @@ export const opsCommands: SlashCommand[] = [
             const detail = r.reason || r.message || r.restored_to || 'restored'
             ctx.transcript.sys(`rollback restored ${target}: ${detail}`)
 
+            if (r.warning) {
+              ctx.transcript.sys(`⚠️  ${r.warning}`)
+            }
+
             if ((r.history_removed ?? 0) > 0) {
               ctx.transcript.setHistoryItems(prev => ctx.transcript.trimLastExchange(prev))
             }

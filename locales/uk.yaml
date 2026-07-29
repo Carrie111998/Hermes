@@ -277,6 +277,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     none_found:            "Контрольних точок для {cwd} не знайдено"
     invalid_number:        "Недійсний номер контрольної точки. Використовуйте 1-{max}."
     restored:              "✅ Відновлено до контрольної точки {hash}: {reason}\nЗнімок перед відкатом збережено автоматично."
+    restored_no_snapshot:  "✅ Restored to checkpoint {hash}: {reason}\n⚠️  {warning}"
     restore_failed:        "❌ {error}"
 
   diff:

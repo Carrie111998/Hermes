@@ -1,8 +1,11 @@
 from hermes_state import AsyncSessionDB
 """Tests for gateway /usage command — agent cache lookup and output fields."""
 
+import asyncio
 import threading
 from unittest.mock import MagicMock, patch
+
+from gateway.slash_commands import GatewaySlashCommandsMixin
 
 import pytest
 
@@ -376,3 +379,59 @@ class TestUsageContextBreakdown:
         assert "📊 **Session Token Usage**" in result
         assert "50,000" in result  # total tokens
         assert "Context breakdown" not in result
+
+# ---------------------------------------------------------------------------
+# /rollback — a restore that could not take a pre-rollback snapshot must say
+# so.  The default success message states one was saved automatically, so
+# emitting it regardless is the false reassurance the warning exists to stop.
+# ---------------------------------------------------------------------------
+
+
+class _RollbackHarness(GatewaySlashCommandsMixin):
+    """Minimal host for the mixin: the handler needs nothing else."""
+
+
+def _rollback_event():
+    event = MagicMock()
+    event.get_command_args.return_value = "abc1234"
+    return event
+
+
+def _run_rollback(restore_result):
+    harness = _RollbackHarness()
+    mgr = MagicMock()
+    mgr.restore.return_value = restore_result
+
+    cp_kwargs = {
+        "checkpoints_enabled": True,
+        "checkpoint_max_snapshots": 10,
+        "checkpoint_max_total_size_mb": 100,
+        "checkpoint_max_file_size_mb": 10,
+    }
+    with patch("gateway.run._load_gateway_config", return_value={}), \
+         patch("gateway.run._checkpoint_agent_kwargs", return_value=cp_kwargs), \
+         patch("tools.checkpoint_manager.CheckpointManager", return_value=mgr):
+        return asyncio.run(harness._handle_rollback_command(_rollback_event()))
+
+
+def test_rollback_restore_surfaces_missing_snapshot_warning():
+    warning = "Could not take a pre-rollback snapshot before this restore."
+    out = _run_rollback({
+        "success": True,
+        "restored_to": "abc1234",
+        "reason": "before edit",
+        "warning": warning,
+    })
+
+    assert warning in out
+    assert "snapshot was saved automatically" not in out
+
+
+def test_rollback_restore_keeps_the_snapshot_notice_when_one_was_taken():
+    out = _run_rollback({
+        "success": True,
+        "restored_to": "abc1234",
+        "reason": "before edit",
+    })
+
+    assert "snapshot was saved automatically" in out

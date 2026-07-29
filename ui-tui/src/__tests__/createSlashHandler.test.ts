@@ -719,6 +719,38 @@ describe('createSlashHandler', () => {
     expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
   })
 
+  it('surfaces the missing-snapshot warning from /rollback restore', async () => {
+    // A restore that could not take a pre-rollback snapshot cannot be undone
+    // through checkpoint recovery, so the warning has to reach the transcript
+    // rather than being dropped alongside the normal success line.
+    patchUiState({ sid: 'sid-abc' })
+    const warning = 'Could not take a pre-rollback snapshot before this restore.'
+    const rpc = vi.fn(() =>
+      Promise.resolve({ reason: 'before edit', restored_to: 'abc1234', success: true, warning })
+    )
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    createSlashHandler(ctx)('/rollback restore abc1234')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(ctx.transcript.sys).toHaveBeenCalledWith(expect.stringContaining(warning))
+  })
+
+  it('says nothing extra when the pre-rollback snapshot succeeded', async () => {
+    patchUiState({ sid: 'sid-abc' })
+    const rpc = vi.fn(() =>
+      Promise.resolve({ reason: 'before edit', restored_to: 'abc1234', success: true })
+    )
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    createSlashHandler(ctx)('/rollback restore abc1234')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(ctx.transcript.sys).not.toHaveBeenCalledWith(expect.stringContaining('\u26a0'))
+  })
+
   it('hot-swaps the live indicator when /indicator <style> succeeds', async () => {
     const rpc = vi.fn(() => Promise.resolve({ value: 'emoji' }))
     const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
