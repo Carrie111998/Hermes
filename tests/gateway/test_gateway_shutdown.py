@@ -1,4 +1,10 @@
 import asyncio
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -176,6 +182,142 @@ async def test_gateway_stop_systemd_service_restart_uses_tempfail(tmp_path, monk
     # of always).  StartLimitBurst still bounds accidental loops.
     assert runner._exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert (tmp_path / ".restart_pending.json").exists()
+
+
+def test_service_restart_process_exits_75_when_worker_owns_persist_lock(tmp_path):
+    """Process-level regression for the production SIGTERM hang.
+
+    The worker deliberately keeps the real agent persistence RLock for the
+    lifetime of the child. The complete ``GatewayRunner.stop`` path must still
+    tear down, publish its shutdown receipt, and exit with the service-restart
+    status rather than waiting for systemd to SIGKILL it.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    child_code = textwrap.dedent(
+        """
+        import asyncio
+        import json
+        import logging
+        import threading
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+        from tests.gateway.restart_test_helpers import make_restart_runner
+
+        logging.basicConfig(level=logging.WARNING)
+
+        runner, adapter = make_restart_runner()
+        adapter.disconnect = AsyncMock()
+        runner._restart_drain_timeout = 0.0
+        runner._launch_systemd_restart_shortcut = MagicMock()
+
+        class BusyPersistAgent:
+            def __init__(self):
+                self._session_persist_lock = threading.RLock()
+                self._session_messages = [
+                    {"role": "user", "content": "active production-sized turn"}
+                ]
+                self.session_id = "process-e2e-busy-persist"
+                self.flush_calls = 0
+                self.closed = False
+
+            def _flush_messages_to_session_db(self, _messages):
+                self.flush_calls += 1
+                with self._session_persist_lock:
+                    pass
+
+            def _drop_trailing_empty_response_scaffolding(self, _messages):
+                pass
+
+            def interrupt(self, _reason):
+                runner._running_agents.clear()
+
+            def shutdown_memory_provider(self, _messages=None):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        agent = BusyPersistAgent()
+        runner._running_agents = {
+            "agent:main:discord:channel:production": agent
+        }
+        runner.session_store.mark_resume_pending = MagicMock(return_value=True)
+
+        lock_held = threading.Event()
+
+        def hold_persist_lock_forever():
+            with agent._session_persist_lock:
+                lock_held.set()
+                threading.Event().wait()
+
+        holder = threading.Thread(
+            target=hold_persist_lock_forever,
+            name="active-persist-writer",
+            daemon=True,
+        )
+        holder.start()
+        if not lock_held.wait(timeout=2):
+            raise SystemExit("worker failed to acquire persistence lock")
+
+        async def stop_for_service_restart():
+            with (
+                patch("gateway.status.remove_pid_file"),
+                patch("gateway.status.release_gateway_runtime_lock"),
+                patch("gateway.status.write_runtime_status"),
+            ):
+                await runner.stop(
+                    restart=True,
+                    detached_restart=False,
+                    service_restart=True,
+                )
+
+        asyncio.run(stop_for_service_restart())
+        print(json.dumps({
+            "closed": agent.closed,
+            "exit_code": runner._exit_code,
+            "flush_calls": agent.flush_calls,
+            "resume_mark_calls": (
+                runner.session_store.mark_resume_pending.call_count
+            ),
+            "shutdown_event": runner._shutdown_event.is_set(),
+        }))
+        if runner._exit_code != GATEWAY_SERVICE_RESTART_EXIT_CODE:
+            raise SystemExit(1)
+        raise SystemExit(runner._exit_code)
+        """
+    )
+    hermes_home = tmp_path / "hermes-home"
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    env["INVOCATION_ID"] = "shutdown-persist-lock-process-e2e"
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child_code],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=12,
+        check=False,
+    )
+
+    assert completed.returncode == GATEWAY_SERVICE_RESTART_EXIT_CODE, (
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+    output_lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    assert output_lines, completed.stderr
+    receipt = json.loads(output_lines[-1])
+    assert receipt == {
+        "closed": True,
+        "exit_code": GATEWAY_SERVICE_RESTART_EXIT_CODE,
+        "flush_calls": 0,
+        "resume_mark_calls": 1,
+        "shutdown_event": True,
+    }
+    assert "reason=persist_lock_busy writer=active_worker" in completed.stderr
+    assert (hermes_home / ".restart_pending.json").exists()
+    assert not (hermes_home / ".clean_shutdown").exists()
 
 
 @pytest.mark.asyncio

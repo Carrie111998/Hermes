@@ -8490,22 +8490,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
-        for agent in active_agents.values():
+        for session_key, agent in active_agents.items():
             # Persist any in-flight transcript to the SQLite session store
-            # before teardown (#13121).  An agent forcibly interrupted by the
-            # drain-timeout escalation may never reach
-            # ``turn_finalizer.finalize_turn`` (the only place that flushes the
-            # turn to state.db) — e.g. it was blocked in a tool call that did
-            # not abort within the post-interrupt grace window.  Its in-flight
-            # tool rounds live only in the in-memory ``_session_messages``
-            # (refreshed per tool round in ``conversation_loop`` but never
-            # written to SQLite mid-turn), so the immediate pre-restart turn is
-            # silently dropped from ``load_transcript()`` on resume.  Flushing
-            # here closes that gap; the resume_pending / fresh-tool-tail
-            # branches in ``_handle_message_with_agent`` already expect a
-            # transcript whose tail may be a pending tool result.  The flush is
-            # idempotent (identity-tracked in ``_flush_messages_to_session_db``),
-            # so agents that DID finish gracefully re-flush nothing.
+            # before teardown (#13121). Most tool-loop boundaries are persisted
+            # incrementally, but a forcibly interrupted worker can still own an
+            # unflushed tail. This final safety-net flush is idempotent, so an
+            # agent that already finished re-flushes nothing.
+            #
+            # Never wait for the agent-wide persistence RLock here. A worker
+            # that still owns it after the drain + interrupt grace is already
+            # the authoritative transcript writer. Waiting synchronously from
+            # the asyncio thread freezes every remaining shutdown phase,
+            # including adapter teardown, SessionDB close, and the planned
+            # service-restart exit. Instead, leave that worker as the sole
+            # writer and continue bounded teardown; resume_pending durability
+            # was attempted before entering the drain.
             try:
                 _flush = getattr(agent, "_flush_messages_to_session_db", None)
                 _session_messages = getattr(agent, "_session_messages", None)
@@ -8514,19 +8513,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and isinstance(_session_messages, list)
                     and _session_messages
                 ):
-                    # Strip private empty-response retry scaffolding from the
-                    # tail first, mirroring the graceful ``_persist_session``
-                    # path, so a resumed turn doesn't replay synthetic recovery
-                    # nudges.
-                    _strip = getattr(
-                        agent, "_drop_trailing_empty_response_scaffolding", None
-                    )
-                    if callable(_strip):
+                    _persist_lock = getattr(agent, "_session_persist_lock", None)
+                    _persist_lock_acquired = False
+                    _skip_flush_reason = None
+                    if _persist_lock is not None:
                         try:
-                            _strip(_session_messages)
+                            _persist_lock_acquired = bool(
+                                _persist_lock.acquire(blocking=False)
+                            )
                         except Exception:
-                            pass
-                    _flush(_session_messages)
+                            _skip_flush_reason = "persist_lock_probe_failed"
+                        if _skip_flush_reason is None and not _persist_lock_acquired:
+                            _skip_flush_reason = "persist_lock_busy"
+
+                    if _skip_flush_reason is not None:
+                        logger.warning(
+                            "Shutdown transcript flush skipped: "
+                            "session=%s messages=%d reason=%s "
+                            "writer=active_worker "
+                            "recovery=pre_drain_resume_pending; "
+                            "continuing bounded teardown",
+                            getattr(agent, "session_id", None) or session_key,
+                            len(_session_messages),
+                            _skip_flush_reason,
+                        )
+                    else:
+                        try:
+                            # Strip private empty-response retry scaffolding
+                            # from the tail first, mirroring the graceful
+                            # ``_persist_session`` path, so a resumed turn
+                            # doesn't replay synthetic recovery nudges.
+                            _strip = getattr(
+                                agent,
+                                "_drop_trailing_empty_response_scaffolding",
+                                None,
+                            )
+                            if callable(_strip):
+                                try:
+                                    _strip(_session_messages)
+                                except Exception:
+                                    pass
+                            _flush(_session_messages)
+                        finally:
+                            if _persist_lock_acquired:
+                                _persist_lock.release()
             except Exception as _e:
                 logger.debug("Shutdown transcript flush failed: %s", _e)
             try:
@@ -11629,18 +11659,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If the process is killed by the service manager during the
             # drain, the durable marker is already written so the next
             # gateway boot can recover in-flight sessions (#27856).
-            _pre_drain_keys: list[str] = []
+            _pre_drain_marked_agents: dict[str, Any] = {}
             for _sk, _agent in list(self._running_agents.items()):
                 if _agent is _AGENT_PENDING_SENTINEL:
                     continue
                 try:
-                    await self.async_session_store.mark_resume_pending(
+                    _marked = await self.async_session_store.mark_resume_pending(
                         _sk,
                         "restart_timeout"
                         if self._restart_requested
                         else "shutdown_timeout",
                     )
-                    _pre_drain_keys.append(_sk)
+                    if _marked:
+                        _pre_drain_marked_agents[_sk] = _agent
                 except Exception as _e:
                     logger.debug(
                         "pre-drain mark_resume_pending failed for %s: %s", _sk, _e
@@ -11670,7 +11701,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Drain completed gracefully — all running sessions finished.
                 # Clear the pre-drain resume_pending markers so sessions that
                 # completed during the drain window don't carry a stale flag.
-                for _sk in _pre_drain_keys:
+                for _sk in _pre_drain_marked_agents:
                     if _sk not in self._running_agents:
                         try:
                             await self.async_session_store.clear_resume_pending(_sk)
@@ -11717,6 +11748,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 for _sk, _agent in list(self._running_agents.items()):
                     if _agent is _AGENT_PENDING_SENTINEL:
+                        continue
+                    # A successful pre-drain write is already the durable
+                    # recovery receipt. Repeating it here can spend the
+                    # service manager's remaining shutdown budget waiting on
+                    # the same contended state.db. Retry only failed marks or
+                    # an ABA replacement agent that rebound the same key.
+                    if _pre_drain_marked_agents.get(_sk) is _agent:
                         continue
                     try:
                         await self.async_session_store.mark_resume_pending(

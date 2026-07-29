@@ -2,12 +2,11 @@
 in-flight (interrupted) turn's transcript to the SQLite session store so the
 immediate pre-restart context survives ``load_transcript()`` on resume.
 
-The bug: every normal/graceful turn exit funnels through
-``turn_finalizer.finalize_turn`` which calls ``_persist_session`` →
-``_flush_messages_to_session_db`` (the only place a turn is written to
-state.db).  During the tool loop only the *in-memory* ``_session_messages``
-reference is refreshed per round — there is no incremental SQLite flush
-mid-turn.
+The original bug predated incremental tool-loop persistence: a normal turn
+exit flushed through ``turn_finalizer.finalize_turn``, while a forcibly
+interrupted tail could remain only in the live ``_session_messages`` list.
+Incremental persistence now protects most tool boundaries, but shutdown still
+needs the final safety-net flush for any unflushed response tail.
 
 When the gateway drain times out it marks the session ``resume_pending``,
 interrupts the running agents, waits a short grace window, then tears them
@@ -24,16 +23,17 @@ The fix flushes ``_session_messages`` to the session DB in
 (identity-tracked in ``_flush_messages_to_session_db``), so agents that DID
 finish gracefully re-flush nothing.
 
-These tests exercise BOTH a lightweight unit path (the flush hook is invoked
-with the in-flight messages) AND a true E2E path (a real ``AIAgent`` flush
-against a real ``SessionDB`` in a temp ``HERMES_HOME``, read back through the
-real ``SessionStore.load_transcript``).
+These tests exercise the lightweight flush/lock behavior and a true E2E path
+(a real ``AIAgent`` flush against a real ``SessionDB`` in a temp
+``HERMES_HOME``, read back through the real ``SessionStore.load_transcript``).
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
+import threading
 import types
 from unittest.mock import MagicMock
 
@@ -100,12 +100,75 @@ class TestFinalizeShutdownFlushesInflightTranscript:
             {"role": "tool", "tool_call_id": "c1", "content": "huge output..."},
         ]
         agent = _FakeAgent(session_messages=inflight)
+        agent._session_persist_lock = threading.RLock()
 
         _finalize(runner, {"agent:main:discord:dm:42": agent})
 
         agent._flush_messages_to_session_db.assert_called_once_with(inflight)
+        # The finalizer's nonblocking claim is always released.
+        assert agent._session_persist_lock.acquire(blocking=False)
+        agent._session_persist_lock.release()
         # Cleanup still happens after the flush.
         agent.close.assert_called_once()
+
+    def test_busy_persist_lock_skips_flush_without_blocking_teardown(self, caplog):
+        """An active worker already persisting the transcript remains the sole
+        writer; shutdown must not wait on its agent-wide persistence lock."""
+        runner = _make_runner()
+        agent = _FakeAgent(
+            session_messages=[{"role": "user", "content": "large active turn"}]
+        )
+        agent._session_persist_lock = threading.RLock()
+
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def _hold_persist_lock():
+            with agent._session_persist_lock:
+                lock_held.set()
+                release_lock.wait(timeout=10)
+
+        holder = threading.Thread(target=_hold_persist_lock, daemon=True)
+        holder.start()
+        assert lock_held.wait(timeout=2), "worker failed to claim persistence lock"
+
+        # Model the real AIAgent wrapper: before the fix this call blocks on
+        # the same RLock the worker owns.
+        def _blocking_flush(_messages):
+            with agent._session_persist_lock:
+                pass
+
+        agent._flush_messages_to_session_db.side_effect = _blocking_flush
+
+        finalized = threading.Event()
+        finalize_errors = []
+
+        def _run_finalize():
+            try:
+                _finalize(runner, {"agent:main:discord:dm:42": agent})
+            except BaseException as exc:  # pragma: no cover - assertion aid
+                finalize_errors.append(exc)
+            finally:
+                finalized.set()
+
+        finalizer = threading.Thread(target=_run_finalize, daemon=True)
+        try:
+            with caplog.at_level(logging.WARNING, logger="gateway.run"):
+                finalizer.start()
+                completed_while_worker_owned_lock = finalized.wait(timeout=2)
+        finally:
+            release_lock.set()
+            holder.join(timeout=2)
+            finalizer.join(timeout=2)
+
+        assert completed_while_worker_owned_lock is True
+        assert finalize_errors == []
+        assert not holder.is_alive()
+        assert not finalizer.is_alive()
+        agent._flush_messages_to_session_db.assert_not_called()
+        agent.close.assert_called_once()
+        assert "Shutdown transcript flush skipped" in caplog.text
+        assert "reason=persist_lock_busy writer=active_worker" in caplog.text
 
     def test_empty_session_messages_not_flushed(self):
         """An agent that ran no turns (empty list) triggers no flush — there
@@ -190,6 +253,7 @@ class TestShutdownTranscriptSurvivesResumeE2E:
         agent.session_id = session_id
         agent.platform = "discord"
         agent._session_messages = session_messages
+        agent._session_persist_lock = threading.RLock()
         # Model a real agent: turn 1 already flushed, so its message identities
         # are recorded in the dedup set. Only the in-flight turn-2 tail is new.
         agent._last_flushed_db_idx = len(prior_history)
@@ -243,6 +307,7 @@ class TestShutdownTranscriptSurvivesResumeE2E:
         agent.session_id = session_id
         agent.platform = "discord"
         agent._session_messages = msgs
+        agent._session_persist_lock = threading.RLock()
         agent._last_flushed_db_idx = 0
         agent._flushed_db_message_ids = set()
         agent._flushed_db_message_session_id = None

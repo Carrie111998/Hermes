@@ -1307,10 +1307,74 @@ async def test_drain_timeout_marks_resume_pending():
 
     # Both active sessions were marked with the shutdown_timeout reason.
     calls = session_store.mark_resume_pending.call_args_list
+    # A successful pre-drain marker is already the durable recovery receipt;
+    # do not repeat the same potentially-contended state.db write at timeout.
+    assert len(calls) == 2
     marked = {args[0][0] for args in calls}
     assert marked == {session_key_one, session_key_two}
     for args in calls:
         assert args[0][1] == "shutdown_timeout"
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_retries_failed_pre_drain_resume_mark():
+    """If the early durable mark failed, the timeout escalation gets one
+    final retry before interrupting the worker."""
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._restart_drain_timeout = 0.05
+
+    session_key = "agent:main:telegram:dm:A"
+    runner._running_agents = {session_key: MagicMock()}
+
+    session_store = MagicMock()
+    session_store.mark_resume_pending = MagicMock(side_effect=[False, True])
+    runner.session_store = session_store
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+
+    assert session_store.mark_resume_pending.call_args_list == [
+        ((session_key, "shutdown_timeout"),),
+        ((session_key, "shutdown_timeout"),),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_marks_replacement_agent_on_same_session_key():
+    """A successful receipt belongs to the agent observed before the drain;
+    a replacement bound to the same key must receive a fresh timeout mark."""
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._restart_drain_timeout = 0.05
+
+    session_key = "agent:main:telegram:dm:A"
+    original_agent = MagicMock()
+    replacement_agent = MagicMock()
+    replacement_agent.interrupt.side_effect = (
+        lambda _reason: runner._running_agents.clear()
+    )
+    runner._running_agents = {session_key: original_agent}
+
+    session_store = MagicMock()
+    session_store.mark_resume_pending = MagicMock(return_value=True)
+    runner.session_store = session_store
+
+    async def replace_during_drain():
+        await asyncio.sleep(0.01)
+        runner._running_agents[session_key] = replacement_agent
+
+    replacement_task = asyncio.create_task(replace_during_drain())
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+    await replacement_task
+
+    assert session_store.mark_resume_pending.call_count == 2
+    replacement_agent.interrupt.assert_called_once()
 
 
 @pytest.mark.asyncio
