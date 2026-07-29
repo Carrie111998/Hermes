@@ -53,7 +53,7 @@ def test_signed_publication_deterministically_defines_transaction_identity() -> 
     assert first_intent == replayed_intent
     assert first_record == replayed_record
     assert first_record["intent"] == first_intent
-    assert first_intent["schema"] == "muncho-production-release-update-intent.v3"
+    assert first_intent["schema"] == "muncho-production-release-update-intent.v4"
     assert first_intent["transaction_nonce_sha256"] == approval["nonce_sha256"]
     assert first_intent["created_at_unix"] == approval["issued_at_unix"]
     assert first_intent["created_at_unix"] == first_intent["approval_issued_at_unix"]
@@ -173,6 +173,14 @@ def _phase_evidence(
             ],
             "prepared_unit_input_set_sha256": _digest("prepared-unit-input-set"),
             "prepared_unit_input_count": 3,
+            "unit_input_rotation_transaction_sha256": _digest(
+                "unit-input-rotation-transaction"
+            ),
+            "unit_input_prepared_receipt_sha256": _digest(
+                "unit-input-prepared-receipt"
+            ),
+            "predecessor_unit_inputs_revision": predecessor,
+            "successor_unit_inputs_revision": release,
             "active_inputs_unchanged": True,
         }
     if phase == "recovery_gate_installed":
@@ -272,19 +280,97 @@ def _phase_evidence(
             "external_ingress_disabled": True,
             "all_required_health_checks_passed": True,
         }
-    if phase == "unit_inputs_finalized":
+    if phase == runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE:
         prepared = receipts["unit_inputs_prepared"]
         return {
             "unit_input_publication_sha256": intent[
                 "successor_unit_input_publication_sha256"
             ],
+            "unit_input_rotation_transaction_sha256": prepared[
+                "unit_input_rotation_transaction_sha256"
+            ],
+            "unit_input_prepared_receipt_sha256": prepared[
+                "unit_input_prepared_receipt_sha256"
+            ],
+            "unit_input_preauthorization_receipt_sha256": _digest(
+                "unit-input-preauthorization"
+            ),
+            "unit_input_abort_receipt_sha256": runtime.ZERO_SHA256,
+            "unit_input_activation_begin_sha256": runtime.ZERO_SHA256,
+            "predecessor_unit_inputs_revision": predecessor,
+            "successor_unit_inputs_revision": release,
+            "observed_unit_inputs_revision": predecessor,
+            "preauthorization_persisted": True,
+            "authoritative_inputs_unchanged": True,
+        }
+    if phase == "unit_inputs_finalized":
+        prepared = receipts["unit_inputs_prepared"]
+        preauthorization = receipts[
+            runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE
+        ]
+        return {
+            "unit_input_publication_sha256": intent[
+                "successor_unit_input_publication_sha256"
+            ],
             "unit_input_activation_receipt_sha256": _digest("unit-input-activation"),
+            "unit_input_activation_begin_sha256": _digest(
+                "unit-input-activation-begin"
+            ),
+            "unit_input_rotation_transaction_sha256": prepared[
+                "unit_input_rotation_transaction_sha256"
+            ],
+            "unit_input_prepared_receipt_sha256": prepared[
+                "unit_input_prepared_receipt_sha256"
+            ],
+            "unit_input_preauthorization_receipt_sha256": preauthorization[
+                "unit_input_preauthorization_receipt_sha256"
+            ],
+            "unit_input_abort_receipt_sha256": runtime.ZERO_SHA256,
             "finalized_unit_input_set_sha256": prepared[
                 "prepared_unit_input_set_sha256"
             ],
             "finalized_unit_input_count": prepared["prepared_unit_input_count"],
+            "predecessor_unit_inputs_revision": predecessor,
+            "successor_unit_inputs_revision": release,
             "observed_unit_inputs_revision": release,
             "authoritative_inputs_active": True,
+        }
+    if phase == runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE:
+        prepared = receipts["unit_inputs_prepared"]
+        preauthorization = receipts.get(
+            runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE
+        )
+        persisted = isinstance(preauthorization, Mapping)
+        return {
+            "unit_input_publication_sha256": intent[
+                "successor_unit_input_publication_sha256"
+            ],
+            "unit_input_rotation_transaction_sha256": prepared[
+                "unit_input_rotation_transaction_sha256"
+            ],
+            "unit_input_prepared_receipt_sha256": prepared[
+                "unit_input_prepared_receipt_sha256"
+            ],
+            "unit_input_preauthorization_receipt_sha256": (
+                preauthorization[
+                    "unit_input_preauthorization_receipt_sha256"
+                ]
+                if persisted
+                else runtime.ZERO_SHA256
+            ),
+            "unit_input_abort_receipt_sha256": (
+                _digest("unit-input-preauthorization-abort")
+                if persisted
+                else runtime.ZERO_SHA256
+            ),
+            "unit_input_activation_begin_sha256": runtime.ZERO_SHA256,
+            "predecessor_unit_inputs_revision": predecessor,
+            "successor_unit_inputs_revision": release,
+            "observed_unit_inputs_revision": predecessor,
+            "preauthorization_persisted": persisted,
+            "abort_persisted": persisted,
+            "preauthorization_terminal": True,
+            "authoritative_inputs_unchanged": True,
         }
     if phase == "release_pointer_rotated":
         return {
@@ -426,7 +512,7 @@ def _valid_action_receipt(
     receipts: Mapping[str, Mapping[str, Any]],
 ) -> Mapping[str, Any]:
     return {
-        "schema": (f"muncho-production-release-update-{phase}-receipt.v1"),
+        "schema": runtime.action_receipt_schema(phase),
         "phase": phase,
         "intent_sha256": intent["intent_sha256"],
         "publication_sha256": intent["publication_sha256"],
@@ -563,6 +649,71 @@ class FakeActions:
         return receipt
 
 
+class DurablePreauthorizationActions(FakeActions):
+    """Model the unit-input primitive independently of runtime event writes."""
+
+    def __init__(
+        self,
+        *,
+        preauthorized: bool = False,
+        activation_begin_persisted: bool = False,
+    ) -> None:
+        super().__init__()
+        self.preauthorized = preauthorized
+        self.activation_begin_persisted = activation_begin_persisted
+        self.preauthorization_sha256 = _digest(
+            "unit-input-preauthorization"
+        )
+        self.abort_sha256 = _digest("unit-input-preauthorization-abort")
+
+    def perform(
+        self,
+        phase: str,
+        *,
+        intent: Mapping[str, Any],
+        receipts: Mapping[str, Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        if phase == runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE:
+            receipt = dict(
+                super().perform(
+                    phase,
+                    intent=intent,
+                    receipts=receipts,
+                )
+            )
+            self.preauthorized = True
+            self.preauthorization_sha256 = str(
+                receipt["unit_input_preauthorization_receipt_sha256"]
+            )
+            return receipt
+        if phase == runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE:
+            self.calls.append(phase)
+            if self.activation_begin_persisted:
+                raise RuntimeError("activation begin forbids cancellation")
+            receipt = dict(
+                _valid_action_receipt(
+                    phase,
+                    intent=intent,
+                    receipts=receipts,
+                )
+            )
+            if self.preauthorized:
+                receipt.update({
+                    "unit_input_preauthorization_receipt_sha256": (
+                        self.preauthorization_sha256
+                    ),
+                    "unit_input_abort_receipt_sha256": self.abort_sha256,
+                    "preauthorization_persisted": True,
+                    "abort_persisted": True,
+                })
+            return receipt
+        return super().perform(
+            phase,
+            intent=intent,
+            receipts=receipts,
+        )
+
+
 def _phases(journal: MemoryJournal) -> list[str]:
     return [str(item["phase"]) for item in journal.events]
 
@@ -648,7 +799,7 @@ def _action_receipt_contexts() -> Mapping[str, Mapping[str, Mapping[str, Any]]]:
                 intent=intent,
             )
         rollback_receipts[phase] = receipt
-    for phase in runtime.ROLLBACK_PHASES:
+    for phase in runtime.PREAUTHORIZED_ROLLBACK_PHASES:
         if phase in runtime.ACTION_PHASES:
             contexts[phase] = deepcopy(rollback_receipts)
             receipt = _valid_action_receipt(
@@ -725,6 +876,11 @@ def test_forward_transaction_persists_exact_order_and_completes() -> None:
         _phases(journal).index("host_payloads_applied")
     )
     assert _phases(journal).index("target_health_validated") < (
+        _phases(journal).index(runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE)
+    )
+    assert _phases(journal).index(
+        runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE
+    ) < (
         _phases(journal).index(runtime.COMMIT_PHASE)
     )
     assert _phases(journal).index(runtime.COMMIT_PHASE) < (
@@ -761,7 +917,7 @@ def test_every_action_receipt_phase_has_exact_semantic_contract() -> None:
 def test_generic_ok_receipt_is_rejected_for_every_action_phase() -> None:
     for phase, receipts in _action_receipt_contexts().items():
         generic = {
-            "schema": (f"muncho-production-release-update-{phase}-receipt.v1"),
+            "schema": runtime.action_receipt_schema(phase),
             "phase": phase,
             "intent_sha256": _intent()["intent_sha256"],
             "publication_sha256": _intent()["publication_sha256"],
@@ -788,6 +944,37 @@ def test_generic_ok_receipt_is_rejected_for_every_action_phase() -> None:
                 phase=phase,
                 receipts=receipts,
             )
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ("unit_inputs_prepared", "unit_inputs_finalized"),
+)
+def test_changed_action_receipt_contracts_reject_legacy_v1_schema(
+    phase: str,
+) -> None:
+    receipts = _action_receipt_contexts()[phase]
+    receipt = {
+        **_valid_action_receipt(
+            phase,
+            intent=_intent(),
+            receipts=receipts,
+        ),
+        "schema": (
+            f"muncho-production-release-update-{phase}-receipt.v1"
+        ),
+    }
+
+    with pytest.raises(
+        runtime.ProductionReleaseUpdateRuntimeError,
+        match="release_update_runtime_action_receipt_invalid",
+    ):
+        runtime._validate_bound_action_receipt(
+            receipt,
+            intent=_intent(),
+            phase=phase,
+            receipts=receipts,
+        )
 
 
 def test_action_receipts_reject_missing_extra_and_stale_context() -> None:
@@ -842,8 +1029,43 @@ def test_action_receipts_reject_missing_extra_and_stale_context() -> None:
             "f" * 64,
         ),
         (
+            "unit_inputs_prepared",
+            "unit_input_rotation_transaction_sha256",
+            runtime.ZERO_SHA256,
+        ),
+        (
+            "unit_inputs_prepared",
+            "unit_input_prepared_receipt_sha256",
+            runtime.ZERO_SHA256,
+        ),
+        (
+            "unit_inputs_prepared",
+            "prepared_unit_input_set_sha256",
+            runtime.ZERO_SHA256,
+        ),
+        (
+            "unit_inputs_finalize_preauthorized",
+            "unit_input_rotation_transaction_sha256",
+            runtime.ZERO_SHA256,
+        ),
+        (
+            "unit_inputs_finalize_preauthorization_cancelled",
+            "unit_input_prepared_receipt_sha256",
+            runtime.ZERO_SHA256,
+        ),
+        (
+            "unit_inputs_finalize_preauthorization_cancelled",
+            "unit_input_activation_begin_sha256",
+            "f" * 64,
+        ),
+        (
             "unit_inputs_finalized",
-            "finalized_unit_input_set_sha256",
+            "unit_input_rotation_transaction_sha256",
+            runtime.ZERO_SHA256,
+        ),
+        (
+            "unit_inputs_finalized",
+            "unit_input_preauthorization_receipt_sha256",
             "f" * 64,
         ),
         (
@@ -1072,6 +1294,214 @@ def test_first_mutation_action_write_gap_is_covered_by_write_ahead_intent() -> N
     assert _phases(journal)[-len(runtime.ROLLBACK_PHASES) :] == list(
         runtime.ROLLBACK_PHASES
     )
+
+
+def test_lost_preauthorization_event_is_cancelled_before_host_restore() -> None:
+    journal = MemoryJournal(
+        fail_append_phase=runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE
+    )
+    actions = DurablePreauthorizationActions()
+
+    state = _execute(actions=actions, journal=journal)
+
+    assert state.terminal_phase == "rolled_back"
+    assert runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE in actions.calls
+    assert runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE not in _phases(journal)
+    assert _phases(journal)[-len(runtime.PREAUTHORIZED_ROLLBACK_PHASES) :] == (
+        list(runtime.PREAUTHORIZED_ROLLBACK_PHASES)
+    )
+    assert actions.calls.index(
+        runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+    ) < actions.calls.index("target_stopped")
+    cancelled = state.receipts[
+        runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+    ]
+    assert cancelled["preauthorization_persisted"] is True
+    assert cancelled["abort_persisted"] is True
+    assert (
+        cancelled["unit_input_preauthorization_receipt_sha256"]
+        == actions.preauthorization_sha256
+    )
+    assert (
+        cancelled["unit_input_activation_begin_sha256"]
+        == runtime.ZERO_SHA256
+    )
+
+
+def test_post_health_rollback_reconciles_absent_preauthorization() -> None:
+    journal = _forward_prefix("target_health_validated")
+    actions = DurablePreauthorizationActions()
+
+    state = _recover(
+        actions=actions,
+        journal=journal,
+        now_unix=NOW + 1,
+    )
+
+    assert state.terminal_phase == "rolled_back"
+    cancelled = state.receipts[
+        runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+    ]
+    assert cancelled["preauthorization_persisted"] is False
+    assert cancelled["abort_persisted"] is False
+    assert (
+        cancelled["unit_input_preauthorization_receipt_sha256"]
+        == runtime.ZERO_SHA256
+    )
+    assert (
+        cancelled["unit_input_abort_receipt_sha256"]
+        == runtime.ZERO_SHA256
+    )
+
+
+def test_recovery_cancels_journaled_preauthorization_before_commit() -> None:
+    journal = _forward_prefix(
+        runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE
+    )
+    actions = DurablePreauthorizationActions(preauthorized=True)
+
+    state = _recover(
+        actions=actions,
+        journal=journal,
+        now_unix=NOW + 1,
+    )
+
+    assert state.terminal_phase == "rolled_back"
+    assert _phases(journal)[-len(runtime.PREAUTHORIZED_ROLLBACK_PHASES) :] == (
+        list(runtime.PREAUTHORIZED_ROLLBACK_PHASES)
+    )
+    cancelled = state.receipts[
+        runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+    ]
+    preauthorized = state.receipts[
+        runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE
+    ]
+    assert (
+        cancelled["unit_input_preauthorization_receipt_sha256"]
+        == preauthorized["unit_input_preauthorization_receipt_sha256"]
+    )
+    assert actions.calls.index(
+        runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+    ) < actions.calls.index("target_stopped")
+
+
+def test_cancel_receipt_append_replays_exactly_before_target_stop() -> None:
+    journal = _forward_prefix("target_health_validated")
+    journal.fail_append_phase = (
+        runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+    )
+    actions = DurablePreauthorizationActions()
+
+    with pytest.raises(
+        runtime.ProductionReleaseUpdateRuntimeError,
+        match="release_update_runtime_rollback_pending",
+    ):
+        _execute(
+            actions=actions,
+            journal=journal,
+            now_unix=NOW + 1,
+        )
+
+    assert _phases(journal)[-1] == "rollback_intent"
+    assert "target_stopped" not in actions.calls
+
+    state = _recover(
+        actions=actions,
+        journal=journal,
+        now_unix=NOW + 2,
+    )
+
+    assert state.terminal_phase == "rolled_back"
+    assert actions.calls.count(
+        runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+    ) == 2
+    assert _phases(journal)[-len(runtime.PREAUTHORIZED_ROLLBACK_PHASES) :] == (
+        list(runtime.PREAUTHORIZED_ROLLBACK_PHASES)
+    )
+
+
+def test_activation_begin_refuses_cancellation_and_blocks_host_restore() -> None:
+    journal = _forward_prefix("target_health_validated")
+    actions = DurablePreauthorizationActions(
+        preauthorized=True,
+        activation_begin_persisted=True,
+    )
+
+    with pytest.raises(
+        runtime.ProductionReleaseUpdateRuntimeError,
+        match="release_update_runtime_rollback_pending",
+    ):
+        _recover(
+            actions=actions,
+            journal=journal,
+            now_unix=NOW + 1,
+        )
+
+    assert _phases(journal)[-1] == "rollback_intent"
+    assert actions.calls == [
+        runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+    ]
+    assert "target_stopped" not in _phases(journal)
+
+
+def test_finalization_path_never_reads_clock_after_preauthorization() -> None:
+    journal = MemoryJournal()
+    actions = FakeActions()
+    observed_calls: list[tuple[str, ...]] = []
+
+    def observed_now() -> int:
+        phases = tuple(_phases(journal))
+        observed_calls.append(phases)
+        if runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE in phases:
+            raise AssertionError("post-preauthorization clock read")
+        return NOW
+
+    with patch.object(runtime.time, "time", side_effect=observed_now):
+        state = runtime._execute_update_for_test(
+            authority_record=_authority_record(),
+            actions=actions,
+            journal=journal,
+            lock_factory=nullcontext,
+        )
+
+    assert state.terminal_phase == "completed"
+    assert _phases(journal) == list(runtime.FORWARD_PHASES)
+    assert observed_calls
+    assert all(
+        runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE not in phases
+        for phases in observed_calls
+    )
+
+
+def test_post_health_journal_cannot_skip_cancellation_during_rollback() -> None:
+    journal = _forward_prefix("target_health_validated")
+    intent = _intent()
+    receipts = runtime.load_state(
+        intent=intent,
+        events=journal.load(),
+    ).receipts
+    for phase in ("rollback_intent", "target_stopped"):
+        receipt = _receipt_for_phase(
+            intent,
+            phase,
+            receipts=receipts,
+        )
+        event = runtime.build_event(
+            intent=intent,
+            sequence=len(journal.events),
+            phase=phase,
+            prior_event_sha256=str(journal.events[-1]["event_sha256"]),
+            receipt=receipt,
+            created_at_unix=NOW,
+        )
+        journal.events.append(event)
+        receipts = {**receipts, phase: receipt}
+
+    with pytest.raises(
+        runtime.ProductionReleaseUpdateRuntimeError,
+        match="release_update_runtime_journal_invalid",
+    ):
+        runtime.load_state(intent=intent, events=journal.load())
 
 
 def test_terminal_exact_replay_revalidates_live_state() -> None:

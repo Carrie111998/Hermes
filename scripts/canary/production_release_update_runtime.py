@@ -20,9 +20,9 @@ from scripts.canary import production_cutover_activation_lock as authority_lock
 from scripts.canary import production_release_update_contract as authority
 
 
-INTENT_SCHEMA = "muncho-production-release-update-intent.v3"
-AUTHORITY_RECORD_SCHEMA = "muncho-production-release-update-authority-record.v1"
-EVENT_SCHEMA = "muncho-production-release-update-event.v1"
+INTENT_SCHEMA = "muncho-production-release-update-intent.v4"
+AUTHORITY_RECORD_SCHEMA = "muncho-production-release-update-authority-record.v2"
+EVENT_SCHEMA = "muncho-production-release-update-event.v2"
 ZERO_SHA256 = "0" * 64
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -41,6 +41,7 @@ FORWARD_PHASES = (
     "host_payloads_applied",
     "target_started_disabled",
     "target_health_validated",
+    "unit_inputs_finalize_preauthorized",
     "activation_commit_intent",
     "unit_inputs_finalized",
     "release_pointer_rotated",
@@ -56,10 +57,20 @@ ROLLBACK_PHASES = (
     "rollback_validated",
     "rolled_back",
 )
+PREAUTHORIZED_ROLLBACK_PHASES = (
+    "rollback_intent",
+    "unit_inputs_finalize_preauthorization_cancelled",
+    *ROLLBACK_PHASES[1:],
+)
 ABORT_PHASES = (
     "approval_expired_abort_intent",
     "preapplication_cleanup",
     "aborted",
+)
+TRANSACTION_PHASES = frozenset(
+    set(FORWARD_PHASES)
+    | set(PREAUTHORIZED_ROLLBACK_PHASES)
+    | set(ABORT_PHASES)
 )
 ACTION_PHASES = frozenset(
     set(FORWARD_PHASES)
@@ -68,7 +79,7 @@ ACTION_PHASES = frozenset(
         "activation_commit_intent",
         "completed",
     }
-    | set(ROLLBACK_PHASES) - {"rollback_intent", "rolled_back"}
+    | set(PREAUTHORIZED_ROLLBACK_PHASES) - {"rollback_intent", "rolled_back"}
     | {"preapplication_cleanup"}
 )
 REVALIDATION_PHASES = frozenset({
@@ -78,7 +89,16 @@ REVALIDATION_PHASES = frozenset({
     "pre_mutation_cas_revalidated",
 })
 ACTION_RECEIPT_PHASES = ACTION_PHASES | REVALIDATION_PHASES
+_ACTION_RECEIPT_SCHEMA_VERSIONS: Mapping[str, int] = {
+    "unit_inputs_prepared": 2,
+    "unit_inputs_finalized": 2,
+}
 COMMIT_PHASE = "activation_commit_intent"
+UNIT_INPUT_PREAUTHORIZATION_PHASE = "unit_inputs_finalize_preauthorized"
+UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE = (
+    "unit_inputs_finalize_preauthorization_cancelled"
+)
+UNIT_INPUT_PREAUTHORIZATION_DISCRIMINATOR_PHASE = "target_health_validated"
 FIRST_APPLICATION_MUTATION_PHASE = "application_mutation_intent"
 TERMINAL_PHASES = frozenset({"completed", "rolled_back", "aborted"})
 EXPECTED_CONSUMER_UNIT_COUNT = 63
@@ -152,6 +172,10 @@ _ACTION_RECEIPT_EVIDENCE_FIELDS: Mapping[str, frozenset[str]] = {
         "prepared_unit_input_publication_sha256",
         "prepared_unit_input_set_sha256",
         "prepared_unit_input_count",
+        "unit_input_rotation_transaction_sha256",
+        "unit_input_prepared_receipt_sha256",
+        "predecessor_unit_inputs_revision",
+        "successor_unit_inputs_revision",
         "active_inputs_unchanged",
     }),
     "recovery_gate_installed": frozenset({
@@ -216,11 +240,31 @@ _ACTION_RECEIPT_EVIDENCE_FIELDS: Mapping[str, frozenset[str]] = {
         "external_ingress_disabled",
         "all_required_health_checks_passed",
     }),
+    "unit_inputs_finalize_preauthorized": frozenset({
+        "unit_input_publication_sha256",
+        "unit_input_rotation_transaction_sha256",
+        "unit_input_prepared_receipt_sha256",
+        "unit_input_preauthorization_receipt_sha256",
+        "unit_input_abort_receipt_sha256",
+        "unit_input_activation_begin_sha256",
+        "predecessor_unit_inputs_revision",
+        "successor_unit_inputs_revision",
+        "observed_unit_inputs_revision",
+        "preauthorization_persisted",
+        "authoritative_inputs_unchanged",
+    }),
     "unit_inputs_finalized": frozenset({
         "unit_input_publication_sha256",
         "unit_input_activation_receipt_sha256",
+        "unit_input_activation_begin_sha256",
+        "unit_input_rotation_transaction_sha256",
+        "unit_input_prepared_receipt_sha256",
+        "unit_input_preauthorization_receipt_sha256",
+        "unit_input_abort_receipt_sha256",
         "finalized_unit_input_set_sha256",
         "finalized_unit_input_count",
+        "predecessor_unit_inputs_revision",
+        "successor_unit_inputs_revision",
         "observed_unit_inputs_revision",
         "authoritative_inputs_active",
     }),
@@ -265,6 +309,21 @@ _ACTION_RECEIPT_EVIDENCE_FIELDS: Mapping[str, frozenset[str]] = {
         "stopped_target_process_count",
         "remaining_target_process_count",
         "target_services_inactive",
+    }),
+    "unit_inputs_finalize_preauthorization_cancelled": frozenset({
+        "unit_input_publication_sha256",
+        "unit_input_rotation_transaction_sha256",
+        "unit_input_prepared_receipt_sha256",
+        "unit_input_preauthorization_receipt_sha256",
+        "unit_input_abort_receipt_sha256",
+        "unit_input_activation_begin_sha256",
+        "predecessor_unit_inputs_revision",
+        "successor_unit_inputs_revision",
+        "observed_unit_inputs_revision",
+        "preauthorization_persisted",
+        "abort_persisted",
+        "preauthorization_terminal",
+        "authoritative_inputs_unchanged",
     }),
     "host_prestate_restored": frozenset({
         "prestate_archive_sha256",
@@ -420,7 +479,13 @@ class ProductionReleaseUpdateRuntimeError(RuntimeError):
 
 
 class ReleaseUpdateActions(Protocol):
-    """Idempotent host action boundary used by the transaction state machine."""
+    """Idempotent host action boundary used by the transaction state machine.
+
+    The runtime holds the global activation lock around every call.  An action
+    that invokes a unit-input rotation primitive may reacquire that same lock
+    only through its supported same-thread reentrant path; it must not acquire
+    another activation lock first or invert the global-before-local order.
+    """
 
     def perform(
         self,
@@ -455,6 +520,7 @@ class TransactionState:
     next_rollback_phase: str | None
     next_abort_phase: str | None
     commit_intent_persisted: bool
+    unit_input_preauthorization_persisted: bool
     application_mutation_started: bool
     terminal_phase: str | None
 
@@ -492,6 +558,19 @@ def action_idempotency_key(
             "intent_sha256": validated["intent_sha256"],
             "phase": phase,
         })
+    )
+
+
+def action_receipt_schema(phase: str) -> str:
+    """Return the exact schema for one action or revalidation receipt."""
+
+    if phase not in ACTION_RECEIPT_PHASES:
+        raise ProductionReleaseUpdateRuntimeError(
+            "release_update_runtime_phase_invalid"
+        )
+    version = _ACTION_RECEIPT_SCHEMA_VERSIONS.get(phase, 1)
+    return (
+        f"muncho-production-release-update-{phase}-receipt.v{version}"
     )
 
 
@@ -858,8 +937,31 @@ def _validate_action_evidence(
                 "prepared_unit_input_publication_sha256",
             )
             == intent["successor_unit_input_publication_sha256"]
+            and _revision_field(
+                receipt,
+                "predecessor_unit_inputs_revision",
+            )
+            == predecessor
+            and _revision_field(
+                receipt,
+                "successor_unit_inputs_revision",
+            )
+            == release
         )
-        _sha_field(receipt, "prepared_unit_input_set_sha256")
+        _require_action(
+            _sha_field(receipt, "prepared_unit_input_set_sha256")
+            != ZERO_SHA256
+            and _sha_field(
+                receipt,
+                "unit_input_rotation_transaction_sha256",
+            )
+            != ZERO_SHA256
+            and _sha_field(
+                receipt,
+                "unit_input_prepared_receipt_sha256",
+            )
+            != ZERO_SHA256
+        )
         _count_field(receipt, "prepared_unit_input_count", positive=True)
         _true_field(receipt, "active_inputs_unchanged")
         return
@@ -1078,22 +1180,198 @@ def _validate_action_evidence(
         _true_field(receipt, "all_required_health_checks_passed")
         return
 
+    if phase == UNIT_INPUT_PREAUTHORIZATION_PHASE:
+        prepared = _receipt_for_evidence(
+            receipts,
+            "unit_inputs_prepared",
+        )
+        _require_action(
+            _sha_field(receipt, "unit_input_publication_sha256")
+            == intent["successor_unit_input_publication_sha256"]
+            and _sha_field(
+                receipt,
+                "unit_input_rotation_transaction_sha256",
+            )
+            == prepared.get("unit_input_rotation_transaction_sha256")
+            and _sha_field(
+                receipt,
+                "unit_input_prepared_receipt_sha256",
+            )
+            == prepared.get("unit_input_prepared_receipt_sha256")
+            and _sha_field(
+                receipt,
+                "unit_input_preauthorization_receipt_sha256",
+            )
+            != ZERO_SHA256
+            and _sha_field(
+                receipt,
+                "unit_input_abort_receipt_sha256",
+            )
+            == ZERO_SHA256
+            and _sha_field(
+                receipt,
+                "unit_input_activation_begin_sha256",
+            )
+            == ZERO_SHA256
+            and _revision_field(
+                receipt,
+                "predecessor_unit_inputs_revision",
+            )
+            == predecessor
+            and _revision_field(
+                receipt,
+                "successor_unit_inputs_revision",
+            )
+            == release
+            and _revision_field(
+                receipt,
+                "observed_unit_inputs_revision",
+            )
+            == predecessor
+        )
+        _true_field(receipt, "preauthorization_persisted")
+        _true_field(receipt, "authoritative_inputs_unchanged")
+        return
+
     if phase == "unit_inputs_finalized":
         prepared = _receipt_for_evidence(
             receipts,
             "unit_inputs_prepared",
         )
-        _sha_field(receipt, "unit_input_activation_receipt_sha256")
+        preauthorization = _receipt_for_evidence(
+            receipts,
+            UNIT_INPUT_PREAUTHORIZATION_PHASE,
+        )
         _require_action(
             _sha_field(receipt, "unit_input_publication_sha256")
             == intent["successor_unit_input_publication_sha256"]
+            and _sha_field(
+                receipt,
+                "unit_input_rotation_transaction_sha256",
+            )
+            == prepared.get("unit_input_rotation_transaction_sha256")
+            and _sha_field(
+                receipt,
+                "unit_input_prepared_receipt_sha256",
+            )
+            == prepared.get("unit_input_prepared_receipt_sha256")
+            and _sha_field(
+                receipt,
+                "unit_input_preauthorization_receipt_sha256",
+            )
+            == preauthorization.get(
+                "unit_input_preauthorization_receipt_sha256"
+            )
+            and _sha_field(
+                receipt,
+                "unit_input_activation_begin_sha256",
+            )
+            != ZERO_SHA256
+            and _sha_field(
+                receipt,
+                "unit_input_activation_receipt_sha256",
+            )
+            != ZERO_SHA256
+            and _sha_field(
+                receipt,
+                "unit_input_abort_receipt_sha256",
+            )
+            == ZERO_SHA256
             and _sha_field(receipt, "finalized_unit_input_set_sha256")
             == prepared.get("prepared_unit_input_set_sha256")
             and _count_field(receipt, "finalized_unit_input_count")
             == prepared.get("prepared_unit_input_count")
+            and _revision_field(
+                receipt,
+                "predecessor_unit_inputs_revision",
+            )
+            == predecessor
+            and _revision_field(
+                receipt,
+                "successor_unit_inputs_revision",
+            )
+            == release
             and _revision_field(receipt, "observed_unit_inputs_revision") == release
         )
         _true_field(receipt, "authoritative_inputs_active")
+        return
+
+    if phase == UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE:
+        prepared = _receipt_for_evidence(
+            receipts,
+            "unit_inputs_prepared",
+        )
+        preauthorization = receipts.get(UNIT_INPUT_PREAUTHORIZATION_PHASE)
+        preauthorization_sha256 = _sha_field(
+            receipt,
+            "unit_input_preauthorization_receipt_sha256",
+        )
+        abort_sha256 = _sha_field(
+            receipt,
+            "unit_input_abort_receipt_sha256",
+        )
+        preauthorization_persisted = receipt.get(
+            "preauthorization_persisted"
+        )
+        abort_persisted = receipt.get("abort_persisted")
+        _require_action(
+            _sha_field(receipt, "unit_input_publication_sha256")
+            == intent["successor_unit_input_publication_sha256"]
+            and _sha_field(
+                receipt,
+                "unit_input_rotation_transaction_sha256",
+            )
+            == prepared.get("unit_input_rotation_transaction_sha256")
+            and _sha_field(
+                receipt,
+                "unit_input_prepared_receipt_sha256",
+            )
+            == prepared.get("unit_input_prepared_receipt_sha256")
+            and _sha_field(
+                receipt,
+                "unit_input_activation_begin_sha256",
+            )
+            == ZERO_SHA256
+            and _revision_field(
+                receipt,
+                "predecessor_unit_inputs_revision",
+            )
+            == predecessor
+            and _revision_field(
+                receipt,
+                "successor_unit_inputs_revision",
+            )
+            == release
+            and _revision_field(
+                receipt,
+                "observed_unit_inputs_revision",
+            )
+            == predecessor
+            and (
+                (
+                    preauthorization_persisted is False
+                    and abort_persisted is False
+                    and preauthorization_sha256 == ZERO_SHA256
+                    and abort_sha256 == ZERO_SHA256
+                )
+                or (
+                    preauthorization_persisted is True
+                    and abort_persisted is True
+                    and preauthorization_sha256 != ZERO_SHA256
+                    and abort_sha256 != ZERO_SHA256
+                )
+            )
+        )
+        if isinstance(preauthorization, Mapping):
+            _require_action(
+                preauthorization_persisted is True
+                and preauthorization_sha256
+                == preauthorization.get(
+                    "unit_input_preauthorization_receipt_sha256"
+                )
+            )
+        _true_field(receipt, "preauthorization_terminal")
+        _true_field(receipt, "authoritative_inputs_unchanged")
         return
 
     if phase == "release_pointer_rotated":
@@ -1293,8 +1571,7 @@ def _validate_bound_action_receipt(
     if (
         evidence_fields is None
         or set(receipt) != _ACTION_RECEIPT_BASE_FIELDS | evidence_fields
-        or receipt.get("schema")
-        != f"muncho-production-release-update-{phase}-receipt.v1"
+        or receipt.get("schema") != action_receipt_schema(phase)
         or receipt.get("phase") != phase
         or receipt.get("intent_sha256") != intent["intent_sha256"]
         or receipt.get("publication_sha256") != intent["publication_sha256"]
@@ -1352,7 +1629,7 @@ def build_event(
     if (
         type(sequence) is not int
         or sequence < 0
-        or phase not in set(FORWARD_PHASES) | set(ROLLBACK_PHASES) | set(ABORT_PHASES)
+        or phase not in TRANSACTION_PHASES
         or _SHA256.fullmatch(prior_event_sha256) is None
         or type(created_at_unix) is not int
         or created_at_unix < validated_intent["created_at_unix"]
@@ -1390,8 +1667,7 @@ def validate_event(
         or raw.get("intent_sha256") != validated_intent["intent_sha256"]
         or type(raw.get("sequence")) is not int
         or raw["sequence"] < 0
-        or raw.get("phase")
-        not in set(FORWARD_PHASES) | set(ROLLBACK_PHASES) | set(ABORT_PHASES)
+        or raw.get("phase") not in TRANSACTION_PHASES
         or _SHA256.fullmatch(str(raw.get("prior_event_sha256", ""))) is None
         or raw.get("receipt_sha256") != _sha(_canonical(receipt))
         or type(raw.get("created_at_unix")) is not int
@@ -1405,6 +1681,23 @@ def validate_event(
     return {**raw, "receipt": receipt}
 
 
+def _rollback_phases_for_forward_prefix(
+    forward_prefix: Sequence[str],
+) -> tuple[str, ...]:
+    """Return the only rollback sequence authorized by a durable prefix.
+
+    ``target_health_validated`` is deliberately the write-ahead discriminator:
+    the following preauthorization action may have become durable even when
+    its runtime event append was interrupted.  Every rollback from that prefix
+    must therefore reconcile/cancel the exact unit-input transaction before
+    stopping the target or restoring host state.
+    """
+
+    if UNIT_INPUT_PREAUTHORIZATION_DISCRIMINATOR_PHASE in forward_prefix:
+        return PREAUTHORIZED_ROLLBACK_PHASES
+    return ROLLBACK_PHASES
+
+
 def _expected_phase_sequence(phases: Sequence[str]) -> bool:
     if not phases:
         return True
@@ -1415,11 +1708,13 @@ def _expected_phase_sequence(phases: Sequence[str]) -> bool:
         if "rollback_intent" not in phases:
             return False
         rollback_index = phases.index("rollback_intent")
+        forward_prefix = phases[:rollback_index]
+        rollback_phases = _rollback_phases_for_forward_prefix(forward_prefix)
         return (
-            tuple(phases[:rollback_index]) == FORWARD_PHASES[:rollback_index]
-            and tuple(phases[rollback_index:]) == ROLLBACK_PHASES
-            and FIRST_APPLICATION_MUTATION_PHASE in phases[:rollback_index]
-            and COMMIT_PHASE not in phases[:rollback_index]
+            tuple(forward_prefix) == FORWARD_PHASES[:rollback_index]
+            and tuple(phases[rollback_index:]) == rollback_phases
+            and FIRST_APPLICATION_MUTATION_PHASE in forward_prefix
+            and COMMIT_PHASE not in forward_prefix
         )
     if terminal == "aborted":
         if "approval_expired_abort_intent" not in phases:
@@ -1442,12 +1737,15 @@ def _expected_phase_sequence(phases: Sequence[str]) -> bool:
         )
     if "rollback_intent" in phases:
         rollback_index = phases.index("rollback_intent")
+        forward_prefix = phases[:rollback_index]
         rollback_prefix = phases[rollback_index:]
+        rollback_phases = _rollback_phases_for_forward_prefix(forward_prefix)
         return (
-            tuple(phases[:rollback_index]) == FORWARD_PHASES[:rollback_index]
-            and tuple(rollback_prefix) == ROLLBACK_PHASES[: len(rollback_prefix)]
-            and FIRST_APPLICATION_MUTATION_PHASE in phases[:rollback_index]
-            and COMMIT_PHASE not in phases[:rollback_index]
+            tuple(forward_prefix) == FORWARD_PHASES[:rollback_index]
+            and tuple(rollback_prefix)
+            == rollback_phases[: len(rollback_prefix)]
+            and FIRST_APPLICATION_MUTATION_PHASE in forward_prefix
+            and COMMIT_PHASE not in forward_prefix
         )
     return tuple(phases) == FORWARD_PHASES[: len(phases)]
 
@@ -1516,8 +1814,12 @@ def load_state(
             abort_count = len(phases) - phases.index("approval_expired_abort_intent")
             next_abort = ABORT_PHASES[abort_count]
         elif rollback_started:
-            rollback_count = len(phases) - phases.index("rollback_intent")
-            next_rollback = ROLLBACK_PHASES[rollback_count]
+            rollback_index = phases.index("rollback_intent")
+            rollback_count = len(phases) - rollback_index
+            rollback_phases = _rollback_phases_for_forward_prefix(
+                phases[:rollback_index]
+            )
+            next_rollback = rollback_phases[rollback_count]
         else:
             next_forward = FORWARD_PHASES[len(phases)]
     return TransactionState(
@@ -1528,6 +1830,9 @@ def load_state(
         next_rollback_phase=next_rollback,
         next_abort_phase=next_abort,
         commit_intent_persisted=COMMIT_PHASE in phases,
+        unit_input_preauthorization_persisted=(
+            UNIT_INPUT_PREAUTHORIZATION_PHASE in phases
+        ),
         application_mutation_started=FIRST_APPLICATION_MUTATION_PHASE in phases,
         terminal_phase=terminal,
     )
@@ -1843,8 +2148,15 @@ def _execute_update_locked(
             ) from exc
 
     while state.terminal_phase is None:
-        if state.commit_intent_persisted:
-            observed_now = _recovery_now(state)
+        if (
+            state.commit_intent_persisted
+            or state.unit_input_preauthorization_persisted
+        ):
+            # The durable unit-input preauthorization is the final freshness
+            # gate.  From this point through finalization, journal time is
+            # purely logical: neither approval expiry nor an unavailable,
+            # backward, or newly advanced wall clock may reopen the decision.
+            observed_now = _clock_lower_bound(state)
         else:
             try:
                 observed_now = _observed_now(state)
@@ -1864,9 +2176,13 @@ def _execute_update_locked(
                         "release update clock and rollback failed",
                         [exc, rollback_exc],
                     )
-        if not state.commit_intent_persisted and _approval_expired(
-            state.intent,
-            now_unix=observed_now,
+        if (
+            not state.commit_intent_persisted
+            and not state.unit_input_preauthorization_persisted
+            and _approval_expired(
+                state.intent,
+                now_unix=observed_now,
+            )
         ):
             if state.application_mutation_started:
                 try:

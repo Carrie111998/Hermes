@@ -145,7 +145,7 @@ def _receipt_base(
     receipts: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     return {
-        "schema": (f"muncho-production-release-update-{phase}-receipt.v1"),
+        "schema": runtime.action_receipt_schema(phase),
         "phase": phase,
         "intent_sha256": intent["intent_sha256"],
         "publication_sha256": intent["publication_sha256"],

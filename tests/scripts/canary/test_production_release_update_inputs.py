@@ -594,6 +594,55 @@ def test_plans_partition_every_allowed_mutation_path_without_active_claim() -> N
         )
         assert "service_unit_count" not in plan
 
+    assert activation["schema"] == (
+        "muncho-production-release-activation-plan.v2"
+    )
+    assert activation["forward_phase_order"] == list(
+        inputs.update_runtime.FORWARD_PHASES
+    )
+    assert activation["unit_input_preauthorization_phase"] == (
+        inputs.update_runtime.UNIT_INPUT_PREAUTHORIZATION_PHASE
+    )
+    assert activation["unit_input_finalization_phase"] == (
+        "unit_inputs_finalized"
+    )
+    assert activation["unit_input_preauthorization_before_commit"] is True
+    assert activation["unit_input_finalization_after_commit"] is True
+    assert activation["forward_phase_order"].index(
+        activation["unit_input_preauthorization_phase"]
+    ) < activation["forward_phase_order"].index(
+        activation["commit_phase"]
+    ) < activation["forward_phase_order"].index(
+        activation["unit_input_finalization_phase"]
+    )
+
+    assert rollback["schema"] == (
+        "muncho-production-release-rollback-plan.v2"
+    )
+    assert rollback["rollback_phase_order"] == list(
+        inputs.update_runtime.ROLLBACK_PHASES
+    )
+    assert rollback["preauthorized_rollback_phase_order"] == list(
+        inputs.update_runtime.PREAUTHORIZED_ROLLBACK_PHASES
+    )
+    assert rollback["unit_input_preauthorization_discriminator_phase"] == (
+        inputs.update_runtime.UNIT_INPUT_PREAUTHORIZATION_DISCRIMINATOR_PHASE
+    )
+    assert rollback["unit_input_preauthorization_cancel_phase"] == (
+        inputs.update_runtime.UNIT_INPUT_PREAUTHORIZATION_CANCEL_PHASE
+    )
+    assert (
+        rollback[
+            "unit_input_preauthorization_cancel_before_host_restore"
+        ]
+        is True
+    )
+    assert rollback["preauthorized_rollback_phase_order"].index(
+        rollback["unit_input_preauthorization_cancel_phase"]
+    ) < rollback["preauthorized_rollback_phase_order"].index(
+        "target_stopped"
+    )
+
 
 @pytest.mark.parametrize(
     ("document_name", "digest_field"),
@@ -655,6 +704,11 @@ def test_resigned_mutation_partition_drift_is_rejected(
             "rollback_phase_order",
             "rollback_plan_sha256",
         ),
+        (
+            "rollback_plan_sha256",
+            "preauthorized_rollback_phase_order",
+            "rollback_plan_sha256",
+        ),
     ),
 )
 def test_plan_phase_order_is_exact_and_cannot_be_resigned(
@@ -683,6 +737,44 @@ def test_plan_phase_order_is_exact_and_cannot_be_resigned(
     with pytest.raises(
         inputs.ProductionReleaseUpdateInputsError,
         match=expected,
+    ):
+        _validate(fixture)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        (
+            "unit_input_preauthorization_discriminator_phase",
+            "target_started_disabled",
+        ),
+        (
+            "unit_input_preauthorization_cancel_phase",
+            "target_stopped",
+        ),
+        (
+            "unit_input_preauthorization_cancel_before_host_restore",
+            False,
+        ),
+    ),
+)
+def test_resigned_conditional_rollback_contract_drift_is_rejected(
+    field: str,
+    replacement: object,
+) -> None:
+    fixture = _fixture()
+    rollback = deepcopy(fixture.documents["rollback_plan_sha256"])
+    rollback[field] = replacement
+    _rehash(rollback, "rollback_plan_sha256")
+    fixture.documents["rollback_plan_sha256"] = rollback
+    fixture.update_publication = _signed_update(
+        fixture,
+        {"rollback_plan_sha256": rollback["rollback_plan_sha256"]},
+    )
+
+    with pytest.raises(
+        inputs.ProductionReleaseUpdateInputsError,
+        match="release_update_inputs_rollback_plan_invalid",
     ):
         _validate(fixture)
 
