@@ -169,6 +169,46 @@ def _sd_mock():
     return sd, out
 
 
+def test_streamer_path_applies_configured_pronunciation(monkeypatch):
+    from tools import tts_tool
+
+    seen = []
+
+    class _Fake(ts.StreamingTTSProvider):
+        sample_rate = 24000
+        channels = 1
+
+        @staticmethod
+        def available():
+            return True
+
+        def stream(self, text):
+            seen.append(text)
+            yield b"\x01\x00" * 10
+
+    sd, _ = _sd_mock()
+    q = _drain_queue(["Say Tahlia now."])
+    stop, done = threading.Event(), threading.Event()
+    config = {
+        "provider": "openai",
+        "pronunciation": {"substitutions": {"Tahlia": "Tarlia"}},
+    }
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch(
+            "tools.tts_streaming.resolve_streaming_provider",
+            return_value=_Fake({}, {}),
+        ),
+        patch.object(tts_tool, "_import_sounddevice", return_value=sd),
+        patch.object(tts_tool.platform, "system", return_value="Linux"),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    assert seen == ["Say Tarlia now."]
+    assert done.is_set()
+
+
 # ── Dispatch: universal per-sentence sync fallback ───────────────────────
 
 

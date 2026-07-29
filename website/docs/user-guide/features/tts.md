@@ -165,9 +165,7 @@ tts:
       Notre: No-tra
 ```
 
-Substitutions are applied to the raw text before markdown stripping, so they work on formatted text too. They work with all TTS providers since the replacement happens before provider dispatch.
-
-You can also configure substitutions from the Desktop app under **Settings → Voice → Pronunciation Substitutions** (JSON editor).
+Protected non-spoken blocks are removed before substitutions, so a configured term cannot alter private reasoning or verifier markers. Substitutions then run before Markdown stripping and provider dispatch, so they still work on formatted text across synchronous and streaming TTS paths.
 
 ### Input length limits
 

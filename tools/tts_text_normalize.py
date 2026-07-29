@@ -280,7 +280,11 @@ def _validate_pronunciation_substitutions(substitutions: object) -> dict[str, st
     if not all(isinstance(source, str) and isinstance(replacement, str)
                for source, replacement in substitutions.items()):
         return {}
-    return {source: replacement for source, replacement in substitutions.items() if source}
+    return {
+        source: replacement
+        for source, replacement in substitutions.items()
+        if isinstance(source, str) and isinstance(replacement, str) and source
+    }
 
 
 def apply_pronunciation_substitutions(text: str, substitutions: object) -> str:
@@ -329,12 +333,14 @@ def prepare_spoken_text(
     the whole script.
 
     When *pronunciation_substitutions* is a valid non-empty ``dict[str, str]``,
-    each source→replacement pair is applied case-insensitively without matching
-    adjacent word characters **before** markdown stripping, so substitutions
-    operate on the raw text.
+    protected non-spoken blocks are removed first. Each source→replacement pair
+    is then applied case-insensitively without matching adjacent word characters,
+    before Markdown stripping.
     """
-    spoken = apply_pronunciation_substitutions(text, pronunciation_substitutions)
-    spoken = strip_nonspoken_blocks(spoken)
+    spoken = strip_nonspoken_blocks(text)
+    spoken = apply_pronunciation_substitutions(
+        spoken, pronunciation_substitutions
+    )
     spoken = strip_markdown_for_tts(spoken)
     spoken = normalize_symbols_for_tts(spoken)
     spoken = smooth_whitespace_for_tts(spoken)

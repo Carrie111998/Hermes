@@ -151,6 +151,17 @@ def test_prepare_spoken_text_with_pronunciation():
     assert "##" not in spoken
 
 
+def test_pronunciation_cannot_mutate_protected_nonspoken_markers():
+    """User substitutions run only after private/verifier blocks are removed."""
+    raw = "<think>secret reasoning</think>Hello"
+    spoken = prepare_spoken_text(
+        raw,
+        pronunciation_substitutions={"think": "thought"},
+    )
+    assert spoken == "Hello"
+    assert "secret" not in spoken
+
+
 def test_prepare_spoken_text_without_pronunciation():
     """prepare_spoken_text with no substitutions works as before."""
     raw = "## Hello **Tahlia**"

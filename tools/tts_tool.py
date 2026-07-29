@@ -3382,6 +3382,12 @@ def stream_tts_to_speaker(
     try:
         output_stream = None
         tts_config = _load_tts_config()
+        from tools.tts_text_normalize import (
+            apply_pronunciation_substitutions,
+            get_pronunciation_substitutions,
+        )
+
+        streaming_pronunciation = get_pronunciation_substitutions(tts_config)
 
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).
@@ -3444,6 +3450,13 @@ def stream_tts_to_speaker(
             if streamer is None:
                 _speak_via_sync(cleaned)
                 return
+            # Apply the same literal pronunciation map used by synchronous and
+            # gateway streaming TTS. The sync fallback below re-enters
+            # text_to_speech_tool(), so only apply it on this direct streamer path.
+            if streaming_pronunciation:
+                cleaned = apply_pronunciation_substitutions(
+                    cleaned, streaming_pronunciation
+                )
             # Truncate very long sentences to the provider's per-request cap.
             if stream_max_len and len(cleaned) > stream_max_len:
                 cleaned = cleaned[:stream_max_len]
