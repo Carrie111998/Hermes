@@ -4502,6 +4502,55 @@ def _split_text_for_speak_stream(text: str, cap: int) -> list:
     return pieces
 
 
+_SPEAK_STREAM_TEXT_QUEUE_MAX_ITEMS = 256
+_SPEAK_STREAM_MAX_TEXT_CHARS = 100_000
+_SPEAK_STREAM_AUDIO_QUEUE_MAX_CHUNKS = 32
+_SPEAK_STREAM_AUDIO_CHUNK_MAX_BYTES = 64 * 1024
+_SPEAK_STREAM_BRIDGE_PUT_TIMEOUT_SECONDS = 0.1
+_SPEAK_STREAM_PROVIDER_STALL_TIMEOUT_SECONDS = 60.0
+_SPEAK_STREAM_SOCKET_SEND_TIMEOUT_SECONDS = 10.0
+_SPEAK_STREAM_PROVIDER_CALL_STARTED = object()
+_SPEAK_STREAM_PROVIDER_CALL_FINISHED = object()
+
+
+def _put_speak_stream_audio(
+    loop: asyncio.AbstractEventLoop,
+    chunks: asyncio.Queue,
+    stop: threading.Event,
+    chunk: Any,
+) -> bool:
+    """Put one audio item from the producer thread with real backpressure."""
+    if loop.is_closed():
+        return False
+    put_coro = chunks.put(chunk)
+    try:
+        future = asyncio.run_coroutine_threadsafe(put_coro, loop)
+    except RuntimeError:
+        put_coro.close()
+        return False
+    while not stop.is_set():
+        try:
+            future.result(timeout=_SPEAK_STREAM_BRIDGE_PUT_TIMEOUT_SECONDS)
+            return True
+        except concurrent.futures.TimeoutError:
+            continue
+        except (concurrent.futures.CancelledError, RuntimeError):
+            return False
+    future.cancel()
+    return False
+
+
+def _stop_speak_stream_text_queue(text_q: queue.Queue) -> None:
+    """Discard queued text and wake a producer blocked on text_q.get()."""
+    while True:
+        try:
+            text_q.get_nowait()
+        except queue.Empty:
+            break
+    with contextlib.suppress(queue.Full):
+        text_q.put_nowait(None)
+
+
 @app.websocket("/api/audio/speak-stream")
 async def speak_stream_ws(ws: "WebSocket") -> None:
     """Streaming TTS for the desktop: text in, raw int16 PCM frames out.
@@ -4557,8 +4606,12 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
     )
 
     stop = threading.Event()
-    text_q: queue.Queue = queue.Queue()  # str deltas; None = end-of-text
-    chunks: asyncio.Queue = asyncio.Queue()  # PCM out; None = synthesis done
+    text_q: queue.Queue = queue.Queue(
+        maxsize=_SPEAK_STREAM_TEXT_QUEUE_MAX_ITEMS
+    )  # str deltas; None = end-of-text
+    chunks: asyncio.Queue = asyncio.Queue(
+        maxsize=_SPEAK_STREAM_AUDIO_QUEUE_MAX_CHUNKS
+    )  # bounded PCM out; None = synthesis done
 
     def _produce():
         from tools.tts_streaming import SentenceChunker
@@ -4580,51 +4633,144 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
                 if not cleaned:
                     continue
                 for piece in _split_text_for_speak_stream(cleaned, cap):
-                    for chunk in streamer.stream(piece):
-                        if stop.is_set():
+                    if not _put_speak_stream_audio(
+                        loop,
+                        chunks,
+                        stop,
+                        _SPEAK_STREAM_PROVIDER_CALL_STARTED,
+                    ):
+                        return
+                    try:
+                        for chunk in streamer.stream(piece):
+                            if stop.is_set():
+                                return
+                            data = bytes(chunk)
+                            for offset in range(
+                                0, len(data), _SPEAK_STREAM_AUDIO_CHUNK_MAX_BYTES
+                            ):
+                                bounded_chunk = data[
+                                    offset : offset + _SPEAK_STREAM_AUDIO_CHUNK_MAX_BYTES
+                                ]
+                                if not _put_speak_stream_audio(
+                                    loop, chunks, stop, bounded_chunk
+                                ):
+                                    return
+                    finally:
+                        if not _put_speak_stream_audio(
+                            loop,
+                            chunks,
+                            stop,
+                            _SPEAK_STREAM_PROVIDER_CALL_FINISHED,
+                        ):
                             return
-                        loop.call_soon_threadsafe(chunks.put_nowait, chunk)
         except Exception as exc:
-            _log.warning("speak-stream synthesis failed: %s", exc)
+            if not stop.is_set():
+                _log.warning("speak-stream synthesis failed: %s", exc)
         finally:
-            loop.call_soon_threadsafe(chunks.put_nowait, None)
+            _put_speak_stream_audio(loop, chunks, stop, None)
 
-    threading.Thread(target=_produce, daemon=True).start()
+    producer = threading.Thread(
+        target=_produce,
+        name="hermes-speak-stream-producer",
+        daemon=True,
+    )
+    producer.start()
+
+    async def _put_text(item: Optional[str]) -> bool:
+        try:
+            await asyncio.to_thread(
+                text_q.put,
+                item,
+                True,
+                _SPEAK_STREAM_BRIDGE_PUT_TIMEOUT_SECONDS,
+            )
+            return True
+        except queue.Full:
+            return False
 
     async def _pump_client():
         # Text frames feed synthesis; done ends the text; stop/disconnect
         # (or any unparseable frame) is barge-in.
+        total_text_chars = 0
+        done_seen = False
         try:
             while True:
                 frame = json.loads(await ws.receive_text())
-                if frame.get("text"):
-                    text_q.put(str(frame["text"]))
                 if frame.get("stop"):
-                    break
-                if frame.get("done"):
-                    text_q.put(None)
+                    return "stop"
+                if frame.get("text") and not done_seen:
+                    delta = str(frame["text"])
+                    total_text_chars += len(delta)
+                    if total_text_chars > _SPEAK_STREAM_MAX_TEXT_CHARS:
+                        return "too_large"
+                    if not await _put_text(delta):
+                        return "overloaded"
+                if frame.get("done") and not done_seen:
+                    if not await _put_text(None):
+                        return "overloaded"
+                    done_seen = True
         except Exception:
-            pass
-        stop.set()
-        text_q.put(None)  # unblock the producer
+            return "disconnect"
+        finally:
+            stop.set()
+            _stop_speak_stream_text_queue(text_q)
 
-    pump = asyncio.ensure_future(_pump_client())
+    pump = asyncio.create_task(_pump_client())
+    close_code = 1000
+    provider_call_active = False
+    synthesis_complete = False
     try:
         while True:
-            chunk = await chunks.get()
-            if chunk is None:
+            chunk_get = asyncio.create_task(chunks.get())
+            done, _ = await asyncio.wait(
+                {chunk_get, pump},
+                timeout=(
+                    _SPEAK_STREAM_PROVIDER_STALL_TIMEOUT_SECONDS
+                    if provider_call_active
+                    else None
+                ),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                chunk_get.cancel()
+                await asyncio.gather(chunk_get, return_exceptions=True)
+                close_code = 1011
                 break
-            await ws.send_bytes(chunk)
-        if not stop.is_set():
+            if pump in done:
+                chunk_get.cancel()
+                await asyncio.gather(chunk_get, return_exceptions=True)
+                reason = pump.result()
+                if reason == "too_large":
+                    close_code = 1009
+                elif reason == "overloaded":
+                    close_code = 1013
+                break
+            chunk = chunk_get.result()
+            if chunk is _SPEAK_STREAM_PROVIDER_CALL_STARTED:
+                provider_call_active = True
+                continue
+            if chunk is _SPEAK_STREAM_PROVIDER_CALL_FINISHED:
+                provider_call_active = False
+                continue
+            if chunk is None:
+                synthesis_complete = True
+                break
+            await asyncio.wait_for(
+                ws.send_bytes(chunk),
+                timeout=_SPEAK_STREAM_SOCKET_SEND_TIMEOUT_SECONDS,
+            )
+        if synthesis_complete and not stop.is_set():
             await ws.send_json({"type": "end"})
-    except (WebSocketDisconnect, RuntimeError):
+    except (WebSocketDisconnect, RuntimeError, asyncio.TimeoutError):
         pass
     finally:
         stop.set()
-        text_q.put(None)
+        _stop_speak_stream_text_queue(text_q)
         pump.cancel()
+        await asyncio.gather(pump, return_exceptions=True)
+        await asyncio.to_thread(producer.join, 0.25)
         with contextlib.suppress(Exception):
-            await ws.close()
+            await ws.close(code=close_code)
 
 
 @app.get("/api/actions/{name}/status")
