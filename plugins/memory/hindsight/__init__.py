@@ -66,7 +66,7 @@ _VALID_BUDGETS = {"low", "mid", "high"}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.6-flash",
     "groq": "openai/gpt-oss-120b",
     "openrouter": "qwen/qwen3.5-9b",
     "minimax": "MiniMax-M2.7",
@@ -131,10 +131,19 @@ def _check_local_runtime() -> tuple[bool, str | None]:
     error from NumPy before the daemon starts. Treat that as "unavailable"
     so Hermes can degrade gracefully instead of repeatedly trying to start
     a broken local memory backend.
+
+    The embedded daemon computes embeddings via ``sentence_transformers``
+    (transformers + huggingface-hub). Importing ``hindsight`` /
+    ``hindsight_embed`` alone succeeds even when that stack is broken, so
+    without importing it here the probe would falsely report the backend
+    healthy and ``hermes memory status`` would stay green while the daemon
+    aborts at startup on every retain/recall. Import it too so the probe (and
+    status) reports the real ImportError.
     """
     try:
         importlib.import_module("hindsight")
         importlib.import_module("hindsight_embed.daemon_embed_manager")
+        importlib.import_module("sentence_transformers")
         return True, None
     except Exception as exc:
         return False, str(exc)
