@@ -1272,6 +1272,17 @@ class _SessionFlight:
         self.error: Optional[BaseException] = None
 
 
+@dataclass(frozen=True)
+class ConsumedResetMarkers:
+    """Immutable one-turn reset facts claimed from durable routing state."""
+
+    was_auto_reset: bool
+    auto_reset_reason: Optional[str]
+    reset_had_activity: bool
+    was_fresh_reset: bool
+    fresh_reset_reason: Optional[str]
+
+
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
@@ -1638,8 +1649,20 @@ class SessionStore:
             self._routing_generation,
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
-        """Serialize all whole-index writers through one durable write lock."""
+    def _persist_routing_data(
+        self,
+        data: Dict[str, Any],
+        generation: int,
+        *,
+        require_primary: bool = False,
+    ) -> None:
+        """Serialize all whole-index writers through one durable write lock.
+
+        ``require_primary`` is reserved for claims that guard an external side
+        effect. When the canonical SQLite writer exists, its failure must be
+        reported to the caller instead of silently succeeding through the
+        legacy JSON mirror.
+        """
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
             save_lock = threading.Lock()
@@ -1659,11 +1682,25 @@ class SessionStore:
                         )
                         db_saved = True
                     except Exception as exc:
+                        if require_primary:
+                            raise RuntimeError(
+                                "gateway routing primary save failed"
+                            ) from None
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
             if getattr(self, "_write_sessions_json", True) or not db_saved:
-                self._save_sessions_json(data)
+                try:
+                    self._save_sessions_json(data)
+                except Exception:
+                    if not (require_primary and db_saved):
+                        raise
+                    # The authoritative DB claim is already durable. A legacy
+                    # mirror failure must not replay the external side effect.
+                    logger.warning(
+                        "gateway.session: sessions.json mirror save failed "
+                        "after primary routing claim"
+                    )
             self._persisted_routing_generation = generation
 
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
@@ -2826,6 +2863,79 @@ class SessionStore:
                     entry.origin,
                     display_name=entry.display_name,
                 )
+
+    def consume_reset_markers(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        expected_capability_epoch: str,
+    ) -> ConsumedResetMarkers:
+        """Durably claim one-shot reset facts for one exact live session.
+
+        The gateway must call this before emitting a reset notice, hook, or
+        model turn.  Persisting the cleared flags before returning prevents a
+        process restart from replaying the same reset boundary and user-facing
+        notice.  The session-id comparison is a CAS guard: a concurrent
+        ``/new`` or ``/resume`` must not let an older handler consume markers
+        from the replacement route, including an away-and-back switch that
+        returns to the same transcript id with fresh mutation authority.
+        """
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if (
+                entry is None
+                or entry.session_id != expected_session_id
+                or entry.capability_epoch != expected_capability_epoch
+            ):
+                raise RuntimeError(
+                    "session changed before reset markers could be consumed"
+                )
+
+            consumed = ConsumedResetMarkers(
+                was_auto_reset=bool(entry.was_auto_reset),
+                auto_reset_reason=entry.auto_reset_reason,
+                reset_had_activity=bool(entry.reset_had_activity),
+                was_fresh_reset=bool(entry.is_fresh_reset),
+                fresh_reset_reason=entry.fresh_reset_reason,
+            )
+            if (
+                entry.was_auto_reset
+                or entry.auto_reset_reason is not None
+                or entry.is_fresh_reset
+                or entry.fresh_reset_reason is not None
+            ):
+                previous_markers = (
+                    entry.was_auto_reset,
+                    entry.auto_reset_reason,
+                    entry.is_fresh_reset,
+                    entry.fresh_reset_reason,
+                )
+                entry.was_auto_reset = False
+                entry.auto_reset_reason = None
+                entry.is_fresh_reset = False
+                entry.fresh_reset_reason = None
+                routing_data, routing_generation = self._snapshot_routing_locked()
+                try:
+                    # Hold the routing lock until the canonical claim is
+                    # acknowledged. Otherwise a second handler could observe
+                    # the in-memory clear and emit side effects before a failed
+                    # primary write is rolled back.
+                    self._persist_routing_data(
+                        routing_data,
+                        routing_generation,
+                        require_primary=True,
+                    )
+                except Exception:
+                    (
+                        entry.was_auto_reset,
+                        entry.auto_reset_reason,
+                        entry.is_fresh_reset,
+                        entry.fresh_reset_reason,
+                    ) = previous_markers
+                    raise
+        return consumed
 
     def get_session_metadata(
         self,

@@ -15366,10 +15366,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug(
                         "Failed to record Telegram topic binding", exc_info=True
                     )
-        # Capture and immediately consume was_auto_reset so it does not
-        # re-fire on subsequent messages — preventing the cleanup from
+        # Claim reset markers durably before any hook, notification, Canonical
+        # lookup, or model call. If this process exits later in the turn, the
+        # next gateway boot must not replay the same reset banner indefinitely.
+        _reset_markers = await self.async_session_store.consume_reset_markers(
+            session_key,
+            session_entry.session_id,
+            session_entry.capability_epoch,
+        )
+
+        # Capture was_auto_reset from the immutable durable claim so it does
+        # not re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
-        _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
+        _was_auto_reset = _reset_markers.was_auto_reset
         if _was_auto_reset:
             # Treat auto-reset as a full conversation boundary — clear every
             # conversation-scoped per-session dict in one funnel call so the
@@ -15385,14 +15394,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compaction summaries. Mirrors /reset and the compression-exhausted
             # path (#9893). Covers daily/idle/suspended auto-reset.
             self._evict_cached_agent(session_key)
+            # The store claim above is authoritative. Keep the live object
+            # explicitly consumed as a defence-in-depth invariant for callers
+            # that retain this exact SessionEntry reference.
             session_entry.was_auto_reset = False
 
         # Capture the one-shot manual/involuntary reset cause before consuming
         # it.  Canonical Task Workspace recovery uses only these exact session
         # lifecycle facts — never authored text — to distinguish an explicit
         # /new choice boundary from involuntary recovery.
-        _was_fresh_reset = bool(getattr(session_entry, "is_fresh_reset", False))
-        _fresh_reset_reason = getattr(session_entry, "fresh_reset_reason", None)
+        _was_fresh_reset = _reset_markers.was_fresh_reset
+        _fresh_reset_reason = _reset_markers.fresh_reset_reason
 
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -15470,7 +15482,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # If the previous session expired and was auto-reset, deliver a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if _was_auto_reset:
-            reset_reason = getattr(session_entry, "auto_reset_reason", None) or "idle"
+            reset_reason = _reset_markers.auto_reset_reason or "idle"
             if reset_reason == "suspended":
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
             elif reset_reason == "daily":
@@ -15502,7 +15514,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_type=getattr(source, "chat_type", "dm"),
                 )
                 platform_name = source.platform.value if source.platform else ""
-                had_activity = getattr(session_entry, 'reset_had_activity', False)
+                had_activity = _reset_markers.reset_had_activity
                 # Suspended and restart-recovery-expired sessions always notify
                 # regardless of policy.notify — the user had an active session
                 # that was silently replaced, so they need to know they can
@@ -15554,10 +15566,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
 
-            # was_auto_reset is already consumed in the cleanup block above
-            # (single source of truth); only the reset reason needs clearing here.
-            session_entry.auto_reset_reason = None
-
         _routeback_context_prompt = ""
         try:
             from gateway.canonical_brain_routeback_context import (
@@ -15573,8 +15581,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 timeout=15.0,
             )
-        except Exception as exc:
-            logger.warning("Canonical Brain route-back context prompt failed: %s", exc)
+        except (Exception, SystemExit) as exc:
+            # The privileged helper uses SystemExit for a hard CLI boundary.
+            # A non-critical route-back read must never inherit that process
+            # exit semantic and take the messaging gateway down. Do not log
+            # the exception text: helper failures can originate at a secret
+            # access boundary.
+            logger.warning(
+                "Canonical Brain route-back context prompt failed soft (%s)",
+                type(exc).__name__,
+            )
             try:
                 from gateway.canonical_brain_routeback_context import (
                     build_routeback_context_incomplete_prompt,

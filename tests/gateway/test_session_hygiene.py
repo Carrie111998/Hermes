@@ -23,7 +23,7 @@ import pytest
 from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
-from gateway.session import SessionEntry, SessionSource
+from gateway.session import ConsumedResetMarkers, SessionEntry, SessionSource
 from tests.gateway._profile_authority import install_frozen_profile_authority
 
 
@@ -459,6 +459,13 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner._session_model_overrides = {}
     runner.session_store = MagicMock()
+    runner.session_store.consume_reset_markers.return_value = ConsumedResetMarkers(
+        False,
+        None,
+        False,
+        False,
+        None,
+    )
     runner.session_store.get_model_override.return_value = None
     runner.session_store.get_or_create_session.return_value = SessionEntry(
         session_key="agent:main:telegram:group:-1001:17585",
