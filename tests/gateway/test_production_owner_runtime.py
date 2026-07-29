@@ -219,5 +219,11 @@ def test_required_module_set_imports_crypto_and_every_mutating_launcher() -> Non
     assert "scripts.canary.owner_gate_caddy_cutover" in (
         runtime.REQUIRED_MODULES
     )
+    assert "scripts.canary.production_cutover_activation_lock" in (
+        runtime.REQUIRED_MODULES
+    )
+    assert "scripts.canary.production_cutover_unit_input_rotation" in (
+        runtime.REQUIRED_MODULES
+    )
     assert "gateway.production_cron_cutover_runtime" in runtime.REQUIRED_MODULES
     assert "gateway.operational_edge_readiness" in runtime.REQUIRED_MODULES

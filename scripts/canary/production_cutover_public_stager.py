@@ -10,12 +10,16 @@ the fixed root-owned 0400 staging files consumed by the cutover service.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -25,6 +29,7 @@ if _REPOSITORY_ROOT not in sys.path:
 
 from gateway import canonical_writer_production_cutover as cutover
 from scripts.canary import package_production_cutover_artifacts as package
+from scripts.canary import production_cutover_activation_lock as authority_lock
 from scripts.canary import production_cutover_passkey as passkey
 
 
@@ -33,6 +38,10 @@ RECEIPT_SCHEMA = "muncho-production-cutover-publication-receipt.v1"
 MAX_INPUT = 16 * 1024 * 1024
 STAGED_MODE = 0o400
 _ACTIONS = frozenset({"unit-input-authority", "freeze-authority", "cutover-plan"})
+_TEMPORARY_SUFFIX = re.compile(r"^[1-9][0-9]*$")
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_MAX_TEMPORARY_ALIASES = 64
 _FIELDS = frozenset({
     "schema",
     "action",
@@ -157,7 +166,13 @@ def _publication(
             }
     except PublicStagingError:
         raise
-    except (KeyError, PermissionError, TypeError, ValueError) as exc:
+    except (
+        KeyError,
+        PermissionError,
+        TypeError,
+        ValueError,
+        package.PackagingError,
+    ) as exc:
         raise PublicStagingError("public_staging_documents_invalid") from exc
     return action, outputs
 
@@ -220,6 +235,163 @@ def _read_exact(path: Path, state: os.stat_result, *, maximum: int) -> bytes:
             os.close(descriptor)
 
 
+def _stage_temporaries(path: Path) -> list[Path]:
+    prefixes = tuple(
+        f".{path.name}.{tag}."
+        for tag in ("stage", "bootstrap", "rotate")
+    )
+    try:
+        children = list(path.parent.iterdir())
+    except OSError as exc:
+        raise PublicStagingError("public_staging_write_failed") from exc
+    result = []
+    for child in children:
+        prefix = next(
+            (
+                candidate
+                for candidate in prefixes
+                if child.name.startswith(candidate)
+            ),
+            None,
+        )
+        if prefix is None:
+            continue
+        if _TEMPORARY_SUFFIX.fullmatch(child.name[len(prefix) :]) is None:
+            raise PublicStagingError("public_staging_conflict")
+        result.append(child)
+    if len(result) > _MAX_TEMPORARY_ALIASES:
+        raise PublicStagingError("public_staging_conflict")
+    return sorted(result)
+
+
+def _validate_stage_file(
+    path: Path,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+    nlink: int,
+) -> os.stat_result:
+    try:
+        state = path.lstat()
+        if (
+            path.resolve(strict=True) != path
+            or stat.S_ISLNK(state.st_mode)
+            or not stat.S_ISREG(state.st_mode)
+            or state.st_nlink != nlink
+            or state.st_uid != uid
+            or state.st_gid != gid
+            or stat.S_IMODE(state.st_mode) != STAGED_MODE
+            or _read_exact(path, state, maximum=MAX_INPUT) != payload
+        ):
+            raise PublicStagingError("public_staging_conflict")
+        return state
+    except PublicStagingError:
+        raise
+    except OSError as exc:
+        raise PublicStagingError("public_staging_conflict") from exc
+
+
+def _recover_stage_temporary(
+    path: Path,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+) -> Path:
+    candidates = _stage_temporaries(path)
+    own_prefix = f".{path.name}.stage."
+    own = [
+        candidate
+        for candidate in candidates
+        if candidate.name.startswith(own_prefix)
+    ]
+    current = path.with_name(f".{path.name}.stage.{os.getpid()}")
+    if not candidates:
+        return current
+    if not os.path.lexists(path):
+        if len(candidates) != 1 or candidates != own:
+            raise PublicStagingError("public_staging_conflict")
+        _validate_stage_file(
+            candidates[0],
+            payload,
+            uid=uid,
+            gid=gid,
+            nlink=1,
+        )
+        return candidates[0]
+    target = path.lstat()
+    if target.st_nlink == 1 or target.st_nlink != len(candidates) + 1:
+        raise PublicStagingError("public_staging_conflict")
+    target = _validate_stage_file(
+        path,
+        payload,
+        uid=uid,
+        gid=gid,
+        nlink=len(candidates) + 1,
+    )
+    for candidate in candidates:
+        item = _validate_stage_file(
+            candidate,
+            payload,
+            uid=uid,
+            gid=gid,
+            nlink=target.st_nlink,
+        )
+        if (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino):
+            raise PublicStagingError("public_staging_conflict")
+    try:
+        for candidate in candidates:
+            item = candidate.lstat()
+            if (item.st_dev, item.st_ino) != (target.st_dev, target.st_ino):
+                raise PublicStagingError("public_staging_conflict")
+            candidate.unlink()
+        cutover.activation._fsync_directory(path.parent)
+    except PublicStagingError:
+        raise
+    except OSError as exc:
+        raise PublicStagingError("public_staging_write_failed") from exc
+    return current
+
+
+def _rename_noreplace(source: Path, destination: Path) -> bool:
+    if sys.platform.startswith("linux"):
+        try:
+            renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+        except (AttributeError, OSError) as exc:
+            raise OSError(
+                errno.ENOSYS,
+                "renameat2(RENAME_NOREPLACE) unavailable",
+            ) from exc
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renameat2(
+            _AT_FDCWD,
+            os.fsencode(source),
+            _AT_FDCWD,
+            os.fsencode(destination),
+            _RENAME_NOREPLACE,
+        )
+        if result == 0:
+            return True
+        number = ctypes.get_errno()
+        if number == errno.EEXIST:
+            return False
+        raise OSError(number, os.strerror(number), destination)
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except FileExistsError:
+        return False
+    return True
+
+
 def _install_exact(path: Path, payload: bytes, *, uid: int, gid: int) -> bool:
     if not path.is_absolute() or path.parent.resolve(strict=True) != path.parent:
         raise PublicStagingError("public_staging_path_invalid")
@@ -232,50 +404,75 @@ def _install_exact(path: Path, payload: bytes, *, uid: int, gid: int) -> bool:
         or stat.S_IMODE(parent.st_mode) != 0o700
     ):
         raise PublicStagingError("public_staging_parent_invalid")
-    temporary = path.with_name(f".{path.name}.stage.{os.getpid()}")
+    temporary = _recover_stage_temporary(
+        path,
+        payload,
+        uid=uid,
+        gid=gid,
+    )
     created = False
     descriptor: int | None = None
+    temporary_identity: tuple[int, int] | None = None
     try:
         if not os.path.lexists(path):
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(temporary, flags, 0o600)
-            os.fchown(descriptor, uid, gid)
-            view = memoryview(payload)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError("short public staging write")
-                view = view[written:]
-            os.fchmod(descriptor, STAGED_MODE)
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
-            try:
-                os.link(temporary, path, follow_symlinks=False)
-                created = True
-                cutover.activation._fsync_directory(path.parent)
-            except FileExistsError:
-                pass
-            temporary.unlink()
-        state = path.lstat()
-        if (
-            path.resolve(strict=True) != path
-            or stat.S_ISLNK(state.st_mode)
-            or not stat.S_ISREG(state.st_mode)
-            or state.st_nlink != 1
-            or state.st_uid != uid
-            or state.st_gid != gid
-            or stat.S_IMODE(state.st_mode) != STAGED_MODE
-            or _read_exact(path, state, maximum=MAX_INPUT) != payload
-        ):
-            raise PublicStagingError("public_staging_conflict")
+            if not os.path.lexists(temporary):
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(temporary, flags, 0o600)
+                opened = os.fstat(descriptor)
+                temporary_identity = (opened.st_dev, opened.st_ino)
+                os.fchown(descriptor, uid, gid)
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short public staging write")
+                    view = view[written:]
+                os.fchmod(descriptor, STAGED_MODE)
+                os.fsync(descriptor)
+                os.close(descriptor)
+                descriptor = None
+            temporary_state = _validate_stage_file(
+                temporary,
+                payload,
+                uid=uid,
+                gid=gid,
+                nlink=1,
+            )
+            temporary_identity = (
+                temporary_state.st_dev,
+                temporary_state.st_ino,
+            )
+            created = _rename_noreplace(temporary, path)
+            if os.path.lexists(temporary):
+                current = temporary.lstat()
+                if (current.st_dev, current.st_ino) != temporary_identity:
+                    raise PublicStagingError("public_staging_conflict")
+                temporary.unlink()
+            cutover.activation._fsync_directory(path.parent)
+        _validate_stage_file(
+            path,
+            payload,
+            uid=uid,
+            gid=gid,
+            nlink=1,
+        )
+    except PublicStagingError:
+        raise
+    except OSError as exc:
+        raise PublicStagingError("public_staging_write_failed") from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
         try:
-            temporary.unlink()
-        except FileNotFoundError:
+            current = temporary.lstat()
+            if temporary_identity is not None and (
+                current.st_dev,
+                current.st_ino,
+            ) == temporary_identity:
+                temporary.unlink()
+        except (FileNotFoundError, OSError):
             pass
     return created
 
@@ -351,10 +548,9 @@ def stage_publication(
     if action != "freeze-authority" and proof is not None:
         raise PublicStagingError("public_staging_passkey_claim_unexpected")
     needs_claim = action in {"freeze-authority", "cutover-plan"}
+    needs_lock = needs_claim or action == "unit-input-authority"
     if needs_claim and journal is None:
         journal = cutover.RootCutoverJournal()
-    if lock_factory is None:
-        lock_factory = cutover.activation._host_activation_lock
 
     def require_or_record_claim() -> None:
         assert journal is not None
@@ -475,27 +671,43 @@ def stage_publication(
 
     records = []
     created_outputs: list[tuple[Path, bytes]] = []
-    context = lock_factory() if needs_claim else None
+    context = (
+        authority_lock.authority_activation_lock(
+            require_root=require_root,
+            lock_factory=lock_factory,
+        )
+        if needs_lock
+        else nullcontext()
+    )
     try:
-        if context is not None:
-            context.__enter__()
-            require_or_record_claim()
-        for path, payload in outputs.items():
-            created = _install_exact(path, payload, uid=uid, gid=gid)
-            if created:
-                created_outputs.append((path, payload))
-            records.append({
-                "path": str(path),
-                "sha256": _sha(payload),
-                "created": created,
-            })
-    except Exception:
+        with context:
+            if action == "unit-input-authority":
+                locked_now = (
+                    int(time.time()) if now_unix is None else now_unix
+                )
+                _publication(publication, now_unix=locked_now)
+            elif needs_claim:
+                require_or_record_claim()
+            for path, payload in outputs.items():
+                created = _install_exact(path, payload, uid=uid, gid=gid)
+                if created:
+                    created_outputs.append((path, payload))
+                records.append({
+                    "path": str(path),
+                    "sha256": _sha(payload),
+                    "created": created,
+                })
+    except Exception as exc:
         for path, payload in reversed(created_outputs):
             _remove_exact_created(path, payload, uid=uid, gid=gid)
+        if isinstance(
+            exc,
+            authority_lock.AuthorityActivationLockError,
+        ):
+            raise PublicStagingError(
+                "public_staging_activation_lock_unavailable"
+            ) from exc
         raise
-    finally:
-        if context is not None:
-            context.__exit__(*sys.exc_info())
     unsigned = {
         "schema": RECEIPT_SCHEMA,
         "action": action,

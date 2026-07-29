@@ -1377,6 +1377,31 @@ def test_standalone_target_bootstrap_verifies_signature_without_repo_imports(
     assert output_path.read_bytes().endswith(b"\n")
     assert stat.S_IMODE(output_path.stat().st_mode) == 0o444
 
+    plan_alias = staged / ".unit-input-plan.json.stage.999997"
+    approval_alias = staged / ".unit-input-approval.json.rotate.999998"
+    output_alias = staged / ".production-unit-inputs.json.bootstrap.999999"
+    os.link(plan_path, plan_alias)
+    os.link(approval_path, approval_alias)
+    os.link(output_path, output_alias)
+    assert plan_path.stat().st_nlink == 2
+    assert approval_path.stat().st_nlink == 2
+    assert output_path.stat().st_nlink == 2
+    replay = bootstrap.bootstrap(
+        plan_path=plan_path,
+        approval_path=approval_path,
+        output_path=output_path,
+        openssl=Path(shutil.which("openssl") or "/usr/bin/openssl"),
+        now_unix=1_800_000_001,
+        require_root=False,
+    )
+    assert replay["created"] is False
+    assert plan_path.stat().st_nlink == 1
+    assert approval_path.stat().st_nlink == 1
+    assert output_path.stat().st_nlink == 1
+    assert not plan_alias.exists()
+    assert not approval_alias.exists()
+    assert not output_alias.exists()
+
 
 def test_packager_binds_gateway_imports_to_its_target_release_under_isolation(
     tmp_path,

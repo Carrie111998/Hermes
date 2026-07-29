@@ -40,6 +40,7 @@ from scripts.canary import package_production_cutover_artifacts as package
 from scripts.canary import production_cutover_host_authority as host_authority
 from scripts.canary import production_database_recovery_gate as database_recovery
 from scripts.canary import production_cutover_passkey as cutover_passkey
+from scripts.canary import production_cutover_unit_input_rotation as unit_rotation
 from scripts.canary.production_cutover_public_stager import (
     PublicStagingError,
     build_publication,
@@ -324,6 +325,7 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
         "prepare-bridge",
         "activate-bridge",
         "stage-publication",
+        "rotate-unit-input-authority",
         "stage-cron-continuity",
         "capture-final-tail",
         "collect-stopped",
@@ -695,6 +697,15 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 "-m",
                 "scripts.canary.production_cutover_public_stager",
             )
+        if action == "rotate-unit-input-authority":
+            return (
+                *prefix,
+                interpreter,
+                "-B",
+                "-I",
+                "-m",
+                "scripts.canary.production_cutover_unit_input_rotation",
+            )
         if action in {"prepare-bridge", "activate-bridge"}:
             return (
                 *prefix,
@@ -761,13 +772,17 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
         command = self._remote_command(revision, action)
         input_actions = {
             "stage-publication",
+            "rotate-unit-input-authority",
             "collect-host-plan",
             "collect-authority",
             "prepare-bridge",
             "activate-bridge",
         }
         if action in input_actions:
-            if action == "stage-publication":
+            if action in {
+                "stage-publication",
+                "rotate-unit-input-authority",
+            }:
                 input_value = publication
             elif action == "collect-host-plan":
                 input_value = initial_receipt
@@ -1648,6 +1663,71 @@ def stage_unit_input_authority(
         publication=expected_publication,
         expected_file_count=2,
     )
+
+
+def rotate_unit_input_authority(
+    *,
+    release_revision: str,
+    remote_stager_revision: str,
+    publication: Mapping[str, Any],
+    transport: Any,
+    now_unix: int | None = None,
+) -> Mapping[str, Any]:
+    """Rotate a complete predecessor triplet through an installed runtime."""
+
+    documents = publication.get("documents") if isinstance(
+        publication, Mapping
+    ) else None
+    if (
+        package.REVISION.fullmatch(release_revision or "") is None
+        or package.REVISION.fullmatch(remote_stager_revision or "") is None
+        or not isinstance(documents, Mapping)
+        or publication.get("action") != "unit-input-authority"
+        or publication.get("release_revision") != release_revision
+        or set(documents) != {"plan", "approval"}
+        or not callable(getattr(transport, "invoke", None))
+    ):
+        raise OwnerCutoverError("owner_cutover_unit_input_rotation_invalid")
+    approval = documents.get("approval")
+    issued_at = (
+        approval.get("issued_at_unix")
+        if isinstance(approval, Mapping)
+        else None
+    )
+    if type(issued_at) is not int:
+        raise OwnerCutoverError("owner_cutover_unit_input_rotation_invalid")
+    try:
+        # The remote edge owns the freshness decision after it acquires the
+        # activation lock.  Here we authenticate the immutable publication at
+        # issuance so an exact completed replay remains possible after expiry.
+        expected_publication = build_publication(
+            action="unit-input-authority",
+            release_revision=release_revision,
+            documents={
+                "plan": documents["plan"],
+                "approval": documents["approval"],
+            },
+            now_unix=issued_at,
+        )
+    except (KeyError, PermissionError, PublicStagingError, TypeError, ValueError):
+        raise OwnerCutoverError(
+            "owner_cutover_unit_input_rotation_invalid"
+        ) from None
+    if publication != expected_publication:
+        raise OwnerCutoverError("owner_cutover_unit_input_rotation_invalid")
+    try:
+        return unit_rotation.validate_rotation_receipt(
+            transport.invoke(
+                remote_stager_revision,
+                "rotate-unit-input-authority",
+                publication=expected_publication,
+            ),
+            publication=expected_publication,
+        )
+    except unit_rotation.UnitInputRotationError:
+        raise OwnerCutoverError(
+            "owner_cutover_unit_input_rotation_invalid"
+        ) from None
 
 
 def _validate_preflight_receipt(
@@ -3516,6 +3596,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     stage_unit.add_argument("--remote-stager-revision", required=True)
     stage_unit.add_argument("--publication", type=Path, required=True)
     stage_unit.add_argument("--output", type=Path, required=True)
+    rotate_unit = subparsers.add_parser("rotate-unit-inputs")
+    rotate_unit.add_argument("--revision", required=True)
+    rotate_unit.add_argument("--remote-stager-revision", required=True)
+    rotate_unit.add_argument("--publication", type=Path, required=True)
+    rotate_unit.add_argument("--output", type=Path, required=True)
     os_login_preflight = subparsers.add_parser("os-login-preflight")
     os_login_preflight.add_argument("--revision", required=True)
     os_login_preflight.add_argument(
@@ -3559,7 +3644,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_attestation = _active_owner_runtime_attestation(
             arguments.revision
         )
-        if arguments.command == "stage-unit-inputs":
+        if arguments.command in {"stage-unit-inputs", "rotate-unit-inputs"}:
             if not arguments.publication.is_absolute():
                 raise OwnerCutoverError(
                     "owner_cutover_public_input_invalid"
@@ -3569,7 +3654,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     arguments.revision
                 )
             )
-            output_value = stage_unit_input_authority(
+            operation = (
+                stage_unit_input_authority
+                if arguments.command == "stage-unit-inputs"
+                else rotate_unit_input_authority
+            )
+            output_value = operation(
                 release_revision=arguments.revision,
                 remote_stager_revision=arguments.remote_stager_revision,
                 publication=_read_public_json(arguments.publication),
