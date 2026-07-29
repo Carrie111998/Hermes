@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   $terminalNerdFontEnabled,
@@ -29,5 +29,18 @@ describe('terminal font preference', () => {
     expect(family).toContain("'Symbols Nerd Font Mono'")
     expect(family).toContain("'JetBrains Mono'")
     expect(window.localStorage.getItem(TERMINAL_NERD_FONT_STORAGE_KEY)).toBe('true')
+  })
+
+  it('restores the persisted preference and writes later changes', async () => {
+    window.localStorage.setItem(TERMINAL_NERD_FONT_STORAGE_KEY, 'true')
+    vi.resetModules()
+
+    const reloaded = await import('./terminal-font')
+
+    expect(reloaded.$terminalNerdFontEnabled.get()).toBe(true)
+
+    reloaded.setTerminalNerdFontEnabled(false)
+
+    expect(window.localStorage.getItem(TERMINAL_NERD_FONT_STORAGE_KEY)).toBe('false')
   })
 })

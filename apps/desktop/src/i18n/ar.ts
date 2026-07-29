@@ -393,6 +393,9 @@ export const ar = defineLocale({
       colorModeDesc: 'اختر الوضع الفاتح أو الداكن أو اتبع النظام.',
       toolViewTitle: 'عرض الأدوات',
       toolViewDesc: 'تحكم في كيفية عرض نشاط الأدوات داخل المحادثة.',
+      terminalNerdFontTitle: 'خط Nerd Font للطرفية',
+      terminalNerdFontDesc:
+        'استخدم خط Nerd Font مثبتا في الطرفية المضمنة لرموز Powerline والأيقونات. يعود إلى الخط المضمن عند عدم توفره.',
       translucencyTitle: 'شفافية النافذة',
       translucencyDesc: 'إظهار سطح المكتب من خلال النافذة بالكامل. متاح على macOS وWindows فقط.',
       backdropTitle: 'خلفية النافذة',
