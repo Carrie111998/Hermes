@@ -16926,6 +16926,31 @@ app.include_router(_dashboard_auth_router)
 mount_spa(app)
 
 
+def _create_server_sockets(hosts: list[str], port: int) -> list:
+    """Pre-bind one TCP socket per host entry and return them as a list.
+
+    Each socket is created with ``SO_REUSEADDR``.  IPv6 sockets get
+    ``IPV6_V6ONLY=1`` so they coexist with IPv4 listeners on the same
+    port.  Intended for uvicorn's ``server.startup(sockets=…)`` API which
+    accepts multiple pre-created sockets natively.
+
+    Raises ``OSError`` if any host fails to bind.
+    """
+    import socket as _sk
+
+    socks: list = []
+    for h in hosts:
+        family = _sk.AF_INET6 if ":" in h else _sk.AF_INET
+        sock = _sk.socket(family, _sk.SOCK_STREAM)
+        sock.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
+        if family == _sk.AF_INET6:
+            sock.setsockopt(_sk.IPPROTO_IPV6, _sk.IPV6_V6ONLY, 1)
+        sock.bind((h, port))
+        sock.set_inheritable(True)
+        socks.append(sock)
+    return socks
+
+
 def _read_bound_port(server: "uvicorn.Server", fallback: int) -> int:
     """Read the OS-assigned port from a live uvicorn server socket.
 
@@ -17022,7 +17047,7 @@ def _maybe_open_browser(
 
 
 def start_server(
-    host: str = "127.0.0.1",
+    hosts: list[str] | None = None,
     port: int = 9119,
     open_browser: bool = True,
     allow_public: bool = False,
@@ -17032,6 +17057,11 @@ def start_server(
     ssh_owner_nonce: Optional[str] = None,
 ):
     """Start the web UI server.
+
+    ``hosts`` is a list of interface addresses to bind (e.g. ``["0.0.0.0", "::"]``
+    for dual-stack).  Each entry creates its own pre-bound socket; uvicorn
+    accepts all of them via ``server.startup(sockets=…)``.  When ``None``
+    (default) falls back to ``["127.0.0.1"]``.
 
     ``initial_profile`` (when set) is appended to the auto-opened browser
     URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
@@ -17050,6 +17080,9 @@ def start_server(
 
     import uvicorn
 
+    hosts = hosts or ["127.0.0.1"]
+    _primary = hosts[0]
+
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
 
@@ -17061,19 +17094,21 @@ def start_server(
     # injection / WS-auth paths can branch on it consistently.  Phase 3.5
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
-    app.state.auth_required = should_require_auth(host)
+    app.state.auth_required = should_require_auth(_primary)
+
+    _any_public = any(h not in _LOOPBACK_HOST_VALUES for h in hosts)
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
     # dashboards). If a caller still passes it, warn that it is now a no-op
     # rather than silently changing their expectation of an open bind.
-    if allow_public and host not in _LOOPBACK_HOST_VALUES:
+    if allow_public and _any_public:
         _log.warning(
             "--insecure no longer bypasses dashboard authentication. A "
             "non-loopback bind (%s) now ALWAYS requires an auth provider "
             "(OAuth or the bundled password provider). Configure one — see "
             "below — or bind to 127.0.0.1 and reach it over an SSH tunnel / "
-            "Tailscale.", host,
+            "Tailscale.", ", ".join(hosts),
         )
 
     if app.state.auth_required:
@@ -17139,7 +17174,7 @@ def start_server(
                 pass
             if skip_reasons:
                 raise SystemExit(
-                    f"Refusing to bind dashboard to {host} — the auth gate "
+                    f"Refusing to bind dashboard to {_primary} — the auth gate "
                     f"engages on non-loopback binds, but no auth providers "
                     f"are registered.\n\n"
                     f"Bundled providers reported these issues:\n"
@@ -17148,19 +17183,26 @@ def start_server(
                     + _fix_hint
                 )
             raise SystemExit(
-                f"Refusing to bind dashboard to {host} — the auth gate "
+                f"Refusing to bind dashboard to {_primary} — the auth gate "
                 f"engages on non-loopback binds, but no auth providers are "
                 f"registered.\n\n" + _fix_hint
             )
         _log.info(
             "Dashboard binding to %s with auth gate enabled. Providers: %s",
-            host,
+            ", ".join(hosts),
             ", ".join(p.name for p in list_providers()),
         )
 
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
-    app.state.bound_host = host
+    app.state.bound_host = _primary
+
+    # ── Pre-bind sockets for all requested hosts ────────────────────
+    # Pre-creating the sockets lets us bind multiple addresses (e.g. IPv4 +
+    # IPv6) on the same port.  IPv6 sockets get IPV6_V6ONLY=1 so they coexist
+    # with IPv4 listeners.  The sockets are passed to uvicorn's startup()
+    # which accepts a pre-created list natively.
+    _precreated_socks = _create_server_sockets(hosts, port)
 
     # ── Start uvicorn with direct Server API ─────────────────────────
     # We use uvicorn.Server directly (not uvicorn.run) so we can split
@@ -17194,23 +17236,12 @@ def start_server(
     # (idle timeout ~100s) where half-open IS a real failure mode, so keep the
     # ping at 20/20 to detect it promptly and stay under the tunnel's idle
     # window.
-    _is_loopback = host in ("127.0.0.1", "localhost", "::1")
+    _all_loopback = all(h in _LOOPBACK_HOST_VALUES for h in hosts)
     config = uvicorn.Config(
-        app, host=host, port=port, log_level="warning",
-        # proxy_headers defaults to False so _ws_client_is_allowed sees
-        # the real connection peer rather than X-Forwarded-For's rewritten
-        # value (which would defeat the loopback gate when behind a reverse
-        # proxy).  When the OAuth gate is active we are explicitly running
-        # behind a TLS terminator (Fly.io) and need X-Forwarded-Proto to
-        # decide cookie Secure flags, so we flip proxy_headers on for that
-        # mode.
+        app, host=_primary, port=port, log_level="warning",
         proxy_headers=bool(app.state.auth_required),
-        # Half-open detection for public binds only (see above). Loopback
-        # disables the protocol ping (None) so an event-loop stall can never
-        # trigger a false disconnect; a genuinely dead local client is still
-        # reaped via the WebSocketDisconnect → disconnect/reap path.
-        ws_ping_interval=None if _is_loopback else 20.0,
-        ws_ping_timeout=None if _is_loopback else 20.0,
+        ws_ping_interval=None if _all_loopback else 20.0,
+        ws_ping_timeout=None if _all_loopback else 20.0,
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
     )
     server = uvicorn.Server(config)
@@ -17222,7 +17253,7 @@ def start_server(
             config.load()
         server.lifespan = config.lifespan_class(config)
         with server.capture_signals():
-            await server.startup()
+            await server.startup(sockets=_precreated_socks)
             if server.should_exit:
                 return
 
@@ -17238,10 +17269,10 @@ def start_server(
             if headless:
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
-                print(f"  Hermes backend listening on {host}:{actual_port}")
+                print(f"  Hermes backend listening on {_primary}:{actual_port}")
             else:
-                print(f"  Hermes Web UI → http://{host}:{actual_port}")
-            _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+                print(f"  Hermes Web UI → http://{_primary}:{actual_port}")
+            _maybe_open_browser(_primary, actual_port, open_browser, initial_profile)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
             # forcibly closes its WebSocket mid-write, asyncio logs a full
