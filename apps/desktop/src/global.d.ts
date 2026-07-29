@@ -127,7 +127,7 @@ declare global {
       readClipboard: () => Promise<string>
       saveImageFromUrl: (url: string) => Promise<boolean>
       saveImageBuffer: (data: ArrayBuffer | Uint8Array, ext: string) => Promise<string>
-      saveClipboardImage: () => Promise<string>
+      saveClipboardImage: (options?: { wslHostOnly?: boolean }) => Promise<string>
       getPathForFile: (file: File) => string
       normalizePreviewTarget: (target: string, baseDir?: string) => Promise<HermesPreviewTarget | null>
       watchPreviewFile: (url: string) => Promise<HermesPreviewWatch>
