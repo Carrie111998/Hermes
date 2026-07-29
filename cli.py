@@ -17429,6 +17429,37 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
+    def _block_kind() -> "str | None":
+        c = _kb.connect()
+        try:
+            t = _kb.get_task(c, task_id)
+            return getattr(t, "block_kind", None) if t is not None else None
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def _reopen(reason: str) -> None:
+        # Restore the live worker's claim identity along with the status —
+        # a 'running' row with NULL worker_pid/claim_expires is invisible to
+        # both watchdogs and would hang forever if this process died.
+        c = _kb.connect()
+        try:
+            _kb.reopen_task(
+                c,
+                task_id,
+                reason=reason,
+                claim_lock=(_os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or None),
+                worker_pid=_os.getpid(),
+                claim_ttl_seconds=_kb._resolve_claim_ttl_seconds(),
+            )
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
@@ -17445,6 +17476,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         run_turn=_run_turn,
         task_status_fn=_task_status,
         block_fn=_block,
+        block_kind_fn=_block_kind,
+        reopen_fn=_reopen,
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
