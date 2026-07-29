@@ -3007,6 +3007,22 @@ def _session_toolset_selection(session: dict) -> list[str] | None:
     return list(stored) if stored is not None else None
 
 
+def _effective_toolset_selection(session: dict | None) -> list[str] | None:
+    """What a session's tools resolve to right now, for inspection RPCs.
+
+    A session with no explicit scope and no agent yet has NOT escaped the
+    configured toolsets: it will be built from them, so inspection must answer
+    with the current global resolution rather than with "everything".
+    """
+    if session:
+        selection = _session_toolset_selection(session)
+        if selection is not None:
+            return selection
+        if session.get("agent") is not None:
+            return None
+    return _load_enabled_toolsets()
+
+
 def _reported_toolset_selection(session: dict | None) -> set[str] | None:
     """Toolsets to mark enabled for a client, or ``None`` when all of them are.
 
@@ -3014,9 +3030,7 @@ def _reported_toolset_selection(session: dict | None) -> set[str] | None:
     no toolset at all, while ``None`` is "no explicit scope" and keeps the
     historical "everything is enabled" answer.
     """
-    selection = (
-        _session_toolset_selection(session) if session else _load_enabled_toolsets()
-    )
+    selection = _effective_toolset_selection(session)
     return set(selection) if selection is not None else None
 
 
@@ -15629,11 +15643,7 @@ def _(rid, params: dict) -> dict:
         from model_tools import get_toolset_for_tool, get_tool_definitions
 
         session = _sessions.get(params.get("session_id", ""))
-        enabled = (
-            _session_toolset_selection(session)
-            if session
-            else _load_enabled_toolsets()
-        )
+        enabled = _effective_toolset_selection(session)
         tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
         sections = {}
 

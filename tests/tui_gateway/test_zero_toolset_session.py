@@ -1237,3 +1237,67 @@ class TestDesktopBranchInheritsScope:
         )
         assert "error" in resp
         assert not calls
+
+
+class TestPrebuildInspection:
+    """Before the agent exists, inspection must reflect the CURRENT global
+    config, not "everything", while a pinned empty scope still reports none."""
+
+    def _session(self, pinned):
+        session = {"session_key": "k", "agent": None}
+        if pinned is not None:
+            session["create_enabled_toolsets"] = pinned
+        return session
+
+    @pytest.mark.parametrize("method", ["tools.list", "toolsets.list"])
+    def test_unpinned_prebuild_follows_restricted_global(self, method, monkeypatch) -> None:
+        server = _reporting_server()
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+        items = _list_toolsets(server, method, self._session(None))
+        assert [i["name"] for i in items if i["enabled"]] == ["file"]
+
+    @pytest.mark.parametrize("method", ["tools.list", "toolsets.list"])
+    def test_unpinned_prebuild_with_global_none_reports_everything(
+        self, method, monkeypatch
+    ) -> None:
+        server = _reporting_server()
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: None)
+        items = _list_toolsets(server, method, self._session(None))
+        assert all(i["enabled"] for i in items)
+
+    @pytest.mark.parametrize("method", ["tools.list", "toolsets.list"])
+    def test_pinned_empty_prebuild_still_reports_none(self, method, monkeypatch) -> None:
+        server = _reporting_server()
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+        items = _list_toolsets(server, method, self._session([]))
+        assert [i["name"] for i in items if i["enabled"]] == []
+
+    def test_tools_show_prebuild_follows_restricted_global(self, monkeypatch) -> None:
+        server = _reporting_server()
+        # Pick a toolset that actually resolves to tools in this environment,
+        # so the assertion measures the restriction and not the registry.
+        from model_tools import get_tool_definitions
+        from toolsets import get_all_toolsets
+
+        restricted = next(
+            (
+                name
+                for name in sorted(get_all_toolsets())
+                if get_tool_definitions(enabled_toolsets=[name], quiet_mode=True)
+            ),
+            None,
+        )
+        assert restricted, "no toolset resolves to tools in this environment"
+
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: None)
+        total_global = _show_tools(server, self._session(None))["total"]
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: [restricted])
+        result = _show_tools(server, self._session(None))
+        assert 0 < result["total"] < total_global
+
+    def test_tools_show_prebuild_pinned_empty_is_zero(self, monkeypatch) -> None:
+        server = _reporting_server()
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+        result = _show_tools(server, self._session([]))
+        assert result["total"] == 0
+        assert result["sections"] == []
