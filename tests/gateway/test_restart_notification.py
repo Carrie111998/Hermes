@@ -705,6 +705,38 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
 
 
 @pytest.mark.asyncio
+async def test_send_restart_notification_uses_standalone_telegram_fallback(
+    tmp_path, monkeypatch
+):
+    """A fresh Telegram polling generation must still acknowledge /restart."""
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=False, error="send_path_degraded"),
+    )
+    standalone_send = AsyncMock(return_value={"success": True, "message_id": "2"})
+    monkeypatch.setattr(telegram_adapter, "_standalone_send", standalone_send)
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "42", None)
+    standalone_send.assert_awaited_once_with(
+        runner.config.platforms[Platform.TELEGRAM],
+        "42",
+        "♻ Gateway restarted successfully. Your session continues.",
+        thread_id=None,
+    )
+    assert not (tmp_path / ".restart_notify.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_send_home_channel_startup_notification_skipped_when_flag_disabled(
     tmp_path, monkeypatch
 ):
