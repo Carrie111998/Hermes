@@ -2931,9 +2931,17 @@ async function applyUpdates(opts = {}) {
     // user an actionable error.  Windows-only; the .pyd lock hazard is a
     // Windows phenomenon.  ALL failures (blocked, missing python, timeout,
     // malformed output, missing psutil) abort the handoff — never proceed
-    // to the detached updater when the venv state is unknown.
+    // to the detached updater when the venv state is unknown.  The scanner
+    // deliberately defers only process trees proved to be a Gateway: the
+    // official updater owns their pause/resume lifecycle after handoff.
     if (IS_WINDOWS) {
       const scanOutcome = await scanVenvBlockers(updateRoot)
+
+      if (scanOutcome.kind !== 'probe-failure' && scanOutcome.result.updaterManagedProcesses.length > 0) {
+        rememberLog(
+          `[updates] deferring ${scanOutcome.result.updaterManagedProcesses.length} Gateway process(es) to the official updater`
+        )
+      }
 
       if (scanOutcome.kind === 'blocked') {
         const message = formatBlockerMessage(scanOutcome.result)

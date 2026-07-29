@@ -59,7 +59,9 @@ def test_venv_health_missing_venv_unhealthy_with_interrupted_marker(tmp_path):
     assert "venv python missing" in detail
 
 
-def _fake_venv_python(tmp_path, *, windows: bool = False):
+def _fake_venv_python(tmp_path, *, windows: bool | None = None):
+    if windows is None:
+        windows = sys.platform == "win32"
     bin_dir = tmp_path / "venv" / ("Scripts" if windows else "bin")
     bin_dir.mkdir(parents=True)
     py = bin_dir / ("python.exe" if windows else "python")
@@ -344,3 +346,36 @@ def _run_update_until_guard(args):
 def test_venv_holder_guard_force_semantics(force, force_venv, expected, capsys):
     result = _run_update_until_guard(_update_args(force=force, force_venv=force_venv))
     assert result == expected, capsys.readouterr().out
+
+
+def test_gateway_pause_precedes_venv_guard_and_restores_on_blocker(capsys):
+    events = []
+    token = {"resume_needed": True}
+
+    def pause_gateways():
+        events.append("pause")
+        return token
+
+    def find_holders():
+        events.append("scan")
+        return [(101, "python.exe", "python.exe -m hermes_cli.main serve")]
+
+    def resume_gateways(received):
+        events.append("resume")
+        assert received is token
+
+    with patch.object(cli_main, "_is_windows", return_value=True), patch.object(
+        cli_main, "_venv_scripts_dir", return_value=None
+    ), patch.object(cli_main, "_run_pre_update_backup"), patch.object(
+        cli_main, "_pause_windows_gateways_for_update", side_effect=pause_gateways
+    ), patch.object(
+        cli_main, "_detect_venv_python_processes", side_effect=find_holders
+    ), patch.object(
+        cli_main, "_resume_windows_gateways_after_update", side_effect=resume_gateways
+    ):
+        with pytest.raises(SystemExit) as exc:
+            cli_main._cmd_update_impl(_update_args(), gateway_mode=False)
+
+    assert exc.value.code == 2
+    assert events == ["pause", "scan", "resume"]
+    assert "Other Hermes processes" in capsys.readouterr().out

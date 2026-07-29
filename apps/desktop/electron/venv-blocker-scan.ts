@@ -25,8 +25,10 @@ export interface VenvBlockerProcess {
 }
 
 export interface VenvBlockerScanResult {
+  schemaVersion: 1 | 2
   blocked: boolean
   processes: VenvBlockerProcess[]
+  updaterManagedProcesses: VenvBlockerProcess[]
 }
 
 export type ScanOutcome =
@@ -70,28 +72,73 @@ export function parseVenvBlockerScanOutput(raw: string): ScanOutcome {
     return { kind: 'probe-failure', error: 'processes must be an array' }
   }
 
-  const processes: VenvBlockerProcess[] = []
+  const schemaVersion = parsed.schema_version === undefined ? 1 : parsed.schema_version
 
-  for (const entry of parsed.processes) {
-    if (!entry || typeof entry !== 'object') {
-      return { kind: 'probe-failure', error: 'process entry must be an object' }
+  if (schemaVersion !== 1 && schemaVersion !== 2) {
+    return { kind: 'probe-failure', error: 'unsupported scan schema version' }
+  }
+
+  if (schemaVersion === 1 && parsed.updater_managed_processes !== undefined) {
+    return { kind: 'probe-failure', error: 'v1 scan must not include updater-managed processes' }
+  }
+
+  if (schemaVersion === 2 && !Array.isArray(parsed.updater_managed_processes)) {
+    return { kind: 'probe-failure', error: 'updater_managed_processes must be an array' }
+  }
+
+  const parseProcesses = (entries: unknown, label: string): VenvBlockerProcess[] | string => {
+    if (!Array.isArray(entries)) {
+      return `${label} must be an array`
     }
 
-    const { pid, name, cmdline } = entry
+    const result: VenvBlockerProcess[] = []
 
-    if (!Number.isInteger(pid) || pid <= 0) {
-      return { kind: 'probe-failure', error: 'process pid must be a positive integer' }
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') {
+        return `${label} entry must be an object`
+      }
+
+      const { pid, name, cmdline } = entry as Record<string, unknown>
+
+      if (!Number.isInteger(pid) || (pid as number) <= 0) {
+        return `${label} pid must be a positive integer`
+      }
+
+      if (typeof name !== 'string' || name.length === 0) {
+        return `${label} name must be a non-empty string`
+      }
+
+      if (typeof cmdline !== 'string') {
+        return `${label} cmdline must be a string`
+      }
+
+      result.push({ pid: pid as number, name, cmdline })
     }
 
-    if (typeof name !== 'string' || name.length === 0) {
-      return { kind: 'probe-failure', error: 'process name must be a non-empty string' }
+    return result
+  }
+
+  const processes = parseProcesses(parsed.processes, 'process')
+
+  if (typeof processes === 'string') {
+    return { kind: 'probe-failure', error: processes }
+  }
+
+  const updaterManagedProcesses =
+    schemaVersion === 2 ? parseProcesses(parsed.updater_managed_processes, 'updater-managed process') : []
+
+  if (typeof updaterManagedProcesses === 'string') {
+    return { kind: 'probe-failure', error: updaterManagedProcesses }
+  }
+
+  const reportedPids = new Set<number>()
+
+  for (const process of [...processes, ...updaterManagedProcesses]) {
+    if (reportedPids.has(process.pid)) {
+      return { kind: 'probe-failure', error: 'process PID appears in multiple scan classes' }
     }
 
-    if (typeof cmdline !== 'string') {
-      return { kind: 'probe-failure', error: 'process cmdline must be a string' }
-    }
-
-    processes.push({ pid, name, cmdline })
+    reportedPids.add(process.pid)
   }
 
   // Reject inconsistent combinations
@@ -104,8 +151,14 @@ export function parseVenvBlockerScanOutput(raw: string): ScanOutcome {
   }
 
   return parsed.blocked
-    ? { kind: 'blocked', result: { blocked: true, processes } }
-    : { kind: 'clear', result: { blocked: false, processes } }
+    ? {
+        kind: 'blocked',
+        result: { schemaVersion, blocked: true, processes, updaterManagedProcesses }
+      }
+    : {
+        kind: 'clear',
+        result: { schemaVersion, blocked: false, processes, updaterManagedProcesses }
+      }
 }
 
 /**

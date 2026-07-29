@@ -555,6 +555,28 @@ def test_resume_windows_gateways_after_update_relaunches_paused_profiles(
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
+def test_resume_windows_gateways_after_update_is_idempotent(_winp, monkeypatch):
+    import hermes_cli.gateway as gateway_mod
+
+    relaunched = []
+    monkeypatch.setattr(
+        gateway_mod,
+        "launch_detached_profile_gateway_restart",
+        lambda profile, old_pid: relaunched.append((profile, old_pid)) or True,
+    )
+    token = {
+        "resume_needed": True,
+        "profiles": {"default": 101},
+        "unmapped_pids": [],
+    }
+
+    cli_main._resume_windows_gateways_after_update(token)
+    cli_main._resume_windows_gateways_after_update(token)
+
+    assert relaunched == [("default", 101)]
+
+
+@patch.object(cli_main, "_is_windows", return_value=True)
 def test_resume_windows_gateways_after_update_respawns_unmapped_by_cmdline(
     _winp,
     monkeypatch,

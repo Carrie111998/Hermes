@@ -55,8 +55,10 @@ describe('resolveVenvPython', () => {
 describe('formatBlockerMessage', () => {
   it('includes PID, name, cmdline, remote-client warning, and retry suggestion', () => {
     const msg = formatBlockerMessage({
+      schemaVersion: 2,
       blocked: true,
-      processes: [{ pid: 101, name: 'python.exe', cmdline: 'serve --host 10.0.0.1' }]
+      processes: [{ pid: 101, name: 'python.exe', cmdline: 'serve --host 10.0.0.1' }],
+      updaterManagedProcesses: []
     })
 
     assert.ok(msg.includes('PID 101'))
@@ -82,10 +84,16 @@ describe('formatProbeFailedMessage', () => {
 
 describe('parseVenvBlockerScanOutput', () => {
   const ok = (over: any = {}) => JSON.stringify({ ok: true, blocked: false, processes: [], ...over })
+  const v2 = (over: any = {}) => ok({ schema_version: 2, updater_managed_processes: [], ...over })
 
-  it('valid clear', () => {
+  it('accepts the legacy v1 clear schema', () => {
     const o = parseVenvBlockerScanOutput(ok())
     assert.equal(o.kind, 'clear')
+
+    if (o.kind === 'clear') {
+      assert.equal(o.result.schemaVersion, 1)
+      assert.deepEqual(o.result.updaterManagedProcesses, [])
+    }
   })
 
   it('valid blocked', () => {
@@ -97,6 +105,50 @@ describe('parseVenvBlockerScanOutput', () => {
     )
 
     assert.equal(o.kind, 'blocked')
+  })
+
+  it('allows a v2 scan that defers only Gateway processes to the official updater', () => {
+    const o = parseVenvBlockerScanOutput(
+      v2({
+        updater_managed_processes: [
+          { pid: 101, name: 'python.exe', cmdline: 'gateway run --replace' },
+          { pid: 202, name: 'python.exe', cmdline: 'runtime gateway child' }
+        ]
+      })
+    )
+
+    assert.equal(o.kind, 'clear')
+
+    if (o.kind === 'clear') {
+      assert.equal(o.result.schemaVersion, 2)
+      assert.deepEqual(
+        o.result.updaterManagedProcesses.map(process => process.pid),
+        [101, 202]
+      )
+    }
+  })
+
+  it('still blocks when a v2 scan also finds an unrelated venv process', () => {
+    const o = parseVenvBlockerScanOutput(
+      v2({
+        blocked: true,
+        processes: [{ pid: 303, name: 'python.exe', cmdline: 'serve' }],
+        updater_managed_processes: [{ pid: 101, name: 'python.exe', cmdline: 'gateway run' }]
+      })
+    )
+
+    assert.equal(o.kind, 'blocked')
+
+    if (o.kind === 'blocked') {
+      assert.deepEqual(
+        o.result.processes.map(process => process.pid),
+        [303]
+      )
+      assert.deepEqual(
+        o.result.updaterManagedProcesses.map(process => process.pid),
+        [101]
+      )
+    }
   })
 
   it('malformed JSON', () => {
@@ -142,6 +194,23 @@ describe('parseVenvBlockerScanOutput', () => {
   it('process missing cmdline is rejected', () => {
     assert.equal(
       parseVenvBlockerScanOutput(ok({ blocked: true, processes: [{ pid: 1, name: 'p' }] })).kind,
+      'probe-failure'
+    )
+  })
+
+  it('rejects a v2 scan without updater-managed processes', () => {
+    assert.equal(parseVenvBlockerScanOutput(ok({ schema_version: 2 })).kind, 'probe-failure')
+  })
+
+  it('rejects the same PID in blocker and updater-managed classes', () => {
+    assert.equal(
+      parseVenvBlockerScanOutput(
+        v2({
+          blocked: true,
+          processes: [{ pid: 101, name: 'python.exe', cmdline: 'serve' }],
+          updater_managed_processes: [{ pid: 101, name: 'python.exe', cmdline: 'gateway run' }]
+        })
+      ).kind,
       'probe-failure'
     )
   })

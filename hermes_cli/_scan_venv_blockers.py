@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import NoReturn
+from collections.abc import Callable
+from typing import Any, NoReturn
+
+
+_SCAN_SCHEMA_VERSION = 2
 
 # Long CLI flags whose argument value must be redacted from the cmdline.
 _SENSITIVE_LONG_FLAGS: list[str] = [
@@ -30,7 +34,15 @@ _SENSITIVE_LONG_FLAGS: list[str] = [
 
 def _probe_fail_json() -> str:
     """Return the standard probe-failure JSON document."""
-    return json.dumps({"ok": False, "blocked": False, "processes": []})
+    return json.dumps(
+        {
+            "ok": False,
+            "schema_version": _SCAN_SCHEMA_VERSION,
+            "blocked": False,
+            "processes": [],
+            "updater_managed_processes": [],
+        }
+    )
 
 
 def _emit_probe_fail(diagnostic: str) -> NoReturn:
@@ -92,6 +104,70 @@ def _redact_sensitive_cmdline(cmdline: str) -> str:
     return cmdline
 
 
+def _gateway_managed_holder_pids(
+    matches: list[tuple[int, str, str]],
+    *,
+    gateway_pid_finder: Callable[..., list[int]] | None = None,
+    process_factory: Callable[[int], Any] | None = None,
+) -> set[int]:
+    """Return venv-holder PIDs belonging to a live Gateway process tree.
+
+    Desktop must leave independent Gateways alive until the staged official
+    updater owns their pause/resume lifecycle.  This classifier is deliberately
+    narrow: it trusts the existing Gateway discovery as the seed, then only
+    exempts holder PIDs that are live ancestors or descendants of that seed.
+    Any discovery or process-tree failure leaves the affected holder blocked.
+    """
+    holder_pids = {pid for pid, _name, _cmdline in matches}
+    if not holder_pids:
+        return set()
+
+    if gateway_pid_finder is None:
+        try:
+            from hermes_cli.gateway import find_gateway_pids
+        except Exception:
+            return set()
+        gateway_pid_finder = find_gateway_pids
+
+    if process_factory is None:
+        try:
+            import psutil
+        except Exception:
+            return set()
+        process_factory = psutil.Process
+
+    try:
+        gateway_pids = gateway_pid_finder(all_profiles=True)
+    except Exception:
+        return set()
+
+    managed: set[int] = set()
+    for gateway_pid in gateway_pids:
+        try:
+            process = process_factory(int(gateway_pid))
+            related_pids = {int(process.pid)}
+            related_pids.update(int(parent.pid) for parent in process.parents())
+            related_pids.update(
+                int(child.pid) for child in process.children(recursive=True)
+            )
+        except Exception:
+            # The PID could have exited, been reused, or become inaccessible
+            # between discovery and inspection.  Keep every such holder blocked.
+            continue
+        managed.update(holder_pids.intersection(related_pids))
+    return managed
+
+
+def _process_payload(match: tuple[int, str, str]) -> dict[str, int | str]:
+    """Serialize one holder after the classification phase used raw argv."""
+    pid, name, cmdline = match
+    return {
+        "pid": pid,
+        "name": name,
+        "cmdline": _redact_sensitive_cmdline(cmdline),
+    }
+
+
 def main() -> None:
     """Entry point.  Prints one JSON doc to stdout.  Exits 0 for valid scan."""
     try:
@@ -106,15 +182,18 @@ def main() -> None:
     except Exception as exc:
         _emit_probe_fail(f"scan aborted: {exc}")
 
-    processes = [
-        {
-            "pid": pid,
-            "name": name,
-            "cmdline": _redact_sensitive_cmdline(cmdline),
-        }
-        for pid, name, cmdline in matches
+    updater_managed_pids = _gateway_managed_holder_pids(matches)
+    processes = [_process_payload(match) for match in matches if match[0] not in updater_managed_pids]
+    updater_managed_processes = [
+        _process_payload(match) for match in matches if match[0] in updater_managed_pids
     ]
-    data = {"ok": True, "blocked": bool(processes), "processes": processes}
+    data = {
+        "ok": True,
+        "schema_version": _SCAN_SCHEMA_VERSION,
+        "blocked": bool(processes),
+        "processes": processes,
+        "updater_managed_processes": updater_managed_processes,
+    }
     print(json.dumps(data))
     sys.exit(0)
 

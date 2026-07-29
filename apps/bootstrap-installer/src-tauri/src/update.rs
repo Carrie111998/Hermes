@@ -223,8 +223,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
         &format!("[update] updating against branch {update_branch}"),
     );
     let child_env = update_child_env(&install_root);
-    let mut update_args: Vec<String> =
-        vec!["update".into(), "--yes".into(), "--gateway".into()];
+    let update_args = update_command_args(&update_branch);
     // --force skips `hermes update`'s Windows running-exe guard (which would
     // `sys.exit(2)` and dead-end the handoff). By contract the desktop has
     // already exited and waited for the install locks to clear before launching
@@ -239,10 +238,6 @@ async fn run_update(app: AppHandle) -> Result<()> {
     // could still be alive here — mutating the venv under it would strand the
     // install half-updated. If that guard fires, it exits 2 and the match arm
     // below surfaces the correct "close all Hermes windows" message.
-    update_args.push("--force".into());
-    update_args.push("--branch".into());
-    update_args.push(update_branch);
-
     emit_stage(&app, "update", StageState::Running, None, None);
     let started = Instant::now();
     let mut update = run_streamed(
@@ -627,6 +622,17 @@ fn is_locked(path: &Path) -> bool {
 /// second run resolves.
 fn rebuild_needs_retry(exit_code: Option<i32>) -> bool {
     exit_code != Some(0)
+}
+
+fn update_command_args(update_branch: &str) -> Vec<String> {
+    vec![
+        "update".into(),
+        "--yes".into(),
+        "--gateway".into(),
+        "--force".into(),
+        "--branch".into(),
+        update_branch.into(),
+    ]
 }
 
 /// Spawn `hermes <args>` from `cwd`, stream stdout/stderr as Log events on the
@@ -1148,6 +1154,21 @@ mod tests {
             Some("main".to_string())
         );
         assert_eq!(update_branch_from_args(["--update"]), None);
+    }
+
+    #[test]
+    fn updater_invokes_official_gateway_aware_update() {
+        assert_eq!(
+            update_command_args("main"),
+            vec![
+                "update".to_string(),
+                "--yes".to_string(),
+                "--gateway".to_string(),
+                "--force".to_string(),
+                "--branch".to_string(),
+                "main".to_string(),
+            ]
+        );
     }
 
     #[test]
