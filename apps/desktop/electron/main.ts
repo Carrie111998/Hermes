@@ -121,10 +121,14 @@ import {
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret as encryptDesktopSecretStrict,
+  filenameFromContentDisposition,
+  PLUGIN_DOWNLOAD_MAX_BYTES,
   readFileDataUrlForIpc,
+  resolveDownloadCollision,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
+  safeDownloadFilename,
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
@@ -4231,6 +4235,82 @@ function fetchJson(url, token, options: any = {}) {
       req.write(body)
     }
 
+    req.end()
+  })
+}
+
+// Binary sibling of `fetchJson`: same auth header and protocol guard, but the
+// response stays a Buffer instead of being decoded as UTF-8 and JSON.parsed.
+// Attachments are arbitrary bytes (PNG, PDF, tarball) — routing them through
+// the JSON path corrupts them. Capped so a huge blob can't exhaust main's heap.
+function fetchBuffer(url, token, options: any = {}) {
+  return new Promise<{ buffer: Buffer; contentDisposition: string; contentType: string }>((resolve, reject) => {
+    const parsed = new URL(url)
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+
+      return
+    }
+
+    const client = parsed.protocol === 'https:' ? https : http
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+    const maxBytes =
+      Number.isFinite(options.maxBytes) && Number(options.maxBytes) > 0
+        ? Number(options.maxBytes)
+        : PLUGIN_DOWNLOAD_MAX_BYTES
+
+    const req = client.request(
+      parsed,
+      {
+        method: 'GET',
+        headers: {
+          ...(token ? { 'X-Hermes-Session-Token': token } : {}),
+          ...(options.bearer ? { Authorization: `Bearer ${options.bearer}` } : {})
+        }
+      },
+      res => {
+        const chunks = []
+        let total = 0
+
+        res.on('error', reject)
+        res.on('data', chunk => {
+          total += chunk.length
+
+          // Abort mid-stream rather than buffering a blob we've already
+          // decided to refuse.
+          if (total > maxBytes) {
+            req.destroy(new Error(`Download exceeds the ${Math.floor(maxBytes / (1024 * 1024))} MB limit.`))
+
+            return
+          }
+
+          chunks.push(chunk)
+        })
+        res.on('end', () => {
+          const buffer = Buffer.concat(chunks)
+
+          if ((res.statusCode || 500) >= 400) {
+            // Errors from the backend are JSON/text even on this path.
+            reject(new Error(`${res.statusCode}: ${buffer.toString('utf8').slice(0, 200) || res.statusMessage}`))
+
+            return
+          }
+
+          resolve({
+            buffer,
+            contentDisposition: String(res.headers['content-disposition'] || ''),
+            contentType: String(res.headers['content-type'] || '')
+          })
+        })
+      }
+    )
+
+    req.on('error', reject)
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+    })
     req.end()
   })
 }
@@ -10127,6 +10207,93 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     upload: request?.upload,
     timeoutMs
   })
+})
+
+// Plugin binary download: fetch bytes from a plugin's own API namespace, ask
+// the user where to put them, write, and offer to reveal. The renderer runs on
+// a file:// origin and `hermes:api` is JSON-only, so a plugin has no other way
+// to hand the user a file. Namespace scoping is enforced renderer-side by
+// `pluginDownload` and re-derived here — main never takes a caller-supplied
+// absolute URL.
+ipcMain.handle('hermes:plugin:download', async (_event, request) => {
+  const pluginId = String(request?.pluginId || '')
+  const suffix = String(request?.path || '')
+
+  // Belt-and-braces against a compromised renderer: rebuild the path from the
+  // plugin id here instead of trusting a caller-assembled one.
+  if (!/^[a-z0-9][a-z0-9-]*$/i.test(pluginId)) {
+    throw new Error(`hermes:plugin:download: invalid plugin id "${pluginId}"`)
+  }
+
+  if (!suffix.startsWith('/') || suffix.split(/[?#]/, 1)[0].split('/').includes('..')) {
+    throw new Error(`hermes:plugin:download: illegal path "${suffix}"`)
+  }
+
+  const profile = request?.profile
+  const connection = await ensureBackend(resolveRouteProfile(null, profile))
+
+  const requestPath = pathWithGlobalRemoteProfile(
+    `/api/plugins/${pluginId}${suffix}`,
+    profile,
+    profileRouteOptions(profile)
+  )
+
+  const url = `${connection.baseUrl}${requestPath}`
+
+  let fetched
+
+  if (connection.authMode === 'oauth') {
+    // Cookie-partition downloads would need the electron.net path; the native
+    // bearer covers the flows we support today. Fail loudly instead of writing
+    // a 401 body to disk as if it were the file.
+    const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
+
+    if (!nativeAt) {
+      throw new Error('Downloads are not supported against cookie-authenticated OAuth backends yet.')
+    }
+
+    fetched = await fetchBuffer(url, null, { bearer: nativeAt, timeoutMs: request?.timeoutMs })
+  } else {
+    fetched = await fetchBuffer(url, connection.token, { timeoutMs: request?.timeoutMs })
+  }
+
+  // Caller's suggestion first (the DB's filename), then the server's
+  // Content-Disposition, then a generic fallback. Every branch is sanitized:
+  // all three sources are attacker-influenced.
+  const suggested =
+    safeDownloadFilename(request?.filename, '') ||
+    filenameFromContentDisposition(fetched.contentDisposition) ||
+    'download'
+
+  const target = await dialog.showSaveDialog(mainWindow, {
+    title: 'Save Attachment',
+    defaultPath: path.join(app.getPath('downloads'), suggested)
+  })
+
+  if (target.canceled || !target.filePath) {
+    return { canceled: true }
+  }
+
+  // The dialog already warns on overwrite, but a user can still land on a name
+  // that raced into existence; never clobber silently.
+  const filePath = resolveDownloadCollision(target.filePath, candidate => fs.existsSync(candidate))
+  await fs.promises.writeFile(filePath, fetched.buffer)
+
+  return { canceled: false, filePath }
+})
+
+// Reveal a saved download in Finder/Explorer/Files — the follow-up affordance
+// for the toast the renderer shows after a successful save.
+ipcMain.handle('hermes:plugin:revealDownload', (_event, filePath) => {
+  const target = String(filePath || '')
+
+  if (!target) {
+    return false
+  }
+
+  shell.showItemInFolder(target)
+
+  return true
 })
 
 // One deduper per cross-window cue — the choke point every window shares. Main
