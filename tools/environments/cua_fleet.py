@@ -37,6 +37,7 @@ class CuaFleetConfig:
     image: str = "trycua/cua:latest"
     image_pull_secret: str = "ecr-credentials"
     pool: str = "hermes-desktop"
+    replicas: int = 1
     cwd: str = "/root"
     timeout: int = 60
     cpu: int | None = 2
@@ -47,6 +48,14 @@ class CuaFleetConfig:
     services: Mapping[str, int] = field(
         default_factory=lambda: {"server": 8000, "mcp": 3000}
     )
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.replicas, bool)
+            or not isinstance(self.replicas, int)
+            or self.replicas < 1
+        ):
+            raise ValueError("replicas must be a positive integer")
 
 
 @dataclass
@@ -573,7 +582,7 @@ class CuaFleetDesktopProvider:
         return sdk.CreatePoolRequest(
             namespace=namespace,
             spec=sdk.PoolSpec(
-                replicas=1,
+                replicas=self.config.replicas,
                 services=services,
                 template=sdk.PoolTemplate(
                     runtime=None,
@@ -632,7 +641,10 @@ class CuaFleetDesktopProvider:
         while True:
             current = worker.run(client.get_pool(pool), self.config.request_timeout)
             status = getattr(current, "status", None)
-            if status is not None and (getattr(status, "available_count", 0) or 0) >= 1:
+            if (
+                status is not None
+                and (getattr(status, "available_count", 0) or 0) >= self.config.replicas
+            ):
                 return current
             if time.monotonic() >= deadline:
                 raise TimeoutError(

@@ -156,6 +156,12 @@ def test_cua_fleet_config_defaults() -> None:
     assert config.client_id == ""
     assert config.client_secret == ""
     assert config.pool == "hermes-desktop"
+    assert config.replicas == 1
+
+
+def test_cua_fleet_config_rejects_non_positive_replicas() -> None:
+    with pytest.raises(ValueError, match="replicas"):
+        CuaFleetConfig(replicas=0)
 
 
 def test_environments_package_reexports_cua_fleet_sdk() -> None:
@@ -282,12 +288,21 @@ class _FakeFleetSdk:
             self.__dict__.update(kwargs)
 
 
-def _fleet_provider() -> CuaFleetDesktopProvider:
+def _fleet_provider(
+    replicas: int = 2, available_count: int | None = None, ready_timeout: float = 600
+) -> CuaFleetDesktopProvider:
     _FakeFleetSdk.CyclopsClient.client = _FakeFleetClient()
+    _FakeFleetSdk.CyclopsClient.client.pool.status.available_count = (
+        replicas if available_count is None else available_count
+    )
     _FakeFleetSdk.CyclopsClient.connect_calls = 0
     return CuaFleetDesktopProvider(
         CuaFleetConfig(
-            client_id="ukey-test", client_secret="secret", ready_poll_interval=0
+            client_id="ukey-test",
+            client_secret="secret",
+            replicas=replicas,
+            ready_poll_interval=0,
+            ready_timeout=ready_timeout,
         ),
         sdk_module=_FakeFleetSdk,
     )
@@ -311,6 +326,7 @@ def test_cua_fleet_reconciles_missing_pool_and_releases_only_claim() -> None:
     assert environment.compute_lease is lease
     assert lease.metadata["namespace"] == "hermes-desktop"
     assert lease.metadata["pool"] == "hermes-desktop"
+    assert _FakeFleetSdk.CyclopsClient.client.pool.spec.replicas == 2
 
 
 def test_cua_fleet_reconcile_is_noop_when_pool_spec_matches() -> None:
@@ -340,7 +356,7 @@ def test_cua_fleet_reconcile_updates_drifted_pool() -> None:
     calls = [call[0] for call in client.calls]
     assert "create_pool" not in calls
     assert calls.count("update_pool") == 1
-    assert client.pool.spec.replicas == 1
+    assert client.pool.spec.replicas == 2
     assert "delete_pool" not in calls
 
 
@@ -377,11 +393,23 @@ def test_compute_config_selects_cua_fleet_provider(monkeypatch) -> None:
     provider = _provider_from_config({
         "provider": "cua_fleet",
         "image": "registry.example/desktop:latest",
-        "cua_fleet": {"base_url": "https://run.cua.ai", "pool": "hermes-desktop"},
+        "cua_fleet": {
+            "base_url": "https://run.cua.ai",
+            "pool": "hermes-desktop",
+            "replicas": 2,
+        },
     })
 
     assert isinstance(provider, CuaFleetDesktopProvider)
     assert provider.config.image == "registry.example/desktop:latest"
+    assert provider.config.replicas == 2
+
+
+def test_cua_fleet_waits_for_configured_replicas() -> None:
+    provider = _fleet_provider(available_count=1, ready_timeout=0)
+
+    with pytest.raises(TimeoutError, match="Timed out waiting for Fleet pool"):
+        provider.acquire("task-insufficient-capacity")
 
 
 def test_cua_fleet_release_reports_claim_delete_failure_without_deleting_pool() -> None:
