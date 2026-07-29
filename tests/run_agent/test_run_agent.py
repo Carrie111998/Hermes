@@ -1962,6 +1962,99 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["extra_body"]["provider"]["only"] == ["Anthropic"]
 
+    def test_provider_max_price_global(self, agent):
+        """Global max_price cap — applied to all models."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = {"prompt": 1.0, "completion": 2.0}
+        agent.model = "anthropic/claude-sonnet-4.6"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["provider"]["max_price"] == {
+            "prompt": 1.0, "completion": 2.0
+        }
+
+    def test_provider_max_price_per_model_exact_match(self, agent):
+        """Per-model override via exact model name match."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = {
+            "prompt": 3.0,
+            "completion": 10.0,
+            "per_model": {
+                "deepseek/deepseek-v4-pro": {"prompt": 0.15, "completion": 0.50},
+                "anthropic/claude-sonnet-4.6": {"prompt": 5.0, "completion": 25.0},
+            },
+        }
+        agent.model = "deepseek/deepseek-v4-pro"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["provider"]["max_price"] == {
+            "prompt": 0.15, "completion": 0.50
+        }
+
+    def test_provider_max_price_per_model_prefix_match(self, agent):
+        """Prefix matching."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = {
+            "prompt": 3.0,
+            "completion": 10.0,
+            "per_model": {
+                "deepseek/deepseek-v4": {"prompt": 0.15, "completion": 0.50},
+            },
+        }
+        agent.model = "deepseek/deepseek-v4-pro"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["provider"]["max_price"] == {
+            "prompt": 0.15, "completion": 0.50
+        }
+
+    def test_provider_max_price_per_model_no_match_fallback(self, agent):
+        """Unmatched model falls back to top-level caps."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = {
+            "prompt": 2.0,
+            "completion": 5.0,
+            "per_model": {
+                "deepseek/deepseek-v4-pro": {"prompt": 0.15, "completion": 0.50},
+            },
+        }
+        agent.model = "anthropic/claude-sonnet-4.6"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["provider"]["max_price"] == {
+            "prompt": 2.0, "completion": 5.0
+        }
+
+    def test_provider_max_price_per_model_only_no_default(self, agent):
+        """per_model entries with no top-level caps: unmatched models get no cap."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = {
+            "per_model": {
+                "deepseek/deepseek-v4-pro": {"prompt": 0.15, "completion": 0.50},
+            },
+        }
+        agent.model = "anthropic/claude-sonnet-4.6"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        provider = kwargs["extra_body"].get("provider", {})
+        assert "max_price" not in provider
+
+    def test_provider_max_price_unset(self, agent):
+        """Completely unset — no max_price in preferences at all."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = None
+        agent.model = "deepseek/deepseek-v4-pro"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        provider = kwargs["extra_body"].get("provider", {})
+        assert "max_price" not in provider
+
     def test_provider_preferences_drop_invalid_sort(self, agent):
         agent.provider = "openrouter"
         agent.base_url = "https://openrouter.ai/api/v1"
