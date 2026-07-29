@@ -37,6 +37,7 @@ from hermes_cli.profiles import (
     rename_profile,
     export_profile,
     import_profile,
+    _get_wrapper_dir,
     _get_profiles_root,
     _get_default_hermes_home,
     seed_profile_skills,
@@ -1069,6 +1070,49 @@ class TestRenameProfile:
         assert not old_dir.is_dir()
         assert new_dir.is_dir()
         assert new_dir == tmp_path / ".hermes" / "profiles" / "newname"
+
+    @pytest.mark.parametrize(
+        ("platform", "suffix"),
+        [("darwin", ""), ("win32", ".bat")],
+    )
+    def test_retargets_all_custom_aliases(self, profile_env, monkeypatch, platform, suffix):
+        monkeypatch.setattr("sys.platform", platform)
+        if platform != "win32":
+            monkeypatch.setattr(
+                "hermes_cli.profiles.shutil.which",
+                lambda _: str(profile_env / "hermes path" / "bin" / "hermes"),
+            )
+        create_profile("oldname", no_alias=True)
+        for alias in ("work", "prod"):
+            create_wrapper_script(alias, target="oldname")
+
+        with patch("hermes_cli.profiles.check_alias_collision", return_value=None):
+            rename_profile("oldname", "newname")
+
+        wrapper_dir = _get_wrapper_dir()
+        for alias in ("work", "prod", "newname"):
+            wrapper = wrapper_dir / f"{alias}{suffix}"
+            content = wrapper.read_text(encoding="utf-8")
+            assert "-p newname" in content
+            assert "-p oldname" not in content
+        assert not (wrapper_dir / f"oldname{suffix}").exists()
+
+    @pytest.mark.parametrize(
+        ("platform", "suffix"),
+        [("darwin", ""), ("win32", ".bat")],
+    )
+    def test_keeps_same_named_alias_for_another_profile(
+        self, profile_env, monkeypatch, platform, suffix
+    ):
+        monkeypatch.setattr("sys.platform", platform)
+        create_profile("oldname", no_alias=True)
+        create_wrapper_script("oldname", target="other")
+
+        with patch("hermes_cli.profiles.check_alias_collision", return_value="skip"):
+            rename_profile("oldname", "newname")
+
+        content = (_get_wrapper_dir() / f"oldname{suffix}").read_text(encoding="utf-8")
+        assert "-p other" in content
 
     def test_renames_root_honcho_host_without_changing_ai_peer(self, profile_env):
         tmp_path = profile_env
