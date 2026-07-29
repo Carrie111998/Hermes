@@ -1,10 +1,31 @@
 """Hetzner AI Inference provider profile."""
 
+from typing import Any
+
 from providers import register_provider
 from providers.base import ProviderProfile
 
 
-hetzner = ProviderProfile(
+class HetznerProfile(ProviderProfile):
+    """Hetzner Qwen thinking control through Hermes reasoning settings."""
+
+    def build_api_kwargs_extras(
+        self,
+        *,
+        reasoning_config: dict | None = None,
+        **context: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not isinstance(reasoning_config, dict):
+            return {}, {}
+
+        return {
+            "chat_template_kwargs": {
+                "enable_thinking": reasoning_config.get("enabled") is not False,
+            }
+        }, {}
+
+
+hetzner = HetznerProfile(
     name="hetzner",
     aliases=("hetzner-ai", "hetzner-inference"),
     display_name="Hetzner AI Inference",

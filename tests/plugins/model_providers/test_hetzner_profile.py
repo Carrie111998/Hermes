@@ -93,3 +93,45 @@ def test_hetzner_fetch_models_uses_bearer_and_standard_endpoint(hetzner_profile)
     request = opener.call_args.args[0]
     assert request.full_url == "https://inference.hetzner.com/api/v1/models"
     assert request.get_header("Authorization") == "Bearer secret-token"
+
+
+@pytest.mark.parametrize(
+    ("reasoning_config", "expected"),
+    [
+        ({"enabled": True, "effort": "medium"}, True),
+        ({"enabled": False, "effort": "none"}, False),
+    ],
+)
+def test_hetzner_maps_reasoning_to_chat_template_kwargs(
+    hetzner_profile, reasoning_config, expected
+):
+    extra_body, top_level = hetzner_profile.build_api_kwargs_extras(
+        reasoning_config=reasoning_config,
+        model="Qwen/Qwen3.6-35B-A3B-FP8",
+    )
+
+    assert extra_body == {
+        "chat_template_kwargs": {"enable_thinking": expected}
+    }
+    assert top_level == {}
+
+
+def test_hetzner_omits_thinking_when_unconfigured(hetzner_profile):
+    assert hetzner_profile.build_api_kwargs_extras(reasoning_config=None) == ({}, {})
+
+
+def test_hetzner_thinking_reaches_chat_completion_request(hetzner_profile):
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    kwargs = ChatCompletionsTransport().build_kwargs(
+        model="Qwen/Qwen3.6-35B-A3B-FP8",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        provider_profile=hetzner_profile,
+        reasoning_config={"enabled": False, "effort": "none"},
+        request_overrides=None,
+    )
+
+    assert kwargs["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }

@@ -263,6 +263,10 @@ hermes chat --provider arcee --model trinity-large-thinking
 # Use the exact model ID returned by GMI's /v1/models endpoint.
 hermes chat --provider gmi --model zai-org/GLM-5.1-FP8
 # Requires: GMI_API_KEY in ~/.hermes/.env
+
+# Hetzner AI Inference
+hermes chat --provider hetzner --model Qwen/Qwen3.6-35B-A3B-FP8
+# Requires: HETZNER_API_KEY in ~/.hermes/.env
 ```
 
 Fireworks uses its native slash-form catalog IDs, such as `accounts/fireworks/models/kimi-k2p6`. Run `hermes model`, choose **Fireworks AI**, and select from the live catalog or enter another Fireworks model ID. The default endpoint is `https://api.fireworks.ai/inference/v1`; configure a different endpoint through `model.base_url` in `config.yaml`, not `.env`.
@@ -275,6 +279,23 @@ model:
 ```
 
 Base URLs can be overridden with `NOVITA_BASE_URL`, `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, `DASHSCOPE_BASE_URL`, `XIAOMI_BASE_URL`, `GMI_BASE_URL`, or `TOKENHUB_BASE_URL` environment variables.
+
+Hetzner's current Qwen model accepts `chat_template_kwargs.enable_thinking`.
+Hermes maps its normal reasoning setting to that field, so no provider-specific
+request configuration is needed:
+
+```yaml
+model:
+  provider: "hetzner"
+  default: "Qwen/Qwen3.6-35B-A3B-FP8"
+
+agent:
+  reasoning_effort: "none"  # sends enable_thinking: false
+```
+
+Use any enabled reasoning level (`minimal` through `ultra`) to send
+`enable_thinking: true`. If no reasoning preference reaches the provider, the
+field is omitted and Hetzner's server default applies.
 
 :::note Z.AI Endpoint Auto-Detection
 When using the Z.AI / GLM provider, Hermes automatically probes multiple endpoints (global, China, coding variants) to find one that accepts your API key. You don't need to set `GLM_BASE_URL` manually — the working endpoint is detected and cached automatically.
