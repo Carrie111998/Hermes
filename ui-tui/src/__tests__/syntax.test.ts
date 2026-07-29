@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
 import { highlightLine, isHighlightable } from '../lib/syntax.js'
-import { DEFAULT_THEME } from '../theme.js'
+import { DARK_THEME } from '../theme.js'
 
-const t = DEFAULT_THEME
+const t = DARK_THEME
 
 describe('syntax highlighter', () => {
   it('recognizes supported langs and aliases', () => {

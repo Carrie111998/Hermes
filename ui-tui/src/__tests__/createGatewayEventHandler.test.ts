@@ -780,6 +780,9 @@ describe('createGatewayEventHandler', () => {
   })
 
   it('picks the polarity-matching paired palette from gateway.ready skins', async () => {
+    vi.unstubAllEnvs()
+    delete process.env.HERMES_TUI_THEME
+    delete process.env.HERMES_TUI_LIGHT
     const appended: Msg[] = []
 
     const skin = {
@@ -787,13 +790,13 @@ describe('createGatewayEventHandler', () => {
       light_colors: { banner_title: '#8B0000', banner_text: '#22201C' }
     }
 
-    // Dark terminal (clean env): the dark-authored `colors` block wins.
-    vi.stubEnv('HERMES_TUI_BACKGROUND', '')
+    // Explicit mode pins make the polarity contract deterministic regardless of
+    // host CI/editor env (COLORFGBG, cached OSC answers, inherited theme pins).
+    vi.stubEnv('HERMES_TUI_THEME', 'dark')
     createGatewayEventHandler(buildCtx(appended))({ payload: skin, type: 'skin.changed' } as any)
     expect(getUiState().theme.color.primary).toBe('#00FF88')
 
-    // Light terminal: the hand-tuned light_colors block wins over adaptation.
-    vi.stubEnv('HERMES_TUI_BACKGROUND', '#ffffff')
+    vi.stubEnv('HERMES_TUI_THEME', 'light')
     createGatewayEventHandler(buildCtx(appended))({ payload: skin, type: 'skin.changed' } as any)
     expect(getUiState().theme.color.primary).toBe('#8B0000')
     vi.unstubAllEnvs()
