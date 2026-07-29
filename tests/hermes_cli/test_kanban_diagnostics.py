@@ -239,6 +239,45 @@ def test_config_from_kanban_config_preserves_explicit_diagnostics_threshold():
     assert cfg["failure_limit"] == 5
 
 
+def test_missing_exit_signal_fires_for_completed_pending_review():
+    task = _task(
+        status="completed_pending_review",
+        last_failure_error="worker exited cleanly (rc=0) without calling kanban_complete",
+    )
+    events = [
+        _event(
+            "missing_exit_signal",
+            ts=200,
+            protocol_violations=3,
+            protocol_violation_limit=3,
+            error="worker exited cleanly (rc=0) without calling kanban_complete",
+        ),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=300)
+    missing = [d for d in diags if d.kind == "missing_exit_signal"]
+    assert len(missing) == 1
+    d = missing[0]
+    assert d.severity == "error"
+    assert "kanban_complete or kanban_block" in d.detail
+    assert "generic crash" in d.detail
+    assert d.count == 3
+    assert d.data["protocol_violations"] == 3
+    assert d.data["protocol_violation_limit"] == 3
+    assert any(a.kind == "comment" and a.suggested for a in d.actions)
+
+
+def test_missing_exit_signal_ignores_unrelated_classifier_cases():
+    for status, last_error in (
+        ("blocked", "Iteration budget exhausted (90/90) — task could not complete"),
+        ("ready", "task t_demo00 worktree path '/tmp/nope' is not inside a git repo"),
+    ):
+        task = _task(status=status, last_failure_error=last_error)
+        events = [_event("blocked", ts=100, reason=last_error)]
+        diags = kd.compute_task_diagnostics(task, events, [], now=300)
+        assert [d for d in diags if d.kind == "missing_exit_signal"] == []
+
+
 def test_repeated_crashes_counts_trailing_streak_only():
     task = _task(status="ready", assignee="crashy")
     runs = [
