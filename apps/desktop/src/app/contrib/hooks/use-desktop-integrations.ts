@@ -15,7 +15,7 @@ import {
 } from '@/store/session'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
-import { isSecondaryWindow } from '@/store/windows'
+import { isNewSessionWindow, isSecondaryWindow } from '@/store/windows'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
 import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
@@ -71,6 +71,10 @@ export function useDesktopIntegrations({
   // lands where you were. Overlays (settings/command-center/…) aren't stored —
   // you don't want to boot into a modal.
   useEffect(() => {
+    if (isNewSessionWindow()) {
+      return
+    }
+
     if (routedSessionId) {
       setRememberedSessionId(
         routedSessionId,
@@ -90,7 +94,7 @@ export function useDesktopIntegrations({
   // remembered route (covers pages); fall back to the last session id.
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
-    if (restoredRef.current || locationPathname !== NEW_CHAT_ROUTE) {
+    if (restoredRef.current || locationPathname !== NEW_CHAT_ROUTE || isNewSessionWindow()) {
       restoredRef.current = true
 
       return
