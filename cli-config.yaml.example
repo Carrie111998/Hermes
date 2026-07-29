@@ -755,6 +755,16 @@ group_sessions_per_user: true
 #         key: "your-api-server-secret"
 #         split_runtime: true          # or API_SERVER_SPLIT_RUNTIME=true
 #
+# Resolved from three sources, in precedence order:
+#   1. platforms.api_server.extra.split_runtime   (above — the canonical form)
+#   2. API_SERVER_SPLIT_RUNTIME=true              (environment)
+#   3. the top-level ``api_server:`` block below  (alongside gateway_timeout)
+# (3) exists because that block is where the other api_server knobs live and is
+# the natural place to reach for; the shared-key bridge in gateway.config does
+# not carry this key into ``extra``, so it is read directly.  Under
+# ``gateway.multiplex_profiles`` it resolves per routed profile, so one
+# multiplexed gateway can serve split-runtime to some profiles and not others.
+#
 # Flow: the client POSTs /v1/runs with a ``tools`` array (JSON-Schema tool
 # defs).  Those tools are offered to the model but never run on the host: when
 # the model calls one, the run suspends, a ``tool_call.request`` event is
