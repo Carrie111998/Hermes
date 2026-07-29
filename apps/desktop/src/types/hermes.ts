@@ -525,6 +525,8 @@ export interface SessionMessage {
    */
   display_metadata?: string | TimelineDisplayMetadata
   role: 'assistant' | 'system' | 'tool' | 'user'
+  /** Device a user message was typed on. */
+  sender_device?: null | string
   text?: unknown
   timestamp?: number
   tool_call_id?: null | string
