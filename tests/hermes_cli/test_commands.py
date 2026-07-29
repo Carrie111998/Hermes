@@ -1,5 +1,7 @@
 """Tests for the central command registry and autocomplete."""
 
+from pathlib import Path
+
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
@@ -524,6 +526,24 @@ class TestGatewayConfigGate:
 # ---------------------------------------------------------------------------
 
 class TestSlashCommandCompleter:
+    def test_simplified_chinese_description(self, monkeypatch):
+        """Slash completion metadata follows the configured UI language."""
+        monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+        from agent.i18n import reset_language_cache
+        from hermes_cli import commands as commands_module
+
+        reset_language_cache()
+        cmd = commands_module.resolve_command("new")
+        assert cmd is not None
+        description = commands_module._build_description(cmd)
+        assert description.startswith("开始新会话")
+        assert "用法: /new [name]" in description
+        assert commands_module._localized_category("Session") == "会话"
+
+        alias = _completions(SlashCommandCompleter(), "/reset")
+        assert len(alias) == 1
+        assert "别名，指向 /new" in alias[0].display_meta_text
+
     # -- basic prefix completion -----------------------------------------
 
     def test_builtin_prefix_completion_uses_shared_registry(self):
@@ -534,7 +554,8 @@ class TestSlashCommandCompleter:
         assert "retry" in texts
         assert "reload-mcp" in texts
 
-    def test_builtin_completion_display_meta_shows_description(self):
+    def test_builtin_completion_display_meta_shows_description(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "en")
         completions = _completions(SlashCommandCompleter(), "/help")
         assert len(completions) == 1
         assert completions[0].display_meta_text == "Show available commands"
@@ -561,7 +582,8 @@ class TestSlashCommandCompleter:
 
     # -- skill commands via provider ------------------------------------
 
-    def test_skill_commands_are_completed_from_provider(self):
+    def test_skill_commands_are_completed_from_provider(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "en")
         completer = SlashCommandCompleter(
             skill_commands_provider=lambda: {
                 "/gif-search": {"description": "Search for GIFs across providers"},
@@ -574,6 +596,42 @@ class TestSlashCommandCompleter:
         assert completions[0].text == "gif-search"
         assert completions[0].display_text == "/gif-search"
         assert completions[0].display_meta_text == "⚡ Search for GIFs across providers"
+
+    def test_skill_command_description_uses_simplified_chinese_catalog(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+        from agent.i18n import reset_language_cache
+
+        reset_language_cache()
+        completer = SlashCommandCompleter(
+            skill_commands_provider=lambda: {
+                "/obsidian": {
+                    "description": "Read, search, create, and edit notes in the Obsidian vault."
+                },
+            }
+        )
+
+        completions = _completions(completer, "/obsidian")
+
+        assert len(completions) == 1
+        assert completions[0].display_meta_text == "⚡ 读取、搜索、创建和编辑 Obsidian 知识库中的笔记"
+
+    def test_simplified_chinese_catalog_covers_bundled_skills(self):
+        from agent.i18n import _load_catalog
+
+        skills_dir = Path(__file__).resolve().parents[2] / "skills"
+        bundled_skill_names = {
+            path.parent.name for path in skills_dir.rglob("SKILL.md")
+        }
+        translated_skill_names = {
+            key.rsplit(".", 1)[-1]
+            for key in _load_catalog("zh")
+            if key.startswith("slash_commands.skill_descriptions.")
+        }
+
+        assert bundled_skill_names <= translated_skill_names, (
+            "Bundled skills missing Simplified Chinese slash descriptions: "
+            f"{sorted(bundled_skill_names - translated_skill_names)}"
+        )
 
     def test_skill_exact_match_adds_trailing_space(self):
         completer = SlashCommandCompleter(
@@ -617,7 +675,8 @@ class TestSlashCommandCompleter:
         # "⚡ " prefix + 50 chars + "..."
         assert meta == f"⚡ {'A' * 50}..."
 
-    def test_skill_missing_description_uses_fallback(self):
+    def test_skill_missing_description_uses_fallback(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "en")
         completer = SlashCommandCompleter(
             skill_commands_provider=lambda: {
                 "/no-desc": {},
@@ -649,6 +708,24 @@ class TestStackedSkillCompletion:
         completions = _completions(_stacked_completer(), "/skill-a /skill-")
         displays = {c.display_text for c in completions}
         assert displays == {"/skill-b", "/skill-c"}
+
+    def test_stacked_skill_uses_localized_description(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+        from agent.i18n import reset_language_cache
+
+        reset_language_cache()
+        completer = _stacked_completer(
+            **{
+                "/obsidian": {
+                    "description": "Read, search, create, and edit notes in the Obsidian vault."
+                }
+            }
+        )
+
+        completions = _completions(completer, "/skill-a /obsidian")
+
+        assert len(completions) == 1
+        assert completions[0].display_meta_text == "⚡ 读取、搜索、创建和编辑 Obsidian 知识库中的笔记"
 
     def test_already_typed_skill_not_reoffered(self):
         completions = _completions(_stacked_completer(), "/skill-a /skill-a")
