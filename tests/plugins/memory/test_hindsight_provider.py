@@ -930,6 +930,15 @@ class TestRecallStatus:
         assert status.provider_label == "Hindsight"
         assert status.count == 2
 
+    def test_reports_count_in_recall_sync_mode(self, provider_with_config):
+        # recall_sync path does a live recall inside prefetch() (no background
+        # prime) — the indicator must still report the count for that turn.
+        p = provider_with_config(recall_sync=True)
+        assert p.prefetch("test")  # live recall returns the 2 mock memories
+        status = p.recall_status()
+        assert status is not None
+        assert status.count == 2
+
     def test_none_when_recall_returned_nothing(self, provider):
         provider._client.arecall = AsyncMock(
             return_value=SimpleNamespace(results=[])
@@ -1245,6 +1254,62 @@ class TestSyncTurn:
         assert "こんにちは" in raw_json
         assert "你好" in raw_json
         assert "👨‍👩‍👧‍👦" in raw_json
+
+
+# ---------------------------------------------------------------------------
+# retain indicator ("saving to memory") tests
+# ---------------------------------------------------------------------------
+
+
+class TestRetainIndicator:
+    _SAVING = "👁️ Hindsight — saving to memory…"
+
+    def test_emits_saving_on_dispatch(self, provider_with_config):
+        calls = []
+        p = provider_with_config(retain_async=False)
+        p._status_callback = calls.append
+        p.sync_turn("hello", "hi")
+        p._retain_queue.join()
+        assert self._SAVING in calls
+
+    def test_suppressed_when_indicator_off(self, provider_with_config):
+        calls = []
+        p = provider_with_config(retain_indicator=False, retain_async=False)
+        p._status_callback = calls.append
+        p.sync_turn("hello", "hi")
+        p._retain_queue.join()
+        assert calls == []
+
+    def test_no_emit_when_auto_retain_off(self, provider_with_config):
+        calls = []
+        p = provider_with_config(auto_retain=False)
+        p._status_callback = calls.append
+        p.sync_turn("hello", "hi")  # returns early — nothing dispatched
+        assert calls == []
+
+    def test_no_emit_on_buffered_turn(self, provider_with_config):
+        # retain_every_n_turns=2: turn 1 buffers (no write, no line),
+        # turn 2 flushes (one line) — "saving" only fires on a real write.
+        calls = []
+        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
+        p._status_callback = calls.append
+        p.sync_turn("t1-u", "t1-a")
+        assert calls == []
+        p.sync_turn("t2-u", "t2-a")
+        p._retain_queue.join()
+        assert calls == [self._SAVING]
+
+    def test_no_crash_without_callback(self, provider_with_config):
+        p = provider_with_config(retain_async=False)
+        assert p._status_callback is None
+        p.sync_turn("hello", "hi")  # must not raise
+        p._retain_queue.join()
+
+    def test_status_callback_wired_from_initialize(self, tmp_path, monkeypatch):
+        cb = lambda _m: None
+        p = _provider_for_mode(tmp_path, monkeypatch, "cloud")
+        p.initialize(session_id="s", hermes_home=str(tmp_path), status_callback=cb)
+        assert p._status_callback is cb
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,11 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# Default glyph for the deterministic memory indicators. Hindsight's brand mark
+# is an eye (the logo is an eye ringed by graph nodes), so the terminal-safe
+# stand-in for the logo is the eye emoji. Providers can override per-status.
+INDICATOR_GLYPH = "👁️"
+
 
 @dataclass(frozen=True)
 class RecallStatus:
@@ -50,11 +55,13 @@ class RecallStatus:
     ``MemoryManager.describe_recall``). ``count`` is the number of discrete
     memories injected; ``0`` means content was injected but has no discrete
     count (e.g. a synthesized reflect answer), which the indicator renders
-    generically rather than as "0 memories".
+    generically rather than as "0 memories". ``glyph`` is the brand mark the
+    indicator leads with.
     """
 
     provider_label: str
     count: int
+    glyph: str = INDICATOR_GLYPH
 
 
 class MemoryProvider(ABC):
@@ -134,7 +141,7 @@ class MemoryProvider(ABC):
         """Describe what the most recent :meth:`prefetch` injected, for the UI.
 
         Called by the agent right after prefetch, on the same (single) turn
-        thread, so it can surface a deterministic "🧠 recalled N memories"
+        thread, so it can surface a deterministic "👁️ recalled N memories"
         status line that does not depend on the model choosing to mention it.
 
         Return ``None`` (the default) when this provider injected nothing this

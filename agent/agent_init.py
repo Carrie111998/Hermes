@@ -1723,6 +1723,10 @@ def init_agent(
                         _init_kwargs["agent_workspace"] = "hermes"
                     except Exception:
                         pass
+                    # Deterministic memory indicators (recall/retain) emit
+                    # through the agent's status channel — model-independent,
+                    # same plumbing as compression/idle notices.
+                    _init_kwargs["status_callback"] = agent._emit_status
                     agent._memory_manager.initialize_all(**_init_kwargs)
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:

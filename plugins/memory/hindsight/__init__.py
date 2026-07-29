@@ -42,9 +42,9 @@ import threading
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, RecallStatus
+from agent.memory_provider import MemoryProvider, RecallStatus, INDICATOR_GLYPH
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
@@ -726,6 +726,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._last_recall_returned = False
         self._last_recall_count = 0
         self._recall_indicator = True
+        # Deterministic retain indicator: emitted from sync_turn the moment a
+        # retain is dispatched to the writer (see _emit_saving_indicator). Uses
+        # the agent's status channel, injected via initialize(status_callback=).
+        self._retain_indicator = True
+        self._status_callback: Optional[Callable[[str], None]] = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -1089,7 +1094,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
-            {"key": "recall_indicator", "description": "Show a '🧠 Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
+            {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
+            {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
@@ -1295,6 +1301,11 @@ class HindsightMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
+        # Agent status channel for the deterministic retain indicator (recall
+        # emits via the pull-based recall_status()/describe_recall() path).
+        _status_cb = kwargs.get("status_callback")
+        if callable(_status_cb):
+            self._status_callback = _status_cb
 
         # Each process lifecycle gets its own document_id. Reusing session_id
         # alone caused overwrites on /resume — the reloaded session starts
@@ -1440,10 +1451,13 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         # On-by-default deterministic indicator: when auto-recall injects memory,
-        # Hermes emits a "🧠 Hindsight — recalled N memories" status line so the
+        # Hermes emits a "👁️ Hindsight — recalled N memories" status line so the
         # user SEES memory working, independent of whether the model mentions it.
         # Off switch for customer-facing agents that shouldn't surface internals.
         self._recall_indicator = bool(self._config.get("recall_indicator", True))
+        # Companion retain indicator: "👁️ Hindsight — saving to memory…" emitted
+        # when a turn is dispatched to the writer. Same off switch rationale.
+        self._retain_indicator = bool(self._config.get("retain_indicator", True))
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
 
@@ -1846,11 +1860,30 @@ class HindsightMemoryProvider(MemoryProvider):
 
         self._ensure_writer()
         self._register_atexit()
+        # Deterministic "saving to memory" indicator — emitted the moment a
+        # real retain is dispatched (past every skip/buffer gate above), so it
+        # only fires on turns that actually persist.
+        self._emit_saving_indicator()
         self._retain_queue.put(_do_retain)
         # Advance the append watermark only after the delta is queued, so a
         # later retain doesn't re-ship turns we've already handed to the writer.
         if update_mode == "append":
             self._last_retained_turn_count = len(self._session_turns)
+
+    def _emit_saving_indicator(self) -> None:
+        """Surface a model-independent "saving to memory" status line.
+
+        Runs on the background sync worker (sync_turn's caller). No-ops when the
+        indicator is turned off (``retain_indicator=false``) or no status
+        channel was injected. Never raises — a status-line failure must not
+        derail the retain.
+        """
+        if not self._retain_indicator or self._status_callback is None:
+            return
+        try:
+            self._status_callback(f"{INDICATOR_GLYPH} Hindsight — saving to memory…")
+        except Exception:
+            logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":

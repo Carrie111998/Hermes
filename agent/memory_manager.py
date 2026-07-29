@@ -599,7 +599,7 @@ class MemoryManager:
 
         Call right after :meth:`prefetch_all` on the turn thread. Collects each
         provider's :meth:`MemoryProvider.recall_status` and renders a single
-        status string (e.g. ``"🧠 Hindsight — recalled 3 memories"``) so the
+        status string (e.g. ``"👁️ Hindsight — recalled 3 memories"``) so the
         user SEES memory was used regardless of whether the model mentions it.
         Returns ``""`` when no provider injected memory this turn — callers can
         emit the result unconditionally.
@@ -623,7 +623,7 @@ class MemoryManager:
             else:
                 # count <= 0 → content injected but no discrete count (reflect).
                 detail = "recalled relevant memory"
-            segments.append(f"🧠 {status.provider_label} — {detail}")
+            segments.append(f"{status.glyph} {status.provider_label} — {detail}")
         return "  ".join(segments)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
