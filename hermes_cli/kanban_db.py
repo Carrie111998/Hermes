@@ -4704,8 +4704,14 @@ def complete_task(
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
-    When ``summary`` is omitted we fall back to ``result`` so single-run
-    callers do not have to pass both. ``metadata`` is a free-form dict
+    When ``summary`` is omitted we fall back to ``result`` — and when
+    ``result`` is omitted we fall back to ``summary`` — so single-run
+    callers do not have to pass both. The result backfill is what keeps
+    a successful worker handoff visible on the task row itself
+    (``tasks.result``) when the worker completed via the run protocol
+    with only a summary and posted no completion comment (#t_343e914f:
+    tasks done + task_runs.summary populated + tasks.result NULL).
+    ``metadata`` is a free-form dict
     (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
     are encouraged to use it for structured handoff facts.
 
@@ -4756,6 +4762,12 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # Backfill tasks.result from the handoff summary when the worker only
+    # passed summary (the common run-protocol shape). Without this the task
+    # closes with result=NULL and the summary is only reachable via the run
+    # row — dashboard/notifier paths that read tasks.result show nothing.
+    if result is None and summary is not None:
+        result = summary
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(

@@ -2446,8 +2446,8 @@ def test_task_detail_exposes_result_and_latest_summary_separately(client):
     assert "final_result" not in data
 
 
-def test_task_detail_exposes_latest_summary_when_result_is_empty(client):
-    """Summary-only completions remain available to the drawer fallback."""
+def test_task_detail_persists_summary_as_result(client):
+    """Summary-only completions remain available on the task row."""
     conn = kb.connect()
     task_id = kb.create_task(conn, title="Task with only run summary")
     kb.claim_task(conn, task_id)
@@ -2458,7 +2458,7 @@ def test_task_detail_exposes_latest_summary_when_result_is_empty(client):
     assert r.status_code == 200
     data = r.json()["task"]
     assert data["status"] == "done"
-    assert not data["result"]
+    assert data["result"] == "Report written to /output/report.md"
     assert data["latest_summary"] == "Report written to /output/report.md"
 
 
@@ -2519,7 +2519,7 @@ def test_task_detail_includes_child_result_summaries(client):
             "title": "Collect sources",
             "status": "done",
             "latest_summary": "Collected five primary sources.",
-            "result": None,
+            "result": "Collected five primary sources.",
         }
     ]
 

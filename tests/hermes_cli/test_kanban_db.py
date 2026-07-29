@@ -4999,3 +4999,49 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_complete_task_backfills_result_from_summary(kanban_home):
+    """Summary-only worker completions remain visible on the task row."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="summary-only", assignee="worker")
+        kb.claim_task(conn, tid)
+
+        assert kb.complete_task(conn, tid, summary="rich worker handoff")
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.result == "rich worker handoff"
+        run = conn.execute(
+            "SELECT summary FROM task_runs WHERE task_id=? AND outcome='completed'",
+            (tid,),
+        ).fetchone()
+        assert run is not None
+        assert run["summary"] == "rich worker handoff"
+
+
+def test_complete_task_keeps_explicit_result_when_summary_differs(kanban_home):
+    """The reverse fallback must not overwrite an explicit task result."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="explicit-result", assignee="worker")
+        kb.claim_task(conn, tid)
+
+        assert kb.complete_task(
+            conn, tid, result="short result", summary="long handoff",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.result == "short result"
+
+
+def test_complete_task_backfills_result_without_active_run(kanban_home):
+    """Manual completion's synthesized run uses the same reverse fallback."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="manual-summary", assignee="worker")
+
+        assert kb.complete_task(conn, tid, summary="manual handoff")
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.result == "manual handoff"
