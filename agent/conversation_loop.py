@@ -2156,6 +2156,10 @@ def run_conversation(
                 # Validate response shape before proceeding
                 response_invalid = False
                 error_details = []
+                # Short role labels for diagnostic logs (issue #73777)
+                _role_map = {"user": "u", "assistant": "a", "system": "s", "tool": "t"}
+                # Track whether Anthropic returned empty content (non-end_turn/refusal)
+                _anthropic_empty_content = False
                 if agent.api_mode == "codex_responses":
                     _ct_v = agent._get_transport()
                     if not _ct_v.validate_response(response):
@@ -2211,7 +2215,21 @@ def run_conversation(
                         if response is None:
                             error_details.append("response is None")
                         else:
-                            error_details.append("response.content invalid (not a non-empty list)")
+                            _anthropic_empty_content = (
+                                hasattr(response, "content")
+                                and isinstance(getattr(response, "content", None), list)
+                                and not getattr(response, "content")
+                            )
+                            if _anthropic_empty_content:
+                                _diag = _tv.diagnose_empty_content(response)
+                                _stop_reason = _diag["stop_reason"]
+                                error_details.append(
+                                    f"response.content invalid (empty content, "
+                                    f"stop_reason={_stop_reason})"
+                                )
+                            else:
+                                _anthropic_empty_content = False
+                                error_details.append("response.content invalid (not a non-empty list)")
                 elif agent.api_mode == "bedrock_converse":
                     _btv = agent._get_transport()
                     if not _btv.validate_response(response):
@@ -2234,6 +2252,36 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    # ── Anthropic empty-content diagnostic ──────────────
+                    # Log the request shape so an operator can tell whether the
+                    # empty response is an upstream hiccup, a repaired-but-still-
+                    # malformed request, or a model refusal.  Issue #73777.
+                    if (
+                        agent.api_mode == "anthropic_messages"
+                        and response is not None
+                        and _anthropic_empty_content
+                    ):
+                        _req_roles = "".join(
+                            _role_map.get(m.get("role", "?"), "?")
+                            for m in (api_messages or [])
+                        )
+                        _repair_count = getattr(agent, "_alternation_repair_count", 0)
+                        _usage_str = ""
+                        _diag = _tv.diagnose_empty_content(response)
+                        if _diag.get("usage"):
+                            _usage_str = f" usage={_diag['usage']}"
+                        logger.warning(
+                            "Anthropic empty-content response (stop_reason=%s)%s. "
+                            "request: %d messages, roles=%s, "
+                            "alternation_repairs=%d. %s",
+                            _diag["stop_reason"],
+                            _usage_str,
+                            len(api_messages),
+                            _req_roles,
+                            _repair_count,
+                            agent._client_log_context(),
+                        )
+
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -2260,10 +2308,50 @@ def run_conversation(
                     # Invalid response — could be rate limiting, provider timeout,
                     # upstream server error, or malformed response.
                     retry_count += 1
-                    
+
                     # Eager fallback: empty/malformed responses are a common
                     # rate-limit symptom.  Switch to fallback immediately
                     # rather than retrying with extended backoff.
+                    # For Anthropic empty-content specifically, skip retries
+                    # entirely — the input is identical and the provider already
+                    # rendered a deterministic verdict; retrying reproduces the
+                    # same failure.  Issue #73777.
+                    if _anthropic_empty_content:
+                        if agent._has_pending_fallback():
+                            agent._buffer_status(
+                                "⚠️ Provider returned empty response — "
+                                "switching to fallback..."
+                            )
+                            if agent._try_activate_fallback():
+                                active_system_prompt = _sync_failover_system_message(
+                                    agent, api_messages, active_system_prompt)
+                                retry_count = 0
+                                compression_attempts = 0
+                                _retry.primary_recovery_attempted = False
+                                continue
+                        agent._flush_status_buffer()
+                        agent._emit_status(
+                            "❌ Provider returned empty response. "
+                            "Try /reset to start a fresh session."
+                        )
+                        logger.error(
+                            "%sAnthropic empty-content response — no fallback available. %s",
+                            agent.log_prefix,
+                            agent._client_log_context(),
+                        )
+                        agent._persist_session(messages, conversation_history)
+                        _final_response = (
+                            "Anthropic returned an empty response. "
+                            "Try /reset to start a fresh session."
+                        )
+                        return {
+                            "final_response": _final_response,
+                            "messages": messages,
+                            "completed": False,
+                            "api_calls": api_call_count,
+                            "error": _final_response,
+                            "failed": True,
+                        }
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                     if agent._try_activate_fallback():
