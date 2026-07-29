@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from agent.lsp.workspace import nearest_root
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger("agent.lsp.servers")
 
@@ -710,10 +711,7 @@ def _find_pses_bundle(ctx: ServerContext) -> Optional[str]:
     env_path = os.environ.get("PSES_BUNDLE_PATH")
     if env_path:
         candidates.append(env_path)
-    home = os.environ.get("HERMES_HOME") or os.path.join(
-        os.path.expanduser("~"), ".hermes"
-    )
-    candidates.append(os.path.join(home, "lsp", "PowerShellEditorServices"))
+    candidates.append(str(get_hermes_home() / "lsp" / "PowerShellEditorServices"))
 
     for cand in candidates:
         if not cand:
@@ -796,12 +794,9 @@ def _spawn_powershell_es(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 def hermes_lsp_session_dir() -> str:
     """Return (and create) the dir for PSES session/log scratch files."""
-    home = os.environ.get("HERMES_HOME") or os.path.join(
-        os.path.expanduser("~"), ".hermes"
-    )
-    d = os.path.join(home, "lsp", "pses")
-    os.makedirs(d, exist_ok=True)
-    return d
+    directory = get_hermes_home() / "lsp" / "pses"
+    directory.mkdir(parents=True, exist_ok=True)
+    return str(directory)
 
 
 def _resolve_override(ctx: ServerContext, server_id: str) -> Optional[str]:

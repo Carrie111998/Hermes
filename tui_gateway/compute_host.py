@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from hermes_constants import get_hermes_home_env
+
 
 def now_ns() -> int:
     return time.perf_counter_ns()
@@ -105,6 +107,11 @@ class _HostTransport:
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def _explicit_hermes_home_text() -> str:
+    """Return the launch-time HERMES_HOME value without a fallback."""
+    return get_hermes_home_env() or ""
 
 
 def _build_sha() -> str:
@@ -732,7 +739,7 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
             "boot_id": host._boot_id,
             "build_sha": _build_sha(),
             "cwd": os.getcwd(),
-            "hermes_home": os.environ.get("HERMES_HOME", ""),
+            "hermes_home": _explicit_hermes_home_text(),
         }
     )
 

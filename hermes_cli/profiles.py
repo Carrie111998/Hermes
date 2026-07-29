@@ -33,6 +33,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_constants import get_hermes_home_env
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -1704,7 +1705,7 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
 
     # Derive service name for this profile
     # Temporarily set HERMES_HOME so _profile_suffix resolves correctly
-    old_home = os.environ.get("HERMES_HOME")
+    old_home = get_hermes_home_env()
     try:
         os.environ["HERMES_HOME"] = str(profile_dir)
         from hermes_cli.gateway import get_service_name, get_launchd_plist_path
@@ -1742,8 +1743,8 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
     finally:
         if old_home is not None:
             os.environ["HERMES_HOME"] = old_home
-        elif "HERMES_HOME" in os.environ:
-            del os.environ["HERMES_HOME"]
+        else:
+            os.environ.pop("HERMES_HOME", None)
 
 
 def _stop_gateway_process(profile_dir: Path) -> None:

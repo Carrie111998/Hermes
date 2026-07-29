@@ -28,6 +28,8 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_constants import get_hermes_home
+
 logger = logging.getLogger("hermes.security_audit")
 
 # Sentinel so the audit only runs once per process even if both the CLI and
@@ -168,9 +170,10 @@ def _path_is_mounted(path: Path) -> bool:
 def _container_no_volume_mount(hermes_home: Optional[Path]) -> Optional[str]:
     if not _in_container():
         return None
-    home = hermes_home or Path(
-        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-    )
+    if hermes_home is None:
+        home = get_hermes_home()
+    else:
+        home = hermes_home
     try:
         if _path_is_mounted(home):
             return None

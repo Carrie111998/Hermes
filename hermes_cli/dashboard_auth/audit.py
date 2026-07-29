@@ -4,10 +4,8 @@ Profile-aware location: ``$HERMES_HOME/logs/dashboard-auth.log``.
 Format: one JSON object per line. Token-like fields are stripped before
 serialisation to avoid leaking refresh tokens or JWTs to disk.
 
-This module deliberately keeps a minimal dependency surface — no imports
-from ``hermes_constants`` or other hermes_cli modules — so it can be
-imported safely from middleware code that loads early in the startup
-sequence.
+This module deliberately keeps a minimal dependency surface so it can be
+imported safely from middleware code that loads early in the startup sequence.
 """
 from __future__ import annotations
 
@@ -19,6 +17,8 @@ import os
 import threading
 from pathlib import Path
 from typing import Any
+
+from hermes_constants import get_hermes_home
 
 _log = logging.getLogger(__name__)
 _write_lock = threading.Lock()
@@ -59,12 +59,9 @@ class AuditEvent(enum.Enum):
 def _resolve_log_path() -> Path:
     """``$HERMES_HOME/logs/dashboard-auth.log`` with the standard fallback.
 
-    Mirrors ``hermes_constants.get_hermes_home`` semantics: env var wins,
-    else ``~/.hermes``. A local copy avoids an import cycle with the
-    middleware which lives below ``hermes_cli``.
+    Follows the profile-aware Hermes home resolver.
     """
-    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
-    return Path(home) / "logs" / "dashboard-auth.log"
+    return get_hermes_home() / "logs" / "dashboard-auth.log"
 
 
 def audit_log(event: AuditEvent, **fields: Any) -> None:

@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_constants import get_hermes_home_env
+
 logger = logging.getLogger(__name__)
 
 
@@ -579,7 +581,7 @@ def _build_hermes_tools_mcp_entry() -> dict:
     # a sibling test's monkeypatch.setenv("HERMES_HOME", tmp_path) would
     # otherwise leak a transient pytest tempdir into the user's real
     # ~/.codex/config.toml and silently brick codex once the tempdir is GC'd.
-    hermes_home = os.environ.get("HERMES_HOME") or ""
+    hermes_home = get_hermes_home_env() or ""
     if hermes_home and _looks_like_test_tempdir(hermes_home):
         hermes_home = ""
     if hermes_home:

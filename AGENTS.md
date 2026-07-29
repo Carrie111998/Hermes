@@ -1188,14 +1188,28 @@ automatically scope to the active profile.
    print(f"Config saved to {display_hermes_home()}/config.yaml")
 
    # BAD — shows wrong path for profiles
-   print("Config saved to ~/.hermes/config.yaml")
-   ```
+    print("Config saved to ~/.hermes/config.yaml")
+    ```
 
-3. **Module-level constants are fine** — they cache `get_hermes_home()` at import time,
+3. **Do not read `HERMES_HOME` directly outside `hermes_constants.py`.** Core Python
+   code selects the appropriate accessor instead:
+   - `get_hermes_home()` for profile-scoped state paths.
+   - `get_process_hermes_home()` for launch-scoped paths that ignore task overrides.
+   - `get_explicit_hermes_home()` when behavior depends on whether an override was set.
+   - `get_hermes_home_env()` only when an unmodified environment string must be
+     propagated or restored.
+
+   Electron main-process code resolves the variable only through
+   `apps/desktop/electron/hermes-home.ts:resolveHermesHome()`, then passes the
+   resolved value to consumers. Standalone plugins and skill scripts remain
+   independently runnable; do not make them import the core accessor without a
+   dedicated portable-helper design.
+
+4. **Module-level constants are fine** — they cache `get_hermes_home()` at import time,
    which is AFTER `_apply_profile_override()` sets the env var. Just use `get_hermes_home()`,
    not `Path.home() / ".hermes"`.
 
-4. **Tests that mock `Path.home()` must also set `HERMES_HOME`** — since code now uses
+5. **Tests that mock `Path.home()` must also set `HERMES_HOME`** — since code now uses
    `get_hermes_home()` (reads env var), not `Path.home() / ".hermes"`:
    ```python
    with patch.object(Path, "home", return_value=tmp_path), \
@@ -1203,13 +1217,13 @@ automatically scope to the active profile.
        ...
    ```
 
-5. **Gateway platform adapters should use token locks** — if the adapter connects with
+6. **Gateway platform adapters should use token locks** — if the adapter connects with
    a unique credential (bot token, API key), call `acquire_scoped_lock()` from
    `gateway.status` in the `connect()`/`start()` method and `release_scoped_lock()` in
    `disconnect()`/`stop()`. This prevents two profiles from using the same credential.
    See `plugins/platforms/irc/adapter.py` for the canonical pattern.
 
-6. **Profile operations are HOME-anchored, not HERMES_HOME-anchored** — `_get_profiles_root()`
+7. **Profile operations are HOME-anchored, not HERMES_HOME-anchored** — `_get_profiles_root()`
    returns `Path.home() / ".hermes" / "profiles"`, NOT `get_hermes_home() / "profiles"`.
    This is intentional — it lets `hermes -p coder profile list` see all profiles regardless
    of which one is active.

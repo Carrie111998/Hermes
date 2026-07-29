@@ -268,12 +268,10 @@ def _config_default_interface_early() -> str:
         return _EARLY_INTERFACE_CACHE[0]
     value = "cli"
     try:
-        home = os.environ.get("HERMES_HOME")
-        if home:
-            cfg_path = os.path.join(home, "config.yaml")
-        else:
-            cfg_path = os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
-        if os.path.exists(cfg_path):
+        from hermes_constants import get_hermes_home
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        if cfg_path.exists():
             import yaml as _yaml_iface
 
             with open(cfg_path, encoding="utf-8") as _f:
@@ -498,7 +496,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 #
 # Many modules cache HERMES_HOME at import time (module-level constants).
 # We intercept --profile/-p from sys.argv here and set the env var so that
-# every subsequent ``os.getenv("HERMES_HOME", ...)`` resolves correctly.
+# every subsequent Hermes-home lookup resolves correctly.
 # The flag is stripped from sys.argv so argparse never sees it.
 # Falls back to ~/.hermes/active_profile for sticky default.
 # ---------------------------------------------------------------------------
@@ -617,9 +615,11 @@ def _apply_profile_override() -> None:
     # still read active_profile — the user may have switched profiles via
     # `hermes profile use` and the gateway should honour that choice.
     # See issue #22502.
-    hermes_home_env = os.environ.get("HERMES_HOME", "")
+    from hermes_constants import get_explicit_hermes_home
+
+    hermes_home_env = get_explicit_hermes_home()
     if profile_name is None and hermes_home_env:
-        if Path(hermes_home_env).parent.name == "profiles":
+        if hermes_home_env.parent.name == "profiles":
             return
 
     # 2. If no flag, check active_profile in the hermes root.
@@ -1816,7 +1816,9 @@ def _ensure_tui_node() -> None:
     if not helper.is_file():
         return
 
-    hermes_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    from hermes_constants import get_hermes_home
+
+    hermes_home = str(get_hermes_home())
     try:
         # Helper writes logs to stderr; we ask bash to print `command -v node`
         # on stdout once ensure_node succeeds. Subshell PATH edits don't leak

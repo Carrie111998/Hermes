@@ -51,7 +51,9 @@ def _get_platform_default_hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
-def _hermes_home_from_env() -> Path:
+def _hermes_home_from_env(
+    *, warn_if_unset: bool = False, fallback: bool = True, raw: bool = False
+) -> Path | str | None:
     """Resolve HERMES_HOME from the process environment only.
 
     Reads the ``HERMES_HOME`` env var, falling back to the platform-native
@@ -60,10 +62,34 @@ def _hermes_home_from_env() -> Path:
     scope rather than a per-task profile.  Shared by :func:`get_hermes_home`
     and :func:`get_process_hermes_home` so the two never drift.
     """
-    val = os.environ.get("HERMES_HOME", "").strip()
+    raw_value = os.environ.get("HERMES_HOME")
+    if raw:
+        return raw_value
+    val = (raw_value or "").strip()
     if val:
         return Path(val)
-    return _get_platform_default_hermes_home()
+    if warn_if_unset:
+        _warn_profile_fallback_once()
+    return _get_platform_default_hermes_home() if fallback else None
+
+
+def get_explicit_hermes_home() -> Path | None:
+    """Return the explicitly configured process Hermes home, if any.
+
+    Unlike :func:`get_hermes_home`, this does not follow context-local profile
+    overrides or supply a default. Use it when code must distinguish an
+    explicitly exported ``HERMES_HOME`` from an implicit default.
+    """
+    home = _hermes_home_from_env(fallback=False)
+    assert home is None or isinstance(home, Path)
+    return home
+
+
+def get_hermes_home_env() -> str | None:
+    """Return the unmodified ``HERMES_HOME`` process value, if it is set."""
+    value = _hermes_home_from_env(raw=True)
+    assert value is None or isinstance(value, str)
+    return value
 
 
 def _warn_profile_fallback_once() -> None:
@@ -125,10 +151,9 @@ def get_hermes_home() -> Path:
     if override:
         return Path(override)
 
-    if not os.environ.get("HERMES_HOME", "").strip():
-        _warn_profile_fallback_once()
-
-    return _hermes_home_from_env()
+    home = _hermes_home_from_env(warn_if_unset=True)
+    assert isinstance(home, Path)
+    return home
 
 
 def get_process_hermes_home() -> Path:
@@ -147,7 +172,9 @@ def get_process_hermes_home() -> Path:
     for genuinely profile-scoped data (memories, backups, checkpoints,
     provider config) — those should keep following the override.
     """
-    return _hermes_home_from_env()
+    home = _hermes_home_from_env()
+    assert isinstance(home, Path)
+    return home
 
 
 def get_default_hermes_root() -> Path:
@@ -168,10 +195,11 @@ def get_default_hermes_root() -> Path:
     Import-safe — no dependencies beyond stdlib.
     """
     native_home = _get_platform_default_hermes_home()
-    env_home = os.environ.get("HERMES_HOME", "")
-    if not env_home:
+    env_home = _hermes_home_from_env(fallback=False)
+    assert env_home is None or isinstance(env_home, Path)
+    if env_home is None:
         return native_home
-    env_path = Path(env_home)
+    env_path = env_home
     try:
         env_path.resolve().relative_to(native_home.resolve())
         # HERMES_HOME is under ~/.hermes (normal or profile mode)
@@ -694,7 +722,7 @@ def _norm_home_path(path: str | None) -> str:
 
 def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
     """Return ``{HERMES_HOME}/home`` when the profile-home directory exists."""
-    hermes_home = get_hermes_home_override() or (env or {}).get("HERMES_HOME") or os.getenv("HERMES_HOME")
+    hermes_home = get_hermes_home_override() or (env or {}).get("HERMES_HOME") or _hermes_home_from_env(fallback=False)
     if not hermes_home:
         return None
     profile_home = os.path.join(hermes_home, "home")

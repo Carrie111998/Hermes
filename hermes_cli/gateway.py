@@ -39,6 +39,7 @@ from gateway.restart import (
     is_gateway_supervisor_process,
     parse_restart_drain_timeout,
 )
+from hermes_constants import get_explicit_hermes_home
 from hermes_cli.config import (
     get_env_value,
     get_hermes_home,
@@ -1002,7 +1003,7 @@ def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
         unit_home = _read_systemd_unit_environment(system=True).get("HERMES_HOME", "").strip()
     if not unit_home:
         return
-    current = os.environ.get("HERMES_HOME", "").strip()
+    current = str(get_explicit_hermes_home() or "")
     if current == unit_home:
         return
     os.environ["HERMES_HOME"] = unit_home
@@ -2625,12 +2626,7 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
       /root/.hermes/profiles/coder     → /home/alice/.hermes/profiles/coder
       /opt/custom-hermes               → /opt/custom-hermes  (kept as-is)
     """
-    current_hermes_raw = os.environ.get("HERMES_HOME", "").strip()
-    current_hermes = (
-        Path(current_hermes_raw).expanduser()
-        if current_hermes_raw
-        else get_hermes_home()
-    )
+    current_hermes = (get_explicit_hermes_home() or get_hermes_home()).expanduser()
     # Keep explicit custom paths lexical. Resolving a non-existent custom path
     # can rewrite it through host-specific path mappings, which would bake a
     # different HERMES_HOME into the generated service unit.

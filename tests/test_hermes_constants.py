@@ -118,6 +118,16 @@ class TestGetHermesHome:
 
         assert get_hermes_home() == local_appdata / "hermes"
 
+    def test_unset_home_warns_from_the_environment_accessor(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
+        warned = []
+        monkeypatch.setattr(hermes_constants, "_warn_profile_fallback_once", lambda: warned.append(True))
+
+        assert get_hermes_home() == tmp_path / ".hermes"
+        assert warned == [True]
+
 
 class TestGetProcessHermesHome:
     """Tests for get_process_hermes_home() — process launch scope.

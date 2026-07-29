@@ -1,4 +1,5 @@
 .DS_Store
+.idea/
 /venv/
 /venv.old/
 /venv.stale.runtime-*/
@@ -125,6 +126,8 @@ models-dev-upstream/
 .cursor/
 .gemini/
 .zed/
+.opencode/
+.codegraph/
 .mcp.json
 opencode.json
 config/mcporter.json
