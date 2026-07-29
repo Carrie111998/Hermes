@@ -7,7 +7,7 @@ import { Progress } from '@/components/ui/progress'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import { BarChart3, CreditCard, ExternalLink, Package, Wrench } from '@/lib/icons'
+import { BarChart3, CreditCard, ExternalLink, Package, Users, Wrench } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
 import { useRouteEnumParam } from '../../hooks/use-route-enum-param'
@@ -48,6 +48,7 @@ const BILLING_VIEWS = ['overview', 'plans'] as const
 type BillingSubView = (typeof BILLING_VIEWS)[number]
 
 const FEATURE_BILLING_INVOICES = false
+const FALLBACK_PORTAL_URL = 'https://portal.nousresearch.com/billing'
 
 const BILLING_DEV_FIXTURE_NAMES = import.meta.env.DEV
   ? (Object.keys(billingDevFixtures) as BillingDevFixtureName[])
@@ -100,6 +101,45 @@ function NoticeCard({ notice }: { notice: BillingNoticeView }) {
         </Button>
       )}
     </div>
+  )
+}
+
+function BillingIdentityCard({ billing }: { billing?: BillingStateResponse }) {
+  if (!billing?.logged_in) {
+    return null
+  }
+
+  const email = billing.account_email?.trim()
+  const org = billing.org_name?.trim()
+
+  const orgLabel = org || 'Personal workspace'
+  const identityLabel = email || 'Account identity unavailable'
+
+  const caption = email
+    ? `${orgLabel}${billing.role ? ` · ${billing.role}` : ''}`
+    : org
+      ? `${orgLabel} · email unavailable`
+      : 'Email and workspace unavailable — reconnect to refresh the account context.'
+
+  return (
+    <SettingsSection icon={Users} title="Billing account">
+      <ListRow
+        action={
+          <Button
+            onClick={() => openExternal(billing.portal_url ?? FALLBACK_PORTAL_URL)}
+            size="sm"
+            type="button"
+            variant="outline"
+          >
+            Reconnect / switch account
+            <ExternalLink className="size-3.5" />
+          </Button>
+        }
+        below={<div className="mt-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">{caption}</div>}
+        description="The account and workspace used for the balance shown below."
+        title={identityLabel}
+      />
+    </SettingsSection>
   )
 }
 
@@ -513,6 +553,8 @@ function BillingSettingsContent({
           ))}
         </div>
       </div>
+
+      <BillingIdentityCard billing={billing} />
 
       {view.plan && (
         <SettingsSection icon={Package} title="Plan">

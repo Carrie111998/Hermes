@@ -83,6 +83,9 @@ describe('BillingSettings', () => {
 
     expect(await screen.findByText('$996.47')).toBeTruthy()
     expect(screen.getByText('Ultra · $200/mo')).toBeTruthy()
+    expect(screen.getByText('owner@sid5.example')).toBeTruthy()
+    expect(screen.getByText('sid-5 · OWNER')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Reconnect \/ switch account/ })).toBeTruthy()
     expect(screen.getByText('Visa •••• 3206')).toBeTruthy()
     expect(
       screen.getByText(
