@@ -68,6 +68,14 @@ def _find_run_call(calls):
     return runs[0]
 
 
+def _has_arg_pair(cmd, flag, value):
+    """True if ``[flag, value]`` appears consecutively in the argv list."""
+    for i, tok in enumerate(cmd):
+        if tok == flag and i + 1 < len(cmd) and cmd[i + 1] == value:
+            return True
+    return False
+
+
 # ---- unit: _resolved_docker_volumes ----
 
 def test_resolved_volumes_unions_passed_and_config(monkeypatch):
@@ -131,15 +139,20 @@ def test_create_path_includes_volumes_added_to_config_after_boot(monkeypatch, tm
     The new mount must land on the freshly-created container despite the
     bootstrap env var having the old list.
 
-    This test mocks Docker fully: pre-seeds the cgroup probe, simulates
-    the cached container being gone (no existing container), and asserts
-    the fresh ``docker run`` has BOTH the env-var-listed mount AND the
-    config-only mount.
+    Black-box: drive the real ``DockerEnvironment(...)`` constructor. It
+    builds ``volume_args`` from ``_resolved_docker_volumes(volumes)`` and,
+    finding no reusable container (``docker ps`` empty), issues a real
+    ``docker run``. We assert the *captured* ``docker run`` argv carries
+    BOTH the env-var-listed mount AND the config-only mount — exercising the
+    fix at the actual call site rather than only via the helper.
     """
     docker_env._cgroup_limits_ok = True
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
 
+    calls = []
+
     def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
         # ps / inspect: no existing container
         if isinstance(cmd, list) and len(cmd) >= 2 and cmd[1] == "ps":
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -179,68 +192,60 @@ def test_create_path_includes_volumes_added_to_config_after_boot(monkeypatch, tm
         persist_across_processes=True,
     )
 
-    # We don't call env.start() end-to-end (it touches too much state);
-    # instead, test the resolved-volumes contract that env._start_reuse_or_create
-    # would call. That keeps the regression net focused on the new fix.
-    passed_volumes = ["/host/OLD:/c/OLD"]  # what the gateway's bootstrap env var carries
-    resolved = docker_env._resolved_docker_volumes(passed_volumes)
-    assert "/host/OLD:/c/OLD" in resolved, "passed mount must be preserved"
-    assert "/host/NEW:/c/NEW" in resolved, "config-added mount must land on fresh container"
-    assert resolved.index("/host/OLD:/c/OLD") < resolved.index("/host/NEW:/c/NEW"), \
-        "caller-passed mounts come first, then config extras"
+    # The constructor found no reusable container and fell through to a fresh
+    # ``docker run``. Assert that real argv mounted BOTH the stale bootstrap
+    # mount AND the config-only mount added since boot — a wiring mistake at
+    # the call site (e.g. bypassing _resolved_docker_volumes) would drop one.
+    run_cmd = _find_run_call(calls)[0]
+    assert _has_arg_pair(run_cmd, "-v", "/host/OLD:/c/OLD"), \
+        "fresh docker run must carry the bootstrap (OLD) mount"
+    assert _has_arg_pair(run_cmd, "-v", "/host/NEW:/c/NEW"), \
+        "fresh docker run must carry the config-added (NEW) mount"
 
 
 # ---- contract: reuse path removes stale-bind-mount containers ----
 
 def test_reuse_path_removes_container_missing_a_bind_mount(monkeypatch, tmp_path):
-    """If the cached container is missing a configured bind-mount
-    destination (operator edited config.yaml post-creation), the reuse
-    check should ``rm -f`` the container and fall through to a fresh
-    create."""
+    """If the cached container is missing a configured bind-mount destination
+    (operator edited config.yaml post-creation), the reuse check should
+    ``rm -f`` the container and fall through to a fresh create that lands the
+    new mount.
+
+    Black-box: drive the real ``DockerEnvironment(...)`` constructor. The
+    mocked ``docker ps`` reports a stale running container, ``docker inspect``
+    reports only the OLD bind-mount destination, so the constructor's reuse
+    branch must issue ``docker rm -f stale-cid`` and then a fresh ``docker
+    run`` carrying the missing NEW mount. We assert both subprocess
+    invocations — a wiring mistake at either call site would leave this red.
+    """
     docker_env._cgroup_limits_ok = True
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
 
-    rm_called = []
-    run_called = []
+    calls = []
 
-    def _inspect_returns_one_container(cmd, **kwargs):
-        # inspect --format ...Mounts -> bind:/c/OLD only (no /c/NEW)
-        if isinstance(cmd, list) and cmd[1] == "inspect":
-            return subprocess.CompletedProcess(
-                cmd, 0,
-                stdout="bind:/c/OLD\n",
-                stderr="",
-            )
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    def _run_all(cmd, **kwargs):
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd), kwargs))
         if isinstance(cmd, list) and len(cmd) >= 2:
-            if cmd[1] == "rm":
-                rm_called.append(list(cmd))
-                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            # Reuse probe: report one stale, running container. Egress is off
+            # so _find_reusable_container uses the 3-field format
+            # ID\tState\tEgressLabel; an empty egress label is accepted.
             if cmd[1] == "ps":
-                # Once the cached container is "rm -f'd", ps returns empty
-                if rm_called:
-                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-                # First pass: report a stale container exists
                 return subprocess.CompletedProcess(
-                    cmd, 0, stdout="stale-cid\n", stderr=""
+                    cmd, 0, stdout="stale-cid\trunning\t\n", stderr=""
                 )
+            # Bind-mount inspection: only the OLD destination is present
+            # (the operator added /c/NEW to config.yaml after creation).
+            if cmd[1] == "inspect":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="bind:/c/OLD\n", stderr=""
+                )
+            if cmd[1] == "rm":
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             if cmd[1] == "run":
-                run_called.append(list(cmd))
                 return subprocess.CompletedProcess(
                     cmd, 0, stdout="new-cid\n", stderr=""
                 )
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    # _inspect_returns_one_container and _run_all share the same call site,
-    # but we want inspect to ALWAYS return the partial-Mounts answer
-    # regardless of rm_called state. Patch inspect explicitly.
-    def _run(cmd, **kwargs):
-        if isinstance(cmd, list) and len(cmd) >= 2 and cmd[1] == "inspect":
-            return subprocess.CompletedProcess(
-                cmd, 0, stdout="bind:/c/OLD\n", stderr=""
-            )
-        return _run_all(cmd, **kwargs)
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
     _stub_load_config(
@@ -248,21 +253,42 @@ def test_reuse_path_removes_container_missing_a_bind_mount(monkeypatch, tmp_path
         {"docker_volumes": ["/host/NEW:/c/NEW", "/host/OLD:/c/OLD"]},
     )
 
-    # Drive the reuse-check helper directly. _container_bind_mounts needs
-    # a real ``docker inspect`` so we use the same monkeypatched subprocess.
-    cid = "stale-cid"
-    actual_dests = docker_env._container_bind_mounts(
-        docker_exe="/usr/bin/docker", container_id=cid
+    env = docker_env.DockerEnvironment(
+        image="python:3.11",
+        cwd="/root",
+        timeout=60,
+        cpu=0,
+        memory=0,
+        disk=0,
+        persistent_filesystem=False,
+        task_id="test-task",
+        # Bootstrap env var is stale: carries only OLD, not the NEW mount
+        # the operator just added to config.yaml.
+        volumes=["/host/OLD:/c/OLD"],
+        forward_env=None,
+        network=True,
+        host_cwd=None,
+        auto_mount_cwd=False,
+        env=None,
+        run_as_host_user=False,
+        extra_args=[],
+        persist_across_processes=True,
     )
-    assert actual_dests == {"/c/OLD"}, "inspect should return only the OLD bind dst"
 
-    required_dests = {
-        d for d in (
-            docker_env._volume_destination(v)
-            for v in ["/host/NEW:/c/NEW", "/host/OLD:/c/OLD"]
-        ) if d
-    }
-    assert required_dests == {"/c/NEW", "/c/OLD"}
+    # (a) The reuse branch removed the stale container. Assert the real
+    # ``docker rm -f stale-cid`` argv was issued (not just that a helper
+    # computed a ``missing`` set).
+    rm_calls = [
+        c[0] for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 4
+        and c[0][1] == "rm" and c[0][2] == "-f" and c[0][3] == "stale-cid"
+    ]
+    assert rm_calls, "constructor must `docker rm -f stale-cid` the stale container"
 
-    missing = required_dests - actual_dests
-    assert missing == {"/c/NEW"}, "the new mount is the missing one"
+    # (b) After the rm, a fresh ``docker run`` carried the previously-missing
+    # NEW mount (and the OLD one).
+    run_cmd = _find_run_call(calls)[0]
+    assert _has_arg_pair(run_cmd, "-v", "/host/NEW:/c/NEW"), \
+        "fresh docker run after rm must carry the previously-missing NEW mount"
+    assert _has_arg_pair(run_cmd, "-v", "/host/OLD:/c/OLD"), \
+        "fresh docker run after rm must still carry the OLD mount"
