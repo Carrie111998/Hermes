@@ -7887,11 +7887,13 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         The task's last failure error matches a quota / authentication
         pattern. Retrying immediately is unlikely to help (rate limits
         reset on a timer; auth needs human action), so we defer to the
-        next tick. The existing ``consecutive_failures`` counter still
-        trips the auto-block circuit breaker after ``failure_limit``
-        consecutive failures, so a persistent auth error eventually
-        blocks via the normal path — but a transient 429 gets a few
-        ticks of recovery first.
+        next tick. The blocker_auth guard alone would prevent any spawn
+        attempt, freezing ``consecutive_failures`` and letting the task
+        loop in ``ready`` forever (bug #73369). To break that loop, the
+        dispatcher's guard handler counts each deferred tick as a failure
+        via ``_record_task_failure``, so the circuit breaker can still
+        trip after ``failure_limit`` consecutive deferrals. A transient
+        429 gets a few ticks of recovery first before the breaker trips.
 
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
@@ -8353,10 +8355,12 @@ def _dispatch_once_locked(
         # in-flight/recent, or when the last failure is a deterministic
         # blocker (quota / auth). The guard defers the spawn this tick so
         # the task gets a chance to clear (rate limits often reset in
-        # seconds-to-minutes); the existing consecutive_failures counter
-        # still trips the auto-block circuit breaker after failure_limit
-        # consecutive failures, so a persistent auth error eventually
-        # blocks via the normal path rather than on first occurrence.
+        # seconds-to-minutes). For blocker_auth, the guard handler also
+        # counts the deferred tick as a failure via _record_task_failure
+        # (#73369), so the circuit breaker can trip after failure_limit
+        # consecutive deferrals — preventing the task from looping in
+        # ready forever. Other guard reasons (rate_limit_cooldown,
+        # recent_success, active_pr) do NOT increment failures.
         guard_reason = check_respawn_guard(conn, row["id"])
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
@@ -8369,6 +8373,33 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+                # When blocker_auth fires, the guard prevents the spawn
+                # attempt, so _record_spawn_failure (normally called in
+                # the spawn exception handler) never runs — the task
+                # stays frozen at its current consecutive_failures count
+                # and loops in ready forever. Count the deferred tick as
+                # a failure so the circuit breaker eventually trips and
+                # auto-blocks the task (#73369).
+                # Only do this for blocker_auth, not rate_limit_cooldown
+                # (which has its own bounded retry cadence) or
+                # recent_success / active_pr (liveness guards unrelated
+                # to spawn failures).
+                if guard_reason == "blocker_auth":
+                    err_row = conn.execute(
+                        "SELECT last_failure_error FROM tasks WHERE id = ?",
+                        (row["id"],),
+                    ).fetchone()
+                    if err_row and err_row["last_failure_error"]:
+                        auto = _record_task_failure(
+                            conn, row["id"],
+                            err_row["last_failure_error"],
+                            outcome="spawn_failed",
+                            failure_limit=failure_limit,
+                            release_claim=False,
+                            end_run=False,
+                        )
+                        if auto:
+                            result.auto_blocked.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
