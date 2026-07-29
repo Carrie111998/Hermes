@@ -210,3 +210,80 @@ async def test_end_webhook_session_awaits_async_session_db(tmp_path):
     assert row["ended_at"] is not None
     assert row["end_reason"] == "webhook_complete"
     store._db.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_cancelled_webhook_run_stays_recoverable(tmp_path):
+    """A run cancelled by a restart drain must NOT be closed.
+
+    Counterpart invariant to the ghost-leak tests above, and the reason the
+    CANCELLED outcome is carved out.  A gateway restart drains in-flight work
+    via ``cancel_background_tasks()``, so a webhook run that was interrupted
+    mid-investigation reaches ``on_processing_complete`` as CANCELLED.  If we
+    stamp ``webhook_complete`` on it, the row falls outside the recoverable set
+    in ``find_latest_gateway_session_for_peer`` (live / ``agent_close`` /
+    ``ws_orphan_reap``) and the restart's auto-resume pass can no longer find
+    the interrupted transcript — it silently starts a fresh empty session
+    instead and the real work is abandoned.
+
+    Asserted as a behavior contract on the recovery query itself, not on the
+    end_reason string, so the test still holds if the reason vocabulary
+    changes.  Goes through the REAL cancel path (``cancel_background_tasks``),
+    not a hand-called hook, so it also covers the drain wiring.
+    """
+    store = _make_store(tmp_path)
+    runner = _FakeRunner(store)
+
+    adapter = _make_adapter(
+        {"alerts": {"secret": _INSECURE_NO_AUTH, "prompt": "x", "deliver": "log"}}
+    )
+    adapter.gateway_runner = runner
+
+    created = {}
+    started = asyncio.Event()
+
+    async def _interrupted_by_restart(event: MessageEvent):
+        # Routing already created the row, and the run has produced real work
+        # (a transcript) before the restart lands on it.
+        entry = store.get_or_create_session(event.source)
+        created["session_id"] = entry.session_id
+        store._db.replace_messages(
+            entry.session_id, [{"role": "user", "content": "investigate ticket"}]
+        )
+        started.set()
+        # Mid-investigation when the drain cancels us.
+        await asyncio.sleep(30)
+        return ""
+
+    adapter._message_handler = _interrupted_by_restart
+
+    event = _make_event(adapter, "alert-restart-001", "x")
+    await adapter.handle_message(event)
+    await asyncio.wait_for(started.wait(), timeout=5.0)
+
+    # The real restart drain path.
+    await adapter.cancel_background_tasks()
+    await asyncio.sleep(0.05)
+
+    session_id = created["session_id"]
+    row = store._db.get_session(session_id)
+    assert row is not None
+
+    # INVARIANT: the interrupted row is still findable by the recovery query
+    # the restart auto-resume pass uses, so the transcript can be continued.
+    session_key = runner._session_key_for_source(event.source)
+    recovered = store._db.find_latest_gateway_session_for_peer(
+        session_key=session_key,
+        source="webhook",
+        user_id=event.source.user_id,
+        chat_id=event.source.chat_id,
+        chat_type=event.source.chat_type,
+        thread_id=event.source.thread_id,
+    )
+    assert recovered is not None, (
+        "a restart-cancelled webhook run was closed as completed, so stale-route "
+        "recovery can no longer find it — the interrupted work is abandoned and "
+        "the auto-resume pass will synthesize an empty session instead"
+    )
+    assert recovered["id"] == session_id
+    store._db.close()
