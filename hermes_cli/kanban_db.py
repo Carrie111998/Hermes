@@ -175,7 +175,7 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
     it through.
     """
     try:
-        from hermes_cli.plugins import invoke_hook
+        from hermes_cli.lifecycle import invoke_hook
         from hermes_cli.profiles import get_active_profile_name
         try:
             profile_name = get_active_profile_name()
@@ -2150,6 +2150,12 @@ def connect(
         return conn
 
     with _cross_process_init_lock(path):
+        # Read-only file/sidecar preflight (port of kilocode#12508) —
+        # repair-or-refuse before the header/integrity probes so a stray
+        # read-only kanban.db fails with an actionable message instead of
+        # "attempt to write a readonly database" mid-init.
+        from hermes_state import preflight_db_writability
+        preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
         _validate_sqlite_header(path)
@@ -5501,7 +5507,6 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
-    routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -5552,7 +5557,6 @@ def block_task(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
-            routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -5612,7 +5616,6 @@ def block_task(
                 },
                 run_id=run_id,
             )
-            routed_to = "triage"
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -7188,7 +7191,6 @@ def detect_stale_running(
 
 
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     reclaimed: list[str] = []
 
     rows = conn.execute(
@@ -7702,7 +7704,6 @@ def _record_task_failure(
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
-        cur_status = row["status"]
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
