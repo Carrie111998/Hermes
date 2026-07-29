@@ -27,4 +27,51 @@ function resolveBehindCount({ countStr, currentSha, targetSha, isShallow, hasMer
   return Number.parseInt(countStr, 10) || 0
 }
 
-export { resolveBehindCount, shouldCountCommits }
+// Paths that can change without altering the Hermes runtime or Desktop app.
+// Keep this allowlist deliberately narrow: unknown paths remain actionable so a
+// future repository layout change cannot silently hide a real update.
+function isDocumentationOnlyPath(filePath: unknown) {
+  const normalized = String(filePath || '')
+    .replaceAll('\\', '/')
+    .replace(/^\.\//, '')
+
+  return (
+    normalized.startsWith('website/') ||
+    normalized.startsWith('docs/') ||
+    normalized === 'SECURITY.md' ||
+    (normalized.startsWith('SECURITY.') && normalized.endsWith('.md'))
+  )
+}
+
+// Suppress the update indicator only when we have a non-empty, successful
+// changed-path result and every path is known documentation. Missing/empty data
+// fails open and preserves the original behind count.
+function resolveActionableBehindCount({
+  behind,
+  changedPaths
+}: {
+  behind: number
+  changedPaths: string[] | null
+}) {
+  if (behind <= 0) {
+    return 0
+  }
+
+  if (!Array.isArray(changedPaths) || changedPaths.length === 0) {
+    return behind
+  }
+
+  return changedPaths.every(isDocumentationOnlyPath) ? 0 : behind
+}
+
+function buildChangedPathDiffArgs(baseRef: string, targetRef: string) {
+  return ['diff', '--no-renames', '--name-only', `${baseRef}..${targetRef}`]
+}
+
+export {
+  buildChangedPathDiffArgs,
+  isDocumentationOnlyPath,
+  resolveActionableBehindCount,
+  resolveBehindCount,
+  shouldCountCommits
+}
