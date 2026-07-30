@@ -14316,7 +14316,7 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
         rememberLog
       })
 
-      nativeAccessTokenCoordinator.invalidateExplicitAuthChange()
+      nativeAccessTokenCoordinator.invalidateExplicitAuthChange(baseUrl)
       _storeNativeTokens(baseUrl, tokens)
       // Confirmed sign-in — release the reauth latch so the next
       // startHermes() re-dials instead of replaying the stale rejection.
@@ -14350,7 +14350,7 @@ ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) =
 
   // Also drop any native (RFC 8252) bearer tokens for this gateway so a
   // logout clears BOTH auth shapes.
-  nativeAccessTokenCoordinator.invalidateExplicitAuthChange()
+  nativeAccessTokenCoordinator.invalidateExplicitAuthChange(baseUrl)
   _clearNativeTokens(baseUrl)
 
   // Report against the SAME liveness notion the Settings indicator uses
