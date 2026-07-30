@@ -68,21 +68,43 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _nested_fallback_providers(fallback_model: Any) -> list[Any]:
+    """Entries declared as ``fallback_model.fallback_providers`` (profile shape).
+
+    Deployed profiles carry their whole chain nested under ``fallback_model``
+    with an ``enable_fallback`` switch. An explicit ``enable_fallback: false``
+    opts the nested chain out; any other value keeps it active.
+    """
+    if not isinstance(fallback_model, dict):
+        return []
+    if fallback_model.get("enable_fallback") is False:
+        return []
+    nested = fallback_model.get("fallback_providers")
+    return nested if isinstance(nested, list) else []
+
+
 def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return the effective fallback chain merged across old and new config keys.
 
     ``fallback_providers`` remains the primary source of truth and keeps its
-    order. Legacy ``fallback_model`` entries are appended afterwards unless
-    they target the same provider/model/base_url route as an earlier entry.
-    The returned list always contains fresh dict copies.
+    order. Legacy ``fallback_model`` entries — either the direct dict/list
+    form or a chain nested as ``fallback_model.fallback_providers`` — are
+    appended afterwards unless they target the same provider/model/base_url
+    route as an earlier entry. The returned list always contains fresh dict
+    copies.
     """
 
     config = config or {}
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
-    for key in ("fallback_providers", "fallback_model"):
-        for entry in _iter_fallback_entries(config.get(key)):
+    sources = (
+        config.get("fallback_providers"),
+        config.get("fallback_model"),
+        _nested_fallback_providers(config.get("fallback_model")),
+    )
+    for raw in sources:
+        for entry in _iter_fallback_entries(raw):
             identity = _entry_identity(entry)
             if identity in seen:
                 continue
