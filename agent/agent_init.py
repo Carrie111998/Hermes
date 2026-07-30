@@ -1494,6 +1494,11 @@ def init_agent(
     # prompt-cache prefixes.
     agent._external_memory_messages: List[Dict[str, Any]] = []
     agent._external_memory_session_id = agent.session_id or ""
+    # Per-turn signal: the live message list is a complete provider transcript,
+    # independent of the session-DB flush baseline. Legacy compression rotation
+    # intentionally clears that baseline even though its compacted messages are
+    # authoritative.
+    agent._external_memory_transcript_authoritative = False
     # Responses encrypted reasoning replay state.  Some OpenAI-compatible
     # routes accept GPT-5 Responses requests but later reject replayed
     # encrypted reasoning blobs (HTTP 400 ``invalid_encrypted_content``).
