@@ -776,7 +776,7 @@ def _venv_pip_install(
         try:
             r = subprocess.run(
                 pip_cmd + ["install", *target_args, *constraint_args, *specs],
-                capture_output=True, text=True, timeout=timeout,
+                capture_output=True, text=True, timeout=timeout, env=uv_env,
                 stdin=subprocess.DEVNULL,
             )
             if r.returncode == 0 and target is not None:
@@ -881,13 +881,17 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
                 feature, missing, "user declined install at prompt"
             )
 
-    # Apply known source-level patches before building (e.g. python-olm's
-    # list.hh const-correctness workaround for Apple Clang >=21).
-    _apply_prebuild_patches(feature)
-
     extra_env = _FEATURE_BUILD_ENV.get(feature)
     logger.info("Lazy-installing %s for feature %r", " ".join(missing), feature)
     result = _venv_pip_install(missing, extra_env=extra_env)
+    if not result.success:
+        # Apply known source-level patches (e.g. python-olm's list.hh
+        # const-correctness workaround for Apple Clang >=21) and retry
+        # once. On a cold uv cache the first install extracts the sdist
+        # but fails to compile it unpatched — the retry picks up the
+        # now-patched source.
+        _apply_prebuild_patches(feature)
+        result = _venv_pip_install(missing, extra_env=extra_env)
     if not result.success:
         # Surface the actual pip error so the user can debug PyPI-side
         # issues (404 quarantine, network down, etc.).
