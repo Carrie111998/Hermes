@@ -398,6 +398,8 @@ terminal:
 
 **Requirements:** Running cluster with installed [k8s-agent-sandbox CRDs and Router](https://github.com/kubernetes-sigs/agent-sandbox#installation). Also deployed SandboxTemplate and SandboxWarmpool ([here is an example](https://github.com/kubernetes-sigs/agent-sandbox/tree/main/examples/python-runtime-sandbox#python-runtime-sandbox)).
 
+**Persistence:** When enabled, sandboxes are disconnected from `AgentSandboxBackend` (not deleted) on cleanup and getting connected on next session. Sandboxes have label: `hermes_task_id={task_id}`.
+
 ### Singularity/Apptainer Backend
 
 Runs commands in a [Singularity/Apptainer](https://apptainer.org) container. Designed for HPC clusters and shared machines where Docker isn't available.
