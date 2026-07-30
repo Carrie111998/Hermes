@@ -55,9 +55,8 @@ describe('buildDashboardSessionUrl', () => {
 })
 
 describe('isPhoneHandoffAuthMode', () => {
-  it('accepts oauth and handoff gated modes', () => {
+  it('accepts the gated mode exposed by the production probe', () => {
     expect(isPhoneHandoffAuthMode('oauth')).toBe(true)
-    expect(isPhoneHandoffAuthMode('handoff')).toBe(true)
     expect(isPhoneHandoffAuthMode('token')).toBe(false)
     expect(isPhoneHandoffAuthMode('unknown')).toBe(false)
   })
@@ -77,17 +76,6 @@ describe('resolveContinueOnPhoneUrl', () => {
     expect(deps.probe).toHaveBeenCalledWith('https://hermes.example.com/agent')
     expect(deps.mintHandoffTicket).toHaveBeenCalledWith('session-42', 'work')
     expect(result.ok && result.url).not.toContain('token=')
-  })
-
-  it('accepts handoff auth mode from the probe', async () => {
-    const deps = dependencies({
-      probe: vi.fn().mockResolvedValue({ authMode: 'handoff', reachable: true })
-    })
-
-    const result = await resolveContinueOnPhoneUrl('session-42', undefined, deps)
-
-    expect(result.ok).toBe(true)
-    expect(result.ok && result.url).toContain('handoff=handoff-ticket-abc')
   })
 
   it('refuses a dashboard without a configured public URL', async () => {

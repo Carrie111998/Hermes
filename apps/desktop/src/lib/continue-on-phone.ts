@@ -27,11 +27,9 @@ const DEFAULT_DEPENDENCIES: ContinueOnPhoneDependencies = {
   probe: publicUrl => window.hermesDesktop.probeConnectionConfig(publicUrl)
 }
 
-/** Gated dashboard modes that can complete phone handoff (OAuth or handoff ticket). */
-export function isPhoneHandoffAuthMode(
-  authMode: DesktopConnectionProbeResult['authMode'] | string | undefined
-): boolean {
-  return authMode === 'oauth' || authMode === 'handoff'
+/** The connection probe reports gated dashboards as OAuth mode. */
+export function isPhoneHandoffAuthMode(authMode: DesktopConnectionProbeResult['authMode']): boolean {
+  return authMode === 'oauth'
 }
 
 export function buildDashboardSessionUrl(
@@ -99,8 +97,9 @@ export async function resolveContinueOnPhoneUrl(
     return { ok: false, reason: 'unreachable' }
   }
 
-  // Token-proxy topologies have no browser sign-in page. Gated modes
-  // (oauth browser gate, or handoff-capable auth_required) are accepted.
+  // Token-proxy topologies have no browser sign-in page. The probe reports
+  // every auth_required dashboard as OAuth mode, including handoff-capable
+  // deployments.
   if (!isPhoneHandoffAuthMode(probe.authMode)) {
     return { ok: false, reason: 'auth-required' }
   }

@@ -916,9 +916,8 @@ Continue-on-phone and remote browser access need the dashboard reachable at a st
 
 **Local tunnel (dev / personal phone)**
 
-1. Run the dashboard on loopback: `hermes dashboard --no-open` (default `127.0.0.1:9119`).
-2. Front it with any TLS tunnel that terminates HTTPS and forwards to that port (examples: Cloudflare Tunnel, Tailscale Serve/Funnel, ngrok, Caddy with a public hostname). Prefer a tunnel that sets `X-Forwarded-Proto` / `X-Forwarded-Host`.
-3. Set the public origin Hermes should advertise:
+1. Configure a browser auth provider as described in [Authentication](#authentication-gated-mode).
+2. Set the public origin Hermes should advertise:
 
 ```yaml
 dashboard:
@@ -927,7 +926,9 @@ dashboard:
 
 or `export HERMES_DASHBOARD_PUBLIC_URL=https://hermes.example.com`.
 
-4. Confirm `curl -sS https://hermes.example.com/api/status | jq '.auth_required, .public_url'` — `auth_required` should be `true` once the process is bound/reached in gated mode (non-loopback bind or equivalent gate). Desktop's Continue-on-phone probe requires a gated public URL.
+3. Start or restart the dashboard on loopback: `hermes dashboard --no-open` (default `127.0.0.1:9119`). An external `dashboard.public_url` activates the auth gate even on a loopback bind, and startup fails closed if no provider is available.
+4. Front it with any TLS tunnel that terminates HTTPS and forwards to that port (examples: Cloudflare Tunnel, Tailscale Serve/Funnel, ngrok, Caddy with a public hostname). Prefer a tunnel that sets `X-Forwarded-Proto` / `X-Forwarded-Host`.
+5. Confirm `curl -sS https://hermes.example.com/api/status | jq '.auth_required, .public_url'` returns `true` for `auth_required`. Desktop's Continue-on-phone probe requires that gated public URL.
 
 **VPS / reverse proxy (production-style)**
 

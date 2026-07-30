@@ -449,16 +449,25 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({
 })
 
 
-def should_require_auth(host: str, allow_public: bool = False) -> bool:
+def should_require_auth(
+    host: str,
+    allow_public: bool = False,
+    public_url: str = "",
+) -> bool:
     """Return True iff the dashboard auth gate must be active.
 
     Truth table:
-      host == loopback        → False (no auth — local-only, trusted operator)
-      host != loopback        → True  (gate engages — OAuth or password required)
+      host != loopback                   → True
+      host == loopback, external URL     → True
+      host == loopback, no/local URL     → False
 
     "Loopback" is 127.0.0.1, localhost, ::1. RFC1918 / CGNAT / link-local are
     deliberately treated as PUBLIC — a hostile device on the same LAN is exactly
     the threat model the gate is designed for.
+
+    An operator-declared external ``dashboard.public_url`` means a reverse proxy
+    or tunnel can reach a loopback bind. Treat that as public too so the proxy
+    path cannot serve the long-lived loopback token in the SPA.
 
     ``allow_public`` (the legacy ``--insecure`` escape hatch) NO LONGER disables
     the gate. It is accepted for backward-compat with old launch scripts and
@@ -468,15 +477,31 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     MCP-persistence campaign, where ``--insecure --host 0.0.0.0`` left the
     config/MCP/agent surface open to internet scanners.
     """
-    return host not in _LOOPBACK_HOST_VALUES
+    if host not in _LOOPBACK_HOST_VALUES:
+        return True
+
+    if not public_url:
+        return False
+
+    try:
+        public_host = urllib.parse.urlparse(public_url).hostname
+    except ValueError:
+        return False
+
+    return bool(public_host and public_host not in _LOOPBACK_HOST_VALUES)
 
 
-def _is_accepted_host(host_header: str, bound_host: str) -> bool:
+def _is_accepted_host(
+    host_header: str,
+    bound_host: str,
+    public_host: str = "",
+) -> bool:
     """True if the Host header targets the interface we bound to.
 
     Accepts:
     - Exact bound host (with or without port suffix)
     - Loopback aliases when bound to loopback
+    - Exact operator-declared public host for a reverse-proxied loopback bind
     - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
       no protection possible at this layer)
     """
@@ -506,6 +531,9 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     if bound_host in {"0.0.0.0", "::"}:
         return True
 
+    if public_host and host_only == public_host.lower():
+        return True
+
     # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
@@ -532,7 +560,8 @@ async def host_header_middleware(request: Request, call_next):
     bound_host = getattr(app.state, "bound_host", None)
     if bound_host:
         host_header = request.headers.get("host", "")
-        if not _is_accepted_host(host_header, bound_host):
+        public_host = getattr(app.state, "public_host", "")
+        if not _is_accepted_host(host_header, bound_host, public_host):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -14525,7 +14554,8 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return None
 
     host_header = ws.headers.get("host", "")
-    if not _is_accepted_host(host_header, bound_host):
+    public_host = getattr(app.state, "public_host", "")
+    if not _is_accepted_host(host_header, bound_host, public_host):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
 
     origin = ws.headers.get("origin", "")
@@ -14542,7 +14572,7 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
+    if not _is_accepted_host(parsed.netloc, bound_host, public_host):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
@@ -17345,7 +17375,15 @@ def start_server(
     # injection / WS-auth paths can branch on it consistently.  Phase 3.5
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
-    app.state.auth_required = should_require_auth(host)
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+    public_url = resolve_public_url()
+    public_host = urllib.parse.urlparse(public_url).hostname if public_url else ""
+    app.state.auth_required = should_require_auth(
+        host,
+        public_url=public_url,
+    )
+    app.state.public_host = public_host or ""
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
