@@ -1,0 +1,22 @@
+request_id: ""
+requested_outcome: ""
+target_user: ""
+current_state: ""
+desired_state: ""
+constraints: []
+# Optional seeds. Research still runs proactively via host tools unless disabled.
+canonical_sources: []
+preferred_profiles: []
+requested_outputs: []
+research:
+  enabled: true          # set false or offline: true to skip live fetches
+  offline: false
+  max_fetches: null      # null = host/default budget; integer caps tool calls
+  focus: []              # optional topic hints; empty = gap-driven
+authority:
+  research: true
+  drafting: true
+  execution: false
+  spending: false
+  publishing: false
+human_review_required: true

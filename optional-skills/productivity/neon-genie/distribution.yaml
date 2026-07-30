@@ -1,0 +1,130 @@
+# Neon Genie — canonical distribution contract (single source of truth)
+# Machine tools: python scripts/distribution_spine.py {verify|write|report}
+# Do not hand-edit hub mirrors or the SKILL.md support-file list; regenerate with --write.
+
+schema_version: 1
+skill: neon-genie
+
+canonical:
+  skill_contract: SKILL.md
+  version: VERSION
+  manifest: manifest.json
+  distribution: distribution.yaml
+
+hub_allowlist_dirs:
+  - references
+  - templates
+  - scripts
+  - assets
+  - examples
+
+# Root canonical → hub-allowlisted mirrors (byte-equal required)
+mirrors:
+  - kind: dir
+    source: schemas
+    destination: references/schemas
+  - kind: dir
+    source: profiles
+    destination: references/profiles
+  - kind: dir
+    source: evals
+    destination: examples/evals
+  - kind: file
+    source: manifest.json
+    destination: references/manifest.json
+  - kind: file
+    source: VERSION
+    destination: references/VERSION
+
+hub_package:
+  root: skills/neon-genie
+  # Files/dirs excluded when rsyncing root → hub package
+  exclude:
+    - .git
+    - out
+    - skills
+    - .superpowers
+    - __pycache__
+    - docs/superpowers
+    - docs/assets
+    - "*.pyc"
+    - .venv
+    - venv
+
+# Globs (relative to skill root) that must appear as file-level refs in SKILL.md
+# for Hermes Hub install selection. Regenerated into the marked section.
+hub_support_globs:
+  - scripts/paths.py
+  - scripts/neon_genie.py
+  - scripts/doctor.py
+  - scripts/validate_hermes_skill.py
+  - scripts/validate_packet.py
+  - scripts/route_profiles.py
+  - scripts/build_receipt.py
+  - scripts/run_fixture_invariants.py
+  - scripts/audit_release_version.py
+  - scripts/run_hermes_evals.py
+  - scripts/check_transcripts.py
+  - scripts/record_learning.py
+  - scripts/recipe_run.py
+  - scripts/recipe_common.py
+  - scripts/recipe_product_audit.py
+  - scripts/distribution_spine.py
+  - scripts/check_behavioral_invariants.py
+  - scripts/hermes_runtime_smoke.py
+  - scripts/lineage.py
+  - scripts/build_envelope.py
+  - scripts/test_run_envelope.py
+  - scripts/run_job.py
+  - scripts/capabilities.py
+  - scripts/test_operator_surface.py
+  - scripts/reconcile_learning.py
+  - scripts/test_learning_reconcile.py
+  - scripts/release_check.py
+  - references/VERSION
+  - references/gates.yaml
+  - references/manifest.json
+  - references/hermes-runtime-contract.md
+  - references/CAPABILITY_MAP.md
+  - references/GOLDEN_TESTS.md
+  - references/anti-overclaim-patterns.md
+  - references/post-seal-verification.md
+  - references/schema-versioning.md
+  - references/profiles/*.md
+  - references/schemas/*.json
+  - templates/request.yaml
+  - examples/README.md
+  - examples/*.brief.yaml
+  - examples/packets/*.json
+  - examples/gallery/README.md
+  - examples/evals/rubric.md
+  - examples/evals/cases/*.json
+  - examples/evals/transcripts/*.md
+  - examples/evals/behavioral/README.md
+  - examples/evals/behavioral/cases/*.json
+  - examples/evals/behavioral/transcripts/*.md
+
+hub_support_exclude:
+  - scripts/sync_skill_package.sh
+  - scripts/test_*.py
+  - scripts/__pycache__/**
+  - examples/gallery/**
+
+skill_md:
+  section_start: "### Hermes Hub support files"
+  # Generated bullet list ends immediately before this line (exact match)
+  section_end: "Full tree also keeps root schemas, profiles, evals, VERSION, and manifest"
+
+# Paths compared root ↔ skills/neon-genie after package sync
+package_parity_globs:
+  - SKILL.md
+  - VERSION
+  - manifest.json
+  - distribution.yaml
+  - scripts/*.py
+  - references/**
+  - schemas/**
+  - profiles/**
+  - evals/**
+  - examples/**
+  - templates/**

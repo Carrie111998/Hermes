@@ -1,0 +1,11 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "notGrouped": "bottom",
+  "groupings": [
+    {
+      "title": "Product Intelligence",
+      "description": "Governed opportunity mining, product architecture, commercial simulation, and Wayfinder-ready handoffs — evidence-bound and advisory only.",
+      "skills": ["neon-genie"]
+    }
+  ]
+}

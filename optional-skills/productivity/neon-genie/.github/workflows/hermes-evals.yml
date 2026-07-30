@@ -1,0 +1,169 @@
+name: Hermes Skill Evals
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Skill integrity (do check)
+        run: python scripts/neon_genie.py do check
+
+      - name: Distribution spine (mirrors + package + SKILL list)
+        run: |
+          python scripts/distribution_spine.py verify
+          python scripts/test_distribution_spine.py
+
+      - name: Wave 3 packaging CLI regression
+        run: python scripts/test_wave3_cli.py
+
+      - name: Eval fixture invariants
+        run: python scripts/run_fixture_invariants.py
+
+      - name: Golden gate evals
+        run: python scripts/neon_genie.py do eval
+
+      - name: Golden prose transcripts
+        run: python scripts/neon_genie.py do transcripts
+
+      - name: Behavioral semantic suite
+        run: |
+          python scripts/neon_genie.py do behavioral --suite --out out/neon-genie/behavioral-report.json
+
+      - name: Isolated runtime smoke (hub layout)
+        run: python scripts/neon_genie.py do runtime --out out/neon-genie/runtime-smoke
+
+      - name: Learning ledger smoke
+        run: |
+          python scripts/neon_genie.py do learn --class other --summary "ci smoke" --ledger out/neon-genie/learning-ledger.jsonl
+          test -s out/neon-genie/learning-ledger.jsonl
+
+      - name: Release version alignment
+        run: python scripts/audit_release_version.py --strict
+
+      - name: Route smoke (examples)
+        run: |
+          python scripts/neon_genie.py do route --request examples/product-audit.brief.yaml --json
+          python scripts/neon_genie.py do route --request examples/zero-option.brief.yaml --json
+
+      - name: Packaging recipes
+        run: |
+          python scripts/neon_genie.py do recipe --list
+          python scripts/neon_genie.py do recipe --name product-audit --out out/neon-genie/product-audit
+          python scripts/neon_genie.py do recipe --name zero-option --out out/neon-genie/zero-option
+          python scripts/neon_genie.py do recipe --name zero-option-executable --out out/neon-genie/zero-option-executable
+          python scripts/neon_genie.py do recipe --name fragmentation --out out/neon-genie/fragmentation
+          python scripts/neon_genie.py do recipe --name commercial --out out/neon-genie/commercial
+          python scripts/neon_genie.py do recipe --name audit --out out/neon-genie/audit
+          python scripts/neon_genie.py do recipe --name agentic --out out/neon-genie/agentic
+          python scripts/neon_genie.py do recipe --name memetic --out out/neon-genie/memetic
+          python scripts/neon_genie.py do recipe --name evidence --out out/neon-genie/evidence
+          python scripts/neon_genie.py do recipe --name opportunity --out out/neon-genie/opportunity
+
+      - name: Doctor suite
+        run: python scripts/neon_genie.py do doctor
+
+      - name: Sample packet validation
+        run: |
+          python scripts/neon_genie.py do validate --packet examples/packets/sample-opportunity.packet.json --type opportunity
+          python scripts/neon_genie.py do validate --packet examples/packets/sample-receipt.packet.json --type receipt --strict-authority
+
+      - name: Run envelope tests
+        run: |
+          python scripts/test_run_envelope.py
+          python scripts/neon_genie.py do recipe --name product-audit --out out/neon-genie/envelope-ci
+          python scripts/neon_genie.py do validate --packet out/neon-genie/envelope-ci/run-envelope.json --type envelope --strict-authority
+          test -f out/neon-genie/envelope-ci/run-envelope.json
+
+      - name: Operator surface (run + capabilities)
+        run: |
+          python scripts/test_operator_surface.py
+          python scripts/neon_genie.py do capabilities --json | python -c "import json,sys; d=json.load(sys.stdin); assert d['authority']=='advisory_only'"
+
+      - name: Learning ledger reconcile
+        run: |
+          python scripts/test_learning_reconcile.py
+
+      - name: Hub-layout smoke (allowlisted files only)
+        run: |
+          python - <<'PY'
+          import re, shutil, tempfile, subprocess, sys
+          from pathlib import Path
+          from urllib.parse import unquote, urlsplit
+          RE = re.compile(
+              r"(?:\]\(|`|(?:^|[\s\"']))((?:references|templates|scripts|assets|examples)/[^\s)`\"'<>]+)",
+              re.MULTILINE,
+          )
+          root = Path(".").resolve()
+          skill = (root / "SKILL.md").read_text(encoding="utf-8")
+          paths = set()
+          for m in RE.finditer(skill.replace("\\", "/")):
+              raw = unquote(urlsplit(m.group(1).rstrip(".,;:")).path)
+              paths.add(raw)
+          non_files = [p for p in paths if not (root / p).is_file()]
+          if non_files:
+              raise SystemExit(f"non-file hub refs: {non_files}")
+          tmp = Path(tempfile.mkdtemp(prefix="ng-hub-ci-"))
+          (tmp / "SKILL.md").write_text(skill, encoding="utf-8")
+          for rel in paths:
+              dest = tmp / rel
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(root / rel, dest)
+          r = subprocess.run(
+              [sys.executable, "scripts/neon_genie.py", "do", "doctor"],
+              cwd=tmp,
+          )
+          raise SystemExit(r.returncode)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: neon-genie-eval-artifacts
+          path: out/neon-genie/
+
+  # Path + CLI smoke across OS/Python (not full recipe matrix)
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Path resolver + integrity + dist verify
+        shell: bash
+        run: |
+          python scripts/paths.py 2>/dev/null || true
+          python -c "import scripts.paths as p" 2>/dev/null || python -c "
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          import paths
+          print(paths.schemas_dir())
+          print(paths.profiles_dir())
+          print(paths.evals_dir())
+          print(paths.version_path().read_text().strip())
+          "
+          python scripts/neon_genie.py do check
+          python scripts/distribution_spine.py verify
+          python scripts/neon_genie.py do eval
+          python scripts/neon_genie.py do route --text "zero capital first cash" --json
