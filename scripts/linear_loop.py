@@ -366,6 +366,16 @@ Branche imposee : {branch}
 ## Contrat
 
 - Un seul perimetre : cette issue. Aucune autre carte, aucun autre worktree.
+- **Travaille exclusivement dans `{repo}`.** Ce dossier contient le depot
+  complet : le code que tu dois lire y est deja. N'utilise jamais un chemin
+  absolu vers une autre copie (ni `~/.hermes/hermes-agent`, ni un autre
+  worktree) — ce sont d'autres exemplaires du meme code, et y toucher est
+  refuse par construction.
+- **Un refus du garde-fou n'est pas une panne.** S'il refuse une commande,
+  c'est que la cible est hors de ton worktree : corrige le chemin et continue.
+  N'audite pas le systeme d'admission, ne cherche pas ton proprietaire dans le
+  registre, ne bloque pas pour cette raison — l'admission a ete verifiee avant
+  ton demarrage.
 - Si les criteres d'acceptation ne sont pas explicites ci-dessus, publie ta
   lecture (AC-1..N et non-objectifs) en commentaire de la carte avant de coder,
   puis avance sans attendre de reponse.

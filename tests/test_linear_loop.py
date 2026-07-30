@@ -347,6 +347,19 @@ def test_brief_forbids_self_review_after_completion(tmp_path):
     assert "pas d'auto-revue" in brief
 
 
+def test_brief_keeps_the_worker_inside_its_own_copy(tmp_path):
+    """HER-112 a lu le code du runtime, s'est fait refuser, et a cru a une panne.
+
+    Le depot est complet dans le worktree : lire ailleurs est inutile et refuse.
+    """
+    brief = linear_loop.build_brief(
+        make_issue("HER-107"), branch="agent/x", repo="/worktrees/agent-her-107"
+    )
+    assert "Travaille exclusivement dans `/worktrees/agent-her-107`" in brief
+    assert "n'est pas une panne" in brief
+    assert "ne bloque pas pour cette raison" in brief
+
+
 def test_tick_marks_the_issue_building_in_linear(tmp_path):
     linear = FakeLinear([make_issue("HER-110", priority=1)])
     linear_loop.run_tick(
