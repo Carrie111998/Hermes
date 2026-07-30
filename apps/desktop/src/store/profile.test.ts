@@ -165,7 +165,7 @@ describe('refreshProfiles shared rail list (#49289)', () => {
 
   it('leaves the shared $profiles cache intact when the refresh fails', async () => {
     $profiles.set([profile('default', true), profile('test1')])
-    vi.mocked(getProfiles).mockRejectedValueOnce(new Error('backend unavailable'))
+    vi.mocked(getProfiles).mockRejectedValue(new Error('backend unavailable'))
 
     await expect(refreshProfiles()).rejects.toThrow('backend unavailable')
 

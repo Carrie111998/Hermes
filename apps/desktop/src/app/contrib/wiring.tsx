@@ -40,8 +40,8 @@ import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
   $freshSessionRequest,
-  $profileScope,
   $profiles,
+  $profileScope,
   ensureGatewayProfile,
   newSessionInProfile,
   normalizeProfileKey,
