@@ -2379,6 +2379,25 @@ def test_sidebar_status_shapes_placement_without_secret_identity_fields() -> Non
         assert secret not in encoded
 
 
+def test_sidebar_status_sanitizes_negative_canary_verified_at() -> None:
+    status = _sidebar_status({
+        "counts": {},
+        "placement": {
+            "inbox_cwd": "C:\\Users\\diego\\.hermes",
+            "generation": 1,
+            "verified_visible": 12,
+            "mismatch_count": 0,
+            "canary": {"status": "passed", "verified_at": -0.001},
+        },
+    })
+
+    assert status["placement"]["canary"] == {
+        "status": "not_run",
+        "verified_at": None,
+    }
+    assert "-0.001" not in json.dumps(status)
+
+
 def test_session_status_uses_explicit_schemas_and_never_stringifies_unknowns(
     db: SessionDB,
     monkeypatch: pytest.MonkeyPatch,

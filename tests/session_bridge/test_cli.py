@@ -3201,6 +3201,13 @@ def test_sidebar_status_exposes_only_sanitized_placement_health(
             "generation": 1,
             "verified_visible": 1,
             "mismatch_count": 0,
+            "canary": {"status": "passed", "verified_at": -0.001},
+        },
+        {
+            "inbox_cwd": "C:\\Users\\diego\\.hermes",
+            "generation": 1,
+            "verified_visible": 1,
+            "mismatch_count": 0,
             "source_cwd": "C:\\secret\\source",
             "canary": {"status": "passed", "verified_at": 1234.0},
         },

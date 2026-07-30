@@ -9964,6 +9964,46 @@ def test_sidebar_placement_canary_rejects_unknown_persisted_fields(db) -> None:
         )
 
 
+def test_sidebar_placement_canary_rejects_negative_verified_at_without_write(
+    db,
+) -> None:
+    store = SessionBridgeStore(db)
+
+    with pytest.raises(
+        ValueError,
+        match="sidebar placement canary verified_at",
+    ):
+        store.record_sidebar_placement_canary(
+            status="passed",
+            placement_generation=1,
+            verified_at=-0.001,
+            canary_identity="codex:negative-canary-task",
+        )
+
+    assert store.get_state("session-bridge:sidebar:placement-canary:v1") is None
+
+
+def test_sidebar_placement_canary_rejects_negative_persisted_verified_at(db) -> None:
+    store = SessionBridgeStore(db)
+    store.set_state(
+        "session-bridge:sidebar:placement-canary:v1",
+        {
+            "version": 1,
+            "status": "passed",
+            "placement_generation": 1,
+            "verified_at": -0.001,
+            "canary_identity_digest": "a" * 64,
+        },
+    )
+
+    with pytest.raises(ValueError, match="invalid sidebar placement canary state"):
+        store.sidebar_delivery_status(
+            now=240.0,
+            inbox_cwd="C:\\Users\\diego\\.hermes",
+            placement_generation=1,
+        )
+
+
 def test_sidebar_delivery_latency_uses_fixed_recent_indexed_sample(db) -> None:
     sample_limit = 512
     row_count = sample_limit + 75

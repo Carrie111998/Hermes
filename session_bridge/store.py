@@ -6361,6 +6361,10 @@ class SessionBridgeStore:
             verified_at,
             "sidebar placement canary verified_at",
         )
+        if timestamp < 0:
+            raise ValueError(
+                "sidebar placement canary verified_at must be nonnegative"
+            )
         identity = _exact_nonempty_text(
             canary_identity,
             "sidebar placement canary identity",
@@ -11924,6 +11928,8 @@ def _sidebar_placement_canary_public_status(
         state.get("verified_at"),
         "sidebar placement canary verified_at",
     )
+    if verified_at < 0:
+        raise ValueError("invalid sidebar placement canary state")
     if state["placement_generation"] != placement_generation:
         return {"status": "not_run", "verified_at": None}
     return {"status": state["status"], "verified_at": verified_at}
