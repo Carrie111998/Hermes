@@ -5295,10 +5295,10 @@ def _inject_platform_plugin_env_vars() -> None:
                     # Trusted bundled platform plugins may declare that one of
                     # their env vars is eligible for an *explicit* terminal
                     # passthrough opt-in. Eligibility alone never exposes the
-                    # value: terminal.env_passthrough (or trusted runtime
-                    # registration) must still name it, and all undeclared
-                    # provider/messaging credentials remain non-bypassable.
-                    "terminal_passthrough": bool(meta.get("terminal_passthrough", False)),
+                    # value: terminal.env_passthrough must still name it, and
+                    # all undeclared provider/messaging credentials remain
+                    # non-bypassable.
+                    "terminal_passthrough": meta.get("terminal_passthrough") is True,
                 }
     except Exception:
         pass

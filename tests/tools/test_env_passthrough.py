@@ -9,6 +9,7 @@ from tools.env_passthrough import (
     clear_env_passthrough,
     get_all_passthrough,
     is_env_passthrough,
+    is_terminal_env_passthrough,
     register_env_passthrough,
 )
 
@@ -18,9 +19,11 @@ def _clean_passthrough():
     """Ensure a clean passthrough state for every test."""
     clear_env_passthrough()
     _ep_mod._config_passthrough = None
+    _ep_mod._terminal_config_passthrough = None
     yield
     clear_env_passthrough()
     _ep_mod._config_passthrough = None
+    _ep_mod._terminal_config_passthrough = None
 
 
 class TestSkillScopedPassthrough:
@@ -221,13 +224,35 @@ class TestTerminalIntegration:
         register_env_passthrough(["MY_SKILL_CUSTOM_CONFIG"])
         assert is_env_passthrough("MY_SKILL_CUSTOM_CONFIG")
 
-    def test_bundled_plugin_var_requires_explicit_passthrough(
+    def test_skill_cannot_self_enable_bundled_plugin_credentials(self):
+        from tools.environments.local import _sanitize_subprocess_env
+
+        buzz_vars = {
+            "BUZZ_RELAY_URL": "https://relay.example",
+            "BUZZ_PRIVATE_KEY": "test-private-key",
+            "BUZZ_AUTH_TAG": "test-auth-tag",
+        }
+        register_env_passthrough(buzz_vars)
+
+        for name in buzz_vars:
+            assert not is_env_passthrough(name)
+            assert not is_terminal_env_passthrough(name)
+        assert not (
+            buzz_vars.keys()
+            & _sanitize_subprocess_env(
+                buzz_vars, terminal_passthrough=True
+            ).keys()
+        )
+
+    def test_bundled_plugin_var_requires_explicit_terminal_config(
         self, tmp_path, monkeypatch
     ):
-        """Trusted plugin metadata makes exact vars eligible, not exposed."""
+        """Explicit config reaches terminal only, never generic sandboxes."""
+        from tools.code_execution_tool import _scrub_child_env
         from tools.environments.local import (
             _HERMES_PROVIDER_ENV_BLOCKLIST,
             _HERMES_TERMINAL_PASSTHROUGH_ELIGIBLE,
+            _make_run_env,
             _sanitize_subprocess_env,
         )
 
@@ -248,22 +273,53 @@ class TestTerminalIntegration:
         (tmp_path / "config.yaml").write_text(yaml.dump(config))
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         _ep_mod._config_passthrough = None
+        _ep_mod._terminal_config_passthrough = None
 
         for name in buzz_vars:
-            assert is_env_passthrough(name)
-        result_after = _sanitize_subprocess_env(buzz_vars)
-        for name, value in buzz_vars.items():
-            assert result_after[name] == value
+            assert not is_env_passthrough(name)
+            assert is_terminal_env_passthrough(name)
 
-    def test_manifest_eligibility_does_not_unlock_provider_credentials(
+        # execute_code/generic children remain unable to read the credentials.
+        generic_result = _sanitize_subprocess_env(buzz_vars)
+        assert not (buzz_vars.keys() & generic_result.keys())
+        execute_code_result = _scrub_child_env(
+            buzz_vars,
+            is_passthrough=is_env_passthrough,
+            is_windows=False,
+        )
+        assert not (buzz_vars.keys() & execute_code_result.keys())
+
+        # Foreground terminal and the shared background/PTY sanitizer receive
+        # only the explicitly configured, manifest-approved names.
+        terminal_result = _sanitize_subprocess_env(
+            buzz_vars, terminal_passthrough=True
+        )
+        for name, value in buzz_vars.items():
+            assert terminal_result[name] == value
+
+        for name, value in buzz_vars.items():
+            monkeypatch.setenv(name, value)
+        foreground_result = _make_run_env({})
+        for name, value in buzz_vars.items():
+            assert foreground_result[name] == value
+
+    def test_terminal_eligibility_does_not_unlock_other_credentials(
         self, tmp_path, monkeypatch
     ):
-        config = {"terminal": {"env_passthrough": ["OPENAI_API_KEY"]}}
+        config = {
+            "terminal": {
+                "env_passthrough": ["OPENAI_API_KEY", "BUZZ_CHANNELS"]
+            }
+        }
         (tmp_path / "config.yaml").write_text(yaml.dump(config))
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         _ep_mod._config_passthrough = None
+        _ep_mod._terminal_config_passthrough = None
 
         assert not is_env_passthrough("OPENAI_API_KEY")
+        assert not is_terminal_env_passthrough("OPENAI_API_KEY")
+        assert not is_env_passthrough("BUZZ_CHANNELS")
+        assert not is_terminal_env_passthrough("BUZZ_CHANNELS")
 
     def test_provider_blocklist_import_failure_fails_closed(self, monkeypatch):
         """If the dynamic provider blocklist can't be imported, provider

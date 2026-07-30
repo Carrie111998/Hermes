@@ -479,10 +479,25 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment."""
+def _sanitize_subprocess_env(
+    base_env: Mapping[str, str] | None,
+    extra_env: Mapping[str, str] | None = None,
+    *,
+    terminal_passthrough: bool = False,
+) -> dict:
+    """Filter Hermes-managed secrets from a subprocess environment.
+
+    ``terminal_passthrough`` is reserved for terminal foreground/background
+    execution. It permits only protected vars explicitly approved by both a
+    trusted bundled plugin manifest and the operator's config.
+    """
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        if terminal_passthrough:
+            from tools.env_passthrough import (
+                is_terminal_env_passthrough as _is_passthrough,
+            )
+        else:
+            from tools.env_passthrough import is_env_passthrough as _is_passthrough
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
 
@@ -1245,7 +1260,9 @@ def _path_env_key(run_env: dict) -> str | None:
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import (
+            is_terminal_env_passthrough as _is_passthrough,
+        )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
 
