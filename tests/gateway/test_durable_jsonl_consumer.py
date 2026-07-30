@@ -12,6 +12,9 @@ import pytest
 import yaml
 
 from gateway import durable_jsonl_consumer as consumer
+from gateway.config import GatewayConfig, Platform
+from gateway.replay import replay_context
+from gateway.session import SessionSource, SessionStore
 
 
 def _message(message_id: str, chat_id: str = "test-group@g.us") -> dict:
@@ -543,6 +546,7 @@ async def test_retained_documents_are_annotated_only_in_replay_copy(
         [complete_record],
         config_path=config,
         state_db=tmp_path / "state.db",
+        persistent_session=True,
         runner=Runner(),
     )
 
@@ -2052,6 +2056,7 @@ async def test_seq_3030_management_lane_runs_during_999_site_shape(
     management_done = asyncio.Event()
 
     async def fake_process(records, **kwargs):
+        assert kwargs["persistent_session"] is True
         chat = records[0].chat_id
         if chat == "site-a@g.us":
             site_a_started.set()
@@ -2132,7 +2137,7 @@ async def test_cancelling_active_chat_requeues_without_double_processing(
 
 
 @pytest.mark.asyncio
-async def test_management_reuses_stable_persistent_chat_namespace(tmp_path, monkeypatch):
+async def test_live_drain_reuses_one_session_across_site_chat_turns(tmp_path):
     args = _enabled_consumer_args(tmp_path, [])
     plans = []
 
@@ -2141,26 +2146,96 @@ async def test_management_reuses_stable_persistent_chat_namespace(tmp_path, monk
             plans.append(plan)
             return SimpleNamespace(processed=1, outbound=[])
 
-    monkeypatch.setenv("TGG_PERSISTENT_CHAT_SESSION_SCOPE", "management")
+    chat_id = "site-ops@g.us"
     record = consumer.InboxRecord(
-        seq=1, message_id="management-1", chat_id="management@g.us",
-        start_offset=0, end_offset=1, raw=_message("management-1", "management@g.us"),
+        seq=1, message_id="site-1", chat_id=chat_id,
+        start_offset=0, end_offset=1, raw=_message("site-1", chat_id),
     )
     await consumer.process_live_records(
-        [record], config_path=Path(args.config), state_db=Path(args.state_db), runner=Runner()
+        [record],
+        config_path=Path(args.config),
+        state_db=Path(args.state_db),
+        persistent_session=True,
+        runner=Runner(),
     )
     record_2 = consumer.InboxRecord(
-        seq=2, message_id="management-2", chat_id="management@g.us",
-        start_offset=1, end_offset=2, raw=_message("management-2", "management@g.us"),
+        seq=2, message_id="site-2", chat_id=chat_id,
+        start_offset=1, end_offset=2, raw=_message("site-2", chat_id),
     )
     await consumer.process_live_records(
-        [record_2], config_path=Path(args.config), state_db=Path(args.state_db), runner=Runner()
+        [record_2],
+        config_path=Path(args.config),
+        state_db=Path(args.state_db),
+        persistent_session=True,
+        runner=Runner(),
     )
     assert [plan.replay_namespace for plan in plans] == [
         "agent:live-drain:persistent-chat",
         "agent:live-drain:persistent-chat",
     ]
-    assert all({message["chatId"] for message in plan.messages} == {"management@g.us"} for plan in plans)
+    assert all({message["chatId"] for message in plan.messages} == {chat_id} for plan in plans)
+
+    store = SessionStore(
+        sessions_dir=tmp_path / "sessions",
+        config=GatewayConfig(group_sessions_per_user=False),
+    )
+    store._db = None
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id=chat_id,
+        chat_type="group",
+        user_id="fixture-user",
+    )
+    session_ids = []
+    for plan in plans:
+        with replay_context(plan):
+            session_ids.append(store.get_or_create_session(source).session_id)
+
+    assert session_ids[0] == session_ids[1]
+    with replay_context(plans[-1]):
+        other_chat = store.get_or_create_session(
+            SessionSource(
+                platform=Platform.WHATSAPP,
+                chat_id="other-site@g.us",
+                chat_type="group",
+                user_id="fixture-user",
+            )
+        )
+    assert other_chat.session_id != session_ids[-1]
+
+
+@pytest.mark.asyncio
+async def test_bounded_backplay_keeps_session_namespaces_isolated(tmp_path):
+    args = _enabled_consumer_args(tmp_path, [])
+    plans = []
+
+    class Runner:
+        async def replay(self, plan):
+            plans.append(plan)
+            return SimpleNamespace(processed=1, outbound=[])
+
+    record = consumer.InboxRecord(
+        seq=1,
+        message_id="backplay-1",
+        chat_id="site-ops@g.us",
+        start_offset=0,
+        end_offset=1,
+        raw=_message("backplay-1", "site-ops@g.us"),
+    )
+    for _ in range(2):
+        await consumer.process_live_records(
+            [record],
+            config_path=Path(args.config),
+            state_db=Path(args.state_db),
+            persistent_session=False,
+            runner=Runner(),
+        )
+
+    assert plans[0].replay_namespace != plans[1].replay_namespace
+    assert all(
+        plan.replay_namespace.startswith("agent:replay:live-drain-")
+        for plan in plans
+    )
 
 
 @pytest.mark.asyncio
@@ -2199,6 +2274,7 @@ async def test_process_live_records_defers_structured_provider_error(tmp_path):
     )
     result = await consumer.process_live_records(
         [record], config_path=config, state_db=state_db, runner=Runner(),
+        persistent_session=True,
         defer_provider_errors=True,
     )
     assert result["handled"] == []
@@ -2380,6 +2456,7 @@ def test_bounded_execution_never_calls_delivery(tmp_path, monkeypatch):
     monkeypatch.setattr(consumer, "_new_gateway_runner", lambda *_a, **_k: object())
 
     async def fake_process(records, **kwargs):
+        assert kwargs["persistent_session"] is False
         return {
             "submitted_message_ids": [record.message_id for record in records],
             "handled": [{

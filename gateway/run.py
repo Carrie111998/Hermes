@@ -716,6 +716,8 @@ from gateway.session import (
     SessionStore,
     SessionSource,
     SessionContext,
+    _in_clock_timezone,
+    _now as _session_now,
     build_session_context,
     build_session_context_prompt,
     build_session_key,
@@ -3982,10 +3984,12 @@ class GatewayRunner:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return 0
 
-        now = datetime.now()
+        now = _session_now()
         scheduled = 0
         for entry in candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
+            if marker is not None:
+                marker = _in_clock_timezone(marker, now)
             if marker is not None and (now - marker).total_seconds() > window:
                 continue
 

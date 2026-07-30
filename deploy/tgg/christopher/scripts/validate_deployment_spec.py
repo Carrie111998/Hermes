@@ -245,6 +245,10 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
             raise RuntimeError(f"slot {slot} enables the built-in WhatsApp gateway")
         if config["group_sessions_per_user"] is not False:
             raise RuntimeError(f"slot {slot} changed group_sessions_per_user")
+        if config.get("timezone") != "Asia/Singapore":
+            raise RuntimeError(f"slot {slot} timezone mismatch")
+        if config.get("session_reset", {}).get("mode") != "none":
+            raise RuntimeError(f"slot {slot} session_reset mode is not none")
         if config["model"]["provider"] != engine["provider"]:
             raise RuntimeError(f"slot {slot} provider mismatch")
         if config["model"]["default"] != model:

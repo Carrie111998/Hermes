@@ -131,6 +131,19 @@ if [[ ! "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
   echo "Christopher consumer has no live MainPID" >&2
   exit 32
 fi
+python3 - "$main_pid" <<'PY'
+import pathlib
+import sys
+
+raw = pathlib.Path(f"/proc/{sys.argv[1]}/environ").read_bytes()
+env = {}
+for item in raw.split(b"\0"):
+    if b"=" in item:
+        key, value = item.split(b"=", 1)
+        env[key.decode(errors="replace")] = value.decode(errors="replace")
+for key in ("HERMES_TIMEZONE", "TZ"):
+    assert env.get(key, "") in {"", "Asia/Singapore"}, (key, env.get(key))
+PY
 for _ in $(seq 1 30); do
   if python3 - "$RUNTIME_ROOT/capture-consumer-status.json" "$main_pid" <<'PY'
 import json, pathlib, sys
@@ -208,6 +221,8 @@ normalized_config = json.loads(json.dumps(config))
 normalized_config["pa"]["enabled"] = False
 assert normalized_config == slot_config
 assert config["group_sessions_per_user"] is False
+assert config["timezone"] == "Asia/Singapore"
+assert config["session_reset"] == {"mode": "none"}
 assert config["platforms"]["whatsapp"]["enabled"] is False
 assert config["model"]["provider"] == "openai-direct-primary"
 assert config["model"]["default"] == slot_model
