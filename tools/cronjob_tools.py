@@ -181,14 +181,15 @@ def _strip_cron_safe_constructs(prompt: str) -> str:
     and the old ``re.search`` + single ``str.replace`` left the rest to trip
     the exfil_curl_auth_header detector on every run.
 
-    The allowlist is deliberately bounded to one shell command.  Consuming
-    through ``&&``, ``||``, ``;``, or ``|`` would erase a chained exfiltration
-    command before the broader scanner can inspect it.
+    The allowlist is deliberately bounded to one simple shell command.
+    Consuming through ``&&``, ``||``, ``;``, ``|``, command substitution
+    (``$()`` / backticks), or process substitution would erase an embedded
+    exfiltration command before the broader scanner can inspect it.
     """
     return re.sub(
-        rf'curl\s+[^\n&|;]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
+        rf'curl\s+[^\n&|;()`]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
         r'\s+["\']?https://api\.github\.com'
-        r'(?:/[^\s"\'&|;]*|(?=["\'\s&|;]|$))["\']?',
+        r'(?:(?:/[^\s"\'&|;()`]*)|(?=["\'\s&|;]|$))["\']?',
         'curl https://api.github.com/user',
         prompt,
         flags=re.IGNORECASE,
