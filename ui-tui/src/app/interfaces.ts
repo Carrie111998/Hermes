@@ -368,6 +368,7 @@ export interface ComposerActions {
   dequeue: () => string | undefined
   enqueue: (text: string) => void
   handleTextPaste: (event: PasteEvent) => MaybePromise<ComposerPasteResult | null>
+  mergeContinuationBackspace: (current: string) => ComposerPasteResult | null
   openEditor: () => Promise<void>
   pushHistory: (text: string) => void
   removeQueue: (index: number) => void
@@ -561,6 +562,7 @@ export interface AppLayoutComposerProps {
   handleTextPaste: (event: PasteEvent) => MaybePromise<ComposerPasteResult | null>
   input: string
   inputBuf: string[]
+  mergeContinuationBackspace: (current: string) => ComposerPasteResult | null
   pagerPageSize: number
   queueEditIdx: null | number
   queuedDisplay: string[]
