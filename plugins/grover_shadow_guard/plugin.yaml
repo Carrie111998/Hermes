@@ -1,0 +1,10 @@
+name: grover-shadow-guard
+version: "0.1.0"
+description: "Mechanically blocks LLM and tool external effects in the Grover shadow runtime."
+author: "Grizzly"
+kind: standalone
+hooks:
+  - pre_tool_call
+middleware:
+  - llm_execution
+  - tool_execution

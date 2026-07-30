@@ -22,6 +22,11 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
+from grover_runtime.telegram_callbacks import handle_typed_action_callback
+
+# Backward-compatible integration name used by the Grover shadow guard.
+handle_typed_telegram_callback = handle_typed_action_callback
+
 logger = logging.getLogger(__name__)
 
 
@@ -861,6 +866,20 @@ class TelegramAdapter(BasePlatformAdapter):
         # API call (e.g. a set_my_commands stall for certain tokens) cannot
         # blow the gateway's connect timeout (#46298).
         self._post_connect_task: Optional[asyncio.Task] = None
+
+    @property
+    def external_effects_allowed(self) -> bool:
+        """Return whether this runtime may call Telegram at all.
+
+        The value must be the literal boolean ``True``. Missing configuration
+        preserves the normal adapter default; malformed or explicit false
+        values fail closed. This is an effect boundary, not an authorization
+        hint, and is checked again on every outbound or polling entry point.
+        """
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        if not isinstance(extra, dict) or "external_effects" not in extra:
+            return True
+        return extra["external_effects"] is True
 
     def _mark_connected(self) -> None:
         self._drop_delayed_deliveries = False
@@ -2349,6 +2368,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
             raise
 
+    def _drop_pending_updates(self, *, is_reconnect: bool) -> bool:
+        """Choose whether startup may discard Telegram's pending update queue."""
+        if is_reconnect:
+            return False
+        extra = getattr(self.config, "extra", None)
+        if (
+            isinstance(extra, dict)
+            and extra.get("preserve_pending_updates_on_start") is True
+        ):
+            return False
+        return True
+
     async def _start_polling_resilient(
         self,
         *,
@@ -3597,6 +3628,15 @@ class TelegramAdapter(BasePlatformAdapter):
                                     all interfaces IPv4+IPv6)
             TELEGRAM_WEBHOOK_SECRET Secret token for update verification
         """
+        if not self.external_effects_allowed:
+            logger.error("[%s] Telegram external effects are mechanically disabled", self.name)
+            self._set_fatal_error(
+                "external_effects_disabled",
+                "Telegram external effects are mechanically disabled",
+                retryable=False,
+            )
+            return False
+
         # Explicit connect() is the only operation allowed to reopen polling
         # after a completed, serialized teardown. Background recovery never
         # clears this fence.
@@ -3985,7 +4025,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     # server-side getUpdates queue, so this flag is a no-op
                     # in practice. Mirror the polling path's reconnect
                     # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=self._drop_pending_updates(
+                        is_reconnect=is_reconnect
+                    ),
                 )
                 self._webhook_mode = True
                 self._polling_progress_accepting = False
@@ -4042,7 +4084,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     # On a cold first boot drop the stale Bot API queue; on a
                     # watcher reconnect after an outage preserve it so messages
                     # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=self._drop_pending_updates(
+                        is_reconnect=is_reconnect
+                    ),
                     error_callback=_polling_error_callback,
                     require_progress=not is_reconnect,
                 )
@@ -4326,6 +4370,11 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
+        if not self.external_effects_allowed:
+            return SendResult(
+                success=False,
+                error="external_effects_disabled",
+            )
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -6203,6 +6252,8 @@ class TelegramAdapter(BasePlatformAdapter):
         query = update.callback_query
         if not query or not query.data:
             return
+        if not self.external_effects_allowed:
+            return
         data = query.data
         query_message = getattr(query, "message", None)
         query_chat_id = getattr(query_message, "chat_id", None)
@@ -6210,6 +6261,16 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # Grizzly shared-decision buttons carry only an opaque, one-card token.
+        # Resolve them before any built-in callback dispatch so they can never
+        # fall through as model-authored action text.  The bridge consumes every
+        # ``od:`` failure and fails closed; unrelated callbacks return False.
+        if await handle_typed_action_callback(
+            query,
+            is_authorized=self._is_callback_user_authorized,
+        ):
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
@@ -9842,6 +9903,10 @@ async def _standalone_send(
     parse-mode fallback). Implements the standalone_sender_fn contract so
     deliver=telegram cron jobs succeed when cron runs separately from the
     gateway."""
+    extra = getattr(pconfig, "extra", None)
+    if isinstance(extra, dict) and "external_effects" in extra:
+        if extra["external_effects"] is not True:
+            return {"error": "external_effects_disabled"}
     token = getattr(pconfig, "token", None) or os.getenv("TELEGRAM_BOT_TOKEN", "")
     disable_link_previews = bool(
         getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")
