@@ -516,26 +516,26 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             observed_urls.append(url)
             return SimpleNamespace()
 
-        adapter = FeishuAdapter(PlatformConfig())
-        adapter._loop = _AdapterLoop()
-        with (
-            patch("plugins.platforms.feishu.adapter.FEISHU_WEBSOCKET_AVAILABLE", True),
-            patch("plugins.platforms.feishu.adapter.EventDispatcherHandler") as mock_handler_class,
-            patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
-            patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
-        ):
-            _mock_event_dispatcher_builder(mock_handler_class)
-            asyncio.run(adapter._connect_websocket())
-
-        self.assertIsInstance(adapter._ws_client, FeishuWSClient)
-        sdk_client = adapter._ws_client
         capture = _CaptureHandler()
         original_level = sdk_logger.level
         original_handlers = list(sdk_logger.handlers)
         original_propagate = sdk_logger.propagate
-        sdk_logger.handlers[:] = [capture]
-        sdk_logger.propagate = False
         try:
+            sdk_logger.handlers[:] = [capture]
+            sdk_logger.propagate = False
+            adapter = FeishuAdapter(PlatformConfig())
+            adapter._loop = _AdapterLoop()
+            with (
+                patch("plugins.platforms.feishu.adapter.FEISHU_WEBSOCKET_AVAILABLE", True),
+                patch("plugins.platforms.feishu.adapter.EventDispatcherHandler") as mock_handler_class,
+                patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
+                patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
+            ):
+                _mock_event_dispatcher_builder(mock_handler_class)
+                asyncio.run(adapter._connect_websocket())
+
+            self.assertIsInstance(adapter._ws_client, FeishuWSClient)
+            sdk_client = adapter._ws_client
             self.assertEqual(sdk_logger.level, LogLevel.WARNING.value)
             with (
                 patch.object(lark_ws_client, "loop", _NoBackgroundTaskLoop()),
