@@ -17092,42 +17092,54 @@ def main():
 
             if has_ws:
                 if has_titles:
-                    print(f"{'Title':<28} {'Workspace':<18} {'Last Active':<13} {'ID'}")
-                    print("─" * 110)
+                    print(f"{'Title':<24} {'Workspace':<18} {'Model':<12} {'Msgs':>4}  {'Last Active':<13} {'ID'}")
+                    print("─" * 100)
                 else:
-                    print(f"{'Preview':<38} {'Workspace':<18} {'Last Active':<13} {'Src':<6} {'ID'}")
+                    print(f"{'Preview':<30} {'Workspace':<18} {'Model':<12} {'Msgs':>4}  {'Last Active':<13} {'Src':<6} {'ID'}")
                     print("─" * 100)
                 for s in sessions:
                     last_active = _relative_time(s.get("last_active"))
                     ws = _ws_label(s)[:16]
+                    model_raw = (s.get("model") or "—")
+                    model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
+                    if len(model) > 12:
+                        model = model[:11] + "…"
+                    msgs = s.get("message_count")
+                    msgs_str = str(msgs) if msgs is not None else "—"
                     if has_titles:
-                        title = (s.get("title") or "—")[:26]
-                        print(f"{title:<28} {ws:<18} {last_active:<13} {s['id']}")
+                        title = (s.get("title") or "—")[:22]
+                        print(f"{title:<24} {ws:<18} {model:<12} {msgs_str:>4}  {last_active:<13} {s['id']}")
                     else:
-                        preview = s.get("preview", "")[:36]
-                        print(f"{preview:<38} {ws:<18} {last_active:<13} {s['source']:<6} {s['id']}")
+                        preview = s.get("preview", "")[:28]
+                        print(f"{preview:<30} {ws:<18} {model:<12} {msgs_str:>4}  {last_active:<13} {s['source']:<6} {s['id']}")
                 return
 
             if has_titles:
-                print(f"{'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
-                print("─" * 110)
+                print(f"{'Title':<28} {'Model':<12} {'Msgs':>4}  {'Preview':<28} {'Last Active':<13} {'ID'}")
+                print("─" * 100)
             else:
-                print(f"{'Preview':<50} {'Last Active':<13} {'Src':<6} {'ID'}")
-                print("─" * 95)
+                print(f"{'Preview':<40} {'Model':<12} {'Msgs':>4}  {'Last Active':<13} {'Src':<6} {'ID'}")
+                print("─" * 90)
             for s in sessions:
                 last_active = _relative_time(s.get("last_active"))
+                model_raw = (s.get("model") or "—")
+                model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
+                if len(model) > 12:
+                    model = model[:11] + "…"
+                msgs = s.get("message_count")
+                msgs_str = str(msgs) if msgs is not None else "—"
                 preview = (
-                    s.get("preview", "")[:38]
+                    s.get("preview", "")[:26]
                     if has_titles
-                    else s.get("preview", "")[:48]
+                    else s.get("preview", "")[:38]
                 )
                 if has_titles:
-                    title = (s.get("title") or "—")[:30]
+                    title = (s.get("title") or "—")[:26]
                     sid = s["id"]
-                    print(f"{title:<32} {preview:<40} {last_active:<13} {sid}")
+                    print(f"{title:<28} {model:<12} {msgs_str:>4}  {preview:<28} {last_active:<13} {sid}")
                 else:
                     sid = s["id"]
-                    print(f"{preview:<50} {last_active:<13} {s['source']:<6} {sid}")
+                    print(f"{preview:<40} {model:<12} {msgs_str:>4}  {last_active:<13} {s['source']:<6} {sid}")
 
         elif action == "export":
             from hermes_cli.session_filters import (
