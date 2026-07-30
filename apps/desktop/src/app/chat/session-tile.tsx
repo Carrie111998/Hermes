@@ -184,7 +184,7 @@ function TileChat({
           onSteer={actions.steerPrompt}
           onSubmit={actions.submitText}
           onThreadMessagesChange={actions.handleThreadMessagesChange}
-          onToggleSelectedPin={() => undefined}
+          onToggleSelectedPin={() => toggleTilePin(storedSessionId)}
           onTranscribeAudio={async audio => (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript}
         />
       </ComposerScopeProvider>
@@ -332,6 +332,26 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
  *  the paginated recents page, so it has no `$sessions` row at all until new
  *  activity lands it there — resolving through the tree keeps its tab titled
  *  and tinted instead of a grey "Session" placeholder. */
+/**
+ * Pin/unpin a tile's session, keyed on the durable lineage-root id so the pin
+ * survives auto-compression — the same id `useTileMenuRow` gives the tab menu.
+ *
+ * Exported so the title menu and the tab menu cannot drift apart: the tile's
+ * ChatView passed `() => undefined` here, and because the Pin item's
+ * availability is `disabled: !onPin`, a stub function left the item ENABLED and
+ * silently did nothing when clicked.
+ */
+export function toggleTilePin(storedSessionId: string): void {
+  const stored = tileStoredRow(storedSessionId)
+  const pinId = stored ? sessionPinId(stored) : storedSessionId
+
+  if ($pinnedSessionIds.get().includes(pinId)) {
+    unpinSession(pinId)
+  } else {
+    pinSession(pinId)
+  }
+}
+
 export function tileStoredRow(storedSessionId: string): SessionInfo | undefined {
   const match = (s: SessionInfo) => sessionMatchesStoredId(s, storedSessionId)
 
