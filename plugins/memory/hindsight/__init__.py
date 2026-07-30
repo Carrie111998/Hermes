@@ -315,12 +315,30 @@ RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
         "Search long-term memory. Returns memories ranked by relevance using "
-        "semantic search, keyword matching, entity graph traversal, and reranking."
+        "semantic search, keyword matching, entity graph traversal, and reranking.\n\n"
+        "Each result includes an id=... prefix so the target can be passed to "
+        "hindsight_invalidate. Use the optional `types` parameter to recall "
+        "world/experience facts (curatable) instead of the default observations.\n\n"
+        "FACT TYPES: observation (consolidated summaries), world (external "
+        "knowledge), experience (agent's own actions). Only world/experience "
+        "facts can be invalidated."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
+            "types": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["world", "experience", "observation"],
+                },
+                "description": (
+                    "Fact types to recall. Overrides the configured default "
+                    "for this single call. Use ['world','experience'] when "
+                    "looking for facts to invalidate. Omit to use defaults."
+                ),
+            },
         },
         "required": ["query"],
     },
@@ -358,7 +376,7 @@ INVALIDATE_SCHEMA = {
         "properties": {
             "memory_id": {
                 "type": "string",
-                "description": "Memory ID from hindsight_recall results (e.g. '5e79c849-f3b6')."
+                "description": "Full memory ID from hindsight_recall results (e.g. from 'id=5e79c849-f3b6-4a1e-b789-123456789abc' output)."
             },
             "reason": {
                 "type": "string",
@@ -1771,8 +1789,12 @@ class HindsightMemoryProvider(MemoryProvider):
                 if self._recall_tags:
                     recall_kwargs["tags"] = self._recall_tags
                     recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
+                # Agent-provided `types` param overrides the configured default
+                # for this single call. Omit → fall back to self._recall_types.
+                caller_types = args.get("types")
+                effective_types = caller_types if caller_types else self._recall_types
+                if effective_types:
+                    recall_kwargs["types"] = effective_types
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -1782,10 +1804,11 @@ class HindsightMemoryProvider(MemoryProvider):
                     return json.dumps({"result": "No relevant memories found."})
                 lines = []
                 for i, r in enumerate(resp.results, 1):
-                    sid = r.id[:12] if r.id else "?"
+                    sid = getattr(r, "id", None)
+                    sid_str = sid if sid else "?"
                     state = getattr(r, "state", None)
                     flag = " [INVALIDATED]" if state == "invalidated" else ""
-                    lines.append(f"{i}. id={sid} {r.text}{flag}")
+                    lines.append(f"{i}. id={sid_str} {r.text}{flag}")
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
@@ -1817,7 +1840,7 @@ class HindsightMemoryProvider(MemoryProvider):
             reason = args.get("reason", "")
 
             try:
-                UpdateMemoryRequest = _try_import_update_memory_request()
+                UpdateMemoryRequest = self._try_import_update_memory_request()
                 if UpdateMemoryRequest is not None:
                     # —— SDK >= 0.8.4 path ——
                     req = UpdateMemoryRequest(state=state)
@@ -1835,7 +1858,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     self._http_patch_memory(memory_id, state, reason=reason or None)
 
                 action = "restored" if state == "valid" else "invalidated"
-                return json.dumps({"result": f"Memory {memory_id[:12]}... {action}."})
+                return json.dumps({"result": f"Memory {memory_id} {action}."})
             except Exception as e:
                 logger.warning("hindsight_invalidate failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to curate memory: {e}")
