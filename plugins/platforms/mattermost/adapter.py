@@ -386,6 +386,8 @@ class MattermostAdapter(BasePlatformAdapter):
         self, channel_id: str, thread_id: str, current_post_id: str
     ) -> str:
         """Fetch prior posts from one DM thread for its first Hermes turn."""
+        from gateway.session import neutralize_untrusted_inline_text
+
         try:
             data = await self._api_get(f"posts/{thread_id}/thread")
             posts = data.get("posts") if isinstance(data, dict) else None
@@ -405,9 +407,13 @@ class MattermostAdapter(BasePlatformAdapter):
                     continue
                 author = str(post.get("user_id") or "unknown")
                 if author == self._bot_user_id:
-                    author = self._bot_username or "assistant"
-                prefix = "[thread parent] " if str(post_id) == thread_id else ""
-                context_parts.append(f"{prefix}{author}: {text}")
+                    role_prefix = "[assistant] "
+                else:
+                    safe_author = neutralize_untrusted_inline_text(author)
+                    role_prefix = f"{safe_author}: "
+                safe_text = neutralize_untrusted_inline_text(text, max_chars=0)
+                parent_prefix = "[thread parent] " if str(post_id) == thread_id else ""
+                context_parts.append(f"{parent_prefix}{role_prefix}{safe_text}")
 
             if not context_parts:
                 return ""
