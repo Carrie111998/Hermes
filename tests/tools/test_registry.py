@@ -631,10 +631,12 @@ class TestCheckFnLogLevels:
         the level change - just below WARNING."""
         reg = self._registry_with(lambda: False)
 
-        with caplog.at_level("DEBUG", logger="tools.registry"):
+        with caplog.at_level("INFO", logger="tools.registry"):
             reg.is_toolset_available("gated")
 
-        assert any("returned False" in r.getMessage() for r in caplog.records)
+        records = [r for r in caplog.records if "returned False" in r.getMessage()]
+        assert len(records) == 1
+        assert records[0].levelname == "INFO"
 
     def test_raising_check_fn_still_warns(self, caplog):
         def boom():
