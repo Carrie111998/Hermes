@@ -18,6 +18,7 @@ import ast
 import importlib
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -25,6 +26,58 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+_RUN_START_EVENT_NAME_RE = re.compile(
+    r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$"
+)
+_RUN_START_EVENT_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_RUN_START_EVENT_RESERVED_NAMESPACES = frozenset({
+    "approval",
+    "message",
+    "reasoning",
+    "run",
+    "subagent",
+    "tool",
+})
+_RUN_START_EVENT_RESERVED_FIELDS = frozenset({
+    "event",
+    "run_id",
+    "sequence",
+    "timestamp",
+    "type",
+})
+
+
+def _normalize_run_start_event(value: Optional[dict]) -> Optional[dict]:
+    """Validate and copy declarative public-event metadata for a tool."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"event", "fields"}:
+        raise ValueError(
+            "run_start_event must contain exactly 'event' and 'fields'"
+        )
+    event = value["event"]
+    fields = value["fields"]
+    if (
+        not isinstance(event, str)
+        or not _RUN_START_EVENT_NAME_RE.fullmatch(event)
+        or event.partition(".")[0] in _RUN_START_EVENT_RESERVED_NAMESPACES
+    ):
+        raise ValueError(
+            "run_start_event.event must be a non-reserved namespaced event name"
+        )
+    if not isinstance(fields, (list, tuple)) or not fields:
+        raise ValueError("run_start_event.fields must be a non-empty list or tuple")
+    if any(
+        not isinstance(field, str)
+        or not _RUN_START_EVENT_FIELD_RE.fullmatch(field)
+        or field in _RUN_START_EVENT_RESERVED_FIELDS
+        for field in fields
+    ):
+        raise ValueError("run_start_event.fields contains an invalid field name")
+    if len(set(fields)) != len(fields):
+        raise ValueError("run_start_event.fields must not contain duplicates")
+    return {"event": event, "fields": tuple(fields)}
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
@@ -164,11 +217,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "run_start_event",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 run_start_event=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -179,6 +234,7 @@ class ToolEntry:
         self.description = description
         self.emoji = emoji
         self.max_result_size_chars = max_result_size_chars
+        self.run_start_event = run_start_event
         # Optional zero-arg callable returning a dict of schema overrides
         # applied at get_definitions() time. Use for fields that depend on
         # runtime config (e.g. delegate_task's description must reflect the
@@ -449,6 +505,8 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        *,
+        run_start_event: dict | None = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -458,6 +516,7 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        normalized_run_start_event = _normalize_run_start_event(run_start_event)
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
@@ -508,6 +567,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                run_start_event=normalized_run_start_event,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -732,6 +792,16 @@ class ToolRegistry:
         """
         entry = self.get_entry(name)
         return entry.schema if entry else None
+
+    def get_run_start_event(self, name: str) -> Optional[dict]:
+        """Return a defensive copy of a tool's public run-start event metadata."""
+        entry = self.get_entry(name)
+        if entry is None or entry.run_start_event is None:
+            return None
+        return {
+            "event": entry.run_start_event["event"],
+            "fields": tuple(entry.run_start_event["fields"]),
+        }
 
     def get_toolset_for_tool(self, name: str) -> Optional[str]:
         """Return the toolset a tool belongs to, or None."""

@@ -6,6 +6,8 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
 
 
@@ -32,6 +34,95 @@ class TestRegisterAndDispatch:
         )
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
+
+    def test_run_start_event_metadata_is_normalized_and_defensively_copied(self):
+        reg = ToolRegistry()
+        metadata = {"event": "agent.intent", "fields": ["text", "speech"]}
+        reg.register(
+            name="report_intent",
+            toolset="plugin",
+            schema=_make_schema("report_intent"),
+            handler=_dummy_handler,
+            run_start_event=metadata,
+        )
+
+        metadata["event"] = "changed.after.registration"
+        metadata["fields"].append("extra")
+        first = reg.get_run_start_event("report_intent")
+        assert first == {
+            "event": "agent.intent",
+            "fields": ("text", "speech"),
+        }
+
+        first["event"] = "changed.after.lookup"
+        assert reg.get_run_start_event("report_intent") == {
+            "event": "agent.intent",
+            "fields": ("text", "speech"),
+        }
+
+    def test_run_start_event_preserves_positional_override_compatibility(self):
+        reg = ToolRegistry()
+        reg.register(
+            "replaceable",
+            "base",
+            _make_schema("replaceable"),
+            _dummy_handler,
+        )
+
+        replacement = lambda args, **kwargs: json.dumps({"replacement": True})
+        reg.register(
+            "replaceable",
+            "replacement",
+            _make_schema("replaceable"),
+            replacement,
+            None,
+            None,
+            False,
+            "",
+            "",
+            None,
+            None,
+            True,
+        )
+
+        entry = reg.get_entry("replaceable")
+        assert entry is not None
+        assert entry.toolset == "replacement"
+        assert entry.handler is replacement
+        assert entry.run_start_event is None
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"event": "intent", "fields": ("text",)},
+            {"event": "approval.responded", "fields": ("text",)},
+            {"event": "message.delta", "fields": ("text",)},
+            {"event": "run.started", "fields": ("text",)},
+            {"event": "run.stopping", "fields": ("text",)},
+            {"event": "tool.failed", "fields": ("text",)},
+            {"event": "tool.progress", "fields": ("text",)},
+            {"event": "tool.started", "fields": ("text",)},
+            {"event": "agent.intent", "fields": ()},
+            {"event": "agent.intent", "fields": ("text", "text")},
+            {"event": "agent.intent", "fields": ("run_id",)},
+            {"event": "agent.intent", "fields": ("type",)},
+            {"event": "agent.intent", "fields": ("not-valid",)},
+            {"event": "agent.intent", "fields": ("text",), "projector": object()},
+        ],
+    )
+    def test_invalid_run_start_event_metadata_is_rejected(self, metadata):
+        reg = ToolRegistry()
+
+        with pytest.raises(ValueError):
+            reg.register(
+                name="report_intent",
+                toolset="plugin",
+                schema=_make_schema("report_intent"),
+                handler=_dummy_handler,
+                run_start_event=metadata,
+            )
+
+        assert reg.get_entry("report_intent") is None
 
 
     def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):

@@ -543,8 +543,72 @@ class TestThreadToolWhitelist:
 class TestPluginContext:
     """Tests for the PluginContext facade."""
 
+    def test_register_tool_forwards_run_start_event(self):
+        from hermes_cli.plugins import PluginContext, PluginManifest
+        from tools.registry import registry
 
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="intent-plugin", source="user"),
+            manager,
+        )
+        try:
+            context.register_tool(
+                name="test_plugin_report_intent",
+                toolset="intent-plugin",
+                schema={
+                    "name": "test_plugin_report_intent",
+                    "description": "Report intent",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                handler=lambda args, **kwargs: "ok",
+                run_start_event={
+                    "event": "agent.intent",
+                    "fields": ("text", "speech"),
+                },
+            )
 
+            assert registry.get_run_start_event("test_plugin_report_intent") == {
+                "event": "agent.intent",
+                "fields": ("text", "speech"),
+            }
+            assert "test_plugin_report_intent" in manager._plugin_tool_names
+        finally:
+            registry.deregister("test_plugin_report_intent")
+
+    def test_register_tool_preserves_positional_override_compatibility(self):
+        from hermes_cli.plugins import PluginContext, PluginManifest
+        from tools.registry import registry
+
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="positional-plugin", source="user"),
+            manager,
+        )
+        try:
+            context.register_tool(
+                "test_plugin_positional_override",
+                "positional-plugin",
+                {
+                    "name": "test_plugin_positional_override",
+                    "description": "Compatibility probe",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                lambda args, **kwargs: "ok",
+                None,
+                None,
+                False,
+                "",
+                "",
+                False,
+            )
+
+            entry = registry.get_entry("test_plugin_positional_override")
+            assert entry is not None
+            assert entry.run_start_event is None
+            assert "test_plugin_positional_override" in manager._plugin_tool_names
+        finally:
+            registry.deregister("test_plugin_positional_override")
 
     def test_register_tool_override_blocked_without_operator_opt_in(self, tmp_path, monkeypatch):
         """override=True must be rejected when the operator hasn't opted in.
