@@ -46,6 +46,9 @@ def local_mode(monkeypatch):
     non-interactive gate, so tests exercise exactly that decision."""
     monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
     monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+    # main resolves CDP via the no-I/O _get_cdp_override_raw(); neutralize it too
+    # so the fixture actually isolates the non-interactive gate (#69071 rebase).
+    monkeypatch.setattr(browser_tool, "_get_cdp_override_raw", lambda: "")
     monkeypatch.setattr(
         browser_tool, "_requires_real_termux_browser_install", lambda cmd: False
     )
@@ -189,18 +192,41 @@ def test_gateway_gated_through_registry(local_mode, monkeypatch):
     assert _browser_visible_in_toolset() is False
 
 
-def test_subagent_worker_mark_gates_despite_tty(local_mode, monkeypatch):
-    """A delegate child's run_conversation runs on a worker thread that starts
-    with an empty contextvars context, so the parent's gateway platform signal
-    does not propagate there; with an inherited TTY the browser check would be
-    ungated on that thread, and a between-turns re-assembly could re-advertise
-    browser and poison the parent's cache. The mark (paired with a reset around
-    the child run) gates it on the worker (#66393)."""
+def test_delegated_child_context_gates_browser_on_worker_despite_tty(local_mode, monkeypatch):
+    """A delegate child's construction and run happen inside
+    ``delegated_child_context()`` (agent/delegation_context.py). Even on a worker
+    thread with an inherited TTY and no propagated gateway signal, being in that
+    context gates the browser — the gate honors ``is_delegated_child_context()``
+    (#69071 supersedes this PR's own subagent mark; the mechanism is now main's)."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from tools.delegate_tool import (
-        _mark_subagent_browser_non_interactive,
-        _unmark_subagent_browser_non_interactive,
+    from agent.delegation_context import delegated_child_context
+
+    monkeypatch.setattr(
+        browser_tool, "_find_agent_browser", lambda validate=False: "npx agent-browser"
+    )
+    monkeypatch.setattr(browser_tool.sys.stdin, "isatty", lambda: True)
+
+    def worker(as_child):
+        if as_child:
+            with delegated_child_context():
+                return browser_tool.check_browser_requirements()
+        return browser_tool.check_browser_requirements()
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        # Plain worker + TTY, no propagated signal → browser advertised...
+        assert ex.submit(worker, False).result() is True
+        # ...inside the delegated-child context → gated.
+        assert ex.submit(worker, True).result() is False
+
+
+def test_delegated_child_context_gates_and_resets(local_mode, monkeypatch):
+    """``delegated_child_context()`` is the mechanism that marks a child; the gate
+    must fire inside it and reset on exit so it never permanently gates the
+    interactive parent (the pairing is main's context manager, not our own)."""
+    from agent.delegation_context import (
+        delegated_child_context,
+        is_delegated_child_context,
     )
 
     monkeypatch.setattr(
@@ -208,36 +234,13 @@ def test_subagent_worker_mark_gates_despite_tty(local_mode, monkeypatch):
     )
     monkeypatch.setattr(browser_tool.sys.stdin, "isatty", lambda: True)
 
-    def worker(mark):
-        tok = _mark_subagent_browser_non_interactive() if mark else None
-        try:
-            return browser_tool.check_browser_requirements()
-        finally:
-            _unmark_subagent_browser_non_interactive(tok)
-
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        # Worker with a TTY and no propagated signal would advertise browser...
-        assert ex.submit(worker, False).result() is True
-        # ...the mark gates it on the worker thread.
-        assert ex.submit(worker, True).result() is False
-
-
-def test_subagent_mark_is_paired_and_restores():
-    """The mark must reset after the child run. A single-task delegation runs
-    the child *inline on the parent's thread* (pool-at-capacity, stateless
-    channel, or a lone CLI `delegate_task`), so an unpaired set would
-    permanently gate the interactive parent session for the rest of its life
-    (#66393)."""
-    from tools.delegate_tool import (
-        _mark_subagent_browser_non_interactive,
-        _unmark_subagent_browser_non_interactive,
-    )
-
-    assert browser_tool._browser_session_interactive.get() is None
-    tok = _mark_subagent_browser_non_interactive()
-    assert browser_tool._browser_session_interactive.get() is False
-    _unmark_subagent_browser_non_interactive(tok)
-    assert browser_tool._browser_session_interactive.get() is None
+    assert is_delegated_child_context() is False
+    assert browser_tool.check_browser_requirements() is True  # interactive parent
+    with delegated_child_context():
+        assert is_delegated_child_context() is True
+        assert browser_tool.check_browser_requirements() is False  # gated in child context
+    assert is_delegated_child_context() is False
+    assert browser_tool.check_browser_requirements() is True  # restored, parent unaffected
 
 
 def test_cloud_provider_not_gated_by_npx_when_non_interactive(local_mode, monkeypatch):
@@ -336,22 +339,16 @@ def test_tool_defs_cache_keys_on_session_context(local_mode, monkeypatch):
     assert gated is False
 
 
-def test_delegate_construction_gates_browser_before_snapshot(local_mode, monkeypatch):
+def test_delegate_child_construction_snapshot_excludes_browser(local_mode, monkeypatch):
     """#69071 Part 3: a delegate child's tool list is snapshotted during
-    *construction* (`_build_child_agent` -> AIAgent -> get_tool_definitions) on the
-    calling thread, before the run-time worker gate. delegate_task must apply the
-    non-interactive browser mark around that construction loop, so an interactive
-    parent does not bake browser tools into the child snapshot.
-
-    This drives the real delegate_task path: a recording _build_child_agent
-    captures the session interactivity seen at construction time. Reverting the
-    construction-wrap hunk makes this fail (it would record an interactive
-    parent, i.e. non-interactive == False)."""
-    import threading
-    from unittest.mock import MagicMock
-
+    construction, and main runs that construction inside ``delegated_child_context()``
+    (verified: ``_build_child_agent`` wraps ``AIAgent()`` in it). Because the gate
+    now honors ``is_delegated_child_context()``, that snapshot excludes browser even
+    under an interactive parent TTY — so the child is never handed the offered-but-
+    unusable npx browser. Assert the tool snapshot taken in that context has none."""
     import model_tools
-    import tools.delegate_tool as dt
+
+    from agent.delegation_context import delegated_child_context
 
     monkeypatch.setattr(
         browser_tool, "_find_agent_browser", lambda validate=False: "npx agent-browser"
@@ -359,56 +356,15 @@ def test_delegate_construction_gates_browser_before_snapshot(local_mode, monkeyp
     monkeypatch.setattr(browser_tool.sys.stdin, "isatty", lambda: True)  # interactive parent
     invalidate_check_fn_cache()
     model_tools._clear_tool_defs_cache()
-    assert browser_tool._is_non_interactive_session() is False  # ambient parent is interactive
 
-    seen = []
-    child_snapshot_has_browser = []
-
-    class _StopAfterConstruction(Exception):
-        pass
-
-    def _recording_build_child_agent(*args, **kwargs):
-        # The gate must already be active here (construction happens inside the
-        # mark). Record both the session flag AND the tool snapshot the child
-        # would capture at this exact moment (what agent_init does via
-        # get_tool_definitions), then short-circuit before the run/aggregate phase.
-        seen.append(browser_tool._is_non_interactive_session())
+    def browser_in_defs():
         defs = model_tools.get_tool_definitions(
             enabled_toolsets=["browser"], quiet_mode=True
         )
-        child_snapshot_has_browser.append(
-            any(d["function"]["name"] == "browser_navigate" for d in defs)
-        )
-        raise _StopAfterConstruction
+        return any(d["function"]["name"] == "browser_navigate" for d in defs)
 
-    monkeypatch.setattr(dt, "_build_child_agent", _recording_build_child_agent)
-    monkeypatch.setattr(
-        dt,
-        "_resolve_delegation_credentials",
-        lambda cfg, parent: {
-            "model": "m", "provider": "p", "base_url": "u", "api_key": "k",
-            "api_mode": "chat_completions", "request_overrides": None,
-            "max_output_tokens": None, "command": None, "args": None,
-        },
-    )
-
-    parent = MagicMock()
-    parent._delegate_depth = 0
-    parent._active_children = []
-    parent._active_children_lock = threading.Lock()
-    parent.enabled_toolsets = None
-    parent.disabled_toolsets = []
-    parent.platform = "cli"
-
-    try:
-        dt.delegate_task(goal="probe", parent_agent=parent)
-    except _StopAfterConstruction:
-        pass
-
-    assert seen == [True], f"construction did not see a non-interactive session: {seen}"
-    # the sweeper's literal ask: the child's would-be tool snapshot excludes browser
-    assert child_snapshot_has_browser == [False], (
-        f"child construction snapshot still exposed browser: {child_snapshot_has_browser}"
-    )
-    # the construction-time mark is reset afterward — the parent stays interactive
-    assert browser_tool._is_non_interactive_session() is False
+    assert browser_in_defs() is True  # interactive parent snapshot includes browser
+    with delegated_child_context():
+        # exactly the context child construction runs in — snapshot must exclude browser
+        assert browser_in_defs() is False
+    assert browser_in_defs() is True  # parent snapshot unaffected afterward
