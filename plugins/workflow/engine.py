@@ -3361,13 +3361,14 @@ class WorkflowEngine:
                                     with kanban_db.connect_closing(board=self.kanban_board) as conn:
                                         kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Passed ({nid}):\n{reviewer_body}")
                                         conn.execute(
-                                            "UPDATE tasks SET status = 'done', completed_at = strftime('%s','now') WHERE id = ?",
+                                            "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
                                             (upstream_state.kanban_card_id,)
                                         )
                                         conn.commit()
-                                    upstream_state.status = "done"
-                                    upstream_state.completed_at = state.completed_at
-                                    print(f"   ↩  {reviewer_for} enriched with pass results, marked done")
+                                    upstream_state.status = "ready"
+                                    upstream_state.completed_at = None
+                                    upstream_state.result = None
+                                    print(f"   ↩  {reviewer_for} enriched with pass results, reset to ready")
                                 except Exception as e:
                                     print(f"   ⚠  Failed to enrich upstream card: {e}")
 
