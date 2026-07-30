@@ -18,6 +18,15 @@ class _FakeMemoryStore:
         return {"success": True, "store": target, "store_state_token": self.token}
 
 
+class _FailingMemoryStore:
+    def stat(self, target: str):
+        return {
+            "success": False,
+            "store": target,
+            "error": f"Could not read {target}",
+        }
+
+
 def _make_tool_defs(*names: str) -> list[dict]:
     return [
         {
@@ -372,6 +381,15 @@ def test_sequential_memory_call_passes_current_store_state_token_to_guardrail():
     before_call.assert_called_once_with(
         "memory", args, current_store_state_token="opaque:seq"
     )
+
+
+def test_failed_memory_stat_passes_none_token_without_fabricating_empty_state():
+    from agent.tool_executor import _memory_current_state_token
+
+    agent = SimpleNamespace(_memory_store=_FailingMemoryStore())
+    assert _memory_current_state_token(
+        agent, "memory", {"target": "memory", "action": "add", "content": "x"}
+    ) is None
 
 
 def test_concurrent_memory_call_passes_current_store_state_token_to_guardrail():

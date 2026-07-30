@@ -176,9 +176,12 @@ def _memory_current_state_token(agent, function_name: str, function_args: dict) 
         stat = memory_store.stat(store)
     except Exception:
         return None
-    if isinstance(stat, dict):
+    # Only a successful, authentic token may refresh observed store state.
+    # Failed/empty fabricated stats must return None so before_call keeps the
+    # previously observed token (and any armed same-state skip).
+    if isinstance(stat, dict) and stat.get("success") is True:
         token = stat.get("store_state_token")
-        if isinstance(token, str):
+        if isinstance(token, str) and token:
             return token
     return None
 

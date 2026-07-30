@@ -477,9 +477,27 @@ class MemoryStore:
         return self._consolidation_failure(response)
 
     def stat(self, target: str) -> Dict[str, Any]:
-        """Return current usage and opaque state without exposing entries."""
-        with self._file_lock(self._path_for(target)):
-            entries = list(dict.fromkeys(self._read_file(self._path_for(target))))
+        """Return current usage and opaque state without exposing entries.
+
+        An unreadable on-disk file is NOT an empty store. Returning a fabricated
+        empty-state token would let the same-store-state retry guard overwrite a
+        real observed token and briefly re-allow identical quota retries
+        (#35121).
+        """
+        path = self._path_for(target)
+        with self._file_lock(path):
+            entries, read_ok = self._read_entries_checked(path)
+        if not read_ok:
+            return {
+                "success": False,
+                "target": target,
+                "store": target,
+                "error": (
+                    f"Could not read {path.name} to compute store state "
+                    "(temporarily locked, permission change, invalid encoding, "
+                    "or filesystem error). No state token is returned."
+                ),
+            }
         current = self._serialized_char_count(entries)
         limit = self._char_limit(target)
         return {

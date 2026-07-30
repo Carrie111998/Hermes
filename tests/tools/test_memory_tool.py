@@ -174,6 +174,24 @@ class TestMemoryQuotaMetadata:
         assert composed["usage"]["current_chars"] == 1
         assert decomposed["store_state_token"] != composed["store_state_token"]
 
+    def test_stat_unreadable_file_returns_error_without_state_token(self, store, monkeypatch):
+        store.add("memory", "entry one")
+        path = store._path_for("memory")
+        real = Path.read_text
+
+        def flaky(self, *a, **k):
+            if self == path:
+                raise OSError("transient: file temporarily unavailable")
+            return real(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", flaky)
+        result = store.stat("memory")
+
+        assert result["success"] is False
+        assert "store_state_token" not in result
+        assert "Could not read" in result["error"]
+        assert result["store"] == "memory"
+
     def test_success_response_keeps_terminal_contract_with_store_state(self, store):
         result = store.add("memory", "entry one")
 

@@ -207,6 +207,21 @@ def test_legacy_memory_overflow_string_does_not_arm_same_state_skip():
     ).action == "allow"
 
 
+def test_none_current_token_keeps_armed_same_state_skip():
+    """A failed stat must not clear observed state or disarm the firebreak."""
+    controller = ToolCallGuardrailController()
+    args = {"target": "memory", "action": "add", "content": "too big"}
+
+    controller.before_call("memory", args, current_store_state_token="opaque:A")
+    controller.after_call("memory", args, _memory_quota_result(), failed=True)
+
+    skipped = controller.before_call(
+        "memory", args, current_store_state_token=None
+    )
+    assert skipped.action == "skip"
+    assert skipped.code == "memory_quota_exceeded_non_retryable"
+
+
 def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(
