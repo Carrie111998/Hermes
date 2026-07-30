@@ -170,6 +170,16 @@ def _looks_like_credential(name: str) -> bool:
 # HERMES_* vars that change test behavior by being set. Unset all of these
 # unconditionally — individual tests that need them set do so explicitly.
 _HERMES_BEHAVIORAL_VARS = frozenset({
+    # Voice/TTS runtime flags. ``tui_gateway/server.py`` reads these straight
+    # off ``os.environ`` at call time (``_voice_mode_enabled`` /
+    # ``_voice_tts_enabled``) and, on every completed turn, hands the turn's
+    # final response text to ``hermes_cli.voice.speak_text`` — real synthesis,
+    # real playback, out of the developer's speakers. Blank them per-test so a
+    # leak (from the shell, or from an earlier test that drove the
+    # ``voice.toggle`` RPC, which writes ``os.environ`` directly) cannot carry
+    # into the next test. See ``_audio_playback_guard`` for the second layer.
+    "HERMES_VOICE",
+    "HERMES_VOICE_TTS",
     "HERMES_YOLO_MODE",
     "HERMES_INTERACTIVE",
     "HERMES_QUIET",
@@ -179,6 +189,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_PLATFORM",
     "HERMES_SESSION_CHAT_ID",
     "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_CHAT_TYPE",
     "HERMES_SESSION_THREAD_ID",
     "HERMES_SESSION_SOURCE",
     "HERMES_SESSION_KEY",
@@ -214,6 +225,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    # Pytest is routinely launched from a delegated worker.  The worker
+    # lineage marker must not make parent-state tests run as delegated
+    # children; tests that exercise child behavior set it explicitly.
+    "HERMES_DELEGATED_CHILD_CONTEXT",
     "HERMES_TENANT",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
@@ -254,6 +269,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "DINGTALK_ALLOWED_USERS",
     "FEISHU_ALLOWED_USERS",
     "WECOM_ALLOWED_USERS",
+    "PHOTON_ALLOWED_USERS",
     "GATEWAY_ALLOWED_USERS",
     "GATEWAY_ALLOW_ALL_USERS",
     "TELEGRAM_ALLOW_ALL_USERS",
@@ -263,6 +279,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "SIGNAL_ALLOW_ALL_USERS",
     "EMAIL_ALLOW_ALL_USERS",
     "SMS_ALLOW_ALL_USERS",
+    "PHOTON_ALLOW_ALL_USERS",
     # Gateway home channels are set by /sethome in real profiles. Tests that
     # exercise dashboard notification toggles must opt in explicitly or they
     # can accidentally subscribe against a developer's real home channel.
@@ -303,6 +320,9 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "WECOM_HOME_CHANNEL",
     "WECOM_HOME_CHANNEL_THREAD_ID",
     "WECOM_HOME_CHANNEL_NAME",
+    "PHOTON_HOME_CHANNEL",
+    "PHOTON_HOME_CHANNEL_THREAD_ID",
+    "PHOTON_HOME_CHANNEL_NAME",
     # API server bind/auth settings are common in local gateway profiles and
     # change adapter defaults plus load_gateway_config() enablement. Tests that
     # need them set opt in explicitly with monkeypatch.
@@ -397,6 +417,15 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # should never perform that implicit network/bootstrap path; Tirith-specific
     # tests opt back in by patching the security config directly.
     monkeypatch.setenv("TIRITH_ENABLED", "false")
+    # Lazy feature deps (tools/lazy_deps.py) pip-install on demand by design —
+    # _allow_lazy_installs() fails open for users. Unit tests must never reach
+    # pip/the network: with the SDK absent, any agent init whose tool checks
+    # touch a lazy feature (e.g. check_tts_requirements →
+    # ensure("tts.elevenlabs")) spawns a real pip install — which hangs to the
+    # suite timeout under tests that set fake proxy env vars. The kill-switch
+    # makes ensure() raise FeatureUnavailable immediately instead.
+    # tests/tools/test_lazy_deps.py overrides this var in both directions.
+    monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
@@ -418,6 +447,131 @@ def _hermetic_environment(tmp_path, monkeypatch):
 def _isolate_hermes_home(_hermetic_environment):
     """Alias preserved for any test that yields this name explicitly."""
     return None
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_webbrowser(monkeypatch):
+    """Record browser-open attempts instead of opening real browser windows."""
+    import webbrowser as _webbrowser
+
+    opened: list[object] = []
+
+    def _record(url=None, *_args, **_kwargs):
+        opened.append(url)
+        return True
+
+    class _RecordingBrowser:
+        def open(self, url, *_args, **_kwargs):
+            return _record(url)
+
+        def open_new(self, url, *_args, **_kwargs):
+            return _record(url)
+
+        def open_new_tab(self, url, *_args, **_kwargs):
+            return _record(url)
+
+    browser = _RecordingBrowser()
+
+    for name in ("open", "open_new", "open_new_tab"):
+        monkeypatch.setattr(_webbrowser, name, _record, raising=False)
+    monkeypatch.setattr(_webbrowser, "get", lambda *_args, **_kwargs: browser)
+
+    return opened
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_macos_keychain_creds(request, monkeypatch):
+    """Default Anthropic credential resolution away from the real macOS Keychain."""
+    if request.node.get_closest_marker(_ALLOW_MACOS_KEYCHAIN_MARK):
+        return None
+
+    try:
+        import agent.anthropic_adapter as _anthropic_adapter
+    except Exception:
+        return None
+
+    monkeypatch.setattr(
+        _anthropic_adapter,
+        "_read_claude_code_credentials_from_keychain",
+        lambda *_args, **_kwargs: None,
+        raising=False,
+    )
+    return None
+
+
+# ── Kanban write guard (#69283) ─────────────────────────────────────────────
+# When hermetic isolation is bypassed (stale checkout, wrong rootdir, direct
+# invocation), kanban writes silently pollute the real ~/.hermes. This autouse
+# fixture patches ``kanban_db.connect`` to refuse writes whose resolved DB
+# path lands under the REAL kanban root (captured at import time, before any
+# fixture rewires the environment). A deny-list is used instead of an
+# allow-list because test-level fixtures legitimately move HERMES_HOME to
+# sibling directories — an allow-list captured at setup time would see the
+# stale autouse-set value and falsely reject hermetic tests (#69385 review).
+
+
+def _capture_real_kanban_root() -> Path:
+    """Resolve the REAL kanban root from the pre-test environment.
+
+    Runs at conftest import time, before any fixture rewires HERMES_HOME.
+    Mirrors ``kanban_db.kanban_home()`` resolution order:
+    1. ``HERMES_KANBAN_HOME`` env var when set and non-empty
+    2. ``get_default_hermes_root()`` otherwise
+    """
+    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    from hermes_constants import get_default_hermes_root
+    return get_default_hermes_root().resolve()
+
+
+_REAL_KANBAN_ROOT = _capture_real_kanban_root()
+
+
+@pytest.fixture(autouse=True)
+def _kanban_write_guard(_hermetic_environment, monkeypatch):
+    """Fail-closed guard: refuse kanban writes that target the REAL root.
+
+    Uses a **deny-list**: only blocks writes where the resolved DB path
+    (explicit ``db_path`` or ``kanban_db_path()``) lands under the real
+    ``~/.hermes`` captured at import time. Hermetic tests that legitimately
+    move HERMES_HOME to sibling tempdirs are unaffected.
+
+    Only patches when ``hermes_cli.kanban_db`` is *already imported* — a
+    ``sys.modules`` probe, not an import — so the guard never drags the
+    kanban module into unrelated test processes.
+
+    Uses ``monkeypatch.setattr`` so pytest restores ``connect`` automatically
+    after each test (no stacked wrappers or state leakage across tests).
+    """
+    _kdb = sys.modules.get("hermes_cli.kanban_db")
+    if _kdb is None:
+        return
+
+    _orig_connect = _kdb.connect
+
+    def _guarded_connect(db_path=None, *args, **kwargs):
+        if db_path is not None:
+            resolved = Path(db_path).expanduser().resolve()
+        else:
+            resolved = (
+                _kdb.kanban_db_path(board=kwargs.get("board"))
+                .expanduser()
+                .resolve()
+            )
+        try:
+            resolved.relative_to(_REAL_KANBAN_ROOT)
+        except ValueError:
+            # Resolved path is NOT under the real root — safe to write.
+            return _orig_connect(db_path, *args, **kwargs)
+        raise RuntimeError(
+            f"kanban_write_guard: kanban DB path resolved to {resolved}, "
+            f"which is under the REAL kanban root ({_REAL_KANBAN_ROOT}). "
+            f"Hermetic isolation has been bypassed — refusing to write "
+            f"to the real ~/.hermes. See #69283."
+        )
+
+    monkeypatch.setattr(_kdb, "connect", _guarded_connect)
 
 
 # ── Module-level state reset — replaced by per-file process isolation ──────
@@ -582,6 +736,52 @@ def _wal_is_usable() -> bool:
     return False
 
 
+# ── Audio-playback guard ───────────────────────────────────────────────────
+#
+# Same class of incident as the live-system guard above, different primitive:
+# a test run spoke the string "partial answer complete" out of the developer's
+# speakers. That string is a test fixture
+# (``tests/test_tui_gateway_server.py``'s fake ``final_response``), and the
+# route it took is fully in-process — no leaked shell variable required:
+#
+#   1. ``test_voice_toggle_tts_branch_also_carries_record_key`` drives the
+#      ``voice.toggle`` RPC with ``action="tts"``. The handler
+#      (``tui_gateway/server.py``) flips the flag by writing the *real*
+#      process environment: ``os.environ["HERMES_VOICE_TTS"] = "1"``. The
+#      test's ``monkeypatch.delenv(..., raising=False)`` records no undo entry
+#      (pytest only records an undo when the key was present), so the "1"
+#      survives teardown and persists for the rest of the pytest process.
+#   2. Any later test in that process that drives a turn to completion hits
+#      the TTS dispatch in ``prompt.submit``, which checks
+#      ``_voice_tts_enabled()`` — now true — and fires
+#      ``hermes_cli.voice.speak_text(final_response)`` on a daemon thread.
+#   3. ``speak_text`` needs no API key to be audible: ``tools/tts_tool.py``
+#      defaults to the ``edge`` provider, which is keyless.
+#
+# Because the flag is set from *inside* the process, ``scripts/run_tests.sh``'s
+# ``env -i`` does not help, and neither does env-blanking on its own — the
+# hermetic fixture blanks at test setup, and step 1 re-sets it mid-test. So we
+# also intercept the primitive that does the damage, exactly as the
+# live-system guard intercepts ``os.kill`` rather than trusting every caller
+# to mock it:
+#
+#  • ``hermes_cli.voice.speak_text`` — the synth+playback entry point both
+#    gateway call sites late-import, so patching the module attribute catches
+#    them wherever they import it from.
+#  • ``hermes_cli.voice.play_audio_file`` — the module-level binding
+#    ``speak_text`` actually plays through. Patching the binding inside
+#    ``hermes_cli.voice`` (not ``tools.voice_mode``) keeps the real function
+#    available to the tests that legitimately exercise it with a mocked
+#    audio backend (``tests/tools/test_voice_mode.py``).
+#
+# Config cannot re-open this hole: the ``tts:`` section of ``config.yaml``
+# only selects *which* provider speaks, never *whether* to speak — that gate
+# is the env var alone.
+
+_AUDIO_GUARD_BYPASS_MARK = "real_audio_playback"
+_ALLOW_MACOS_KEYCHAIN_MARK = "allow_macos_keychain"
+
+
 def pytest_configure(config):  # noqa: D401 — pytest hook
     """Register markers used by hermetic conftest."""
     config.addinivalue_line(
@@ -595,6 +795,17 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         f"{_REQUIRES_WAL_MARK}: test needs the runtime to actually enable "
         "SQLite WAL mode; skipped on builds where Hermes falls back to "
         "journal_mode=DELETE for the WAL-reset bug.",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{_AUDIO_GUARD_BYPASS_MARK}: bypass the audio-playback guard (only "
+        "for tests that genuinely need real TTS synthesis and speaker "
+        "playback — there are none in the default suite).",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{_ALLOW_MACOS_KEYCHAIN_MARK}: allow a test to exercise the macOS "
+        "Keychain credential reader with its own subprocess/platform mocks.",
     )
 
     # The pyproject addopts pin ``--timeout-method=signal`` relies on
@@ -976,3 +1187,79 @@ def _live_system_guard(request, monkeypatch):
         pass
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def _audio_playback_guard(request, monkeypatch):
+    """Stub TTS synthesis + speaker playback for every test.
+
+    See the block comment above for the incident this closes. Defence in
+    depth behind ``_HERMES_BEHAVIORAL_VARS``: the env blanking stops the flag
+    leaking *between* tests, this stops the speakers ever opening even when a
+    test sets the flag *itself* (which the ``voice.toggle`` RPC handler does,
+    by writing ``os.environ`` directly).
+
+    Deliberately silent rather than raising: unlike a stray ``os.kill``, a
+    stray ``speak_text`` is dispatched on a daemon thread whose exception
+    nobody would ever see, so a hard failure would neither stop the test nor
+    surface. Silence is the whole point. Tests that genuinely want real audio
+    can opt out with ``@pytest.mark.real_audio_playback``.
+    """
+    if request.node.get_closest_marker(_AUDIO_GUARD_BYPASS_MARK):
+        yield
+        return
+
+    try:
+        import hermes_cli.voice as _voice
+    except Exception:
+        # Optional audio deps missing — nothing importable to speak with.
+        yield
+        return
+
+    def _blocked_speak_text(text, *args, **kwargs):
+        return None
+
+    def _blocked_play_audio_file(path, *args, **kwargs):
+        return False
+
+    if hasattr(_voice, "speak_text"):
+        monkeypatch.setattr(_voice, "speak_text", _blocked_speak_text)
+    if hasattr(_voice, "play_audio_file"):
+        monkeypatch.setattr(_voice, "play_audio_file", _blocked_play_audio_file)
+
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_computer_use_approval_state():
+    """Reset computer-use approval globals after every test.
+
+    ``tools.computer_use.tool`` keeps three module-globals for the CLI
+    approval flow: ``_approval_callback`` (set by the CLI console on init)
+    plus the per-session unlock stores ``_always_allow`` /
+    ``_session_auto_approve``. A test that installs a callback — or drives
+    CLI init far enough that the real one is registered — and does not reset
+    it poisons every later computer-use test in the same process:
+
+    * a leaked callback that raises (dead UI/queue infra, or a stale
+      two-argument signature — the real contract is ``(action, args,
+      summary)``) turns into ``verdict = "deny"`` in ``_request_approval``,
+      so dispatch tests fail with an empty backend call list;
+    * a leaked callback that blocks (the real CLI one waits on an answer
+      queue) hangs the whole single-process run forever — pytest-timeout is
+      the only thing that can cut it.
+
+    Both symptoms are order-dependent: the affected files pass in isolation
+    and only fail in full-suite runs. Teardown-only, so tests that install
+    their own callback keep it for their own duration.
+    """
+    yield
+    try:
+        from tools.computer_use import tool as _cu_tool
+
+        _cu_tool.set_approval_callback(None)
+        with _cu_tool._approval_lock:
+            _cu_tool._always_allow.clear()
+            _cu_tool._session_auto_approve.clear()
+    except Exception:
+        pass
