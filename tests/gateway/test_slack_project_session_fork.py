@@ -26,7 +26,7 @@ async def test_marked_project_thread_forks_from_derived_channel_session():
     store = SimpleNamespace(get_or_create_session=AsyncMock())
     parent_entry = SimpleNamespace(session_id="parent-session")
     child_entry = SimpleNamespace(session_id="child-session")
-    store.get_or_create_session.side_effect = [parent_entry, child_entry]
+    store.get_or_create_session.side_effect = [parent_entry, parent_entry, child_entry]
     runner = SimpleNamespace(async_session_store=store)
     event = SimpleNamespace(metadata={"slack_project_session_fork": True})
     source = _source()
@@ -36,12 +36,12 @@ async def test_marked_project_thread_forks_from_derived_channel_session():
     )
 
     assert result is child_entry
-    assert store.get_or_create_session.await_count == 2
+    assert store.get_or_create_session.await_count == 3
     parent_source = store.get_or_create_session.await_args_list[0].args[0]
     assert parent_source.thread_id is None
     assert parent_source.chat_id == source.chat_id
     assert parent_source.scope_id == source.scope_id
-    child_call = store.get_or_create_session.await_args_list[1]
+    child_call = store.get_or_create_session.await_args_list[2]
     assert child_call.args[0] is source
     assert child_call.kwargs["fork_from_session_id"] == "parent-session"
 
@@ -77,8 +77,13 @@ async def test_unmarked_or_non_slack_lanes_never_fork(event, source):
 async def test_project_fork_holds_parent_turn_lease_until_snapshot_finishes():
     store = SimpleNamespace(get_or_create_session=AsyncMock())
     parent_entry = SimpleNamespace(session_id="parent-session")
+    snapshot_entry = SimpleNamespace(session_id="compressed-tip-session")
     child_entry = SimpleNamespace(session_id="child-session")
-    store.get_or_create_session.side_effect = [parent_entry, child_entry]
+    store.get_or_create_session.side_effect = [
+        parent_entry,
+        snapshot_entry,
+        child_entry,
+    ]
     token = object()
     leases = SimpleNamespace(
         acquire=AsyncMock(return_value=token),
@@ -96,4 +101,6 @@ async def test_project_fork_holds_parent_turn_lease_until_snapshot_finishes():
     acquire = leases.acquire.await_args
     assert acquire.args[0] == "parent-session"
     assert acquire.kwargs["generation"] == 7
+    child_call = store.get_or_create_session.await_args_list[2]
+    assert child_call.kwargs["fork_from_session_id"] == "compressed-tip-session"
     leases.release.assert_called_once_with(token)

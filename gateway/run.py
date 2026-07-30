@@ -15551,9 +15551,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timeout=_float_env("HERMES_AGENT_TIMEOUT", 1800),
             )
         try:
+            # A parent turn may have compressed and rebound its lease while we
+            # waited. Resolve once more under the lease so lineage and snapshot
+            # target the live compression tip, never the retired parent row.
+            snapshot_parent_entry = (
+                await self.async_session_store.get_or_create_session(parent_source)
+            )
             return await self.async_session_store.get_or_create_session(
                 source,
-                fork_from_session_id=parent_entry.session_id,
+                fork_from_session_id=snapshot_parent_entry.session_id,
             )
         finally:
             if lease_registry is not None:
