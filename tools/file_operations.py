@@ -3,7 +3,8 @@
 File Operations Module
 
 Provides file manipulation capabilities (read, write, patch, search) that work
-across all terminal backends (local, docker, ssh, singularity, modal, daytona, tenki).
+across all terminal backends (local, docker, ssh, singularity, modal, daytona,
+vercel_sandbox, tenki).
 
 The key insight is that all file operations can be expressed as shell commands,
 so we wrap the terminal backend's execute() interface to provide a unified file API.

@@ -165,7 +165,7 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset(
-    {"docker", "singularity", "modal", "daytona", "tenki"}
+    {"docker", "singularity", "modal", "daytona", "vercel_sandbox", "tenki"}
 )
 
 
