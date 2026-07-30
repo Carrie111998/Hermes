@@ -855,6 +855,71 @@ def test_create_task_ignores_platform_disabled_skills(kanban_home):
         conn.close()
 
 
+def test_assign_task_drops_skills_disabled_for_the_new_assignee(kanban_home):
+    """Reassignment re-runs the filter — creation only ever saw the old owner.
+
+    Otherwise a perfectly valid card can be handed to a profile that disables
+    a pinned skill, which is the state the creation-time filter exists to keep
+    off the board.
+    """
+    _write_profile_skills_config(kanban_home, "researcher", ["arxiv"])
+    conn = kb.connect()
+    try:
+        # "linguist" has no config, so nothing is dropped at creation.
+        tid = kb.create_task(
+            conn,
+            title="reassigned card",
+            assignee="linguist",
+            skills=["arxiv", "translation"],
+        )
+        assert kb.get_task(conn, tid).skills == ["arxiv", "translation"]
+
+        assert kb.assign_task(conn, tid, "researcher") is True
+        assert kb.get_task(conn, tid).skills == ["translation"]
+    finally:
+        conn.close()
+
+
+def test_assign_task_pins_none_when_new_assignee_disables_every_skill(kanban_home):
+    """The all-missing worker failure, reached by reassignment instead.
+
+    ``build_preloaded_skills_prompt`` raises when every requested skill is
+    missing, so the card would kill its worker before doing any work and
+    auto-block once retries ran out.
+    """
+    _write_profile_skills_config(kanban_home, "researcher", ["arxiv", "translation"])
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="reassigned card",
+            assignee="linguist",
+            skills=["arxiv", "translation"],
+        )
+        assert kb.assign_task(conn, tid, "researcher") is True
+        task = kb.get_task(conn, tid)
+        assert task.assignee == "researcher"
+        assert task.skills is None
+    finally:
+        conn.close()
+
+
+def test_assign_task_keeps_skills_the_new_assignee_allows(kanban_home):
+    """Regression: an ordinary reassignment must not touch the skill set."""
+    _write_profile_skills_config(kanban_home, "researcher", ["kanban-orchestrator"])
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="reassigned card",
+            assignee="linguist",
+            skills=["arxiv", "translation"],
+        )
+        assert kb.assign_task(conn, tid, "researcher") is True
+        assert kb.get_task(conn, tid).skills == ["arxiv", "translation"]
+    finally:
+        conn.close()
+
 def test_legacy_db_without_skills_column_migrates(tmp_path):
     """_migrate_add_optional_columns is idempotent and adds skills
     when absent. Run it twice on a pared-down schema to confirm."""
