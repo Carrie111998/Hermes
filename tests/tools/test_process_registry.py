@@ -199,7 +199,7 @@ class TestOrphanedPipeReconciliation:
             ["sh", "-c", "exec 1>&2; ( sleep 30 ) & disown; exit 0"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            preexec_fn=os.setsid,  # windows-footgun: ok - POSIX-only test class
         )
 
         s = _make_session(sid="proc_orphan_test")
@@ -229,7 +229,7 @@ class TestOrphanedPipeReconciliation:
 
         # Clean up the orphaned descendant.
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -239,7 +239,7 @@ class TestOrphanedPipeReconciliation:
             ["sh", "-c", "( sleep 30 ) & disown; exit 0"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            preexec_fn=os.setsid,  # windows-footgun: ok - POSIX-only test class
         )
 
         s = _make_session(sid="proc_wait_orphan")
@@ -259,7 +259,7 @@ class TestOrphanedPipeReconciliation:
         )
 
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -326,6 +326,10 @@ class TestStdinHelpers:
         proc.stdin.close.assert_called_once()
         assert result["status"] == "ok"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="pywinpty sendeof does not deliver console EOF to the child",
+    )
     def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
         """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
 
@@ -481,6 +485,10 @@ class TestSpawnEnvSanitization:
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
             "USER": "tester",
+            # Windows Path.home()/Hermes-home discovery ignores HOME and
+            # requires these variables even in the test's clear environment.
+            "USERPROFILE": "C:\\Users\\tester",
+            "LOCALAPPDATA": "C:\\Users\\tester\\AppData\\Local",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "FIRECRAWL_API_KEY": "fc-secret",
         }, clear=True), \
@@ -600,7 +608,7 @@ class TestPopenLeakOnSetupFailure:
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", side_effect=boom), \
-             patch("os.getpgid", side_effect=ProcessLookupError), \
+             patch("os.getpgid", side_effect=ProcessLookupError, create=True), \
              patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
                 registry.spawn_local("echo hello", cwd="/tmp")
@@ -728,14 +736,14 @@ class TestCheckpoint:
             "task_id": "t1",
             "pid_scope": "sandbox",
         }]
-        checkpoint.write_text(json.dumps(original))
+        checkpoint.write_text(json.dumps(original), encoding="utf-8")
 
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
             assert registry.get("proc_remote") is None
 
-            data = json.loads(checkpoint.read_text())
+            data = json.loads(checkpoint.read_text(encoding="utf-8"))
             assert data == []
 
 # =========================================================================
@@ -776,7 +784,8 @@ class TestKillProcess:
             # touches ``os.kill`` directly. Mock both seams.  Disable the
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
-            with patch("gateway.status._pid_exists", return_value=True), \
+            with patch("tools.process_registry._IS_WINDOWS", False), \
+                 patch("gateway.status._pid_exists", return_value=True), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
@@ -786,6 +795,93 @@ class TestKillProcess:
             assert ("terminate", 424242) in terminate_calls
         finally:
             registry._running.pop(s.id, None)
+
+    def test_windows_pty_kill_verifies_tree_before_pty_teardown_and_is_idempotent(
+        self, registry, monkeypatch
+    ):
+        """A successful Windows PTY kill verifies the owned tree first."""
+        from tools import process_registry as pr
+
+        events = []
+
+        class FakePty:
+            def terminate(self, force=False):
+                events.append(("pty_terminate", force))
+
+        s = _make_session(sid="proc_windows_pty", output="partial output")
+        s.pid = 4242
+        s.host_start_time = 123456
+        s._pty = FakePty()
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+
+        def verified_tree_kill(pid, expected_start):
+            events.append(("tree_kill", pid, expected_start))
+            return True
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(registry, "_terminate_host_pid", verified_tree_kill)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        result = registry.kill_process(s.id)
+        again = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        assert again["status"] == "already_exited"
+        assert events == [
+            ("tree_kill", 4242, 123456),
+            ("pty_terminate", True),
+        ]
+        completion = registry.completion_queue.get_nowait()
+        assert completion["session_id"] == s.id
+        assert completion["completion_reason"] == "killed"
+        assert registry.completion_queue.empty()
+
+    @pytest.mark.parametrize(
+        "tree_kill_outcome",
+        [
+            False,
+            RuntimeError("taskkill failed"),
+            RuntimeError("taskkill timed out"),
+            RuntimeError("owned process survived"),
+        ],
+        ids=["pid-mismatch", "taskkill-failure", "taskkill-timeout", "survivor"],
+    )
+    def test_windows_pty_kill_never_claims_success_when_tree_cleanup_is_unverified(
+        self, registry, monkeypatch, tree_kill_outcome
+    ):
+        """Every unverified Windows tree-cleanup outcome fails closed."""
+        from tools import process_registry as pr
+
+        pty_terminate_calls = []
+
+        class FakePty:
+            def terminate(self, force=False):
+                pty_terminate_calls.append(force)
+
+        s = _make_session(sid="proc_windows_pty_failure")
+        s.pid = 4343
+        s.host_start_time = 654321
+        s._pty = FakePty()
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+
+        def failed_tree_kill(_pid, _expected_start):
+            if isinstance(tree_kill_outcome, Exception):
+                raise tree_kill_outcome
+            return tree_kill_outcome
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(registry, "_terminate_host_pid", failed_tree_kill)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "error"
+        assert result["status"] != "killed"
+        assert pty_terminate_calls == []
+        assert s.exited is False
+        assert s.id in registry._running
+        assert registry.completion_queue.empty()
 
 
 # =========================================================================
@@ -966,6 +1062,158 @@ class TestTerminateHostPidWindows:
         assert "12345" in captured["args"]
         assert "/T" in captured["args"], "Tree flag required to reach descendants"
         assert "/F" in captured["args"], "Force flag required for headless Chromium"
+
+    def test_windows_taskkill_nonzero_is_an_explicit_failure(self, monkeypatch):
+        from tools import process_registry as pr
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_host_pid_is_ours",
+            classmethod(lambda cls, pid, expected_start: True),
+        )
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_snapshot_windows_tree_identities",
+            classmethod(lambda cls, pid, expected_start: [(pid, expected_start)]),
+        )
+        monkeypatch.setattr(
+            pr.subprocess,
+            "run",
+            lambda *args, **kwargs: MagicMock(
+                returncode=1, stdout="", stderr="ERROR: Access is denied."
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Access is denied"):
+            pr.ProcessRegistry._terminate_host_pid(12345, 67890)
+
+    def test_windows_taskkill_timeout_is_an_explicit_failure(self, monkeypatch):
+        from tools import process_registry as pr
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_host_pid_is_ours",
+            classmethod(lambda cls, pid, expected_start: True),
+        )
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_snapshot_windows_tree_identities",
+            classmethod(lambda cls, pid, expected_start: [(pid, expected_start)]),
+        )
+
+        def timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(args[0], timeout=10)
+
+        monkeypatch.setattr(pr.subprocess, "run", timeout)
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            pr.ProcessRegistry._terminate_host_pid(12345, 67890)
+
+    def test_windows_surviving_owned_pid_is_an_explicit_failure(self, monkeypatch):
+        from tools import process_registry as pr
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_host_pid_is_ours",
+            classmethod(lambda cls, pid, expected_start: True),
+        )
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_snapshot_windows_tree_identities",
+            classmethod(lambda cls, pid, expected_start: [(pid, expected_start), (22222, 33333)]),
+        )
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_wait_for_host_identities_exit",
+            classmethod(lambda cls, identities, timeout: [(22222, 33333)]),
+        )
+        monkeypatch.setattr(
+            pr.subprocess,
+            "run",
+            lambda *args, **kwargs: MagicMock(returncode=0, stdout="", stderr=""),
+        )
+
+        with pytest.raises(RuntimeError, match="22222"):
+            pr.ProcessRegistry._terminate_host_pid(12345, 67890)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native Windows PTY integration")
+def test_windows_pty_kill_removes_owned_tree_and_preserves_unrelated_sentinel(
+    registry, tmp_path
+):
+    """Provider-free E2E: real PTY wrapper, child, and grandchild all exit."""
+    tree_script = tmp_path / "pty_tree.py"
+    receipt_path = tmp_path / "pty_tree.json"
+    tree_script.write_text(
+        "\n".join(
+            [
+                "import json, os, subprocess, sys, time",
+                "from pathlib import Path",
+                "grandchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])",
+                "Path(sys.argv[1]).write_text(json.dumps({'child': os.getpid(), 'grandchild': grandchild.pid}), encoding='utf-8')",
+                "while True: time.sleep(0.2)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    sentinel = _spawn_python_sleep(120)
+    sentinel_start = ProcessRegistry._safe_host_start_time(sentinel.pid)
+    session = None
+    owned = []
+
+    def cleanup_owned_processes():
+        for pid, start_time in reversed(owned):
+            if not ProcessRegistry._host_pid_is_ours(pid, start_time):
+                continue
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+
+    try:
+        command = f'"{sys.executable}" "{tree_script.as_posix()}" "{receipt_path.as_posix()}"'
+        session = registry.spawn_local(command, cwd=str(tmp_path), use_pty=True)
+        assert session._pty is not None, "test requires the real native Windows PTY path"
+        assert _wait_until(receipt_path.exists, timeout=20.0), "PTY child tree did not become ready"
+
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        wrapper_pid = session.pid
+        child_pid = int(receipt["child"])
+        grandchild_pid = int(receipt["grandchild"])
+        assert len({wrapper_pid, child_pid, grandchild_pid, sentinel.pid, os.getpid()}) == 5
+
+        owned = [
+            (wrapper_pid, session.host_start_time),
+            (child_pid, ProcessRegistry._safe_host_start_time(child_pid)),
+            (grandchild_pid, ProcessRegistry._safe_host_start_time(grandchild_pid)),
+        ]
+        assert all(start is not None for _, start in owned)
+        assert all(ProcessRegistry._host_pid_is_ours(pid, start) for pid, start in owned)
+        assert ProcessRegistry._host_pid_is_ours(sentinel.pid, sentinel_start)
+
+        result = registry.kill_process(session.id)
+
+        assert result["status"] == "killed", result
+        assert _wait_until(
+            lambda: all(
+                not ProcessRegistry._host_pid_is_ours(pid, start) for pid, start in owned
+            ),
+            timeout=10.0,
+        ), f"owned PTY tree survived: {owned}"
+        assert ProcessRegistry._host_pid_is_ours(sentinel.pid, sentinel_start)
+        assert registry.kill_process(session.id)["status"] == "already_exited"
+    finally:
+        cleanup_owned_processes()
+        if sentinel.poll() is None:
+            sentinel.kill()
+        sentinel.wait(timeout=10)
 
 class TestTerminateHostPidPosix:
     """POSIX branch walks the tree via psutil and SIGTERMs children first."""
@@ -1205,7 +1453,7 @@ class TestSigkillEscalation:
         finally:
             for p in all_pids:
                 try:
-                    os.kill(p, signal.SIGKILL)
+                    os.kill(p, signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
             parent.wait()
@@ -1294,7 +1542,7 @@ class TestReaderLoopOrphanedPipe:
             text=True,
             encoding="utf-8",
             errors="replace",
-            preexec_fn=os.setsid,
+            preexec_fn=os.setsid,  # windows-footgun: ok - POSIX-only test class
         )
         s = _make_session(sid="proc_orphan_reader")
         s.process = proc
@@ -1324,7 +1572,7 @@ class TestReaderLoopOrphanedPipe:
             assert s.id in registry._finished
         finally:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
             except (ProcessLookupError, PermissionError):
                 pass
 
@@ -1338,7 +1586,7 @@ class TestReaderLoopOrphanedPipe:
             text=True,
             encoding="utf-8",
             errors="replace",
-            preexec_fn=os.setsid,
+            preexec_fn=os.setsid,  # windows-footgun: ok - POSIX-only test class
         )
         s = _make_session(sid="proc_orphan_notify")
         s.process = proc
@@ -1365,7 +1613,7 @@ class TestReaderLoopOrphanedPipe:
             assert item["exit_code"] == 0
         finally:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
             except (ProcessLookupError, PermissionError):
                 pass
 
