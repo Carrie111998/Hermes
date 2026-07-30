@@ -1,0 +1,3 @@
+# Optional plugin-edge dependency for the dedicated SkyAI Discord mirror
+# Postgres outbox. It is intentionally not a Hermes core dependency.
+psycopg[binary]==3.2.9
