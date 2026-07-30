@@ -32,7 +32,7 @@ interface VoiceConversationOptions {
    *  Fired when the user speaks while the model is still generating. */
   onInterrupt?: () => Promise<void> | void
   onStopWord?: () => void
-  onSubmit: (text: string) => Promise<void> | void
+  onSubmit: (text: string) => Promise<VoiceConversationSubmitResult | void> | VoiceConversationSubmitResult | void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
@@ -40,6 +40,8 @@ interface VoiceConversationOptions {
    *  fully release the capture device first, so the two never contend. */
   beforeMicOpen?: () => Promise<void> | void
 }
+
+export type VoiceConversationSubmitResult = 'await-response' | 'end' | 'retry'
 
 /** How long a barge-triggered interrupt may take to settle before we submit
  *  the captured utterance anyway. */
@@ -183,9 +185,22 @@ export function useVoiceConversation({
             return
           }
 
-          awaitingSpokenResponseRef.current = true
           dropSpeechSession()
-          await onSubmit(transcript)
+          const submitResult = await onSubmit(transcript)
+
+          if (submitResult === 'end' || submitResult === 'retry') {
+            awaitingSpokenResponseRef.current = false
+
+            if (submitResult === 'retry' && enabledRef.current && !mutedRef.current && !busyRef.current) {
+              pendingStartRef.current = true
+            }
+
+            setStatus('idle')
+
+            return
+          }
+
+          awaitingSpokenResponseRef.current = true
           setStatus('thinking')
         } catch (error) {
           notifyError(error, voiceCopy.transcriptionFailed)

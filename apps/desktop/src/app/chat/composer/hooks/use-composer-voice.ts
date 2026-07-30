@@ -9,6 +9,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
+import { routeWakeVoiceTranscript } from '@/store/wake-voice-routing'
 import { resumeWakeAfterVoice } from '@/store/wake-word'
 
 import type { ComposerTarget } from '../focus'
@@ -18,6 +19,7 @@ import type { ChatBarProps } from '../types'
 
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
 import { useVoiceConversation } from './use-voice-conversation'
+import type { VoiceConversationSubmitResult } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
 
 interface UseComposerVoiceArgs {
@@ -62,6 +64,8 @@ export function useComposerVoice({
   const { $messages } = useComposerScope()
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
   const lastSpokenIdRef = useRef<string | null>(null)
+  const routeProfileRef = useRef<string | null>(null)
+  const routeFirstTranscriptRef = useRef(false)
   const voiceStartRequest = useStore($voiceConversationStartRequest)
 
   const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
@@ -109,15 +113,37 @@ export function useComposerVoice({
     }
   }
 
-  const submitVoiceTurn = async (text: string) => {
+  const submitVoiceTurn = async (text: string): Promise<VoiceConversationSubmitResult> => {
     if (busy) {
-      return
+      return 'retry'
+    }
+
+    if (target === 'main' && routeFirstTranscriptRef.current) {
+      const routeOutcome = await routeWakeVoiceTranscript(text, routeProfileRef.current)
+
+      if (routeOutcome === 'rejected') {
+        // Keep the first-turn router armed while Voice Mode listens for the
+        // corrected/full title. Falling through here could send the correction
+        // to the fresh/current session instead of the intended destination.
+        return 'retry'
+      }
+
+      routeFirstTranscriptRef.current = false
+      routeProfileRef.current = null
+
+      if (routeOutcome === 'routed') {
+        triggerHaptic('submit')
+        setVoiceConversationActive(false)
+
+        return 'end'
+      }
     }
 
     triggerHaptic('submit')
     resetBrowseState(sessionId)
     clearDraft()
-    await onSubmit(text)
+
+    return (await onSubmit(text)) === false ? 'retry' : 'await-response'
   }
 
   const wakePausedRef = useRef(false)
@@ -128,11 +154,17 @@ export function useComposerVoice({
   // fail and the conversation never starts listening.
   const wakePauseBarrierRef = useRef<Promise<void> | null>(null)
 
+  const endVoiceConversation = useCallback(() => {
+    routeFirstTranscriptRef.current = false
+    routeProfileRef.current = null
+    setVoiceConversationActive(false)
+  }, [])
+
   const conversation = useVoiceConversation({
     busy,
     consumePendingResponse,
     enabled: voiceConversationActive,
-    onFatalError: () => setVoiceConversationActive(false),
+    onFatalError: endVoiceConversation,
     // Speaking over the model mid-generation interrupts the in-flight turn —
     // the same seam as the Stop button — so the interjection becomes the next
     // turn instead of waiting behind a reply the user already rejected.
@@ -141,7 +173,7 @@ export function useComposerVoice({
     // hands-free conversation. Flipping the flag is the authoritative off
     // switch — the enabled=false prop + effect below drive conversation.end()
     // teardown (mic close, wake re-arm).
-    onStopWord: () => setVoiceConversationActive(false),
+    onStopWord: endVoiceConversation,
     onSubmit: submitVoiceTurn,
     onTranscribeAudio,
     pendingResponse: pendingTurnResponse,
@@ -159,20 +191,31 @@ export function useComposerVoice({
     }
 
     if (voiceConversationActive) {
-      setVoiceConversationActive(false)
+      endVoiceConversation()
       void conversation.end()
     } else {
+      routeFirstTranscriptRef.current = false
+      routeProfileRef.current = null
       setVoiceConversationActive(true)
     }
-  }, [conversation, disabled, voiceConversationActive])
+  }, [conversation, disabled, endVoiceConversation, voiceConversationActive])
 
   useEffect(
     () => onComposerVoiceToggleRequest(toggled => toggled === target && toggleVoiceConversation()),
     [target, toggleVoiceConversation]
   )
 
+  // eslint-disable-next-line no-restricted-syntax -- consumes one-shot request metadata; it does not mirror atom state
   useEffect(() => {
-    if (target === 'main' && !disabled && takeVoiceConversationStart(voiceStartRequest) && !voiceConversationActive) {
+    if (target !== 'main' || disabled) {
+      return
+    }
+
+    const request = takeVoiceConversationStart(voiceStartRequest)
+
+    if (request && !voiceConversationActive) {
+      routeProfileRef.current = request.profile
+      routeFirstTranscriptRef.current = request.routeFirstTranscript
       setVoiceConversationActive(true)
     }
   }, [disabled, target, voiceConversationActive, voiceStartRequest])
@@ -240,12 +283,16 @@ export function useComposerVoice({
 
   // Explicit start/end for the on-screen conversation controls (the hotkey uses
   // the gated toggle above).
-  const startConversation = useCallback(() => setVoiceConversationActive(true), [])
+  const startConversation = useCallback(() => {
+    routeFirstTranscriptRef.current = false
+    routeProfileRef.current = null
+    setVoiceConversationActive(true)
+  }, [])
 
   const endConversation = useCallback(() => {
-    setVoiceConversationActive(false)
+    endVoiceConversation()
     void conversation.end()
-  }, [conversation])
+  }, [conversation, endVoiceConversation])
 
   const handleToggleAutoSpeak = useCallback(() => {
     void setAutoSpeakReplies(!$autoSpeakReplies.get()).catch(error =>

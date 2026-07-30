@@ -195,6 +195,13 @@ export interface Translations {
       noSpeechDetected: string
       playbackFailed: string
       recordingFailed: string
+      routeAmbiguous: (destination: string) => string
+      routeFailed: (title: string) => string
+      routeInvalidSyntax: string
+      routeMissingPrompt: (destination: string) => string
+      routeNotFound: (destination: string) => string
+      routedToSession: (title: string) => string
+      routeUnavailable: string
       sayStopToEnd: (phrase: string) => string
       transcriptionFailed: string
       transcriptionUnavailable: string

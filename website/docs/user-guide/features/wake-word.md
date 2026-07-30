@@ -35,6 +35,38 @@ spoken command ends the conversation instead of being sent to the agent. Only a
 whole-utterance stop command matches, so a real request like "stop the docker
 container" still goes through normally.
 
+### Sending the first turn to an existing desktop session
+
+The desktop app can route the **first utterance after a wake phrase** to an
+existing session without switching the foreground to that destination. Use an
+explicit session-title command:
+
+- "Send to Toss résumé session: review the experience section."
+- "Route to Gmail integration session, rerun the connector test."
+- "Continue in mobile use session and summarize the latest failure."
+
+The separator after `session` is required: say "and", or pause so transcription
+produces a colon, comma, semicolon, or dash. Hermes rejects route-looking text
+without that boundary because session titles and requests can both contain the
+word "session".
+
+Hermes compares the spoken destination with non-archived session titles in the
+active profile. Matching ignores case, punctuation, whitespace, and accents. A
+full title always works; a prefix works only when it identifies exactly one
+session. Rename a session to give it a shorter voice-friendly title.
+
+Routing is deliberately conservative: duplicate or ambiguous titles, missing
+sessions, cross-profile sessions, incomplete session-history reads, and
+commands without a prompt are never sent to a guessed destination. The desktop
+shows the matching problem and listens again so you can use a longer title.
+Ordinary wake-word utterances that do not use this explicit grammar follow the
+existing `start_new_session` behavior unchanged.
+
+The routed turn runs in the destination session in the background. Because the
+foreground voice conversation is not moved between session runtimes, the wake
+listener re-arms after a successful send instead of waiting for that session's
+reply aloud.
+
 ## Engines
 
 | Engine | Cost | API key | Notes |

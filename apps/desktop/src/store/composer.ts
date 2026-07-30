@@ -23,20 +23,41 @@ export const $composerTerminalSelections = atom<Record<string, string>>({})
 
 // Latched because opening a fresh session may remount the main composer before
 // it can start voice. Session-tile composers deliberately never consume this.
-export const $voiceConversationStartRequest = atom(0)
+// Routing intent rides the same latch so a remount cannot turn a wake-triggered
+// first turn into an ordinary voice turn (or vice versa).
+export interface VoiceConversationStartRequest {
+  id: number
+  profile: null | string
+  routeFirstTranscript: boolean
+}
+
+export const $voiceConversationStartRequest = atom<VoiceConversationStartRequest>({
+  id: 0,
+  profile: null,
+  routeFirstTranscript: false
+})
 let nextVoiceStartRequest = 0
 let handledVoiceStartRequest = 0
 
-export const requestVoiceConversationStart = (): void => $voiceConversationStartRequest.set(++nextVoiceStartRequest)
+export const requestVoiceConversationStart = (
+  options: { profile?: null | string; routeFirstTranscript?: boolean } = {}
+): void =>
+  $voiceConversationStartRequest.set({
+    id: ++nextVoiceStartRequest,
+    profile: options.profile?.trim() || null,
+    routeFirstTranscript: options.routeFirstTranscript === true
+  })
 
-export const takeVoiceConversationStart = (current: number): boolean => {
-  if (current <= handledVoiceStartRequest) {
-    return false
+export const takeVoiceConversationStart = (
+  current: VoiceConversationStartRequest
+): null | Pick<VoiceConversationStartRequest, 'profile' | 'routeFirstTranscript'> => {
+  if (current.id <= handledVoiceStartRequest) {
+    return null
   }
 
-  handledVoiceStartRequest = current
+  handledVoiceStartRequest = current.id
 
-  return true
+  return { profile: current.profile, routeFirstTranscript: current.routeFirstTranscript }
 }
 
 // ---------------------------------------------------------------------------

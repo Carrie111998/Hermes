@@ -2,6 +2,7 @@ import { renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { setSessions } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
@@ -33,7 +34,16 @@ const row = (over: Partial<SessionInfo>): SessionInfo =>
     ...over
   }) as SessionInfo
 
-function renderTile(requestGateway: ReturnType<typeof vi.fn>) {
+function renderTile(
+  requestGateway: ReturnType<typeof vi.fn>,
+  options: {
+    runtimeIdByStoredSessionId?: Map<string, string>
+    sessionStateByRuntimeId?: Map<string, ReturnType<typeof createClientSessionState>>
+  } = {}
+) {
+  const runtimeIdByStoredSessionId = options.runtimeIdByStoredSessionId ?? new Map()
+  const sessionStateByRuntimeId = options.sessionStateByRuntimeId ?? new Map()
+
   renderHook(() =>
     useSessionTileDelegate({
       archiveSession: vi.fn(async () => undefined),
@@ -41,11 +51,23 @@ function renderTile(requestGateway: ReturnType<typeof vi.fn>) {
       executeSlashCommand: vi.fn(async () => undefined) as never,
       removeSession: vi.fn(async () => undefined),
       requestGateway: requestGateway as never,
-      runtimeIdByStoredSessionIdRef: { current: new Map() },
-      sessionStateByRuntimeIdRef: { current: new Map() },
-      updateSessionState: vi.fn()
+      runtimeIdByStoredSessionIdRef: { current: runtimeIdByStoredSessionId },
+      sessionStateByRuntimeIdRef: { current: sessionStateByRuntimeId },
+      updateSessionState: vi.fn((runtimeId, updater, storedSessionId) => {
+        const current = sessionStateByRuntimeId.get(runtimeId) ?? createClientSessionState(storedSessionId ?? null)
+        const next = updater(current)
+        sessionStateByRuntimeId.set(runtimeId, next)
+
+        if (storedSessionId) {
+          runtimeIdByStoredSessionId.set(storedSessionId, runtimeId)
+        }
+
+        return next
+      })
     })
   )
+
+  return { runtimeIdByStoredSessionId, sessionStateByRuntimeId }
 }
 
 describe('useSessionTileDelegate resumeTile', () => {
@@ -96,5 +118,48 @@ describe('useSessionTileDelegate resumeTile', () => {
       cols: 96,
       profile: 'default'
     })
+  })
+
+  it('honors an explicit caller profile without relying on the global session cache', async () => {
+    const requestGateway = vi.fn(async (method: string) =>
+      method === 'session.resume' ? ({ session_id: 'runtime-3' } as never) : ({} as never)
+    )
+
+    renderTile(requestGateway)
+    await sessionTileDelegate()!.resumeTile('stored-z', 'wake-profile')
+
+    expect(getSessionMessages).toHaveBeenCalledWith('stored-z', 'wake-profile')
+    expect(requestGateway).toHaveBeenCalledWith('session.resume', {
+      session_id: 'stored-z',
+      cols: 96,
+      profile: 'wake-profile'
+    })
+  })
+
+  it('does not replace another profile runtime in the global stored-id cache', async () => {
+    const runtimeIdByStoredSessionId = new Map([['shared-id', 'runtime-a']])
+    const sessionStateByRuntimeId = new Map([['runtime-a', createClientSessionState('shared-id')]])
+
+    const requestGateway = vi.fn(async (method: string) =>
+      method === 'session.resume' ? ({ session_id: 'runtime-b' } as never) : ({} as never)
+    )
+
+    renderTile(requestGateway, { runtimeIdByStoredSessionId, sessionStateByRuntimeId })
+    await sessionTileDelegate()!.resumeTile('shared-id', 'profile-b')
+
+    expect(runtimeIdByStoredSessionId.get('shared-id')).toBe('runtime-a')
+    expect(sessionStateByRuntimeId.get('runtime-b')?.storedSessionId).toBe('shared-id')
+  })
+
+  it('leaves no global stored-id mapping after an explicit-profile cold resume', async () => {
+    const requestGateway = vi.fn(async (method: string) =>
+      method === 'session.resume' ? ({ session_id: 'runtime-c' } as never) : ({} as never)
+    )
+
+    const { runtimeIdByStoredSessionId } = renderTile(requestGateway)
+
+    await sessionTileDelegate()!.resumeTile('shared-id', 'profile-c')
+
+    expect(runtimeIdByStoredSessionId.has('shared-id')).toBe(false)
   })
 })

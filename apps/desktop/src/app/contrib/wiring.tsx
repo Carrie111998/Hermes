@@ -111,6 +111,7 @@ import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { usePetBridge } from './hooks/use-pet-bridge'
 import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
+import { useWakeVoiceRoutingBridge } from './hooks/use-wake-voice-routing-bridge'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
@@ -604,6 +605,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     updateSessionState
   })
 
+  // Explicit first-turn Wake Word commands can address an existing session by
+  // title without changing the primary view. This registers after the tile
+  // delegate because it reuses that profile-safe resume + submit path.
+  useWakeVoiceRoutingBridge()
+
   // The popped-out pet overlay's bridge back into the app.
   usePetBridge({ requestGateway, resumeSession, submitText })
 
@@ -698,7 +704,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           startFreshSessionDraft()
         }
 
-        requestVoiceConversationStart()
+        requestVoiceConversationStart({
+          profile: targetProfile || activeProfile,
+          routeFirstTranscript: true
+        })
 
         return
       }

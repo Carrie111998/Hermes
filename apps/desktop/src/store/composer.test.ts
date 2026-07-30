@@ -17,15 +17,18 @@ import {
 } from './composer'
 
 describe('voice conversation start requests', () => {
-  it('latches each request until the main composer consumes it once', () => {
-    requestVoiceConversationStart()
+  it('latches each request and its wake-routing intent until the main composer consumes it once', () => {
+    requestVoiceConversationStart({ profile: 'work', routeFirstTranscript: true })
     const first = $voiceConversationStartRequest.get()
 
-    expect(takeVoiceConversationStart(first)).toBe(true)
-    expect(takeVoiceConversationStart(first)).toBe(false)
+    expect(takeVoiceConversationStart(first)).toEqual({ profile: 'work', routeFirstTranscript: true })
+    expect(takeVoiceConversationStart(first)).toBeNull()
 
     requestVoiceConversationStart()
-    expect(takeVoiceConversationStart($voiceConversationStartRequest.get())).toBe(true)
+    expect(takeVoiceConversationStart($voiceConversationStartRequest.get())).toEqual({
+      profile: null,
+      routeFirstTranscript: false
+    })
   })
 })
 

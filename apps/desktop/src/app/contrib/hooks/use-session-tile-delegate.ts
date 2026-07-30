@@ -57,11 +57,17 @@ export function useSessionTileDelegate({
       interruptSession: async runtimeId => {
         await requestGateway('session.interrupt', { session_id: runtimeId })
       },
-      resumeTile: async storedSessionId => {
+      resumeTile: async (storedSessionId, requestedProfile) => {
+        const explicitProfile = requestedProfile?.trim() || null
         const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         const cached = existing ? sessionStateByRuntimeIdRef.current.get(existing) : undefined
+        const previousMappedRuntimeId = cached?.storedSessionId === storedSessionId ? existing : undefined
 
-        if (existing && cached?.storedSessionId === storedSessionId) {
+        // An explicit profile is authoritative and must not reuse the global
+        // stored-id cache: different profile DBs can theoretically contain the
+        // same stored id, and the caller supplied the ownership precisely to
+        // avoid cross-profile inference.
+        if (!explicitProfile && existing && cached?.storedSessionId === storedSessionId) {
           publishSessionState(existing, cached)
 
           return existing
@@ -72,7 +78,7 @@ export function useSessionTileDelegate({
         // reading messages) without a profile lets the gateway fall back to the
         // launch-profile DB and fork the conversation into the wrong profile —
         // the same cross-profile bleed the recovery resumes had (#67603).
-        const profile = await resolveSessionProfile(storedSessionId)
+        const profile = explicitProfile || (await resolveSessionProfile(storedSessionId))
 
         const [prefetch, resumed] = await Promise.all([
           getSessionMessages(storedSessionId, profile).catch(() => null),
@@ -89,16 +95,33 @@ export function useSessionTileDelegate({
           throw new Error('resume returned no session id')
         }
 
-        updateSessionState(
-          runtimeId,
-          state => ({
-            ...state,
-            busy: Boolean(resumed?.info?.running),
-            messages:
-              state.messages.length > 0 ? state.messages : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
-          }),
-          storedSessionId
-        )
+        try {
+          updateSessionState(
+            runtimeId,
+            state => ({
+              ...state,
+              busy: Boolean(resumed?.info?.running),
+              messages:
+                state.messages.length > 0
+                  ? state.messages
+                  : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
+            }),
+            storedSessionId
+          )
+        } finally {
+          if (explicitProfile) {
+            // updateSessionState normally registers a profile-agnostic
+            // stored-id → runtime mapping. An authoritative-profile background
+            // resume must not replace another profile's valid mapping (or leave
+            // its own behind), because later ordinary tile resumes do not carry
+            // enough ownership information to distinguish colliding ids.
+            if (previousMappedRuntimeId) {
+              runtimeIdByStoredSessionIdRef.current.set(storedSessionId, previousMappedRuntimeId)
+            } else {
+              runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+            }
+          }
+        }
 
         return runtimeId
       },
