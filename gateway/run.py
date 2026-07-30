@@ -17277,6 +17277,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                # The outer turn boundary normally runs the goal judge from
+                # this method's returned text. Streaming returns None to avoid
+                # sending the already-delivered response twice, so run the
+                # judge here while the actual final response is still present.
+                # Its status message must be sent directly: streaming has
+                # already completed platform delivery, so a post-delivery
+                # callback registered now would never fire.
+                if response.strip():
+                    try:
+                        await self._post_turn_goal_continuation(
+                            session_entry=session_entry,
+                            source=source,
+                            final_response=response,
+                            response_already_delivered=True,
+                        )
+                    except Exception as _goal_exc:
+                        logger.debug("goal continuation hook after streamed response failed: %s", _goal_exc)
                 return None
 
             return response
@@ -17901,6 +17918,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        response_already_delivered: bool = False,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -17948,7 +17966,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
         if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            if response_already_delivered:
+                await self._send_goal_status_notice(source, msg)
+            else:
+                await self._defer_goal_status_notice_after_delivery(source, msg)
 
         if not decision.get("should_continue"):
             return
