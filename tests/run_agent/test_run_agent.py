@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -177,6 +180,48 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
     assert not normal.is_alive()
     assert not direct.is_alive()
     assert db.rows == ["exactly once"]
+
+
+def test_persist_session_does_not_clear_inflight_marker_when_db_flush_fails(agent):
+    """A failed canonical flush must not be reported as a completed persist."""
+    from agent import agent_runtime_helpers as _helpers
+
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent.session_id = "session-123"
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+    agent._persist_disabled = False
+    agent._session_persist_lock = threading.RLock()
+    agent._session_json_enabled = False
+    agent._inflight_turn_id = "session-123:t1:aaaa"
+    agent._inflight_turn_session_id = agent.session_id
+
+    with _helpers._INFLIGHT_TURNS_LOCK:
+        _helpers._INFLIGHT_TURNS_BY_SESSION.clear()
+        _helpers._INFLIGHT_TURNS_BY_SESSION[agent.session_id] = (
+            agent._inflight_turn_id,
+            time.time(),
+        )
+
+    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+
+    try:
+        result = agent._persist_session([{"role": "user", "content": "hello"}], [])
+
+        assert result is False
+        assert agent._inflight_turn_id == "session-123:t1:aaaa"
+        with _helpers._INFLIGHT_TURNS_LOCK:
+            assert _helpers._INFLIGHT_TURNS_BY_SESSION[agent.session_id][0] == (
+                "session-123:t1:aaaa"
+            )
+    finally:
+        with _helpers._INFLIGHT_TURNS_LOCK:
+            _helpers._INFLIGHT_TURNS_BY_SESSION.clear()
 
 
 @pytest.fixture()
