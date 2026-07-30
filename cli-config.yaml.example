@@ -587,6 +587,10 @@ agent:
   # primaries (default 3). The OpenAI SDK does its own low-level retries
   # underneath this wrapper — this is the Hermes-level loop.
   # api_max_retries: 3
+
+  # Max retries when a model returns an empty response (no content/reasoning)
+  # before fallback provider switching engages. Set to 0 for instant fallback.
+  # empty_response_retries: 5
   
   # Enable verbose logging
   verbose: false

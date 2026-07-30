@@ -3593,17 +3593,67 @@ def run_conversation(
                         _has_structured
                         and agent._thinking_prefill_retries >= 2
                     )
-                    if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
+                    _max_empty_retries = getattr(agent, "_empty_response_retries", 5)
+                    if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < _max_empty_retries:
                         agent._empty_content_retries += 1
                         logger.warning(
                             "Empty response (no content or reasoning) — "
-                            "retry %d/3 (model=%s)",
-                            agent._empty_content_retries, agent.model,
+                            "retry %d/%d (model=%s)",
+                            agent._empty_content_retries, _max_empty_retries, agent.model,
                         )
                         agent._emit_status(
                             f"⚠️ Empty response from model — retrying "
-                            f"({agent._empty_content_retries}/3)"
+                            f"({agent._empty_content_retries}/{_max_empty_retries})"
                         )
+                        wait_time = jittered_backoff(
+                            agent._empty_content_retries,
+                            base_delay=3.0,
+                            max_delay=15.0,
+                        )
+                        agent._vprint(
+                            f"{agent.log_prefix}⏳ Retrying empty response in {wait_time:.1f}s...",
+                            force=True,
+                        )
+                        sleep_end = time.time() + wait_time
+                        _backoff_touch_counter = 0
+                        _backoff_interrupted = False
+                        while time.time() < sleep_end:
+                            if agent._interrupt_requested:
+                                # Preserve pending steer redirect if present during retry wait
+                                if getattr(agent, "_pending_steer", None) is not None:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}⚡ Steering redirect detected during empty-response backoff, applying.",
+                                        force=True,
+                                    )
+                                    agent.iteration_budget.refund()
+                                    agent.clear_interrupt(preserve_redirect=True)
+                                    _backoff_interrupted = True
+                                    break
+                                agent._vprint(
+                                    f"{agent.log_prefix}⚡ Interrupt detected during empty-response retry wait, aborting.",
+                                    force=True,
+                                )
+                                agent._persist_session(messages, conversation_history)
+                                agent.clear_interrupt()
+                                return {
+                                    "final_response": (
+                                        f"Operation interrupted during retry (empty response, attempt "
+                                        f"{agent._empty_content_retries}/{_max_empty_retries})."
+                                    ),
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "interrupted": True,
+                                }
+                            time.sleep(0.2)
+                            _backoff_touch_counter += 1
+                            if _backoff_touch_counter % 150 == 0:
+                                agent._touch_activity(
+                                    f"empty response backoff ({agent._empty_content_retries}/{_max_empty_retries}), "
+                                    f"{int(sleep_end - time.time())}s remaining"
+                                )
+                        if _backoff_interrupted:
+                            continue
                         continue
 
                     # ── Exhausted retries — try fallback provider ──
