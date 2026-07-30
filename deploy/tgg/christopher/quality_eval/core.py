@@ -705,7 +705,7 @@ class Judge:
         )
         with tempfile.TemporaryDirectory(prefix="tgg-output-judge-") as tmp:
             try:
-                source_bundle = json.loads(bundle_path.read_text())
+                source_bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise EvalError("judge source bundle is unreadable JSON") from exc
             source_images = [
