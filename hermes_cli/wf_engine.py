@@ -327,6 +327,21 @@ def register_template(conn: sqlite3.Connection, spec: dict) -> tuple[str, int]:
     if not isinstance(slug, str) or not slug.strip():
         raise ValueError("template spec id is required")
 
+    # Validate wait contracts before persisting the immutable template.  A
+    # malformed timer must fail at registration, not much later inside the
+    # gateway watcher after an instance has parked on it.
+    workflow = _workflow_spec(spec)
+    for step in _steps(spec) if workflow.get("steps") is not None else ():
+        waits = step.get("waits") or []
+        if not isinstance(waits, list):
+            raise ValueError("workflow step waits must be a list")
+        for wait in waits:
+            if not isinstance(wait, dict):
+                raise ValueError("workflow waits must be objects")
+            kind, _types, _schema, after, _action = _wait_fields(wait)
+            if kind == "timer":
+                _timer_at(after, 0)
+
     canonical_spec = json.dumps(
         spec,
         sort_keys=True,
@@ -550,6 +565,15 @@ def _wait_fields(wait: dict) -> tuple[str, list[str] | None, str | None, int | N
     action = wait.get("action")
     if action is not None and not isinstance(action, str):
         raise ValueError("workflow timer action must be a string")
+    if kind == "timer" and wait.get("max_fires") is not None:
+        try:
+            max_fires = int(wait["max_fires"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("workflow timer max_fires must be an integer") from exc
+        if max_fires < 1:
+            raise ValueError("workflow timer max_fires must be at least one")
+        if action != "chase" and max_fires > 1:
+            raise ValueError("repeating workflow timers must use action='chase'")
     return kind, types, schema, wait.get("after"), action
 
 
@@ -1864,7 +1888,7 @@ def fire_due_timers(conn, now: int) -> list[int]:
                 # same engine-owned row after each fire; the external id's
                 # monotonically increasing fire number is the durable dedupe
                 # key across gateway restarts.
-                cadence = max(1, _duration(timer_spec.get("after", 60)))
+                cadence = max(1, _duration(timer_spec["after"]))
                 next_timer_at = int(now) + cadence
             updated = conn.execute(
                 """
@@ -1880,7 +1904,12 @@ def fire_due_timers(conn, now: int) -> list[int]:
                 ),
             )
             if updated.rowcount != 1:
-                continue
+                # Keep the inserted event and wait counter atomic.  A caller
+                # must never observe a durable received event whose fire
+                # number was not claimed by the wait row.
+                raise WorkflowConflictError(
+                    f"workflow timer fire CAS lost for wait {wait['id']}"
+                )
             created.append(int(event_id))
     return created
 
@@ -2043,7 +2072,7 @@ def process_timer_event(conn, event_id: int) -> ApplyResult:
             """,
             (wait["task_id"], _now(), int(event_id)),
         )
-        if fire_number >= limit and timer_spec.get("then") == "escalate":
+        if fire_number >= limit and timer_spec.get("then", "escalate") == "escalate":
             reason = (
                 f"workflow chase cap reached at {wait['step_key']} "
                 f"({fire_number}/{limit})"
@@ -2088,6 +2117,7 @@ def sweep(conn, now: int) -> SweepResult:
             SELECT id
               FROM wf_event
              WHERE created_at >= ?
+               AND source != 'timer'
                AND status IN ('received', 'classified', 'unmatched', 'buffered')
              ORDER BY id
             """,

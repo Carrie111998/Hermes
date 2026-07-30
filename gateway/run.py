@@ -5925,11 +5925,14 @@ class GatewayRunner:
                     ):
                         logger.info(
                             "workflow watcher [%s]: timers=%d polls=%d "
-                            "poll_duplicates=%d swept=%d applied=%d",
+                            "poll_duplicates=%d probe_errors=%d "
+                            "timer_errors=%d swept=%d applied=%d",
                             slug,
                             len(result.timers_fired),
                             len(result.poll_events),
                             result.poll_duplicates,
+                            result.probe_errors,
+                            result.timer_errors,
                             result.sweep_processed,
                             len(result.applied_events),
                         )

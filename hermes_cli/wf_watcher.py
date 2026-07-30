@@ -9,12 +9,15 @@ matching, application, timer catch-up, and sweep recovery.
 from __future__ import annotations
 
 import inspect
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
 from hermes_cli import wf_engine
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,8 @@ class WatchTickResult:
     timer_results: tuple[str, ...] = ()
     poll_events: tuple[int, ...] = ()
     poll_duplicates: int = 0
+    probe_errors: int = 0
+    timer_errors: int = 0
     sweep_processed: int = 0
     applied_events: tuple[int, ...] = ()
 
@@ -184,22 +189,54 @@ def run_tick(conn: sqlite3.Connection, now: int) -> WatchTickResult:
     """Run one complete timer/probe/sweeper cycle against one board."""
 
     timers = tuple(wf_engine.fire_due_timers(conn, int(now)))
+    pending_timers = tuple(
+        int(row["id"])
+        for row in conn.execute(
+            """
+            SELECT id FROM wf_event
+             WHERE source = 'timer' AND status = 'received'
+             ORDER BY id
+            """
+        ).fetchall()
+    )
     timer_results: list[str] = []
+    timer_errors = 0
     applied: list[int] = []
-    for event_id in timers:
-        result = wf_engine.process_timer_event(conn, event_id)
+    for event_id in pending_timers:
+        try:
+            result = wf_engine.process_timer_event(conn, event_id)
+        except Exception:
+            timer_errors += 1
+            logger.exception("workflow watcher: timer event %s failed", event_id)
+            continue
         timer_results.append(result.kind)
         if result.kind in {"applied", "chase", "exception"}:
             applied.append(event_id)
 
     poll_events: list[int] = []
     poll_duplicates = 0
+    probe_errors = 0
     # Probe calls happen outside a write transaction and receive immutable
     # values only.  A slow tenant probe cannot hold the SQLite writer lock.
     for tenant, targets in _probe_targets(conn).items():
-        observations = _STATE_PROBES[tenant](targets)
-        for raw in observations or ():
-            observation = _observation(raw)
+        try:
+            observations = tuple(_STATE_PROBES[tenant](targets) or ())
+        except Exception:
+            probe_errors += 1
+            logger.exception(
+                "workflow watcher: state probe failed for tenant %s", tenant
+            )
+            continue
+        for raw in observations:
+            try:
+                observation = _observation(raw)
+            except Exception:
+                probe_errors += 1
+                logger.exception(
+                    "workflow watcher: invalid state probe observation for tenant %s",
+                    tenant,
+                )
+                continue
             event_id = wf_engine.ingest_event(
                 conn,
                 source="state_poll",
@@ -224,6 +261,8 @@ def run_tick(conn: sqlite3.Connection, now: int) -> WatchTickResult:
         timer_results=tuple(timer_results),
         poll_events=tuple(poll_events),
         poll_duplicates=poll_duplicates,
+        probe_errors=probe_errors,
+        timer_errors=timer_errors,
         sweep_processed=swept.processed,
         applied_events=tuple(dict.fromkeys(applied)),
     )

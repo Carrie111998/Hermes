@@ -318,3 +318,114 @@ def test_restart_catchup_fires_timer_missed_while_gateway_was_down(
         )[0] == "done"
     finally:
         restarted.close()
+
+
+def test_restart_drains_timer_event_committed_before_processing(
+    tmp_path, monkeypatch
+):
+    path, conn, task_id = _board(
+        tmp_path,
+        monkeypatch,
+        {"after": 30, "action": "advance", "advance_to": "done"},
+    )
+    due = NOW + 30
+    fired = wf_engine.fire_due_timers(conn, due)
+    assert len(fired) == 1
+    assert _row(
+        conn, "SELECT status FROM wf_event WHERE id = ?", fired[0]
+    )[0] == "received"
+    conn.close()
+
+    restarted = kanban_db.connect(path)
+    try:
+        caught_up = wf_watcher.run_tick(restarted, due + 60)
+        repeated = wf_watcher.run_tick(restarted, due + 120)
+        assert caught_up.timers_fired == ()
+        assert caught_up.timer_results == ("applied",)
+        assert repeated.timer_results == ()
+        assert _row(
+            restarted,
+            "SELECT current_step_key FROM tasks WHERE id = ?",
+            task_id,
+        )[0] == "done"
+        assert _row(
+            restarted,
+            "SELECT COUNT(*) FROM wf_transition WHERE task_id = ? AND step_key = 'wait'",
+            task_id,
+        )[0] == 1
+    finally:
+        restarted.close()
+
+
+def test_bad_timer_and_probe_do_not_block_other_work(tmp_path, monkeypatch):
+    _path, conn, task_id = _board(
+        tmp_path,
+        monkeypatch,
+        {"after": 30, "action": "advance", "advance_to": "done"},
+    )
+    invalid_timer = wf_engine.ingest_event(
+        conn,
+        source="timer",
+        external_id="invalid-timer",
+        payload={"wait_id": -1, "fire": 1, "action": "advance"},
+        corr={"task_id": task_id},
+        event_type="advance",
+    )
+    stuck = wf_engine.ingest_event(
+        conn,
+        source="synthetic",
+        external_id="stuck-observation",
+        payload={},
+        corr={"entity": "entity-1"},
+        event_type="observed",
+    )
+    assert invalid_timer is not None
+    assert stuck is not None
+
+    real_process_timer_event = wf_engine.process_timer_event
+
+    def isolate_invalid_timer(target_conn, event_id):
+        if event_id == invalid_timer:
+            raise RuntimeError("one malformed timer")
+        return real_process_timer_event(target_conn, event_id)
+
+    def broken_probe(_targets):
+        yield {"external_id": "never-consumed", "event_type": "observed"}
+        raise RuntimeError("tenant probe failed after yielding")
+
+    monkeypatch.setattr(wf_engine, "process_timer_event", isolate_invalid_timer)
+    wf_watcher.register_state_probe("tenant", broken_probe, read_only=True)
+    try:
+        result = wf_watcher.run_tick(conn, NOW)
+        assert result.timer_errors == 1
+        assert result.probe_errors == 1
+        assert stuck in result.applied_events
+        assert _row(
+            conn,
+            "SELECT current_step_key FROM tasks WHERE id = ?",
+            task_id,
+        )[0] == "done"
+        assert _row(
+            conn, "SELECT status FROM wf_event WHERE id = ?", invalid_timer
+        )[0] == "received"
+    finally:
+        wf_watcher.unregister_state_probe("tenant")
+        conn.close()
+
+
+def test_repeating_non_chase_timer_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(wf_engine, "_now", lambda: NOW)
+    conn = kanban_db.connect(tmp_path / "workflow.sqlite")
+    with pytest.raises(ValueError, match="must use action='chase'"):
+        wf_engine.register_template(
+            conn,
+            _spec(
+                {
+                    "after": 30,
+                    "action": "advance",
+                    "advance_to": "done",
+                    "max_fires": 2,
+                }
+            ),
+        )
+    conn.close()
