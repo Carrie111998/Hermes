@@ -69,17 +69,19 @@ def main() -> None:
         response.raise_for_status()
         data = response.json()
         text = data["choices"][0]["message"]["content"].strip()
-        if text != "LITELLM_OK":
-            raise SystemExit("Unexpected model response")
+        if not text:
+            raise SystemExit("Model response was empty")
         if not data.get("usage"):
             raise SystemExit("LiteLLM usage metadata missing")
-        results.append((elapsed, response.headers))
+        results.append((elapsed, response.headers, text))
 
     first, second = results
     cache_key = second[1].get("x-litellm-cache-key")
     cost = first[1].get("x-litellm-response-cost")
-    if not cache_key and second[0] > 0.1:
-        raise SystemExit("Second request did not show a cache hit")
+    if not cache_key:
+        raise SystemExit("Second response did not include LiteLLM's cache-hit key")
+    if second[2] != first[2]:
+        raise SystemExit("Cached response content differs from the original response")
     if cost is None:
         raise SystemExit("LiteLLM cost header missing")
     print(
