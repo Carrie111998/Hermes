@@ -448,11 +448,15 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # preserves local-before-external precedence.
                     cmd_key = f"/{cmd_name}"
                     if cmd_key in _skill_commands:
-                        logger.warning(
-                            "Skill %r maps to slash command %s already claimed "
-                            "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, _skill_commands[cmd_key]["name"],
-                        )
+                        # Silent skip when the same skill name claims its own
+                        # command (e.g. skill present in both local and external
+                        # dirs, or scan_skill_commands called more than once).
+                        if _skill_commands[cmd_key]["name"] != name:
+                            logger.warning(
+                                "Skill %r maps to slash command %s already claimed "
+                                "by %r; keeping the first and skipping this one.",
+                                name, cmd_key, _skill_commands[cmd_key]["name"],
+                            )
                         continue
                     _skill_commands[cmd_key] = {
                         "name": name,
