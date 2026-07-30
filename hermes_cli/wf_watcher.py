@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
-from hermes_cli import wf_engine
+from hermes_cli import kanban_db, wf_engine
 
 logger = logging.getLogger(__name__)
 
@@ -168,21 +168,55 @@ def _drive_matched_event(
     conn: sqlite3.Connection,
     event_id: int,
 ) -> bool:
-    result = wf_engine.match_event(conn, int(event_id))
-    if result.kind != "matched" or not result.task_id:
-        return False
-    task = conn.execute(
-        "SELECT current_step_key FROM tasks WHERE id = ?", (result.task_id,)
-    ).fetchone()
-    if task is None or not task["current_step_key"]:
-        return False
-    applied = wf_engine.apply_event(
-        conn,
-        int(event_id),
-        result.task_id,
-        expected_step=task["current_step_key"],
-    )
-    return applied.kind == "applied"
+    # ``matched`` is a terminal intake status.  Keep classification and
+    # application in one outer transaction so a process exit or exception
+    # cannot strand a newly matched event.  The engine calls nest through
+    # savepoints under this transaction.
+    with kanban_db.write_txn(conn):
+        result = wf_engine.match_event(conn, int(event_id))
+        if result.kind != "matched" or not result.task_id:
+            return False
+        task = conn.execute(
+            "SELECT current_step_key FROM tasks WHERE id = ?", (result.task_id,)
+        ).fetchone()
+        if task is None or not task["current_step_key"]:
+            conn.execute(
+                """
+                UPDATE wf_event
+                   SET status = 'received',
+                       matched_task_id = NULL,
+                       match_method = NULL
+                 WHERE id = ? AND status = 'matched'
+                """,
+                (int(event_id),),
+            )
+            return False
+        applied = wf_engine.apply_event(
+            conn,
+            int(event_id),
+            result.task_id,
+            expected_step=task["current_step_key"],
+        )
+        if applied.kind in {"re_correlate", "unmatched"}:
+            conn.execute(
+                """
+                UPDATE wf_event
+                   SET status = 'received',
+                       matched_task_id = NULL,
+                       match_method = NULL
+                 WHERE id = ? AND status = 'matched'
+                """,
+                (int(event_id),),
+            )
+            return False
+        if applied.kind != "applied":
+            logger.warning(
+                "workflow watcher: matched event %s produced apply result %s",
+                event_id,
+                applied.kind,
+            )
+            return False
+        return True
 
 
 def run_tick(conn: sqlite3.Connection, now: int) -> WatchTickResult:
@@ -253,7 +287,25 @@ def run_tick(conn: sqlite3.Connection, now: int) -> WatchTickResult:
                 applied.append(event_id)
 
     swept = wf_engine.sweep(conn, int(now))
-    for event_id in swept.matched_ids:
+    # ``sweep`` classifies before returning.  Include every durable
+    # non-create match, not only matches produced in this process, so a
+    # gateway restart after classification but before application catches up.
+    # Create matches already birthed their instance during classification and
+    # deliberately have no event-wait application phase.
+    matched_ids = tuple(
+        int(row["id"])
+        for row in conn.execute(
+            """
+            SELECT id
+              FROM wf_event
+             WHERE source != 'timer'
+               AND status = 'matched'
+               AND COALESCE(match_method, '') != 'deterministic:create'
+             ORDER BY id
+            """
+        ).fetchall()
+    )
+    for event_id in matched_ids:
         if _drive_matched_event(conn, event_id):
             applied.append(event_id)
     return WatchTickResult(

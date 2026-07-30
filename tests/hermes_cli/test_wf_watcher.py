@@ -252,6 +252,93 @@ def test_read_only_tenant_probe_ingests_applies_and_dedupes(tmp_path, monkeypatc
         conn.close()
 
 
+def test_match_and_apply_roll_back_together_on_failure_and_restart_recovers(
+    tmp_path, monkeypatch
+):
+    path, conn, task_id = _board(tmp_path, monkeypatch)
+    event_id = wf_engine.ingest_event(
+        conn,
+        source="synthetic",
+        external_id="crash-between-match-and-apply",
+        payload={},
+        corr={"entity": "entity-1"},
+        event_type="observed",
+    )
+    assert event_id is not None
+    real_apply_event = wf_engine.apply_event
+
+    def fail_after_match(*_args, **_kwargs):
+        raise RuntimeError("synthetic process exit after match")
+
+    monkeypatch.setattr(wf_engine, "apply_event", fail_after_match)
+    with pytest.raises(RuntimeError, match="synthetic process exit"):
+        wf_watcher.run_tick(conn, NOW)
+    # The sweep classification committed before the synthetic exit.  A
+    # durable matched row is now itself part of the watcher's restart queue.
+    assert _row(
+        conn, "SELECT status FROM wf_event WHERE id = ?", event_id
+    )[0] == "matched"
+    conn.close()
+
+    monkeypatch.setattr(wf_engine, "apply_event", real_apply_event)
+    restarted = kanban_db.connect(path)
+    try:
+        caught_up = wf_watcher.run_tick(restarted, NOW + 60)
+        assert event_id in caught_up.applied_events
+        assert _row(
+            restarted, "SELECT status FROM wf_event WHERE id = ?", event_id
+        )[0] == "applied"
+        assert _row(
+            restarted,
+            "SELECT current_step_key FROM tasks WHERE id = ?",
+            task_id,
+        )[0] == "done"
+    finally:
+        restarted.close()
+
+
+def test_recorrelate_rolls_match_back_for_next_sweep(tmp_path, monkeypatch):
+    _path, conn, task_id = _board(tmp_path, monkeypatch)
+    event_id = wf_engine.ingest_event(
+        conn,
+        source="synthetic",
+        external_id="cas-retry-after-match",
+        payload={},
+        corr={"entity": "entity-1"},
+        event_type="observed",
+    )
+    assert event_id is not None
+    real_apply_event = wf_engine.apply_event
+
+    def request_recorrelation(_conn, target_event_id, target_task_id, **_kwargs):
+        return wf_engine.ApplyResult(
+            kind="re_correlate",
+            task_id=target_task_id,
+            event_id=target_event_id,
+            reason="synthetic stage race",
+        )
+
+    monkeypatch.setattr(wf_engine, "apply_event", request_recorrelation)
+    first = wf_watcher.run_tick(conn, NOW)
+    assert event_id not in first.applied_events
+    assert _row(
+        conn, "SELECT status FROM wf_event WHERE id = ?", event_id
+    )[0] == "received"
+
+    monkeypatch.setattr(wf_engine, "apply_event", real_apply_event)
+    second = wf_watcher.run_tick(conn, NOW + 60)
+    assert event_id in second.applied_events
+    assert _row(
+        conn, "SELECT status FROM wf_event WHERE id = ?", event_id
+    )[0] == "applied"
+    assert _row(
+        conn,
+        "SELECT current_step_key FROM tasks WHERE id = ?",
+        task_id,
+    )[0] == "done"
+    conn.close()
+
+
 def test_sweeper_redrives_stuck_intake_and_restart_catches_overdue_timer(
     tmp_path, monkeypatch
 ):
