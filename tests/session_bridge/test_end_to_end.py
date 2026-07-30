@@ -52,10 +52,12 @@ from session_bridge.models import (
     SidebarJobState,
     canonical_session_id,
     decode_bridge_marker,
+    encode_bridge_marker,
 )
 from session_bridge.preview import build_session_preview
 from session_bridge.sidebar import (
     VerifiedSidebarThread,
+    build_registration_prompt,
     decode_sidebar_registration_identity,
     encode_hydration_marker,
 )
@@ -228,7 +230,9 @@ class _SidebarSkillContract:
                 '"target":{"type":"project"',
                 "match either the job's exact source cwd",
             )
-            if any(rule in text for rule in forbidden_stale_rules):
+            if any(
+                rule in text for rule in forbidden_stale_rules
+            ) or cls._contains_source_first_placement_rule(text):
                 raise ValueError("stale source-first placement rule")
 
             mapping_block = text.split("\n## Fixed Failure Mapping\n", 1)[1].split(
@@ -249,6 +253,7 @@ class _SidebarSkillContract:
                 "Create response lost or otherwise ambiguous": "native_create_ambiguous",
                 "Bound task not yet indexed": "native_task_not_indexed",
                 "Authenticated marker conflict": "marker_conflict",
+                "Source identity mismatch": "source_identity_mismatch",
                 "Session Inbox unavailable": "inbox_unavailable",
                 "Native task outside Session Inbox placement": "placement_mismatch",
             }
@@ -292,6 +297,51 @@ class _SidebarSkillContract:
         except (IndexError, OSError, ValueError) as exc:
             raise ValueError(f"sidebar skill contract is invalid: {path}") from exc
 
+    @staticmethod
+    def _contains_source_first_placement_rule(text: str) -> bool:
+        clauses = re.split(r"(?<=[.!?])(?:\s+|$)|[\r\n]+", text.casefold())
+        source_terms = (
+            "source cwd",
+            "source folder",
+            "source directory",
+            "source workspace",
+            "source project",
+            "source repository",
+            "originating directory",
+            "originating folder",
+            "originating workspace",
+            "git root",
+        )
+        selection_pattern = re.compile(
+            r"\b(?:favor|prefer|prioritize|select|choose|use|place|route|target)\b"
+        )
+        precedence_terms = (
+            " over ",
+            " before ",
+            " ahead of ",
+            " first",
+            " fallback",
+            " instead of ",
+        )
+        negations = (
+            "never ",
+            "do not ",
+            "must not ",
+            "cannot ",
+            "can't ",
+            "not select",
+            "not choose",
+            "not use",
+        )
+        return any(
+            "inbox" in clause
+            and any(term in clause for term in source_terms)
+            and selection_pattern.search(clause) is not None
+            and any(term in clause for term in precedence_terms)
+            and not any(term in clause for term in negations)
+            for clause in clauses
+        )
+
     def failure_code(self, label: str) -> str:
         try:
             return self.failure_codes[label]
@@ -314,6 +364,100 @@ class _SidebarSkillContract:
         raise ValueError(
             self.failure_code("Session Inbox unavailable")
         )
+
+    def validate_status(self, status: object, *, inbox: str) -> bool:
+        if not isinstance(status, dict):
+            return False
+        health = status.get("health")
+        sidebar = status.get("sidebar")
+        if not isinstance(health, dict) or not isinstance(sidebar, dict):
+            return False
+        if (
+            health.get("running") is not True
+            or health.get("watcher_state") != "running"
+        ):
+            return False
+        providers = health.get("providers")
+        if not isinstance(providers, dict) or any(
+            not isinstance(provider, dict)
+            or "degraded_reason" not in provider
+            or provider.get("degraded_reason") is not None
+            for provider in providers.values()
+        ):
+            return False
+        placement = sidebar.get("placement")
+        counts = sidebar.get("counts")
+        hydration = sidebar.get("hydration")
+        hydration_counts = (
+            hydration.get("counts") if isinstance(hydration, dict) else None
+        )
+        if (
+            not isinstance(placement, dict)
+            or not isinstance(counts, dict)
+            or not isinstance(hydration_counts, dict)
+        ):
+            return False
+        try:
+            status_inbox = _canonical_sidebar_path(placement.get("inbox_cwd", ""))
+        except (OSError, TypeError, ValueError):
+            return False
+        required_counts = (
+            SidebarJobState.PENDING.value,
+            SidebarJobState.RETRY.value,
+        )
+        required_hydration_counts = (
+            SidebarHydrationState.PENDING.value,
+            SidebarHydrationState.RETRY.value,
+        )
+        return (
+            status_inbox == _canonical_sidebar_path(inbox)
+            and placement.get("generation") == 1
+            and all(
+                type(counts.get(state)) is int and counts[state] >= 0
+                for state in required_counts
+            )
+            and all(
+                type(hydration_counts.get(state)) is int
+                and hydration_counts[state] >= 0
+                for state in required_hydration_counts
+            )
+        )
+
+    def build_project_map(
+        self,
+        projects: object,
+        *,
+        inbox: str,
+    ) -> dict[str, str]:
+        if not isinstance(projects, list):
+            raise ValueError("project preflight")
+        indexed: dict[str, str] = {}
+        inbox_matches = 0
+        canonical_inbox = _canonical_sidebar_path(inbox)
+        for project in projects:
+            if not isinstance(project, dict):
+                raise ValueError("project preflight")
+            project_id = project.get("projectId")
+            path = project.get("path")
+            host_id = project.get("hostId")
+            if (
+                type(project_id) is not str
+                or not project_id
+                or project_id != project_id.strip()
+                or type(path) is not str
+                or not path
+                or host_id not in (None, "local")
+            ):
+                raise ValueError("project preflight")
+            canonical_path = _canonical_sidebar_path(path)
+            if canonical_path in indexed:
+                raise ValueError("project preflight")
+            indexed[canonical_path] = project_id
+            if canonical_path == canonical_inbox:
+                inbox_matches += 1
+        if inbox_matches != 1:
+            raise ValueError("project preflight")
+        return indexed
 
     def resolve_placement(
         self,
@@ -367,6 +511,8 @@ class _SidebarSkillContract:
             raise AssertionError("projects must be listed before pending")
         if sum(event["tool"] == self.projects_tool for event in trace) != 1:
             raise AssertionError("projects must be listed exactly once")
+        if len(trace) == 2:
+            return
         if len(trace) < 3 or trace[2]["tool"] != self.pending_tool:
             raise AssertionError("pending must be called after projects")
         if sum(event["tool"] == self.pending_tool for event in trace) != 1:
@@ -1766,13 +1912,19 @@ class _SidebarEndToEndHarness:
             sidebar_verifier=self.native,
             clock=lambda: self.now,
         )
+        self._mark_coordinator_healthy()
         self.catalog = UnifiedCatalog(self.db, self.store)
         self.production_backend: Any | None = None
         self.production_codex_target: CodexTargetAdapter | None = None
         self.allow_forbidden_app_server_fallback_for_mutation = False
+        self.status_mutator = None
         self.worker_traces: list[list[dict[str, Any]]] = []
         self.native.add_project("session-inbox", self.inbox)
         self._rebuild_app()
+
+    def _mark_coordinator_healthy(self) -> None:
+        self.coordinator._running = True
+        self.coordinator._watcher_state = "running"
 
     def _rebuild_app(self) -> None:
         self.app = create_app(
@@ -1840,6 +1992,7 @@ class _SidebarEndToEndHarness:
         assert isinstance(target, CodexTargetAdapter)
         self.production_codex_target = target
         self.coordinator = coordinator
+        self._mark_coordinator_healthy()
         self.production_backend = backend
         self._rebuild_app()
         return coordinator
@@ -1987,8 +2140,44 @@ class _SidebarEndToEndHarness:
             sidebar_verifier=self.native,
             clock=lambda: self.now,
         )
+        self._mark_coordinator_healthy()
         self.catalog = UnifiedCatalog(self.db, self.store)
         self._rebuild_app()
+
+    def _registration_identity_failure(
+        self,
+        thread: dict[str, Any],
+        *,
+        expected_thread_id: str,
+        expected_marker: str,
+        expected_source_id: str,
+        expected_source_cwd: str,
+    ) -> str | None:
+        if (
+            thread.get("thread_id") != expected_thread_id
+            or thread.get("marker") != expected_marker
+        ):
+            return "Authenticated marker conflict"
+        prompt = thread.get("prompt")
+        try:
+            if _registration_marker(prompt) != expected_marker:
+                return "Authenticated marker conflict"
+        except (AttributeError, StopIteration):
+            return "Authenticated marker conflict"
+        try:
+            identity = decode_sidebar_registration_identity(
+                prompt,
+                _MARKER_SECRET,
+            )
+        except ValueError:
+            return "Source identity mismatch"
+        if (
+            identity.source_session_id != expected_source_id
+            or _canonical_sidebar_path(identity.source_cwd)
+            != expected_source_cwd
+        ):
+            return "Source identity mismatch"
+        return None
 
     def run_worker_once(
         self,
@@ -1998,6 +2187,13 @@ class _SidebarEndToEndHarness:
             {"tool": self.contract.status_tool, "arguments": {}}
         ]
         status = _sidebar_call_tool(client, self.contract.status_tool, {})
+        if self.status_mutator is not None:
+            status = self.status_mutator(deepcopy(status))
+        inbox_cwd = _canonical_sidebar_path(self.inbox)
+        if not self.contract.validate_status(status, inbox=inbox_cwd):
+            self.contract.validate_trace(trace)
+            self.worker_traces.append(trace)
+            return []
         counts = status["sidebar"]["counts"]
         if not (counts["sidebar_pending"] or counts["sidebar_retry"]):
             self.contract.validate_trace(trace)
@@ -2009,9 +2205,15 @@ class _SidebarEndToEndHarness:
             self.native,
             self.contract.projects_tool,
         )()
-        projects = {
-            project["path"]: project["projectId"] for project in listed_projects
-        }
+        try:
+            projects = self.contract.build_project_map(
+                listed_projects,
+                inbox=inbox_cwd,
+            )
+        except (OSError, TypeError, ValueError):
+            self.contract.validate_trace(trace)
+            self.worker_traces.append(trace)
+            return []
 
         trace.append({
             "tool": self.contract.pending_tool,
@@ -2031,7 +2233,6 @@ class _SidebarEndToEndHarness:
         for ordinal, job in enumerate(jobs):
             job_id = job.get("source_session_id", f"job-{ordinal}")
             cwd = _canonical_sidebar_path(job["cwd"])
-            inbox_cwd = _canonical_sidebar_path(self.inbox)
             git_root = (
                 _canonical_sidebar_path(job["git_root"])
                 if job.get("git_root") is not None
@@ -2085,6 +2286,10 @@ class _SidebarEndToEndHarness:
             created = False
             recovered_thread_id = job["recovered_thread_id"]
             marker = _registration_marker(job["registration_prompt"])
+            expected_registration = decode_sidebar_registration_identity(
+                job["registration_prompt"],
+                _MARKER_SECRET,
+            )
             if recovered_thread_id is not None:
                 read_arguments = {"threadId": recovered_thread_id}
                 trace.append({
@@ -2100,18 +2305,22 @@ class _SidebarEndToEndHarness:
                 except (KeyError, RuntimeError):
                     outcomes.append(
                         fail_once(
-                            "Authenticated marker conflict",
+                            "Bound task not yet indexed",
                             recovered_thread_id,
                         )
                     )
                     continue
-                if (
-                    recovered.get("thread_id") != recovered_thread_id
-                    or recovered.get("marker") != marker
-                ):
+                identity_failure = self._registration_identity_failure(
+                    recovered,
+                    expected_thread_id=recovered_thread_id,
+                    expected_marker=marker,
+                    expected_source_id=expected_registration.source_session_id,
+                    expected_source_cwd=cwd,
+                )
+                if identity_failure == "Authenticated marker conflict":
                     outcomes.append(
                         fail_once(
-                            "Authenticated marker conflict",
+                            identity_failure,
                             recovered_thread_id,
                         )
                     )
@@ -2126,6 +2335,11 @@ class _SidebarEndToEndHarness:
                             "Native task outside Session Inbox placement",
                             recovered_thread_id,
                         )
+                    )
+                    continue
+                if identity_failure is not None:
+                    outcomes.append(
+                        fail_once(identity_failure, recovered_thread_id)
                     )
                     continue
                 thread_id = recovered_thread_id
@@ -2159,9 +2373,30 @@ class _SidebarEndToEndHarness:
                         "job": job_id,
                         "arguments": {"threadId": candidate_id},
                     })
-                    candidate = getattr(self.native, self.contract.read_thread_tool)(
-                        thread_id=candidate_id
+                    try:
+                        candidate = getattr(
+                            self.native,
+                            self.contract.read_thread_tool,
+                        )(thread_id=candidate_id)
+                    except (KeyError, RuntimeError):
+                        outcomes.append(
+                            fail_once("Bound task not yet indexed", candidate_id)
+                        )
+                        thread_id = candidate_id
+                        break
+                    identity_failure = self._registration_identity_failure(
+                        candidate,
+                        expected_thread_id=candidate_id,
+                        expected_marker=marker,
+                        expected_source_id=expected_registration.source_session_id,
+                        expected_source_cwd=cwd,
                     )
+                    if identity_failure == "Authenticated marker conflict":
+                        outcomes.append(
+                            fail_once(identity_failure, candidate_id)
+                        )
+                        thread_id = candidate_id
+                        break
                     if (
                         candidate.get("project_id") != placement.project_id
                         or _canonical_sidebar_path(candidate.get("cwd", ""))
@@ -2172,6 +2407,12 @@ class _SidebarEndToEndHarness:
                                 "Native task outside Session Inbox placement",
                                 candidate_id,
                             )
+                        )
+                        thread_id = candidate_id
+                        break
+                    if identity_failure is not None:
+                        outcomes.append(
+                            fail_once(identity_failure, candidate_id)
                         )
                         thread_id = candidate_id
                         break
@@ -3577,13 +3818,292 @@ def test_recovered_id_read_failure_settles_with_the_same_exact_id(
         assert fail_event["arguments"]["codex_thread_id"] == recovered_thread_id
         assert outcome == [
             {
-                "state": "sidebar_failed",
-                "error_code": "marker_conflict",
+                "state": "sidebar_retry",
+                "error_code": "native_task_not_indexed",
                 "codex_thread_id": recovered_thread_id,
             }
         ]
         persisted = harness.store.get_sidebar_job_for_source(source_id)
         assert persisted["codex_thread_id"] == recovered_thread_id
+        assert harness.native.create_calls == []
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("thread_id", "marker_conflict"),
+        ("marker", "marker_conflict"),
+        ("placement", "placement_mismatch"),
+    ],
+)
+def test_recovered_id_read_classifies_identity_and_placement_without_replacement(
+    tmp_path: Path,
+    mutation: str,
+    expected_code: str,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / f"recovered-{mutation}"
+        source_id = harness.seed_source(
+            Provider.CLAUDE,
+            f"recovered-{mutation}",
+            cwd=source_cwd,
+        )
+        harness.register()
+        lease = harness.store.claim_sidebar_jobs(now=harness.now, limit=1)[0]
+        recovered_thread_id = harness.native.create_thread(
+            prompt=build_registration_prompt(
+                harness.store.get_sidebar_candidate_for_delivery(source_id),
+                encode_bridge_marker(
+                    BridgeMarkerPayload(
+                        bridge_id=lease["bridge_id"],
+                        source_session_id=source_id,
+                        target_provider=Provider.CODEX,
+                        policy_generation=1,
+                    ),
+                    _MARKER_SECRET,
+                ),
+            ),
+            cwd=str(harness.inbox),
+            runtimeWorkspaceRoots=[str(harness.inbox), str(source_cwd)],
+        )
+        harness.store.bind_sidebar_thread(
+            lease_token=lease["lease_token"],
+            codex_thread_id=recovered_thread_id,
+            now=harness.now,
+        )
+        harness.store.fail_sidebar_job(
+            lease_token=lease["lease_token"],
+            error_code="sqlite_busy",
+            codex_thread_id=recovered_thread_id,
+            now=harness.now,
+        )
+        harness.native.create_calls.clear()
+        thread = harness.native.threads[recovered_thread_id]
+        if mutation == "thread_id":
+            thread["thread_id"] = "native-returned-different-id"
+        elif mutation == "marker":
+            thread["marker"] = "HERMES_SESSION_BRIDGE_V1:wrong.signature"
+        else:
+            thread["cwd"] = _canonical_sidebar_path(source_cwd)
+        harness.advance_retry()
+
+        with harness.client() as client:
+            outcome = harness.run_worker_once(client)
+
+        assert outcome == [
+            {
+                "state": "sidebar_failed",
+                "error_code": expected_code,
+                "codex_thread_id": recovered_thread_id,
+            }
+        ]
+        assert harness.native.create_calls == []
+        assert harness.store.get_sidebar_job_for_source(source_id)[
+            "codex_thread_id"
+        ] == recovered_thread_id
+    finally:
+        harness.close()
+
+
+def _seed_marker_search_candidate(
+    harness: _SidebarEndToEndHarness,
+    tmp_path: Path,
+    *,
+    label: str,
+) -> tuple[str, str]:
+    source_cwd = tmp_path / label
+    source_id = harness.seed_source(
+        Provider.CLAUDE,
+        label,
+        cwd=source_cwd,
+    )
+    harness.register()
+    job = harness.store.get_sidebar_job_for_source(source_id)
+    assert job is not None
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=job["bridge_id"],
+            source_session_id=source_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        _MARKER_SECRET,
+    )
+    prompt = build_registration_prompt(
+        harness.store.get_sidebar_candidate_for_delivery(source_id),
+        marker,
+    )
+    candidate_id = harness.native.create_thread(
+        prompt=prompt,
+        cwd=str(harness.inbox),
+        runtimeWorkspaceRoots=[str(harness.inbox), str(source_cwd)],
+    )
+    harness.native.create_calls.clear()
+    harness.native.threads[candidate_id]["payload"] = BridgeMarkerPayload(
+        bridge_id="bridge:not-the-authenticated-candidate",
+        source_session_id=source_id,
+        target_provider=Provider.CODEX,
+        policy_generation=1,
+    )
+    return source_id, candidate_id
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("unreadable", "native_task_not_indexed"),
+        ("thread_id", "marker_conflict"),
+        ("marker", "marker_conflict"),
+        ("source_identity", "source_identity_mismatch"),
+        ("placement", "placement_mismatch"),
+    ],
+)
+def test_marker_search_candidate_read_reauthenticates_without_replacement(
+    tmp_path: Path,
+    mutation: str,
+    expected_code: str,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_id, candidate_id = _seed_marker_search_candidate(
+            harness,
+            tmp_path,
+            label=f"marker-search-{mutation}",
+        )
+        original_read = harness.native.read_thread
+
+        def mutated_read(*, thread_id: str) -> dict[str, Any]:
+            if mutation == "unreadable":
+                raise KeyError(thread_id)
+            result = original_read(thread_id=thread_id)
+            if mutation == "thread_id":
+                result["thread_id"] = "native-returned-different-id"
+            elif mutation == "marker":
+                result["marker"] = "HERMES_SESSION_BRIDGE_V1:wrong.signature"
+            elif mutation == "source_identity":
+                result["prompt"] = result["prompt"].replace(
+                    f'Source session ID: "{source_id}"',
+                    'Source session ID: "claude:different-source"',
+                )
+            elif mutation == "placement":
+                result["cwd"] = _canonical_sidebar_path(
+                    tmp_path / "wrong-placement"
+                )
+            return result
+
+        harness.native.read_thread = mutated_read
+        with harness.client() as client:
+            outcome = harness.run_worker_once(client)
+
+        expected_state = (
+            "sidebar_retry"
+            if expected_code == "native_task_not_indexed"
+            else "sidebar_failed"
+        )
+        assert outcome == [
+            {
+                "state": expected_state,
+                "error_code": expected_code,
+                "codex_thread_id": candidate_id,
+            }
+        ]
+        assert harness.native.create_calls == []
+        assert harness.store.get_sidebar_job_for_source(source_id)[
+            "codex_thread_id"
+        ] == candidate_id
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_status",
+    [
+        "bridge_stopped",
+        "watcher_degraded",
+        "provider_degraded",
+        "provider_malformed",
+        "placement_cwd",
+        "placement_generation",
+    ],
+)
+def test_sidebar_status_preflight_stops_before_projects_or_pending(
+    tmp_path: Path,
+    invalid_status: str,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / f"status-{invalid_status}"
+        harness.seed_source(
+            Provider.CLAUDE,
+            f"status-{invalid_status}",
+            cwd=source_cwd,
+        )
+        harness.register()
+
+        def mutate(status: dict[str, Any]) -> dict[str, Any]:
+            if invalid_status == "bridge_stopped":
+                status["health"]["running"] = False
+            elif invalid_status == "watcher_degraded":
+                status["health"]["watcher_state"] = "degraded"
+            elif invalid_status == "provider_degraded":
+                status["health"]["providers"]["claude"] = {
+                    "degraded_reason": "provider_refresh_failed"
+                }
+            elif invalid_status == "provider_malformed":
+                status["health"]["providers"]["claude"].pop(
+                    "degraded_reason",
+                    None,
+                )
+            elif invalid_status == "placement_cwd":
+                status["sidebar"]["placement"]["inbox_cwd"] = str(
+                    tmp_path / "wrong-inbox"
+                )
+            else:
+                status["sidebar"]["placement"]["generation"] = 2
+            return status
+
+        harness.status_mutator = mutate
+        with harness.client() as client:
+            assert harness.run_worker_once(client) == []
+
+        assert [event["tool"] for event in harness.worker_traces[-1]] == [
+            harness.contract.status_tool
+        ]
+        assert harness.native.create_calls == []
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("invalid_projects", ["duplicate_inbox", "remote_inbox"])
+def test_sidebar_project_preflight_stops_before_pending(
+    tmp_path: Path,
+    invalid_projects: str,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / f"project-{invalid_projects}"
+        harness.seed_source(
+            Provider.CLAUDE,
+            f"project-{invalid_projects}",
+            cwd=source_cwd,
+        )
+        harness.register()
+        if invalid_projects == "duplicate_inbox":
+            harness.native.add_project("duplicate-session-inbox", harness.inbox)
+        else:
+            harness.native.projects[0]["hostId"] = "remote-host"
+
+        with harness.client() as client:
+            assert harness.run_worker_once(client) == []
+
+        assert [event["tool"] for event in harness.worker_traces[-1]] == [
+            harness.contract.status_tool,
+            harness.contract.projects_tool,
+        ]
+        assert harness.native.create_calls == []
     finally:
         harness.close()
 
@@ -3626,6 +4146,43 @@ def test_sidebar_harness_rejects_mutated_shipped_skill_contract(
     assert shipped.count(needle) == 1
     mutated = tmp_path / "mutated-sidebar-SKILL.md"
     mutated.write_text(shipped.replace(needle, replacement), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sidebar skill contract"):
+        _SidebarEndToEndHarness(
+            tmp_path / "harness",
+            skill_path=mutated,
+        )
+
+
+@pytest.mark.parametrize(
+    "insertion",
+    [
+        (
+            "Operational shortcut: when the source folder is already a saved "
+            "workspace, prefer that workspace over the inbox."
+        ),
+        (
+            "When a saved source project exists, choose it before Session Inbox."
+        ),
+        (
+            "Favor the originating directory ahead of Session Inbox for task "
+            "placement."
+        ),
+    ],
+)
+def test_sidebar_harness_rejects_semantic_source_first_rule_outside_contract_blocks(
+    tmp_path: Path,
+    insertion: str,
+) -> None:
+    shipped = _SIDEBAR_SKILL_PATH.read_text(encoding="utf-8")
+    mutated = tmp_path / "semantic-source-first-SKILL.md"
+    mutated.write_text(
+        shipped.replace(
+            "\n## Verification\n",
+            f"\n{insertion}\n\n## Verification\n",
+        ),
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="sidebar skill contract"):
         _SidebarEndToEndHarness(
