@@ -1,0 +1,5 @@
+name: telnyx-provider
+kind: model-provider
+version: 1.0.0
+description: Telnyx — OpenAI-compatible inference, hosted open models + frontier routes
+author: Rudra Arora (@dynamite-bud) + Hermes Agent

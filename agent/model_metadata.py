@@ -76,6 +76,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "qwen-oauth",
     "xiaomi",
     "arcee",
+    "telnyx",
     "gmi",
     "tencent-tokenhub",
     "custom", "local",
@@ -970,6 +971,25 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
         if deepinfra_pricing.get("cache_read_tokens") is not None:
             result["cache_read"] = str(float(deepinfra_pricing["cache_read_tokens"]) / 1_000_000)
         return result
+
+    # Telnyx ships pricing as per-1M-token strings tagged with an explicit
+    # unit (``"unit": "1M_tokens"``; keys ``input``/``output``/
+    # ``cached_prompt``). Convert to per-token strings so the generic cost
+    # machinery (usage_pricing.py) consumes them through the same path as
+    # OpenRouter / OpenAI. This branch must run before the generic alias
+    # walk below, which would otherwise read the per-1M figures as
+    # per-token — a 1,000,000× overcharge.
+    unit_pricing = payload.get("pricing") if isinstance(payload.get("pricing"), dict) else None
+    if unit_pricing and unit_pricing.get("unit") == "1M_tokens":
+        per_m: Dict[str, Any] = {}
+        if unit_pricing.get("input") not in (None, ""):
+            per_m["prompt"] = str(float(unit_pricing["input"]) / 1_000_000)
+        if unit_pricing.get("output") not in (None, ""):
+            per_m["completion"] = str(float(unit_pricing["output"]) / 1_000_000)
+        if unit_pricing.get("cached_prompt") not in (None, ""):
+            per_m["cache_read"] = str(float(unit_pricing["cached_prompt"]) / 1_000_000)
+        if per_m:
+            return per_m
 
     alias_map = {
         "prompt": ("prompt", "input", "input_cost_per_token", "prompt_token_cost"),
