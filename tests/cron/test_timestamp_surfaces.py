@@ -41,9 +41,13 @@ def _stored_job(job_id: str):
 def test_shared_timestamp_setting_respects_explicit_false_with_other_keys():
     from gateway.message_timestamps import message_timestamps_enabled
 
-    assert message_timestamps_enabled(
-        {"message_timestamps": {"enabled": False, "other": "stuff"}}
-    ) is False
+    config = {"gateway": {"message_timestamps": {"enabled": False, "other": "stuff"}}}
+    # Explicit False under gateway.message_timestamps must be honored even
+    # when sibling keys are present, proving the setting is genuinely read
+    # from the nested path rather than falling through to the missing-gateway
+    # default.
+    assert message_timestamps_enabled(config) is False
+    assert config["gateway"]["message_timestamps"]["other"] == "stuff"
 
 
 def test_model_tool_persists_true_false_and_inherit(isolated_home):
@@ -77,22 +81,18 @@ def test_registered_model_tool_handler_persists_timestamp_overrides(isolated_hom
     assert entry is not None
 
     created = json.loads(
-        entry.handler(
-            {
-                "action": "create",
-                "prompt": "registered handler timestamps",
-                "schedule": "every 1 hour",
-                "timestamps": True,
-            }
-        )
+        entry.handler({
+            "action": "create",
+            "prompt": "registered handler timestamps",
+            "schedule": "every 1 hour",
+            "timestamps": True,
+        })
     )
     job_id = created["job_id"]
     assert _stored_job(job_id)["timestamps"] is True
 
     updated = json.loads(
-        entry.handler(
-            {"action": "update", "job_id": job_id, "timestamps": False}
-        )
+        entry.handler({"action": "update", "job_id": job_id, "timestamps": False})
     )
     assert updated["success"] is True
     assert _stored_job(job_id)["timestamps"] is False
