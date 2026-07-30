@@ -248,6 +248,54 @@ class TestDeduplicationCorrectness:
         # deleted count should match unique IDs
         assert deleted == len(set(all_deleted_ids))
 
+    def test_overlapping_pairs_transitive_safety(self) -> None:
+        """A point must not be deleted when its keeper is also slated for deletion.
+
+        Setup: groups are sorted descending by similarity.
+          Group 0 (higher similarity): B~C, C is longest so C is kept, B deleted.
+          Group 1 (lower similarity):  A~B, B is already in ids_to_delete.
+
+        With the transitive-safety guard, Group 1 is skipped entirely, so A
+        survives even though it was near-duplicate of B (which is now gone).
+        A and C are not similar so A must not be collateral damage.
+        """
+        mod = _load_module()
+        a = _make_point("a1", "u", "short A", [1.0, 0.0, 0.0])
+        b = _make_point("b1", "u", "medium text B", [0.999, 0.045, 0.0])
+        c = _make_point("c1", "u", "very long text C is the longest here", [0.0, 0.0, 1.0])
+
+        # Present higher-similarity pair first (B~C) so B gets marked for deletion
+        # before the lower-similarity pair (A~B) is processed.
+        groups = [
+            {
+                "members": ["b1", "c1"],
+                "points": {"b1": b, "c1": c},
+                "edge_scores": {("b1", "c1"): 0.96},
+            },
+            {
+                "members": ["a1", "b1"],
+                "points": {"a1": a, "b1": b},
+                "edge_scores": {("a1", "b1"): 0.95},
+            },
+        ]
+
+        deleted_calls: list[list] = []
+
+        def fake_delete_points(ids: list) -> bool:
+            deleted_calls.append(list(ids))
+            return True
+
+        with patch.object(mod, "delete_points", side_effect=fake_delete_points):
+            mod.consolidate_groups(groups, dry_run=False)
+
+        all_deleted = {pid for call in deleted_calls for pid in call}
+        # 'a1' must survive: its keeper 'b1' was deleted, and 'a1' is not
+        # similar to 'c1', so deleting it would be permanent information loss.
+        assert "a1" not in all_deleted, (
+            f"'a1' was unsafely deleted (transitive deletion bug). Deleted: {all_deleted}"
+        )
+        assert "b1" in all_deleted
+
     def test_pick_keeper_prefers_longer_text(self) -> None:
         """pick_keeper should choose the member with the longer text."""
         mod = _load_module()

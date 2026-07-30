@@ -306,8 +306,9 @@ def find_duplicates(points, target_user_id):
         vec = p.get("vector")
         if not isinstance(vec, list) or not vec:
             continue
-        # mem0 stores user_id directly in payload
-        if payload.get("user_id") != target_user_id:
+        # mem0 stores user_id directly in payload (may be int or str)
+        raw_uid = payload.get("user_id")
+        if raw_uid is None or str(raw_uid) != str(target_user_id):
             continue
         eligible.append(p)
 
@@ -492,6 +493,12 @@ def consolidate_groups(groups: list, dry_run: bool = True) -> tuple[int, int]:
 
     for idx, group in enumerate(groups, 1):
         members = group["members"]
+        # Skip this group if any member is already slated for deletion by a
+        # higher-similarity group.  Without this guard, a transitive chain
+        # A~B~C could delete both A and B even when A and C are not similar,
+        # causing permanent information loss.
+        if any(m in ids_to_delete for m in members):
+            continue
         keeper_id = pick_keeper(group)
         to_delete = [pid for pid in members if pid != keeper_id]
         ids_to_delete.update(to_delete)
@@ -698,9 +705,9 @@ def main():
         user_ids = [args.user]
     else:
         user_ids = sorted({
-            p.get("payload", {}).get("user_id")
+            str(p.get("payload", {}).get("user_id"))
             for p in points
-            if p.get("payload", {}).get("user_id")
+            if p.get("payload", {}).get("user_id") is not None
         })
         if not user_ids:
             print("No points with a user_id found in collection.", file=sys.stderr)
