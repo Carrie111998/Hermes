@@ -17,6 +17,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.colors import Colors, color, RichColors, rich_color
 import rich
 from rich.text import Text
+from rich.prompt import Prompt
 
 def log_info(msg: str):
     rich.print(Text.assemble(rich_color('→', RichColors.CYAN), " ", msg))
@@ -541,7 +542,7 @@ def run_gui_uninstall(args):
 
     if not skip_confirm:
         try:
-            confirm = input(f"Type '{rich_color('yes', RichColors.YELLOW)}' to remove the Chat GUI: ").strip().lower()
+            confirm = Prompt.ask(Text.assemble("Type ", rich_color('yes', RichColors.YELLOW),  "to remove the Chat GUI: ")).strip().lower()
         except (KeyboardInterrupt, EOFError):
             rich.print()
             rich.print("Cancelled.")
@@ -643,7 +644,7 @@ def run_uninstall(args):
     rich.print()
     
     try:
-        choice = input(rich_color("Select option [1/2/3]: ", RichColors.BOLD)).strip()
+        choice = Prompt.ask(rich_color("Select option [1/2/3]: ", RichColors.BOLD)).strip()
     except (KeyboardInterrupt, EOFError):
         rich.print()
         rich.print("Cancelled.")
@@ -668,7 +669,7 @@ def run_uninstall(args):
               ", ".join(p.name for p in named_profiles))
         rich.print()
         try:
-            resp = input(rich_color(
+            resp = Prompt.ask(rich_color(
                 f"Also stop and remove these {len(named_profiles)} profile(s)? [y/N]: ",
                 RichColors.BOLD
             )).strip().lower()
@@ -694,7 +695,7 @@ def run_uninstall(args):
     
     rich.print()
     try:
-        confirm = input(f"Type '{rich_color('yes', RichColors.YELLOW)}' to confirm: ").strip().lower()
+        confirm = Prompt.ask(f"Type '{rich_color('yes', RichColors.YELLOW)}' to confirm: ").strip().lower()
     except (KeyboardInterrupt, EOFError):
         rich.print()
         rich.print("Cancelled.")

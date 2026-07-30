@@ -8,6 +8,8 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Set
 import rich
+from rich.text import Text
+from rich.prompt import Prompt
 
 from hermes_cli.colors import Colors, color, RichColors, rich_color
 
@@ -726,10 +728,10 @@ def _radio_numbered_fallback(
 
     for i, label in enumerate(items):
         marker = rich_color("(\u25cf)", RichColors.GREEN) if i == selected else "(\u25cb)"
-        rich.print(f"  {marker} {i + 1:>2}. {label}")
+        rich.print(Text.assemble("  ", marker, f" {i + 1:>2}. {label}"))
     rich.print()
     try:
-        val = input(rich_color(f"  Choice [default {selected + 1}]: ", RichColors.DIM)).strip()
+        val = Prompt.ask(rich_color(f"  Choice [default {selected + 1}]: ", RichColors.DIM)).strip()
         if not val:
             return selected
         idx = int(val) - 1
@@ -825,7 +827,7 @@ def _numbered_single_fallback(
         rich.print(f"  {i}. {label}")
     rich.print()
     try:
-        val = input(f"  Choice [1-{len(items)}]: ").strip()
+        val = Prompt.ask(f"  Choice [1-{len(items)}]: ").strip()
         if not val:
             return None
         idx = int(val) - 1
@@ -854,13 +856,14 @@ def _numbered_fallback(
         for i, label in enumerate(items):
             marker = rich_color("[✓]", RichColors.GREEN) if i in chosen else "[ ]"
             rich.print(f"  {marker} {i + 1:>2}. {label}")
+            rich.print(Text.assemble("  ", marker, f" {i + 1:>2}. {label}"))
         if status_fn:
             status_text = status_fn(chosen)
             if status_text:
                 rich.print(rich_color(f"\n  {status_text}", RichColors.DIM))
         rich.print()
         try:
-            val = input(rich_color("  Toggle # (or Enter to confirm): ", RichColors.DIM)).strip()
+            val = Prompt.ask(rich_color("  Toggle # (or Enter to confirm): ", RichColors.DIM)).strip()
             if not val:
                 break
             idx = int(val) - 1

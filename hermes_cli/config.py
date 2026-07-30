@@ -8345,7 +8345,6 @@ def show_config():
     
     for env_key, name in keys:
         value = get_env_value(env_key)
-        rich.print(f"  {name:<14} {redact_key(value)}")
         rich.print(Text.assemble(f"  {name:<14} ", redact_key(value)))
     from hermes_cli.auth import get_anthropic_key
     anthropic_value = get_anthropic_key()
