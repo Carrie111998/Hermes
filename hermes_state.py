@@ -1509,9 +1509,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Instead, we keep the SQLite timeout short (1s) and handle retries at the
     # application level with random jitter, which naturally staggers competing
     # writers and avoids the convoy.
-    _WRITE_MAX_RETRIES = 15
-    _WRITE_RETRY_MIN_S = 0.020   # 20ms
-    _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    #
+    # Time-based patience replaces the old attempt-counted scheme (15 * 20-150ms
+    # ≈ 1.3s max). A sibling process can legitimately hold the WAL write lock
+    # for multiple seconds (VACUUM after auto-prune, WAL checkpoint, offline
+    # recovery/repair, or an older version's mixed-connection pool), so the
+    # retry window must exceed the longest routine write-hold. Two budgets:
+    #
+    #   routine (20s) — used for most writes (create_session, meta updates, etc.)
+    #   critical (60s) — used for append_message (loss of a turn's transcript)
+    #
+    # Backoff jitter activates after BACKOFF_AFTER_S: once elapsed time exceeds
+    # that threshold the max sleep grows linearly so competing processes have
+    # room to finish their long-running operations.
+    _WRITE_PATIENCE_S = 20.0               # routine writes
+    _WRITE_PATIENCE_CRITICAL_S = 60.0      # transcript-critical writes (append_message)
+    _WRITE_RETRY_MIN_S = 0.020              # 20ms
+    _WRITE_RETRY_MAX_S = 0.150              # 150ms (base, before backoff)
+    _WRITE_BACKOFF_AFTER_S = 2.0            # switch to backoff jitter after 2s
+    _WRITE_BACKOFF_MAX_S = 1.0              # cap backoff jitter at 1s
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Retain the existing coarse 1000-write maintenance cadence, but replace
@@ -1667,31 +1683,86 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
 
-            try:
-                _connect_and_init()
-            except sqlite3.DatabaseError as exc:
-                # The malformed-schema class (e.g. a duplicate sqlite_master
-                # row for messages_fts) fails on the very first statement —
-                # before _init_schema can run — so it can't be caught at the
-                # FTS-rebuild layer. Recover by repairing sqlite_master in
-                # place (backup first; canonical sessions/messages preserved),
-                # then reopen once. This is what lets Desktop/Dashboard
-                # self-heal instead of silently showing "no sessions".
-                if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
-                    raise
-                logger.error(
-                    "state.db schema is malformed (%s) — attempting automatic "
-                    "repair (a backup copy is made first).", exc,
-                )
+            # Retry _connect_and_init() for locked/busy errors with the
+            # same time-based patience as routine writes.  A sibling
+            # process may hold the WAL write lock during VACUUM after
+            # auto-prune, a WAL checkpoint, offline recovery, or an older
+            # version's mixed-connection pool — the open path must wait
+            # long enough for those to complete instead of failing fast.
+            last_open_err: Optional[Exception] = None
+            open_deadline = time.monotonic() + self._WRITE_PATIENCE_S
+            open_attempt = 0
+            while True:
+                open_attempt += 1
                 try:
-                    if self._conn is not None:
-                        self._conn.close()
-                except Exception:
-                    pass
-                report = repair_state_db_schema(self.db_path)
-                if not report.get("repaired"):
+                    _connect_and_init()
+                    break
+                except sqlite3.OperationalError as exc:
+                    err_msg = str(exc).lower()
+                    if "locked" in err_msg or "busy" in err_msg:
+                        last_open_err = exc
+                        now = time.monotonic()
+                        if now < open_deadline:
+                            elapsed = now - (open_deadline - self._WRITE_PATIENCE_S)
+                            # Same backoff strategy as _execute_write
+                            if elapsed <= self._WRITE_BACKOFF_AFTER_S:
+                                hi = self._WRITE_RETRY_MAX_S
+                            else:
+                                progress = min(
+                                    1.0,
+                                    (elapsed - self._WRITE_BACKOFF_AFTER_S)
+                                    / (self._WRITE_PATIENCE_S - self._WRITE_BACKOFF_AFTER_S),
+                                )
+                                hi = self._WRITE_RETRY_MAX_S + progress * (
+                                    self._WRITE_BACKOFF_MAX_S - self._WRITE_RETRY_MAX_S
+                                )
+                            jitter = random.uniform(
+                                self._WRITE_RETRY_MIN_S,
+                                hi,
+                            )
+                            time.sleep(jitter)
+                            continue
+                        # Patience exhausted — break so the post-loop
+                        # check below raises with the clear message.
+                        break
+                    # Not a lock/busy error — propagate to the outer
+                    # handler (malformed repair or generic failure).
                     raise
-                _connect_and_init()
+                except sqlite3.DatabaseError as exc:
+                    # The malformed-schema class (e.g. a duplicate sqlite_master
+                    # row for messages_fts) fails on the very first statement —
+                    # before _init_schema can run — so it can't be caught at the
+                    # FTS-rebuild layer. Recover by repairing sqlite_master in
+                    # place (backup first; canonical sessions/messages preserved),
+                    # then reopen once. This is what lets Desktop/Dashboard
+                    # self-heal instead of silently showing "no sessions".
+                    if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
+                        raise
+                    logger.error(
+                        "state.db schema is malformed (%s) — attempting automatic "
+                        "repair (a backup copy is made first).", exc,
+                    )
+                    try:
+                        if self._conn is not None:
+                            self._conn.close()
+                    except Exception:
+                        pass
+                    report = repair_state_db_schema(self.db_path)
+                    if not report.get("repaired"):
+                        raise
+                    _connect_and_init()
+                    break
+            if last_open_err is not None and time.monotonic() >= open_deadline:
+                # Patience exhausted on a locked/busy error — give a clear
+                # actionable message instead of the raw OperationalError.
+                raise sqlite3.OperationalError(
+                    f"SessionDB open failed: state.db write lock not acquired "
+                    f"after {self._WRITE_PATIENCE_S}s (routine patience). "
+                    f"The database is locked by another process "
+                    f"(VACUUM, checkpoint, or an older hermes version). "
+                    f"This is not disk corruption — wait for the other process "
+                    f"to finish or stop it before retrying."
+                ) from last_open_err
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
@@ -2029,6 +2100,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
+        *,
+        critical: bool = False,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -2039,13 +2112,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         BEGIN IMMEDIATE acquires the WAL write lock at transaction start
         (not at commit time), so lock contention surfaces immediately.
         On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry — breaking the convoy pattern that
+        random interval, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
+
+        *critical* selects the patience budget (default 20s routine,
+        60s for transcript-critical writes).
 
         Returns whatever *fn* returns.
         """
+        patience = (
+            self._WRITE_PATIENCE_CRITICAL_S
+            if critical
+            else self._WRITE_PATIENCE_S
+        )
         last_err: Optional[Exception] = None
-        for attempt in range(self._WRITE_MAX_RETRIES):
+        deadline = time.monotonic() + patience
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 with self._lock:
                     self._conn.execute("BEGIN IMMEDIATE")
@@ -2069,10 +2153,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
                     last_err = exc
-                    if attempt < self._WRITE_MAX_RETRIES - 1:
+                    now = time.monotonic()
+                    if now < deadline:
+                        elapsed = now - (deadline - patience)
+                        # Compute jitter: base 20-150ms for first 2s, then
+                        # grow max linearly so competing writers have room
+                        # to finish long-running operations.
+                        if elapsed <= self._WRITE_BACKOFF_AFTER_S:
+                            hi = self._WRITE_RETRY_MAX_S
+                        else:
+                            # Linear ramp from RETRY_MAX_S to BACKOFF_MAX_S
+                            # as elapsed goes from BACKOFF_AFTER_S to deadline.
+                            progress = min(
+                                1.0,
+                                (elapsed - self._WRITE_BACKOFF_AFTER_S)
+                                / (patience - self._WRITE_BACKOFF_AFTER_S),
+                            )
+                            hi = self._WRITE_RETRY_MAX_S + progress * (
+                                self._WRITE_BACKOFF_MAX_S - self._WRITE_RETRY_MAX_S
+                            )
                         jitter = random.uniform(
                             self._WRITE_RETRY_MIN_S,
-                            self._WRITE_RETRY_MAX_S,
+                            hi,
                         )
                         time.sleep(jitter)
                         continue
@@ -2092,8 +2194,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise
                 continue
         # Retries exhausted (shouldn't normally reach here).
+        label = "critical" if critical else "routine"
         raise last_err or sqlite3.OperationalError(
-            "database is locked after max retries"
+            f"SessionDB write lock not acquired after {patience}s ({label} "
+            f"patience). The state.db write lock is held by another process "
+            f"(VACUUM, checkpoint, or an older hermes version). This is not "
+            f"disk corruption — the write was abandoned after exhausting the "
+            f"retry budget."
         )
 
     @staticmethod
@@ -5287,7 +5394,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return msg_id
 
-        return self._execute_write(_do)
+        return self._execute_write(_do, critical=True)
 
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
