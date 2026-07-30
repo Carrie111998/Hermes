@@ -1,0 +1,24 @@
+# Hermes Mongo remote storage — local bootstrap ONLY.
+# Prefer X.509 (issued by control-plane enroll-agent.sh).
+#
+# Windows: %LOCALAPPDATA%\hermes\bootstrap.yaml
+# Linux/macOS: ~/.hermes/bootstrap.yaml
+
+# --- Preferred: X.509 client certificate ---
+# Same cert unlocks BOTH MongoDB and the orchestrator API (mTLS).
+# No cert ⇒ Mongo rejects auth / orchestrator drops the TLS handshake.
+mongo_uri: "mongodb://db1:27017,db2:27017,db3:27017/?replicaSet=rs0&tls=true&authMechanism=MONGODB-X509&authSource=%24external"
+profile: default
+machine_id: home-pc          # must match cert CN from enroll
+auth_mode: x509
+shared_db: hermes_shared
+tls:
+  ca_file: certs/ca.crt
+  cert_key_file: certs/agent.pem
+orchestrator:
+  url: "https://db1:8744"
+# --- Fallback (labs only): SCRAM password in URI ---
+# auth_mode: scram
+# mongo_uri: "mongodb://hermesApp:SECRET@db1:27017,db2:27017,db3:27017/?replicaSet=rs0&tls=true"
+# tls:
+#   ca_file: certs/ca.crt

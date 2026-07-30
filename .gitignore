@@ -194,3 +194,11 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+# Hermes control-plane secrets (CA keys, agent bundles, generated passwords)
+deploy/control-plane/.env
+deploy/control-plane/certs/**
+!deploy/control-plane/certs/.gitkeep
+deploy/control-plane/bundles/**
+!deploy/control-plane/bundles/.gitkeep
+deploy/control-plane/enroll_pending/

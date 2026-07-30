@@ -26,6 +26,7 @@ hermes-agent/
 ```
 
 Config: `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys) — both under `$HERMES_HOME` when it is set.
+In Mongo remote mode (`hermes storage status` ON), durable config/secrets live in Mongo; local disk keeps `bootstrap.yaml` + certs — see `references/mongo-remote-storage.md`.
 
 ### Adding a Tool
 

@@ -1989,6 +1989,22 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
+    # Mongo remote soul is authoritative when configured — never fall back to
+    # local SOUL.md (would diverge across fleet nodes).
+    from hermes_storage import is_mongo_mode
+    if is_mongo_mode():
+        from hermes_storage import require_storage
+        storage = require_storage()
+        content = (storage.load_soul() or "").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, "SOUL.md")
+        content = _truncate_content(
+            content, "SOUL.md", context_length=context_length,
+            read_path="mongo://soul",
+        )
+        return content
+
     try:
         from hermes_cli.config import ensure_hermes_home
         ensure_hermes_home()

@@ -45,10 +45,39 @@ class DiscordRecoveryStore:
                             os.chmod(path, 0o600)
                     result = fn(conn)
                     conn.commit()
+                    try:
+                        from hermes_storage import is_mongo_mode
+                        if is_mongo_mode():
+                            from hermes_storage.sqlite_mirrors import (
+                                DISCORD_RECOVERY_COLLECTION,
+                                mirror_put,
+                            )
+                            # Lightweight cursors + message counts — full row dump is heavy.
+                            cur = conn.execute("SELECT * FROM discord_recovery_cursors")
+                            cols = [d[0] for d in (cur.description or [])]
+                            cursors = [dict(zip(cols, r)) for r in cur.fetchall()]
+                            msg_count = conn.execute(
+                                "SELECT COUNT(*) AS c FROM discord_messages"
+                            ).fetchone()[0]
+                            mirror_put(
+                                DISCORD_RECOVERY_COLLECTION,
+                                "snapshot",
+                                {
+                                    "cursors": cursors,
+                                    "message_count": msg_count,
+                                },
+                            )
+                    except Exception:
+                        from hermes_storage import is_mongo_mode
+                        if is_mongo_mode():
+                            raise
                     return result
                 finally:
                     conn.close()
         except Exception as exc:
+            from hermes_storage.errors import MongoStorageError
+            if isinstance(exc, MongoStorageError):
+                raise
             logger.warning("Discord recovery ledger unavailable: %s", exc)
             return default
 

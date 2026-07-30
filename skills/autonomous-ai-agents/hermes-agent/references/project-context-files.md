@@ -9,7 +9,8 @@ Hermes injects project-level instructions into the system prompt by reading cont
 | `CLAUDE.md` / `claude.md` | Cwd only | Same as AGENTS.md, Claude-flavored |
 | `.cursorrules` / `.cursor/rules/*.mdc` | Cwd only | Migrating from Cursor |
 
-`SOUL.md` (in `$HERMES_HOME`) is independent and always loaded when present — it sets the agent's identity, not project rules.
+`SOUL.md` (classic: `$HERMES_HOME/SOUL.md`; Mongo: profile `soul` collection) is
+independent and always loaded when present — it sets the agent's identity, not project rules.
 
 ### Pick the right one
 

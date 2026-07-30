@@ -537,6 +537,62 @@ class GatewaySlashCommandsMixin:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
+    async def _handle_cluster_command(self, event: MessageEvent) -> str:
+        """Handle /cluster [status|activate <target>] for multi-PC fleet."""
+        try:
+            from hermes_storage import get_storage, is_mongo_mode
+        except Exception:
+            return "Cluster commands require hermes_storage (Mongo mode)."
+        if not is_mongo_mode():
+            return (
+                "Mongo/cluster mode is not enabled. "
+                "Create bootstrap.yaml with mongo_uri (see `hermes storage init-bootstrap`)."
+            )
+        storage = get_storage()
+        if storage is None:
+            return "Storage unavailable."
+        text = (getattr(event, "text", None) or getattr(event, "content", None) or "").strip()
+        # Strip leading /cluster
+        parts = text.split(None, 2)
+        args = ""
+        if len(parts) >= 2 and parts[0].lstrip("/").lower().startswith("cluster"):
+            args = text[len(parts[0]):].strip()
+        elif len(parts) >= 1:
+            # Some platforms pass only the args
+            lower = parts[0].lower()
+            if lower in ("status", "activate"):
+                args = text
+        if not args or args.lower() == "status" or args.lower().startswith("status"):
+            status = storage.cluster_status()
+            state = status.get("state") or {}
+            lines = [
+                f"Active: {state.get('active_node_id') or 'none'}",
+                f"Messaging owner: {state.get('messaging_owner') or 'none'}",
+                f"Handoff: {state.get('handoff_state') or 'idle'}",
+                "Online:",
+            ]
+            for n in status.get("nodes") or []:
+                if not n.get("online"):
+                    continue
+                mark = " *" if n.get("node_id") == state.get("active_node_id") else ""
+                lines.append(
+                    f"- {n.get('hostname') or n.get('machine_id')} [{n.get('node_id')}]{mark}"
+                )
+            return "\n".join(lines)
+        if args.lower().startswith("activate"):
+            target = args.split(None, 1)[1].strip() if " " in args else ""
+            if not target:
+                return "Usage: /cluster activate <node_id|hostname|machine_id>"
+            try:
+                state = storage.activate(target, reason="slash")
+                return (
+                    f"Activation/handoff started toward `{target}`.\n"
+                    f"handoff_state={state.get('handoff_state')}"
+                )
+            except Exception as exc:
+                return f"Activate failed: {exc}"
+        return "Usage: /cluster [status|activate <target>]"
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model

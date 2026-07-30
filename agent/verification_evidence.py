@@ -520,7 +520,24 @@ def record_terminal_result(
             _prune_old_events(conn, session_id=evidence.session_id, root=evidence.root)
             conn.commit()
 
-    return {"id": event_id, **evidence.__dict__, "created_at": created_at}
+    payload = {"id": event_id, **evidence.__dict__, "created_at": created_at}
+    try:
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage.sqlite_mirrors import (
+                VERIFICATION_COLLECTION,
+                mirror_put,
+            )
+            mirror_put(
+                VERIFICATION_COLLECTION,
+                f"{evidence.session_id}:{evidence.root}",
+                payload,
+            )
+    except Exception:
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            raise
+    return payload
 
 
 def mark_workspace_edited(
@@ -574,7 +591,25 @@ def mark_workspace_edited(
             )
             conn.commit()
 
-    return {"session_id": sid, "root": root, "last_edit_at": edited_at, "changed_paths": changed_paths}
+    payload = {
+        "session_id": sid,
+        "root": root,
+        "last_edit_at": edited_at,
+        "changed_paths": changed_paths,
+    }
+    try:
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage.sqlite_mirrors import (
+                VERIFICATION_COLLECTION,
+                mirror_put,
+            )
+            mirror_put(VERIFICATION_COLLECTION, f"{sid}:{root}:edit", payload)
+    except Exception:
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            raise
+    return payload
 
 
 def verification_status(

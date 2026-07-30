@@ -1173,7 +1173,19 @@ def get_config_path() -> Path:
 
 
 def get_skills_dir() -> Path:
-    """Return the path to the skills directory under HERMES_HOME."""
+    """Return the path to the skills directory under HERMES_HOME.
+
+    When Mongo remote storage is enabled, materialize shared skills into a
+    local cache and return that tree. Failures raise (no classic-dir fallback).
+    """
+    from hermes_storage import is_mongo_mode
+    if is_mongo_mode():
+        from hermes_storage.skills_sync import sync_skills_from_mongo
+        cached = sync_skills_from_mongo()
+        if cached is not None:
+            return cached
+        from hermes_storage.errors import raise_mongo_unavailable
+        raise_mongo_unavailable("skills cache materialize returned None")
     return get_hermes_home() / "skills"
 
 

@@ -498,6 +498,13 @@ def set_current_board(slug: str) -> Path:
     path = current_board_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(normed + "\n", encoding="utf-8")
+    try:
+        from hermes_storage.sqlite_mirrors import sync_kanban_current
+        sync_kanban_current(normed)
+    except Exception:
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            raise
     return path
 
 
@@ -508,6 +515,13 @@ def clear_current_board() -> None:
         current_board_path().unlink()
     except FileNotFoundError:
         pass
+    try:
+        from hermes_storage.sqlite_mirrors import sync_kanban_current
+        sync_kanban_current(None)
+    except Exception:
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            raise
 
 
 def board_dir(board: Optional[str] = None) -> Path:
@@ -733,6 +747,13 @@ def write_board_metadata(
         encoding="utf-8",
     )
     meta["db_path"] = str(kanban_db_path(slug))
+    try:
+        from hermes_storage.sqlite_mirrors import sync_kanban_board_meta
+        sync_kanban_board_meta(slug, {k: v for k, v in meta.items() if k != "db_path"})
+    except Exception:
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            raise
     return meta
 
 

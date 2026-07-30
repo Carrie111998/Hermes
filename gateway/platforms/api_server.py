@@ -710,6 +710,16 @@ class ResponseStore:
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage.sqlite_mirrors import (
+                RESPONSE_STORE_COLLECTION,
+                mirror_get,
+            )
+            remote = mirror_get(RESPONSE_STORE_COLLECTION, response_id)
+            if isinstance(remote, dict):
+                return remote
+            return None
         row = self._conn.execute(
             "SELECT data FROM responses WHERE response_id = ?", (response_id,)
         ).fetchone()
@@ -736,6 +746,14 @@ class ResponseStore:
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage.sqlite_mirrors import (
+                RESPONSE_STORE_COLLECTION,
+                mirror_put,
+            )
+            mirror_put(RESPONSE_STORE_COLLECTION, response_id, data)
+            # Local SQLite remains a cache only; Mongo is authoritative.
         self._conn.execute(
             "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
             (response_id, json.dumps(data, default=str), time.time()),
@@ -763,10 +781,28 @@ class ResponseStore:
                     f"DELETE FROM responses WHERE response_id IN ({placeholders})",
                     evict_ids,
                 )
+                if is_mongo_mode():
+                    from hermes_storage.sqlite_mirrors import (
+                        RESPONSE_STORE_COLLECTION,
+                        mirror_delete,
+                    )
+                    for eid in evict_ids:
+                        mirror_delete(RESPONSE_STORE_COLLECTION, eid)
         self._conn.commit()
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage.sqlite_mirrors import (
+                RESPONSE_STORE_COLLECTION,
+                mirror_delete,
+                mirror_get,
+            )
+            existed = mirror_get(RESPONSE_STORE_COLLECTION, response_id) is not None
+            mirror_delete(RESPONSE_STORE_COLLECTION, response_id)
+            mirror_delete(RESPONSE_STORE_COLLECTION, f"conv-by-resp:{response_id}")
+            return existed
         # Clear conversation mappings pointing to this response
         self._conn.execute(
             "DELETE FROM conversations WHERE response_id = ?", (response_id,)
@@ -779,6 +815,18 @@ class ResponseStore:
 
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage.sqlite_mirrors import (
+                RESPONSE_STORE_COLLECTION,
+                mirror_get,
+            )
+            remote = mirror_get(RESPONSE_STORE_COLLECTION, f"conv:{name}")
+            if isinstance(remote, dict):
+                return remote.get("response_id")
+            if isinstance(remote, str):
+                return remote
+            return None
         row = self._conn.execute(
             "SELECT response_id FROM conversations WHERE name = ?", (name,)
         ).fetchone()
@@ -786,6 +834,17 @@ class ResponseStore:
 
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage.sqlite_mirrors import (
+                RESPONSE_STORE_COLLECTION,
+                mirror_put,
+            )
+            mirror_put(
+                RESPONSE_STORE_COLLECTION,
+                f"conv:{name}",
+                {"response_id": response_id},
+            )
         self._conn.execute(
             "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
             (name, response_id),

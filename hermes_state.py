@@ -1788,6 +1788,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
+    def __new__(cls, db_path: Path = None, read_only: bool = False):
+        # When Mongo remote storage is configured, return the Mongo adapter
+        # instead of opening local state.db. Never fall back to SQLite while
+        # Mongo mode is on — that would split active/passive fleet state.
+        if cls is SessionDB and db_path is None:
+            from hermes_storage import is_mongo_mode
+            if is_mongo_mode():
+                try:
+                    from hermes_storage.session_bridge import MongoSessionAdapter
+                    inst = object.__new__(MongoSessionAdapter)
+                    MongoSessionAdapter.__init__(inst, read_only=read_only)
+                    return inst
+                except Exception as exc:
+                    from hermes_storage.errors import raise_mongo_unavailable
+                    raise_mongo_unavailable(
+                        f"SessionDB Mongo bridge failed: {exc}", cause=exc
+                    )
+        return object.__new__(cls)
+
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
         self.read_only = read_only

@@ -49,6 +49,21 @@ hermes doctor [--fix]       Check dependencies and config
 hermes status [--all]       Component status
 ```
 
+### Mongo remote storage & multi-PC cluster
+
+```
+hermes storage status|migrate|init-bootstrap
+hermes agent add [--name PC] [--ttl 300] [--hosts host:27017,...]
+hermes db connect [--host IP:8743] [--code CODE]
+hermes machine show|list|set-overlay
+hermes cluster status
+hermes cluster activate <hostname|machine_id|node_id>
+```
+
+When `hermes storage status` is ON, durable state is in Mongo — see
+`references/mongo-remote-storage.md`. Sessions may live in Mongo instead of
+local `state.db`.
+
 ### Tools & Skills
 
 ```

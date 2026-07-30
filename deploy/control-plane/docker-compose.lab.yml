@@ -1,0 +1,25 @@
+# Lab control plane — single Mongo without TLS (integration tests / local smoke).
+# Production HA: use docker-compose.yml + install-control-plane.sh
+#
+#   docker compose -f docker-compose.lab.yml up -d
+#   export HERMES_MONGO_URI=mongodb://127.0.0.1:27017/?directConnection=true
+#   pytest tests/hermes_storage/test_mongo_integration.py -m integration
+
+services:
+  mongo-lab:
+    image: mongo:7
+    container_name: hermes-mongo-lab
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    command: ["mongod", "--bind_ip_all", "--port", "27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - mongo_lab_data:/data/db
+
+volumes:
+  mongo_lab_data:

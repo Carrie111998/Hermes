@@ -68,11 +68,12 @@ it. New commands land often; `/help` in-session is always authoritative.
 /curator [sub]           Skill maintenance (status, run, pin, archive, …)
 /kanban [sub]            Multi-profile collaboration board
 /moa <prompt>            One prompt through the Mixture-of-Agents preset
-/reload                  Reload .env into the running session (CLI)
+/reload                  Reload .env / secrets into the running session (CLI; Mongo: remote secrets)
 /reload-mcp              Reload MCP servers
-/reload-skills           Re-scan skills directory
+/reload-skills           Re-scan skills directory (Mongo: rematerialize from GridFS cache)
 /browser [connect|status] CDP connection to your live browser (CLI)
 /plugins                 List plugins (CLI)
+/cluster [status|activate <id>] Multi-PC fleet status / switch active agent (Mongo)
 ```
 
 ### Gateway

@@ -3,6 +3,11 @@
 Edit with `hermes config edit` or `hermes config set section.key value`.
 Full reference: https://hermes-agent.nousresearch.com/docs/user-guide/configuration
 
+**Storage mode:** run `hermes storage status` first. In **Mongo remote** mode,
+`hermes config set` persists to the profile DB (+ machine overlay for local
+keys); do not treat a local `config.yaml` as the durable source of truth.
+Fleet/enroll/cluster details → `references/mongo-remote-storage.md`.
+
 ### Config Sections (most-used keys)
 
 | Section | Key options |
@@ -55,6 +60,7 @@ Full enumeration: `TOOLSETS` dict in `toolsets.py` (`_HERMES_CORE_TOOLS` is the 
 | `debugging` | Extra introspection tools (off by default) |
 | `safe` | Minimal low-risk toolset for locked-down sessions |
 | `spotify`, `homeassistant`, `discord`, `discord_admin`, `feishu_doc`, `feishu_drive`, `yuanbao` | Service integrations (gated on their credentials) |
+| `cluster` | Multi-PC presence + activate (`cluster_status`, `cluster_activate`) when Mongo fleet is configured |
 
 Tool changes take effect on `/reset` (new session) — never mid-conversation, to preserve prompt caching.
 

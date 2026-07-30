@@ -33,7 +33,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
+from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.sqlite_util import write_txn as _sqlite_write_txn
+
+
+@contextlib.contextmanager
+def write_txn(conn: sqlite3.Connection):
+    """Commit projects mutations, then mirror to Mongo when enabled."""
+    with _sqlite_write_txn(conn):
+        yield
+    _mirror_projects(conn)
+
+
+def _mirror_projects(conn: sqlite3.Connection) -> None:
+    try:
+        from hermes_storage.sqlite_mirrors import sync_projects_from_conn
+        sync_projects_from_conn(conn)
+    except Exception:
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            raise
 from hermes_constants import get_hermes_home
 
 # ---------------------------------------------------------------------------

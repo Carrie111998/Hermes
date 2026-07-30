@@ -1,13 +1,13 @@
 ---
 name: hermes-agent
-description: "Use, configure, theme, extend, and orchestrate Hermes Agent."
-version: 3.1.0
+description: "Use, configure, theme, extend, and orchestrate Hermes Agent — including Mongo remote multi-PC fleets."
+version: 3.2.0
 author: Hermes Agent + Teknium
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [hermes, setup, configuration, multi-agent, spawning, cli, gateway, themes, skins, desktop-plugins, tui-widgets, petdex, development]
+    tags: [hermes, setup, configuration, multi-agent, spawning, cli, gateway, themes, skins, desktop-plugins, tui-widgets, petdex, development, mongo, cluster, mtls]
     homepage: https://github.com/NousResearch/hermes-agent
     related_skills: [claude-code, codex, opencode]
 ---
@@ -24,11 +24,13 @@ What makes Hermes different:
 - **Many surfaces** — the same agent core drives the CLI, the Ink TUI, a native Electron desktop app, a web dashboard, and an ACP server for IDEs (VS Code / Zed / JetBrains).
 - **Provider-agnostic** — swap models and providers mid-workflow; credential pools rotate across multiple API keys automatically.
 - **Profiles** — run multiple independent Hermes instances with isolated configs, sessions, skills, and memory.
+- **Remote fleet (optional)** — MongoDB replica set + mTLS orchestrator so the brain (memory, soul, skills, sessions, secrets) lives off-box; PCs only keep `bootstrap.yaml` + client certs and can switch the active agent live.
 - **Extensible & themeable** — plugins, MCP servers, custom tools, webhook triggers, cron scheduling, skins that theme every surface, desktop UI plugins, TUI widgets, and pet mascots.
 
 **This skill is a hub.** The body covers identity, quick start, spawning/orchestration, and hard invariants. Everything else lives in reference files — **load the matching reference (below) before answering**; do not answer detail questions from the body alone.
 
-**Docs:** https://hermes-agent.nousresearch.com/docs/
+**Docs:** https://hermes-agent.nousresearch.com/docs/  
+**Mongo / multi-PC:** `references/mongo-remote-storage.md` and repo `docs/mongodb-remote-storage.md`
 
 ## Scope & Verification
 
@@ -39,18 +41,16 @@ Good verification targets:
 - CLI commands: `hermes --help`, `hermes <command> --help`, and `hermes_cli/main.py`
 - User documentation: https://hermes-agent.nousresearch.com/docs/
 - Source tree: https://github.com/NousResearch/hermes-agent
+- Storage mode: `hermes storage status` (ON = Mongo remote; OFF = classic local home)
 
 ## Quick Start
 
 ```bash
-# Install (shell installer — sets up uv, Python, the venv, and the launcher)
+# Classic install (local home)
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 
-# Interactive chat (default surface; set display.interface: tui to launch the Ink TUI instead)
+# Interactive chat
 hermes
-
-# Single query
-hermes chat -q "What is the capital of France?"
 
 # Setup wizard  /  pick model+provider  /  health check
 hermes setup
@@ -58,34 +58,70 @@ hermes model
 hermes doctor
 
 # Other surfaces
-hermes desktop                 # launch the native desktop app (alias: hermes gui)
-hermes dashboard               # web admin panel + embedded chat
-hermes proxy                   # OpenAI-compatible local proxy backed by your OAuth provider
+hermes desktop                 # native desktop app
+hermes dashboard               # web admin panel
+hermes proxy                   # OpenAI-compatible local proxy
 ```
 
+### Multi-PC / Mongo fleet (when using remote storage)
+
+```bash
+# On the control-plane server (once)
+./scripts/install-control-plane.sh
+hermes agent add                 # one-time code, waits ~5 minutes
+
+# On each agent PC
+hermes db connect                # enter server IP:8743 + code → gets X.509 certs
+hermes storage status
+hermes cluster status
+```
+
+Load `references/mongo-remote-storage.md` before advising on fleet setup, overlays, or cluster switching.
+
 ## Key Paths
+
+### Classic local mode (`hermes storage status` → OFF)
 
 ```
 ~/.hermes/config.yaml       Main configuration (settings — never secrets)
 ~/.hermes/.env              API keys and secrets ONLY (under $HERMES_HOME if set)
 $HERMES_HOME/skills/        Installed skills
 ~/.hermes/skins/            Custom themes (see references/themes.md)
-~/.hermes/desktop-plugins/  Desktop app UI plugins (see references/desktop-plugins.md)
-~/.hermes/tui-widgets/      TUI widget apps (see references/tui-widgets.md)
-~/.hermes/pets/             Installed pet mascots (see references/petdex.md)
+~/.hermes/desktop-plugins/  Desktop app UI plugins
+~/.hermes/tui-widgets/      TUI widget apps
+~/.hermes/pets/             Installed pet mascots
 ~/.hermes/state.db          Canonical session store (SQLite + FTS5)
-~/.hermes/sessions/         Gateway routing index, request dumps, *.jsonl transcripts
+~/.hermes/sessions/         Gateway routing index, request dumps
 ~/.hermes/logs/             Gateway and error logs
 ~/.hermes/auth.json         OAuth tokens and credential pools
+~/.hermes/SOUL.md           Agent identity
+~/.hermes/memories/         MEMORY.md + USER.md
 ~/.hermes/hermes-agent/     Source code (if git-installed)
 ```
 
 Profiles use `~/.hermes/profiles/<name>/` with the same layout. When a profile is active, resolve the real home from `$HERMES_HOME` — never hardcode `~/.hermes`.
 
+### Mongo remote mode (`hermes storage status` → ON)
+
+```
+$HERMES_HOME/bootstrap.yaml     ONLY durable local config (URI + profile + tls paths)
+$HERMES_HOME/certs/ca.crt       Control-plane CA
+$HERMES_HOME/certs/agent.pem    This PC's client cert+key (secret!)
+$HERMES_HOME/cache/skills/      Materialized skill scripts from GridFS (runtime cache)
+$HERMES_HOME/logs/              Optional local logs
+```
+
+Everything else (config, secrets, SOUL, memory, skills catalog, sessions, cluster
+state) lives in Mongo (`hermes_shared` + `hermes_profile_<name>`) and the mTLS
+orchestrator on port **8744**. Per-PC cwd/docker/browser/MCP live in
+`machine_<id>` overlays — use `hermes machine …`, not a hand-edited local yaml
+as the source of truth.
+
 ## Routing Table — load the reference for the task
 
 | User wants... | Load |
 |---|---|
+| **Mongo remote storage, enroll, mTLS, multi-PC cluster** | `references/mongo-remote-storage.md` |
 | CLI commands, subcommands, flags, "how do I run X" | `references/cli-reference.md` |
 | In-session slash commands | `references/slash-commands.md` |
 | Provider setup, API keys, OAuth | `references/providers-and-models.md` |
@@ -120,6 +156,10 @@ Run additional Hermes processes as fully independent subprocesses — separate s
 | Tool access | Subset of parent's tools | Full tool access |
 | Interactive | No | Yes (PTY mode) |
 | Use case | Quick parallel subtasks | Long autonomous missions |
+
+On a **Mongo fleet**, prefer `hermes cluster activate <pc>` / tools `cluster_activate`
+to move the *active* agent (and messaging gateway lease) between already-running
+PCs instead of spawning a second Telegram gateway for the same bot.
 
 ### One-Shot Mode
 
@@ -199,6 +239,9 @@ terminal(command="tmux new-session -d -s resumed 'hermes --resume 20260225_14305
 
 - **Never break prompt caching** — don't change past context, toolsets, or the system prompt mid-conversation. The only exception is context compression.
 - **Message role alternation** — never two assistant or two user messages in a row; only `tool` results can repeat.
-- **Secrets in `.env`, settings in `config.yaml`** — never tell a user to put a non-credential setting in `.env`.
+- **Classic mode: secrets in `.env`, settings in `config.yaml`** — never tell a user to put a non-credential setting in `.env`.
+- **Mongo mode: secrets/settings/soul/memory/sessions live in Mongo** — local disk only holds `bootstrap.yaml` + certs; use `hermes config set`, `memory` tool, `hermes machine` / `hermes cluster` / `hermes storage`. **Fail-hard** on Mongo outage (`MongoStorageError`) — never silent `state.db` / local-file fallback (fleet split-brain).
 - **Profile-safe paths** — `get_hermes_home()` in code, `$HERMES_HOME` when resolving paths in a session.
-- **Never hand-edit `config.yaml` for the user** — use `hermes config set KEY VAL`; a stray indent can corrupt the file and break the live gateway.
+- **Never hand-edit `config.yaml` for the user** — use `hermes config set KEY VAL`; a stray indent can corrupt the file and break the live gateway. In Mongo mode the writer also persists to the remote profile/overlay.
+- **One messaging gateway per bot** — never run two Telegram/Discord gateways with the same token; use cluster handoff (`cluster_activate` / `hermes cluster activate`).
+- **Orchestrator is mTLS** — without a CA-signed `agent.pem`, connections to `:8744` are dropped; do not suggest plain HTTP for cluster control.

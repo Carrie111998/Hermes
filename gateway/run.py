@@ -10199,6 +10199,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # pythonw / detached service) — otherwise the gateway would die
         # here and take every adapter offline. See #71671.
         try:
+            from hermes_storage import is_mongo_mode
+            from hermes_storage.cluster import (
+                register_messaging_callbacks,
+                start_heartbeat_loop,
+            )
+            if is_mongo_mode():
+                def _release_messaging():
+                    # Stop messaging adapters while retaining API/local ones.
+                    for platform, adapter in list(getattr(self, "adapters", {}).items()):
+                        name = getattr(platform, "value", str(platform))
+                        if name in ("api_server", "local", "webhook"):
+                            continue
+                        try:
+                            stop = getattr(adapter, "stop", None) or getattr(adapter, "disconnect", None)
+                            if stop:
+                                import asyncio as _asyncio
+                                result = stop()
+                                if _asyncio.iscoroutine(result):
+                                    # Best-effort sync bridge during handoff loop
+                                    try:
+                                        loop = _asyncio.get_event_loop()
+                                        if loop.is_running():
+                                            _asyncio.ensure_future(result)
+                                        else:
+                                            loop.run_until_complete(result)
+                                    except Exception:
+                                        pass
+                        except Exception as exc:
+                            logger.warning("Failed stopping %s during handoff: %s", name, exc)
+
+                def _acquire_messaging() -> bool:
+                    # Health: storage reachable + at least attempt to mark healthy.
+                    try:
+                        from hermes_storage import get_storage
+                        storage = get_storage()
+                        if storage is None:
+                            return False
+                        storage.client.admin.command("ping")
+                        return True
+                    except Exception as exc:
+                        logger.error("Messaging acquire health-check failed: %s", exc)
+                        return False
+
+                def _notify(msg: str) -> None:
+                    logger.info("Cluster notify: %s", msg)
+
+                register_messaging_callbacks(
+                    on_release=_release_messaging,
+                    on_acquire=_acquire_messaging,
+                    on_notify=_notify,
+                )
+                api_base = ""
+                try:
+                    api_cfg = getattr(self.config, "platforms", None)
+                except Exception:
+                    api_cfg = None
+                start_heartbeat_loop(api_base=api_base or None)
+                logger.info("Mongo cluster heartbeat started")
+        except Exception as exc:
+            logger.debug("Cluster heartbeat not started: %s", exc)
+        try:
             faulthandler.enable()
         except (RuntimeError, ValueError, OSError):
             try:
@@ -13366,6 +13427,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if policy in ("dispatch", "interrupt_then_dispatch"):
             plain = {
                 "status": self._handle_status_command,
+                "cluster": self._handle_cluster_command,
                 "context": self._handle_context_command,
                 "restart": self._handle_restart_command,
                 "approve": self._handle_approve_command,
@@ -14322,6 +14384,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "cluster":
+            return await self._handle_cluster_command(event)
 
         if canonical == "egress":
             from hermes_cli.proxy_cli import format_status_text

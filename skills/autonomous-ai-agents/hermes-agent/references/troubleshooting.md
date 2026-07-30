@@ -1,19 +1,19 @@
 # Troubleshooting
 
 ### Voice not working
-1. Check `stt.enabled: true` in config.yaml
+1. Check `stt.enabled: true` via `hermes config get stt.enabled` (Mongo mode: remote profile)
 2. Verify provider: `pip install faster-whisper` or set API key
 3. In gateway: `/restart`. In CLI: exit and relaunch.
 
 ### Tool not available
 1. `hermes tools` — check if toolset is enabled for your platform
-2. Some tools need env vars (check `.env`)
+2. Some tools need env vars (classic: `.env`; Mongo: profile `secrets` / `hermes config`)
 3. `/reset` after enabling tools
 
 ### Model/provider issues
 1. `hermes doctor` — check config and dependencies
 2. `hermes auth` — re-authenticate OAuth providers (or `hermes auth add <provider>`)
-3. Check `.env` has the right API key
+3. Check the API key is set (classic `.env` / Mongo secrets store)
 4. **Copilot 403**: `gh auth login` tokens do NOT work for Copilot API. You must use the Copilot-specific OAuth device code flow via `hermes model` → GitHub Copilot.
 
 ### Changes not taking effect

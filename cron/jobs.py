@@ -1012,6 +1012,16 @@ def get_ticker_last_error() -> Optional[str]:
 
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
+    from hermes_storage import is_mongo_mode
+    if is_mongo_mode():
+        from hermes_storage.ledgers import load_cron_jobs
+        remote = load_cron_jobs()
+        if isinstance(remote, dict) and "jobs" in remote:
+            return list(remote.get("jobs") or [])
+        if isinstance(remote, list):
+            return remote
+        return []
+
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     if not jobs_file.exists():
@@ -1064,6 +1074,12 @@ def load_jobs() -> List[Dict[str, Any]]:
 
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
+    from hermes_storage import is_mongo_mode
+    if is_mongo_mode():
+        from hermes_storage.ledgers import save_cron_jobs
+        save_cron_jobs({"jobs": jobs, "updated_at": _hermes_now().isoformat()})
+        return
+
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged

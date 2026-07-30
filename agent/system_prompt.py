@@ -244,6 +244,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 
+    # Multi-PC cluster awareness (Mongo mode)
+    if "cluster_status" in agent.valid_tool_names or "cluster_activate" in agent.valid_tool_names:
+        try:
+            from hermes_storage.cluster import format_cluster_prompt_block
+            cluster_block = format_cluster_prompt_block()
+            if cluster_block:
+                stable_parts.append(cluster_block)
+        except Exception:
+            pass
+
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
     if agent.valid_tool_names:

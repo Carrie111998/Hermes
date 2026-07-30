@@ -3376,6 +3376,14 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
+        # Mongo remote config: shared settings ⊕ profile config ⊕ machine overlay
+        # win over local yaml when bootstrap/URI is present. Fail hard — no local
+        # durable fallback while Mongo mode is on (fleet split-brain).
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage import require_storage
+            storage = require_storage()
+            expanded = storage.load_effective_config(expanded)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
@@ -3527,6 +3535,14 @@ def save_config(
         ensure_hermes_home()
         config_path = get_config_path()
         require_readable_config_before_write(config_path)
+        # Persist to Mongo when remote storage is enabled. Fail hard on error —
+        # do not leave a local-only write that diverges from the fleet brain.
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage import require_storage
+            storage = require_storage()
+            storage.save_profile_config(config)
+            storage.save_machine_overlay_from_config(config)
         # Compute explicit user paths BEFORE any normalisation --------
         # _normalize_max_turns_config may inject agent.max_turns from
         # DEFAULT_CONFIG; using the raw dict preserves which paths the

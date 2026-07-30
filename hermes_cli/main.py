@@ -475,6 +475,13 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.storage_cluster import (
+    build_agent_parser,
+    build_cluster_parser,
+    build_db_parser,
+    build_machine_parser,
+    build_storage_parser,
+)
 
 
 def _require_tty(command_name: str) -> None:
@@ -4531,6 +4538,163 @@ def cmd_status(args):
     from hermes_cli.status import show_status
 
     show_status(args)
+
+
+def cmd_storage(args):
+    """Mongo remote storage: status / migrate / init-bootstrap."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    from hermes_constants import get_hermes_home
+    from hermes_storage import get_storage, is_mongo_mode, load_bootstrap, reset_bootstrap_cache
+    from hermes_storage.bootstrap import bootstrap_path
+
+    sub = getattr(args, "storage_command", None)
+    if sub == "init-bootstrap":
+        path = bootstrap_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "mongo_uri": args.uri,
+            "profile": getattr(args, "profile", None) or "default",
+            "auth_mode": getattr(args, "auth_mode", None) or "uri",
+        }
+        mid = getattr(args, "machine_id", None)
+        if mid:
+            payload["machine_id"] = mid
+        tls_ca = getattr(args, "tls_ca", None)
+        tls_cert = getattr(args, "tls_cert", None)
+        if tls_ca or tls_cert:
+            payload["auth_mode"] = "x509"
+            payload["tls"] = {}
+            if tls_ca:
+                payload["tls"]["ca_file"] = tls_ca
+            if tls_cert:
+                payload["tls"]["cert_key_file"] = tls_cert
+        import yaml as _yaml
+        path.write_text(_yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+        reset_bootstrap_cache()
+        print(f"Wrote {path}")
+        return
+
+    if sub == "status":
+        boot = load_bootstrap(force=True)
+        if not boot:
+            print("Mongo mode: OFF (no bootstrap.yaml / HERMES_MONGO_URI)")
+            return
+        print(f"Mongo mode: ON")
+        print(f"  uri: {boot.mongo_uri.split('@')[-1] if '@' in boot.mongo_uri else boot.mongo_uri}")
+        print(f"  profile: {boot.profile} → DB {boot.profile_db}")
+        print(f"  shared DB: {boot.shared_db}")
+        try:
+            storage = get_storage(force=True)
+            storage.client.admin.command("ping")
+            print("  connection: OK")
+            print(f"  machine_id: {storage.machine_id}")
+            print(f"  node_id: {storage.node_id}")
+        except Exception as exc:
+            print(f"  connection: FAILED ({exc})")
+        return
+
+    if sub == "migrate":
+        if not is_mongo_mode():
+            print("Error: enable Mongo mode first (hermes storage init-bootstrap --uri ...)")
+            raise SystemExit(1)
+        home = _Path(args.from_home) if getattr(args, "from_home", None) else get_hermes_home()
+        from hermes_storage.local.migrate import export_local_home, import_payload_to_storage
+        storage = get_storage(force=True)
+        print(f"Exporting from {home} …")
+        payload = export_local_home(home)
+        counts = import_payload_to_storage(storage, payload)
+        print("Imported:")
+        print(_json.dumps(counts, indent=2))
+        return
+
+    print("usage: hermes storage <status|migrate|init-bootstrap>")
+
+
+def cmd_cluster(args):
+    """Multi-PC cluster status / activate."""
+    import json as _json
+
+    from hermes_storage import get_storage, is_mongo_mode
+    from hermes_storage.cluster import start_heartbeat_loop
+
+    if not is_mongo_mode():
+        print("Error: Mongo/cluster mode is not enabled.")
+        raise SystemExit(1)
+    storage = get_storage(force=True)
+    storage.register_presence()
+    start_heartbeat_loop()
+
+    sub = getattr(args, "cluster_command", None)
+    if sub == "status" or sub is None:
+        status = storage.cluster_status()
+        print(_json.dumps(status, indent=2, default=str))
+        return
+    if sub == "activate":
+        state = storage.activate(args.target, reason=getattr(args, "reason", None) or "cli")
+        print(_json.dumps({"ok": True, "state": state}, indent=2, default=str))
+        return
+    print("usage: hermes cluster <status|activate>")
+
+
+def cmd_machine(args):
+    """Per-PC machine overlay commands."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    import yaml as _yaml
+
+    from hermes_storage import get_storage, is_mongo_mode
+
+    if not is_mongo_mode():
+        print("Error: Mongo mode is not enabled.")
+        raise SystemExit(1)
+    storage = get_storage(force=True)
+    sub = getattr(args, "machine_command", None)
+    mid = getattr(args, "id", None) or storage.machine_id
+
+    if sub == "list":
+        print(_json.dumps(storage.machines.list_machines(), indent=2, default=str))
+        return
+    if sub == "show" or sub is None:
+        doc = storage.machines.get_machine(mid) or {}
+        overlay = storage.machines.get_overlay(mid)
+        print(_json.dumps({"machine_id": mid, "meta": doc, "overlay": overlay}, indent=2, default=str))
+        return
+    if sub == "set-overlay":
+        path = _Path(args.file)
+        raw = path.read_text(encoding="utf-8")
+        data = _yaml.safe_load(raw) if path.suffix.lower() in {".yaml", ".yml"} else _json.loads(raw)
+        if not isinstance(data, dict):
+            print("Overlay file must contain a mapping/object")
+            raise SystemExit(1)
+        storage.machines.set_overlay(mid, data)
+        print(f"Updated overlay for {mid}")
+        return
+    print("usage: hermes machine <show|list|set-overlay>")
+
+
+def cmd_agent(args):
+    """Control-plane agent enrollment (hermes agent add)."""
+    sub = getattr(args, "agent_command", None)
+    if sub == "add":
+        from hermes_cli.enroll_cmds import cmd_agent_add
+
+        cmd_agent_add(args)
+        return
+    print("usage: hermes agent add [--name PC] [--ttl 300]")
+
+
+def cmd_db(args):
+    """Agent-side DB connect (hermes db connect)."""
+    sub = getattr(args, "db_command", None)
+    if sub == "connect":
+        from hermes_cli.enroll_cmds import cmd_db_connect
+
+        cmd_db_connect(args)
+        return
+    print("usage: hermes db connect [--host IP:PORT] [--code ABCD-EFGH]")
 
 
 def cmd_cron(args):
@@ -11327,6 +11491,11 @@ def main():
     # status command  (parser built in hermes_cli/subcommands/status.py)
     # =========================================================================
     build_status_parser(subparsers, cmd_status=cmd_status)
+    build_storage_parser(subparsers, cmd_storage=cmd_storage)
+    build_cluster_parser(subparsers, cmd_cluster=cmd_cluster)
+    build_machine_parser(subparsers, cmd_machine=cmd_machine)
+    build_agent_parser(subparsers, cmd_agent=cmd_agent)
+    build_db_parser(subparsers, cmd_db=cmd_db)
 
     # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)

@@ -217,6 +217,30 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
+        # Mongo remote memory is authoritative when configured — no local file
+        # fallback (fleet split-brain).
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage import require_storage
+            storage = require_storage()
+            mem_raw = storage.memories.load("memory")
+            user_raw = storage.memories.load("user")
+            self.memory_entries = self._parse_entries(mem_raw)
+            self.user_entries = self._parse_entries(user_raw)
+            self.memory_entries = list(dict.fromkeys(self.memory_entries))
+            self.user_entries = list(dict.fromkeys(self.user_entries))
+            sanitized_memory = self._sanitize_entries_for_snapshot(
+                self.memory_entries, "MEMORY.md"
+            )
+            sanitized_user = self._sanitize_entries_for_snapshot(
+                self.user_entries, "USER.md"
+            )
+            self._system_prompt_snapshot = {
+                "memory": self._render_block("memory", sanitized_memory),
+                "user": self._render_block("user", sanitized_user),
+            }
+            return
+
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
@@ -870,6 +894,14 @@ class MemoryStore:
         readers always see either the old complete file or the new one.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
+        # Mongo is authoritative when enabled — never write only local files.
+        from hermes_storage import is_mongo_mode
+        if is_mongo_mode():
+            from hermes_storage import require_storage
+            storage = require_storage()
+            target = "user" if path.name.upper().startswith("USER") else "memory"
+            storage.memories.save(target, content)
+            return
         try:
             atomic_write_text(path, content, tmp_prefix=".mem_")
         except (OSError, IOError) as e:

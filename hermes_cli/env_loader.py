@@ -342,6 +342,18 @@ def load_hermes_dotenv(
     _apply_external_secret_sources(home_path)
     _apply_managed_env()
 
+    # Mongo secrets (profile .env equivalent) — required when Mongo mode is on.
+    # Never silently skip: missing secrets would leave stale local .env in force.
+    from hermes_storage import is_mongo_mode
+    if is_mongo_mode():
+        from hermes_storage import require_storage
+        storage = require_storage()
+        for key, value in storage.secrets.get_all().items():
+            if key.startswith("__"):
+                continue
+            if value is not None:
+                os.environ[str(key)] = str(value)
+
     return loaded
 
 
