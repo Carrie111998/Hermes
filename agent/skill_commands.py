@@ -17,6 +17,7 @@ from agent.skill_preprocessing import (
     load_skills_config as _load_skills_config,
     substitute_template_vars as _substitute_template_vars,
 )
+from tools.path_security import validate_within_dir
 
 logger = logging.getLogger(__name__)
 
@@ -277,15 +278,18 @@ def _build_skill_message(
 
     supporting = []
     linked_files = loaded_skill.get("linked_files") or {}
-    for entries in linked_files.values():
-        if isinstance(entries, list):
-            supporting.extend(entries)
+    if skill_dir:
+        for entries in linked_files.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, str):
+                    continue
+                if validate_within_dir(skill_dir / entry, skill_dir):
+                    continue
+                supporting.append(entry)
 
     if not supporting and skill_dir:
-        try:
-            skill_root = skill_dir.resolve()
-        except OSError:
-            skill_root = skill_dir
         for subdir in ("references", "templates", "scripts", "assets"):
             subdir_path = skill_dir / subdir
             # Skip missing/redirected dirs so rglob cannot walk host paths
@@ -299,10 +303,7 @@ def _build_skill_message(
             for f in sorted(subdir_path.rglob("*")):
                 if not f.is_file() or f.is_symlink():
                     continue
-                try:
-                    if not f.resolve().is_relative_to(skill_root):
-                        continue
-                except (OSError, ValueError):
+                if validate_within_dir(f, skill_dir):
                     continue
                 rel = str(f.relative_to(skill_dir))
                 supporting.append(rel)

@@ -1,5 +1,6 @@
 """Tests for agent/skill_commands.py — skill slash command scanning and platform filtering."""
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -765,7 +766,7 @@ class TestSkillDirectoryHeader:
         """Directory symlinks under scripts/ must not leak host file listings."""
         secret_dir = tmp_path / "secret"
         secret_dir.mkdir()
-        (secret_dir / "id_rsa").write_text("PRIVATE KEY MATERIAL")
+        (secret_dir / "payload.py").write_text("PRIVATE_KEY = 'MATERIAL'")
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
             skills_root = tmp_path / "skills"
@@ -779,8 +780,8 @@ class TestSkillDirectoryHeader:
             msg = build_skill_invocation_message("/evil-skill")
 
         assert msg is not None
-        assert "id_rsa" not in msg
-        assert "PRIVATE KEY" not in msg
+        assert "payload.py" not in msg
+        assert str(secret_dir / "payload.py") not in msg
         assert "[This skill has supporting files:]" not in msg
 
     def test_supporting_files_skip_nested_symlink_escape(self, tmp_path):
@@ -807,6 +808,43 @@ class TestSkillDirectoryHeader:
         assert "ok.js" in msg
         assert "id_rsa" not in msg
         assert "PRIVATE KEY" not in msg
+
+    def test_supporting_files_filter_untrusted_linked_file_entries(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skill_dir = _make_skill(skills_root, "stale-index")
+        scripts = skill_dir / "scripts"
+        scripts.mkdir()
+        (scripts / "safe.py").write_text("print('safe')")
+
+        external = tmp_path / "external"
+        external.mkdir()
+        (external / "payload.py").write_text("PRIVATE_KEY = 'MATERIAL'")
+        redirected = skill_dir / "redirected"
+        try:
+            redirected.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+        loaded = {
+            "success": True,
+            "name": "stale-index",
+            "content": "Do the thing.",
+            "skill_dir": str(skill_dir),
+            "linked_files": {
+                "scripts": ["scripts/safe.py", "redirected/payload.py"]
+            },
+        }
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_root),
+            patch("tools.skills_tool.skill_view", return_value=json.dumps(loaded)),
+        ):
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/stale-index")
+
+        assert msg is not None
+        assert "scripts/safe.py" in msg
+        assert "redirected/payload.py" not in msg
+        assert str(external / "payload.py") not in msg
 
 
 class TestTemplateVarSubstitution:
