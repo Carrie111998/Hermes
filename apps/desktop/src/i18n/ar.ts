@@ -1360,6 +1360,12 @@ export const ar = defineLocale({
     failedCreate: 'فشل الإنشاء',
     failedRename: 'فشل إعادة التسمية'
   },
+
+  webhooks: {
+    statusEnabled: 'مفعّل',
+    statusDisabled: 'معطّل'
+  },
+
   cron: {
     close: 'إغلاق',
     search: 'بحث',
