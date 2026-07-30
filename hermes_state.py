@@ -152,7 +152,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -853,6 +853,18 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     first_seen REAL,
     last_seen REAL,
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
+);
+
+CREATE TABLE IF NOT EXISTS provider_session_attachments (
+    hermes_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    provider_session_id TEXT NOT NULL,
+    model_requested TEXT NOT NULL DEFAULT '',
+    model_reported TEXT NOT NULL DEFAULT '',
+    tool_catalog_fingerprint TEXT NOT NULL,
+    system_prompt_fingerprint TEXT NOT NULL,
+    last_success_at REAL NOT NULL,
+    PRIMARY KEY (hermes_session_id, provider)
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -2012,6 +2024,85 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def upsert_provider_attachment(
+        self,
+        *,
+        hermes_session_id: str,
+        provider: str,
+        provider_session_id: str,
+        model_requested: str,
+        model_reported: str,
+        tool_catalog_fingerprint: str,
+        system_prompt_fingerprint: str,
+        last_success_at: float,
+    ) -> None:
+        """Persist one provider-native session attachment for a Hermes session."""
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO provider_session_attachments (
+                       hermes_session_id, provider, provider_session_id,
+                       model_requested, model_reported,
+                       tool_catalog_fingerprint, system_prompt_fingerprint,
+                       last_success_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(hermes_session_id, provider) DO UPDATE SET
+                       provider_session_id = excluded.provider_session_id,
+                       model_requested = excluded.model_requested,
+                       model_reported = excluded.model_reported,
+                       tool_catalog_fingerprint = excluded.tool_catalog_fingerprint,
+                       system_prompt_fingerprint = excluded.system_prompt_fingerprint,
+                       last_success_at = excluded.last_success_at""",
+                (
+                    hermes_session_id,
+                    provider,
+                    provider_session_id,
+                    model_requested,
+                    model_reported,
+                    tool_catalog_fingerprint,
+                    system_prompt_fingerprint,
+                    float(last_success_at),
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_provider_attachment(
+        self,
+        hermes_session_id: str,
+        provider: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a provider-native attachment without exposing credentials."""
+
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT hermes_session_id, provider, provider_session_id,
+                          model_requested, model_reported,
+                          tool_catalog_fingerprint, system_prompt_fingerprint,
+                          last_success_at
+                   FROM provider_session_attachments
+                   WHERE hermes_session_id = ? AND provider = ?""",
+                (hermes_session_id, provider),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def delete_provider_attachment(
+        self,
+        hermes_session_id: str,
+        provider: str,
+    ) -> bool:
+        """Delete one attachment and report whether a row existed."""
+
+        def _do(conn):
+            cursor = conn.execute(
+                """DELETE FROM provider_session_attachments
+                   WHERE hermes_session_id = ? AND provider = ?""",
+                (hermes_session_id, provider),
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
 
     def record_gateway_session_peer(
         self,
