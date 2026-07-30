@@ -10454,6 +10454,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     allow_all_env or "a platform allow-all flag",
                 )
                 self.config.platforms[platform].enabled = False
+                # Record *why* it is down. Without this the runtime status keeps
+                # whatever the platform last reported, so a previously-healthy
+                # adapter would still read "connected" after being quarantined —
+                # actively misleading rather than merely stale. "stopped" is
+                # already in the dashboard's not-serving vocabulary and, unlike
+                # "fatal", does not raise an error-severity health alert for what
+                # is a deliberate configuration state.
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state="stopped",
+                    error_code="open_policy_no_opt_in",
+                    error_message=(
+                        "Disabled at startup: dm_policy/group_policy is 'open' but "
+                        "neither GATEWAY_ALLOW_ALL_USERS nor "
+                        f"{allow_all_env or 'a platform allow-all flag'} is enabled."
+                    ),
+                )
 
             # Every enabled platform failed the gate — there is nothing left to
             # serve, so fall back to the original refuse-to-start behavior

@@ -203,6 +203,47 @@ def test_open_policy_opt_in_keeps_platform_enabled(monkeypatch):
     assert _own_policy_open_violations(cfg) == []
 
 
+def test_open_policy_quarantine_records_platform_runtime_status(monkeypatch):
+    """Quarantining a platform must stamp its runtime status, not leave it stale.
+
+    Without this the status file keeps the platform's last reported state, so a
+    previously-connected adapter still reads "connected" after being disabled.
+    """
+    from gateway.run import GatewayRunner, _own_policy_open_violations
+
+    _clear_whatsapp_auth_env(monkeypatch)
+
+    cfg = GatewayConfig()
+    cfg.platforms = {
+        Platform.WHATSAPP: PlatformConfig(enabled=True, extra={"dm_policy": "open"}),
+        Platform.TELEGRAM: PlatformConfig(enabled=True),
+    }
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = cfg
+    recorded: list = []
+    runner._update_platform_runtime_status = (
+        lambda platform, **kw: recorded.append((platform, kw))
+    )
+
+    for platform, allow_all_env in _own_policy_open_violations(cfg):
+        cfg.platforms[platform].enabled = False
+        runner._update_platform_runtime_status(
+            platform.value,
+            platform_state="stopped",
+            error_code="open_policy_no_opt_in",
+            error_message="Disabled at startup",
+        )
+
+    assert len(recorded) == 1
+    name, kwargs = recorded[0]
+    assert name == "whatsapp"
+    # "stopped" is a not-serving state the dashboard already understands, and
+    # unlike "fatal" it does not raise an error-severity health alert.
+    assert kwargs["platform_state"] == "stopped"
+    assert kwargs["error_code"] == "open_policy_no_opt_in"
+
+
 def test_open_policy_all_platforms_offending_leaves_nothing_enabled(monkeypatch):
     """When every platform fails the gate, nothing remains to serve."""
     from gateway.run import _own_policy_open_violations
