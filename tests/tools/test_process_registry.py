@@ -701,6 +701,85 @@ class TestSpawnRewriteCompoundBackground:
         assert session.command == "cd /app && node server.js &"
 
 
+class TestPtySpawnBaseExceptionFallback:
+    """Regression for PR #55003: pyo3 0.21 PanicException derives from
+    BaseException, so ``except Exception`` does not catch a PTY spawn panic and
+    the gateway persistent shell crashes. spawn_local must fall back to pipes
+    for BaseException-derived panics while re-raising KeyboardInterrupt /
+    SystemExit / GeneratorExit.
+    """
+
+    def _patch_pty_spawn_raises(self, exc):
+        """Patch ptyprocess.PtyProcess.spawn to raise *exc* (BaseException-derived)."""
+        mock_pty_module = MagicMock()
+        mock_pty_module.PtyProcess.spawn = MagicMock(side_effect=exc)
+        return patch.dict("sys.modules", {"ptyprocess": mock_pty_module})
+
+    def _patch_popen_capture(self):
+        """Patch subprocess.Popen to capture args and return a MagicMock proc."""
+        captured = []
+
+        def fake_popen(args, **kwargs):
+            captured.append(args)
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = MagicMock()
+            return proc
+
+        return patch("subprocess.Popen", side_effect=fake_popen), captured
+
+    def test_base_exception_pty_spawn_falls_back_to_pipes(self, registry):
+        """A BaseException-derived PTY spawn panic must fall back to pipes, not
+        propagate out of spawn_local and crash the gateway.
+        """
+        class _PanicLike(BaseException):
+            pass
+
+        fake_thread = MagicMock()
+        fake_thread.daemon = False
+
+        popen_patch, captured = self._patch_popen_capture()
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("tools.process_registry._IS_WINDOWS", False), \
+             self._patch_pty_spawn_raises(_PanicLike("pyo3 panic")), \
+             popen_patch, \
+             patch("threading.Thread", return_value=fake_thread), \
+             patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_local("echo hi", cwd="/tmp", use_pty=True)
+
+        # Pipe fallback path (Popen) must have been used.
+        assert len(captured) == 1, \
+            f"Expected pipe fallback Popen, got {len(captured)} calls"
+        assert captured[0][2] == "set +m; echo hi"
+        # No PTY handle should be attached (pipe mode).
+        assert not getattr(session, "_pty", None)
+
+    @pytest.mark.parametrize("exc_cls", [KeyboardInterrupt, SystemExit, GeneratorExit])
+    def test_base_exception_subclasses_reraised(self, registry, exc_cls):
+        """KeyboardInterrupt / SystemExit / GeneratorExit must NOT be swallowed
+        by the BaseException fallback — they must re-raise out of spawn_local.
+        """
+        fake_thread = MagicMock()
+        fake_thread.daemon = False
+
+        popen_patch, captured = self._patch_popen_capture()
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("tools.process_registry._IS_WINDOWS", False), \
+             self._patch_pty_spawn_raises(exc_cls("must reraise")), \
+             popen_patch, \
+             patch("threading.Thread", return_value=fake_thread), \
+             patch.object(registry, "_write_checkpoint"):
+            with pytest.raises(exc_cls):
+                registry.spawn_local("echo hi", cwd="/tmp", use_pty=True)
+
+        # Pipe fallback must NOT have been used — the control-flow exception
+        # propagates before reaching the Popen block.
+        assert captured == [], \
+            f"Pipe fallback should not run for {exc_cls.__name__}"
+
+
 # =========================================================================
 # Checkpoint
 # =========================================================================

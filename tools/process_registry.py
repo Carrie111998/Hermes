@@ -765,6 +765,19 @@ class ProcessRegistry:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+            except BaseException as e:
+                # pyo3 0.21 (pinned by pywinpty) raises PanicException from
+                # BaseException, not Exception, so ``except Exception`` misses
+                # it and the panic escapes spawn_local, crashing the gateway
+                # persistent shell (PR #55003). Re-raise genuine control-flow
+                # signals; recover all other BaseException-derived panics by
+                # falling back to pipe mode, matching the Exception path above.
+                if isinstance(e, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                    raise
+                logger.warning(
+                    "PTY spawn raised BaseException (%s), falling back to pipe mode",
+                    e,
+                )
 
         # Standard Popen path (non-PTY or PTY fallback)
         # Use the user's login shell for consistency with LocalEnvironment --
