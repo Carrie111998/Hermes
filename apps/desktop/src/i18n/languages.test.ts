@@ -1,8 +1,34 @@
 import { describe, expect, it } from 'vitest'
 
+import { fr } from './fr'
 import { DEFAULT_LOCALE, isLocale, isSupportedLocaleValue, localeConfigValue, normalizeLocale } from './languages'
 
 describe('desktop i18n languages', () => {
+  it('keeps every fixed French sidebar navigation label non-empty', () => {
+    expect(fr.sidebar.nav).toMatchObject({
+      'new-session': 'Nouvelle session',
+      artifacts: 'Artefacts',
+      cron: 'Tâches planifiées',
+      messaging: 'Messagerie',
+      skills: 'Capacités'
+    })
+  })
+
+  it('keeps reviewed French copy localized and plural-aware', () => {
+    expect(fr.settings.gateway.sshErrHostKey).not.toContain('CHANGED')
+    expect(fr.settings.mcp.testOk(1)).toContain('1 outil disponible')
+    expect(fr.settings.mcp.testOk(2)).toContain('2 outils disponibles')
+    expect(fr.skills.bulkUpdated(2)).toContain('2 éléments mis à jour')
+    expect(fr.starmap.importSuccess(2)).toBe('Carte chargée avec 2 nœuds.')
+    expect(fr.commandCenter.generatePet.hatchRow('', 2, 3)).toBe("Dessin de l'image 2 sur 3…")
+    expect(fr.notifications.updateReadyMessage(1)).toContain('1 nouvelle modification disponible.')
+    expect(fr.notifications.updateReadyMessage(2)).toContain('2 nouvelles modifications disponibles.')
+    expect(fr.settings.appearance.embedsReset(2)).toContain('2 services autorisés')
+    expect(fr.composer.attachments(2)).toBe('2 pièces jointes')
+    expect(fr.statusStack.coding.changed(2)).toBe('2 modifiés')
+    expect(fr.updates.moreChanges(2)).toBe('+ 2 changements supplémentaires inclus.')
+  })
+
   it('normalizes supported locale aliases', () => {
     expect(normalizeLocale('en')).toBe('en')
     expect(normalizeLocale('EN-US')).toBe('en')
