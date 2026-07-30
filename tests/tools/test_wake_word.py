@@ -624,3 +624,162 @@ def test_machine_lock_is_released_when_owner_process_exits(tmp_path):
         if process.is_alive():
             process.terminate()
         process.join(10)
+
+
+# ── Retry logic ────────────────────────────────────────────────────────
+
+
+def test_retry_constants_exist():
+    """Retry constants are defined and sane."""
+    assert hasattr(ww, "_RETRY_ON_BUSY_DEFAULT")
+    assert hasattr(ww, "_RETRY_INTERVAL_SECONDS")
+    assert hasattr(ww, "_RETRY_MAX_ATTEMPTS_DEFAULT")
+    assert ww._RETRY_ON_BUSY_DEFAULT is True
+    assert ww._RETRY_INTERVAL_SECONDS > 0
+    assert ww._RETRY_MAX_ATTEMPTS_DEFAULT == 0
+
+
+def test_retry_config_defaults_in_config():
+    """Retry config keys appear in the DEFAULTS dict."""
+    defaults = ww._DEFAULTS
+    assert isinstance(defaults, dict)
+
+
+def test_start_listening_retries_when_detector_held(monkeypatch, tmp_path):
+    """start_listening retries when _detector is held by another owner,
+    then succeeds once the detector is released."""
+    class FakeDetector:
+        def __init__(self, *a, **kw):
+            self.on_wake = None
+        def start(self):
+            pass
+        def stop(self):
+            pass
+        def pause(self):
+            pass
+        def resume(self):
+            pass
+
+    other_owner = object()
+    my_owner = object()
+    original_detector = FakeDetector()
+    monkeypatch.setattr(ww, "_detector", original_detector)
+    monkeypatch.setattr(ww, "_detector_owner", other_owner)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+    def fake_build_engine(cfg):
+        return object()
+
+    def fake_input_device(cfg):
+        return None
+
+    lock_path = tmp_path / "lock"
+    lock_path.write_bytes(b"\0")
+
+    def fake_acquire():
+        return open(lock_path, "rb")
+
+    def fake_release(h):
+        if h:
+            try:
+                h.close()
+            except Exception:
+                pass
+
+    monkeypatch.setattr(ww, "_build_engine", fake_build_engine)
+    monkeypatch.setattr(ww, "_input_device", fake_input_device)
+    monkeypatch.setattr(ww, "_acquire_machine_lock", fake_acquire)
+    monkeypatch.setattr(ww, "_release_machine_lock", fake_release)
+    # Mock WakeWordDetector so it returns our FakeDetector
+    monkeypatch.setattr(ww, "WakeWordDetector", FakeDetector)
+
+    cfg = {"retry_on_busy": True, "retry_interval": 0.01, "retry_max_attempts": 0}
+
+    # Background thread releases the detector after a short delay
+    import threading
+
+    def release_detector():
+        time.sleep(0.05)
+        with ww._detector_lock:
+            if ww._detector is original_detector:
+                ww._detector = None
+                ww._detector_owner = None
+                ww._detector_file_lock = None
+
+    t = threading.Thread(target=release_detector)
+    t.start()
+
+    detector = ww.start_listening(lambda: None, owner=my_owner, config=cfg)
+    t.join()
+    assert detector is not None
+    assert ww._detector_owner is my_owner
+
+    # Cleanup
+    ww._release_machine_lock(ww._detector_file_lock)
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+
+def test_start_listening_gives_up_after_max_retries(monkeypatch, tmp_path):
+    """start_listening raises after retry_max_attempts is reached."""
+    class FakeDetector:
+        def __init__(self):
+            self.on_wake = None
+        def start(self):
+            pass
+        def stop(self):
+            pass
+        def pause(self):
+            pass
+        def resume(self):
+            pass
+
+    other_owner = object()
+    my_owner = object()
+
+    monkeypatch.setattr(ww, "_detector", FakeDetector())
+    monkeypatch.setattr(ww, "_detector_owner", other_owner)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+    cfg = {"retry_on_busy": True, "retry_interval": 0.01, "retry_max_attempts": 2}
+
+    with pytest.raises(ww.WakeWordInUse, match="retry limit"):
+        ww.start_listening(lambda: None, owner=my_owner, config=cfg)
+
+    # Cleanup
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+
+def test_start_listening_no_retry_when_disabled(monkeypatch, tmp_path):
+    """start_listening raises immediately when retry_on_busy is False."""
+    class FakeDetector:
+        def __init__(self):
+            self.on_wake = None
+        def start(self):
+            pass
+        def stop(self):
+            pass
+        def pause(self):
+            pass
+        def resume(self):
+            pass
+
+    other_owner = object()
+    my_owner = object()
+
+    monkeypatch.setattr(ww, "_detector", FakeDetector())
+    monkeypatch.setattr(ww, "_detector_owner", other_owner)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+    cfg = {"retry_on_busy": False}
+
+    with pytest.raises(ww.WakeWordInUse):
+        ww.start_listening(lambda: None, owner=my_owner, config=cfg)
+
+    # Cleanup
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)

@@ -63,6 +63,13 @@ _DEFAULT_CONFIRMATION_FRAMES = 3
 _SILENCE_PEAK = 10
 _SILENCE_ALERT_SECONDS = 10
 
+# Auto-retry when the microphone is busy (another process, another Hermes
+# instance, desktop app, etc.). Hermes is a long-lived agent — giving up
+# on the first mic-busy error is wrong; quietly retry until the mic is freed.
+_RETRY_ON_BUSY_DEFAULT = True
+_RETRY_INTERVAL_SECONDS = 10
+_RETRY_MAX_ATTEMPTS_DEFAULT = 0  # 0 = unlimited
+
 
 class WakeWordInUse(RuntimeError):
     """Raised when another surface or process owns the wake-word listener."""
@@ -1092,7 +1099,12 @@ def _acquire_machine_lock(path: Optional[Path] = None):
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (OSError, BlockingIOError) as e:
         handle.close()
-        raise WakeWordInUse("Wake-word microphone is already owned.") from e
+        raise WakeWordInUse(
+            "Wake-word microphone is already owned. "
+            "Another Hermes instance or application (Teams, Discord, Zoom, etc.) "
+            "may be holding the microphone. Close other apps or run: "
+            "hermes config set wake_word.enabled false"
+        ) from e
     return handle
 
 
@@ -1146,29 +1158,77 @@ def start_listening(
     if owner is None:
         raise ValueError("wake-word owner must not be None")
 
+    # Resolve retry config
+    _cfg = config if config is not None else load_wake_word_config()
+    retry_on = bool(_cfg.get("retry_on_busy", _RETRY_ON_BUSY_DEFAULT))
+    retry_interval = max(1, int(_cfg.get("retry_interval", _RETRY_INTERVAL_SECONDS)))
+    retry_max = max(0, int(_cfg.get("retry_max_attempts", _RETRY_MAX_ATTEMPTS_DEFAULT)))
+
     global _detector, _detector_owner, _detector_file_lock
-    with _detector_lock:
-        if _detector is not None:
-            if _detector_owner is not owner:
-                raise WakeWordInUse("Wake-word microphone is already owned.")
-            _detector.on_wake = on_wake
-            _detector.resume()
-            return _detector
+    attempt = 0
+    while True:
+        attempt += 1
+        with _detector_lock:
+            if _detector is not None:
+                if _detector_owner is not owner:
+                    # Detector held by another surface — fall through to
+                    # the retry gate below (handles logging + max attempts).
+                    pass
+                else:
+                    _detector.on_wake = on_wake
+                    _detector.resume()
+                    return _detector
+        # Sleep outside the detector_lock so other threads can proceed
+        with _detector_lock:
+            held_by_other = _detector is not None and _detector_owner is not owner
+        if retry_on and held_by_other:
+            if retry_max and attempt > retry_max:
+                raise WakeWordInUse(
+                    "Wake-word microphone is already owned and retry limit "
+                    f"({retry_max}) reached. Run: hermes config set "
+                    "wake_word.enabled false"
+                )
+            logger.info(
+                "wake word: mic held by another surface — retrying "
+                "in %ds (attempt %d%s)",
+                retry_interval, attempt,
+                f"/{retry_max}" if retry_max else "",
+            )
+            time.sleep(retry_interval)
+            continue
+        if held_by_other:
+            # retry_on is False — fail immediately with actionable message
+            raise WakeWordInUse(
+                "Wake-word microphone is already owned by another "
+                "surface in this process (e.g. desktop app + CLI)."
+            )
         lock_handle = _acquire_machine_lock()
         try:
-            cfg = config if config is not None else load_wake_word_config()
-            engine = _build_engine(cfg)
+            _cfg = config if config is not None else load_wake_word_config()
+            engine = _build_engine(_cfg)
             detector = WakeWordDetector(
                 engine,
                 on_wake,
                 on_failure=_detector_failed,
-                input_device=_input_device(cfg),
+                input_device=_input_device(_cfg),
             )
             _detector = detector
             _detector_owner = owner
             _detector_file_lock = lock_handle
             detector.start()
             return detector
+        except WakeWordInUse:
+            if retry_on and (retry_max == 0 or attempt <= retry_max):
+                logger.info(
+                    "wake word: mic busy — retrying in %ds (attempt %d%s)",
+                    retry_interval, attempt,
+                    f"/{retry_max}" if retry_max else "",
+                )
+                _release_machine_lock(lock_handle)
+                time.sleep(retry_interval)
+                continue  # retry the outer loop
+            _release_machine_lock(lock_handle)
+            raise
         except Exception:
             if _detector is not None:
                 try:
