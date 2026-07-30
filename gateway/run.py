@@ -15616,19 +15616,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _auto_reset_pending
             and self._auto_resume_contextual_reset_enabled()
         )
-        if (
+        # Completion/watch events re-enter through ``handle_message`` as
+        # ``internal`` events.  They still need their own cascading turn, but
+        # must not make (or consume) the user's contextual-resume decision.
+        # In particular, returning here used to silently drop those events.
+        _defer_contextual_reset_decision_for_internal_event = bool(
             _auto_reset_pending
             and _is_internal_event
             and _auto_reset_reason in {"idle", "daily"}
             and _auto_reset_previous_session_id
             and _contextual_auto_resume_enabled
-        ):
-            return ""
+        )
         _was_auto_reset = _auto_reset_pending
         _auto_resumed_previous = False
         if _was_auto_reset:
             if (
-                _auto_reset_reason in {"idle", "daily"}
+                not _defer_contextual_reset_decision_for_internal_event
+                and _auto_reset_reason in {"idle", "daily"}
                 and _auto_reset_previous_session_id
                 and _contextual_auto_resume_enabled
                 and (
@@ -15733,7 +15737,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
-        if _was_auto_reset:
+        if (
+            _was_auto_reset
+            and not _defer_contextual_reset_decision_for_internal_event
+        ):
             # Treat auto-reset as a full conversation boundary — clear every
             # conversation-scoped per-session dict in one funnel call so the
             # fresh session does not inherit the previous conversation's
@@ -15755,7 +15762,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_entry.created_at == session_entry.updated_at
             or _was_auto_reset
             or getattr(session_entry, "is_fresh_reset", False)
-        ) and not _auto_resumed_previous
+        ) and not (
+            _auto_resumed_previous
+            or _defer_contextual_reset_decision_for_internal_event
+        )
         # Consume the is_fresh_reset flag immediately so it doesn't leak
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
@@ -15803,7 +15813,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # If the previous session expired and was auto-reset, deliver a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
-        if _was_auto_reset:
+        if (
+            _was_auto_reset
+            and not _defer_contextual_reset_decision_for_internal_event
+        ):
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
             if reset_reason == "suspended":
                 context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"

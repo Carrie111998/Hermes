@@ -196,7 +196,15 @@ async def test_ineligible_reset_keeps_fresh_session(
 
 
 @pytest.mark.asyncio
-async def test_internal_event_leaves_reset_decision_for_user(monkeypatch):
+async def test_internal_completion_cascades_without_committing_reset_decision(
+    monkeypatch,
+):
+    """A completion gets its own turn; the next user message still decides.
+
+    Internal completion/watch events are routed back through handle_message.
+    They must not be dropped just because an idle/daily reset is waiting for a
+    contextual user follow-up, nor may they consume that user-facing choice.
+    """
     entry = _entry()
     runner, store = _runner(entry)
     monkeypatch.setattr(
@@ -205,13 +213,33 @@ async def test_internal_event_leaves_reset_decision_for_user(monkeypatch):
         lambda: {"session_reset": {"auto_resume_previous_if_contextual": True}},
     )
 
-    result = await runner._handle_message_with_agent(
-        _event("Please continue", internal=True), _source(), SESSION_KEY, 1
+    def stop_after_context_construction(*_args, **_kwargs):
+        raise StopAfterResetDecision
+
+    monkeypatch.setattr(
+        gateway_run, "build_session_context", stop_after_context_construction
     )
 
-    assert result == ""
+    with pytest.raises(StopAfterResetDecision):
+        await runner._handle_message_with_agent(
+            _event("[async delegation completed]", internal=True),
+            _source(),
+            SESSION_KEY,
+            1,
+        )
+
+    # Reaching context construction proves this was not an empty early return.
+    # Keep the decision pending for the next actual user message.
     assert entry.was_auto_reset is True
     store.switch_session.assert_not_awaited()
+
+    # The following user message can still make the deferred resume decision.
+    with pytest.raises(StopAfterResetDecision):
+        await runner._handle_message_with_agent(
+            _event("Please continue"), _source(), SESSION_KEY, 2
+        )
+
+    store.switch_session.assert_awaited_once_with(SESSION_KEY, "previous")
 
 
 @pytest.mark.parametrize(
