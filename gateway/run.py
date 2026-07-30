@@ -5273,8 +5273,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # tail.  Enqueue puts new items in the slot when free, otherwise in
     # the overflow.  Promotion (called after each run's drain) moves the
     # next overflow item into the slot so the following recursion picks
-    # it up.  Clearing happens on /new and /reset via
-    # _handle_reset_command.
+    # it up.  Clearing happens on /new, /reset, and /stop via
+    # _interrupt_and_clear_session.
 
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Append a /queue event to the FIFO chain for a session."""
@@ -19940,6 +19940,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         if _iac_state is not None:
+            # Refused cross-sender turns and /queue overflow live outside the
+            # adapter's single pending slot and must share /stop discard semantics.
+            _iac_state.conversation.queued_events.clear()
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
             self._release_running_agent_state(session_key)

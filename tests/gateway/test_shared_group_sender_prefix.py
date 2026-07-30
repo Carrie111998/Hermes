@@ -644,6 +644,27 @@ def test_get_pending_message_only_consumes_and_never_promotes_fifo():
 
 
 @pytest.mark.asyncio
+async def test_stop_consumes_adapter_head_and_refused_runner_fifo():
+    """Stopping a session must discard every queued turn, including refusals."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:stop-discard"
+    alice = _photo_event(_alice_source(), "/tmp/a.jpg", message_id="a")
+    bob = _photo_event(_bob_source(), "/tmp/b.jpg", message_id="b")
+    adapter._pending_messages[session_key] = alice
+    runner._enqueue_fifo(session_key, bob, adapter)
+
+    await runner._interrupt_and_clear_session(
+        session_key,
+        alice.source,
+        interrupt_reason="test-stop",
+        invalidation_reason="test-stop",
+    )
+
+    assert session_key not in adapter._pending_messages
+    assert runner._queue_depth(session_key, adapter=adapter) == 0
+
+
+@pytest.mark.asyncio
 async def test_refused_events_live_only_in_runner_fifo_not_adapter_reset_state():
     """Adapter discard paths must not leave refusal work that can resurrect."""
     runner, adapter = _runner_with_adapter()
