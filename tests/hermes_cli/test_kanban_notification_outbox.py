@@ -189,7 +189,9 @@ def test_ordered_lease_keeps_a_pending_tail_behind_an_active_head(outbox_db):
         contender.close()
 
 
-def test_staged_snapshot_omits_unused_task_and_event_fields(outbox_db):
+def test_staged_snapshot_preserves_raw_session_and_omits_unused_event_fields(
+    outbox_db,
+):
     conn, _task_id, _subscription_id = outbox_db
     task_id = kb.create_task(
         conn,
@@ -229,10 +231,45 @@ def test_staged_snapshot_omits_unused_task_and_event_fields(outbox_db):
         "title": "minimal snapshot",
         "assignee": "worker",
         "result": None,
+        "session_id": "unused-session-marker",
     }
     assert snapshot["event_payload"] == {"status": "visible"}
-    assert "unused-session-marker" not in row["payload"]
     assert "unused-event-marker" not in row["payload"]
+
+
+def test_staged_block_loop_snapshot_preserves_reason_and_recurrences(outbox_db):
+    conn, task_id, subscription_id = outbox_db
+    kb._append_event(
+        conn,
+        task_id,
+        "block_loop_detected",
+        {
+            "reason": "approval keeps bouncing",
+            "recurrences": 2,
+            "debug_context": "must-not-leak",
+        },
+    )
+
+    old_cursor, new_cursor = kb.stage_unseen_notifications_for_sub(
+        conn,
+        subscription_id=subscription_id,
+        kinds=["block_loop_detected"],
+        action_kinds=["block_loop_detected"],
+    )
+    assert new_cursor > old_cursor
+
+    row = conn.execute(
+        "SELECT payload FROM kanban_notification_outbox "
+        "WHERE subscription_id = ?",
+        (subscription_id,),
+    ).fetchone()
+    snapshot = json.loads(row["payload"])
+    assert snapshot["kind"] == "block_loop_detected"
+    assert snapshot["event_payload"] == {
+        "reason": "approval keeps bouncing",
+        "recurrences": 2,
+    }
+    assert "must-not-leak" not in row["payload"]
 
 
 def test_crash_expiry_does_not_charge_unsent_batch_actions(outbox_db):

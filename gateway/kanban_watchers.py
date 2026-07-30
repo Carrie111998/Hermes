@@ -19,6 +19,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
+from agent.i18n import t
+
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
@@ -166,8 +168,14 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
-        NOTIFICATION_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
+        NOTIFICATION_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "block_loop_detected",
+        )
+        WAKE_KINDS = {
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+        }
         MAX_ACTIONS_PER_ROUTE_PER_TICK = 100
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
@@ -231,6 +239,26 @@ class GatewayKanbanWatchersMixin:
                             )
                             continue
                         seen_db_paths.add(resolved_db_path)
+                        # Zero-subscription early exit: probe the board with a
+                        # cheap read-only connection BEFORE the writable
+                        # `connect()`. A board with no subscriptions has
+                        # nothing to notify, and the writable open (schema
+                        # init/migration on first open, WAL/-shm sidecars,
+                        # checkpoint traffic) is exactly the per-tick cost
+                        # this skip avoids.
+                        try:
+                            if _kb.count_notify_subs(board=slug) == 0:
+                                logger.debug(
+                                    "kanban notifier: board %s has no subscriptions; skipping open",
+                                    slug,
+                                )
+                                continue
+                        except Exception as exc:
+                            logger.debug(
+                                "kanban notifier: read-only subscription probe failed "
+                                "for board %s (%s); falling back to writable open",
+                                slug, exc,
+                            )
                         try:
                             conn = _kb.connect(board=slug)
                         except Exception as exc:
@@ -253,41 +281,74 @@ class GatewayKanbanWatchersMixin:
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
-                                platform_name = (sub.get("platform") or "").lower()
                                 try:
-                                    platform = _Platform(platform_name)
-                                except ValueError:
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s has unknown platform %s",
-                                        sub.get("task_id"), platform_name or "<missing>",
+                                    platform_name = (
+                                        sub.get("platform") or ""
+                                    ).lower()
+                                    try:
+                                        platform = _Platform(platform_name)
+                                    except ValueError:
+                                        logger.debug(
+                                            "kanban notifier: subscription for %s has unknown platform %s",
+                                            sub.get("task_id"),
+                                            platform_name or "<missing>",
+                                        )
+                                        continue
+                                    route_profile = (
+                                        sub.get("notifier_profile")
+                                        or notifier_profile
                                     )
-                                    continue
-                                route_profile = sub.get("notifier_profile") or notifier_profile
-                                if _notification_adapter(platform, route_profile) is None:
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s on %s profile %s skipped; adapter not connected",
-                                        sub.get("task_id"), platform_name, route_profile,
+                                    if (
+                                        _notification_adapter(
+                                            platform, route_profile,
+                                        )
+                                        is None
+                                    ):
+                                        logger.debug(
+                                            "kanban notifier: subscription for %s on %s profile %s skipped; adapter not connected",
+                                            sub.get("task_id"),
+                                            platform_name,
+                                            route_profile,
+                                        )
+                                        continue
+                                    old_cursor, cursor = (
+                                        _kb.stage_unseen_notifications_for_sub(
+                                            conn,
+                                            subscription_id=sub[
+                                                "subscription_id"
+                                            ],
+                                            kinds=TERMINAL_KINDS,
+                                            action_kinds=NOTIFICATION_KINDS,
+                                        )
                                     )
-                                    continue
-                                old_cursor, cursor = _kb.stage_unseen_notifications_for_sub(
-                                    conn,
-                                    subscription_id=sub["subscription_id"],
-                                    kinds=TERMINAL_KINDS,
-                                    action_kinds=NOTIFICATION_KINDS,
-                                )
-                                task = _kb.get_task(conn, sub["task_id"])
-                                logger.debug(
-                                    "kanban notifier: staged %s on board %s cursor %s→%s",
-                                    sub["task_id"], slug, old_cursor, cursor,
-                                )
-                                deliveries.append({
-                                    "sub": sub,
-                                    "old_cursor": old_cursor,
-                                    "cursor": cursor,
-                                    "task": task,
-                                    "board": slug,
-                                    "lease_seconds": _kb.NOTIFICATION_LEASE_SECONDS,
-                                })
+                                    task = _kb.get_task(conn, sub["task_id"])
+                                    logger.debug(
+                                        "kanban notifier: staged %s on board %s cursor %s→%s",
+                                        sub["task_id"],
+                                        slug,
+                                        old_cursor,
+                                        cursor,
+                                    )
+                                    deliveries.append({
+                                        "sub": sub,
+                                        "old_cursor": old_cursor,
+                                        "cursor": cursor,
+                                        "task": task,
+                                        "board": slug,
+                                        "lease_seconds": (
+                                            _kb.NOTIFICATION_LEASE_SECONDS
+                                        ),
+                                    })
+                                except Exception as exc:
+                                    # A malformed or corrupt subscription
+                                    # cannot starve every healthy route on the
+                                    # board for this tick.
+                                    logger.warning(
+                                        "kanban notifier: failed to stage subscription %s on board %s: %s",
+                                        sub.get("task_id"),
+                                        slug,
+                                        exc,
+                                    )
                         finally:
                             conn.close()
                     return deliveries
@@ -411,6 +472,25 @@ class GatewayKanbanWatchersMixin:
                             if event_payload and event_payload.get("status"):
                                 new_status = str(event_payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                        elif kind == "block_loop_detected":
+                            # A task re-blocked for the same cause past the
+                            # recurrence limit and was routed to `triage` for a
+                            # human decision. This is the ONE transition that
+                            # exists to force human attention, yet it emits no
+                            # `blocked`/`status` event — so before adding it to
+                            # TERMINAL_KINDS it produced zero notification and
+                            # the task stalled in triage silently. Ping loudly.
+                            reason = ""
+                            recurrences = None
+                            if isinstance(event_payload, dict):
+                                if event_payload.get("reason"):
+                                    reason = f": {str(event_payload['reason'])[:160]}"
+                                recurrences = event_payload.get("recurrences")
+                            rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
+                            msg = (
+                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
+                                f" — needs a human decision{rc}{reason}"
+                            )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -419,49 +499,88 @@ class GatewayKanbanWatchersMixin:
                             # archive needs no user ping, and unblocked is an
                             # internal transition.
                             continue
-                        metadata: dict[str, Any] = {}
-                        if sub.get("thread_id"):
+                        delivery_metadata = sub.get("delivery_metadata")
+                        metadata: dict[str, Any] = (
+                            dict(delivery_metadata)
+                            if isinstance(delivery_metadata, dict)
+                            else {}
+                        )
+                        if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        from gateway.wake import adapter_supports_push, deliver_wake
+
+                        is_push_adapter = adapter_supports_push(adapter)
+                        session_key = str(
+                            getattr(notification_task, "session_id", None) or ""
+                        )
+                        wake_text = msg
+                        if kind in WAKE_KINDS:
+                            wake_status = t(f"gateway.kanban.wake.{kind}")
+                            wake_text = t(
+                                "gateway.kanban.wake.message",
+                                task_id=sub["task_id"],
+                                status=wake_status,
+                                title=title,
+                                assignee=who or "",
+                                board=board_slug,
+                            )
                         send_error: Optional[str] = None
-                        # An exception from ``adapter.send`` occurs after the
-                        # platform attempt began, so it must still be recorded
-                        # through the token-CAS failure path below.
                         send_started = True
                         try:
-                            send_result, send_started = await self._kanban_send_notification_with_lease_heartbeat(
-                                adapter=adapter,
-                                chat_id=sub["chat_id"],
-                                message=msg,
-                                metadata=metadata,
-                                item=item,
-                                board=board_slug,
-                                lease_seconds=d["lease_seconds"],
-                            )
-                            if not isinstance(send_result, _SendResult):
-                                send_error = (
-                                    "adapter.send() did not return the required SendResult"
+                            if is_push_adapter:
+                                async def _deliver_push():
+                                    return await adapter.send(
+                                        sub["chat_id"], msg, metadata=metadata,
+                                    )
+
+                                send_result, send_started = await self._kanban_send_notification_with_lease_heartbeat(
+                                    delivery=_deliver_push,
+                                    item=item,
+                                    board=board_slug,
+                                    lease_seconds=d["lease_seconds"],
                                 )
-                            elif not send_result.success:
-                                send_error = send_result.error or "platform rejected notification"
+                                if not isinstance(send_result, _SendResult):
+                                    send_error = "adapter.send() did not return the required SendResult"
+                                elif not send_result.success:
+                                    send_error = send_result.error or "platform rejected notification"
+                            elif kind not in WAKE_KINDS:
+                                # Stateless adapters have no push channel and
+                                # current-main intentionally wakes only the
+                                # terminal kinds above. A status-only action is
+                                # therefore an explicit no-op delivery.
+                                pass
+                            elif not session_key:
+                                send_error = "non-push adapter has no raw task session_id for wake delivery"
+                            else:
+                                async def _deliver_nonpush_wake():
+                                    await deliver_wake(
+                                        adapter,
+                                        text=wake_text,
+                                        session_id=session_key,
+                                    )
+
+                                _, send_started = await self._kanban_send_notification_with_lease_heartbeat(
+                                    delivery=_deliver_nonpush_wake,
+                                    item=item,
+                                    board=board_slug,
+                                    lease_seconds=d["lease_seconds"],
+                                )
                         except Exception as exc:
                             send_error = str(exc) or exc.__class__.__name__
 
                         if not send_started:
-                            # No platform call began because the initial
-                            # token-CAS renewal did not establish ownership.
-                            # Do not spend a delivery attempt; expiry leaves
-                            # the row safely recoverable by a later watcher.
+                            # No delivery call began because the initial token-CAS
+                            # renewal did not establish ownership. Leave the lease
+                            # recoverable without consuming a durable attempt.
                             logger.warning(
-                                "kanban notifier: could not establish lease before sending %s event %s on board %s",
+                                "kanban notifier: could not establish lease before delivering %s event %s on board %s",
                                 sub["task_id"], item["event_id"], board_slug,
                             )
                             break
 
                         if send_error is None:
                             acknowledged = await asyncio.to_thread(
-                                self._kanban_ack_notification,
-                                item,
-                                board_slug,
+                                self._kanban_ack_notification, item, board_slug,
                             )
                             if not acknowledged:
                                 logger.warning(
@@ -469,6 +588,40 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], item["event_id"], board_slug,
                                 )
                                 break
+                            if (
+                                is_push_adapter
+                                and session_key
+                                and kind in WAKE_KINDS
+                            ):
+                                try:
+                                    from gateway.session import SessionSource
+
+                                    chat_type = str(sub.get("chat_type") or "").strip()
+                                    if not chat_type and isinstance(delivery_metadata, dict):
+                                        chat_type = str(
+                                            delivery_metadata.get("chat_type") or ""
+                                        ).strip()
+                                    source = SessionSource(
+                                        platform=plat,
+                                        chat_id=sub["chat_id"],
+                                        chat_type=chat_type or "group",
+                                        thread_id=sub.get("thread_id") or None,
+                                        user_id=sub.get("user_id"),
+                                        profile=sub_profile or None,
+                                    )
+                                    await deliver_wake(
+                                        adapter,
+                                        text=wake_text,
+                                        session_id=session_key,
+                                        source=source,
+                                    )
+                                except Exception as wake_exc:
+                                    # The push notification has already been ACKed;
+                                    # wake injection is intentionally best-effort.
+                                    logger.warning(
+                                        "kanban notifier: wakeup injection failed for %s: %s",
+                                        sub["task_id"], wake_exc, exc_info=True,
+                                    )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -482,7 +635,7 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if is_push_adapter and kind == "completed":
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
@@ -573,26 +726,24 @@ class GatewayKanbanWatchersMixin:
     async def _kanban_send_notification_with_lease_heartbeat(
         self,
         *,
-        adapter,
-        chat_id: str,
-        message: str,
-        metadata: dict[str, Any],
+        delivery,
         item: dict,
         board: Optional[str],
         lease_seconds: int,
     ) -> tuple[Any, bool]:
-        """Send one notification while retaining its token-owned lease.
+        """Run one notification delivery while retaining its token-owned lease.
 
         This prevents another watcher from reclaiming a slow in-flight send.
         The platform still cannot atomically acknowledge its own delivery and
         this SQLite row, so a crash after platform acceptance but before the
         durable ACK remains intentionally at-least-once.
 
-        The second return value tells the caller whether ``adapter.send`` was
-        started. A pre-send renewal failure must not consume an attempt. Once
-        sending has started, the caller always resolves success or failure by
-        token-CAS: a heartbeat renewal error is uncertain ownership, while the
-        ACK/fail CAS is the authoritative ownership decision.
+        ``delivery`` is either a push ``adapter.send`` call or the raw-session
+        wake used by a non-push adapter. The second return value tells the
+        caller whether that actual delivery began. A pre-delivery renewal
+        failure must not consume an attempt. Once delivery has started, the
+        caller always resolves success or failure by token-CAS: a heartbeat
+        renewal error is uncertain ownership, while ACK/fail is authoritative.
         """
         stop_heartbeat = asyncio.Event()
         heartbeat_interval = max(0.25, min(float(lease_seconds) / 3, 20.0))
@@ -647,7 +798,7 @@ class GatewayKanbanWatchersMixin:
 
         heartbeat_task = asyncio.create_task(heartbeat())
         try:
-            result = await adapter.send(chat_id, message, metadata=metadata)
+            result = await delivery()
         finally:
             stop_heartbeat.set()
             await heartbeat_task

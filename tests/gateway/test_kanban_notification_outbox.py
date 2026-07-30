@@ -748,7 +748,9 @@ def test_partial_batch_keeps_acknowledged_actions_and_recovers_later_failure(
         conn.close()
 
 
-def test_terminal_notification_never_injects_a_sessionless_wake(tmp_path, monkeypatch):
+def test_push_notification_ack_survives_best_effort_wake_failure(
+    tmp_path, monkeypatch,
+):
     db_path = tmp_path / "notify-only.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -758,7 +760,7 @@ def test_terminal_notification_never_injects_a_sessionless_wake(tmp_path, monkey
             conn,
             title="notify only",
             assignee="worker",
-            session_id="session-that-must-not-wake",
+            session_id="session-to-wake",
         )
         kb.add_notify_sub(
             conn,
@@ -773,7 +775,7 @@ def test_terminal_notification_never_injects_a_sessionless_wake(tmp_path, monkey
     adapter = NoWakeAdapter([SendResult(success=True)])
     asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
 
-    assert adapter.wake_calls == 0
+    assert adapter.wake_calls == 1
     assert len(adapter.sent) == 1
 
     adapter = ResultAdapter([])

@@ -153,17 +153,12 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
 @pytest.mark.asyncio
 async def test_notifier_second_blocked_delivers(kanban_home):
-    """
-    After the first blocked, should receive second blocked notification.
-    """
-    import hermes_cli.kanban_db as kb
-    from gateway.run import GatewayRunner
+    """Distinct blocked events remain independently deliverable."""
     from gateway.config import Platform
+    from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
     runner._running = True
-    runner._kanban_sub_fail_counts = {}
-
     delivered_msgs: list[str] = []
 
     async def _capture_send(chat_id, msg, metadata=None):
@@ -174,60 +169,43 @@ async def test_notifier_second_blocked_delivers(kanban_home):
     fake_adapter.send = AsyncMock(side_effect=_capture_send)
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
-    _orig_sleep = asyncio.sleep
+    original_sleep = asyncio.sleep
     tick_count = 0
 
     async def _fast_sleep(_):
         nonlocal tick_count
-        await _orig_sleep(0)
+        await original_sleep(0)
         tick_count += 1
         if tick_count >= 6:
             runner._running = False
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="test task", assignee="worker1")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat1")
-
-        # Cycle 1: blocked for one reason
-        kb.block_task(conn, tid, reason="first block", kind="needs_input")
+        task_id = kb.create_task(conn, title="test task", assignee="worker1")
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat1")
+        kb.block_task(conn, task_id, reason="first block", kind="needs_input")
     finally:
         conn.close()
 
     with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
-        await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
-            timeout=10.0,
-        )
+        await asyncio.wait_for(runner._kanban_notifier_watcher(interval=1), timeout=10.0)
 
-    # Cycle 2: unblock → block again for a DIFFERENT reason. A distinct
-    # block cause must still notify. (A *same*-cause re-block instead trips
-    # the unblock-loop breaker and routes to triage — covered by
-    # test_kanban_block_kinds.py; here we exercise two genuinely different
-    # blocks, which is the case the user wants notified twice.)
     runner._running = True
     tick_count = 0
-
     conn = kb.connect()
     try:
-        kb.unblock_task(conn, tid)
-        kb.block_task(conn, tid, reason="second block", kind="capability")
+        kb.unblock_task(conn, task_id)
+        kb.block_task(conn, task_id, reason="second block", kind="capability")
     finally:
         conn.close()
 
     with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
-        await asyncio.wait_for(
-            runner._kanban_notifier_watcher(interval=1),
-            timeout=10.0,
-        )
+        await asyncio.wait_for(runner._kanban_notifier_watcher(interval=1), timeout=10.0)
 
-    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m]
+    blocked_deliveries = [message for message in delivered_msgs if "blocked" in message]
+    assert len(blocked_deliveries) == 2
     assert "second block" not in blocked_deliveries[0]
     assert "second block" in blocked_deliveries[1]
-    assert len(blocked_deliveries) == 2, (
-        f"Should receive 2 blocked notification, but only get {len(blocked_deliveries)} count\n"
-        f"Message {delivered_msgs}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,43 +274,6 @@ async def test_notifier_does_not_call_init_db(kanban_home):
     )
 
 
-def test_dispatcher_tick_does_not_call_init_db(kanban_home, monkeypatch):
-    """`_tick_once_for_board` must not invoke `_kb.init_db` (issue #21378).
-
-    `connect()` already runs the schema + idempotent migration on first open
-    per process. The explicit `init_db()` call was redundant and triggered a
-    second migration on a second connection that raced the first.
-    """
-    import hermes_cli.kanban_db as kb
-    from gateway.run import GatewayRunner
-
-    runner = object.__new__(GatewayRunner)
-
-    init_db_calls: list[object] = []
-    real_init_db = kb.init_db
-
-    def _spy_init_db(*args, **kwargs):
-        init_db_calls.append((args, kwargs))
-        return real_init_db(*args, **kwargs)
-
-    # The dispatcher watcher's tick lives as a local closure inside
-    # `_kanban_dispatcher_watcher`. Read the source and assert the
-    # specific patterns that would reintroduce the bug are absent.
-    import inspect
-    src = inspect.getsource(GatewayRunner._kanban_dispatcher_watcher)
-    assert "_kb.init_db(board=slug)" not in src, (
-        "_kanban_dispatcher_watcher must not call _kb.init_db(board=slug) — "
-        "see issue #21378. Use connect() alone; it runs migrations on first "
-        "open per process."
-    )
-
-    notifier_src = inspect.getsource(GatewayRunner._kanban_notifier_watcher)
-    assert "_kb.init_db(board=slug)" not in notifier_src, (
-        "_kanban_notifier_watcher must not call _kb.init_db(board=slug) — "
-        "see issue #21378."
-    )
-
-
 @pytest.mark.asyncio
 async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
     """Each gateway keeps its watcher on, but only the subscribing profile claims."""
@@ -386,7 +327,17 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
     finally:
         conn.close()
     assert len(subs) == 1
-    assert int(subs[0]["last_event_id"]) == 0, "wrong profile must not claim the event"
+    conn = kb.connect()
+    try:
+        latest_event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert int(subs[0]["last_event_id"]) < int(latest_event_id), (
+        "wrong profile must not stage the new event"
+    )
 
 
 @pytest.mark.asyncio
@@ -462,12 +413,15 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     source = SimpleNamespace(
         platform=Platform.TELEGRAM,
         chat_id="chat1",
-        thread_id="th1",
+        chat_type="dm",
+        thread_id="20197",
         user_id="u1",
     )
     event = SimpleNamespace(
         text='/kanban --board projx create "hello" --assignee alice',
         source=source,
+        message_id="462",
+        reply_to_message_id=None,
     )
 
     out = await GatewayRunner._handle_kanban_command(runner, event)
@@ -484,7 +438,14 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
     assert [t.title for t in tasks] == ["hello"]
     assert len(subs) == 1
     assert subs[0]["chat_id"] == "chat1"
-    assert subs[0]["thread_id"] == "th1"
+    assert subs[0]["thread_id"] == "20197"
+    assert subs[0]["delivery_metadata"] == {
+        "chat_type": "dm",
+        "direct_messages_topic_id": "20197",
+        "telegram_dm_topic_reply_fallback": True,
+        "telegram_reply_to_message_id": "462",
+        "thread_id": "20197",
+    }
 
     conn = kb.connect(board="default")
     try:

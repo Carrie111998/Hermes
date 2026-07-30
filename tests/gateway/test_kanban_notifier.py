@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from pathlib import Path
 
 
@@ -13,10 +14,14 @@ _REAL_ASYNCIO_SLEEP = asyncio.sleep
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
         return SendResult(success=True, message_id="m-1")
+
+    async def handle_message(self, event):
+        self.handled.append(event)
 
 
 class DisconnectedAdapters(dict):
@@ -69,6 +74,92 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
+    db_path = tmp_path / "dm-topic-metadata.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="dm topic task",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="20197",
+            delivery_metadata={
+                "chat_type": "dm",
+                "direct_messages_topic_id": "20197",
+                "telegram_dm_topic_reply_fallback": True,
+                "telegram_reply_to_message_id": "462",
+                "thread_id": "20197",
+            },
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["metadata"] == {
+        "chat_type": "dm",
+        "direct_messages_topic_id": "20197",
+        "telegram_dm_topic_reply_fallback": True,
+        "telegram_reply_to_message_id": "462",
+        "thread_id": "20197",
+    }
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.chat_type == "dm"
+    assert adapter.handled[0].source.thread_id == "20197"
+
+
+def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
+    """A sub stamped with the gateway's own named profile uses self.adapters.
+
+    Regression for #71340: on a standalone (non-multiplex) gateway running a
+    named profile, _authorization_adapter() used to treat the active name as a
+    multiplex secondary, find no _profile_adapters entry, fail closed, and
+    rewind the claim forever — silent zero-delivery.
+    """
+    db_path = tmp_path / "actionable-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    reason = "AGE-39 — https://linear.example/AGE-39 — publishing verified."
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="approval", assignee="publisher")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            notifier_profile="main",
+        )
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "main"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert tid in message
+    assert "blocked" in message
 
 
 def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):
@@ -130,7 +221,11 @@ def test_kanban_notifier_leaves_events_unstaged_until_an_adapter_reconnects(
             "WHERE subscription_id = ?",
             (sub["subscription_id"],),
         ).fetchone()
-        assert int(sub["last_event_id"]) == 0
+        latest_event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0]
+        assert int(sub["last_event_id"]) < int(latest_event_id)
         assert row is None
     finally:
         conn.close()
@@ -204,6 +299,46 @@ def test_kanban_notifier_persists_retry_on_send_exception(tmp_path, monkeypatch)
         conn.close()
 
 
+class ReportedFailureAdapter:
+    """Adapter that REPORTS failure via SendResult(success=False) instead of
+    raising — the exact contract the Telegram adapter uses for 'Not connected'
+    and degraded-send paths."""
+
+    def __init__(self):
+        self.attempts = 0
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        return SendResult(success=False, error="Not connected")
+
+
+def test_kanban_notifier_persists_retry_on_reported_send_failure(tmp_path, monkeypatch):
+    """A reported SendResult failure is as durable as a raised send error."""
+    db_path = tmp_path / "reported-send-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = ReportedFailureAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.attempts >= 1
+    conn = kb.connect()
+    try:
+        sub = kb.list_notify_subs(conn, tid)[0]
+        row = conn.execute(
+            "SELECT state, attempts FROM kanban_notification_outbox "
+            "WHERE subscription_id = ?",
+            (sub["subscription_id"],),
+        ).fetchone()
+        assert row["state"] == "pending"
+        assert row["attempts"] == 1
+    finally:
+        conn.close()
+
+
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     """A retry cycle (crashed → reclaimed → crashed) notifies the user twice.
 
@@ -266,6 +401,48 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     assert "crashed" in adapter.sent[1]["text"].lower()
 
 
+def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
+    db_path = tmp_path / "chat-type-wakeup.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="dm requester",
+            assignee="worker",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-dm",
+            chat_type="dm",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.chat_type == "dm"
+
+    # The wake must resume the creator's real DM session key — the whole bug
+    # was that a hardcoded chat_type="group" made build_session_key() produce
+    # a group-scoped key (a NEW session) instead of the ":dm:<chat_id>" shape
+    # the original conversation runs under (#56580 / #68874).
+    from gateway.session import build_session_key
+
+    wake_key = build_session_key(adapter.handled[0].source)
+    assert wake_key == "agent:main:telegram:dm:chat-dm"
+    assert ":group:" not in wake_key
+
+
 def test_notifier_owning_profile_adapter_never_falls_back_to_default(
     tmp_path, monkeypatch,
 ):
@@ -277,9 +454,11 @@ def test_notifier_owning_profile_adapter_never_falls_back_to_default(
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="owned by beta", assignee="worker")
-        # Subscription is owned by profile "beta".
         kb.add_notify_sub(
-            conn, task_id=tid, platform="telegram", chat_id="chat-beta",
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-beta",
             notifier_profile="beta",
         )
         kb.complete_task(conn, tid, summary="done")
@@ -291,16 +470,12 @@ def test_notifier_owning_profile_adapter_never_falls_back_to_default(
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
     runner._kanban_notifier_profile = "default"
-    # Default profile has a telegram adapter …
     runner.adapters = {Platform.TELEGRAM: default_adapter}
-    # Profile "beta" has a different adapter but no Telegram route. Its
-    # Telegram subscription must not borrow the default profile's bot.
     runner._profile_adapters = {"beta": {Platform.DISCORD: other_adapter}}
     runner._kanban_sub_fail_counts = {}
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # The default profile's adapter must never receive beta's notification.
     assert default_adapter.sent == [], (
         "Owning-profile subscription must not fall back to the default "
         f"profile's adapter; got {default_adapter.sent!r}"
@@ -316,7 +491,11 @@ def test_notifier_owning_profile_adapter_never_falls_back_to_default(
             "WHERE subscription_id = ?",
             (sub["subscription_id"],),
         ).fetchone()
-        assert int(sub["last_event_id"]) == 0
+        latest_event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?",
+            (tid,),
+        ).fetchone()[0]
+        assert int(sub["last_event_id"]) < int(latest_event_id)
         assert row is None
     finally:
         conn.close()
@@ -415,3 +594,115 @@ def _unseen_terminal_events_for(tid, chat_id):
         return events
     finally:
         conn.close()
+
+
+def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch):
+    """One bad subscription must not block delivery for all others.
+
+    Regression for #59269: when staging an outbox notification raises for one
+    subscription, the entire notifier tick used to abort — silently blocking
+    delivery for every other subscription.
+    """
+    db_path = tmp_path / "isolation.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    # Create two tasks with subscriptions and complete both. The BAD task is
+    # created first: list_notify_subs() has no ORDER BY, so SQLite's natural
+    # scan returns insertion order — the failing subscription must be
+    # processed BEFORE the good one or this test passes even without the
+    # per-subscription isolation (the good delivery happens before the tick
+    # aborts). A deterministic-order shim below removes the reliance on the
+    # scan order entirely.
+    conn = kb.connect()
+    try:
+        tid_bad = kb.create_task(conn, title="bad task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid_bad, platform="telegram", chat_id="chat-bad")
+        kb.complete_task(conn, tid_bad, summary="done")
+
+        tid_good = kb.create_task(conn, title="good task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid_good, platform="telegram", chat_id="chat-good")
+        kb.complete_task(conn, tid_good, summary="done")
+    finally:
+        conn.close()
+
+    original_stage = kb.stage_unseen_notifications_for_sub
+
+    def selective_stage(conn, *, subscription_id, **kwargs):
+        sub = conn.execute(
+            "SELECT task_id FROM kanban_notify_subs WHERE subscription_id = ?",
+            (subscription_id,),
+        ).fetchone()
+        if sub["task_id"] == tid_bad:
+            raise RuntimeError("simulated DB corruption for bad task")
+        return original_stage(conn, subscription_id=subscription_id, **kwargs)
+
+    monkeypatch.setattr(kb, "stage_unseen_notifications_for_sub", selective_stage)
+
+    # Force the failing subscription to be iterated FIRST regardless of the
+    # unordered SELECT's scan order.
+    original_list = kb.list_notify_subs
+
+    def bad_first(conn, task_id=None):
+        subs = original_list(conn, task_id)
+        return sorted(subs, key=lambda s: 0 if s["task_id"] == tid_bad else 1)
+
+    monkeypatch.setattr(kb, "list_notify_subs", bad_first)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # The good task must still be delivered despite the bad task failing.
+    assert len(adapter.sent) == 1
+    assert tid_good in adapter.sent[0]["text"]
+
+
+def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
+    """A `block_loop_detected` event must reach the subscriber as a triage ping.
+
+    Regression for the silent-triage gap (PR #62712): kanban_db routes a task
+    to `triage` after BLOCK_RECURRENCE_LIMIT re-blocks for the same cause and
+    emits ONLY a `block_loop_detected` event — no `blocked`/`status` event.
+    Before `block_loop_detected` joined TERMINAL_KINDS with its own message
+    branch, that one transition (the whole point of which is to force human
+    attention) produced zero notification and the task stalled in triage
+    silently.
+    """
+    db_path = tmp_path / "block-loop.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="loops forever", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn, tid, "block_loop_detected",
+            {"reason": "needs credentials", "kind": "needs_input",
+             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
+    text = adapter.sent[0]["text"]
+    assert "TRIAGE" in text
+    assert tid in text
+    assert "needs credentials" in text
+    # Cursor advanced: the event is claimed and not re-delivered.
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["block_loop_detected"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []

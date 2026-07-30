@@ -1,8 +1,34 @@
-"""Behavior contracts for GatewayRunner's Kanban background watchers."""
+"""Tests for the extracted GatewayKanbanWatchersMixin (god-file Phase 3).
+
+The kanban watcher loops were lifted out of gateway/run.py into a mixin that
+GatewayRunner inherits. These tests confirm the mixin exposes the methods and
+that GatewayRunner picks them up via the MRO (behavior-neutral relocation).
+"""
 
 from __future__ import annotations
 
 import asyncio
+
+from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+KANBAN_METHODS = [
+    "_kanban_notifier_watcher",
+    "_kanban_dispatcher_watcher",
+    "_kanban_lease_next_notification",
+    "_kanban_send_notification_with_lease_heartbeat",
+    "_kanban_renew_notification_lease",
+    "_kanban_ack_notification",
+    "_kanban_fail_notification",
+    "_kanban_unsub",
+    "_deliver_kanban_artifacts",
+]
+
+
+def test_mixin_defines_kanban_methods():
+    for method in KANBAN_METHODS:
+        assert hasattr(GatewayKanbanWatchersMixin, method), (
+            f"mixin missing {method}"
+        )
 
 
 def test_gateway_watchers_honor_the_dispatch_disabled_environment(monkeypatch):
