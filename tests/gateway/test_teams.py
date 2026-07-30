@@ -951,7 +951,60 @@ class TestTeamsMediaAttachments:
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
         adapter._app.send = AsyncMock(return_value=MagicMock(id="msg-001"))
+        adapter._app.reply = AsyncMock(return_value=MagicMock(id="reply-001"))
         return adapter
+
+    @pytest.mark.asyncio
+    async def test_send_image_uses_cron_thread_metadata(self):
+        adapter = self._make_adapter()
+
+        result = await adapter.send_image(
+            "19:abc@thread.v2",
+            "https://example.invalid/image.png",
+            metadata={"thread_id": "1780267076971"},
+        )
+
+        assert result.success
+        adapter._app.reply.assert_awaited_once()
+        assert adapter._app.reply.await_args.args[:2] == (
+            "19:abc@thread.v2",
+            "1780267076971",
+        )
+        adapter._app.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_all_media_methods_forward_thread_metadata(self, tmp_path):
+        adapter = self._make_adapter()
+        metadata = {"thread_id": "1780267076971"}
+        media = tmp_path / "media.bin"
+        media.write_bytes(b"media")
+
+        await adapter.send_image_file(
+            "19:abc@thread.v2",
+            str(media),
+            metadata=metadata,
+        )
+        await adapter.send_video(
+            "19:abc@thread.v2",
+            str(media),
+            metadata=metadata,
+        )
+        await adapter.send_voice(
+            "19:abc@thread.v2",
+            str(media),
+            metadata=metadata,
+        )
+        await adapter.send_document(
+            "19:abc@thread.v2",
+            str(media),
+            metadata=metadata,
+        )
+
+        assert adapter._app.reply.await_count == 4
+        assert {
+            call.args[1] for call in adapter._app.reply.await_args_list
+        } == {"1780267076971"}
+        adapter._app.send.assert_not_awaited()
 
 
     @pytest.mark.asyncio

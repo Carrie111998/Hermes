@@ -1248,6 +1248,8 @@ class TeamsAdapter(BasePlatformAdapter):
         default_mime: str,
         caption: Optional[str] = None,
         media_label: str = "media",
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send any media file/URL as a Teams attachment.
 
@@ -1280,11 +1282,51 @@ class TeamsAdapter(BasePlatformAdapter):
             if caption:
                 activity = activity.add_text(caption)
 
-            conv_ref = self._conv_refs.get(chat_id)
-            if conv_ref:
-                result = await self._app.activity_sender.send(activity, conv_ref)
+            metadata_thread_id = (metadata or {}).get("thread_id")
+            effective_reply_to = (
+                reply_to if reply_to is not None else metadata_thread_id
+            )
+            effective_reply_to = (
+                str(effective_reply_to).strip()
+                if effective_reply_to is not None
+                else None
+            )
+            if effective_reply_to == "0":
+                effective_reply_to = None
+            if (
+                effective_reply_to
+                and not _TEAMS_CONV_ID_RE.fullmatch(effective_reply_to)
+            ):
+                return SendResult(
+                    success=False,
+                    error="Invalid Teams thread activity ID",
+                )
+            metadata_thread_requested = (
+                reply_to is None and bool(effective_reply_to)
+            )
+
+            async def _send_flat():
+                conv_ref = self._conv_refs.get(chat_id)
+                if conv_ref:
+                    return await self._app.activity_sender.send(
+                        activity,
+                        conv_ref,
+                    )
+                return await self._app.send(chat_id, activity)
+
+            if effective_reply_to:
+                try:
+                    result = await self._app.reply(
+                        chat_id,
+                        effective_reply_to,
+                        activity,
+                    )
+                except Exception:
+                    if metadata_thread_requested:
+                        raise
+                    result = await _send_flat()
             else:
-                result = await self._app.send(chat_id, activity)
+                result = await _send_flat()
 
             return SendResult(success=True, message_id=getattr(result, "id", None))
         except Exception as e:
@@ -1305,6 +1347,8 @@ class TeamsAdapter(BasePlatformAdapter):
             default_mime="image/png",
             caption=caption,
             media_label="image",
+            reply_to=reply_to,
+            metadata=metadata,
         )
 
     async def send_image_file(
@@ -1313,6 +1357,7 @@ class TeamsAdapter(BasePlatformAdapter):
         image_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
         return await self.send_image(
@@ -1320,6 +1365,7 @@ class TeamsAdapter(BasePlatformAdapter):
             image_url=image_path,
             caption=caption,
             reply_to=reply_to,
+            metadata=metadata,
         )
 
     async def send_video(
@@ -1337,6 +1383,8 @@ class TeamsAdapter(BasePlatformAdapter):
             default_mime="video/mp4",
             caption=caption,
             media_label="video",
+            reply_to=reply_to,
+            metadata=metadata,
         )
 
     async def send_voice(
@@ -1354,6 +1402,8 @@ class TeamsAdapter(BasePlatformAdapter):
             default_mime="audio/mpeg",
             caption=caption,
             media_label="voice",
+            reply_to=reply_to,
+            metadata=metadata,
         )
 
     async def send_document(
@@ -1372,6 +1422,8 @@ class TeamsAdapter(BasePlatformAdapter):
             default_mime="application/octet-stream",
             caption=caption,
             media_label="document",
+            reply_to=reply_to,
+            metadata=metadata,
         )
 
     async def get_chat_info(self, chat_id: str) -> dict:
