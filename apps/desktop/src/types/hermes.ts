@@ -201,7 +201,10 @@ export interface CustomEndpointValidationResponse {
 
 export interface MessagingEnvVarInfo {
   advanced: boolean
+  current_value?: string
+  default_value?: string
   description: string
+  input_type?: 'boolean' | 'password' | 'text' | 'textarea'
   is_password: boolean
   is_set: boolean
   key: string

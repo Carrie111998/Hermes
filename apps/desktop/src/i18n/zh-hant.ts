@@ -1323,9 +1323,46 @@ export const zhHant = defineLocale({
       WHATSAPP_ALLOWED_USERS: {
         label: '允許的 WhatsApp 使用者',
         help: '建議設定。逗號分隔的電話號碼或 WhatsApp ID。'
-      }
+      },
+      EMAIL_ADDRESS: { label: '電子郵件地址', help: 'Hermes 用於收信與回覆的地址。' },
+      EMAIL_PASSWORD: { label: '應用程式密碼', help: '請使用郵件服務商產生的應用程式密碼，而非帳戶密碼。' },
+      EMAIL_IMAP_HOST: { label: '收件伺服器', help: 'IMAP 主機，例如 imap.gmail.com。' },
+      EMAIL_SMTP_HOST: { label: '寄件伺服器', help: 'SMTP 主機，例如 smtp.gmail.com。' },
+      EMAIL_IMAP_PORT: { label: 'IMAP 連接埠' },
+      EMAIL_SMTP_PORT: { label: 'SMTP 連接埠' },
+      EMAIL_IMAP_SECURITY: { label: 'IMAP 安全方式' },
+      EMAIL_SMTP_SECURITY: { label: 'SMTP 安全方式' },
+      EMAIL_HOME_ADDRESS: { label: '預設投遞地址' }
     },
-    platformIntro: {}
+    platformIntro: {},
+    emailPolicy: {
+      title: '自動回覆策略',
+      description: '在產生或寄出任何回覆前，先決定哪些郵件可以交給 Agent。',
+      categoriesTitle: '郵件類別',
+      categoriesDescription: '推廣、通知等機器產生郵件預設攔截；只有明確開啟後才允許自動回覆。',
+      allowCategory: '允許自動回覆',
+      promotions: '推廣與行銷',
+      newsletters: '電子報與摘要',
+      transactions: '訂單與付款',
+      security: '安全與驗證碼',
+      social: '社交通知',
+      calendar: '行事曆通知',
+      reports: '定期報告',
+      keywordsTitle: '關鍵字規則',
+      keywordsDescription: '關鍵字會先於 Agent 判定；每行是一個可獨立命中的關鍵字群組。',
+      neverReply: '絕不回覆',
+      neverReplyDescription: '命中後一律攔截，即使其他規則要求回覆。',
+      mustReply: '必須回覆',
+      mustReplyDescription: '命中後交給 Agent，並要求產生回覆。',
+      keywordPlaceholder: '每行輸入一個關鍵字群組',
+      keywordSyntax: '用 + 表示群組內所有詞必須同時命中；不同行之間為任一命中。',
+      clearKeywords: '清除關鍵字規則',
+      decisionTitle: 'Agent 判定',
+      strictDecision: '要求結構化回覆判定',
+      strictDecisionDescription: '只有模型回傳有效結構且 need_response: true 時，才允許寄出。',
+      priorityLabel: '判定順序',
+      priorityText: '絕不回覆 → 必須回覆 → 類別過濾 → Agent 判定'
+    }
   },
 
   profiles: {

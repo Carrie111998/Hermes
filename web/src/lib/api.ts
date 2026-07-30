@@ -1553,6 +1553,9 @@ export interface MessagingPlatformEnvVar {
   url: string | null;
   is_password: boolean;
   advanced: boolean;
+  input_type: "text" | "password" | "boolean" | "textarea";
+  default_value: string;
+  current_value: string;
 }
 
 export interface MessagingPlatform {
