@@ -5720,8 +5720,30 @@ This compaction should PRIORITISE preserving all information related to the focu
             else []
         )
 
+        marker_role = self._micro_marker_role(
+            messages, splice_start, splice_end, retained
+        )
+        # A forward collision is not always avoidable (colliding backwards is
+        # worse — see _micro_marker_role), and when it happens pass 2 folds the
+        # successor's text INTO this marker. If that successor is a real user
+        # turn, this row is about to contain user-authored content, so it must
+        # not be described as a pure summary: `run_agent` persists
+        # display_kind="hidden" for a marker whose has_user_turn is false, and
+        # every transcript surface drops hidden rows. Without this the user
+        # watches their own message disappear from the conversation.
+        successor = (
+            retained[0] if retained
+            else (messages[splice_end] if splice_end < len(messages) else None)
+        )
+        will_absorb_user_turn = (
+            marker_role == "user"
+            and isinstance(successor, dict)
+            and successor.get("role") == "user"
+            and not successor.get(COMPRESSED_SUMMARY_METADATA_KEY)
+        )
+
         summary_msg = {
-            "role": self._micro_marker_role(messages, splice_start, splice_end, retained),
+            "role": marker_role,
             "content": content,
             COMPRESSED_SUMMARY_METADATA_KEY: True,
             # Provenance (#64650), not a constant: this says whether the text
@@ -5731,7 +5753,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # survives in the summary when none does.
             COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: any(
                 isinstance(m, dict) and m.get("role") == "user" for m in absorbed
-            ),
+            ) or will_absorb_user_turn,
             COMPRESSED_SUMMARY_SOURCE_KEY: _MICRO_COMPACT_SOURCE,
         }
 

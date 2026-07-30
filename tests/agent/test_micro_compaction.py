@@ -23,6 +23,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.context_compressor import (
+    COMPRESSED_SUMMARY_HAS_USER_TURN_KEY,
     COMPRESSED_SUMMARY_METADATA_KEY,
     COMPRESSED_SUMMARY_SOURCE_KEY,
     HISTORICAL_TASK_HEADING,
@@ -134,7 +135,6 @@ class TestMicroCompaction:
         markers = _summary_markers(result)
         assert len(markers) == 1
         assert "ROLLING SUMMARY" in markers[0]["content"]
-        # The marker stands in for a user turn, like batch compaction's does.
         # The marker must alternate with BOTH neighbours, exactly as batch
         # compaction picks its summary role. Pinning it to "user" put it
         # straight after a real user turn, and the pre-send alternation repair
@@ -638,6 +638,47 @@ class TestMicroCompaction:
             m.get("role") == "user" and not m.get(COMPRESSED_SUMMARY_METADATA_KEY)
             for m in result
         )
+
+    def test_marker_that_absorbs_a_user_turn_is_not_persisted_hidden(self):
+        """A marker about to swallow a user turn must not claim to be pure summary.
+
+        Colliding forwards is sometimes unavoidable (backwards is worse), and
+        pass 2 then folds the successor's text into the marker. ``run_agent``
+        persists ``display_kind="hidden"`` for a marker whose has_user_turn is
+        false, and every transcript surface drops hidden rows -- so a marker
+        that absorbed a real user turn while still reporting False makes the
+        user's own message vanish from the conversation.
+        """
+        from unittest.mock import MagicMock
+
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        cc = _compressor()
+        cc._micro_compact_rolling_summary = "ROLLING SUMMARY"
+        # Interim assistant before the exchange forces prev_role="assistant"
+        # (pass 0 merges consecutive assistants but exempts codex interims),
+        # and a real user turn follows the exchange -- so neither role is free.
+        messages = [
+            {"role": "user", "content": "opening ask"},
+            {"role": "assistant", "content": "interim"},
+        ]
+        for i in range(8):
+            messages.append({"role": "assistant", "content": f"answer {i} " + "z" * 400})
+            messages.append({"role": "user", "content": f"REAL USER TURN {i}"})
+        cc._micro_compact_cursor = 2
+
+        result = cc._micro_compact(list(messages))
+        repair_message_sequence(MagicMock(), result)
+
+        markers = _summary_markers(result)
+        assert len(markers) == 1
+        marker = markers[0]
+        if "REAL USER TURN 0" in str(marker.get("content")):
+            assert marker.get(COMPRESSED_SUMMARY_HAS_USER_TURN_KEY) is True, (
+                "marker absorbed a real user turn but still reports pure-summary "
+                "provenance; run_agent will persist it display_kind='hidden' and "
+                "the user's message disappears from every transcript surface"
+            )
 
     def test_supersede_never_deletes_a_foreign_summary_marker(self):
         """A batch marker must survive micro-compaction passes.
