@@ -1492,6 +1492,8 @@ class SidebarExecutor:
             )
         except (KeyboardInterrupt, SystemExit):
             raise
+        except NativeCreateRejected as exc:
+            return exc.code
         except Exception:
             return "native_task_not_indexed"
         if not isinstance(state, NativeThreadState):

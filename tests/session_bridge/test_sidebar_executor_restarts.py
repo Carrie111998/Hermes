@@ -54,6 +54,7 @@ class _Clock:
 @dataclass
 class _NativeWorld:
     threads: dict[str, BridgeMarkerPayload] = field(default_factory=dict)
+    projections: dict[str, SessionProjection] = field(default_factory=dict)
     recovery_keys: dict[str, str] = field(default_factory=dict)
     registered_threads: set[str] = field(default_factory=set)
     create_calls: list[str] = field(default_factory=list)
@@ -100,30 +101,30 @@ class _NativeDelivery:
         self._world.create_calls.append(_THREAD_ID)
         self._world.threads[_THREAD_ID] = payload
         self._world.recovery_keys[_THREAD_ID] = recovery_key
-        self._store.upsert_projection(
-            SessionProjection(
-                provider=Provider.CODEX,
-                native_id=_THREAD_ID,
-                title="Native sidebar placeholder",
-                cwd=candidate.cwd,
-                started_at=self._clock(),
-                last_active=self._clock(),
-                messages=(
-                    ProjectedMessage(
-                        native_event_id=f"registration-{_THREAD_ID}",
-                        ordinal=0,
-                        role="user",
-                        content=prompt,
-                        timestamp=self._clock(),
-                    ),
+        projection = SessionProjection(
+            provider=Provider.CODEX,
+            native_id=_THREAD_ID,
+            title="Native sidebar placeholder",
+            cwd=_INBOX_CWD,
+            started_at=self._clock(),
+            last_active=self._clock(),
+            messages=(
+                ProjectedMessage(
+                    native_event_id=f"registration-{_THREAD_ID}",
+                    ordinal=0,
+                    role="user",
+                    content=prompt,
+                    timestamp=self._clock(),
                 ),
-                native_path=f"native://{_THREAD_ID}",
-                native_cursor=f"cursor-{_THREAD_ID}",
-                native_hash=f"hash-{_THREAD_ID}",
-                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
-                origin_bridge_id=payload.bridge_id,
-            )
+            ),
+            native_path=f"native://{_THREAD_ID}",
+            native_cursor=f"cursor-{_THREAD_ID}",
+            native_hash=f"hash-{_THREAD_ID}",
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=payload.bridge_id,
         )
+        self._world.projections[_THREAD_ID] = projection
+        self._store.upsert_projection(projection)
         if self._world.lose_create_response_once:
             self._world.lose_create_response_once = False
             raise NativeCreateAmbiguous()
@@ -223,7 +224,11 @@ class _Verifier:
         if self._world.die_before_rename_once:
             self._world.die_before_rename_once = False
             raise SystemExit("synthetic process death before rename")
-        return _verified(thread_id, expected)
+        return _verified(
+            thread_id,
+            expected,
+            projection=self._world.projections[thread_id],
+        )
 
 
 class _CommitResponseLossStore:
@@ -526,11 +531,14 @@ def _executor(
 def _verified(
     thread_id: str,
     payload: BridgeMarkerPayload,
+    *,
+    projection: SessionProjection | None = None,
 ) -> VerifiedSidebarThread:
     return VerifiedSidebarThread(
         thread_id=thread_id,
         source_session_id=payload.source_session_id,
         bridge_id=payload.bridge_id,
+        projection=projection,
     )
 
 

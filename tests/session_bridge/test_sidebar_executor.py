@@ -1859,7 +1859,7 @@ def test_verified_projection_is_indexed_before_lineage_commit() -> None:
         provider=Provider.CODEX,
         native_id=THREAD_1,
         title="[Claude] Indexed before commit",
-        cwd="C:/Users/diego/.hermes",
+        cwd=INBOX_CWD,
         started_at=90.0,
         last_active=100.0,
         messages=(),
@@ -2622,6 +2622,40 @@ def test_native_read_identity_mismatch_is_fatal(
     assert store.failures == [expected_code]
     assert not any(event[0] in {"bind", "register"} for event in events)
     assert not any(event[0] in {"verify", "rename", "commit"} for event in events)
+
+
+def test_prebound_rejected_placement_read_releases_exact_id_without_mutation() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1, thread_id=THREAD_1)],
+        failure_state="sidebar_pending",
+    )
+
+    class BudgetReadNative(FakeNative):
+        def read_thread_state(
+            self, *, thread_id: str, deadline: float
+        ) -> NativeThreadState | None:
+            self.events.append(("read", thread_id, deadline))
+            raise NativeCreateRejected("broker_time_budget")
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        BudgetReadNative(events),
+        clock,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="retry",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+        error_code="broker_time_budget",
+    )
+    assert store.failures == ["broker_time_budget"]
+    assert store.failure_thread_ids == [THREAD_1]
+    assert not any(event[0] in {"bind", "register"} for event in events)
 
 
 def test_native_read_accepts_platform_equivalent_cwd() -> None:
