@@ -1,26 +1,10 @@
-# Neon Genie — official optional skill
+# Catalog notes
 
-Evidence-bound product and opportunity intelligence for Hermes.
+- **Category folder:** `productivity` (official optional path)
+- **Frontmatter domain tags:** Product / OpportunityIntelligence
+- **Maintainer:** Applied Alchemy Labs / Zero State (@scrimshawlife-ctrl)
+- **Upstream source of truth:** https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes
+- **Why optional (not bundled):** specialized product-intelligence skill, not universal day-one need
+- **Why not Hub-only:** optional catalog gives official trust tier; Hub remains for latest packaging releases
 
-| | |
-|--|--|
-| **Upstream** | https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes |
-| **Authority** | `advisory_only` |
-| **Folder** | `optional-skills/productivity/neon-genie` |
-
-## Install
-
-```bash
-hermes skills install official/productivity/neon-genie
-# or community Hub (upstream):
-hermes skills install scrimshawlife-ctrl/Neon-Genie-Hermes/skills/neon-genie
-```
-
-## Smoke
-
-```bash
-python scripts/neon_genie.py do doctor
-python scripts/neon_genie.py do run --recipe product-audit --out out/neon-genie/demo
-```
-
-Open `run-envelope.json` first when consuming outputs. Maintained upstream.
+Slim package: skill contract, profiles, schemas, packaging CLI, examples, golden evals.

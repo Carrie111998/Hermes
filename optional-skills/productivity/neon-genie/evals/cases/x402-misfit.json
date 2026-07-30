@@ -1,9 +1,0 @@
-{
-  "input": {
-    "service": "subjective long-term consulting",
-    "persistent_relationship": true
-  },
-  "expected": {
-    "x402_fit": "REJECT"
-  }
-}

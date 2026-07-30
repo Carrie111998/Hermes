@@ -22,7 +22,7 @@ metadata:
       - WayfinderHandoff
       - AdvisoryOnly
       - AgenticServices
-    category: product
+    category: productivity
     related_skills: []
 triggers:
   - neon genie
@@ -44,19 +44,21 @@ triggers:
 
 # Neon Genie v3
 
+> **Official optional skill** (productivity). Full packaging monorepo & releases: [Neon-Genie-Hermes](https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes). Authority: **advisory_only**.
+
 ## Hermes skill identity
 
 Neon Genie is a **standalone Hermes skill**. Hermes loads this directory directly and uses `SKILL.md` as the operating contract. No Python package install, Kubrick skill, Wayfinder runtime, or external knowledge base is required to load.
 
 See `references/hermes-runtime-contract.md` for path, artifact, authority, and dependency policy.
 
-Profile contracts, packet schemas, and golden tests ship as hub mirrors (see **Hermes Hub support files** below) and as root `profiles/`, `schemas/`, `evals/` on full install.
+Profile contracts live in `references/profiles/`; packet schemas in `references/schemas/`; golden tests under `examples/evals/`.
 
 **Optional companions:** host research tools, Wayfinder (handoff consumer). Their absence never blocks local advisory work.
 
 ## Packaging CLI
 
-One pattern (packaging only — not a product brain):
+Packaging only — product judgment stays in this `SKILL.md` (Hermes runtime).
 
 ```text
 python scripts/neon_genie.py do <job> [options]
@@ -66,30 +68,87 @@ python scripts/neon_genie.py do <job> [options]
 |-----|-----|
 | `doctor` | Full smoke after install |
 | `check` | Skill integrity |
-| `run` | Operator packaging run (brief/recipe → envelope) |
-| `capabilities` | Machine-readable skill surface (JSON) |
-| `dist` | Hub mirrors + package (`verify` / `write`) |
-| `recipe` | Named example (`--list` / `--name`) |
-| `route` / `validate` / `receipt` / `envelope` | Profiles, schema, receipt, run envelope |
-| `eval` / `transcripts` | Golden tests |
-| `behavioral` / `runtime` | Semantic agent gates + hub install smoke |
-| `learn` / `reconcile` | PROPOSED ledger entry; link entries to run_id |
-| `release-check` | Pre-release version / changelog / dist gate |
+| `run` | Brief/recipe → workspace + `run-envelope.json` |
+| `capabilities` | Machine-readable surface (`--json`) |
+| `recipe` / `route` / `validate` | Examples, routing, schema check |
+| `receipt` / `envelope` | Receipt + canonical envelope |
+| `eval` / `transcripts` / `behavioral` | Golden gates + semantic suite |
+| `learn` / `reconcile` | PROPOSED ledger linked to `run_id` |
 
 ```bash
-python scripts/neon_genie.py help
 python scripts/neon_genie.py do doctor
 python scripts/neon_genie.py do run --recipe product-audit --out out/neon-genie/demo
+# open out/neon-genie/demo/run-envelope.json first
 ```
 
-See `README.md` (How to use) and `QUICKSTART.md`. Golden prose: `examples/evals/transcripts/README.md`. Post-SEAL: `references/post-seal-verification.md`. Gate ontology: `references/gates.yaml`.
+**Upstream (full monorepo, releases, distribution spine):** https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes
 
-### Hermes Hub support files
+Profiles: `references/profiles/`. Schemas: `references/schemas/`. Gates: `references/gates.yaml`.
 
+### Support files (this install)
 
-Hermes Hub installs only `SKILL.md` plus **explicitly path-referenced** files under allowlisted dirs (`references/`, `templates/`, `scripts/`, `assets/`, `examples/`). The list below is **generated** from `distribution.yaml` — run `python scripts/distribution_spine.py write` after adding packaging files:
+Hub-style allowlisted paths shipped with this optional skill:
 
 <!-- BEGIN HUB_SUPPORT_FILES (generated; do not edit) -->
+- `references/CAPABILITY_MAP.md`
+- `references/GOLDEN_TESTS.md`
+- `references/VERSION`
+- `references/anti-overclaim-patterns.md`
+- `references/gates.yaml`
+- `references/hermes-runtime-contract.md`
+- `references/manifest.json`
+- `references/post-seal-verification.md`
+- `references/profiles/agentic_services.md`
+- `references/profiles/audit_delivery.md`
+- `references/profiles/commercial.md`
+- `references/profiles/core.md`
+- `references/profiles/evidence_intelligence.md`
+- `references/profiles/fragmentation.md`
+- `references/profiles/memetic.md`
+- `references/profiles/opportunity_mining.md`
+- `references/profiles/product_architecture.md`
+- `references/profiles/wayfinder_handoff.md`
+- `references/profiles/zero_option.md`
+- `references/schema-versioning.md`
+- `references/schemas/agentic-service-graph.schema.json`
+- `references/schemas/audit-delivery-packet.schema.json`
+- `references/schemas/commercial-simulation.schema.json`
+- `references/schemas/data-request.schema.json`
+- `references/schemas/evidence-intelligence-packet.schema.json`
+- `references/schemas/fragmentation-packet.schema.json`
+- `references/schemas/learning-ledger-entry.schema.json`
+- `references/schemas/memetic-pressure-packet.schema.json`
+- `references/schemas/opportunity-packet.schema.json`
+- `references/schemas/product-packet.schema.json`
+- `references/schemas/run-envelope.schema.json`
+- `references/schemas/run-receipt.schema.json`
+- `references/schemas/wayfinder-execution-packet.schema.json`
+- `references/schemas/zero-option-packet.schema.json`
+- `templates/request.yaml`
+- `scripts/audit_release_version.py`
+- `scripts/build_envelope.py`
+- `scripts/build_receipt.py`
+- `scripts/capabilities.py`
+- `scripts/check_behavioral_invariants.py`
+- `scripts/check_transcripts.py`
+- `scripts/distribution_spine.py`
+- `scripts/doctor.py`
+- `scripts/hermes_runtime_smoke.py`
+- `scripts/lineage.py`
+- `scripts/neon_genie.py`
+- `scripts/paths.py`
+- `scripts/recipe_common.py`
+- `scripts/recipe_product_audit.py`
+- `scripts/recipe_run.py`
+- `scripts/reconcile_learning.py`
+- `scripts/record_learning.py`
+- `scripts/release_check.py`
+- `scripts/route_profiles.py`
+- `scripts/run_fixture_invariants.py`
+- `scripts/run_hermes_evals.py`
+- `scripts/run_job.py`
+- `scripts/validate_hermes_skill.py`
+- `scripts/validate_packet.py`
 - `examples/README.md`
 - `examples/agentic.brief.yaml`
 - `examples/audit.brief.yaml`
@@ -147,68 +206,9 @@ Hermes Hub installs only `SKILL.md` plus **explicitly path-referenced** files un
 - `examples/product-audit.brief.yaml`
 - `examples/zero-option-with-skills.brief.yaml`
 - `examples/zero-option.brief.yaml`
-- `references/CAPABILITY_MAP.md`
-- `references/GOLDEN_TESTS.md`
-- `references/VERSION`
-- `references/anti-overclaim-patterns.md`
-- `references/gates.yaml`
-- `references/hermes-runtime-contract.md`
-- `references/manifest.json`
-- `references/post-seal-verification.md`
-- `references/profiles/agentic_services.md`
-- `references/profiles/audit_delivery.md`
-- `references/profiles/commercial.md`
-- `references/profiles/core.md`
-- `references/profiles/evidence_intelligence.md`
-- `references/profiles/fragmentation.md`
-- `references/profiles/memetic.md`
-- `references/profiles/opportunity_mining.md`
-- `references/profiles/product_architecture.md`
-- `references/profiles/wayfinder_handoff.md`
-- `references/profiles/zero_option.md`
-- `references/schema-versioning.md`
-- `references/schemas/agentic-service-graph.schema.json`
-- `references/schemas/audit-delivery-packet.schema.json`
-- `references/schemas/commercial-simulation.schema.json`
-- `references/schemas/data-request.schema.json`
-- `references/schemas/evidence-intelligence-packet.schema.json`
-- `references/schemas/fragmentation-packet.schema.json`
-- `references/schemas/learning-ledger-entry.schema.json`
-- `references/schemas/memetic-pressure-packet.schema.json`
-- `references/schemas/opportunity-packet.schema.json`
-- `references/schemas/product-packet.schema.json`
-- `references/schemas/run-envelope.schema.json`
-- `references/schemas/run-receipt.schema.json`
-- `references/schemas/wayfinder-execution-packet.schema.json`
-- `references/schemas/zero-option-packet.schema.json`
-- `scripts/audit_release_version.py`
-- `scripts/build_envelope.py`
-- `scripts/build_receipt.py`
-- `scripts/capabilities.py`
-- `scripts/check_behavioral_invariants.py`
-- `scripts/check_transcripts.py`
-- `scripts/distribution_spine.py`
-- `scripts/doctor.py`
-- `scripts/hermes_runtime_smoke.py`
-- `scripts/lineage.py`
-- `scripts/neon_genie.py`
-- `scripts/paths.py`
-- `scripts/recipe_common.py`
-- `scripts/recipe_product_audit.py`
-- `scripts/recipe_run.py`
-- `scripts/reconcile_learning.py`
-- `scripts/record_learning.py`
-- `scripts/release_check.py`
-- `scripts/route_profiles.py`
-- `scripts/run_fixture_invariants.py`
-- `scripts/run_hermes_evals.py`
-- `scripts/run_job.py`
-- `scripts/validate_hermes_skill.py`
-- `scripts/validate_packet.py`
-- `templates/request.yaml`
 <!-- END HUB_SUPPORT_FILES -->
 
-Full tree also keeps root schemas, profiles, evals, VERSION, and manifest for clone/`./install.sh` installs (scripts resolve either layout via `scripts/paths.py`).
+
 
 ## Mission
 
