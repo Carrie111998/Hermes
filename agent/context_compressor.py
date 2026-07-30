@@ -137,6 +137,14 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 # "is_compressed_summary" would reach the wire and trip exactly that.
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
+# Which mechanism produced a summary marker. Micro-compaction supersedes its
+# own markers because its rolling summary is cumulative — each marker contains
+# everything the previous one held. That guarantee covers ITS lineage only:
+# a batch-compaction marker summarizes a different span, so deleting one
+# destroys content nothing else holds. Untagged markers (legacy sessions, or
+# any future producer) are treated as foreign and are never superseded.
+COMPRESSED_SUMMARY_SOURCE_KEY = "_compressed_summary_source"
+_MICRO_COMPACT_SOURCE = "micro"
 _DB_PERSISTED_MARKER = "_db_persisted"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
@@ -5626,10 +5634,24 @@ This compaction should PRIORITISE preserving all information related to the focu
         on the very next API call, and the repair persisted that.
 
         ``assistant`` is the usual answer: an exchange starts at the assistant
-        message, so the preceding row is a user turn. Falls back to ``user``
-        when the neighbours make ``assistant`` collide, which is the safer
-        collision to have -- consecutive user rows merge and keep their text,
-        while a stray assistant row can be read back as model output.
+        message, so the preceding row is a user turn.
+
+        When no role avoids both neighbours, the collisions are NOT equally
+        bad, and picking either one blindly is how the original bug survives.
+        ``repair_message_sequence`` pass 2 folds the second of two consecutive
+        user rows into the first and drops the second dict:
+
+        * Colliding with the PREVIOUS row is fatal -- the marker is the second
+          of the pair, so it is the dict that gets dropped, taking
+          ``_compressed_summary`` with it. That is exactly the bug this
+          function exists to prevent.
+        * Colliding with the NEXT row is survivable -- the marker is the first
+          of the pair, so it survives the fold and keeps its metadata.
+
+        So never collide with ``prev_role``; accept a collision with
+        ``next_role`` only when there is no alternative. A collision with the
+        next row still merges a neighbour's text into the marker, which is why
+        it is a last resort rather than a free choice.
         """
         prev_role = (
             messages[splice_start - 1].get("role") if splice_start > 0 else None
@@ -5644,10 +5666,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                 if splice_end < len(messages)
                 else None
             )
+        # First choice: alternate with both neighbours.
         for candidate in ("assistant", "user"):
             if candidate != prev_role and candidate != next_role:
                 return candidate
-        return "user"
+        # Fallback: whatever happens, do not collide with the predecessor.
+        for candidate in ("assistant", "user"):
+            if candidate != prev_role:
+                return candidate
+        return "assistant"
 
     def _splice_micro_compact_result(
         self,
@@ -5705,6 +5732,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: any(
                 isinstance(m, dict) and m.get("role") == "user" for m in absorbed
             ),
+            COMPRESSED_SUMMARY_SOURCE_KEY: _MICRO_COMPACT_SOURCE,
         }
 
         result = (
@@ -5725,14 +5753,41 @@ This compaction should PRIORITISE preserving all information related to the focu
         # A pass that started from nothing (a resume that could not rehydrate)
         # produces a marker covering one exchange, and dropping the previous
         # marker would throw away the entire compacted history.
+        #
+        # "Everything the previous marker held" is true of MICRO-compaction's
+        # own markers and nothing else. A batch-compaction marker summarizes a
+        # different span of the session, and the rolling summary has never seen
+        # its content -- `_resolve_compact_cursor` only rehydrates from a marker
+        # when the rolling summary is EMPTY, so in steady state a foreign marker
+        # is read by nobody. Superseding it deleted the whole compacted history
+        # of the session silently and unrecoverably. Only ever drop markers this
+        # mechanism produced; anything untagged (legacy sessions) or from another
+        # producer is left alone, even at the cost of a duplicate-looking
+        # transcript.
         if supersede:
             marker_idxs = [
                 i for i, m in enumerate(result)
-                if isinstance(m, dict) and m.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                if isinstance(m, dict)
+                and m.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                and m.get(COMPRESSED_SUMMARY_SOURCE_KEY) == _MICRO_COMPACT_SOURCE
             ]
             if len(marker_idxs) > 1:
                 superseded = set(marker_idxs[:-1])
                 result = [m for i, m in enumerate(result) if i not in superseded]
+
+        # Zero-user backstop (#58753). Strict OpenAI-compatible backends reject
+        # a request with no user-role message ("400 No user query found"), which
+        # is non-retryable -- every resume replays the same poisoned history.
+        # Batch compaction guards this by forcing its summary to role="user";
+        # micro-compaction had no equivalent, and while the marker was pinned to
+        # "user" it never needed one. Now that the role alternates, and now that
+        # supersede can remove an earlier marker that was carrying "user", the
+        # last user-role row can disappear. Checked on the FINAL list so it
+        # accounts for both.
+        if summary_msg["role"] != "user" and not any(
+            isinstance(m, dict) and m.get("role") == "user" for m in result
+        ):
+            summary_msg["role"] = "user"
 
         _strip_persistence_markers(result)
         return result

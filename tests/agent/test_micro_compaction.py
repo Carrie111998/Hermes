@@ -24,9 +24,58 @@ import pytest
 
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
+    COMPRESSED_SUMMARY_SOURCE_KEY,
+    HISTORICAL_TASK_HEADING,
+    SUMMARY_PREFIX,
     ContextCompressor,
     _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES,
+    _SUMMARY_END_MARKER,
 )
+
+
+BATCH_ONLY_TEXT = "BATCH-ONLY CONTENT THE ROLLING SUMMARY NEVER SAW"
+
+
+def _batch_marker(text: str = BATCH_ONLY_TEXT) -> dict:
+    """A marker shaped like the one batch ``compress()`` emits.
+
+    Note the absent source tag: batch does not claim micro-compaction's
+    lineage, which is exactly what keeps supersede off it.
+    """
+    return {
+        "role": "user",
+        "content": (
+            f"{SUMMARY_PREFIX}\n\n{HISTORICAL_TASK_HEADING}\n"
+            f"{text}\n\n{_SUMMARY_END_MARKER}"
+        ),
+        COMPRESSED_SUMMARY_METADATA_KEY: True,
+    }
+
+
+def _worker_conversation(steps: int = 8) -> list:
+    """Production-shaped transcript with no user turns left of its own.
+
+    Two things differ from the other fixtures here, both deliberate: there is
+    no ``role="system"`` row (the live ``messages`` list never carries one --
+    the system prompt is prepended at request-build time), and the only user
+    turn has already been folded into a batch marker, which is the shape the
+    zero-user guard exists for.
+    """
+    msgs = [_batch_marker("seed prompt: work kanban task 42")]
+    for i in range(steps):
+        msgs.append({
+            "role": "assistant",
+            "content": f"step {i} " + "z" * 400,
+            "tool_calls": [{
+                "id": f"c{i}", "type": "function",
+                "function": {"name": "sh", "arguments": "{}"},
+            }],
+        })
+        msgs.append({
+            "role": "tool", "tool_call_id": f"c{i}",
+            "content": "output " + "y" * 300,
+        })
+    return msgs
 
 
 def _compressor(summary="ROLLING SUMMARY") -> ContextCompressor:
@@ -468,14 +517,29 @@ class TestMicroCompaction:
         assert after_many < after_first, "later passes must recover it"
 
     def test_cumulative_savings_accumulate_across_passes(self):
+        # Break-even is pass 5 on this fixture, not pass 4. The first pass pays
+        # the marker's fixed scaffolding cost and each later pass recovers a
+        # slice of it, so the crossing point moves whenever the marker's size
+        # changes -- the provenance key that keeps supersede off foreign
+        # markers added ~10 tokens to it. Assert the invariant this test is
+        # named for (savings accumulate monotonically, and do turn positive)
+        # rather than pinning the exact pass the sign flips on, which passed by
+        # a 5-token margin and made an unrelated metadata change look like a
+        # regression.
         cc = _compressor()
         messages = _conversation(exchanges=10)
 
-        for _ in range(4):
+        totals = []
+        for _ in range(5):
             messages = cc._micro_compact(messages)
+            totals.append(cc._micro_compact_tokens_saved_total)
 
-        assert cc._micro_compact_passes == 4
-        assert cc._micro_compact_tokens_saved_total > 0
+        assert cc._micro_compact_passes == 5
+        later = totals[1:]
+        assert all(b > a for a, b in zip(later, later[1:])), (
+            f"savings must improve every pass after the first: {totals}"
+        )
+        assert cc._micro_compact_tokens_saved_total > 0, totals
 
     def test_marker_survives_the_pre_send_alternation_repair(self):
         """The marker must still be a marker after the pre-request repair.
@@ -531,6 +595,109 @@ class TestMicroCompaction:
         # The summary must still be discoverable after all that repairing --
         # supersede, cursor resolution and resume rehydration key off it.
         assert len(_summary_markers(messages)) == 1
+
+    def test_supersede_never_deletes_a_foreign_summary_marker(self):
+        """A batch marker must survive micro-compaction passes.
+
+        Supersede is only sound within micro-compaction's own cumulative
+        lineage. A batch marker covers a different span, and the rolling
+        summary has never read it -- ``_resolve_compact_cursor`` rehydrates
+        from a marker only when the rolling summary is EMPTY, so in steady
+        state nothing folds a foreign marker in before it is dropped. Deleting
+        it destroyed the session's whole compacted history, silently.
+        """
+        cc = _compressor()
+        # Steady state: micro has been running, so supersede is armed.
+        cc._micro_compact_rolling_summary = "MICRO ROLLING SUMMARY"
+        messages = [_batch_marker()] + _conversation(exchanges=8)[1:]
+
+        result = cc._micro_compact(list(messages))
+
+        assert any(BATCH_ONLY_TEXT in str(m.get("content")) for m in result), (
+            "supersede deleted a batch summary; its content exists nowhere else"
+        )
+
+    def test_supersede_still_collapses_its_own_markers(self):
+        """The foreign-marker fix must not disarm supersede for its own kind."""
+        cc = _compressor()
+        messages = _conversation(exchanges=10)
+
+        first = cc._micro_compact(list(messages))
+        second = cc._micro_compact(list(first))
+
+        own = [
+            m for m in second
+            if m.get(COMPRESSED_SUMMARY_SOURCE_KEY) == "micro"
+        ]
+        assert len(own) == 1, "own markers stacked instead of superseding"
+
+    def test_marker_never_collides_with_its_predecessor(self):
+        """Colliding backwards is the fatal direction; never do it.
+
+        ``repair_message_sequence`` pass 2 folds the second of two consecutive
+        user rows into the first and drops the second dict. A marker that
+        collides with the row BEFORE it is therefore the one destroyed, which
+        is the original bug. Colliding with the row after is survivable.
+        """
+        for prev_role in ("user", "assistant", "tool", None):
+            for next_role in ("user", "assistant", None):
+                messages = []
+                if prev_role is not None:
+                    messages.append({"role": prev_role, "content": "before"})
+                start = len(messages)
+                messages.append({"role": "assistant", "content": "absorbed"})
+                end = len(messages)
+                if next_role is not None:
+                    messages.append({"role": next_role, "content": "after"})
+
+                role = ContextCompressor._micro_marker_role(
+                    messages, start, end, []
+                )
+                assert role != prev_role, (
+                    f"marker collides backwards with {prev_role!r} "
+                    f"(next={next_role!r}) -- pass 2 will drop it"
+                )
+
+    def test_zero_user_transcript_is_never_produced(self):
+        """Never hand a strict backend a transcript with no user row.
+
+        vLLM/Qwen reject it with a non-retryable 400 "No user query found in
+        messages", and every resume replays the same poisoned history. Batch
+        compaction forces role="user" for this; micro-compaction needs the
+        same backstop now that its role alternates and supersede can remove an
+        earlier marker that was carrying "user".
+        """
+        cc = _compressor()
+        cc._micro_compact_rolling_summary = "MICRO ROLLING SUMMARY"
+        cc.compression_count = 1  # batch has run, so the protected head decays
+        messages = _worker_conversation(steps=8)
+
+        result = cc._micro_compact(list(messages))
+
+        assert any(m.get("role") == "user" for m in result), (
+            "no user-role message survives; this request 400s on vLLM/Qwen"
+        )
+
+    def test_retained_user_turns_survive_the_pre_send_repair(self):
+        """Defrag keeps user turns -- the repair must not undo that."""
+        from unittest.mock import MagicMock
+
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        cc = _compressor(summary="FRESH DEFRAGGED SUMMARY")
+        cc._micro_compact_rolling_summary = "PRIOR SUMMARY " + "x" * 20_000
+        cc._micro_compact_defrag_threshold_tokens = 10
+        messages = _conversation(exchanges=8)
+        originals = [m["content"] for m in messages if m["role"] == "user"]
+
+        result = cc._micro_compact(list(messages))
+        repair_message_sequence(MagicMock(), result)
+
+        blob = "\n".join(
+            str(m.get("content")) for m in result if m.get("role") == "user"
+        )
+        missing = [u for u in originals if u not in blob]
+        assert not missing, f"repair lost retained user text: {missing}"
 
     def test_marker_never_sits_next_to_a_same_role_neighbour(self):
         cc = _compressor()
