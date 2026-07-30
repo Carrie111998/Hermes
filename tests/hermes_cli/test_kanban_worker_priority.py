@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 
 
 BASE_CMD = [
@@ -78,6 +79,11 @@ def _capture_popen(monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     return captured
+
+
+def test_priority_defaults_live_in_active_config_mapping():
+    assert DEFAULT_CONFIG["kanban"]["worker_nice"] == 0
+    assert DEFAULT_CONFIG["kanban"]["worker_ionice_class"] == "none"
 
 
 def test_default_priority_config_preserves_worker_argv(monkeypatch, tmp_path):
