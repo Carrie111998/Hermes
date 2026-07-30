@@ -13853,9 +13853,28 @@ def _aux_task_summary(aux_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
+_ANALYTICS_DEFAULT_DAYS = 30
+_ANALYTICS_MAX_DAYS = 365
+
+
+def _clamp_analytics_days(value: int) -> int:
+    """Clamp dashboard analytics lookback window to a safe positive range.
+
+    The UI only offers 7/30/90, but the query param is unbounded. Huge or
+    non-positive ``days`` values force expensive full-history SQL scans and
+    InsightsEngine work, or produce empty/inverted time windows.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return _ANALYTICS_DEFAULT_DAYS
+    return max(1, min(_ANALYTICS_MAX_DAYS, parsed))
+
+
 def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     from agent.insights import InsightsEngine
 
+    days = _clamp_analytics_days(days)
     db = _open_session_db_for_profile(profile)
     try:
         cutoff = time.time() - (days * 86400)
@@ -13945,6 +13964,7 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
+    days = _clamp_analytics_days(days)
     db = _open_session_db_for_profile(profile)
     try:
         cutoff = time.time() - (days * 86400)
