@@ -1970,9 +1970,6 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
-            # Baseline for the per-turn config sync; the profile home
-            # override is still active here.
-            current["config_model_seen"] = _config_model_target()
 
             # No eager slash-worker pre-warm: slash.exec spawns one on demand
             # (its error path already relies on that respawn to recover from a
@@ -4247,52 +4244,6 @@ def _apply_model_switch(
     }
 
 
-def _sync_agent_model_with_config(sid: str, session: dict) -> None:
-    """Adopt a config.yaml model change at turn start, like gateways do per
-    message. Sessions pinned with /model keep their choice; a failed switch
-    keeps the current model and never blocks the turn.
-    """
-    agent = session.get("agent")
-    if agent is None or session.get("model_override"):
-        return
-    target = _config_model_target()
-    if not target[0]:
-        return
-    seen = session.get("config_model_seen")
-    # Record first so a broken config gets one attempt per edit, not per turn.
-    session["config_model_seen"] = target
-    if target == seen:
-        return
-    model, provider = target
-    # Already running the configured model (branched/resumed session before
-    # its first sync, or a config revert after a failed switch): adopt the
-    # baseline without a redundant switch.
-    if model == getattr(agent, "model", "") and (
-        not provider or provider == getattr(agent, "provider", "")
-    ):
-        return
-    raw = f"{model} --provider {provider}" if provider else model
-    try:
-        _apply_model_switch(
-            sid,
-            session,
-            raw,
-            confirm_expensive_model=True,
-            pin_session_override=False,
-            # This sync ADOPTS a config.yaml change into the live session; it
-            # must never write config back. Without this, the flag/config
-            # default (persist_switch_by_default=True) re-persisted whatever
-            # target the sync computed — the path that leaked `hermes --tui -m`
-            # into config.yaml as the permanent global model.
-            persist_override=False,
-        )
-    except Exception as e:
-        _emit(
-            "error",
-            sid,
-            {"message": f"Could not switch to configured model {model}: {e}"},
-        )
-
 
 class CompressionLockHeld(Exception):
     """Raised by _compress_session_history when compression skipped due
@@ -5796,7 +5747,6 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
-    session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
     session["edit_snapshots"] = {}
     session["image_counter"] = 0
@@ -8974,15 +8924,10 @@ def _run_prompt_submit(
             # the sudo.request overlay. (secret capture is a module global, so
             # re-running is a harmless no-op.)
             _wire_callbacks(sid)
-            # Skip the config-model sync while a /model --once override is
-            # active: the once-model is intentionally not pinned as a session
-            # model_override (it must not persist), so without this guard the
-            # sync would see "agent model != config model" and clobber the
-            # once-override back to the config model before the turn runs
-            # (#29923 review defect). Any config.yaml change is adopted on
-            # the NEXT turn, after the finally-restore below.
-            if not one_turn_restore:
-                _sync_agent_model_with_config(sid, session)
+            # Sessions lock to whatever model was active when they started.
+            # `hermes model` changes only affect new sessions. Per-turn config
+            # sync was removed to prevent cross-session model contamination
+            # when running multiple instances (#73680).
             cwd = _session_cwd(session)
             _register_session_cwd(session)
             cols = session.get("cols", 80)

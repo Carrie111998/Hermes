@@ -265,6 +265,30 @@ def test_classify_api_error_stream_event_grok_subscription_is_auth():
 
 
 
+def test_classify_api_error_stream_event_unauthenticated_bad_credentials_is_auth():
+    """_StreamErrorEvent with 'unauthenticated:bad-credentials' classifies as auth/non-retryable.
+
+    xAI OAuth returns this message via an SSE error frame when the access
+    token has expired or been revoked. status_code is None on the wire
+    (SSE frame, not HTTP), so _classify_by_status is skipped — the message
+    must match _AUTH_PATTERNS to route correctly to FailoverReason.auth
+    so the fallback chain activates instead of burning retries.
+    """
+    from run_agent import _StreamErrorEvent
+    from agent.error_classifier import classify_api_error, FailoverReason
+
+    err = _StreamErrorEvent(
+        "unauthenticated:bad-credentials",
+        code="forbidden",
+    )
+    result = classify_api_error(err, provider="xai-oauth", model="grok-4.3")
+    assert result.reason == FailoverReason.auth
+    assert result.retryable is False
+    assert result.should_fallback is True
+
+
+
+
 
 # ---------------------------------------------------------------------------
 # Fix C: reasoning replay gating for xai-oauth

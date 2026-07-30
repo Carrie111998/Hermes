@@ -458,6 +458,7 @@ _AUTH_PATTERNS = [
     "gateway_auth_failed",
     "authentication",
     "unauthorized",
+    "unauthenticated",
     "forbidden",
     "invalid token",
     "token expired",
