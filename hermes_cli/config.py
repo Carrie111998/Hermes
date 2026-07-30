@@ -3152,6 +3152,17 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def openrouter_zdr_enabled() -> bool:
+    """Return whether request-time OpenRouter ZDR enforcement is enabled.
+
+    The mtime-keyed read-only cache lets profile config changes apply to the
+    next request without rebuilding an active conversation.
+    """
+    config = load_config_readonly()
+    openrouter = config.get("openrouter")
+    return isinstance(openrouter, dict) and openrouter.get("zdr") is True
+
+
 def write_platform_config_field(
     platform_key: str,
     field_key: str,

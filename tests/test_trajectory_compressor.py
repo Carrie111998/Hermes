@@ -58,6 +58,31 @@ def test_generate_summary_kimi_omits_temperature():
 
 
 
+def test_generate_summary_openrouter_enforces_zdr(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.openrouter_zdr_enabled", lambda: True)
+    config = CompressionConfig(
+        summarization_model="anthropic/claude-sonnet-4.6",
+        base_url="https://openrouter.ai/api/v1",
+        summary_target_tokens=100,
+        max_retries=1,
+    )
+    compressor = TrajectoryCompressor.__new__(TrajectoryCompressor)
+    compressor.config = config
+    compressor.logger = MagicMock()
+    compressor._use_call_llm = False
+    compressor.client = MagicMock()
+    compressor.client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="[CONTEXT SUMMARY]: summary"))]
+    )
+
+    metrics = TrajectoryMetrics()
+    result = compressor._generate_summary("tool output", metrics)
+
+    assert result.startswith("[CONTEXT SUMMARY]:")
+    kwargs = compressor.client.chat.completions.create.call_args.kwargs
+    assert kwargs["extra_body"]["provider"] == {"zdr": True}
+
+
 # ---------------------------------------------------------------------------
 # CompressionConfig
 # ---------------------------------------------------------------------------
