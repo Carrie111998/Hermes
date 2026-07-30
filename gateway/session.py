@@ -1550,10 +1550,14 @@ class SessionStore:
         requested_session_key: str,
         recovered: Dict[str, Any],
     ) -> bool:
-        """Prevent non-multiplexed gateways from reviving another profile's row."""
-        if getattr(self.config, "multiplex_profiles", False):
-            return True
+        """Prevent a gateway from reviving another profile's row.
 
+        The durable peer fallback in ``find_latest_gateway_session_for_peer``
+        drops ``session_key`` and matches only the peer tuple, which for a DM is
+        byte-identical across profiles (``chat_id == user_id``, no thread). Both
+        configurations therefore have to check the recovered row's namespace;
+        they differ only in what counts as ours (#74285).
+        """
         recovered_key = str(recovered.get("session_key") or "")
         if not recovered_key or recovered_key == requested_session_key:
             return True
@@ -1561,6 +1565,18 @@ class SessionStore:
         recovered_profile = self._profile_from_session_key(recovered_key)
         if recovered_profile is None:
             return True
+
+        if getattr(self.config, "multiplex_profiles", False):
+            # Multiplexed: the requested key carries the profile this message
+            # was routed to, and that is what owns the turn. The process-wide
+            # active profile is meaningless here — several profiles serve
+            # traffic concurrently, so comparing against it would let a DM
+            # addressed to one bot resume a sibling profile's transcript and
+            # run with that profile's credentials and filesystem scope.
+            requested_profile = self._profile_from_session_key(requested_session_key)
+            if requested_profile is None:
+                return True
+            return recovered_profile == requested_profile
 
         return recovered_profile == self._active_profile_name()
 
@@ -1742,9 +1758,8 @@ class SessionStore:
             recovered=recovered,
         ):
             logger.warning(
-                "Gateway session DB recovery ignored %s for %s because "
-                "multiplex_profiles is disabled and the row belongs to a "
-                "different profile",
+                "Gateway session DB recovery ignored %s for %s because the row "
+                "belongs to a different profile",
                 recovered.get("session_key"),
                 session_key,
             )
@@ -1802,9 +1817,8 @@ class SessionStore:
             recovered=recovered,
         ):
             logger.warning(
-                "Gateway session DB recovery ignored %s for %s because "
-                "multiplex_profiles is disabled and the row belongs to a "
-                "different profile",
+                "Gateway session DB recovery ignored %s for %s because the row "
+                "belongs to a different profile",
                 recovered.get("session_key"),
                 session_key,
             )
