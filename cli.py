@@ -7478,8 +7478,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # False and the hook was silently skipped (#70139).
             _context_engine = getattr(self.agent, "context_compressor", None)
             _carry_over = bool(_context_engine and hasattr(_context_engine, "carry_over_new_session_context"))
+            # _launch_session_boundary_memory_flush() above already delivered
+            # on_session_end synchronously whenever there was history to flush
+            # (self.agent and _old_conversation_history both truthy) --
+            # forwarding previous_messages here too would fire it a second
+            # time for the same transcript (the same double-finalization bug
+            # class fixed for gateway soft-eviction in #64284). Only forward
+            # it when that synchronous delivery didn't happen, so
+            # on_session_end still fires exactly once either way.
+            _end_hook_already_delivered = bool(self.agent and _old_conversation_history)
             self.agent.reset_session_state(
-                previous_messages=_old_conversation_history if _carry_over else None,
+                previous_messages=(
+                    _old_conversation_history
+                    if (_carry_over and not _end_hook_already_delivered)
+                    else None
+                ),
                 old_session_id=old_session_id if _carry_over else None,
                 carry_over_context=_carry_over,
             )
