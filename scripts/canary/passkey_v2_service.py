@@ -43,6 +43,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 from scripts.canary import passkey_v2_protocol as protocol
 from scripts.canary import passkey_v2_storage_growth as storage
+from scripts.canary import passkey_v2_upstream_sync as upstream_sync
 from scripts.canary import production_cutover_passkey as production_cutover
 from scripts.canary import owner_gate_firewall_readiness as firewall
 from scripts.canary import storage_growth_evidence as growth_evidence
@@ -895,6 +896,63 @@ def _local_cutover_authority_binding(
     )
 
 
+def _local_upstream_sync_authority_binding(
+    release_revision: str,
+    activation_plan: Mapping[str, Any],
+) -> tuple[
+    Mapping[str, Any],
+    str,
+    str,
+    str,
+    Ed25519PublicKey,
+]:
+    """Bind the external activation bytes to installed owner-gate trust."""
+
+    try:
+        plan = upstream_sync.validate_activation_plan(activation_plan)
+    except upstream_sync.UpstreamSyncPasskeyError:
+        raise PasskeyV2ServiceError(
+            "passkey_v2_upstream_sync_plan_binding_invalid"
+        ) from None
+    if plan["release_revision"] != release_revision:
+        raise PasskeyV2ServiceError(
+            "passkey_v2_upstream_sync_plan_binding_invalid"
+        )
+    (
+        base_runtime,
+        manifest_sha256,
+        host_receipt_sha256,
+        trust_bundle,
+    ) = _local_cutover_authority_binding(
+        release_revision,
+        plan["activation_plan_sha256"],
+    )
+    try:
+        checked_trust, receipt_public_key = (
+            production_cutover.validate_trust_bundle(trust_bundle)
+        )
+    except production_cutover.ProductionCutoverPasskeyError:
+        raise PasskeyV2ServiceError(
+            "passkey_v2_upstream_sync_trust_invalid"
+        ) from None
+    runtime = protocol.build_runtime_binding(
+        executor_release_sha=release_revision,
+        executor_plan_sha256=plan["activation_plan_sha256"],
+        executor_binary_sha256=plan["activation_runtime_sha256"],
+        mutation_wrapper_sha256=plan["package_manifest_sha256"],
+        remote_transport_sha256=base_runtime[
+            "remote_transport_sha256"
+        ],
+    )
+    return (
+        runtime,
+        manifest_sha256,
+        host_receipt_sha256,
+        str(checked_trust["trust_bundle_sha256"]),
+        receipt_public_key,
+    )
+
+
 def build_service_frame(
     operation: str, document: Mapping[str, Any]
 ) -> Mapping[str, Any]:
@@ -1180,9 +1238,12 @@ def _validate_authority_action(value: Any) -> Mapping[str, Any]:
             return storage.validate_storage_growth_envelope(value)
         if schema == production_cutover.CUTOVER_ACTION_SCHEMA:
             return production_cutover.validate_cutover_action_envelope(value)
+        if schema == upstream_sync.UPSTREAM_SYNC_ACTION_SCHEMA:
+            return upstream_sync.validate_upstream_sync_action_envelope(value)
     except (
         storage.PasskeyV2StorageBoundaryError,
         production_cutover.ProductionCutoverPasskeyError,
+        upstream_sync.UpstreamSyncPasskeyError,
     ):
         raise PasskeyV2ServiceError("passkey_v2_action_invalid") from None
     raise PasskeyV2ServiceError("passkey_v2_action_schema_forbidden")
@@ -1196,6 +1257,8 @@ def _mechanical_authority_facts(
         return storage.mechanical_approval_facts(action)
     if payload["schema"] == production_cutover.CUTOVER_ACTION_SCHEMA:
         return production_cutover.mechanical_approval_facts(action)
+    if payload["schema"] == upstream_sync.UPSTREAM_SYNC_ACTION_SCHEMA:
+        return upstream_sync.mechanical_approval_facts(action)
     raise PasskeyV2ServiceError("passkey_v2_action_schema_forbidden")
 
 
@@ -2390,7 +2453,7 @@ const bytesToB64 = value => btoa(String.fromCharCode(...new Uint8Array(value))).
 const base = location.pathname;
 const csrf = () => document.cookie.split('; ').find(v => v.startsWith('muncho_csrf='))?.split('=')[1];
 const approve = document.getElementById('approve');
-async function load() { const response=await fetch(base + '/view',{cache:'no-store'}); if(!response.ok) throw new Error('view'); const view=await response.json(); const schemas=new Set(['muncho-passkey-v2-storage-growth-facts.v1','muncho-passkey-v2-production-cutover-facts.v1']); if(!schemas.has(view.mechanical_facts?.schema)||view.values_are_complete_and_untruncated!==true) throw new Error('facts'); document.getElementById('facts').textContent=JSON.stringify(view.mechanical_facts,null,2); document.getElementById('action').textContent=view.exact_action_envelope_canonical_json; document.getElementById('status').textContent='Review all facts before approval.'; approve.disabled=false; }
+async function load() { const response=await fetch(base + '/view',{cache:'no-store'}); if(!response.ok) throw new Error('view'); const view=await response.json(); const schemas=new Set(['muncho-passkey-v2-storage-growth-facts.v1','muncho-passkey-v2-production-cutover-facts.v1','muncho-passkey-v2-dual-upstream-sync-facts.v1']); if(!schemas.has(view.mechanical_facts?.schema)||view.values_are_complete_and_untruncated!==true) throw new Error('facts'); document.getElementById('facts').textContent=JSON.stringify(view.mechanical_facts,null,2); document.getElementById('action').textContent=view.exact_action_envelope_canonical_json; document.getElementById('status').textContent='Review all facts before approval.'; approve.disabled=false; }
 approve.addEventListener('click', async () => { if(approve.disabled) return; approve.disabled=true; try { const optionsResponse=await fetch(base + '/options',{cache:'no-store'}); if(!optionsResponse.ok) throw new Error('options'); const options=await optionsResponse.json(); options.publicKey.challenge=b64ToBytes(options.publicKey.challenge); options.publicKey.allowCredentials=options.publicKey.allowCredentials.map(v=>({...v,id:b64ToBytes(v.id)})); const value=await navigator.credentials.get(options); const c=value; const assertion={id:c.id,rawId:bytesToB64(c.rawId),type:c.type,authenticatorAttachment:c.authenticatorAttachment,clientExtensionResults:c.getClientExtensionResults(),response:{clientDataJSON:bytesToB64(c.response.clientDataJSON),authenticatorData:bytesToB64(c.response.authenticatorData),signature:bytesToB64(c.response.signature),userHandle:c.response.userHandle===null?null:bytesToB64(c.response.userHandle)}}; const response=await fetch(base+'/verify',{method:'POST',headers:{'Content-Type':'application/json','X-Muncho-CSRF':csrf()},body:JSON.stringify({schema:'muncho-passkey-v2-web-verify.v1',assertion:{schema:'muncho-passkey-v2-assertion.v1',credential:assertion}})}); if(!response.ok) throw new Error('verify'); const result=await response.json(); document.getElementById('status').textContent=result.state==='granted'?'Approved. You may return to Muncho.':'Approval failed.'; } catch (_error) { document.getElementById('status').textContent='Approval failed safely.'; approve.disabled=false; }});
 load().catch(()=>{approve.disabled=true;document.getElementById('status').textContent='Request unavailable.';});
 """
@@ -4502,6 +4565,16 @@ def handle_intake_frame(
         [str, str],
         tuple[Mapping[str, Any], str, str, Mapping[str, Any]],
     ] = _local_cutover_authority_binding,
+    upstream_sync_binding_loader: Callable[
+        [str, Mapping[str, Any]],
+        tuple[
+            Mapping[str, Any],
+            str,
+            str,
+            str,
+            Ed25519PublicKey,
+        ],
+    ] = _local_upstream_sync_authority_binding,
 ) -> Mapping[str, Any]:
     frame = _validate_intake_frame(
         value,
@@ -4574,6 +4647,187 @@ def handle_intake_frame(
             },
             maximum_response_bytes=MAX_AUTHORITY_FRAME_BYTES,
         )
+    elif operation == "request_upstream_sync_activation":
+        if set(document) != {
+            "activation_plan",
+            "authorization_nonce_sha256",
+        } or not isinstance(document.get("activation_plan"), Mapping):
+            raise PasskeyV2ServiceError(
+                "passkey_v2_service_document_invalid"
+            )
+        nonce = document.get("authorization_nonce_sha256")
+        if not isinstance(nonce, str) or _SHA256.fullmatch(nonce) is None:
+            raise PasskeyV2ServiceError(
+                "passkey_v2_service_document_invalid"
+            )
+        try:
+            plan = upstream_sync.validate_activation_plan(
+                document["activation_plan"]
+            )
+            (
+                _runtime_binding,
+                manifest_sha,
+                host_receipt_sha,
+                external_iam_receipt_sha,
+                _receipt_public_key,
+            ) = upstream_sync_binding_loader(release_revision, plan)
+            action = upstream_sync.build_upstream_sync_action_envelope(
+                activation_plan=plan,
+                authorization_nonce_sha256=nonce,
+                authority_manifest_sha256=manifest_sha,
+                authority_host_receipt_sha256=host_receipt_sha,
+                external_iam_receipt_sha256=external_iam_receipt_sha,
+                prior_authoritative_receipt_sha256=(
+                    protocol.GENESIS_JOURNAL_HEAD_SHA256
+                ),
+                prior_event_head_sha256=(
+                    protocol.GENESIS_JOURNAL_HEAD_SHA256
+                ),
+                issued_at_unix=now_unix,
+            )
+        except (
+            upstream_sync.UpstreamSyncPasskeyError,
+            PasskeyV2ServiceError,
+        ):
+            raise PasskeyV2ServiceError(
+                "passkey_v2_upstream_sync_request_invalid"
+            ) from None
+        created = authority_client.call(
+            "create_request",
+            {"action_envelope": action},
+        )
+        if (
+            not isinstance(created, Mapping)
+            or created.get("request_id") != action["request_id"]
+            or created.get("expires_at_unix") != action["expires_at_unix"]
+            or created.get("action_envelope_sha256")
+            != action["envelope_sha256"]
+        ):
+            raise PasskeyV2ServiceError(
+                "passkey_v2_upstream_sync_request_invalid"
+            )
+        result = {
+            **created,
+            "release_sha": release_revision,
+            "plan_sha256": plan["activation_plan_sha256"],
+            "action_payload_sha256": action["action_payload_sha256"],
+            "transaction_id": action["transaction_id"],
+            "approval_url": (
+                f"{protocol.PRODUCTION_ORIGIN}/approve/"
+                f"{action['request_id']}"
+            ),
+            "passkey_only": True,
+            "single_use": True,
+            "control_plane_mutation_performed": True,
+            "source_data_mutation_performed": False,
+            "production_host_mutation_performed": False,
+        }
+    elif operation == "consume_upstream_sync_activation":
+        if set(document) != {
+            "activation_plan",
+            "request_id",
+            "consume_attempt_id",
+        } or not isinstance(document.get("activation_plan"), Mapping):
+            raise PasskeyV2ServiceError(
+                "passkey_v2_service_document_invalid"
+            )
+        if (
+            not isinstance(document.get("request_id"), str)
+            or _SHA256.fullmatch(document["request_id"]) is None
+            or not isinstance(document.get("consume_attempt_id"), str)
+            or _SHA256.fullmatch(document["consume_attempt_id"]) is None
+        ):
+            raise PasskeyV2ServiceError(
+                "passkey_v2_service_document_invalid"
+            )
+        try:
+            plan = upstream_sync.validate_activation_plan(
+                document["activation_plan"]
+            )
+            (
+                runtime_binding,
+                _manifest_sha,
+                _host_receipt_sha,
+                _external_iam_receipt_sha,
+                receipt_public_key,
+            ) = upstream_sync_binding_loader(release_revision, plan)
+        except (
+            upstream_sync.UpstreamSyncPasskeyError,
+            PasskeyV2ServiceError,
+        ):
+            raise PasskeyV2ServiceError(
+                "passkey_v2_upstream_sync_request_binding_invalid"
+            ) from None
+        preview = authority_client.call(
+            "render",
+            {"request_id": document["request_id"]},
+        )
+        try:
+            rendered = preview[
+                "exact_action_envelope_canonical_json"
+            ]
+            if not isinstance(rendered, str):
+                raise PasskeyV2ServiceError(
+                    "passkey_v2_upstream_sync_request_binding_invalid"
+                )
+            preview_action = protocol.decode_canonical_json(
+                rendered.encode("utf-8", errors="strict")
+            )
+            upstream_sync.validate_upstream_sync_action_envelope(
+                preview_action,
+                activation_plan=plan,
+            )
+        except (
+            KeyError,
+            UnicodeError,
+            protocol.PasskeyV2ProtocolError,
+            upstream_sync.UpstreamSyncPasskeyError,
+        ):
+            raise PasskeyV2ServiceError(
+                "passkey_v2_upstream_sync_request_binding_invalid"
+            ) from None
+        consumed = authority_client.call(
+            "consume",
+            {
+                "request_id": document["request_id"],
+                "consume_attempt_id": document["consume_attempt_id"],
+                "runtime_binding": runtime_binding,
+            },
+        )
+        if consumed.get("action_envelope") != preview_action:
+            raise PasskeyV2ServiceError(
+                "passkey_v2_upstream_sync_request_binding_invalid"
+            )
+        try:
+            authorization = upstream_sync.build_authorization_bundle(
+                activation_plan=plan,
+                action_envelope=consumed["action_envelope"],
+                challenge_record=consumed["challenge_record"],
+                grant_record=consumed["grant_record"],
+                authorization_receipt=consumed[
+                    "authorization_receipt"
+                ],
+                receipt_public_key=receipt_public_key,
+            )
+        except (
+            KeyError,
+            upstream_sync.UpstreamSyncPasskeyError,
+        ):
+            raise PasskeyV2ServiceError(
+                "passkey_v2_upstream_sync_authorization_invalid"
+            ) from None
+        result = {
+            "request_id": document["request_id"],
+            "consume_attempt_id": document["consume_attempt_id"],
+            "disposition": consumed["disposition"],
+            "authorization_bundle": authorization,
+            "release_sha": release_revision,
+            "plan_sha256": plan["activation_plan_sha256"],
+            "single_use": True,
+            "control_plane_mutation_performed": True,
+            "source_data_mutation_performed": False,
+            "production_host_mutation_performed": False,
+        }
     elif operation == "request_production_cutover":
         if set(document) != {"freeze_publication"} or not isinstance(
             document.get("freeze_publication"), Mapping

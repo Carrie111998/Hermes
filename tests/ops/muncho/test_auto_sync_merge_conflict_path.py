@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import importlib.util
 import json
 import sys
@@ -28,6 +29,41 @@ def _load_routine():
         sys.path.remove(str(RUNTIME))
 
 
+def test_missing_execute_approval_recovers_state_only_under_lock(
+    tmp_path, monkeypatch
+):
+    routine = _load_routine()
+    events: list[str] = []
+
+    @contextmanager
+    def locked(_path):
+        events.append("lock_enter")
+        try:
+            yield
+        finally:
+            events.append("lock_exit")
+
+    def build_plan(_args):
+        assert events == ["lock_enter"]
+        events.append("build_plan")
+        return {"candidate_pr": None}
+
+    def finish(report, _candidate=None):
+        assert events == ["lock_enter", "build_plan"]
+        assert report["status"] == "blocked_execute_env_missing"
+        events.append("finish")
+        return 2
+
+    monkeypatch.delenv(routine.EXECUTE_ENV, raising=False)
+    monkeypatch.setattr(routine, "AUTO_STATE", tmp_path / "candidate.json")
+    monkeypatch.setattr(routine, "candidate_manifest_lock", locked)
+    monkeypatch.setattr(routine, "build_plan", build_plan)
+    monkeypatch.setattr(routine, "finish_blocked_report", finish)
+
+    assert routine.execute(argparse.Namespace(execute=True)) == 2
+    assert events == ["lock_enter", "build_plan", "finish", "lock_exit"]
+
+
 def test_blocked_merge_conflicts_emit_once_then_stay_silent_and_safe(
     tmp_path, monkeypatch, capsys
 ):
@@ -40,6 +76,7 @@ def test_blocked_merge_conflicts_emit_once_then_stay_silent_and_safe(
     monkeypatch.setattr(
         routine, "BLOCKER_DEDUPE_STATE", state_dir / "blocker-dedupe.json"
     )
+    monkeypatch.setattr(routine, "AUTO_STATE", state_dir / "candidate.json")
     monkeypatch.setattr(routine, "WORKTREE_ROOT", tmp_path / "worktrees")
     monkeypatch.setenv(routine.EXECUTE_ENV, "1")
 
@@ -51,6 +88,8 @@ def test_blocked_merge_conflicts_emit_once_then_stay_silent_and_safe(
         return {
             "created_at_utc": f"2026-07-14T0{run_number * 3}:00:00Z",
             "status": "dry_run_plan",
+            "blocked": False,
+            "blockers": [],
             "mode": "execute",
             "monitor_state": {},
             "fresh_refs": {
@@ -62,28 +101,15 @@ def test_blocked_merge_conflicts_emit_once_then_stay_silent_and_safe(
                 "ahead_by": 188,
                 "behind_by": 196 + run_number,
             },
-            "open_sync_prs": [],
+            "open_fork_prs": [],
+            "candidate_manifest": None,
+            "candidate_pr": None,
             "proposed_branch": f"codex/upstream-sync-auto-run-{run_number}",
             "hard_boundaries": {},
         }
 
     monkeypatch.setattr(routine, "build_plan", build_plan)
-    monkeypatch.setattr(
-        routine,
-        "cleanup_stale_sync_prs",
-        lambda _open_prs, _fresh: {"closed": [], "kept": []},
-    )
-    monkeypatch.setattr(routine, "cleanup_old_auto_sync_worktrees", lambda: [])
     monkeypatch.setattr(routine, "disk_free_bytes", lambda _path: 10 << 30)
-    monkeypatch.setattr(routine, "marker_scan", lambda _path: [])
-    monkeypatch.setattr(
-        routine,
-        "try_known_conflict_auto_resolvers",
-        lambda _repo, _conflicted: {
-            "resolved": False,
-            "reason": "unsupported_conflict_set",
-        },
-    )
 
     commands: list[tuple[str, ...]] = []
     conflicts = ("gateway/run.py", "tools/approval.py")
@@ -92,6 +118,12 @@ def test_blocked_merge_conflicts_emit_once_then_stay_silent_and_safe(
         del cwd, check, timeout
         command = tuple(cmd)
         commands.append(command)
+        if command == ("git", "rev-parse", "origin/main"):
+            return routine.CmdResult(list(cmd), 0, "a" * 40 + "\n", "")
+        if command == ("git", "rev-parse", "upstream/main"):
+            return routine.CmdResult(
+                list(cmd), 0, str(run_number) * 40 + "\n", ""
+            )
         if command[:4] == ("git", "merge", "--no-commit", "--no-ff"):
             return routine.CmdResult(list(cmd), 1, "", "merge conflict")
         if command == ("git", "diff", "--name-only", "--diff-filter=U"):
@@ -104,13 +136,6 @@ def test_blocked_merge_conflicts_emit_once_then_stay_silent_and_safe(
         raise AssertionError("blocked merge-conflict path attempted an external mutation")
 
     monkeypatch.setattr(routine, "gh_json", forbidden_external_mutation)
-    monkeypatch.setattr(
-        routine, "auto_merge_sync_pr_and_start_deploy", forbidden_external_mutation
-    )
-    monkeypatch.setattr(
-        routine, "queue_auto_deploy_request", forbidden_external_mutation
-    )
-
     args = argparse.Namespace(execute=True)
 
     monkeypatch.setenv("HERMES_CRON_PREVIOUS_DELIVERY", "none")
@@ -128,7 +153,7 @@ def test_blocked_merge_conflicts_emit_once_then_stay_silent_and_safe(
         "HERMES_CRON_PREVIOUS_RUN_AT", "2026-07-14T03:00:00+00:00"
     )
     monkeypatch.setenv("HERMES_CRON_PREVIOUS_DELIVERY", "confirmed")
-    assert routine.execute(args) == 0
+    assert routine.execute(args) == 2
     assert capsys.readouterr().out == ""
     second_report = json.loads(
         (state_dir / "auto-sync-pr-latest.json").read_text(encoding="utf-8")
@@ -149,4 +174,8 @@ def test_blocked_merge_conflicts_emit_once_then_stay_silent_and_safe(
     assert sum(command[:3] == ("git", "merge", "--abort") for command in commands) == 2
     assert not any("push" in command for command in commands)
     assert not any("pr" in command for command in commands)
-    assert not any(str(routine.AUTO_DEPLOY_HELPER) in command for command in commands)
+    source = (
+        RUNTIME / "fork_upstream_auto_sync_pr_routine.py"
+    ).read_text(encoding="utf-8")
+    assert '"merge",\n            str(number)' not in source
+    assert "deploy_queue" not in source

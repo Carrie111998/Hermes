@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Create a fork-only upstream sync PR when the Muncho fork is behind.
+"""Prepare one fork-only upstream-sync candidate for explicit review.
 
 Safety contract:
 - pulls NousResearch/hermes-agent main into lomliev/hermes-agent only;
-- creates one fork-only branch/PR when no sync PR is already open;
-- never opens an upstream PR;
-- may auto-merge only automation-owned clean/green upstream sync PRs;
-- may auto-deploy only the exact auto-merge fork/main SHA via a restricted helper;
-- never force-pushes main.
+- candidate ownership comes only from an exact private manifest;
+- authored PR title/body text and branch-name patterns are never authority;
+- merge conflicts remain blocked for LLM/Codex integration;
+- this routine never merges, deploys, restarts, or mutates upstream.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -19,28 +19,34 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-# The reviewed systemd rail invokes this file with ``-I -S -B``.  Isolated
+# The reviewed systemd rail invokes this file with ``-I -S -B``. Isolated
 # mode intentionally omits the script directory from ``sys.path``; re-add only
-# this already digest-attested sibling directory so the pure hardening helper
-# remains importable without exposing a mutable PYTHONPATH.
+# this already digest-attested sibling directory.
 _RUNTIME_DIR = Path(__file__).resolve().parent
 if str(_RUNTIME_DIR) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_DIR))
 
 from auto_sync_hardening import (
+    CandidateManifestError,
+    append_candidate_manifest,
+    append_candidate_terminal_receipt,
     blocker_fingerprint,
-    classify_stale_sync_pr,
+    build_prepared_candidate_manifest,
+    candidate_manifest_lock,
+    classify_stale_candidate,
     clear_blocker_delivery_state,
     decide_blocker_delivery,
+    publish_candidate_manifest,
+    recover_candidate_manifest,
 )
 
 FORK_REPO = "lomliev/hermes-agent"
+FORK_OWNER = "lomliev"
 UPSTREAM_REPO = "NousResearch/hermes-agent"
 FORK_BRANCH = "main"
 UPSTREAM_BRANCH = "main"
@@ -49,8 +55,9 @@ UPSTREAM_GIT_URL = "https://github.com/NousResearch/hermes-agent.git"
 AUTOMATION_GIT_NAME = "Muncho Fork Sync"
 AUTOMATION_GIT_EMAIL = "muncho-fork-sync@users.noreply.github.com"
 BRANCH_PREFIX = "codex/upstream-sync-auto-"
-WORKTREE_DIR_PREFIX = BRANCH_PREFIX.replace("/", "-")
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/adventico-ai-platform/hermes-home"))
+HERMES_HOME = Path(
+    os.environ.get("HERMES_HOME", "/opt/adventico-ai-platform/hermes-home")
+)
 GH = Path(
     os.environ.get(
         "FORK_UPSTREAM_AUTO_SYNC_GH",
@@ -79,31 +86,8 @@ MONITOR_LATEST = STATE_DIR / "fork-upstream-drift-latest.json"
 AUTO_STATE = STATE_DIR / "auto-sync-pr-state.json"
 BLOCKER_DEDUPE_STATE = STATE_DIR / "auto-sync-blocker-dedupe.json"
 EXECUTE_ENV = "FORK_UPSTREAM_AUTO_SYNC_EXECUTE_APPROVED"
-AUTO_MERGE_DEPLOY_ENV = "FORK_UPSTREAM_AUTO_SYNC_AUTO_MERGE_DEPLOY_APPROVED"
-POST_CREATE_WAIT_SECONDS_ENV = "FORK_UPSTREAM_AUTO_SYNC_POST_CREATE_WAIT_SECONDS"
-POST_CREATE_POLL_SECONDS_ENV = "FORK_UPSTREAM_AUTO_SYNC_POST_CREATE_POLL_SECONDS"
-WORKTREE_RETENTION_ENV = "FORK_UPSTREAM_AUTO_SYNC_WORKTREE_RETENTION"
-AUTO_DEPLOY_HELPER = Path("/usr/local/sbin/muncho-auto-deploy-release")
-AUTO_DEPLOY_QUEUE_DIR = STATE_DIR / "deploy_queue"
-RELEASE_AUTHOR_MAP_PATH = "scripts/release.py"
-DISCORD_TOOL_PATH = "tools/discord_tool.py"
-GATEWAY_RUN_PATH = "gateway/run.py"
-ALLOWED_CHECK_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
-WAITABLE_AUTO_MERGE_BLOCKERS = {
-    "checks_missing",
-    "checks_pending_or_active",
-    "mergeable_UNKNOWN",
-    "merge_state_UNSTABLE",
-    "merge_state_UNKNOWN",
-}
-AUTHOR_ENTRY_RE = re.compile(
-    r"^(?P<indent>\s*)(?P<quote>['\"])(?P<key>[^'\"]+)(?P=quote)\s*:\s*"
-    r"(?P<value_quote>['\"])(?P<value>[^'\"]+)(?P=value_quote)\s*,(?:\s*#.*)?$"
-)
-CONFLICT_RE = re.compile(r"^<<<<<<< [^\n]*\n(?P<ours>.*?)^=======\n(?P<theirs>.*?)^>>>>>>> [^\n]*\n?", re.M | re.S)
-_TOKEN_PATTERN = re.compile(
-    r"(?i)(?:github_pat_[A-Za-z0-9_]{10,}|gh[pousr]_[A-Za-z0-9_]{10,})"
-)
+_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+_REGISTERED_SECRET_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN")
 
 
 @dataclass
@@ -115,32 +99,35 @@ class CmdResult:
 
 
 def now_utc() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return max(minimum, min(maximum, value))
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def redact_command_output(value: str) -> str:
-    """Remove credential material before output can reach reports or journals."""
+    """Redact only exact credential values from registered secret fields."""
 
+    registered = {
+        secret
+        for name in _REGISTERED_SECRET_ENV_NAMES
+        if (secret := os.environ.get(name))
+    }
     redacted = value
-    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
-        secret = os.environ.get(name)
-        if secret:
-            redacted = redacted.replace(secret, "[REDACTED]")
-    return _TOKEN_PATTERN.sub("[REDACTED]", redacted)
+    for secret in sorted(registered, key=len, reverse=True):
+        redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
 
 
-def run(cmd: list[str], *, cwd: Path | None = None, check: bool = True, timeout: int | None = None) -> CmdResult:
+def run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    timeout: int | None = None,
+) -> CmdResult:
     cp = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -169,81 +156,107 @@ def gh_json(args: list[str]) -> Any:
     return json.loads(cp.stdout or "null")
 
 
+def _require_sha(value: Any, field: str) -> str:
+    if not isinstance(value, str) or _SHA_PATTERN.fullmatch(value) is None:
+        raise RuntimeError(f"invalid_{field}")
+    return value
+
+
+def _single_protocol_line(result: CmdResult, field: str) -> str:
+    lines = result.stdout.splitlines()
+    if len(lines) != 1:
+        raise RuntimeError(f"invalid_{field}")
+    return lines[0]
+
+
 def load_monitor() -> dict[str, Any]:
     if not MONITOR_LATEST.exists():
         return {"status": "missing_monitor_state", "behind_by": None}
-    return json.loads(MONITOR_LATEST.read_text(encoding="utf-8"))
+    value = json.loads(MONITOR_LATEST.read_text(encoding="utf-8"))
+    return value if isinstance(value, dict) else {"status": "invalid_monitor_state"}
 
 
 def ref_sha(repo: str, branch: str) -> str:
     data = gh_json(["api", f"repos/{repo}/git/ref/heads/{branch}"])
-    return data["object"]["sha"]
+    if not isinstance(data, dict) or not isinstance(data.get("object"), dict):
+        raise RuntimeError("invalid_ref_response")
+    return _require_sha(data["object"].get("sha"), "ref_sha")
 
 
 def compare_refs() -> dict[str, Any]:
-    comp = gh_json(["api", f"repos/{UPSTREAM_REPO}/compare/{UPSTREAM_BRANCH}...lomliev:{FORK_BRANCH}"])
+    comp = gh_json(
+        [
+            "api",
+            f"repos/{UPSTREAM_REPO}/compare/{UPSTREAM_BRANCH}...lomliev:{FORK_BRANCH}",
+        ]
+    )
+    if not isinstance(comp, dict):
+        raise RuntimeError("invalid_compare_response")
+    merge_base = comp.get("merge_base_commit")
+    if not isinstance(merge_base, dict):
+        raise RuntimeError("invalid_compare_merge_base")
+    ahead_by = comp.get("ahead_by")
+    behind_by = comp.get("behind_by")
+    if type(ahead_by) is not int or type(behind_by) is not int:
+        raise RuntimeError("invalid_compare_counts")
+    status = comp.get("status")
+    if not isinstance(status, str):
+        raise RuntimeError("invalid_compare_status")
+    compare_url = comp.get("html_url")
+    if compare_url is not None and not isinstance(compare_url, str):
+        raise RuntimeError("invalid_compare_url")
     return {
         "fork_main_ref": ref_sha(FORK_REPO, FORK_BRANCH),
         "upstream_main_ref": ref_sha(UPSTREAM_REPO, UPSTREAM_BRANCH),
-        "merge_base": (comp.get("merge_base_commit") or {}).get("sha"),
-        "ahead_by": int(comp.get("ahead_by") or 0),
-        "behind_by": int(comp.get("behind_by") or 0),
-        "compare_status": comp.get("status"),
-        "compare_url": comp.get("html_url"),
+        "merge_base": _require_sha(merge_base.get("sha"), "merge_base"),
+        "ahead_by": ahead_by,
+        "behind_by": behind_by,
+        "compare_status": status,
+        "compare_url": compare_url,
     }
 
 
 def branch_name(ts: str) -> str:
-    stamp = ts.replace("-", "").replace(":", "").replace("Z", "").replace("T", "-")
+    stamp = (
+        ts.replace("-", "")
+        .replace(":", "")
+        .replace("Z", "")
+        .replace("T", "-")
+    )
     return f"{BRANCH_PREFIX}{stamp[:13]}"
 
 
-def list_open_sync_prs() -> list[dict[str, Any]]:
-    prs = gh_json([
-        "pr",
-        "list",
-        "--repo",
-        FORK_REPO,
-        "--base",
-        FORK_BRANCH,
-        "--state",
-        "open",
-        "--json",
-        "number,title,url,headRefName,headRefOid,baseRefName,isDraft,labels,createdAt,body",
-    ])
-    return [p for p in prs if str(p.get("headRefName", "")).startswith(("codex/upstream-sync-", BRANCH_PREFIX))]
+def list_open_fork_prs() -> list[dict[str, Any]]:
+    """List every open PR to fork main without interpreting authored text."""
+
+    value = gh_json(
+        [
+            "pr",
+            "list",
+            "--repo",
+            FORK_REPO,
+            "--base",
+            FORK_BRANCH,
+            "--state",
+            "open",
+            "--json",
+            (
+                "number,url,state,headRefName,headRefOid,baseRefName,isDraft,"
+                "createdAt,isCrossRepository,headRepository,headRepositoryOwner"
+            ),
+        ]
+    )
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise RuntimeError("invalid_open_pr_list")
+    return value
 
 
-def compare_sha(repo: str, base: str, head: str) -> dict[str, Any] | None:
-    if not base or not head:
-        return None
-    try:
-        return gh_json(["api", f"repos/{repo}/compare/{base}...{head}"])
-    except Exception:
-        return None
+def pr_view(number: int) -> dict[str, Any]:
+    """Fetch a later candidate only by its exact stored PR number."""
 
-
-def compare_shows_head_contains_base(repo: str, base: str, head: str) -> bool:
-    comp = compare_sha(repo, base, head)
-    if not comp:
-        return False
-    return int(comp.get("behind_by") or 0) == 0 and comp.get("status") in {"identical", "ahead"}
-
-
-def upstream_sha_from_pr_body(pr: dict[str, Any]) -> str | None:
-    body = str(pr.get("body") or "")
-    match = re.search(r"Upstream main:\s*`?([0-9a-f]{40})`?", body)
-    return match.group(1) if match else None
-
-
-def is_auto_owned_sync_pr(pr: dict[str, Any]) -> bool:
-    head = str(pr.get("headRefName") or "")
-    body = str(pr.get("body") or "")
-    return head.startswith(BRANCH_PREFIX) and "Automated fork-only upstream sync PR" in body
-
-
-def pr_view(number: int | str) -> dict[str, Any]:
-    return gh_json(
+    if type(number) is not int or number <= 0:
+        raise RuntimeError("invalid_candidate_pr_number")
+    value = gh_json(
         [
             "pr",
             "view",
@@ -251,327 +264,220 @@ def pr_view(number: int | str) -> dict[str, Any]:
             "--repo",
             FORK_REPO,
             "--json",
-            "number,title,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,labels,body",
+            (
+                "number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
+                "mergeable,mergeStateStatus,statusCheckRollup,labels,"
+                "isCrossRepository,headRepository,headRepositoryOwner"
+            ),
         ]
     )
+    if not isinstance(value, dict):
+        raise RuntimeError("invalid_candidate_pr_view")
+    return value
 
 
-def check_rollup_summary(pr: dict[str, Any]) -> dict[str, Any]:
-    rollup = pr.get("statusCheckRollup") or []
-    summary: dict[str, Any] = {
-        "total": len(rollup),
-        "success": 0,
-        "skipped": 0,
-        "neutral": 0,
-        "active": 0,
-        "failure_like": 0,
-        "failure_like_checks": [],
-        "active_checks": [],
+def manifest_scope_mismatches(manifest: Mapping[str, Any]) -> list[str]:
+    expected = {
+        "fork_repository": FORK_REPO,
+        "upstream_repository": UPSTREAM_REPO,
+        "base_ref": FORK_BRANCH,
+        "upstream_ref": UPSTREAM_BRANCH,
     }
-    for item in rollup:
-        status = str(item.get("status") or "").upper()
-        conclusion = str(item.get("conclusion") or "").upper()
-        name = item.get("name")
-        if status != "COMPLETED":
-            summary["active"] += 1
-            summary["active_checks"].append(name)
-            continue
-        if conclusion == "SUCCESS":
-            summary["success"] += 1
-        elif conclusion == "SKIPPED":
-            summary["skipped"] += 1
-        elif conclusion == "NEUTRAL":
-            summary["neutral"] += 1
-        elif conclusion not in ALLOWED_CHECK_CONCLUSIONS:
-            summary["failure_like"] += 1
-            summary["failure_like_checks"].append({"name": name, "conclusion": conclusion})
-    summary["ready"] = (
-        summary["total"] > 0
-        and summary["success"] > 0
-        and summary["active"] == 0
-        and summary["failure_like"] == 0
-    )
-    return summary
+    return [
+        f"manifest_{field}_mismatch"
+        for field, exact in expected.items()
+        if manifest.get(field) != exact
+    ]
 
 
-def evaluate_auto_merge_deploy_pr(pr: dict[str, Any]) -> dict[str, Any]:
-    view = pr_view(pr["number"])
-    checks = check_rollup_summary(view)
-    blockers: list[str] = []
-    if os.environ.get(AUTO_MERGE_DEPLOY_ENV) != "1":
-        blockers.append(f"missing_{AUTO_MERGE_DEPLOY_ENV}")
-    if not is_auto_owned_sync_pr(view):
-        blockers.append("not_auto_owned_sync_pr")
-    if view.get("state") != "OPEN":
-        blockers.append("pr_not_open")
-    if view.get("isDraft"):
-        blockers.append("pr_is_draft")
-    if view.get("baseRefName") != FORK_BRANCH:
-        blockers.append("base_not_fork_main")
-    if view.get("mergeable") != "MERGEABLE":
-        blockers.append(f"mergeable_{view.get('mergeable')}")
-    if view.get("mergeStateStatus") != "CLEAN":
-        blockers.append(f"merge_state_{view.get('mergeStateStatus')}")
-    if not checks["ready"]:
-        if checks["active"]:
-            blockers.append("checks_pending_or_active")
-        if checks["failure_like"]:
-            blockers.append("checks_failed")
-        if checks["total"] == 0:
-            blockers.append("checks_missing")
-    return {"ready": not blockers, "blockers": blockers, "pr": view, "checks": checks}
+def candidate_pr_mismatches(
+    pr: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> list[str]:
+    """Compare structured PR identity with the private manifest byte-for-byte."""
 
-
-def verify_new_main_contains_head(new_main: str, expected_head: str) -> bool:
-    if new_main == expected_head:
-        return True
-    commit = gh_json(["api", f"repos/{FORK_REPO}/commits/{new_main}"])
-    parents = [p.get("sha") for p in commit.get("parents", [])]
-    if expected_head in parents:
-        return True
-    return compare_shows_head_contains_base(FORK_REPO, expected_head, new_main)
-
-
-def queue_auto_deploy_request(target_sha: str, pr_number: str) -> CmdResult:
-    """Request deploy without sudo so gateway/cron no-new-privileges contexts can proceed."""
-    if not re.fullmatch(r"[0-9a-f]{40}", target_sha):
-        return CmdResult(cmd=["queue_auto_deploy_request"], rc=2, stdout="", stderr="invalid target sha")
-    if not re.fullmatch(r"[0-9]+", pr_number):
-        return CmdResult(cmd=["queue_auto_deploy_request"], rc=2, stdout="", stderr="invalid pr number")
-
-    AUTO_DEPLOY_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema": "muncho-auto-deploy-request.v1",
-        "target_commit": target_sha,
-        "pr_number": int(pr_number),
-        "requested_at": now_utc(),
-        "requested_by": "fork_upstream_auto_sync_pr_routine",
-        "source": "post_auto_merge",
+    if manifest.get("phase") != "published":
+        return ["candidate_manifest_not_published"]
+    expected = {
+        "number": manifest.get("pr_number"),
+        "headRefName": manifest.get("branch"),
+        "headRefOid": manifest.get("head_sha"),
+        "baseRefName": manifest.get("base_ref"),
     }
-    target = AUTO_DEPLOY_QUEUE_DIR / f"deploy-{target_sha[:12]}-pr{pr_number}.json"
-    tmp = AUTO_DEPLOY_QUEUE_DIR / f".{target.name}.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, target)
-    try:
-        target.chmod(0o640)
-    except PermissionError:
-        pass
-    return CmdResult(
-        cmd=["queue_auto_deploy_request", str(target)],
-        rc=0,
-        stdout=f"queued {target}\n",
-        stderr="",
-    )
+    mismatches = [
+        f"candidate_pr_{field}_mismatch"
+        for field, exact in expected.items()
+        if pr.get(field) != exact
+    ]
+    mismatches.extend(candidate_repository_identity_mismatches(pr))
+    return mismatches
 
 
-def auto_merge_sync_pr_and_start_deploy(pr: dict[str, Any]) -> dict[str, Any]:
-    evaluation = evaluate_auto_merge_deploy_pr(pr)
-    if not evaluation["ready"]:
-        return {"merged": False, "deploy_started": False, **evaluation}
-    view = evaluation["pr"]
-    number = str(view["number"])
-    expected_head = str(view["headRefOid"])
-    before_main = ref_sha(FORK_REPO, FORK_BRANCH)
-    merge = run(
-        [
-            str(GH),
-            "pr",
-            "merge",
-            number,
-            "--repo",
-            FORK_REPO,
-            "--merge",
-            "--delete-branch",
-            "--subject",
-            f"Merge auto upstream sync PR #{number}",
-            "--body",
-            "Auto-merged by Muncho fork upstream sync routine after CLEAN merge state and green checks. "
-            "No upstream action was performed.",
-        ],
-        check=False,
-        timeout=180,
-    )
-    if merge.rc != 0:
-        return {
-            "merged": False,
-            "deploy_started": False,
-            **evaluation,
-            "merge_rc": merge.rc,
-            "merge_stdout_tail": merge.stdout[-2000:],
-            "merge_stderr_tail": merge.stderr[-2000:],
-        }
-
-    after_main = ref_sha(FORK_REPO, FORK_BRANCH)
-    contains_head = verify_new_main_contains_head(after_main, expected_head)
-    if after_main == before_main or not contains_head:
-        return {
-            "merged": False,
-            "deploy_started": False,
-            **evaluation,
-            "merge_rc": merge.rc,
-            "before_main": before_main,
-            "after_main": after_main,
-            "expected_head": expected_head,
-            "reason": "post_merge_sha_verification_failed",
-        }
-
-    deploy = queue_auto_deploy_request(after_main, number)
-    return {
-        "merged": True,
-        "deploy_started": deploy.rc == 0,
-        **evaluation,
-        "merge_rc": merge.rc,
-        "before_main": before_main,
-        "after_main": after_main,
-        "expected_head": expected_head,
-        "deploy_rc": deploy.rc,
-        "deploy_start_mode": "systemd_queue",
-        "deploy_stdout_tail": deploy.stdout[-2000:],
-        "deploy_stderr_tail": deploy.stderr[-2000:],
-    }
+def candidate_repository_identity_mismatches(
+    pr: Mapping[str, Any],
+) -> list[str]:
+    head_repository = pr.get("headRepository")
+    head_owner = pr.get("headRepositoryOwner")
+    mismatches: list[str] = []
+    if pr.get("isCrossRepository") is not False:
+        mismatches.append("candidate_pr_cross_repository_mismatch")
+    if (
+        not isinstance(head_repository, Mapping)
+        or head_repository.get("nameWithOwner") != FORK_REPO
+    ):
+        mismatches.append("candidate_pr_head_repository_mismatch")
+    if (
+        not isinstance(head_owner, Mapping)
+        or head_owner.get("login") != FORK_OWNER
+    ):
+        mismatches.append("candidate_pr_head_owner_mismatch")
+    return mismatches
 
 
-def wait_for_pr_auto_merge_deploy(pr_number: int | str) -> dict[str, Any]:
-    """Poll a newly opened automation PR so green sync PRs do not wait for the next cron tick."""
-    wait_seconds = env_int(POST_CREATE_WAIT_SECONDS_ENV, 20 * 60, minimum=0, maximum=45 * 60)
-    poll_seconds = env_int(POST_CREATE_POLL_SECONDS_ENV, 30, minimum=10, maximum=120)
-    deadline = time.monotonic() + wait_seconds
-    attempts: list[dict[str, Any]] = []
-    last_result: dict[str, Any] | None = None
-
-    while True:
-        result = auto_merge_sync_pr_and_start_deploy({"number": pr_number})
-        last_result = result
-        attempts.append(
-            {
-                "checked_at_utc": now_utc(),
-                "ready": result.get("ready"),
-                "merged": result.get("merged"),
-                "deploy_started": result.get("deploy_started"),
-                "blockers": result.get("blockers") or [],
-                "checks": result.get("checks"),
-            }
-        )
-        if result.get("merged") and result.get("deploy_started"):
-            return {
-                "status": "merged_deploy_started",
-                "wait_seconds": wait_seconds,
-                "poll_seconds": poll_seconds,
-                "attempts": attempts,
-                "result": result,
-            }
-        if result.get("merged") and not result.get("deploy_started"):
-            return {
-                "status": "merged_deploy_start_failed",
-                "wait_seconds": wait_seconds,
-                "poll_seconds": poll_seconds,
-                "attempts": attempts,
-                "result": result,
-            }
-
-        blockers = set(result.get("blockers") or [])
-        if not blockers.issubset(WAITABLE_AUTO_MERGE_BLOCKERS):
-            return {
-                "status": "blocked_non_waitable",
-                "wait_seconds": wait_seconds,
-                "poll_seconds": poll_seconds,
-                "attempts": attempts,
-                "result": result,
-            }
-        if time.monotonic() >= deadline:
-            return {
-                "status": "timed_out_waiting_for_clean_green",
-                "wait_seconds": wait_seconds,
-                "poll_seconds": poll_seconds,
-                "attempts": attempts,
-                "result": result,
-            }
-        time.sleep(poll_seconds)
-
-
-def stale_sync_reason(pr: dict[str, Any], fresh: dict[str, Any]) -> str | None:
-    automation_owned = is_auto_owned_sync_pr(pr)
-    if not automation_owned:
+def compare_sha(repo: str, base: str, head: str) -> dict[str, Any] | None:
+    if (
+        not isinstance(base, str)
+        or not isinstance(head, str)
+        or _SHA_PATTERN.fullmatch(base) is None
+        or _SHA_PATTERN.fullmatch(head) is None
+    ):
         return None
-    head_sha = str(pr.get("headRefOid") or "")
-    fork_sha = str(fresh.get("fork_main_ref") or "")
+    try:
+        value = gh_json(["api", f"repos/{repo}/compare/{base}...{head}"])
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def compare_shows_head_contains_base(repo: str, base: str, head: str) -> bool:
+    comp = compare_sha(repo, base, head)
+    if not comp:
+        return False
+    behind_by = comp.get("behind_by")
+    status = comp.get("status")
+    return (
+        type(behind_by) is int
+        and behind_by == 0
+        and status in {"identical", "ahead"}
+    )
+
+
+def candidate_commit_mismatches(
+    manifest: Mapping[str, Any],
+) -> list[str]:
+    """Validate both exact recorded inputs as ancestors of the exact head."""
+
+    head_sha = manifest.get("head_sha")
+    base_sha = manifest.get("base_sha")
+    upstream_sha = manifest.get("upstream_sha")
+    if not all(
+        isinstance(value, str) for value in (head_sha, base_sha, upstream_sha)
+    ):
+        return ["candidate_manifest_commit_identity_invalid"]
+    mismatches: list[str] = []
+    if not compare_shows_head_contains_base(FORK_REPO, base_sha, head_sha):
+        mismatches.append("candidate_head_missing_exact_base_sha")
+    if not compare_shows_head_contains_base(FORK_REPO, upstream_sha, head_sha):
+        mismatches.append("candidate_head_missing_exact_upstream_sha")
+    return mismatches
+
+
+def stale_candidate_reason(
+    manifest: Mapping[str, Any],
+    pr: Mapping[str, Any],
+    fresh: Mapping[str, Any],
+) -> str | None:
+    """Classify staleness only after exact manifest/PR identity validation."""
+
+    if manifest_scope_mismatches(manifest) or candidate_pr_mismatches(pr, manifest):
+        return None
+    head_sha = manifest.get("head_sha")
+    fork_sha = fresh.get("fork_main_ref")
+    merge_base = fresh.get("merge_base")
+    upstream_sha = manifest.get("upstream_sha")
+    current_upstream_sha = fresh.get("upstream_main_ref")
+    if not all(
+        isinstance(value, str)
+        for value in (
+            head_sha,
+            fork_sha,
+            merge_base,
+            upstream_sha,
+            current_upstream_sha,
+        )
+    ):
+        return None
+
     head_already_in_fork_main = compare_shows_head_contains_base(
         FORK_REPO, head_sha, fork_sha
     )
-    upstream_sha = upstream_sha_from_pr_body(pr)
-    merge_base = str(fresh.get("merge_base") or "")
-    upstream_snapshot_in_fork_merge_base = bool(
-        upstream_sha
-        and compare_shows_head_contains_base(UPSTREAM_REPO, upstream_sha, merge_base)
+    upstream_snapshot_in_fork_merge_base = compare_shows_head_contains_base(
+        UPSTREAM_REPO, upstream_sha, merge_base
     )
-    current_upstream_sha = str(fresh.get("upstream_main_ref") or "")
     current_upstream_contains_snapshot = bool(
-        upstream_sha
-        and current_upstream_sha
-        and upstream_sha != current_upstream_sha
+        upstream_sha != current_upstream_sha
         and compare_shows_head_contains_base(
             UPSTREAM_REPO, upstream_sha, current_upstream_sha
         )
     )
-    return classify_stale_sync_pr(
-        automation_owned=automation_owned,
+    return classify_stale_candidate(
         head_already_in_fork_main=head_already_in_fork_main,
         upstream_snapshot_sha=upstream_sha,
-        upstream_snapshot_in_fork_merge_base=upstream_snapshot_in_fork_merge_base,
+        upstream_snapshot_in_fork_merge_base=(
+            upstream_snapshot_in_fork_merge_base
+        ),
         current_upstream_sha=current_upstream_sha,
         current_upstream_contains_snapshot=current_upstream_contains_snapshot,
     )
 
 
 def apply_blocker_notification_dedupe(
-    report: dict[str, Any], pr: dict[str, Any]
+    report: dict[str, Any], pr: Mapping[str, Any]
 ) -> bool:
-    """Return True only when this blocker should reach the cron notifier.
+    """Return True only when this factual blocker should reach the notifier."""
 
-    The scheduler supplies a mechanical observation of the prior run's
-    delivery outcome.  ``emit`` below means stdout was selected for delivery;
-    confirmed platform delivery is recorded only after a later invocation
-    observes the scheduler's persisted success receipt.
-    """
-
-    evaluation = report.get("auto_merge_deploy") or {}
-    checks = evaluation.get("checks") or {}
-    # A pre-PR merge conflict has no PR/evaluation object. Its deterministic
-    # conflict-path set is the stable blocker identity; deliberately exclude
-    # volatile upstream SHAs and ahead/behind counts so ordinary upstream
-    # movement does not turn the same unresolved conflict into three-hour
-    # notification spam.
-    blockers = list(
-        evaluation.get("blockers") or report.get("conflicted_files") or []
-    )
-    if report.get("error_type"):
-        blockers.append(f"error_type:{str(report['error_type'])[:80]}")
-    for open_pr in report.get("open_sync_prs") or []:
+    blockers: list[str] = []
+    for key in ("blockers", "conflicted_files"):
+        value = report.get(key)
+        if isinstance(value, list):
+            blockers.extend(item for item in value if isinstance(item, str))
+    error_type = report.get("error_type")
+    if isinstance(error_type, str):
+        blockers.append(f"error_type:{error_type[:80]}")
+    for open_pr in report.get("open_fork_prs") or []:
         if not isinstance(open_pr, dict):
             continue
         number = open_pr.get("number")
-        head = str(open_pr.get("headRefOid") or "")
-        blockers.append(f"open_pr:{number}:{head[:40]}")
-    for marker in report.get("conflict_markers") or []:
-        if isinstance(marker, str):
-            blockers.append(f"conflict_marker:{marker[:120]}")
-        elif isinstance(marker, dict) and marker.get("path"):
-            blockers.append(f"conflict_marker:{str(marker['path'])[:120]}")
-    fresh_refs = report.get("fresh_refs") or {}
+        head = open_pr.get("headRefOid")
+        if type(number) is int and isinstance(head, str):
+            blockers.append(f"open_pr:{number}:{head[:40]}")
+
+    fresh_refs = report.get("fresh_refs")
+    if not isinstance(fresh_refs, dict):
+        fresh_refs = {}
+    candidate_head = pr.get("headRefOid")
+    fork_head = fresh_refs.get("fork_main_ref")
     stable_head_sha = (
-        str(pr.get("headRefOid") or "")
-        or str(fresh_refs.get("fork_main_ref") or "")
-        or None
+        candidate_head
+        if isinstance(candidate_head, str)
+        and _SHA_PATTERN.fullmatch(candidate_head)
+        else (
+            fork_head
+            if isinstance(fork_head, str) and _SHA_PATTERN.fullmatch(fork_head)
+            else None
+        )
     )
+    pr_number = pr.get("number")
+    exact_pr_number = pr_number if type(pr_number) is int else None
+    status = report.get("status")
     fingerprint = blocker_fingerprint(
-        status=str(report.get("status") or "blocked_unknown"),
-        pr_number=pr.get("number"),
+        status=status if isinstance(status, str) else "blocked_unknown",
+        pr_number=exact_pr_number,
         head_sha=stable_head_sha,
         blockers=blockers,
-        failed_checks=checks.get("failure_like_checks") or [],
+        failed_checks=[],
     )
-    previous_run_at = os.environ.get("HERMES_CRON_PREVIOUS_RUN_AT") or None
-    previous_delivery = os.environ.get("HERMES_CRON_PREVIOUS_DELIVERY") or None
+    previous_run_at = os.environ.get("HERMES_CRON_PREVIOUS_RUN_AT")
+    previous_delivery = os.environ.get("HERMES_CRON_PREVIOUS_DELIVERY")
     if previous_delivery not in {"none", "confirmed", "failed"}:
         previous_delivery = None
     if previous_run_at is not None and not (0 < len(previous_run_at) <= 80):
@@ -596,67 +502,31 @@ def apply_blocker_notification_dedupe(
     return bool(decision["emit"])
 
 
-def cleanup_stale_sync_prs(open_prs: list[dict[str, Any]], fresh: dict[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {"enabled": True, "closed": [], "kept": []}
-    for pr in open_prs:
-        reason = stale_sync_reason(pr, fresh)
-        if not reason:
-            result["kept"].append(
-                {
-                    "number": pr.get("number"),
-                    "headRefName": pr.get("headRefName"),
-                    "reason": "not_provably_auto_owned_stale",
-                }
-            )
-            continue
-        number = str(pr["number"])
-        comment = (
-            "Auto-closing stale fork upstream sync PR.\n\n"
-            f"Reason: `{reason}`.\n"
-            "This PR is automation-owned and superseded by the current fork/main state. "
-            "No upstream action, merge, deploy, or force-push was performed."
-        )
-        close = run(
-            [str(GH), "pr", "close", number, "--repo", FORK_REPO, "--comment", comment, "--delete-branch"],
-            check=False,
-            timeout=120,
-        )
-        if close.rc != 0:
-            close = run([str(GH), "pr", "close", number, "--repo", FORK_REPO, "--comment", comment], check=False, timeout=120)
-        bucket = "closed" if close.rc == 0 else "kept"
-        result[bucket].append(
-            {
-                "number": pr.get("number"),
-                "headRefName": pr.get("headRefName"),
-                "headRefOid": pr.get("headRefOid"),
-                "reason": reason if close.rc == 0 else "close_failed",
-                "stale_reason": reason,
-                "close_rc": close.rc,
-                "close_stdout_tail": close.stdout[-1000:],
-                "close_stderr_tail": close.stderr[-1000:],
-            }
-        )
-    return result
+def worktree_for_branch(branch: str) -> Path:
+    """Address worktree state by an exact branch digest, never by a prefix."""
+
+    digest = hashlib.sha256(branch.encode("utf-8")).hexdigest()
+    return WORKTREE_ROOT / f"candidate-{digest}"
 
 
-def marker_scan(root: Path) -> list[str]:
-    """Return real Git conflict markers, avoiding decorative separator false positives."""
-    exclude = {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".pytest_cache"}
-    marker_prefixes = ("<<<<<<< ", ">>>>>>> ", "||||||| ")
-    markers: list[str] = []
-    for p in root.rglob("*"):
-        if not p.is_file() or any(part in exclude for part in p.parts):
-            continue
-        try:
-            text = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        for i, line in enumerate(text.splitlines(), 1):
-            if line.startswith(marker_prefixes):
-                markers.append(f"{p.relative_to(root)}:{i}:{line[:140]}")
-                if len(markers) >= 100:
-                    return markers
-    return markers
+def safe_rmtree(path: Path) -> None:
+    root = WORKTREE_ROOT.resolve()
+    target = path.resolve()
+    if root not in target.parents:
+        raise RuntimeError(f"refusing to remove path outside worktree root: {target}")
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def cleanup_exact_candidate_worktree(manifest: Mapping[str, Any]) -> bool:
+    branch = manifest.get("branch")
+    if not isinstance(branch, str):
+        raise RuntimeError("candidate_manifest_branch_invalid")
+    target = worktree_for_branch(branch)
+    if not target.exists():
+        return False
+    safe_rmtree(target)
+    return True
 
 
 def disk_free_bytes(path: Path) -> int:
@@ -666,336 +536,40 @@ def disk_free_bytes(path: Path) -> int:
     return shutil.disk_usage(probe).free
 
 
-def cleanup_old_auto_sync_worktrees() -> list[str]:
-    retain = env_int(WORKTREE_RETENTION_ENV, 2, minimum=0, maximum=20)
-    if not WORKTREE_ROOT.exists():
-        return []
-
-    candidates = [
-        path
-        for path in WORKTREE_ROOT.iterdir()
-        if path.is_dir() and path.name.startswith(WORKTREE_DIR_PREFIX)
-    ]
-    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-
-    deleted: list[str] = []
-    for old_worktree in candidates[retain:]:
-        safe_rmtree(old_worktree)
-        deleted.append(str(old_worktree))
-    return deleted
-
-
 def changed_python_files(repo: Path, base_ref: str) -> list[str]:
     cp = run(["git", "diff", "--name-only", f"{base_ref}..HEAD"], cwd=repo)
-    return [line for line in cp.stdout.splitlines() if line.endswith(".py") and (repo / line).exists()]
-
-
-def author_map_conflict_start_is_inside_map(text: str, conflict_start: int) -> bool:
-    map_start = text.rfind("AUTHOR_MAP", 0, conflict_start)
-    if map_start < 0:
-        return False
-    brace_start = text.find("{", map_start, conflict_start)
-    if brace_start < 0:
-        return False
-    return "}" not in text[brace_start:conflict_start]
-
-
-def parse_author_entry_lines(block: str) -> tuple[list[tuple[str, str]], str | None]:
-    entries: list[tuple[str, str]] = []
-    for line in block.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        match = AUTHOR_ENTRY_RE.match(line)
-        if not match:
-            return [], f"unsupported_author_map_line:{line[:160]}"
-        entries.append((match.group("key"), line))
-    return entries, None
-
-
-def merge_author_map_conflict_text(text: str) -> tuple[str, dict[str, Any]]:
-    matches = list(CONFLICT_RE.finditer(text))
-    if not matches:
-        return text, {"resolved": False, "reason": "no_conflict_block"}
-    if any(not author_map_conflict_start_is_inside_map(text, match.start()) for match in matches):
-        return text, {"resolved": False, "reason": "conflict_outside_AUTHOR_MAP"}
-
-    merged_parts: list[str] = []
-    last = 0
-    resolved_blocks: list[dict[str, Any]] = []
-    for match in matches:
-        ours_entries, ours_error = parse_author_entry_lines(match.group("ours"))
-        theirs_entries, theirs_error = parse_author_entry_lines(match.group("theirs"))
-        if ours_error or theirs_error:
-            return text, {"resolved": False, "reason": ours_error or theirs_error}
-
-        seen: set[str] = set()
-        merged_lines: list[str] = []
-        for key, line in ours_entries:
-            if key not in seen:
-                merged_lines.append(line)
-                seen.add(key)
-        added_from_theirs = 0
-        for key, line in theirs_entries:
-            if key not in seen:
-                merged_lines.append(line)
-                seen.add(key)
-                added_from_theirs += 1
-
-        merged_parts.append(text[last:match.start()])
-        merged_parts.append("\n".join(merged_lines) + "\n")
-        last = match.end()
-        resolved_blocks.append(
-            {
-                "ours_entries": len(ours_entries),
-                "theirs_entries": len(theirs_entries),
-                "added_from_theirs": added_from_theirs,
-            }
-        )
-
-    merged_parts.append(text[last:])
-    return "".join(merged_parts), {"resolved": True, "blocks": resolved_blocks}
-
-
-def resolve_release_author_map_conflict(repo: Path) -> dict[str, Any]:
-    path = repo / RELEASE_AUTHOR_MAP_PATH
-    text = path.read_text(encoding="utf-8")
-    merged, result = merge_author_map_conflict_text(text)
-    if not result.get("resolved"):
-        return {"file": RELEASE_AUTHOR_MAP_PATH, **result}
-    path.write_text(merged, encoding="utf-8")
-    markers = marker_scan(repo)
-    release_markers = [m for m in markers if m.startswith(f"{RELEASE_AUTHOR_MAP_PATH}:")]
-    if release_markers:
-        return {"file": RELEASE_AUTHOR_MAP_PATH, "resolved": False, "reason": "markers_remain", "markers": release_markers[:20]}
-    compile_result = run([sys.executable, "-m", "py_compile", RELEASE_AUTHOR_MAP_PATH], cwd=repo, check=False, timeout=120)
-    if compile_result.rc != 0:
-        return {
-            "file": RELEASE_AUTHOR_MAP_PATH,
-            "resolved": False,
-            "reason": "py_compile_failed",
-            "stderr_tail": compile_result.stderr[-2000:],
-        }
-    run(["git", "add", RELEASE_AUTHOR_MAP_PATH], cwd=repo, timeout=120)
-    return {"file": RELEASE_AUTHOR_MAP_PATH, **result, "py_compile": "pass"}
-
-
-def parse_simple_import_lines(block: str) -> tuple[list[str], str | None]:
-    imports: list[str] = []
-    for line in block.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if not re.fullmatch(r"import [A-Za-z_][A-Za-z0-9_]*", stripped):
-            return [], f"unsupported_import_conflict_line:{line[:160]}"
-        imports.append(stripped)
-    return imports, None
-
-
-def merge_simple_import_conflict_text(text: str) -> tuple[str, dict[str, Any]]:
-    matches = list(CONFLICT_RE.finditer(text))
-    if not matches:
-        return text, {"resolved": False, "reason": "no_conflict_block"}
-
-    merged_parts: list[str] = []
-    last = 0
-    resolved_blocks: list[dict[str, Any]] = []
-    for match in matches:
-        ours_imports, ours_error = parse_simple_import_lines(match.group("ours"))
-        theirs_imports, theirs_error = parse_simple_import_lines(match.group("theirs"))
-        if ours_error or theirs_error:
-            return text, {"resolved": False, "reason": ours_error or theirs_error}
-
-        seen: set[str] = set()
-        merged_imports: list[str] = []
-        for line in [*ours_imports, *theirs_imports]:
-            if line not in seen:
-                merged_imports.append(line)
-                seen.add(line)
-
-        merged_parts.append(text[last:match.start()])
-        merged_parts.append("\n".join(merged_imports) + "\n")
-        last = match.end()
-        resolved_blocks.append(
-            {
-                "ours_imports": len(ours_imports),
-                "theirs_imports": len(theirs_imports),
-                "merged_imports": len(merged_imports),
-            }
-        )
-
-    merged_parts.append(text[last:])
-    return "".join(merged_parts), {"resolved": True, "blocks": resolved_blocks}
-
-
-def resolve_discord_tool_import_conflict(repo: Path) -> dict[str, Any]:
-    path = repo / DISCORD_TOOL_PATH
-    text = path.read_text(encoding="utf-8")
-    merged, result = merge_simple_import_conflict_text(text)
-    if not result.get("resolved"):
-        return {"file": DISCORD_TOOL_PATH, **result}
-    path.write_text(merged, encoding="utf-8")
-    markers = marker_scan(repo)
-    discord_markers = [m for m in markers if m.startswith(f"{DISCORD_TOOL_PATH}:")]
-    if discord_markers:
-        return {"file": DISCORD_TOOL_PATH, "resolved": False, "reason": "markers_remain", "markers": discord_markers[:20]}
-    compile_result = run([sys.executable, "-m", "py_compile", DISCORD_TOOL_PATH], cwd=repo, check=False, timeout=120)
-    if compile_result.rc != 0:
-        return {
-            "file": DISCORD_TOOL_PATH,
-            "resolved": False,
-            "reason": "py_compile_failed",
-            "stderr_tail": compile_result.stderr[-2000:],
-        }
-    run(["git", "add", DISCORD_TOOL_PATH], cwd=repo, timeout=120)
-    return {"file": DISCORD_TOOL_PATH, **result, "py_compile": "pass"}
-
-
-def normalized_conflict_lines(block: str) -> list[str]:
-    return [line.strip() for line in block.splitlines() if line.strip()]
-
-
-def merge_gateway_startup_resume_conflict_text(text: str) -> tuple[str, dict[str, Any]]:
-    """Merge the one proven startup-resume sync/async migration conflict.
-
-    The fork adds exact active-session recovery before the historical timestamp
-    heuristic. Upstream moved that heuristic onto ``async_session_store``. The
-    safe union preserves the exact recovery and adopts the awaited async call.
-    Any other shape is rejected instead of being guessed.
-    """
-    matches = list(CONFLICT_RE.finditer(text))
-    if len(matches) != 1:
-        return text, {"resolved": False, "reason": f"expected_one_conflict_block_got:{len(matches)}"}
-
-    match = matches[0]
-    ours = normalized_conflict_lines(match.group("ours"))
-    theirs = normalized_conflict_lines(match.group("theirs"))
-    expected_ours = [
-        "exact_marked = self._mark_runtime_status_active_sessions_resume_pending()",
-        "heuristic_marked = self.session_store.suspend_recently_active()",
-        "total_marked = exact_marked + heuristic_marked",
-        "if total_marked:",
-        "logger.info(",
-        '"Marked %d in-flight session(s) as resumable from previous run "',
-        '"(exact=%d, heuristic=%d)",',
-        "total_marked,",
-        "exact_marked,",
-        "heuristic_marked,",
-        ")",
+    return [
+        line
+        for line in cp.stdout.splitlines()
+        if line.endswith(".py") and (repo / line).exists()
     ]
-    expected_theirs = [
-        "suspended = await self.async_session_store.suspend_recently_active()",
-        "if suspended:",
-        'logger.info("Marked %d in-flight session(s) as resumable from previous run", suspended)',
-    ]
-    if ours != expected_ours or theirs != expected_theirs:
-        return text, {
-            "resolved": False,
-            "reason": "unsupported_gateway_startup_resume_conflict_shape",
-            "ours_lines": ours[:20],
-            "theirs_lines": theirs[:20],
-        }
-
-    old_call = "heuristic_marked = self.session_store.suspend_recently_active()"
-    new_call = "heuristic_marked = await self.async_session_store.suspend_recently_active()"
-    ours_block = match.group("ours")
-    if ours_block.count(old_call) != 1:
-        return text, {"resolved": False, "reason": "expected_single_sync_heuristic_call"}
-    merged_block = ours_block.replace(old_call, new_call, 1)
-    merged = text[:match.start()] + merged_block + text[match.end():]
-    return merged, {"resolved": True, "blocks": 1, "strategy": "fork_exact_plus_upstream_async_heuristic"}
 
 
-def resolve_gateway_startup_resume_conflict(repo: Path) -> dict[str, Any]:
-    path = repo / GATEWAY_RUN_PATH
-    text = path.read_text(encoding="utf-8")
-    merged, result = merge_gateway_startup_resume_conflict_text(text)
-    if not result.get("resolved"):
-        return {"file": GATEWAY_RUN_PATH, **result}
-    path.write_text(merged, encoding="utf-8")
-    gateway_markers = [m for m in marker_scan(repo) if m.startswith(f"{GATEWAY_RUN_PATH}:")]
-    if gateway_markers:
-        return {
-            "file": GATEWAY_RUN_PATH,
-            "resolved": False,
-            "reason": "markers_remain",
-            "markers": gateway_markers[:20],
-        }
-    compile_result = run(
-        [sys.executable, "-m", "py_compile", GATEWAY_RUN_PATH],
-        cwd=repo,
-        check=False,
-        timeout=120,
-    )
-    if compile_result.rc != 0:
-        return {
-            "file": GATEWAY_RUN_PATH,
-            "resolved": False,
-            "reason": "py_compile_failed",
-            "stderr_tail": compile_result.stderr[-2000:],
-        }
-    run(["git", "add", GATEWAY_RUN_PATH], cwd=repo, timeout=120)
-    return {"file": GATEWAY_RUN_PATH, **result, "py_compile": "pass"}
-
-
-def try_known_conflict_auto_resolvers(repo: Path, conflicted: list[str]) -> dict[str, Any]:
-    known_paths = {RELEASE_AUTHOR_MAP_PATH, DISCORD_TOOL_PATH, GATEWAY_RUN_PATH}
-    supported = sorted(known_paths)
-    if not conflicted or any(path not in known_paths for path in conflicted):
-        return {
-            "resolved": False,
-            "reason": "unsupported_conflict_set",
-            "supported_conflict_paths": supported,
-        }
-
-    results: list[dict[str, Any]] = []
-    if RELEASE_AUTHOR_MAP_PATH in conflicted:
-        result = resolve_release_author_map_conflict(repo)
-        result["resolver"] = "scripts/release.py:AUTHOR_MAP"
-        results.append(result)
-    if DISCORD_TOOL_PATH in conflicted:
-        result = resolve_discord_tool_import_conflict(repo)
-        result["resolver"] = "tools/discord_tool.py:import_union"
-        results.append(result)
-    if GATEWAY_RUN_PATH in conflicted:
-        result = resolve_gateway_startup_resume_conflict(repo)
-        result["resolver"] = "gateway/run.py:exact_resume_plus_async_heuristic"
-        results.append(result)
-
-    return {
-        "resolved": all(result.get("resolved") for result in results),
-        "results": results,
-        "supported_conflict_paths": supported,
-    }
-
-
-def safe_rmtree(path: Path) -> None:
-    root = WORKTREE_ROOT.resolve()
-    target = path.resolve()
-    if root not in target.parents and target != root:
-        raise RuntimeError(f"refusing to remove path outside worktree root: {target}")
-    if path.exists():
-        shutil.rmtree(path)
-
-
-def write_json(path: Path, data: dict[str, Any]) -> None:
+def write_json(path: Path, data: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    raw = (
+        json.dumps(dict(data), indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    )
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp")
+    try:
+        tmp.write_text(raw, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
-def render_summary(report: dict[str, Any]) -> str:
-    status = report.get("status")
+def render_summary(report: Mapping[str, Any]) -> str:
     lines = [
-        "# Fork Upstream Auto Sync PR Routine",
+        "# Fork Upstream Sync Candidate Routine",
         "",
-        f"Status: `{status}`",
+        f"Status: `{report.get('status')}`",
         "",
         f"Time: `{report.get('created_at_utc')}`",
         "",
-        "Boundaries: fork-only branch/PR; no upstream PR/push; auto-merge/deploy only for auto-owned clean/green sync PRs.",
+        "Boundaries: fork-only candidate branch/PR; explicit later merge and deploy gates; no upstream mutation.",
     ]
-    fresh = report.get("fresh_refs") or {}
-    if fresh:
+    fresh = report.get("fresh_refs")
+    if isinstance(fresh, Mapping):
         lines += [
             "",
             "## Refs",
@@ -1007,28 +581,26 @@ def render_summary(report: dict[str, Any]) -> str:
         ]
     if report.get("pr_url"):
         lines += ["", f"PR: {report['pr_url']}"]
-    auto_merge = report.get("auto_merge_deploy")
-    if auto_merge:
-        lines += [
-            "",
-            "## Auto Merge/Deploy",
-            f"- ready: `{auto_merge.get('ready')}`",
-            f"- merged: `{auto_merge.get('merged')}`",
-            f"- deploy_started: `{auto_merge.get('deploy_started')}`",
-        ]
-        if auto_merge.get("blockers"):
-            lines += ["- blockers: `" + ", ".join(auto_merge.get("blockers") or []) + "`"]
-    if report.get("conflicted_files"):
-        lines += ["", "Conflicts:", *[f"- `{p}`" for p in report["conflicted_files"]]]
-    if report.get("message"):
-        lines += ["", str(report["message"])]
+    conflicts = report.get("conflicted_files")
+    if isinstance(conflicts, list) and conflicts:
+        lines += ["", "Conflicts:", *[f"- `{path}`" for path in conflicts]]
+    message = report.get("message")
+    if message is not None:
+        if not isinstance(message, str):
+            raise RuntimeError("report_message_invalid")
+        if message:
+            lines += ["", message]
     return "\n".join(lines) + "\n"
 
 
-def write_report(report: dict[str, Any]) -> None:
-    ts = report["created_at_utc"].replace("-", "").replace(":", "")
+def write_report(report: Mapping[str, Any]) -> None:
+    created_at = report.get("created_at_utc")
+    if not isinstance(created_at, str):
+        raise RuntimeError("report_created_at_missing")
+    ts = created_at.replace("-", "").replace(":", "")
     write_json(STATE_DIR / "auto-sync-pr-latest.json", report)
     write_json(STATE_DIR / f"auto-sync-pr-{ts}.json", report)
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
     (REPORT_DIR / "fork-upstream-auto-sync-pr-latest-public-summary.md").write_text(
         render_summary(report),
         encoding="utf-8",
@@ -1036,199 +608,612 @@ def write_report(report: dict[str, Any]) -> None:
 
 
 def finish_blocked_report(
-    report: dict[str, Any], pr: dict[str, Any] | None = None
+    report: dict[str, Any], pr: Mapping[str, Any] | None = None
 ) -> int:
-    """Persist every terminal blocker and notify only through one dedupe path."""
+    """Persist a factual terminal blocker through the single dedupe path."""
 
-    if not str(report.get("status") or "").startswith("blocked_"):
-        raise ValueError("finish_blocked_report requires a blocked status")
+    report["blocked"] = True
     selected = apply_blocker_notification_dedupe(report, pr or {})
     write_report(report)
     if selected:
         print(render_summary(report).rstrip())
-        return 2
-    return 0
+    # Delivery deduplication controls only whether the human-facing summary is
+    # emitted.  The process contract must continue to report the factual
+    # blocked outcome on every run so the supervising rail cannot mistake a
+    # repeated blocker for success.
+    return 2
+
+
+def _candidate_state_for_plan(
+    open_fork_prs: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[str]]:
+    try:
+        manifest = recover_candidate_manifest(AUTO_STATE)
+    except CandidateManifestError as exc:
+        return None, None, [str(exc)]
+    if manifest is None:
+        # The private ledger is the sole candidate authority. Other open PRs
+        # remain observable facts, but authored text and branch names cannot
+        # make them candidates or block creation.
+        return None, None, []
+    scope_mismatches = manifest_scope_mismatches(manifest)
+    if scope_mismatches:
+        return manifest, None, scope_mismatches
+    if manifest.get("phase") == "prepared":
+        return manifest, None, []
+    if manifest.get("phase") != "published":
+        return manifest, None, ["candidate_manifest_phase_invalid"]
+    try:
+        candidate = pr_view(manifest["pr_number"])
+    except Exception as exc:
+        return manifest, None, [f"candidate_pr_lookup_failed:{type(exc).__name__}"]
+    mismatches = [
+        *candidate_pr_mismatches(candidate, manifest),
+        *candidate_commit_mismatches(manifest),
+    ]
+    return manifest, candidate, mismatches
 
 
 def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     ts = now_utc()
     monitor = load_monitor()
     fresh = compare_refs()
-    prs = list_open_sync_prs()
-    status = "dry_run_plan"
-    if fresh["behind_by"] == 0:
+    open_fork_prs = list_open_fork_prs()
+    manifest, candidate, blockers = _candidate_state_for_plan(open_fork_prs)
+    blocked = bool(blockers)
+
+    if blocked:
+        status = "blocked_candidate_identity_state"
+    elif manifest is not None and manifest.get("phase") == "prepared":
+        status = "candidate_prepared_recovery_required"
+    elif candidate is not None:
+        state = candidate.get("state")
+        if state == "OPEN":
+            status = "candidate_pr_exists_review_required_no_action"
+        elif state == "CLOSED":
+            status = "blocked_candidate_closed_requires_operator_reconciliation"
+            blockers = ["candidate_closed_requires_operator_reconciliation"]
+            blocked = True
+        elif state == "MERGED":
+            status = "candidate_merged_requires_reconciliation"
+        else:
+            status = "blocked_candidate_pr_state_unknown"
+            blockers = ["candidate_pr_state_unknown"]
+            blocked = True
+    elif fresh["behind_by"] == 0:
         status = "no_drift_no_action"
-    elif len(prs) == 1:
-        status = "open_sync_pr_exists_no_action"
-    elif len(prs) > 1:
-        status = "blocked_multiple_open_sync_prs"
+    else:
+        status = "dry_run_candidate_plan"
+
     return {
         "created_at_utc": ts,
         "status": status,
+        "blocked": blocked,
+        "blockers": blockers,
         "mode": "execute" if args.execute else "dry_run",
         "monitor_state": monitor,
         "fresh_refs": fresh,
-        "open_sync_prs": prs,
+        "open_fork_prs": open_fork_prs,
+        "candidate_manifest": manifest,
+        "candidate_pr": candidate,
         "proposed_branch": branch_name(ts),
         "hard_boundaries": {
-            "auto_merge": "auto_owned_clean_green_sync_pr_only",
-            "merge_into_fork_main": "auto_owned_clean_green_sync_pr_only",
+            "candidate_identity": "exact_private_manifest_only",
+            "display_title_or_body_authority": False,
+            "branch_prefix_authority": False,
+            "merge_into_fork_main": False,
+            "runtime_deploy": False,
             "upstream_pr_or_push": False,
-            "runtime_deploy": "after_auto_merge_exact_sha_only",
             "dashboard_update": False,
             "gateway_restart": False,
-            "conflict_auto_resolution": "known_safe_only",
-            "known_conflict_auto_resolvers": [
-                "scripts/release.py:AUTHOR_MAP",
-                "tools/discord_tool.py:import_union",
-                "gateway/run.py:exact_resume_plus_async_heuristic",
-            ],
-            "stale_sync_pr_cleanup": True,
-            "auto_merge_green_sync_pr": os.environ.get(AUTO_MERGE_DEPLOY_ENV) == "1",
-            "auto_deploy_after_auto_merge": os.environ.get(AUTO_MERGE_DEPLOY_ENV) == "1",
+            "conflict_resolution": "llm_codex_integration_required",
         },
     }
 
 
-def execute(args: argparse.Namespace) -> int:
-    if os.environ.get(EXECUTE_ENV) != "1":
-        report = build_plan(args)
-        report["status"] = "blocked_execute_env_missing"
-        report["message"] = f"Missing {EXECUTE_ENV}=1"
-        return finish_blocked_report(report)
+def discover_created_candidate_pr(branch: str, head_sha: str) -> dict[str, Any]:
+    """Resolve the just-created PR through exact structured identity fields."""
 
+    value = gh_json(
+        [
+            "pr",
+            "list",
+            "--repo",
+            FORK_REPO,
+            "--base",
+            FORK_BRANCH,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            (
+                "number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
+                "createdAt,isCrossRepository,headRepository,headRepositoryOwner"
+            ),
+        ]
+    )
+    if not isinstance(value, list):
+        raise RuntimeError("invalid_created_candidate_list")
+    exact = [
+        row
+        for row in value
+        if isinstance(row, dict)
+        and row.get("headRefName") == branch
+        and row.get("headRefOid") == head_sha
+        and row.get("baseRefName") == FORK_BRANCH
+        and row.get("state") == "OPEN"
+        and not candidate_repository_identity_mismatches(row)
+        and type(row.get("number")) is int
+        and row["number"] > 0
+    ]
+    if len(exact) != 1:
+        raise RuntimeError("created_candidate_exact_identity_unavailable")
+    return exact[0]
+
+
+def list_exact_branch_candidate_prs(
+    branch: str,
+    head_sha: str,
+) -> list[dict[str, Any]]:
+    """Read all terminal/open PR facts for one manifest-owned exact branch."""
+
+    value = gh_json(
+        [
+            "pr",
+            "list",
+            "--repo",
+            FORK_REPO,
+            "--base",
+            FORK_BRANCH,
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--limit",
+            "100",
+            "--json",
+            (
+                "number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
+                "createdAt,isCrossRepository,headRepository,headRepositoryOwner"
+            ),
+        ]
+    )
+    if not isinstance(value, list) or any(
+        not isinstance(row, dict) for row in value
+    ):
+        raise RuntimeError("invalid_exact_candidate_pr_list")
+    mismatched = [
+        row
+        for row in value
+        if row.get("headRefName") != branch
+        or row.get("baseRefName") != FORK_BRANCH
+        or row.get("headRefOid") != head_sha
+        or candidate_repository_identity_mismatches(row)
+        or type(row.get("number")) is not int
+        or row["number"] <= 0
+        or row.get("state") not in {"OPEN", "CLOSED", "MERGED"}
+    ]
+    if mismatched:
+        raise RuntimeError("exact_candidate_pr_identity_mismatch")
+    if len(value) > 1:
+        raise RuntimeError("multiple_exact_candidate_prs")
+    return value
+
+
+def create_candidate_pr(
+    *,
+    worktree: Path,
+    branch: str,
+    head_sha: str,
+    base_sha: str,
+    upstream_sha: str,
+    created_at_utc: str,
+    behind_by: int,
+    ahead_by: int,
+) -> tuple[dict[str, Any], CmdResult]:
+    title = (
+        "chore: prepare fork upstream-sync candidate "
+        f"{created_at_utc[:10]}"
+    )
+    body = (
+        "Fork-only upstream-sync candidate for explicit review.\n\n"
+        f"- Base fork SHA: `{base_sha}`\n"
+        f"- Upstream SHA: `{upstream_sha}`\n"
+        f"- behind_by before preparation: `{behind_by}`\n"
+        f"- ahead_by before preparation: `{ahead_by}`\n\n"
+        "The title and this body are display text only. Candidate identity "
+        "is held in private canonical state. This routine does not merge, "
+        "deploy, restart, or mutate upstream.\n"
+    )
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", delete=False
+    ) as stream:
+        stream.write(body)
+        body_file = stream.name
+    try:
+        result = run(
+            [
+                str(GH),
+                "pr",
+                "create",
+                "--repo",
+                FORK_REPO,
+                "--base",
+                FORK_BRANCH,
+                "--head",
+                branch,
+                "--draft",
+                "--title",
+                title,
+                "--body-file",
+                body_file,
+            ],
+            cwd=worktree,
+            timeout=120,
+        )
+    finally:
+        Path(body_file).unlink(missing_ok=True)
+    return discover_created_candidate_pr(branch, head_sha), result
+
+
+def _validate_prepared_worktree(
+    manifest: Mapping[str, Any],
+) -> Path:
+    worktree = worktree_for_branch(manifest["branch"])
+    if not worktree.is_dir():
+        raise RuntimeError("prepared_candidate_worktree_missing")
+    head = _require_sha(
+        _single_protocol_line(
+            run(["git", "rev-parse", "HEAD"], cwd=worktree),
+            "prepared_candidate_head",
+        ),
+        "prepared_candidate_head",
+    )
+    if head != manifest["head_sha"]:
+        raise RuntimeError("prepared_candidate_worktree_head_mismatch")
+    status = run(["git", "status", "--porcelain"], cwd=worktree)
+    if status.stdout:
+        raise RuntimeError("prepared_candidate_worktree_not_clean")
+    for label, ancestor in (
+        ("base", manifest["base_sha"]),
+        ("upstream", manifest["upstream_sha"]),
+    ):
+        if (
+            run(
+                ["git", "merge-base", "--is-ancestor", ancestor, head],
+                cwd=worktree,
+                check=False,
+            ).rc
+            != 0
+        ):
+            raise RuntimeError(
+                f"prepared_candidate_head_missing_exact_{label}_sha"
+            )
+    return worktree
+
+
+def _recover_prepared_candidate(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    manifest: Mapping[str, Any],
+) -> int:
+    """Resume only the exact prepared transaction; never infer ownership."""
+
+    exact_prs = list_exact_branch_candidate_prs(
+        manifest["branch"],
+        manifest["head_sha"],
+    )
+    create_result: CmdResult | None = None
+    if exact_prs:
+        candidate = exact_prs[0]
+    else:
+        worktree = _validate_prepared_worktree(manifest)
+        # A normal non-force push is idempotent for an absent/same remote ref
+        # and fails closed if an external actor moved the exact branch.
+        run(
+            [
+                "git",
+                "-c",
+                f"credential.https://github.com.helper=!{GH} auth git-credential",
+                "push",
+                FORK_GIT_URL,
+                f"{manifest['head_sha']}:refs/heads/{manifest['branch']}",
+            ],
+            cwd=worktree,
+            timeout=300,
+        )
+        candidate, create_result = create_candidate_pr(
+            worktree=worktree,
+            branch=manifest["branch"],
+            head_sha=manifest["head_sha"],
+            base_sha=manifest["base_sha"],
+            upstream_sha=manifest["upstream_sha"],
+            created_at_utc=manifest["created_at_utc"],
+            behind_by=report["fresh_refs"]["behind_by"],
+            ahead_by=report["fresh_refs"]["ahead_by"],
+        )
+
+    published = publish_candidate_manifest(
+        manifest,
+        pr_number=candidate["number"],
+    )
+    if candidate_pr_mismatches(candidate, published):
+        raise RuntimeError("recovered_candidate_manifest_mismatch")
+    append_candidate_manifest(AUTO_STATE, published)
+    report["prepared_recovery"] = {
+        "candidate_id": manifest["candidate_id"],
+        "candidate_head": manifest["head_sha"],
+        "pr_number": candidate["number"],
+        "pr_create_replayed": create_result is not None,
+    }
+    return _execute_locked(args)
+
+
+def _refresh_after_candidate_reconciliation(
+    args: argparse.Namespace,
+    prior_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    refreshed = build_plan(args)
+    refreshed["candidate_reconciliation"] = prior_report
+    return refreshed
+
+
+def _execute_locked(args: argparse.Namespace) -> int:
     report = build_plan(args)
+    if report["blocked"]:
+        return finish_blocked_report(report, report.get("candidate_pr"))
+
+    manifest = report.get("candidate_manifest")
+    candidate = report.get("candidate_pr")
+    if (
+        isinstance(manifest, dict)
+        and manifest.get("phase") == "prepared"
+        and candidate is None
+    ):
+        try:
+            return _recover_prepared_candidate(args, report, manifest)
+        except Exception as exc:
+            report.update(
+                {
+                    "status": "blocked_prepared_candidate_recovery",
+                    "blocked": True,
+                    "blockers": ["prepared_candidate_recovery_failed"],
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "candidate_ref_frozen": True,
+                }
+            )
+            return finish_blocked_report(report)
+    if isinstance(manifest, dict) and isinstance(candidate, dict):
+        state = candidate.get("state")
+        if state == "CLOSED":
+            report.update(
+                {
+                    "status": (
+                        "blocked_candidate_closed_requires_operator_reconciliation"
+                    ),
+                    "blocked": True,
+                    "blockers": [
+                        "candidate_closed_requires_operator_reconciliation"
+                    ],
+                    "pr_number": manifest["pr_number"],
+                    "candidate_ref_frozen": True,
+                    "message": (
+                        "The exact candidate was closed without merge. Its "
+                        "private manifest and worktree evidence are preserved; "
+                        "this routine will not reopen, replace, or recreate it "
+                        "without explicit operator reconciliation."
+                    ),
+                }
+            )
+            return finish_blocked_report(report, candidate)
+        if state == "MERGED":
+            fork_main_after = report["fresh_refs"]["fork_main_ref"]
+            if not compare_shows_head_contains_base(
+                FORK_REPO,
+                manifest["head_sha"],
+                fork_main_after,
+            ):
+                report.update(
+                    {
+                        "status": (
+                            "blocked_candidate_merged_without_base_proof"
+                        ),
+                        "blocked": True,
+                        "blockers": [
+                            "candidate_merged_head_missing_from_fork_main"
+                        ],
+                        "candidate_ref_frozen": True,
+                    }
+                )
+                return finish_blocked_report(report, candidate)
+            terminal = append_candidate_terminal_receipt(
+                AUTO_STATE,
+                manifest,
+                observed_base_sha=fork_main_after,
+                created_at_utc=report["created_at_utc"],
+            )
+            worktree_deleted = cleanup_exact_candidate_worktree(manifest)
+            report = _refresh_after_candidate_reconciliation(
+                args,
+                {
+                    "terminal_state": state,
+                    "pr_number": manifest["pr_number"],
+                    "terminal_receipt_sha256": terminal["receipt_sha256"],
+                    "worktree_deleted": worktree_deleted,
+                },
+            )
+            if report["blocked"]:
+                return finish_blocked_report(report, report.get("candidate_pr"))
+        elif state == "OPEN":
+            tail_drift = (
+                manifest.get("upstream_sha")
+                != report["fresh_refs"].get("upstream_main_ref")
+            )
+            report["status"] = (
+                "candidate_pr_exists_review_required_tail_pending_no_action"
+                if tail_drift
+                else "candidate_pr_exists_review_required_no_action"
+            )
+            report["pr_url"] = candidate.get("url")
+            report["pr_number"] = manifest["pr_number"]
+            report["candidate_ref_frozen"] = True
+            report["later_upstream_is_tail_drift"] = tail_drift
+            report["tail_drift_rebinds_candidate"] = False
+            report["message"] = (
+                "The exact manifest-owned fork candidate remains open and "
+                "immutable. Later upstream commits are tail drift for a "
+                "future reviewed candidate; this routine will not close, "
+                "replace, merge, or deploy the open candidate."
+            )
+            clear_blocker_delivery_state(BLOCKER_DEDUPE_STATE)
+            write_report(report)
+            return 0
+
     fresh = report["fresh_refs"]
-    open_prs = report["open_sync_prs"]
-
-    cleanup = cleanup_stale_sync_prs(open_prs, fresh)
-    if cleanup["closed"]:
-        open_prs = list_open_sync_prs()
-        report["stale_sync_pr_cleanup"] = cleanup
-        report["open_sync_prs_after_cleanup"] = open_prs
-    elif cleanup["kept"]:
-        report["stale_sync_pr_cleanup"] = cleanup
-
-    report["old_worktrees_deleted"] = cleanup_old_auto_sync_worktrees()
-
     if fresh["behind_by"] == 0:
         report["status"] = "no_drift_no_action"
         clear_blocker_delivery_state(BLOCKER_DEDUPE_STATE)
         write_report(report)
         return 0
-    if len(open_prs) == 1:
-        if os.environ.get(AUTO_MERGE_DEPLOY_ENV) != "1":
-            report["status"] = "open_sync_pr_exists_review_required_no_action"
-            report["pr_url"] = open_prs[0].get("url")
-            report["pr_number"] = open_prs[0].get("number")
-            report["message"] = (
-                "One fork-only sync PR is already open. The mechanical rail "
-                "does not merge or deploy it without the separate standing gate."
-            )
-            clear_blocker_delivery_state(BLOCKER_DEDUPE_STATE)
-            write_report(report)
-            return 0
-        auto_merge_deploy = auto_merge_sync_pr_and_start_deploy(open_prs[0])
-        public_result = {
-            k: v
-            for k, v in auto_merge_deploy.items()
-            if k not in {"pr"}
-        }
-        report["auto_merge_deploy"] = public_result
-        if auto_merge_deploy.get("merged") and auto_merge_deploy.get("deploy_started"):
-            report["status"] = "sync_pr_auto_merged_deploy_started"
-            report["pr_url"] = (auto_merge_deploy.get("pr") or {}).get("url")
-            report["pr_number"] = (auto_merge_deploy.get("pr") or {}).get("number")
-            report["head"] = auto_merge_deploy.get("after_main")
-            report["message"] = "Auto-owned upstream sync PR was clean/green, merged into fork main, and a detached Cloud deploy unit was started."
-            clear_blocker_delivery_state(BLOCKER_DEDUPE_STATE)
-            write_report(report)
-            print(render_summary(report).rstrip())
-            return 0
-        if auto_merge_deploy.get("merged") and not auto_merge_deploy.get("deploy_started"):
-            report["status"] = "blocked_deploy_start_failed_after_auto_merge"
-            report["pr_url"] = (auto_merge_deploy.get("pr") or {}).get("url")
-            report["pr_number"] = (auto_merge_deploy.get("pr") or {}).get("number")
-            report["head"] = auto_merge_deploy.get("after_main")
-            report["message"] = (
-                "Auto-owned upstream sync PR was clean/green and merged into fork main, "
-                "but the detached Cloud deploy unit did not start. Manual deploy reconciliation is required."
-            )
-            return finish_blocked_report(report, open_prs[0])
-        blockers = auto_merge_deploy.get("blockers") or []
-        if set(blockers).issubset(WAITABLE_AUTO_MERGE_BLOCKERS):
-            report["status"] = "open_sync_pr_exists_waiting_checks_no_action"
-            report["message"] = "Existing auto sync PR is not ready yet; waiting for checks/merge state."
-            write_report(report)
-            return 0
-        report["status"] = "blocked_auto_merge_deploy_gate"
-        report["message"] = "Existing sync PR did not satisfy the standing auto-merge/deploy safety gate."
-        return finish_blocked_report(report, open_prs[0])
-    if len(open_prs) > 1:
-        report["status"] = "blocked_multiple_open_sync_prs"
-        return finish_blocked_report(report)
 
     branch = report["proposed_branch"]
-    worktree = WORKTREE_ROOT / branch.replace("/", "-")
-    safe_rmtree(worktree)
+    worktree = worktree_for_branch(branch)
+    if worktree.exists():
+        report.update(
+            {
+                "status": "blocked_candidate_worktree_already_exists",
+                "blockers": ["candidate_worktree_already_exists"],
+                "branch": branch,
+                "worktree": str(worktree),
+            }
+        )
+        return finish_blocked_report(report)
     WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
 
     free_bytes = disk_free_bytes(WORKTREE_ROOT)
     report["disk_free_bytes"] = free_bytes
     if free_bytes < 5 * 1024 * 1024 * 1024:
-        report.update({
-            "status": "blocked_disk_space_low",
-            "branch": branch,
-            "worktree": str(worktree),
-            "message": "Less than 5 GiB free before cloning upstream sync worktree.",
-        })
+        report.update(
+            {
+                "status": "blocked_disk_space_low",
+                "blockers": ["disk_space_below_5_gib"],
+                "branch": branch,
+                "worktree": str(worktree),
+                "message": "Less than 5 GiB free before cloning.",
+            }
+        )
         return finish_blocked_report(report)
 
     try:
         run(["git", "clone", FORK_GIT_URL, str(worktree)], timeout=300)
         run(["git", "remote", "add", "upstream", UPSTREAM_GIT_URL], cwd=worktree)
-        run(["git", "fetch", "origin", FORK_BRANCH], cwd=worktree, timeout=300)
-        run(["git", "fetch", "upstream", UPSTREAM_BRANCH], cwd=worktree, timeout=300)
-        run(["git", "checkout", "-B", branch, f"origin/{FORK_BRANCH}"], cwd=worktree)
-        merge = run(["git", "merge", "--no-commit", "--no-ff", f"upstream/{UPSTREAM_BRANCH}"], cwd=worktree, check=False, timeout=300)
-        if merge.rc != 0:
-            conflicted = run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=worktree, check=False).stdout.splitlines()
-            resolver_result = try_known_conflict_auto_resolvers(worktree, conflicted)
-            report["known_conflict_auto_resolvers"] = resolver_result
-            remaining_conflicted = run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=worktree, check=False).stdout.splitlines()
-            if merge.rc != 0 and (not resolver_result.get("resolved") or remaining_conflicted):
-                report.update(
-                    {
-                        "status": "blocked_merge_conflicts",
-                        "branch": branch,
-                        "worktree": str(worktree),
-                        "conflicted_files": remaining_conflicted or conflicted,
-                        "merge_stdout_tail": merge.stdout[-4000:],
-                        "merge_stderr_tail": merge.stderr[-4000:],
-                        "conflict_markers": marker_scan(worktree),
-                    }
-                )
-                run(["git", "merge", "--abort"], cwd=worktree, check=False)
-                return finish_blocked_report(report)
-
-        markers = marker_scan(worktree)
-        if markers:
-            report.update({"status": "blocked_conflict_markers_after_clean_merge", "branch": branch, "worktree": str(worktree), "conflict_markers": markers})
+        run(
+            ["git", "fetch", "origin", FORK_BRANCH],
+            cwd=worktree,
+            timeout=300,
+        )
+        run(
+            ["git", "fetch", "upstream", UPSTREAM_BRANCH],
+            cwd=worktree,
+            timeout=300,
+        )
+        fetched_fork = _require_sha(
+            _single_protocol_line(
+                run(["git", "rev-parse", f"origin/{FORK_BRANCH}"], cwd=worktree),
+                "fetched_fork_ref",
+            ),
+            "fetched_fork_ref",
+        )
+        fetched_upstream = _require_sha(
+            _single_protocol_line(
+                run(
+                    ["git", "rev-parse", f"upstream/{UPSTREAM_BRANCH}"],
+                    cwd=worktree,
+                ),
+                "fetched_upstream_ref",
+            ),
+            "fetched_upstream_ref",
+        )
+        if (
+            fetched_fork != fresh["fork_main_ref"]
+            or fetched_upstream != fresh["upstream_main_ref"]
+        ):
+            report.update(
+                {
+                    "status": "blocked_refs_changed_during_candidate_preparation",
+                    "blockers": ["fetched_refs_do_not_match_plan"],
+                    "branch": branch,
+                    "worktree": str(worktree),
+                    "fetched_fork_ref": fetched_fork,
+                    "fetched_upstream_ref": fetched_upstream,
+                }
+            )
             return finish_blocked_report(report)
 
-        py_files = changed_python_files(worktree, f"origin/{FORK_BRANCH}")
-        if py_files:
-            run([sys.executable, "-m", "py_compile", *py_files], cwd=worktree, timeout=300)
+        run(
+            ["git", "checkout", "-B", branch, fresh["fork_main_ref"]],
+            cwd=worktree,
+        )
+        merge = run(
+            [
+                "git",
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                fresh["upstream_main_ref"],
+            ],
+            cwd=worktree,
+            check=False,
+            timeout=300,
+        )
+        conflicted = run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=worktree,
+            check=False,
+        ).stdout.splitlines()
+        if merge.rc != 0 or conflicted:
+            report.update(
+                {
+                    "status": "blocked_merge_conflicts",
+                    "blockers": ["upstream_candidate_requires_llm_integration"],
+                    "branch": branch,
+                    "worktree": str(worktree),
+                    "conflicted_files": conflicted,
+                    "merge_rc": merge.rc,
+                    "merge_stdout_tail": merge.stdout[-4000:],
+                    "merge_stderr_tail": merge.stderr[-4000:],
+                    "message": (
+                        "Conflicts remain for explicit LLM/Codex integration; "
+                        "no source-text auto-resolver was run."
+                    ),
+                }
+            )
+            run(["git", "merge", "--abort"], cwd=worktree, check=False)
+            return finish_blocked_report(report)
 
-        title = f"chore: sync fork with upstream main {report['created_at_utc'][:10]}"
+        py_files = changed_python_files(worktree, fresh["fork_main_ref"])
+        if py_files:
+            run(
+                [sys.executable, "-m", "py_compile", *py_files],
+                cwd=worktree,
+                timeout=300,
+            )
+
+        title = (
+            f"chore: prepare fork upstream-sync candidate "
+            f"{report['created_at_utc'][:10]}"
+        )
         body = (
-            "Automated fork-only upstream sync PR.\n\n"
-            f"- Base fork_main: `{fresh['fork_main_ref']}`\n"
-            f"- Upstream main: `{fresh['upstream_main_ref']}`\n"
-            f"- behind_by before sync: `{fresh['behind_by']}`\n"
-            f"- ahead_by before sync: `{fresh['ahead_by']}`\n\n"
-            "Boundaries: no upstream PR/push; may be auto-merged/deployed only by the "
-            "standing Muncho auto-sync gate after CLEAN merge state, green checks, and exact SHA verification.\n"
+            "Fork-only upstream-sync candidate for explicit review.\n\n"
+            f"- Base fork SHA: `{fresh['fork_main_ref']}`\n"
+            f"- Upstream SHA: `{fresh['upstream_main_ref']}`\n"
+            f"- behind_by before preparation: `{fresh['behind_by']}`\n"
+            f"- ahead_by before preparation: `{fresh['ahead_by']}`\n\n"
+            "The title and this body are display text only. Candidate identity "
+            "is held in private canonical state. This routine does not merge, "
+            "deploy, restart, or mutate upstream.\n"
         )
         run(
             [
@@ -1246,21 +1231,60 @@ def execute(args: argparse.Namespace) -> int:
             cwd=worktree,
             timeout=300,
         )
-        head = run(["git", "rev-parse", "HEAD"], cwd=worktree).stdout.strip()
-        run([
-            "git",
-            "-c",
-            f"credential.https://github.com.helper=!{GH} auth git-credential",
-            "push",
-            FORK_GIT_URL,
-            f"HEAD:refs/heads/{branch}",
-        ], cwd=worktree, timeout=300)
+        head = _require_sha(
+            _single_protocol_line(
+                run(["git", "rev-parse", "HEAD"], cwd=worktree),
+                "candidate_head",
+            ),
+            "candidate_head",
+        )
+        for label, ancestor in (
+            ("base", fresh["fork_main_ref"]),
+            ("upstream", fresh["upstream_main_ref"]),
+        ):
+            ancestry = run(
+                ["git", "merge-base", "--is-ancestor", ancestor, head],
+                cwd=worktree,
+                check=False,
+            )
+            if ancestry.rc != 0:
+                raise RuntimeError(
+                    f"candidate_head_missing_exact_{label}_sha"
+                )
+        candidate_id = hashlib.sha256(os.urandom(32)).hexdigest()
+        prepared_manifest = build_prepared_candidate_manifest(
+            candidate_id=candidate_id,
+            fork_repository=FORK_REPO,
+            upstream_repository=UPSTREAM_REPO,
+            base_ref=FORK_BRANCH,
+            upstream_ref=UPSTREAM_BRANCH,
+            branch=branch,
+            head_sha=head,
+            base_sha=fresh["fork_main_ref"],
+            upstream_sha=fresh["upstream_main_ref"],
+            created_at_utc=report["created_at_utc"],
+        )
+        append_candidate_manifest(AUTO_STATE, prepared_manifest)
+        run(
+            [
+                "git",
+                "-c",
+                f"credential.https://github.com.helper=!{GH} auth git-credential",
+                "push",
+                FORK_GIT_URL,
+                f"HEAD:refs/heads/{branch}",
+            ],
+            cwd=worktree,
+            timeout=300,
+        )
 
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as fh:
-            fh.write(body)
-            body_file = fh.name
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", delete=False
+        ) as stream:
+            stream.write(body)
+            body_file = stream.name
         try:
-            pr_url = run(
+            create_result = run(
                 [
                     str(GH),
                     "pr",
@@ -1271,6 +1295,7 @@ def execute(args: argparse.Namespace) -> int:
                     FORK_BRANCH,
                     "--head",
                     branch,
+                    "--draft",
                     "--title",
                     title,
                     "--body-file",
@@ -1278,91 +1303,85 @@ def execute(args: argparse.Namespace) -> int:
                 ],
                 cwd=worktree,
                 timeout=120,
-            ).stdout.strip()
+            )
         finally:
             Path(body_file).unlink(missing_ok=True)
 
-        pr_number = None
-        if pr_url.rstrip("/").split("/")[-1].isdigit():
-            pr_number = int(pr_url.rstrip("/").split("/")[-1])
-        state = {
-            "automation_owned": True,
-            "branch": branch,
-            "head": head,
-            "pr_url": pr_url,
-            "pr_number": pr_number,
-            "created_at_utc": report["created_at_utc"],
-        }
-        write_json(AUTO_STATE, state)
-
-        post_create_wait: dict[str, Any] | None = None
-        if pr_number is not None and os.environ.get(AUTO_MERGE_DEPLOY_ENV) == "1":
-            post_create_wait = wait_for_pr_auto_merge_deploy(pr_number)
+        candidate = discover_created_candidate_pr(branch, head)
+        manifest = publish_candidate_manifest(
+            prepared_manifest,
+            pr_number=candidate["number"],
+        )
+        mismatches = [
+            *manifest_scope_mismatches(manifest),
+            *candidate_pr_mismatches(candidate, manifest),
+        ]
+        if mismatches:
+            raise RuntimeError(
+                "created_candidate_manifest_mismatch:" + ",".join(mismatches)
+            )
+        append_candidate_manifest(AUTO_STATE, manifest)
 
         report.update(
             {
-                "status": "sync_pr_opened_no_merge",
+                "status": "sync_candidate_pr_opened_review_required",
+                "blocked": False,
                 "branch": branch,
                 "head": head,
-                "pr_url": pr_url,
-                "pr_number": pr_number,
+                "pr_url": candidate.get("url"),
+                "pr_number": candidate["number"],
+                "candidate_manifest_sha256": manifest["manifest_sha256"],
                 "worktree": str(worktree),
                 "py_compile_files": len(py_files),
-                "post_create_wait": post_create_wait,
+                "pr_create_stdout_tail": create_result.stdout[-1000:],
+                "message": (
+                    "A fork-only candidate PR was opened and bound to an exact "
+                    "private manifest. Merge and deploy remain separate gates."
+                ),
             }
         )
-        if os.environ.get(AUTO_MERGE_DEPLOY_ENV) != "1":
-            report["status"] = "sync_pr_opened_review_required"
-            report["message"] = (
-                "A fork-only upstream sync PR was opened. The mechanical rail "
-                "did not merge, deploy, restart, or mutate upstream."
-            )
-        if post_create_wait:
-            result = post_create_wait.get("result") or {}
-            if result.get("merged") and result.get("deploy_started"):
-                report["status"] = "sync_pr_created_auto_merged_deploy_started"
-                report["head"] = result.get("after_main")
-                report["auto_merge_deploy"] = {k: v for k, v in result.items() if k not in {"pr"}}
-                report["message"] = (
-                    "Newly opened auto-owned upstream sync PR became clean/green inside the bounded "
-                    "post-create wait window, was merged into fork main, and a detached Cloud deploy unit was started."
-                )
-            elif result.get("merged") and not result.get("deploy_started"):
-                report["status"] = "blocked_post_create_deploy_start_failed_after_merge"
-                report["head"] = result.get("after_main")
-                report["auto_merge_deploy"] = {k: v for k, v in result.items() if k not in {"pr"}}
-                report["message"] = (
-                    "Newly opened auto sync PR was merged after clean/green validation, but the detached Cloud deploy "
-                    "unit did not start. Manual deploy reconciliation is required."
-                )
-            elif post_create_wait.get("status") == "timed_out_waiting_for_clean_green":
-                report["status"] = "sync_pr_opened_waiting_followup"
-                report["message"] = (
-                    "Newly opened auto sync PR was not clean/green before the bounded wait window ended; "
-                    "the next cron tick will continue the auto-merge/deploy gate."
-                )
-            elif post_create_wait.get("status") == "blocked_non_waitable":
-                report["status"] = "blocked_post_create_auto_merge_deploy_gate"
-                report["auto_merge_deploy"] = {k: v for k, v in result.items() if k not in {"pr"}}
-                report["message"] = "Newly opened sync PR did not satisfy the standing auto-merge/deploy safety gate."
-
-        if report["status"].startswith("blocked_"):
-            return finish_blocked_report(
-                report,
-                {"number": pr_number, "headRefOid": head},
-            )
+        clear_blocker_delivery_state(BLOCKER_DEDUPE_STATE)
         write_report(report)
         print(render_summary(report).rstrip())
         return 0
     except Exception as exc:
-        report.update({"status": "blocked_execute_exception", "error_type": type(exc).__name__, "error": str(exc), "branch": branch, "worktree": str(worktree)})
+        report.update(
+            {
+                "status": "blocked_execute_exception",
+                "blockers": ["candidate_execution_exception"],
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "branch": branch,
+                "worktree": str(worktree),
+            }
+        )
         return finish_blocked_report(report)
 
 
+def execute(args: argparse.Namespace) -> int:
+    with candidate_manifest_lock(AUTO_STATE):
+        if os.environ.get(EXECUTE_ENV) != "1":
+            report = build_plan(args)
+            report["status"] = "blocked_execute_env_missing"
+            report["blockers"] = [f"missing_{EXECUTE_ENV}"]
+            report["message"] = f"Missing {EXECUTE_ENV}=1"
+            return finish_blocked_report(report, report.get("candidate_pr"))
+        return _execute_locked(args)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fork-only upstream auto-sync PR routine")
-    parser.add_argument("--execute", action="store_true", help="Create a fork-only sync PR if drift exists")
-    parser.add_argument("--output", default=str(STATE_DIR / "auto-sync-pr-dry-run-latest.json"))
+    parser = argparse.ArgumentParser(
+        description="Fork-only upstream-sync candidate routine"
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="Create a fork-only candidate PR if drift exists",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(STATE_DIR / "auto-sync-pr-dry-run-latest.json"),
+    )
     args = parser.parse_args()
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1372,12 +1391,13 @@ def main() -> int:
     if args.execute:
         return execute(args)
 
-    plan = build_plan(args)
+    with candidate_manifest_lock(AUTO_STATE):
+        plan = build_plan(args)
     write_json(Path(args.output), plan)
     if plan["status"] == "no_drift_no_action":
         return 0
     print(json.dumps(plan, indent=2, ensure_ascii=False))
-    return 0
+    return 2 if plan["blocked"] else 0
 
 
 if __name__ == "__main__":
