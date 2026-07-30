@@ -133,18 +133,33 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
     ]
 
 
-def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):
+@pytest.mark.parametrize(
+    ("failure_reason", "kanban_task", "expected_exit_code"),
+    [
+        (None, None, 1),
+        (None, "t_generic_failure", 1),
+        ("rate_limit", None, 1),
+        ("rate_limit", "t_rate_limited", 75),
+        ("billing", "t_billing_limited", 75),
+    ],
+)
+def test_quiet_single_query_main_finalizes_while_preserving_exit_code(
+    monkeypatch, failure_reason, kanban_task, expected_exit_code,
+):
     calls = []
 
     import cli as cli_mod
 
     def run_conversation(*, user_message, conversation_history):
         calls.append(("run", user_message, conversation_history))
-        return {
+        result = {
             "final_response": "",
             "error": "provider failed",
             "failed": True,
         }
+        if failure_reason:
+            result["failure_reason"] = failure_reason
+        return result
 
     class FakeCLI:
         def __init__(self, **_kwargs):
@@ -184,7 +199,10 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
             calls.append(("init", kwargs))
             return True
 
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    if kanban_task:
+        monkeypatch.setenv("HERMES_KANBAN_TASK", kanban_task)
+    else:
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
     monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
     monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
@@ -197,7 +215,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     with pytest.raises(SystemExit) as exc_info:
         cli_mod.main(query="hello", quiet=True, toolsets="terminal")
 
-    assert exc_info.value.code == 1
+    assert exc_info.value.code == expected_exit_code
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")

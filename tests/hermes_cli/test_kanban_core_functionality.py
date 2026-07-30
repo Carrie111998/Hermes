@@ -736,6 +736,13 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert cmd.index("--accept-hooks") < cmd.index("chat"), (
         f"--accept-hooks must come before 'chat' in argv: {cmd}"
     )
+    # Every headless worker must use the failure-aware quiet query path. The
+    # human-facing ``chat -q`` branch renders failed agent results but returns
+    # success, which turns provider/input failures into clean-exit protocol
+    # violations at the dispatcher boundary.
+    assert cmd.count("-Q") == 1, (
+        f"spawn argv must contain exactly one quiet flag: {cmd}"
+    )
     # Assignee + task env are still present
     assert "some-profile" in cmd
     env = captured["env"]

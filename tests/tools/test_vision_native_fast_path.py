@@ -13,6 +13,7 @@ import base64
 import json
 from unittest.mock import patch
 
+import pytest
 
 from tools.vision_tools import (
     _build_native_vision_tool_result,
@@ -103,6 +104,57 @@ class TestVisionAnalyzeNative:
         )
         assert isinstance(result, dict)
         assert result.get("_multimodal") is True
+
+    def test_corrupt_supported_image_is_rejected_before_embedding(self, tmp_path):
+        """A PNG header alone must not let corrupt bytes poison tool history.
+
+        Native vision tool results are replayed on the next provider request.
+        If malformed bytes reach that immutable history, the provider returns a
+        non-retryable HTTP 400 on every resume instead of letting the worker
+        handle the bad artifact as a normal tool error.
+        """
+        corrupt = tmp_path / "corrupt.png"
+        corrupt.write_bytes(_TINY_PNG[:-12])
+
+        result = asyncio.get_event_loop().run_until_complete(
+            _vision_analyze_native(str(corrupt), "describe")
+        )
+
+        assert isinstance(result, str), result
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "invalid or corrupt" in payload["error"].lower()
+
+    def test_image_that_verifies_but_cannot_decode_is_rejected(self, tmp_path):
+        """Pillow ``verify()`` alone must not admit corrupt pixel data."""
+        from io import BytesIO
+
+        from PIL import Image
+
+        encoded = BytesIO()
+        Image.effect_noise((128, 128), 80).convert("RGB").save(
+            encoded, format="JPEG", quality=90,
+        )
+        corrupt_bytes = encoded.getvalue()[:-1]
+
+        # This is the load-bearing shape: Pillow's structural check succeeds,
+        # but decoding the pixels fails and providers reject the same payload.
+        with Image.open(BytesIO(corrupt_bytes)) as image:
+            image.verify()
+        with pytest.raises(OSError, match="truncated"):
+            with Image.open(BytesIO(corrupt_bytes)) as image:
+                image.load()
+
+        corrupt = tmp_path / "corrupt.jpg"
+        corrupt.write_bytes(corrupt_bytes)
+        result = asyncio.get_event_loop().run_until_complete(
+            _vision_analyze_native(str(corrupt), "describe")
+        )
+
+        assert isinstance(result, str), result
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "invalid or corrupt" in payload["error"].lower()
 
     def test_oversized_image_resized_under_embed_cap(self, tmp_path):
         """Regression for the wedged-session incident (May 2026).
