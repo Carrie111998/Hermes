@@ -154,7 +154,11 @@ def _is_langfuse_cloud_host(base_url: str) -> bool:
     from urllib.parse import urlparse
 
     try:
-        host = (urlparse(base_url).hostname or "").lower()
+        # urlparse preserves a terminal dot (DNS root notation, e.g.
+        # https://cloud.langfuse.com.), so strip it before comparison
+        # so the placeholder guard still fires for Cloud URLs typed
+        # with an explicit root (#72484 review).
+        host = (urlparse(base_url).hostname or "").lower().rstrip(".")
     except Exception:
         return False
     return host == _LANGFUSE_CLOUD_HOST_SUFFIX or host.endswith(

@@ -722,10 +722,12 @@ class TestCustomEndpointCredentials:
 
     @pytest.mark.parametrize("base_url", [
         "https://cloud.langfuse.com",
+        "https://cloud.langfuse.com.",          # dns root dot notation
         "https://us.cloud.langfuse.com",
+        "https://us.cloud.langfuse.com.",       # dns root dot on subdomain
         "https://eu.cloud.langfuse.com",
         "https://langfuse.com",
-        "https://CLOUD.LANGFUSE.COM",          # case-insensitive host match
+        "https://CLOUD.LANGFUSE.COM",           # case-insensitive host match
         "https://cloud.langfuse.com:443/path",
     ])
     def test_cloud_hosts_detected(self, monkeypatch, base_url):
