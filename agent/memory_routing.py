@@ -165,11 +165,16 @@ def _deterministic_route(query: str, policy: dict[str, Any]) -> MemoryRoute:
     for domain_name, config in domains.items():
         if not isinstance(config, dict):
             continue
-        trigger = _first_matching_trigger(query, config.get("triggers"))
+        trigger = _first_matching_trigger(query, _domain_triggers(config))
         if trigger is None:
             continue
+        domain_risk = str(config.get("risk_level") or config.get("risk") or "low").lower()
         route.domains = _dedupe([*route.domains, str(domain_name)])
         route.slots = _dedupe([*route.slots, *_domain_slots(str(domain_name), domains)])
+        if domain_risk in {"medium", "high", "critical"} and _risk_rank(domain_risk) > _risk_rank(route.risk):
+            route.risk = domain_risk
+        if domain_risk in {"high", "critical"}:
+            route.gate_required = True
         matched_reasons.append(f"{domain_name} matched {trigger!r}")
 
     safety = policy.get("safety") if isinstance(policy, dict) else None
@@ -203,7 +208,20 @@ def _domain_slots(domain_name: str, domains: dict[str, Any], seen: set[str] | No
     for parent in _strings(config.get("extends")):
         slots.extend(_domain_slots(parent, domains, seen))
     slots.extend(_strings(config.get("slots")))
+    slots.extend(_strings(config.get("required_if_available")))
+    slots.extend(_strings(config.get("recommended_if_available")))
     return _dedupe(slots)
+
+
+def _domain_triggers(config: dict[str, Any]) -> list[str]:
+    triggers = config.get("triggers")
+    if isinstance(triggers, dict):
+        return _dedupe([*_strings(triggers.get("keywords")), *_strings(triggers.get("semantic_hints"))])
+    return _strings(triggers)
+
+
+def _risk_rank(risk: str) -> int:
+    return {"low": 0, "medium": 1, "high": 2, "critical": 3}.get(str(risk).lower(), 0)
 
 
 def _load_policy() -> dict[str, Any]:
@@ -211,10 +229,39 @@ def _load_policy() -> dict[str, Any]:
         try:
             loaded = yaml.safe_load(_POLICY_PATH.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
-                return loaded
+                return _merge_default_policy(loaded)
         except Exception:
             pass
     return _DEFAULT_POLICY
+
+
+def _merge_default_policy(loaded: dict[str, Any]) -> dict[str, Any]:
+    """Overlay documented policy on top of test-safe deterministic defaults."""
+
+    merged = dict(loaded)
+    raw_loaded_domains = loaded.get("domains")
+    loaded_domains = raw_loaded_domains if isinstance(raw_loaded_domains, dict) else {}
+    domains: dict[str, Any] = {name: dict(config) for name, config in loaded_domains.items() if isinstance(config, dict)}
+    for name, default_config in _DEFAULT_POLICY["domains"].items():
+        current = dict(domains.get(name, {}))
+        current["extends"] = _dedupe([*_strings(default_config.get("extends")), *_strings(current.get("extends"))])
+        current["slots"] = _dedupe([*_strings(default_config.get("slots")), *_strings(current.get("slots"))])
+        current["triggers"] = _dedupe([*_strings(_domain_triggers(default_config)), *_strings(_domain_triggers(current))])
+        domains[name] = current
+    merged["domains"] = domains
+
+    raw_loaded_safety = loaded.get("safety")
+    loaded_safety = raw_loaded_safety if isinstance(raw_loaded_safety, dict) else {}
+    raw_default_safety = _DEFAULT_POLICY.get("safety", {})
+    default_safety = raw_default_safety if isinstance(raw_default_safety, dict) else {}
+    merged["safety"] = {
+        **loaded_safety,
+        "high_risk_triggers": _dedupe([
+            *_strings(default_safety.get("high_risk_triggers")),
+            *_strings(loaded_safety.get("high_risk_triggers")),
+        ]),
+    }
+    return merged
 
 
 def _first_matching_trigger(query: str, triggers: Any) -> str | None:
