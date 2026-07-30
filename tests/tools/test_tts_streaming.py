@@ -169,7 +169,7 @@ def _sd_mock():
     return sd, out
 
 
-def test_streamer_path_applies_configured_pronunciation(monkeypatch):
+def test_streamer_path_applies_symbol_bearing_pronunciation_before_normalization(monkeypatch):
     from tools import tts_tool
 
     seen = []
@@ -187,11 +187,16 @@ def test_streamer_path_applies_configured_pronunciation(monkeypatch):
             yield b"\x01\x00" * 10
 
     sd, _ = _sd_mock()
-    q = _drain_queue(["Say Tahlia now."])
+    q = _drain_queue(["Our R&D team shipped."])
     stop, done = threading.Event(), threading.Event()
     config = {
         "provider": "openai",
-        "pronunciation": {"substitutions": {"Tahlia": "Tarlia"}},
+        "pronunciation": {
+            "substitutions": {
+                "R&D": "Research and Development",
+                "Research and Development": "WRONG",
+            },
+        },
     }
 
     with (
@@ -205,11 +210,43 @@ def test_streamer_path_applies_configured_pronunciation(monkeypatch):
     ):
         tts_tool.stream_tts_to_speaker(q, stop, done)
 
-    assert seen == ["Say Tarlia now."]
+    assert seen == ["Our Research and Development team shipped."]
     assert done.is_set()
 
 
 # ── Dispatch: universal per-sentence sync fallback ───────────────────────
+
+
+def test_sync_fallback_preserves_symbols_for_single_pronunciation_pass(monkeypatch):
+    from tools import tts_tool
+
+    config = {
+        "provider": "openai",
+        "openai": {},
+        "pronunciation": {
+            "substitutions": {
+                "R&D": "Research and Development",
+                "Research and Development": "WRONG",
+            },
+        },
+    }
+    generated = MagicMock()
+    q = _drain_queue(["Our R&D team shipped."])
+    stop, done = threading.Event(), threading.Event()
+
+    with (
+        patch.object(tts_tool, "_load_tts_config", return_value=config),
+        patch.object(tts_tool, "_get_provider", return_value="openai"),
+        patch.object(tts_tool, "_resolve_command_provider_config", return_value=None),
+        patch.object(tts_tool, "_resolve_max_text_length", return_value=4096),
+        patch.object(tts_tool, "_generate_openai_tts", generated),
+        patch("tools.tts_streaming.resolve_streaming_provider", return_value=None),
+        patch("gateway.session_context.get_session_env", return_value=""),
+    ):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    assert generated.call_args[0][0] == "Our Research and Development team shipped."
+    assert done.is_set()
 
 
 # ── tts.streaming.provider config knob (salvaged from PR #47588) ─────────
