@@ -51,6 +51,7 @@ def query_session_listing(
     include_unnamed: bool = False,
     search_query: str | None = None,
     limit: int = 10,
+    offset: int = 0,
     exclude_sources: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return session rows for interactive listing surfaces.
@@ -61,9 +62,12 @@ def query_session_listing(
     With ``search_query``, rows are filtered by title/id match (SQL-level, see
     ``SessionDB.list_sessions_rich``) and ordered by most-recent activity;
     unnamed sessions stay visible since an id match may be the only handle.
+
+    ``offset`` skips that many *qualifying* rows (after source/title filtering
+    but before the ``limit`` cap) — useful for paginated listing in the CLI.
     """
     query_source = None if include_all_sources else source
-    fetch_limit = max(limit * 4, limit)
+    fetch_limit = max((limit + offset) * 4, limit + offset)
     search = (search_query or "").strip()
     rows = session_db.list_sessions_rich(
         source=query_source,
@@ -73,10 +77,14 @@ def query_session_listing(
         order_by_last_active=bool(search),
     )
     result: list[dict[str, Any]] = []
+    skipped = 0
     for row in rows:
         if current_session_id and row.get("id") == current_session_id:
             continue
         if not include_unnamed and not row.get("title") and not search:
+            continue
+        if skipped < offset:
+            skipped += 1
             continue
         result.append(row)
         if len(result) >= limit:

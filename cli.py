@@ -4536,6 +4536,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # the next submitted input, whether it's the selection or anything
         # else). See #34584.
         self._pending_resume_sessions = None
+        # Limit used when arming _pending_resume_sessions, so the bare-number
+        # flow re-fetches the same count as what was displayed.
+        self._pending_resume_limit = 10
         # One-shot agent seed set by a slash handler (e.g. /blueprint <name>)
         # that wants its output run as the next agent turn. Consumed and cleared
         # by the interactive loop immediately after process_command() returns.
@@ -7581,8 +7584,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  Config File: {config_path} {config_status}")
         print()
     
-    def _list_recent_sessions(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Return recent CLI sessions for in-chat browsing/resume affordances."""
+    def _list_recent_sessions(self, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
+        """Return recent CLI sessions for in-chat browsing/resume affordances.
+
+        Pass ``offset`` to skip past already-shown rows for pagination.
+        """
         if not self._session_db:
             return []
         try:
@@ -7595,35 +7601,57 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 include_all_sources=False,
                 include_unnamed=True,
                 limit=limit,
+                offset=offset,
                 exclude_sources=["tool"],
             )
         except Exception:
             return []
 
-    def _show_recent_sessions(self, *, reason: str = "history", limit: int = 10) -> bool:
+    def _show_recent_sessions(
+        self,
+        *,
+        reason: str = "history",
+        limit: int = 10,
+        offset: int = 0,
+        sessions: list[dict] | None = None,
+    ) -> bool:
         """Render recent sessions inline from the active chat TUI.
+
+        When ``sessions`` is provided it is used directly (e.g. search results);
+        otherwise ``_list_recent_sessions(limit, offset)`` is called.
 
         Returns True when something was shown, False if no session list was available.
         """
-        sessions = self._list_recent_sessions(limit=limit)
+        if sessions is None:
+            sessions = self._list_recent_sessions(limit=limit, offset=offset)
         if not sessions:
             return False
 
         from hermes_cli.main import _relative_time
+        from datetime import datetime as _dt
 
         _cli_visible_print()
         if reason == "history":
             _cli_visible_print("(._.) No messages in the current chat yet — here are recent sessions you can resume:")
+        elif reason and reason.startswith("search:"):
+            _cli_visible_print(f"  Sessions matching \"{reason[7:]}\":")
         else:
             _cli_visible_print("  Recent sessions:")
         _cli_visible_print()
-        _cli_visible_print(f"  {'#':<3} {'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
-        _cli_visible_print(f"  {'─' * 3} {'─' * 32} {'─' * 40} {'─' * 13} {'─' * 24}")
+        _cli_visible_print(f"  {'#':<3} {'Title':<28} {'Model':<12} {'Msgs':>4}  {'Preview':<28} {'Last Active':<13} {'ID'}")
+        _cli_visible_print(f"  {'─' * 3} {'─' * 28} {'─' * 12} {'─' * 4}  {'─' * 28} {'─' * 13} {'─' * 24}")
         for idx, session in enumerate(sessions, start=1):
             title = session.get("title") or "—"
-            preview = (session.get("preview") or "")[:38]
+            # Abbreviate model: strip provider prefix, max 12 chars
+            model_raw = (session.get("model") or "—")
+            model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
+            if len(model) > 12:
+                model = model[:11] + "…"
+            msgs = session.get("message_count")
+            msgs_str = str(msgs) if msgs is not None else "—"
+            preview = (session.get("preview") or "")[:26]
             last_active = _relative_time(session.get("last_active"))
-            _cli_visible_print(f"  {idx:<3} {title:<32} {preview:<40} {last_active:<13} {session['id']}")
+            _cli_visible_print(f"  {idx:<3} {title:<28} {model:<12} {msgs_str:>4}  {preview:<28} {last_active:<13} {session['id']}")
         _cli_visible_print()
         _cli_visible_print("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
         _cli_visible_print("  Example: /resume 2")

@@ -854,8 +854,35 @@ class CLICommandsMixin:
     def _handle_resume_command(self, cmd_original: str) -> None:
         """Handle /resume <session_id_or_title> — switch to a previous session mid-conversation."""
         from cli import _cprint, _sync_process_session_id
-        parts = cmd_original.split(None, 1)
-        target = parts[1].strip() if len(parts) > 1 else ""
+        import shlex
+
+        # Parse --limit and extract the bare target
+        raw = cmd_original.split(None, 1)
+        rest = raw[1].strip() if len(raw) > 1 else ""
+        limit = 10
+        search_query = None
+
+        # Helper: find --limit in tokenized args; return cleaned args
+        def _parse_flags(args: str, default_limit: int = 10):
+            if not args.strip():
+                return "", default_limit
+            tokens = shlex.split(args)
+            clean = []
+            i = 0
+            parsed_limit = default_limit
+            while i < len(tokens):
+                if tokens[i] == "--limit" and i + 1 < len(tokens):
+                    try:
+                        parsed_limit = min(int(tokens[i + 1]), 100)
+                    except ValueError:
+                        pass
+                    i += 2
+                    continue
+                clean.append(tokens[i])
+                i += 1
+            return " ".join(clean), parsed_limit
+
+        target, limit = _parse_flags(rest, default_limit=10)
 
         # Strip common outer brackets/quotes users may type literally from the
         # usage hint (e.g. ``/resume <abc123>`` or ``/resume [abc123]``).  The
@@ -872,14 +899,13 @@ class CLICommandsMixin:
 
         if not target:
             _cprint("  Usage: /resume <number|session_id_or_title>")
-            if self._show_recent_sessions(reason="resume"):
+            if self._show_recent_sessions(reason="resume", limit=limit):
                 # Arm a one-shot pending-resume selection so the user can type
                 # just the number (`3`) on the next line instead of having to
-                # retype `/resume 3`. The list here must match the one shown by
-                # _show_recent_sessions and used for index resolution below —
-                # all three go through _list_recent_sessions(limit=10). See
-                # #34584.
-                self._pending_resume_sessions = self._list_recent_sessions(limit=10)
+                # retype `/resume 3`. Store the limit so the bare-number
+                # flow re-fetches the same count.
+                self._pending_resume_sessions = self._list_recent_sessions(limit=limit)
+                self._pending_resume_limit = limit
                 return
             _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
             return
@@ -895,7 +921,11 @@ class CLICommandsMixin:
 
         # Resolve numbered selection, title, or ID
         if target.isdigit():
-            sessions = self._list_recent_sessions(limit=10)
+            # Use the stored limit from a prior --limit so the bare-number
+            # flow (via _consume_pending_resume_selection) re-fetches the
+            # same number of sessions that was displayed.
+            digit_limit = getattr(self, '_pending_resume_limit', 10)
+            sessions = self._list_recent_sessions(limit=digit_limit)
             index = int(target)
             if index < 1 or index > len(sessions):
                 _cprint(f"  Resume index {index} is out of range.")
@@ -1034,12 +1064,15 @@ class CLICommandsMixin:
         self._restore_session_cwd(session_meta)
 
     def _handle_sessions_command(self, cmd_original: str) -> None:
-        """Handle /sessions [list|<id_or_title>] — browse or resume previous sessions.
+        """Handle /sessions [list|<id_or_title>|search <query>] — browse or resume previous sessions.
 
         Without arguments, prints the same recent-sessions table that /resume
         shows when called without a target, and tells the user how to resume.
         With an explicit subcommand or target, delegates to the resume flow so
         ``/sessions <id>`` and ``/resume <id>`` behave identically.
+
+        ``/sessions search <query>`` searches session titles/IDs via the
+        session DB's FTS5-backed listing and shows matching sessions inline.
 
         The TUI ships an interactive picker overlay for this command; the
         classic CLI prints an inline list because there is no equivalent
@@ -1049,10 +1082,44 @@ class CLICommandsMixin:
         registered in the central COMMAND_REGISTRY.
         """
         from cli import _cprint
+        from hermes_cli.session_listing import parse_session_listing_args, query_session_listing
+
         parts = cmd_original.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
-        sub = arg.lower()
 
+        # Check for search/find subcommand via the shared arg parser
+        _, _, _, search_query = parse_session_listing_args(arg)
+        if search_query is not None:
+            if search_query == "":
+                _cprint("  Usage: /sessions search <query>")
+                _cprint("  Example: /sessions search deploy")
+                return
+            if not self._session_db:
+                from hermes_state import format_session_db_unavailable
+                _cprint(f"  {format_session_db_unavailable()}")
+                return
+            try:
+                results = query_session_listing(
+                    self._session_db,
+                    source="cli",
+                    current_session_id=self.session_id,
+                    include_unnamed=True,
+                    search_query=search_query,
+                    limit=10,
+                )
+            except Exception as e:
+                _cprint(f"  Search failed: {e}")
+                return
+            if not results:
+                _cprint(f"  No sessions matching \"{search_query}\".")
+                return
+            self._show_recent_sessions(
+                reason=f"search:{search_query}",
+                sessions=results,
+            )
+            return
+
+        sub = arg.lower()
         # Bare /sessions or /sessions list — show recent sessions inline.
         if not arg or sub in {"list", "ls", "browse"}:
             if not self._session_db:
