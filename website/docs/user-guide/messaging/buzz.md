@@ -87,7 +87,7 @@ gateway:
 
 - `interim_assistant_messages: false` — prevents intermediate tool results, reasoning comments, and progress updates from being posted as separate messages to the channel. Only the final response goes to the channel.
 - `tool_progress: off` — suppresses tool progress bubbles (e.g., "Running terminal command...", "Reading file..."). Keeps the channel focused on actual results, not process.
-- `poll_interval: 4` — balances inbound latency (up to 4s delay) against relay load. Lower values increase polling frequency; higher values reduce it.
+- `poll_interval: 4` — used when inbound falls back to CLI polling (or `transport: poll`). Balances poll latency (up to one interval) against relay load; WebSocket mode does not wait on this interval for delivery.
 - `allowed_users: []` + `allow_all_users: false` — private mode by default. Only listed users can interact. Set `allow_all_users: true` for community mode where everyone can chat (admin tier still restricted to the owner).
 - `require_mention: true` — in channels, the agent only responds when addressed. DMs always dispatch regardless of this setting.
 
@@ -117,7 +117,7 @@ Check status with `hermes gateway status` — Buzz connection state is reported 
 
 ## Notes and limitations
 
-- **Inbound is polled, not streamed.** The `buzz` CLI is request/response, so the adapter polls `buzz messages get` per watched channel every `poll_interval` seconds (default 4). Expect up to one interval of latency on inbound messages. A future optimization is a websocket transport (the Buzz repo ships `buzz-ws-client` for true streaming).
+- **Inbound defaults to WebSocket; polling is the fallback.** A persistent NIP-42-authenticated Nostr WebSocket delivers near-instant inbound events. If the WebSocket cannot be established (or `transport` / `BUZZ_TRANSPORT` is `poll`), the adapter falls back to polling `buzz messages get` per watched channel every `poll_interval` seconds (default 4) — expect up to one interval of latency in that mode. Outbound always goes through the request/response `buzz` CLI regardless of inbound transport. Set `transport: websocket` to require WebSocket and fail closed instead of falling back.
 - On (re)connect the adapter seeds its high-water mark from the newest events, so channel history is never replayed into the agent.
-- New DM conversations are discovered automatically (every few poll sweeps).
+- New DM conversations are discovered automatically (WebSocket subscription and/or every few poll sweeps in poll mode).
 - The private key is passed to the CLI via the subprocess environment — it never appears in argv or logs.
