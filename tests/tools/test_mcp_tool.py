@@ -1115,6 +1115,38 @@ class TestDiscoverAndRegister:
         _servers.pop("srv", None)
 
 
+    def test_same_server_normalization_collision_skips_all_ambiguous_tools(self, caplog):
+        from tools.mcp_tool import _register_server_tools
+        from tools.registry import ToolRegistry
+
+        registry = ToolRegistry()
+        server = _make_mock_server(
+            "srv",
+            session=MagicMock(),
+            tools=[
+                _make_mcp_tool("read-file"),
+                _make_mcp_tool("read_file"),
+                _make_mcp_tool("safe_tool"),
+            ],
+        )
+        config = {"tools": {"resources": False, "prompts": False}}
+
+        with patch("tools.registry.registry", registry), \
+             patch("tools.mcp_tool._track_mcp_tool_server"), \
+             caplog.at_level(logging.ERROR, logger="tools.mcp_tool"):
+            registered = _register_server_tools("srv", server, config)
+
+        assert registered == ["mcp__srv__safe_tool"]
+        assert registry.get_entry("mcp__srv__read_file") is None
+        assert registry.get_entry("mcp__srv__safe_tool") is not None
+        assert any(
+            "name normalization collision" in record.message
+            and "tool 'read-file'" in record.message
+            and "tool 'read_file'" in record.message
+            for record in caplog.records
+        )
+
+
 # ---------------------------------------------------------------------------
 # MCPServerTask (run / start / shutdown)
 # ---------------------------------------------------------------------------
@@ -1704,6 +1736,87 @@ class TestShutdown:
         assert elapsed < 2.5, f"Shutdown took {elapsed:.1f}s, expected ~1s (parallel)"
 
 
+    def test_shutdown_drains_parked_server_after_bounded_wait_expires(self):
+        """The public shutdown path drains a parked server if graceful shutdown stalls.
+
+        This exercises the production ownership path: a real ``MCPServerTask``
+        is registered, its parked waiter owns child tasks on the shared loop,
+        and the bounded wait for the scheduled shutdown expires. The loop owner
+        must still cancel and drain that waiter before closing the loop.
+        """
+        import tools.mcp_tool as mcp_mod
+        from tools.mcp_tool import MCPServerTask, shutdown_mcp_servers
+
+        shutdown_started = threading.Event()
+        parked_task_done = threading.Event()
+        scheduled_shutdown = {}
+        schedule_count = 0
+
+        class StalledShutdownServer(MCPServerTask):
+            async def shutdown(self):
+                shutdown_started.set()
+                await asyncio.Event().wait()
+
+        server = StalledShutdownServer("parked")
+        with mcp_mod._lock:
+            mcp_mod._servers.clear()
+            mcp_mod._server_connecting.clear()
+        mcp_mod._ensure_mcp_loop()
+        with mcp_mod._lock:
+            loop = mcp_mod._mcp_loop
+        assert loop is not None
+
+        async def install_parked_waiter():
+            task = asyncio.create_task(server._wait_for_reconnect_or_shutdown())
+            server._task = task
+            task.add_done_callback(lambda _task: parked_task_done.set())
+            await asyncio.sleep(0)
+            return task
+
+        parked_task = asyncio.run_coroutine_threadsafe(
+            install_parked_waiter(), loop
+        ).result(timeout=2)
+        with mcp_mod._lock:
+            mcp_mod._servers[server.name] = server
+
+        def schedule_then_report_timeout(coro, target_loop, **_kwargs):
+            nonlocal schedule_count
+            schedule_count += 1
+            future = asyncio.run_coroutine_threadsafe(coro, target_loop)
+            if schedule_count > 1:
+                return future
+
+            scheduled_shutdown["future"] = future
+
+            class TimedOutFuture:
+                def result(self, timeout):
+                    assert timeout > 0
+                    assert shutdown_started.wait(timeout=2)
+                    raise TimeoutError("simulated bounded MCP shutdown timeout")
+
+            return TimedOutFuture()
+
+        try:
+            with patch(
+                "agent.async_utils.safe_schedule_threadsafe",
+                side_effect=schedule_then_report_timeout,
+            ):
+                shutdown_mcp_servers()
+
+            assert loop.is_closed()
+            assert parked_task_done.is_set(), (
+                "parked MCPServerTask was not drained before its loop closed"
+            )
+            assert parked_task.done()
+            assert scheduled_shutdown["future"].done()
+            assert schedule_count == 2
+        finally:
+            with mcp_mod._lock:
+                mcp_mod._servers.clear()
+                mcp_mod._server_connecting.clear()
+            mcp_mod._stop_mcp_loop()
+
+
 # ---------------------------------------------------------------------------
 # _build_safe_env
 # ---------------------------------------------------------------------------
@@ -1895,6 +2008,23 @@ class TestSanitizeError:
         assert "sk-" not in result
         assert "token=" not in result
         assert result.count("[REDACTED]") == 3
+
+
+    def test_strips_credentials(self):
+        from tools.mcp_tool import _sanitize_error
+
+        for text, expected in (
+            ("Error with ghp_abc123def456", "Error with [REDACTED]"),
+            ("key sk-projABC123xyz", "key [REDACTED]"),
+            ("Authorization: Bearer eyJabc123def", "Authorization: [REDACTED]"),
+            ("url?token=secret123", "url?[REDACTED]"),
+        ):
+            assert _sanitize_error(text) == expected, text
+
+        # Several credentials in one message are all masked.
+        multi = _sanitize_error("ghp_abc123 and sk-projXyz789 and token=foo")
+        assert "ghp_" not in multi and "sk-" not in multi and "token=" not in multi
+        assert multi.count("[REDACTED]") == 3
 
 
 # ---------------------------------------------------------------------------
@@ -2872,6 +3002,9 @@ from tools.mcp_tool import (
     ToolUseContent,
     _safe_numeric,
 )
+import logging
+import os
+import sys
 
 
 # ---------------------------------------------------------------------------
@@ -2982,6 +3115,23 @@ class TestSafeNumeric:
 
     def test_float_coercion(self):
         assert _safe_numeric("3.5", 1.0, float) == 3.5
+
+
+    def test_coercion_clamping_and_fallbacks(self):
+        # (value, default, caster, kwargs, expected)
+        cases = [
+            (10, 5, int, {}, 10),
+            ("20", 5, int, {}, 20),
+            ("3.5", 1.0, float, {}, 3.5),
+            (None, 7, int, {}, 7),
+            ("abc", 42, int, {}, 42),
+            (float("inf"), 3.0, float, {}, 3.0),
+            (float("nan"), 4.0, float, {}, 4.0),
+            (-5, 10, int, {"minimum": 1}, 1),
+            (0, 10, int, {"minimum": 0}, 0),
+        ]
+        for value, default, caster, kwargs, expected in cases:
+            assert _safe_numeric(value, default, caster, **kwargs) == expected, value
 
 
 # ---------------------------------------------------------------------------
@@ -4258,8 +4408,8 @@ class TestMCPBuiltinCollisionGuard:
 
         _servers.pop("minimax", None)
 
-    def test_mcp_tool_allowed_when_collision_is_another_mcp(self):
-        """Collision between two MCP toolsets is allowed (last wins)."""
+    def test_mcp_tool_rejected_when_collision_is_another_mcp(self):
+        """Cross-server MCP collisions preserve the existing owner."""
         from tools.registry import ToolRegistry
         from tools.mcp_tool import _discover_and_register_server, _servers, MCPServerTask
 
@@ -4291,9 +4441,13 @@ class TestMCPBuiltinCollisionGuard:
                 _discover_and_register_server("srv", {"command": "test", "args": []})
             )
 
-        # MCP-to-MCP collision is allowed — the new server wins.
-        assert "mcp__srv__do_thing" in registered
-        assert mock_registry.get_toolset_for_tool("mcp__srv__do_thing") == "mcp-srv"
+        # Cross-server MCP collisions fail closed: the existing owner stays active.
+        assert "mcp__srv__do_thing" not in registered
+        entry = mock_registry.get_entry("mcp__srv__do_thing")
+        assert entry is not None
+        assert entry.toolset == "mcp-old"
+        assert entry.schema["description"] == "From another MCP server"
+        assert mock_registry.get_toolset_for_tool("mcp__srv__do_thing") == "mcp-old"
 
         _servers.pop("srv", None)
 
@@ -4671,3 +4825,172 @@ class TestMcpParallelToolCalls:
             register_mcp_servers(config_off)
         with _lock:
             assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
+
+
+class TestMCPParallelSafetyProvenance:
+    def test_parallel_safe_servers_keep_exact_raw_names(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        first = SimpleNamespace(session=object(), _registered_tool_names=[])
+        second = SimpleNamespace(session=object(), _registered_tool_names=[])
+
+        with mcp_tool._lock:
+            saved_servers = dict(mcp_tool._servers)
+            saved_parallel = set(mcp_tool._parallel_safe_servers)
+            mcp_tool._servers.clear()
+            mcp_tool._servers.update({"foo-bar": first, "foo_bar": second})
+            mcp_tool._parallel_safe_servers.clear()
+
+        try:
+            monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+            monkeypatch.setattr(
+                mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
+            )
+            mcp_tool.register_mcp_servers(
+                {
+                    "foo-bar": {"supports_parallel_tool_calls": True},
+                    "foo_bar": {"supports_parallel_tool_calls": False},
+                }
+            )
+            with mcp_tool._lock:
+                assert "foo-bar" in mcp_tool._parallel_safe_servers
+                assert "foo_bar" not in mcp_tool._parallel_safe_servers
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.clear()
+                mcp_tool._servers.update(saved_servers)
+                mcp_tool._parallel_safe_servers.clear()
+                mcp_tool._parallel_safe_servers.update(saved_parallel)
+
+    def test_tool_provenance_keeps_exact_raw_server_names(self):
+        import tools.mcp_tool as mcp_tool
+
+        first_tool = "mcp__foo_bar__first"
+        second_tool = "mcp__foo_bar__second"
+        with mcp_tool._lock:
+            saved_map = dict(mcp_tool._mcp_tool_server_names)
+            saved_parallel = set(mcp_tool._parallel_safe_servers)
+            mcp_tool._mcp_tool_server_names.clear()
+            mcp_tool._parallel_safe_servers.clear()
+            mcp_tool._parallel_safe_servers.add("foo-bar")
+
+        try:
+            mcp_tool._track_mcp_tool_server(first_tool, "foo-bar")
+            mcp_tool._track_mcp_tool_server(second_tool, "foo_bar")
+
+            assert mcp_tool.is_mcp_tool_parallel_safe(first_tool) is True
+            assert mcp_tool.is_mcp_tool_parallel_safe(second_tool) is False
+            assert mcp_tool.get_registered_mcp_server_names() == {
+                "foo-bar",
+                "foo_bar",
+            }
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._mcp_tool_server_names.clear()
+                mcp_tool._mcp_tool_server_names.update(saved_map)
+                mcp_tool._parallel_safe_servers.clear()
+                mcp_tool._parallel_safe_servers.update(saved_parallel)
+
+class TestMCPDiscoveryCrossProcessLock:
+    """Tests for the cross-process MCP discovery guard in discover_mcp_tools()."""
+
+    @staticmethod
+    def _lock_exclusive(fh):
+        """Lock a file handle exclusively, cross-platform.
+
+        Mirrors production _try_acquire_mcp_discovery_lock: fcntl on POSIX,
+        portalocker on Windows (portalocker only ships on win32 installs).
+        """
+        if sys.platform == "win32":
+            import portalocker
+
+            self._lock_exclusive(fh)
+        else:
+            import fcntl
+
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @pytest.fixture(autouse=True)
+    def _fast_retries(self):
+        """Override retry constants so tests are fast."""
+        import tools.mcp_tool as mcp_tool
+        orig_max = mcp_tool._MCP_DISCOVERY_LOCK_MAX_RETRIES
+        orig_delay = mcp_tool._MCP_DISCOVERY_LOCK_RETRY_DELAY_S
+        mcp_tool._MCP_DISCOVERY_LOCK_MAX_RETRIES = 3
+        mcp_tool._MCP_DISCOVERY_LOCK_RETRY_DELAY_S = 0.01
+        yield
+        mcp_tool._MCP_DISCOVERY_LOCK_MAX_RETRIES = orig_max
+        mcp_tool._MCP_DISCOVERY_LOCK_RETRY_DELAY_S = orig_delay
+
+    def test_lock_acquired_path(self, tmp_path):
+        """Lock acquired -> discovery runs normally, lock released at end."""
+        from tools.mcp_tool import (
+            _LockCookie,
+            discover_mcp_tools,
+        )
+
+        lock_file = tmp_path / ".mcp-discovery.lock"
+        fh = open(lock_file, "w", encoding="utf-8")
+        cookie = _LockCookie(fh)
+
+        def mock_acquire():
+            return cookie
+
+        mock_config = {"test_srv": {"command": "echo", "enabled": True}}
+        with patch.object(cookie, "release", wraps=cookie.release) as release_spy:
+            with patch("tools.mcp_tool._try_acquire_mcp_discovery_lock", mock_acquire), \
+                 patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._load_mcp_config", return_value=mock_config), \
+                 patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp__test_srv__ping"]) as reg_spy:
+                result = discover_mcp_tools()
+            assert result == ["mcp__test_srv__ping"]
+            release_spy.assert_called_once()
+
+    def test_lock_held_retries_exhausted_fallback(self):
+        """All retry attempts see lock held -> runs discovery unguarded."""
+        from tools.mcp_tool import (
+            _LOCK_UNAVAILABLE,
+            discover_mcp_tools,
+            _MCP_DISCOVERY_LOCK_MAX_RETRIES,
+        )
+
+        mock_config = {"test_srv": {"command": "echo", "enabled": True}}
+        # Every attempt returns None (lock held)
+        with patch("tools.mcp_tool._try_acquire_mcp_discovery_lock", return_value=None), \
+             patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_tool._load_mcp_config", return_value=mock_config), \
+             patch("tools.mcp_tool.register_mcp_servers") as reg_spy, \
+             patch("tools.mcp_tool._existing_tool_names", return_value=[]):
+            result = discover_mcp_tools()
+        # Must still run local discovery
+        reg_spy.assert_called_once_with(mock_config)
+
+    def test_posix_flock_acquire_and_release(self):
+        """_acquire_lock_on_fh uses fcntl.flock on POSIX."""
+        import sys
+        import tempfile
+        from unittest.mock import MagicMock
+
+        mock_fcntl = MagicMock()
+        mock_fcntl.LOCK_EX = 2
+        mock_fcntl.LOCK_NB = 4
+
+        with tempfile.NamedTemporaryFile(prefix="mcp-lock-", suffix=".tmp", delete=False) as tf:
+            lock_path = tf.name
+
+        try:
+            fh = open(lock_path, "w", encoding="utf-8")
+            with patch.dict("sys.modules", {"fcntl": mock_fcntl}), \
+                 patch("tools.mcp_tool.os.name", "posix"):
+                from tools.mcp_tool import _acquire_lock_on_fh
+                result = _acquire_lock_on_fh(fh)
+            assert result is True
+            mock_fcntl.flock.assert_called_once_with(
+                fh.fileno(), mock_fcntl.LOCK_EX | mock_fcntl.LOCK_NB
+            )
+            fh.close()
+        finally:
+            try:
+                os.unlink(lock_path)
+            except Exception:
+                pass

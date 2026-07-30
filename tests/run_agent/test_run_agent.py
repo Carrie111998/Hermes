@@ -232,6 +232,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -1077,7 +1080,7 @@ class TestInit:
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
-            patch("hermes_cli.config.load_config", return_value={}),
+            patch("hermes_cli.config.load_config_readonly", return_value={}),
         ):
             a = AIAgent(
                 api_key="test-k...7890",
@@ -1096,7 +1099,7 @@ class TestInit:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"prompt_caching": {"cache_ttl": "1h"}},
             ),
         ):
@@ -1117,7 +1120,7 @@ class TestInit:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"model": {"max_tokens": 4096}},
             ),
         ):
@@ -1143,7 +1146,7 @@ class TestInit:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"model": {"max_tokens": 4096}},
             ),
         ):
@@ -1167,7 +1170,7 @@ class TestInit:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"prompt_caching": {"cache_ttl": "30m"}},
             ),
         ):
@@ -1216,6 +1219,26 @@ class TestInit:
             assert re.match(r"^\d{8}_\d{6}_[0-9a-f]{6}$", a.session_id), (
                 f"session_id doesn't match expected format: {a.session_id}"
             )
+
+
+    def test_tool_delay_kwarg_is_deprecated_noop(self):
+        """tool_delay stays accepted for compatibility but warns and is ignored."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            with pytest.warns(DeprecationWarning, match="tool_delay"):
+                a = AIAgent(
+                    api_key="test-key-1234567890",
+                    base_url="https://openrouter.ai/api/v1",
+                    tool_delay=0,
+                    quiet_mode=True,
+                    skip_context_files=True,
+                    skip_memory=True,
+                )
+            # The value is discarded — nothing downstream reads it anymore.
+            assert not hasattr(a, "tool_delay")
 
 
 class TestInterrupt:
@@ -1622,7 +1645,7 @@ class TestToolUseEnforcementConfig:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": {"tool_use_enforcement": tool_use_enforcement}},
             ),
         ):
@@ -1768,7 +1791,7 @@ class TestToolUseEnforcementConfig:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": {"tool_use_enforcement": True}},
             ),
         ):
@@ -1805,7 +1828,7 @@ class TestTaskCompletionGuidance:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": agent_cfg},
             ),
         ):
@@ -1864,7 +1887,7 @@ class TestTaskCompletionGuidance:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": {"task_completion_guidance": True}},
             ),
         ):
@@ -1896,7 +1919,7 @@ class TestEnvironmentProbeIntegration:
             patch("run_agent.check_toolset_requirements", return_value={}),
             patch("run_agent.OpenAI"),
             patch(
-                "hermes_cli.config.load_config",
+                "hermes_cli.config.load_config_readonly",
                 return_value={"agent": {"environment_probe": environment_probe}},
             ),
         ):
@@ -2757,6 +2780,23 @@ class TestExecuteToolCalls:
         output = captured.getvalue()
         assert "API call failed" not in output
         assert "Rate limit reached" not in output
+
+
+    def test_sequential_tool_calls_run_without_delay(self, agent):
+        """Two sequential tool calls execute back-to-back with no sleep between them."""
+        tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        with (
+            patch("run_agent.handle_function_call", return_value="ok") as mock_hfc,
+            patch("agent.tool_executor.time.sleep") as mock_sleep,
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+        assert mock_hfc.call_count == 2
+        mock_sleep.assert_not_called()
+        tool_results = [m for m in messages if m["role"] == "tool"]
+        assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
 
 class TestRetryAfterCap:
@@ -4346,133 +4386,261 @@ class TestConcurrentToolExecution:
         cp_mock.assert_called_once()
 
 
+    @pytest.mark.parametrize("quiet_mode", [True, False])
+    def test_sequential_registry_tool_forwards_request_middleware_trace(
+        self,
+        agent,
+        monkeypatch,
+        quiet_mode,
+    ):
+        from hermes_cli.middleware import RequestMiddlewareResult
+
+        trace = [{"source": "test-middleware"}]
+        observed = []
+        agent.quiet_mode = quiet_mode
+        tool_call = _mock_tool_call(
+            name="web_search",
+            arguments='{"query":"hello"}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: RequestMiddlewareResult(
+                payload=args,
+                original_payload=args,
+                changed=True,
+                trace=trace,
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, args, callback, **_kwargs: callback(args),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "agent.tool_executor._begin_tool_execution",
+            lambda *_args, **_kwargs: None,
+        )
+
+        def handle_function_call(*_args, **kwargs):
+            observed.append(kwargs)
+            return '{"success": true}'
+
+        with patch("run_agent.handle_function_call", side_effect=handle_function_call):
+            agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+
+        assert observed[0]["tool_request_middleware_trace"] == trace
+
+    def test_managed_tool_pipeline_rejects_second_dispatch(self, agent, monkeypatch):
+        from agent import relay_tools, tool_executor
+
+        dispatched = []
+        duplicate_errors = []
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, args, callback, **_kwargs: callback(args),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
+
+        def invoke_twice(name, args, callback, **kwargs):
+            del name, kwargs
+            result = callback(args)
+            try:
+                callback(args)
+            except RuntimeError as exc:
+                duplicate_errors.append(str(exc))
+            return result, args
+
+        monkeypatch.setattr(relay_tools, "execute", invoke_twice)
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="terminal",
+            function_args={"command": "true"},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=lambda args: dispatched.append(args) or "ok",
+        )
+
+        assert outcome.result == "ok"
+        assert dispatched == [{"command": "true"}]
+        assert duplicate_errors == [
+            "Hermes tool execution callback invoked more than once"
+        ]
+        assert outcome.blocked is False
+
+    def test_managed_tool_pipeline_allows_one_concurrent_dispatch(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from agent import relay_tools, tool_executor
+
+        dispatched = []
+        results = []
+        errors = []
+        barrier = threading.Barrier(2)
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, args, callback, **_kwargs: callback(args),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
+
+        def invoke_concurrently(name, args, callback, **kwargs):
+            del name, kwargs
+
+            def invoke():
+                barrier.wait(timeout=2)
+                try:
+                    results.append(callback(args))
+                except RuntimeError as exc:
+                    errors.append(str(exc))
+
+            threads = [threading.Thread(target=invoke) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+            return results[0], args
+
+        monkeypatch.setattr(relay_tools, "execute", invoke_concurrently)
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="terminal",
+            function_args={"command": "true"},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=lambda args: dispatched.append(args) or "ok",
+        )
+
+        assert outcome.result == "ok"
+        assert dispatched == [{"command": "true"}]
+        assert errors == ["Hermes tool execution callback invoked more than once"]
+        assert outcome.blocked is False
+
+
 class TestAgentRuntimePostHookOwnershipSync:
-    """Pin the inline-dispatch tool list against the post-hook ownership set.
+    """Exercise post-hook ownership through both agent-runtime tool paths."""
 
-    The post_tool_call hook fires from two places: the inline dispatcher in
-    agent/tool_executor.py:execute_tool_calls_sequential (for agent-runtime
-    tools that never reach handle_function_call) and
-    model_tools.handle_function_call itself (for registry-dispatched tools).
-    To prevent the executor from silently dropping or double-emitting,
-    AGENT_RUNTIME_POST_HOOK_TOOL_NAMES has to match exactly the static
-    `function_name == "..."` branches in the inline dispatch chain.
+    _CASES = (
+        ("todo", {"todos": []}),
+        ("session_search", {"query": "needle"}),
+        ("memory", {"action": "view", "target": "memory"}),
+        ("clarify", {"question": "Continue?"}),
+        ("read_terminal", {}),
+        ("delegate_task", {"goal": "Check the child path"}),
+    )
 
-    The chain is the if/elif tower anchored on `_block_msg is not None`.
-    Pre-dispatch `function_name == "..."` checks (counter resets, checkpoint
-    triggers) live outside the dispatch chain and are explicitly skipped.
-    """
-
-    _DISPATCH_ANCHOR_LEFT = "_block_msg"
-
-    @classmethod
-    def _is_dispatch_anchor(cls, test_node) -> bool:
-        # Looking for `_block_msg is not None`.
-        if not isinstance(test_node, ast.Compare):
-            return False
-        if not (isinstance(test_node.left, ast.Name) and test_node.left.id == cls._DISPATCH_ANCHOR_LEFT):
-            return False
-        if not (len(test_node.ops) == 1 and isinstance(test_node.ops[0], ast.IsNot)):
-            return False
-        comparator = test_node.comparators[0]
-        return isinstance(comparator, ast.Constant) and comparator.value is None
-
-    @staticmethod
-    def _function_name_literal(test_node) -> str | None:
-        """Return the string literal X for `function_name == "X"`, else None."""
-        if not isinstance(test_node, ast.Compare):
-            return None
-        if not (isinstance(test_node.left, ast.Name) and test_node.left.id == "function_name"):
-            return None
-        if not (len(test_node.ops) == 1 and isinstance(test_node.ops[0], ast.Eq)):
-            return None
-        comparator = test_node.comparators[0]
-        if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
-            return comparator.value
-        return None
-
-    @classmethod
-    def _extract_dispatch_chain_names(cls, func) -> set[str]:
-        """Find the if/elif chain anchored on `_block_msg is not None`, return its
-        `function_name == "..."` literals."""
-        source = inspect.cleandoc("\n" + inspect.getsource(func))
-        tree = ast.parse(source)
-        names: set[str] = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.If):
-                continue
-            if not cls._is_dispatch_anchor(node.test):
-                continue
-            current = node
-            while current is not None:
-                literal = cls._function_name_literal(current.test)
-                if literal is not None:
-                    names.add(literal)
-                if current.orelse and len(current.orelse) == 1 and isinstance(current.orelse[0], ast.If):
-                    current = current.orelse[0]
-                else:
-                    current = None
-            break
-        return names
-
-    @classmethod
-    def _extract_invoke_tool_names(cls, func) -> set[str]:
-        """invoke_tool uses a flat if/elif on function_name directly; walk every
-        Compare in the function body (no other static `function_name == "..."`
-        checks live there)."""
-        source = inspect.cleandoc("\n" + inspect.getsource(func))
-        tree = ast.parse(source)
-        names: set[str] = set()
-        for node in ast.walk(tree):
-            literal = cls._function_name_literal(node)
-            if literal is not None:
-                names.add(literal)
-        return names
-
-    def test_frozenset_matches_inline_dispatch_chain(self):
-        from agent import tool_executor
+    @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
+    def test_agent_runtime_tools_emit_once_per_executor_path(
+        self,
+        agent,
+        monkeypatch,
+        tool_name,
+        tool_args,
+    ):
         from agent.agent_runtime_helpers import AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
 
-        inline_names = self._extract_dispatch_chain_names(
-            tool_executor.execute_tool_calls_sequential
+        hook_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
         )
-        assert inline_names, (
-            "Could not find the dispatch chain (anchored on "
-            "`_block_msg is not None`) in execute_tool_calls_sequential. "
-            "If the dispatcher was refactored, update _DISPATCH_ANCHOR_LEFT "
-            "and the walker in this test."
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
         )
-        assert inline_names == set(AGENT_RUNTIME_POST_HOOK_TOOL_NAMES), (
-            "Inline dispatch chain in "
-            "agent/tool_executor.py:execute_tool_calls_sequential has drifted "
-            "from AGENT_RUNTIME_POST_HOOK_TOOL_NAMES in "
-            "agent/agent_runtime_helpers.py.\n"
-            f"  Inline branches:     {sorted(inline_names)}\n"
-            f"  Ownership frozenset: {sorted(AGENT_RUNTIME_POST_HOOK_TOOL_NAMES)}\n"
-            "Update both together so post_tool_call fires exactly once per "
-            "tool execution."
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+        monkeypatch.setattr(
+            "tools.todo_tool.todo_tool",
+            lambda **kwargs: '{"ok":true}',
         )
+        monkeypatch.setattr(
+            "tools.memory_tool.memory_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.clarify_tool.clarify_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.read_terminal_tool.read_terminal_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: None)
+        monkeypatch.setattr(
+            agent,
+            "_dispatch_delegate_task",
+            lambda args: '{"ok":true}',
+        )
+        agent._memory_manager = None
 
-    def test_invoke_tool_dispatch_matches_inline_dispatch_chain(self):
-        """invoke_tool (concurrent path) and the inline dispatcher (sequential
-        path) must cover the same set of agent-runtime tools — otherwise
-        post_tool_call fires inconsistently depending on which executor ran
-        the tool."""
-        from agent import agent_runtime_helpers, tool_executor
+        assert tool_name in AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("agent-runtime tools must stay inline"),
+        ):
+            agent._invoke_tool(
+                tool_name,
+                dict(tool_args),
+                "task-concurrent",
+                tool_call_id=f"{tool_name}-concurrent",
+            )
+            tool_call = _mock_tool_call(
+                name=tool_name,
+                arguments=json.dumps(tool_args),
+                call_id=f"{tool_name}-sequential",
+            )
+            agent._execute_tool_calls_sequential(
+                _mock_assistant_msg(content="", tool_calls=[tool_call]),
+                [],
+                "task-sequential",
+            )
 
-        invoke_tool_names = self._extract_invoke_tool_names(
-            agent_runtime_helpers.invoke_tool
-        )
-        inline_names = self._extract_dispatch_chain_names(
-            tool_executor.execute_tool_calls_sequential
-        )
-        assert invoke_tool_names == inline_names, (
-            "Static `function_name == \"...\"` branches diverged between "
-            "agent/agent_runtime_helpers.py:invoke_tool (concurrent path) "
-            "and agent/tool_executor.py:execute_tool_calls_sequential "
-            "(sequential path).\n"
-            f"  invoke_tool:                   {sorted(invoke_tool_names)}\n"
-            f"  execute_tool_calls_sequential: {sorted(inline_names)}"
-        )
+        post_calls = [
+            kwargs
+            for hook_name, kwargs in hook_calls
+            if hook_name == "post_tool_call"
+        ]
+        assert [call["tool_call_id"] for call in post_calls] == [
+            f"{tool_name}-concurrent",
+            f"{tool_name}-sequential",
+        ]
+        assert all(call["tool_name"] == tool_name for call in post_calls)
+
+    def test_post_hook_ownership_contract_lists_exercised_tools(self):
+        from agent.agent_runtime_helpers import AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
+
+        assert AGENT_RUNTIME_POST_HOOK_TOOL_NAMES == {
+            tool_name for tool_name, _ in self._CASES
+        }
 
 
 class TestPathsOverlap:
@@ -4700,8 +4868,6 @@ class TestHandleMaxIterations:
         assert "iteration budget" in result.lower()
         run_codex.assert_not_called()
         attest.assert_not_called()
-
-
 class TestRenewableIterationSlices:
     @staticmethod
     def _tool_call(name, arguments, call_id):
@@ -6133,7 +6299,8 @@ class TestRunConversation:
         }
 
     def test_redirect_during_thinking_retries_same_turn_with_context(self, agent):
-        """A corrective follow-up keeps displayed reasoning and does not end the turn."""
+        """A corrective follow-up does not end the turn, and displayed reasoning
+        never re-enters the transcript (classifier-poisoning guard)."""
         self._setup_agent(agent)
         agent.reasoning_callback = lambda _text: None
         final = _mock_response(content="Using Postgres instead.", finish_reason="stop")
@@ -6175,7 +6342,11 @@ class TestRunConversation:
         ]
         checkpoint = replay[-2]["content"]
         assert "interrupted by a user correction" in checkpoint
-        assert "I should implement this with SQLite." in checkpoint
+        # Displayed chain-of-thought must NOT be replayed: an assistant turn
+        # inlining its own reasoning trips Anthropic's output classifier and
+        # bricks the session with deterministic empty responses (July 2026).
+        assert "I should implement this with SQLite." not in checkpoint
+        assert "Reasoning shown before the interruption" not in checkpoint
         assert replay[-1]["content"] == "No, use Postgres instead."
         assert agent._pending_redirect is None
         assert any(
@@ -6257,7 +6428,10 @@ class TestRunConversation:
         assert results["result"]["completed"] is True
         assert results["result"]["final_response"] == "Corrected answer."
         checkpoint = results["result"]["messages"][-3]
-        assert "Following the original approach." in checkpoint["content"]
+        assert "interrupted by a user correction" in checkpoint["content"]
+        # Displayed reasoning is display-only — replaying it as assistant
+        # content trips Anthropic's output classifier (July 2026 brickings).
+        assert "Following the original approach." not in checkpoint["content"]
         assert results["result"]["messages"][-2]["content"] == (
             "Use the corrected approach."
         )
@@ -7559,6 +7733,86 @@ class TestRunConversation:
         mock_compress.assert_not_called()
 
 
+    def test_task_start_failure_closes_relay_turn_and_lease(self, agent):
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = object()
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+        start_error = RuntimeError("task metrics start failed")
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run",
+                side_effect=start_error,
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ) as finish_task_run,
+            patch("agent.conversation_loop.run_conversation") as run_conversation,
+        ):
+            with pytest.raises(RuntimeError) as caught:
+                agent.run_conversation("hello", task_id="task-1")
+
+        assert caught.value is start_error
+        run_conversation.assert_not_called()
+        finish_task_run.assert_not_called()
+        coordinator.finish_logical_calls.assert_called_once_with(
+            relay_turn,
+            outcome="failed",
+        )
+        coordinator.end_turn.assert_called_once_with(
+            relay_turn,
+            outcome="failed",
+        )
+        coordinator.release_conversation.assert_called_once_with(relay_lease)
+        assert agent._relay_pending_turn_id is None
+
+    def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
+        from agent import relay_runtime
+
+        order = []
+        failed_result = {
+            "final_response": "provider failed",
+            "messages": [],
+            "completed": False,
+            "failed": True,
+            "interrupted": False,
+        }
+
+        with (
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value=failed_result,
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run",
+                side_effect=lambda **_kwargs: order.append("metrics"),
+            ),
+            patch.object(
+                relay_runtime.SESSION_COORDINATOR,
+                "finish_logical_calls",
+                side_effect=lambda *_args, **_kwargs: order.append("logical"),
+            ),
+        ):
+            result = agent.run_conversation("private prompt")
+
+        assert result is failed_result
+        assert order == ["logical", "metrics"]
+
+
 class TestHookPayloadSanitizesSimpleNamespace:
     """Regression: ``_hook_jsonable`` referenced ``SimpleNamespace`` without
     importing it, so sanitizing any hook payload that contained one raised
@@ -7777,6 +8031,51 @@ class TestRetryExhaustion:
         )
 
 
+    def test_invalid_response_retry_completes_one_logical_call(self, agent):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.side_effect = [
+            SimpleNamespace(choices=[], model="test/model", usage=None),
+            _mock_response(content="recovered"),
+        ]
+        relay_attempts = []
+        logical_completions = []
+
+        def execute(request, callback, **kwargs):
+            relay_attempts.append(kwargs)
+            return callback(request)
+
+        from agent import conversation_loop as _conv_loop
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "time", self._make_fast_time_mock()),
+            patch.object(_conv_loop, "jittered_backoff", lambda *a, **k: 0.0),
+            patch("agent.relay_llm.execute", side_effect=execute),
+            patch(
+                "agent.relay_llm.complete_logical_call",
+                side_effect=lambda request_id, *, outcome: logical_completions.append(
+                    (request_id, outcome)
+                ),
+            ),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert len(relay_attempts) == 2
+        assert all(
+            attempt["defer_logical_completion"] is True
+            for attempt in relay_attempts
+        )
+        request_ids = {
+            attempt["metadata"]["api_request_id"] for attempt in relay_attempts
+        }
+        assert len(request_ids) == 1
+        assert logical_completions == [(request_ids.pop(), "success")]
+
+
 # ---------------------------------------------------------------------------
 # Conversation history mutation
 # ---------------------------------------------------------------------------
@@ -7883,6 +8182,69 @@ class TestNousCredentialRefresh:
         )
         assert "default_headers" not in rebuilt["kwargs"]
         assert isinstance(agent.client, _RebuiltClient)
+
+
+    def test_try_refresh_nous_client_credentials_rebuilds_anthropic_client(
+        self, agent, monkeypatch
+    ):
+        """Portal anthropic/* sessions hold an Anthropic client, not OpenAI.
+
+        A 401 on the Messages wire must refresh the invoke JWT into
+        ``_anthropic_api_key`` / ``_anthropic_base_url`` and rebuild that
+        client — swapping only ``agent.client`` would leave the turn stuck
+        on the expired Bearer token.
+        """
+        agent.provider = "nous"
+        agent.api_mode = "anthropic_messages"
+        agent.model = "anthropic/claude-opus-4.8"
+        agent.api_key = "stale-nous-key"
+        agent.base_url = "https://inference-api.nousresearch.com/v1"
+        agent._anthropic_api_key = "stale-nous-key"
+        agent._anthropic_base_url = "https://inference-api.nousresearch.com/v1"
+        agent._client_kwargs = {}
+        agent.client = None
+
+        captured = {}
+        rebuild_calls = {"count": 0}
+
+        class _RebuiltAnthropic:
+            pass
+
+        def _fake_resolve(**kwargs):
+            captured.update(kwargs)
+            return {
+                "api_key": "fresh-portal-jwt",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+            }
+
+        def _fake_rebuild():
+            rebuild_calls["count"] += 1
+            agent._anthropic_client = _RebuiltAnthropic()
+
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_nous_runtime_credentials", _fake_resolve
+        )
+        monkeypatch.setattr(agent, "_rebuild_anthropic_client", _fake_rebuild)
+        monkeypatch.setattr(
+            agent,
+            "_replace_primary_openai_client",
+            MagicMock(side_effect=AssertionError("OpenAI client must not be rebuilt")),
+        )
+
+        ok = agent._try_refresh_nous_client_credentials(force=True)
+
+        assert ok is True
+        assert captured["force_refresh"] is True
+        assert agent.api_key == "fresh-portal-jwt"
+        assert agent.base_url == "https://inference-api.nousresearch.com/v1"
+        assert agent._anthropic_api_key == "fresh-portal-jwt"
+        assert agent._anthropic_base_url == (
+            "https://inference-api.nousresearch.com/v1"
+        )
+        assert rebuild_calls["count"] == 1
+        assert isinstance(agent._anthropic_client, _RebuiltAnthropic)
+        assert agent.client is None
+        agent._replace_primary_openai_client.assert_not_called()
 
 
 class TestCredentialPoolRecovery:

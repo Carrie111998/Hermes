@@ -74,6 +74,15 @@ class TestCheckRequirements:
         assert _get_bot_token() is None
 
 
+    @pytest.mark.parametrize("token, expected", [(None, False), ("test-token-123", True)])
+    def test_requirements_follow_token(self, monkeypatch, token, expected):
+        if token is None:
+            monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        else:
+            monkeypatch.setenv("DISCORD_BOT_TOKEN", token)
+        assert check_discord_tool_requirements() is expected
+
+
 # ---------------------------------------------------------------------------
 # Channel type names
 # ---------------------------------------------------------------------------
@@ -88,6 +97,14 @@ class TestChannelTypeNames:
         assert _channel_type_name(15) == "forum"
 
     def test_unknown_type(self):
+        assert _channel_type_name(99) == "unknown(99)"
+
+
+    def test_type_names(self):
+        assert _channel_type_name(0) == "text"
+        assert _channel_type_name(2) == "voice"
+        assert _channel_type_name(4) == "category"
+        assert _channel_type_name(15) == "forum"
         assert _channel_type_name(99) == "unknown(99)"
 
 
@@ -1409,6 +1426,14 @@ class TestToolsetInclusion:
             assert "discord_admin" not in tools or name == "discord_admin", (
                 f"discord_admin tool should not be in toolset '{name}'"
             )
+
+
+    def test_discord_tools_only_in_hermes_discord_toolset(self):
+        from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+        assert "discord" in TOOLSETS["hermes-discord"]["tools"]
+        assert "discord_admin" in TOOLSETS["hermes-discord"]["tools"]
+        assert "discord" not in _HERMES_CORE_TOOLS
+        assert "discord_admin" not in _HERMES_CORE_TOOLS
 
 
 # ---------------------------------------------------------------------------

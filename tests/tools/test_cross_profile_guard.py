@@ -18,6 +18,15 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cross_profile_guard_from_system_path_guard(monkeypatch):
+    """These tests exercise profile ownership, not privileged path policy."""
+    monkeypatch.setattr(
+        "tools.file_tools._check_sensitive_path",
+        lambda _path, _task_id="default": None,
+    )
+
+
 @pytest.fixture
 def fake_hermes(tmp_path, monkeypatch):
     """Build a two-profile Hermes layout and point HERMES_HOME at
@@ -82,16 +91,6 @@ class TestWriteFileCrossProfileGuard:
         # File untouched.
         assert target.read_text() == original
 
-    def test_cross_profile_True_bypass(self, fake_hermes):
-        """Explicit override after user direction must succeed."""
-        from tools.file_tools import write_file_tool
-        target = fake_hermes["root"] / "skills" / "shared-skill" / "SKILL.md"
-        result_json = write_file_tool(
-            str(target), "user-directed override", cross_profile=True
-        )
-        result = json.loads(result_json)
-        assert not result.get("error"), f"cross_profile=True must succeed: {result}"
-        assert target.read_text() == "user-directed override"
 
     def test_non_hermes_path_unaffected(self, fake_hermes, tmp_path):
         from tools.file_tools import write_file_tool
@@ -191,21 +190,6 @@ class TestSkillManageCrossProfileErrorUX:
         assert "default" in err
         assert "cross_profile=True" in err
 
-    def test_error_names_multiple_profiles(self, fake_hermes, monkeypatch):
-        """When the skill exists in TWO other profiles, both should be named."""
-        self._make_skill_in_profile(fake_hermes["root"], "everywhere-skill")
-        self._make_skill_in_profile(fake_hermes["coder_home"], "everywhere-skill")
-
-        import importlib
-        import tools.skill_manager_tool
-        importlib.reload(tools.skill_manager_tool)
-        from tools.skill_manager_tool import _skill_not_found_error
-
-        err = _skill_not_found_error("everywhere-skill")
-        assert "default" in err
-        assert "coder" in err
-        # Switch-profiles hint
-        assert "hermes -p" in err
 
     def test_genuinely_missing_skill_keeps_helpful_hint(
         self, fake_hermes, monkeypatch

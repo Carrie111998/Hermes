@@ -19,8 +19,6 @@ from tools.approval import (
     load_permanent,
     prompt_dangerous_approval,
 )
-
-
 class TestApprovalModeParsing:
     def test_unquoted_yaml_off_boolean_false_maps_to_off(self):
         with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": False}}):
@@ -50,6 +48,9 @@ class TestApprovalModeParsing:
 
     def test_yaml_bool_true_maps_to_manual(self):
         assert _normalize_approval_mode(True) == "manual"
+    def test_config_bool_false_maps_to_off(self):
+        with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": False}}):
+            assert _get_approval_mode() == "off"
 
 
 class TestDetectDangerousRm:
@@ -1125,6 +1126,16 @@ class TestFullCommandAlwaysShown:
         with mock_patch("builtins.input", return_value="v"):
             result = prompt_dangerous_approval(short_cmd, "recursive delete")
         assert result == "deny"
+
+
+    def test_choice_with_long_command(self):
+        long_cmd = "rm -rf " + "a" * 200
+        for keystroke, expected in (
+            ("o", "once"), ("s", "session"), ("a", "always"), ("d", "deny"), ("v", "deny"),
+        ):
+            with mock_patch("builtins.input", return_value=keystroke):
+                result = prompt_dangerous_approval(long_cmd, "recursive delete")
+            assert result == expected, keystroke
 
 
 class TestForkBombDetection:
@@ -2272,6 +2283,64 @@ class TestApprovalTimeoutIsNotConsent:
         last_post = posts[-1][1]
         assert last_post.get("choice") == "timeout", (
             f"hook choice should be 'timeout' on no-response, got {last_post.get('choice')!r}"
+        )
+
+
+    SESSION_KEY = "test-no-consent-session"
+
+    def test_timeout_blocks_with_no_consent_and_timeout_hook(self, monkeypatch):
+        """The reported #24912 scenario — user never responds, agent must see
+        BLOCKED, and the post hook must distinguish timeout from deny so audit
+        plugins can alert on 'agent asked, user never replied'."""
+        from tools import approval as mod
+
+        self._force_short_timeout(monkeypatch)
+
+        # Slack-shaped: notify_cb registered, but user doesn't respond.
+        notified = []
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
+
+        hook_calls = []
+        original_fire = mod._fire_approval_hook
+
+        def _capture(event_name, **kwargs):
+            hook_calls.append((event_name, kwargs))
+            return original_fire(event_name, **kwargs)
+
+        monkeypatch.setattr(mod, "_fire_approval_hook", _capture)
+        monkeypatch.setattr(
+            mod,
+            "detect_dangerous_command",
+            lambda _command: (
+                True,
+                "typed:test-protected-action",
+                "typed protected action",
+            ),
+        )
+
+        result = mod.check_all_command_guards("opaque protected action", "local")
+
+        assert result["approved"] is False
+        assert result.get("user_consent") is False
+        assert result.get("outcome") == "timeout"
+        # The notify_cb DID fire — we did try to ask the user.
+        assert len(notified) == 1
+
+        # The BLOCKED message must explicitly tell the agent not to rephrase;
+        # without it the agent treats "Do NOT retry this command" as permission
+        # to try a different command achieving the same outcome.
+        msg = result["message"]
+        assert "BLOCKED" in msg
+        assert "NOT consented" in msg
+        assert "Silence is not consent" in msg
+        assert "retry" in msg.lower()
+        assert "rephrase" in msg.lower()
+        assert "different command" in msg.lower()
+
+        posts = [c for c in hook_calls if c[0] == "post_approval_response"]
+        assert posts, "post_approval_response hook did not fire"
+        assert posts[-1][1].get("choice") == "timeout", (
+            f"hook choice should be 'timeout' on no-response, got {posts[-1][1].get('choice')!r}"
         )
 
 

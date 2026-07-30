@@ -23,6 +23,7 @@ import pytest
 
 from tools import approval as A
 from tools.thread_context import propagate_context_to_thread
+import json
 
 
 # ---------------------------------------------------------------------------

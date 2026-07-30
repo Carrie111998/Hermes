@@ -156,7 +156,7 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     pre_approval_request, post_approval_response.
     """
     try:
-        from hermes_cli.plugins import invoke_hook
+        from hermes_cli.lifecycle import invoke_hook
     except Exception:
         # Plugin system not available in this execution context
         # (e.g. bare tool-only imports, minimal test environments).
@@ -2802,6 +2802,26 @@ def approve_session(
     )
 
 
+def _release_permission_mode_dependents(session_key: str) -> None:
+    """Drop resources whose immutable mode is derived from Hermes YOLO.
+
+    The import stays lazy so approval-only sessions do not load computer-use.
+    Releasing on both edges makes enabling YOLO replace an existing standard
+    backend and makes disabling YOLO revoke a private unrestricted daemon
+    immediately, even when no later computer-use call occurs.
+    """
+    try:
+        from tools.computer_use import release_computer_use_session
+
+        release_computer_use_session(session_key)
+    except Exception:
+        logger.debug(
+            "Failed to release permission-mode dependent resources for %s",
+            session_key,
+            exc_info=True,
+        )
+
+
 def enable_session_yolo(
     session_key: str,
     *,
@@ -2828,7 +2848,8 @@ def enable_session_yolo(
             return False
         _session_yolo.add(session_key)
         _session_yolo_generations[session_key] = current_generation
-        return True
+    _release_permission_mode_dependents(session_key)
+    return True
 
 
 def disable_session_yolo(
@@ -2848,7 +2869,8 @@ def disable_session_yolo(
             return False
         _session_yolo.discard(session_key)
         _session_yolo_generations.pop(session_key, None)
-        return True
+    _release_permission_mode_dependents(session_key)
+    return True
 
 
 def revoke_session_capabilities_durably(
@@ -2979,6 +3001,7 @@ def clear_session_local(
         # immediately so the old run can unwind instead of idling until timeout.
         entry.result = "deny"
         entry.event.set()
+    _release_permission_mode_dependents(session_key)
 
 
 def clear_session(session_key: str) -> None:
@@ -4321,8 +4344,8 @@ def _get_approval_mode() -> str:
     return _normalize_approval_mode(mode)
 
 
-def is_approval_bypass_active() -> bool:
-    """Return True when the user has opted out of Hermes approval prompts.
+def is_approval_bypass_active_for_session(session_key: str) -> bool:
+    """Return whether one exact session bypasses Hermes approval prompts.
 
     Collapses the canonical three-source bypass check used across the codebase
     into one place:
@@ -4340,11 +4363,18 @@ def is_approval_bypass_active() -> bool:
     This is the pure-bypass sub-expression only. Callers that also honor a
     hardline blocklist / permanent allowlist must check those separately.
     """
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    if _YOLO_MODE_FROZEN or is_session_yolo_enabled(session_key):
         return True
     if _is_cron_session():
         return _get_cron_approval_mode() == "approve"
     return _get_approval_mode() == "off"
+
+
+def is_approval_bypass_active() -> bool:
+    """Return whether the current approval context has bypass enabled."""
+    return is_approval_bypass_active_for_session(
+        get_current_session_key(default="")
+    )
 
 
 def _get_approval_timeout() -> int:
@@ -4802,7 +4832,7 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     """
     if env_type == "docker":
         return not has_host_access
-    return env_type in ("singularity", "modal", "daytona")
+    return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
 
 
 def check_dangerous_command(command: str, env_type: str,

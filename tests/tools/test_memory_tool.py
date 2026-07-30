@@ -97,6 +97,24 @@ class TestMemoryStoreAdd:
         assert store.memory_entries == [content]
 
 
+    def test_overflow_returns_consolidation_context(self, store):
+        store.add("memory", "x" * 490)
+        result = store.add("memory", "this will exceed the limit")
+        assert result["success"] is False
+        assert "exceed" in result["error"].lower()
+        # Overflow response gives the model what it needs to consolidate in-turn
+        assert "current_entries" in result
+        assert "usage" in result
+        assert "retry" in result["error"].lower()
+
+        # A replace that blows the budget mirrors the add-overflow shape.
+        result = store.replace("memory", "x" * 490, "y" * 600)
+        assert result["success"] is False
+        assert "current_entries" in result
+        assert "usage" in result
+        assert "retry" in result["error"].lower()
+
+
 
 
 
@@ -164,6 +182,17 @@ class TestMemoryStoreRemove:
     def test_remove_empty_old_text(self, store):
         result = store.remove("memory", "  ")
         assert result["success"] is False
+
+
+    def test_remove_no_match_and_empty_old_text(self, store):
+        store.add("memory", "fact A")
+        result = store.remove("memory", "nonexistent")
+        assert result["success"] is False
+        assert "No entry matched" in result["error"]
+        # Zero-match must return current entries (#42405, co-author #42417).
+        assert result["current_entries"] == ["fact A"]
+
+        assert store.remove("memory", "  ")["success"] is False
 
 
 class TestMemoryConsolidationGracefulDegrade:
@@ -265,6 +294,28 @@ class TestMemoryConsolidationGracefulDegrade:
         # cap reached across batch + single ops → next degrades.
         r = store.replace("memory", "nope", "x")
         assert "continue with your reply" in r["error"]
+
+
+    def test_success_and_turn_boundary_reset_failure_budget(self, store):
+        store.add("memory", "real entry")
+        cap = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        for _ in range(cap):
+            store.replace("memory", "nonexistent", "new")
+        # A successful op resets the counter — progress was made.
+        ok = store.replace("memory", "real entry", "updated entry")
+        assert ok["success"] is True
+        # Now a fresh failure is treated as the first again (still actionable).
+        r = store.replace("memory", "nonexistent", "new")
+        assert "current_entries" in r
+        assert "continue with your reply" not in r["error"]
+
+        # Blow past the cap, then a new turn boundary resets the budget.
+        for _ in range(cap + 1):
+            store.replace("memory", "nonexistent", "new")
+        store.reset_consolidation_failures()
+        r = store.replace("memory", "nonexistent", "new")
+        assert "current_entries" in r  # actionable again, not degraded
+        assert "continue with your reply" not in r["error"]
 
 
 class TestMemoryStorePersistence:

@@ -536,6 +536,8 @@ def build_turn_context(
     user_message_provenance: Optional[Dict[str, Any]] = None,
     runtime_effect: Optional[Dict[str, Any]] = None,
     *,
+    persist_user_display_kind: Optional[str] = None,
+    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -749,7 +751,14 @@ def build_turn_context(
         )
         if callable(_track_persistent) and _session_runtime_identity:
             _track_persistent((_session_runtime_identity,))
-    turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    _relay_pending_turn_id = getattr(agent, "_relay_pending_turn_id", None)
+    if isinstance(_relay_pending_turn_id, str) and _relay_pending_turn_id:
+        turn_id = _relay_pending_turn_id
+    else:
+        turn_id = (
+            f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+        )
+    agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     # Clear before any fallible prologue work so a cached agent can never carry
     # authority from its prior turn into a new one.
@@ -901,6 +910,19 @@ def build_turn_context(
     # Add the current user message after the prompt/session setup has made
     # close persistence safe. The handoff above preserves any marker already
     # stamped by an earlier close flush.
+    #
+    # A synthesized turn (auto-continue recovery note, delegation completion)
+    # declares how it should READ in a transcript. Stamp that on the live
+    # message so the crash persist below writes the row already typed. Typing
+    # it after the turn instead leaves the row untyped for the whole run — and
+    # forever if the turn crashes — so the raw system note paints as a user
+    # bubble. The model still receives role/content unchanged; the api_messages
+    # build strips both fields from every outgoing copy.
+    if persist_user_display_kind:
+        user_msg["display_kind"] = persist_user_display_kind
+        if persist_user_display_metadata:
+            user_msg["display_metadata"] = persist_user_display_metadata
+
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
@@ -1391,7 +1413,7 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
@@ -1402,6 +1424,7 @@ def build_turn_context(
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
         )
         _ctx_parts: list[str] = []

@@ -345,6 +345,26 @@ class TestTelegramExecApproval:
         kwargs = adapter._bot.send_message.call_args[1]
         assert "..." in kwargs["text"]
         assert len(kwargs["text"]) < 5000
+
+    @pytest.mark.asyncio
+    async def test_non_smart_allow_permanent_false_keeps_session(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        buttons = []
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: buttons.append(text) or text,
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
+        )
+
+        await adapter.send_exec_approval(
+            chat_id="12345", command="curl example.test", session_key="s",
+            allow_permanent=False,
+        )
+
+        assert buttons == ["✅ Allow Once", "✅ Session", "❌ Deny"]
 # _handle_callback_query — approval button clicks
 # ===========================================================================
 

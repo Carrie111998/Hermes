@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
+import tempfile
 import threading
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -311,7 +314,16 @@ class _Pid:
 
 def test_real_unix_transport_authenticates_peer_and_receipt(tmp_path: Path) -> None:
     api = FakeApi()
-    config = _config(tmp_path)
+    # macOS caps AF_UNIX path names at roughly 104 bytes; pytest's private
+    # per-test directory can exceed that before the socket filename is added.
+    # Keep the short parent private so the production socket-parent invariant
+    # is exercised rather than bypassed.
+    socket_parent = Path(tempfile.mkdtemp(prefix="mac-edge-", dir="/tmp"))
+    socket_parent.chmod(0o700)
+    config = replace(
+        _config(tmp_path),
+        socket_path=socket_parent / "edge.sock",
+    )
     runtime = MacOpsEdgeRuntime(
         config=config,
         api=api,
@@ -352,6 +364,7 @@ def test_real_unix_transport_authenticates_peer_and_receipt(tmp_path: Path) -> N
     finally:
         server.shutdown()
         thread.join(timeout=2)
+        shutil.rmtree(socket_parent, ignore_errors=True)
 
     assert response["state"] == "queued"
     assert response["receipt"]["service_identity_sha256"] == IDENTITY

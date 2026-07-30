@@ -53,6 +53,8 @@ _ensure_discord_mock()
 
 from gateway.platforms.base import MessageEvent, MessageType, SessionSource
 
+import asyncio
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -787,6 +789,30 @@ class TestVoiceReceiver:
         receiver._on_packet(bytes(data))
         assert len(receiver._buffers) == 0
 
+    def test_ffmpeg_resolver_finds_winget_install_when_not_on_path(self, monkeypatch, tmp_path):
+        """Windows winget installs ffmpeg outside PATH; Discord voice should still find it."""
+        from plugins.platforms.discord import ffmpeg_utils
+
+        ffmpeg = (
+            tmp_path
+            / "Microsoft"
+            / "WinGet"
+            / "Packages"
+            / "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe"
+            / "ffmpeg-7.1-full_build"
+            / "bin"
+            / "ffmpeg.exe"
+        )
+        ffmpeg.parent.mkdir(parents=True)
+        ffmpeg.write_text("", encoding="utf-8")
+
+        monkeypatch.delenv("FFMPEG_PATH", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+        # Discovery delegates to tools.transcription_tools; simulate "not found".
+        monkeypatch.setattr(ffmpeg_utils, "_shared_find_ffmpeg", lambda: None)
+
+        assert ffmpeg_utils.resolve_ffmpeg_executable() == str(ffmpeg)
+
 
 # =====================================================================
 # Gateway voice channel commands (join / leave / input)
@@ -1270,6 +1296,23 @@ class TestVoiceChannelCommands:
         result = runner._get_guild_id(event)
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_input_resolves_channel_prompt(self, runner):
+        """Voice input must carry the bound text channel's channel_prompt (#50149)."""
+        from gateway.config import Platform
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        mock_adapter.handle_message = AsyncMock()
+        mock_adapter._resolve_channel_prompt = MagicMock(return_value="Be terse in #dev.")
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        await runner._handle_voice_channel_input(111, 42, "Hello from VC")
+        mock_adapter._resolve_channel_prompt.assert_called_once_with("123")
+        event = mock_adapter.handle_message.call_args[0][0]
+        assert event.channel_prompt == "Be terse in #dev."
+
 
 # =====================================================================
 # Discord adapter voice channel methods
@@ -1493,6 +1536,94 @@ class TestDiscordVoiceChannelMethods:
         with patch("plugins.platforms.discord.adapter.VoiceReceiver.pcm_to_wav",
                    side_effect=RuntimeError("ffmpeg not found")):
             await adapter._process_voice_input(111, 42, b"\x00" * 96000)
+
+    @pytest.mark.asyncio
+    async def test_leave_voice_channel_processes_pending_audio_before_disconnect(self):
+        """Recent speech is transcribed before the voice connection is torn down."""
+        adapter = self._make_adapter()
+        events = []
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+
+        async def disconnect():
+            events.append("disconnect")
+
+        mock_vc.disconnect = disconnect
+        adapter._voice_clients[111] = mock_vc
+
+        mock_receiver = MagicMock()
+        mock_receiver.flush_pending.side_effect = lambda: events.append("flush") or [(42, b"pcm")]
+        mock_receiver.stop.side_effect = lambda: events.append("stop")
+        adapter._voice_receivers[111] = mock_receiver
+        adapter._voice_listen_tasks[111] = MagicMock()
+        adapter._is_allowed_user = MagicMock(return_value=True)
+
+        async def process(guild_id, user_id, pcm_data):
+            events.append("process")
+
+        adapter._process_voice_input = process
+
+        await adapter.leave_voice_channel(111)
+
+        assert events == ["flush", "stop", "process", "disconnect"]
+        adapter._is_allowed_user.assert_called_once_with("42", guild=adapter._client.get_guild(111), is_dm=False)
+    def test_voice_timeout_zero_disables_auto_leave(self):
+        adapter = self._make_adapter()
+        adapter._voice_timeout_seconds = 0
+        existing_task = MagicMock()
+        adapter._voice_timeout_tasks[111] = existing_task
+
+        adapter._reset_voice_timeout(111)
+
+        existing_task.cancel.assert_called_once()
+        assert adapter._voice_timeout_tasks == {}
+    def test_discord_voice_timeout_config_loaded(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import PlatformConfig
+
+        with patch("hermes_cli.config.read_raw_config", return_value={
+            "discord": {
+                "voice_channel_inactivity_timeout_seconds": 0,
+                "voice_playback_timeout_seconds": 240,
+            }
+        }):
+            adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
+
+        assert adapter._voice_timeout_seconds == 0
+        assert adapter._playback_timeout_seconds == 240
+    @pytest.mark.asyncio
+    async def test_playback_timeout_scales_with_audio_duration(self):
+        adapter = self._make_adapter()
+        adapter._playback_timeout_seconds = 120
+        adapter._probe_audio_duration_seconds = MagicMock(return_value=180.5)
+
+        timeout = await adapter._playback_timeout_for_audio("/tmp/long.mp3")
+
+        assert timeout == pytest.approx(210.5)
+    @pytest.mark.asyncio
+    async def test_play_in_voice_channel_uses_duration_aware_timeout(self):
+        adapter = self._make_adapter()
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.is_playing.return_value = False
+        adapter._voice_clients[111] = mock_vc
+        adapter._playback_timeout_for_audio = AsyncMock(return_value=211.0)
+        adapter._cancel_voice_timeout = MagicMock()
+        adapter._reset_voice_timeout = MagicMock()
+
+        def _play(_source, after):
+            after(None)
+        mock_vc.play.side_effect = _play
+
+        with patch("plugins.platforms.discord.adapter.discord") as mock_discord:
+            mock_discord.FFmpegPCMAudio.return_value = MagicMock()
+            mock_discord.PCMVolumeTransformer.return_value = MagicMock()
+            result = await adapter.play_in_voice_channel(111, "/tmp/long.mp3")
+
+        assert result is True
+        adapter._playback_timeout_for_audio.assert_awaited_once_with("/tmp/long.mp3")
+        adapter._cancel_voice_timeout.assert_called_once_with(111)
+        adapter._reset_voice_timeout.assert_called_once_with(111)
         # Should not raise
 
 
@@ -2060,14 +2191,16 @@ class TestSendVoiceReplyFilename:
     """_send_voice_reply uses uuid for unique filenames."""
 
     def test_filename_uses_uuid(self):
-        """The method uses uuid in the filename, not time-based."""
-        import inspect
-        from gateway.run import GatewayRunner
-        source = inspect.getsource(GatewayRunner._send_voice_reply)
-        assert "uuid" in source, \
-            "_send_voice_reply should use uuid for unique filenames"
-        assert "int(time.time())" not in source, \
-            "_send_voice_reply should not use int(time.time()) — collision risk"
+        """The shared output-path helper returns collision-resistant names."""
+        from gateway.config import Platform
+        from gateway.platforms.base import build_auto_tts_output_path
+
+        first = build_auto_tts_output_path(Platform.DISCORD)
+        second = build_auto_tts_output_path(Platform.DISCORD)
+
+        assert first != second
+        assert first.endswith(".mp3")
+        assert second.endswith(".mp3")
 
     def test_filenames_are_unique(self):
         """Two calls produce different filenames."""
@@ -2265,14 +2398,15 @@ class TestPlaybackTimeout:
         return adapter
 
     def test_source_has_wait_for_timeout(self):
-        """The method uses asyncio.wait_for with timeout."""
-        import inspect
+        """The configured timeout falls back to the class contract."""
         from plugins.platforms.discord.adapter import DiscordAdapter
-        source = inspect.getsource(DiscordAdapter.play_in_voice_channel)
-        assert "wait_for" in source, \
-            "play_in_voice_channel must use asyncio.wait_for for timeout"
-        assert "PLAYBACK_TIMEOUT" in source, \
-            "play_in_voice_channel must reference PLAYBACK_TIMEOUT constant"
+
+        adapter = self._make_discord_adapter()
+
+        assert (
+            adapter._playback_timeout_limit()
+            == DiscordAdapter.PLAYBACK_TIMEOUT
+        )
 
     def test_playback_timeout_constant_exists(self):
         """PLAYBACK_TIMEOUT constant is defined on DiscordAdapter."""
@@ -3183,3 +3317,93 @@ class TestShouldAutoTtsForChat:
         fn, adapter = self._make_adapter(default=False, enabled={"chat1"})
         assert fn(adapter, "chat1") is True
         assert fn(adapter, "chat2") is False
+
+class TestStreamTtsTempfileFallback:
+    """Regression for the temp-WAV fallback in stream_tts_to_speaker.
+
+    When no sounddevice output stream is available the streaming path falls
+    back to writing each sentence to a temp WAV and playing it via the system
+    player.  ``wave.open()`` given a *file object* flushes but does NOT close
+    it (it only closes files it opened itself, by name), so the OS handle to
+    the temp file stays open.  On Windows that open write handle blocks the
+    player from reading the file and blocks ``os.unlink()`` (WinError 32,
+    silently swallowed), leaving orphaned temp .wav files behind.  The fix
+    closes the handle before playback/cleanup; this test asserts the close
+    happens before the play call.
+    """
+    def test_tempfile_handle_closed_before_playback(self, monkeypatch):
+        import wave
+        import tools.tts_tool as tts_mod
+        import tools.voice_mode as vm
+        from tools.tts_tool import stream_tts_to_speaker
+
+        # Fake registry streamer so resolve_streaming_provider yields chunked
+        # PCM regardless of which real providers are configured in the env.
+        class _FakeStreamer:
+            sample_rate = 24000
+            channels = 1
+
+            def stream(self, text):
+                yield b"\x00\x00" * 240
+                yield b"\x00\x00" * 240
+
+        monkeypatch.setattr(
+            "tools.tts_streaming.resolve_streaming_provider",
+            lambda tts_config, preferred=None: _FakeStreamer(),
+        )
+
+        # Force sounddevice unavailable → output_stream is None → tempfile fallback.
+        def _no_sounddevice():
+            raise ImportError("sounddevice unavailable in test")
+        monkeypatch.setattr(tts_mod, "_import_sounddevice", _no_sounddevice)
+
+        events = []  # ordered log of ("close", name) / ("play", path)
+
+        # Spy on NamedTemporaryFile to record when the handle is closed.
+        real_ntf = tts_mod.tempfile.NamedTemporaryFile
+
+        def _spy_ntf(*args, **kwargs):
+            f = real_ntf(*args, **kwargs)
+            orig_close = f.close
+
+            def _tracked_close():
+                events.append(("close", f.name))
+                return orig_close()
+
+            f.close = _tracked_close
+            return f
+
+        monkeypatch.setattr(tts_mod.tempfile, "NamedTemporaryFile", _spy_ntf)
+
+        played = []
+
+        def _fake_play(path):
+            events.append(("play", path))
+            played.append(path)
+            # At play time the file must be a fully written, readable WAV.
+            with wave.open(path, "rb") as wf:
+                assert wf.getnframes() > 0
+
+        monkeypatch.setattr(vm, "play_audio_file", _fake_play)
+
+        text_q = queue.Queue()
+        stop_evt = threading.Event()
+        done_evt = threading.Event()
+        text_q.put("This is a spoken sentence for the fallback. ")
+        text_q.put(None)
+
+        stream_tts_to_speaker(text_q, stop_evt, done_evt)
+
+        assert done_evt.is_set()
+        assert played, "temp-file fallback player was never invoked"
+
+        play_idx = next(i for i, e in enumerate(events) if e[0] == "play")
+        closes_before_play = [
+            i for i, e in enumerate(events[:play_idx]) if e[0] == "close"
+        ]
+        assert closes_before_play, (
+            "temp WAV handle must be closed BEFORE play_audio_file — an open "
+            "write handle blocks playback and os.unlink() on Windows"
+        )
+        # And the temp file is cleaned up afterwards.
+        assert not os.path.exists(played[0]), "temp WAV was not unlinked"

@@ -33,7 +33,6 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 from typing import Optional
@@ -75,7 +74,7 @@ _WAIT_ALREADY_TIMED_OUT = False
 # imports nothing from tools).
 _REMOTE_BACKENDS = frozenset({
     "docker", "singularity", "modal", "daytona", "ssh", "managed_modal",
-    "isolated_worker",
+    "isolated_worker", "vercel_sandbox",
 })
 
 

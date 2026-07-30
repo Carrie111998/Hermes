@@ -18,6 +18,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from unittest.mock import MagicMock, patch
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -34,6 +36,7 @@ def hermes_home(tmp_path, monkeypatch):
 
     # Bust the goal module's DB cache so it re-resolves HERMES_HOME each test.
     from hermes_cli import goals
+
     goals._DB_CACHE.clear()
     yield home
     goals._DB_CACHE.clear()
@@ -171,7 +174,8 @@ class TestEmptyResponseSkip:
 
 class TestHealthyTurnStillRuns:
     def test_clean_response_enqueues_model_authored_continuation(
-        self, hermes_home,
+        self,
+        hermes_home,
     ):
         """Sanity check: the hook still works in the happy path."""
         sid = f"sid-healthy-{uuid.uuid4().hex}"
@@ -193,7 +197,9 @@ class TestHealthyTurnStillRuns:
         assert "Continuing toward your standing goal" in queued
         assert mgr.state.status == "active"
 
-    def test_clean_response_marks_done_when_primary_model_records_completion(self, hermes_home):
+    def test_clean_response_marks_done_when_primary_model_records_completion(
+        self, hermes_home
+    ):
         sid = f"sid-done-{uuid.uuid4().hex}"
         cli, mgr = _make_cli_with_goal(sid)
         cli._last_turn_interrupted = False
@@ -228,9 +234,7 @@ class TestHealthyTurnStillRuns:
         assert cli._pending_input.qsize() == 1
         assert cli._pending_input.get_nowait() == "new user instruction"
 
-    def test_queued_user_turn_suppresses_only_automatic_continuation(
-        self, hermes_home
-    ):
+    def test_queued_user_turn_suppresses_only_automatic_continuation(self, hermes_home):
         sid = f"sid-preempt-continue-{uuid.uuid4().hex}"
         cli, mgr = _make_cli_with_goal(sid)
         cli.conversation_history = [

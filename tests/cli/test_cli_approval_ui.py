@@ -36,16 +36,18 @@ def _make_background_cli_stub():
     cli._background_task_counter = 0
     cli._background_tasks = {}
     cli._ensure_runtime_credentials = MagicMock(return_value=True)
-    cli._resolve_turn_agent_config = MagicMock(return_value={
-        "model": "test-model",
-        "runtime": {
-            "api_key": "test-key",
-            "base_url": "https://example.test/v1",
-            "provider": "test",
-            "api_mode": "chat_completions",
-        },
-        "request_overrides": None,
-    })
+    cli._resolve_turn_agent_config = MagicMock(
+        return_value={
+            "model": "test-model",
+            "runtime": {
+                "api_key": "test-key",
+                "base_url": "https://example.test/v1",
+                "provider": "test",
+                "api_mode": "chat_completions",
+            },
+            "request_overrides": None,
+        }
+    )
     cli.max_turns = 90
     cli.enabled_toolsets = []
     cli._session_db = None
@@ -94,9 +96,11 @@ class TestCliApprovalUi:
 
     def test_non_permanent_choice_helper_preserves_session_choice(self):
         cli = _make_cli_stub()
-        assert cli._approval_choices(
-            "rm -rf /tmp/example", allow_permanent=False
-        ) == ["once", "session", "deny"]
+        assert cli._approval_choices("rm -rf /tmp/example", allow_permanent=False) == [
+            "once",
+            "session",
+            "deny",
+        ]
 
     def test_sudo_prompt_restores_existing_draft_after_response(self):
         cli = _make_cli_stub()
@@ -148,6 +152,7 @@ class TestCliApprovalUi:
         cli._approval_state["response_queue"].put("deny")
         thread.join(timeout=2)
         assert result["value"] == "deny"
+
     def test_handle_approval_selection_view_expands_in_place(self):
         cli = _make_cli_stub()
         cli._approval_state = {
@@ -200,8 +205,10 @@ class TestCliApprovalUi:
 
         import shutil as _shutil
 
-        with patch("cli.shutil.get_terminal_size",
-                   return_value=_shutil.os.terminal_size((30, 24))):
+        with patch(
+            "cli.shutil.get_terminal_size",
+            return_value=_shutil.os.terminal_size((30, 24)),
+        ):
             fragments = cli._get_approval_display_fragments()
 
         rendered = "".join(text for _style, text in fragments)
@@ -260,8 +267,10 @@ class TestCliApprovalUi:
         # Simulate a compact terminal where the old unbounded panel would overflow.
         import shutil as _shutil
 
-        with patch("cli.shutil.get_terminal_size",
-                   return_value=_shutil.os.terminal_size((100, 20))):
+        with patch(
+            "cli.shutil.get_terminal_size",
+            return_value=_shutil.os.terminal_size((100, 20)),
+        ):
             fragments = cli._get_approval_display_fragments()
 
         rendered = "".join(text for _style, text in fragments)
@@ -299,8 +308,10 @@ class TestCliApprovalUi:
 
         import shutil as _shutil
 
-        with patch("cli.shutil.get_terminal_size",
-                   return_value=_shutil.os.terminal_size((100, 12))):
+        with patch(
+            "cli.shutil.get_terminal_size",
+            return_value=_shutil.os.terminal_size((100, 12)),
+        ):
             fragments = cli._get_approval_display_fragments()
 
         rendered = "".join(text for _style, text in fragments)
@@ -308,8 +319,12 @@ class TestCliApprovalUi:
         # Command visible.
         assert "rm -rf /var/log/apache2/*.log" in rendered
         # All four choices visible.
-        for label in ("Allow once", "Allow for this session",
-                      "Add to permanent allowlist", "Deny"):
+        for label in (
+            "Allow once",
+            "Allow for this session",
+            "Add to permanent allowlist",
+            "Deny",
+        ):
             assert label in rendered, f"choice {label!r} missing"
 
     def test_approval_display_truncates_giant_command_in_view_mode(self):
@@ -332,15 +347,21 @@ class TestCliApprovalUi:
 
         import shutil as _shutil
 
-        with patch("cli.shutil.get_terminal_size",
-                   return_value=_shutil.os.terminal_size((100, 24))):
+        with patch(
+            "cli.shutil.get_terminal_size",
+            return_value=_shutil.os.terminal_size((100, 24)),
+        ):
             fragments = cli._get_approval_display_fragments()
 
         rendered = "".join(text for _style, text in fragments)
 
         # All four choices visible even with a huge command.
-        for label in ("Allow once", "Allow for this session",
-                      "Add to permanent allowlist", "Deny"):
+        for label in (
+            "Allow once",
+            "Allow for this session",
+            "Add to permanent allowlist",
+            "Deny",
+        ):
             assert label in rendered, f"choice {label!r} missing"
 
         # Command got truncated with a marker.
@@ -378,9 +399,11 @@ class TestCliApprovalUi:
                     "failed": False,
                 }
 
-        with patch.object(cli_module, "AIAgent", FakeAgent), \
-             patch.object(cli_module, "_cprint"), \
-             patch.object(cli_module, "ChatConsole") as chat_console:
+        with (
+            patch.object(cli_module, "AIAgent", FakeAgent),
+            patch.object(cli_module, "_cprint"),
+            patch.object(cli_module, "ChatConsole") as chat_console,
+        ):
             chat_console.return_value.print = MagicMock()
             cli._handle_background_command("/btw check weather")
 
@@ -395,7 +418,6 @@ class TestCliApprovalUi:
         assert seen["sudo"].__self__ is cli
         assert seen["sudo"].__func__ is HermesCLI._sudo_password_callback
         assert not cli._background_tasks
-
 
 def _make_real_paint_cli_stub():
     """A stub whose modal repaint path runs the REAL _paint_now / _invalidate.
@@ -417,8 +439,8 @@ def _make_real_paint_cli_stub():
     # Real methods, not mocks.
     cli._paint_now = HermesCLI._paint_now.__get__(cli, HermesCLI)
     cli._invalidate = HermesCLI._invalidate.__get__(cli, HermesCLI)
-    cli._resize_recovery_pending = True       # gate 1: resize in flight
-    cli._last_invalidate = time.monotonic()   # gate 2: inside throttle window
+    cli._resize_recovery_pending = True  # gate 1: resize in flight
+    cli._last_invalidate = time.monotonic()  # gate 2: inside throttle window
     cli._app = SimpleNamespace(invalidate=MagicMock(), current_buffer=_FakeBuffer())
     return cli
 
@@ -468,8 +490,9 @@ class TestModalPaintNow:
             # (the panel must clear at once, not be held by the throttle).
             cli._app.invalidate.reset_mock()
             getattr(cli, state_attr)["response_queue"].put(
-                "deny" if state_attr == "_approval_state" else
-                ("a" if state_attr == "_clarify_state" else "pw")
+                "deny"
+                if state_attr == "_approval_state"
+                else ("a" if state_attr == "_clarify_state" else "pw")
             )
             thread.join(timeout=2)
             # clarify returns immediately on a response (no teardown repaint);
@@ -484,7 +507,8 @@ class TestModalPaintNow:
     def test_approval_prompt_paints_under_both_gates(self):
         cli = _make_real_paint_cli_stub()
         value = self._drive(
-            cli, lambda: cli._approval_callback("rm -rf /tmp/scratch", "danger"),
+            cli,
+            lambda: cli._approval_callback("rm -rf /tmp/scratch", "danger"),
             "_approval_state",
         )
         assert value == "deny"
@@ -492,7 +516,8 @@ class TestModalPaintNow:
     def test_clarify_prompt_paints_under_both_gates(self):
         cli = _make_real_paint_cli_stub()
         value = self._drive(
-            cli, lambda: cli._clarify_callback("Pick one", ["a", "b"]),
+            cli,
+            lambda: cli._clarify_callback("Pick one", ["a", "b"]),
             "_clarify_state",
         )
         assert value == "a"
@@ -643,8 +668,12 @@ class TestPersistPromptSummary:
     def test_persist_prompts_false_suppresses_summary(self):
         cli = _make_cli_stub()
         printed = []
-        with patch.dict(cli_module.CLI_CONFIG.get("display", {}), {"persist_prompts": False}), \
-             patch.object(cli_module, "_cprint", printed.append):
+        with (
+            patch.dict(
+                cli_module.CLI_CONFIG.get("display", {}), {"persist_prompts": False}
+            ),
+            patch.object(cli_module, "_cprint", printed.append),
+        ):
             verdict = self._resolve_approval(cli, "once")
         assert verdict == "once"
         assert not any("Approval" in p for p in printed)

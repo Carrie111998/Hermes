@@ -1014,7 +1014,9 @@ class TestSecondaryProfileConfigHandling:
         )
 
         assert connected == 0
-        assert duplicate.disconnected is True
+        # The duplicate never connected and therefore owns no resources.
+        # Disconnecting it can tear down shared same-credential sidecars.
+        assert duplicate.disconnected is False
         assert runner._profile_adapters["reviewer"] == {}
 
     def test_port_binding_set_covers_known_listeners(self):

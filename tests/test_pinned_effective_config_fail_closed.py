@@ -87,14 +87,6 @@ def test_agent_init_propagates_pinned_effective_config_violation() -> None:
 
 
 def test_agent_init_stops_on_one_shot_custom_provider_pin_violation() -> None:
-    load_results = iter([{}, _pin_violation(), {}])
-
-    def one_shot_violation():
-        result = next(load_results)
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -104,7 +96,11 @@ def test_agent_init_stops_on_one_shot_custom_provider_pin_violation() -> None:
             "_apply_user_default_headers",
             return_value=None,
         ),
-        patch("hermes_cli.config.load_config", side_effect=one_shot_violation),
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            side_effect=_pin_violation(),
+        ),
         pytest.raises(
             config_module.PinnedEffectiveConfigError,
             match="synthetic pinned drift",
