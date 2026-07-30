@@ -303,11 +303,52 @@ class LSPClient:
         # genuine native binary that just lacks a recognized suffix.
         try:
             with open(exe, "rb") as f:
-                head = f.read(2)
-            if head != b"#!":
+                # A shebang line can legitimately be much longer than 2
+                # bytes (e.g. "#!/usr/bin/env node"); read enough to parse
+                # the interpreter, not just the "#!" marker.
+                head_line = f.readline(512)
+            if not head_line.startswith(b"#!"):
                 return cmd
         except OSError:
             return cmd
+
+        # Parse the interpreter the shebang actually names. A shebang can
+        # name Node, Python, Perl, or any other interpreter -- not just a
+        # shell -- and routing those through `bash -c` is wrong: bash would
+        # try to execute the target's source as shell script under the
+        # wrong interpreter and fail (or worse, partially "succeed" on
+        # lines that happen to parse as valid shell).
+        try:
+            shebang_text = head_line[2:].decode("utf-8", errors="replace").strip()
+        except Exception:
+            shebang_text = ""
+        shebang_parts = shebang_text.split()
+        # "#!/usr/bin/env node" -> interpreter is the env argument, not env
+        # itself. "#!/bin/sh" -> interpreter is the direct path.
+        if shebang_parts and Path(shebang_parts[0]).stem.lower() == "env" and len(shebang_parts) > 1:
+            interpreter_name = Path(shebang_parts[1]).stem.lower()
+        elif shebang_parts:
+            interpreter_name = Path(shebang_parts[0]).stem.lower()
+        else:
+            interpreter_name = ""
+
+        _SHELL_INTERPRETER_NAMES = {"sh", "bash", "dash", "zsh", "ash", "ksh"}
+        if interpreter_name and interpreter_name not in _SHELL_INTERPRETER_NAMES:
+            # A real, non-shell interpreter (node, python3, perl, ...) --
+            # spawn the script through that interpreter directly rather
+            # than bash. Resolve it via PATH the same way a Unix shell
+            # would when honoring the shebang.
+            resolved_interpreter = shutil.which(interpreter_name)
+            if resolved_interpreter:
+                return [resolved_interpreter, *cmd]
+            logger.warning(
+                "[lsp] '%s' has a non-shell shebang naming '%s', but that "
+                "interpreter is not on PATH; spawn will likely fail with "
+                "WinError 193.",
+                exe, interpreter_name,
+            )
+            return cmd
+
         bash = shutil.which("bash")
         if not bash:
             logger.warning(
