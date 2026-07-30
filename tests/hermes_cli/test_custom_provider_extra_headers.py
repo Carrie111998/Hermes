@@ -34,6 +34,11 @@ def test_normalize_entry_keeps_extra_headers():
 
 
 def test_session_affinity_requires_explicit_matching_provider_opt_in():
+    config = {
+        "privacy": {
+            "allow_third_party_identifiers": True,
+        },
+    }
     providers = [
         {
             "name": "opted-in-proxy",
@@ -49,10 +54,26 @@ def test_session_affinity_requires_explicit_matching_provider_opt_in():
     assert get_custom_provider_session_affinity(
         "https://proxy.example.com/anthropic",
         custom_providers=providers,
+        config=config,
     ) is True
     assert get_custom_provider_session_affinity(
         "https://other.example.com/anthropic",
         custom_providers=providers,
+        config=config,
+    ) is False
+
+
+def test_session_affinity_requires_generic_privacy_opt_in():
+    assert get_custom_provider_session_affinity(
+        "https://proxy.example.com/anthropic",
+        custom_providers=[
+            {
+                "name": "proxy",
+                "base_url": "https://proxy.example.com/anthropic",
+                "session_affinity": True,
+            },
+        ],
+        config={"privacy": {"allow_third_party_identifiers": False}},
     ) is False
 
 

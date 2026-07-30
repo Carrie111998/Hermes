@@ -1217,8 +1217,10 @@ providers:
 
 Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key`, `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, `session_affinity`, and `enabled: false` to hide an entry without deleting it.
 
-`session_affinity` is an explicit opt-in for Anthropic-compatible proxies that
-support the `x-session-affinity` header. Hermes hashes the conversation ID
+`session_affinity` is a provider-specific opt-in for Anthropic-compatible
+proxies that support the `x-session-affinity` header. You must also enable the
+global `privacy.allow_third_party_identifiers` gate through `hermes setup
+telemetry`, `hermes tools`, or `config.yaml`. Hermes hashes the conversation ID
 before sending it and reuses the opaque value across tool-loop requests,
 client recovery, fallback, credential rotation, and model switches. Leave it
 disabled for endpoints that do not document this header. Hermes never sends

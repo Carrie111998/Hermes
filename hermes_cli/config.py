@@ -1695,9 +1695,22 @@ def get_custom_provider_session_affinity(
     """Return whether a matching custom provider opted into session affinity.
 
     Matching is scoped to the normalized endpoint identity, as with custom
-    provider TLS and extra-header settings. The default is deliberately false:
-    enabling this sends a stable, hashed conversation identifier to the proxy.
+    provider TLS and extra-header settings. Both the generic privacy opt-in and
+    the provider-specific switch must be true because enabling this sends a
+    stable, hashed conversation identifier to the proxy.
     """
+    if config is None:
+        try:
+            config = load_config_readonly()
+        except Exception:
+            config = {}
+    privacy = config.get("privacy") if isinstance(config, dict) else None
+    if (
+        not isinstance(privacy, dict)
+        or privacy.get("allow_third_party_identifiers") is not True
+    ):
+        return False
+
     if custom_providers is None:
         try:
             custom_providers = get_compatible_custom_providers(config)
