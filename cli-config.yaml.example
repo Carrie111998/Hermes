@@ -164,6 +164,11 @@ model:
 #
 #   # Data policy: "allow" (default) or "deny" to exclude providers that may store data
 #   # data_collection: "deny"
+#
+#   # Quantization floor: only route to providers serving these precisions.
+#   # Excludes aggressively quantized (fp4/int4) variants. Common values:
+#   # fp4, fp8, fp16, bf16, fp32.
+#   # quantizations: ["fp8", "fp16", "bf16"]
 
 # =============================================================================
 # OpenRouter Response Caching (only applies when using OpenRouter)

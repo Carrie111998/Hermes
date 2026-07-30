@@ -27,6 +27,7 @@ provider_routing:
   order: []               # Explicit provider priority order
   require_parameters: false  # Only use providers that support all parameters
   data_collection: null   # Control data collection ("allow" or "deny")
+  quantizations: []       # Quantization floor, e.g. ["fp8", "fp16", "bf16"]
 ```
 
 :::info
@@ -101,6 +102,20 @@ Controls whether providers can use your prompts for training. Options are `"allo
 provider_routing:
   data_collection: "deny"
 ```
+
+### `quantizations`
+
+Sets a quantization floor so OpenRouter only routes to providers serving the model at one of the listed precisions. Use this to exclude aggressively quantized (e.g. `fp4`/`int4`) variants whose quality can degrade noticeably. List the precisions you're willing to accept:
+
+```yaml
+provider_routing:
+  quantizations:
+    - "fp8"
+    - "fp16"
+    - "bf16"
+```
+
+Common values are `fp4`, `fp8`, `fp16`, `bf16`, and `fp32`. See the [OpenRouter provider-selection docs](https://openrouter.ai/docs/guides/routing/provider-selection#quantization) for the full list.
 
 ## Practical Examples
 
@@ -181,6 +196,7 @@ providers_order    ← from provider_routing.order
 provider_sort      ← from provider_routing.sort
 provider_require_parameters ← from provider_routing.require_parameters
 provider_data_collection    ← from provider_routing.data_collection
+provider_quantizations      ← from provider_routing.quantizations
 ```
 
 :::tip
