@@ -55,6 +55,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -146,6 +147,31 @@ _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
 
 # Max files to snapshot — skip huge directories to avoid slowdowns.
 _MAX_FILES = 50_000
+
+# Shared roots that must never be snapshotted wholesale.  ``_take`` stages the
+# entire working dir with ``git add -A``; aimed at a shared root it walks other
+# services' private trees — under /tmp systemd keeps systemd-private-* dirs that
+# are mode 0700 and root-owned — so git exits 128 and every checkpoint for the
+# rest of the session fails.  Even when it succeeds it would snapshot unrelated
+# data.  Matching is deliberately EXACT: real projects checked out *below* these
+# roots (pytest's tmp_path, /tmp/build-xyz, ...) are still checkpointed.
+_UNSAFE_CHECKPOINT_ROOTS: Set[str] = {
+    "/", "/boot", "/dev", "/dev/shm", "/etc", "/home", "/opt", "/proc",
+    "/root", "/run", "/srv", "/sys", "/tmp", "/usr", "/var", "/var/tmp",
+}
+
+
+def _is_unsafe_checkpoint_root(abs_dir: str) -> bool:
+    """True when ``abs_dir`` is a shared/system root rather than a project tree."""
+    if abs_dir in _UNSAFE_CHECKPOINT_ROOTS:
+        return True
+    if abs_dir == str(Path.home()):
+        return True
+    # tempfile honours TMPDIR, so the platform temp root is not always /tmp.
+    if abs_dir == str(_normalize_path(tempfile.gettempdir())):
+        return True
+    return False
+
 
 # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
@@ -671,8 +697,8 @@ class CheckpointManager:
 
         abs_dir = str(_normalize_path(working_dir))
 
-        # Skip root, home, and other overly broad directories
-        if abs_dir in {"/", str(Path.home())}:
+        # Skip root, home, temp and other overly broad directories
+        if _is_unsafe_checkpoint_root(abs_dir):
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 

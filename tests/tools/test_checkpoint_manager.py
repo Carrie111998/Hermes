@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import time
 import pytest
 from pathlib import Path
@@ -1049,3 +1050,44 @@ class TestClearFunctions:
         result = clear_all()
         assert result["deleted"] is False
         assert result["bytes_freed"] == 0
+
+
+# =========================================================================
+# Broad-directory guard — a checkpoint stages the whole working dir with
+# ``git add -A``.  Pointed at a shared root it walks other services' private
+# trees (systemd-private-* under /tmp is mode 0700, owned by root), git exits
+# 128 and every checkpoint of the session fails.  Observed in production
+# 2026-07-30 on the nightly cron profile.
+# =========================================================================
+
+def test_ensure_checkpoint_skips_shared_temp_root():
+    """The temp root itself is never a project — never stage it."""
+    mgr = CheckpointManager(enabled=True)
+    with patch.object(CheckpointManager, "_take", return_value=True) as take:
+        assert mgr.ensure_checkpoint(tempfile.gettempdir(), "before write_file") is False
+    take.assert_not_called()
+
+
+@pytest.mark.parametrize("root", ["/tmp", "/var/tmp", "/etc", "/usr", "/var", "/opt", "/srv"])
+def test_ensure_checkpoint_skips_system_roots(root):
+    """System roots are shared state, not project trees."""
+    mgr = CheckpointManager(enabled=True)
+    with patch.object(CheckpointManager, "_take", return_value=True) as take:
+        assert mgr.ensure_checkpoint(root, f"before terminal in {root}") is False
+    take.assert_not_called()
+
+
+def test_ensure_checkpoint_still_allows_project_below_temp(tmp_path):
+    """Regression guard: the deny-list matches exact roots, not descendants.
+
+    pytest's own tmp_path lives under the temp root, and real projects are
+    routinely checked out there — those must still be checkpointed.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text("print('hello')\n")
+
+    mgr = CheckpointManager(enabled=True)
+    with patch.object(CheckpointManager, "_take", return_value=True) as take:
+        assert mgr.ensure_checkpoint(str(project), "before write_file") is True
+    take.assert_called_once()
