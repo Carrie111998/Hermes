@@ -1971,9 +1971,11 @@ class SessionDB:
     # Instead, we keep the SQLite timeout short (1s) and handle retries at the
     # application level with random jitter, which naturally staggers competing
     # writers and avoids the convoy.
-    _WRITE_MAX_RETRIES = 15
+    _WRITE_MAX_RETRIES = 60  # was 15 — 1.3s tolerance lost races against
+    # dual-writer FTS sync on large appends ("no more rows available" ->
+    # session_persistence_failed). 60 x ~160ms avg ~= 10s tolerance.
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
-    _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    _WRITE_RETRY_MAX_S = 0.300   # 300ms (was 150ms)
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Merge fragmented FTS5 segments every N successful writes. The message
@@ -2107,7 +2109,10 @@ class SessionDB:
                     # Short timeout — application-level retry with random
                     # jitter handles contention instead of sitting in
                     # SQLite's internal busy handler for up to 30s.
-                    timeout=1.0,
+                    # 2.0s (was 1.0s): the engine absorbs brief WAL
+                    # contention from the dual gateway/agent writers before
+                    # erroring; still far from pathological long stalls.
+                    timeout=2.0,
                     # auto-starts transactions on DML, which conflicts with
                     # our explicit BEGIN IMMEDIATE.  None = we manage
                     # transactions ourselves.
@@ -2616,7 +2621,15 @@ class SessionDB:
                 return result
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
-                if "locked" in err_msg or "busy" in err_msg:
+                # "no more rows available": transient engine-level error
+                # observed on contended WAL appends (dual gateway/agent
+                # writers); the identical write succeeds standalone, so it
+                # is retryable like locked/busy.
+                if (
+                    "locked" in err_msg
+                    or "busy" in err_msg
+                    or "no more rows" in err_msg
+                ):
                     last_err = exc
                     if attempt < self._WRITE_MAX_RETRIES - 1:
                         jitter = random.uniform(
@@ -2628,6 +2641,20 @@ class SessionDB:
                 # Non-lock error or retries exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
+                # Same transient engine error, potentially surfaced through
+                # the generic DatabaseError class (exact subclass varies
+                # with the SQLite build) — retry with jitter, then give up.
+                err_msg = str(exc).lower()
+                if "no more rows" in err_msg:
+                    last_err = exc
+                    if attempt < self._WRITE_MAX_RETRIES - 1:
+                        jitter = random.uniform(
+                            self._WRITE_RETRY_MIN_S,
+                            self._WRITE_RETRY_MAX_S,
+                        )
+                        time.sleep(jitter)
+                        continue
+                    raise
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
                 # while the canonical messages table is intact. The gateway
@@ -2640,6 +2667,23 @@ class SessionDB:
                 if not self._try_runtime_fts_rebuild(exc):
                     raise
                 continue
+            except sqlite3.Error as exc:
+                # Catch-all: some SQLite builds surface "no more rows
+                # available" as InterfaceError / plain sqlite3.Error, which
+                # lives OUTSIDE DatabaseError and would otherwise escape
+                # the retry net on the first contention race (observed
+                # 2026-07-30: failure 1.16s after append start < 1.18s
+                # minimum for 60 retries => retry loop was bypassed).
+                if "no more rows" in str(exc).lower():
+                    last_err = exc
+                    if attempt < self._WRITE_MAX_RETRIES - 1:
+                        jitter = random.uniform(
+                            self._WRITE_RETRY_MIN_S,
+                            self._WRITE_RETRY_MAX_S,
+                        )
+                        time.sleep(jitter)
+                        continue
+                raise
         # Retries exhausted (shouldn't normally reach here).
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
