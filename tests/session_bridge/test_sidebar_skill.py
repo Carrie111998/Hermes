@@ -183,9 +183,10 @@ def test_sidebar_skill_encodes_the_single_lease_sequential_delivery_protocol() -
     assert "no user-facing message" in skill
     assert "list" in skill.casefold() and "projects" in skill.casefold()
     assert "canonical local path" in skill
-    assert "exact cwd" in skill
-    assert "exact git root" in skill
     assert "Session Inbox" in skill
+    assert "never select placement or project identity" in skill
+    assert "exact source cwd is a saved project | Use that project" not in skill
+    assert "exact source cwd, exact git root, then" not in skill
     assert "reconcile_required" in skill
     assert "recovered_thread_id" in skill
     assert "registration_prompt" in skill
@@ -273,7 +274,7 @@ def test_sidebar_skill_closes_the_baseline_and_ambiguity_loopholes() -> None:
     assert "transcript" in folded and "summar" in folded
     assert "ambiguous" in folded and "duplicate" in folded
     assert "without a lease" in folded
-    assert "sidebar grouping" in folded and "command cwd" in folded
+    assert "presentation placement" in folded and "runtime workspace root" in folded
     assert "first substantive continuation" in folded
     assert "session_continue" in skill
     assert 'prompt="Audit billing"' not in skill
@@ -403,9 +404,11 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     assert "`codex_thread_conflict`" in skill
     assert (
         '`create_thread({"prompt":"<registration_prompt verbatim>",'
-        '"target":{"type":"project","projectId":"<chosen projectId>",'
-        '"environment":{"type":"local"}}})`'
+        '"cwd":"<resolved Session Inbox cwd>",'
+        '"runtimeWorkspaceRoots":["<resolved Session Inbox cwd>",'
+        '"<exact source cwd>"]})`'
     ) in skill
+    assert '"target":{"type":"project"' not in skill
     assert "Only the returned `threadId` is a successful create result" in skill
     assert "`worktreeId`" in skill and "`clientThreadId`" in skill
     assert (
@@ -415,6 +418,41 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     assert (
         '`set_thread_title({"threadId":"<threadId>","title":"<exact title>"})`' in skill
     )
+
+
+def test_sidebar_skill_uses_inbox_placement_for_every_leased_native_delivery() -> (
+    None
+):
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    hydration = skill.split("\n## In-place Hydration Procedure\n", 1)[1].split(
+        "\n## Registration Procedure\n",
+        1,
+    )[0]
+    registration = skill.split("\n## Registration Procedure\n", 1)[1].split(
+        "\n## Fixed Failure Mapping\n",
+        1,
+    )[0]
+
+    inbox_rule = (
+        "select only the saved `Session Inbox` project whose canonical path equals "
+        "the resolved canonical local `.hermes` inbox cwd"
+    )
+    assert inbox_rule in hydration
+    assert inbox_rule in registration
+    assert (
+        "The exact source cwd and exact git root never select placement or project "
+        "identity."
+    ) in registration
+    assert (
+        "exact source cwd remains authenticated readable metadata and the secondary "
+        "runtime workspace root"
+    ) in registration
+    assert (
+        "Require `thread.cwd` to match the resolved Session Inbox cwd"
+        in registration
+    )
+    assert "`inbox_unavailable`" in skill
+    assert "`placement_mismatch`" in skill
 
 
 def test_sidebar_skill_reads_recovered_thread_directly_before_marker_search() -> None:
@@ -444,9 +482,11 @@ def test_sidebar_skill_reads_recovered_thread_directly_before_marker_search() ->
         "to `marker_conflict`"
     ) in recovered_branch
     assert (
-        "host, project, environment, or task-kind field that explicitly contradicts "
-        "local native execution maps to `codex_thread_conflict`"
+        "host, environment, or task-kind field that explicitly contradicts local "
+        "native execution maps to `codex_thread_conflict`"
     ) in recovered_branch
+    assert "project identity outside the selected inbox project" in recovered_branch
+    assert "maps to `placement_mismatch`" in recovered_branch
     assert (
         "missing or mismatched task maps to `marker_conflict`" not in recovered_branch
     )
@@ -466,26 +506,28 @@ def test_sidebar_skill_matches_the_native_read_thread_response_schema() -> None:
     assert "every other explicit `thread.hostId` maps to `codex_thread_conflict`" in (
         reconcile_step
     )
-    assert "must equal the chosen project's normalized host" in reconcile_step
+    assert "must equal the Session Inbox project's normalized host" in reconcile_step
     assert "does not return an explicit environment field" in reconcile_step
     assert "must not be treated as unavailable or ambiguous" in reconcile_step
     assert "explicitly contradicts local native execution" in reconcile_step
 
 
-def test_sidebar_skill_reconciles_bound_task_after_saved_project_map_drift() -> None:
+def test_sidebar_skill_fails_closed_when_recovered_task_drifted_outside_inbox() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
     recovered_branch = reconcile_step.split("When `recovered_thread_id` is present", 1)[
         1
     ].split("Only when `recovered_thread_id` is absent", 1)[0]
 
-    assert "current saved-project membership is not identity authority" in (
+    assert "Require `thread.cwd` to match the resolved Session Inbox cwd" in (
         recovered_branch
     )
-    assert "job's exact source cwd" in recovered_branch
-    assert "chosen project's canonical path" in recovered_branch
-    assert "either" in recovered_branch
-    assert "never authorizes replacement creation" in recovered_branch
+    assert "source cwd remains authenticated only from the registration metadata" in (
+        recovered_branch
+    )
+    assert "it never satisfies native placement" in recovered_branch
+    assert "`placement_mismatch`" in recovered_branch
+    assert "never permits creation or replacement" in recovered_branch
 
 
 def test_sidebar_skill_never_creates_after_an_unverifiable_search_candidate() -> None:
@@ -524,7 +566,10 @@ def test_sidebar_skill_deterministically_settles_native_and_broker_failures() ->
         "`native_task_not_indexed`",
         "Successfully returned thread-ID or marker mismatch, or multiple exact "
         "marker matches -> `marker_conflict`",
-        "Explicit host, project, environment, or task-kind contradiction -> "
+        "A registration candidate, recovered task, or newly created task whose cwd "
+        "or supplied project identity is outside the resolved Session Inbox -> "
+        "`placement_mismatch`",
+        "Explicit host, environment, or task-kind contradiction -> "
         "`codex_thread_conflict`",
         "Failed rename -> `rename_failed`",
         "Definite or ambiguous commit failure -> `bridge_temporarily_unavailable`",

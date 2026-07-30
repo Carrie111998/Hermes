@@ -76,6 +76,14 @@ _SIDEBAR_SKILL_PATH = (
 
 
 @dataclass(frozen=True)
+class _SidebarSkillPlacement:
+    project_id: str
+    inbox_cwd: str
+    source_cwd: str
+    runtime_workspace_roots: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _SidebarSkillContract:
     status_tool: str
     pending_tool: str
@@ -91,6 +99,8 @@ class _SidebarSkillContract:
     fail_tool: str
     reconcile_limit: int
     project_precedence: tuple[str, ...]
+    create_cwd_source: str
+    runtime_root_sources: tuple[str, ...]
     failure_codes: dict[str, str]
     forbid_app_server: bool
 
@@ -164,18 +174,62 @@ class _SidebarSkillContract:
                 and fail
             )
 
-            precedence: list[str] = []
-            for item in re.findall(r"(?m)^   \d+\. (.+)$", steps[3]):
-                if "exact cwd" in item:
-                    precedence.append("cwd")
-                elif "exact git root" in item:
-                    precedence.append("git_root")
-                elif "Session Inbox" in item:
-                    precedence.append("inbox")
-                else:
-                    raise ValueError("project precedence")
-            if tuple(precedence) != ("cwd", "git_root", "inbox"):
+            inbox_selection = re.search(
+                r"select only the saved `(Session Inbox)` project whose canonical "
+                r"path equals the resolved canonical local `\.hermes` inbox cwd",
+                steps[3],
+            )
+            if inbox_selection is None:
                 raise ValueError("project precedence")
+            precedence = ("inbox",)
+
+            create_schema = re.search(
+                r"`create_thread\((\{[^\n`]+\})\)`",
+                steps[6],
+            )
+            if create_schema is None:
+                raise ValueError("native create schema")
+            create_arguments = json.loads(create_schema.group(1))
+            if set(create_arguments) != {
+                "prompt",
+                "cwd",
+                "runtimeWorkspaceRoots",
+            }:
+                raise ValueError("native create arguments")
+            if create_arguments["prompt"] != "<registration_prompt verbatim>":
+                raise ValueError("native create prompt")
+            source_placeholders = {
+                "<resolved Session Inbox cwd>": "inbox",
+                "<exact source cwd>": "source",
+            }
+            create_cwd_source = source_placeholders.get(create_arguments["cwd"])
+            runtime_roots = create_arguments["runtimeWorkspaceRoots"]
+            if (
+                create_cwd_source is None
+                or not isinstance(runtime_roots, list)
+                or any(not isinstance(root, str) for root in runtime_roots)
+            ):
+                raise ValueError("native create placement")
+            try:
+                runtime_root_sources = tuple(
+                    source_placeholders[root] for root in runtime_roots
+                )
+            except KeyError as exc:
+                raise ValueError("native create runtime roots") from exc
+            if (
+                create_cwd_source != "inbox"
+                or runtime_root_sources != ("inbox", "source")
+            ):
+                raise ValueError("native create placement")
+
+            forbidden_stale_rules = (
+                "Exact source cwd is a saved project",
+                "exact source cwd, exact git root, then",
+                '"target":{"type":"project"',
+                "match either the job's exact source cwd",
+            )
+            if any(rule in text for rule in forbidden_stale_rules):
+                raise ValueError("stale source-first placement rule")
 
             mapping_block = text.split("\n## Fixed Failure Mapping\n", 1)[1].split(
                 "\n## Deterministic Call-Failure Rules\n", 1
@@ -195,6 +249,8 @@ class _SidebarSkillContract:
                 "Create response lost or otherwise ambiguous": "native_create_ambiguous",
                 "Bound task not yet indexed": "native_task_not_indexed",
                 "Authenticated marker conflict": "marker_conflict",
+                "Session Inbox unavailable": "inbox_unavailable",
+                "Native task outside Session Inbox placement": "placement_mismatch",
             }
             if any(
                 failure_codes.get(label) != code
@@ -204,7 +260,7 @@ class _SidebarSkillContract:
 
             no_app_server_rule = "Never use app-server thread creation as a fallback"
             required_rules = (
-                "choose its sidebar project in this exact order",
+                "never select placement or project identity",
                 "reconcile before creating anything",
                 '"prompt":"<registration_prompt verbatim>"',
                 "title before commit",
@@ -227,7 +283,9 @@ class _SidebarSkillContract:
                 commit_tool=commit.group(1),
                 fail_tool=fail.group(1),
                 reconcile_limit=int(list_threads.group(2)),
-                project_precedence=tuple(precedence),
+                project_precedence=precedence,
+                create_cwd_source=create_cwd_source,
+                runtime_root_sources=runtime_root_sources,
                 failure_codes=failure_codes,
                 forbid_app_server=text.count(no_app_server_rule) == 1,
             )
@@ -254,8 +312,49 @@ class _SidebarSkillContract:
             if candidate is not None and candidate in projects:
                 return projects[candidate]
         raise ValueError(
-            self.failure_code("Project listing or canonical lookup failed")
+            self.failure_code("Session Inbox unavailable")
         )
+
+    def resolve_placement(
+        self,
+        projects: dict[str, str],
+        *,
+        cwd: str,
+        git_root: str | None,
+        inbox: str,
+    ) -> _SidebarSkillPlacement:
+        project_id = self.choose_project(
+            projects,
+            cwd=cwd,
+            git_root=git_root,
+            inbox=inbox,
+        )
+        sources = {
+            "inbox": inbox,
+            "source": cwd,
+        }
+        placement_cwd = sources[self.create_cwd_source]
+        runtime_workspace_roots = tuple(
+            dict.fromkeys(sources[source] for source in self.runtime_root_sources)
+        )
+        return _SidebarSkillPlacement(
+            project_id=project_id,
+            inbox_cwd=placement_cwd,
+            source_cwd=cwd,
+            runtime_workspace_roots=runtime_workspace_roots,
+        )
+
+    def create_arguments(
+        self,
+        *,
+        prompt: str,
+        placement: _SidebarSkillPlacement,
+    ) -> dict[str, Any]:
+        return {
+            "prompt": prompt,
+            "cwd": placement.inbox_cwd,
+            "runtimeWorkspaceRoots": list(placement.runtime_workspace_roots),
+        }
 
     def validate_trace(self, trace: list[dict[str, Any]]) -> None:
         if not trace or trace[0]["tool"] != self.status_tool:
@@ -307,6 +406,22 @@ class _SidebarSkillContract:
                 create = events[tools.index(self.create_tool)]
                 if create["arguments"]["prompt"] != create["registration_prompt"]:
                     raise AssertionError("registration prompt must be verbatim")
+                project_choice = events[tools.index("project_choice")]["arguments"]
+                placement = _SidebarSkillPlacement(
+                    project_id=project_choice["project_id"],
+                    inbox_cwd=project_choice["inbox_cwd"],
+                    source_cwd=project_choice["source_cwd"],
+                    runtime_workspace_roots=tuple(
+                        project_choice["runtime_workspace_roots"]
+                    ),
+                )
+                if create["arguments"] != self.create_arguments(
+                    prompt=create["registration_prompt"],
+                    placement=placement,
+                ):
+                    raise AssertionError(
+                        "native create must follow the shipped placement contract"
+                    )
                 if self.reserve_tool not in tools or tools.index(
                     self.reserve_tool
                 ) > tools.index(self.create_tool):
@@ -1422,25 +1537,26 @@ class _FakeNativeCodexTasks:
         self,
         *,
         prompt: str,
-        project_id: str,
-        source_cwd: str,
-        cwd: str | None = None,
-        runtime_workspace_roots: tuple[str, ...] | None = None,
+        cwd: str,
+        runtimeWorkspaceRoots: list[str],
     ) -> str:
         if not self.available:
             raise RuntimeError("synthetic Desktop offline")
-        if cwd is None or runtime_workspace_roots is None:
-            if project_id != "session-inbox":
-                raise AssertionError("sidebar test creation must use the Session Inbox")
-            cwd = next(
-                project["path"]
+        canonical_cwd = _canonical_sidebar_path(cwd)
+        project_id = next(
+            (
+                project["projectId"]
                 for project in self.projects
-                if project["projectId"] == project_id
-            )
-            runtime_workspace_roots = (
-                cwd,
-                _canonical_sidebar_path(source_cwd),
-            )
+                if project["path"] == canonical_cwd
+            ),
+            None,
+        )
+        if project_id is None:
+            raise AssertionError("native task cwd must resolve to a saved project")
+        registration = decode_sidebar_registration_identity(
+            prompt,
+            self.marker_secret,
+        )
         thread_id = self.next_thread_id or f"native-sidebar-{len(self.threads) + 1}"
         self.next_thread_id = None
         marker = _registration_marker(prompt)
@@ -1449,9 +1565,11 @@ class _FakeNativeCodexTasks:
             "thread_id": thread_id,
             "prompt": prompt,
             "project_id": project_id,
-            "source_cwd": source_cwd,
-            "cwd": cwd,
-            "runtime_workspace_roots": runtime_workspace_roots,
+            "source_cwd": registration.source_cwd,
+            "cwd": canonical_cwd,
+            "runtime_workspace_roots": tuple(
+                _canonical_sidebar_path(root) for root in runtimeWorkspaceRoots
+            ),
         }
         self.create_calls.append(call)
         self.threads[thread_id] = {
@@ -1914,14 +2032,25 @@ class _SidebarEndToEndHarness:
             job_id = job.get("source_session_id", f"job-{ordinal}")
             cwd = _canonical_sidebar_path(job["cwd"])
             inbox_cwd = _canonical_sidebar_path(self.inbox)
-            project_id = projects[inbox_cwd]
+            git_root = (
+                _canonical_sidebar_path(job["git_root"])
+                if job.get("git_root") is not None
+                else None
+            )
+            placement = self.contract.resolve_placement(
+                projects,
+                cwd=cwd,
+                git_root=git_root,
+                inbox=inbox_cwd,
+            )
             trace.append({
                 "tool": "project_choice",
                 "job": job_id,
                 "arguments": {
-                    "cwd": inbox_cwd,
-                    "runtime_workspace_roots": (inbox_cwd, cwd),
-                    "project_id": project_id,
+                    "inbox_cwd": placement.inbox_cwd,
+                    "source_cwd": placement.source_cwd,
+                    "runtime_workspace_roots": placement.runtime_workspace_roots,
+                    "project_id": placement.project_id,
                 },
             })
 
@@ -1987,6 +2116,18 @@ class _SidebarEndToEndHarness:
                         )
                     )
                     continue
+                if (
+                    recovered.get("project_id") != placement.project_id
+                    or _canonical_sidebar_path(recovered.get("cwd", ""))
+                    != placement.inbox_cwd
+                ):
+                    outcomes.append(
+                        fail_once(
+                            "Native task outside Session Inbox placement",
+                            recovered_thread_id,
+                        )
+                    )
+                    continue
                 thread_id = recovered_thread_id
             elif job.get("reconcile_required") or job.get("create_reserved"):
                 list_arguments = {
@@ -2004,16 +2145,41 @@ class _SidebarEndToEndHarness:
                 )(**list_arguments)
                 for summary in summaries:
                     candidate_id = summary["threadId"]
+                    if summary.get("projectId") != placement.project_id:
+                        outcomes.append(
+                            fail_once(
+                                "Native task outside Session Inbox placement",
+                                candidate_id,
+                            )
+                        )
+                        thread_id = candidate_id
+                        break
                     trace.append({
                         "tool": self.contract.read_thread_tool,
                         "job": job_id,
                         "arguments": {"threadId": candidate_id},
                     })
-                    getattr(self.native, self.contract.read_thread_tool)(
+                    candidate = getattr(self.native, self.contract.read_thread_tool)(
                         thread_id=candidate_id
                     )
+                    if (
+                        candidate.get("project_id") != placement.project_id
+                        or _canonical_sidebar_path(candidate.get("cwd", ""))
+                        != placement.inbox_cwd
+                    ):
+                        outcomes.append(
+                            fail_once(
+                                "Native task outside Session Inbox placement",
+                                candidate_id,
+                            )
+                        )
+                        thread_id = candidate_id
+                        break
                     thread_id = candidate_id
                     break
+
+                if outcomes and thread_id is not None:
+                    continue
 
             if thread_id is None and job.get("create_reserved"):
                 outcomes.append(
@@ -2043,11 +2209,10 @@ class _SidebarEndToEndHarness:
                 }:
                     outcomes.append(fail_once("Bridge temporarily unavailable"))
                     continue
-                create_arguments = {
-                    "prompt": job["registration_prompt"],
-                    "cwd": inbox_cwd,
-                    "runtimeWorkspaceRoots": [inbox_cwd, cwd],
-                }
+                create_arguments = self.contract.create_arguments(
+                    prompt=job["registration_prompt"],
+                    placement=placement,
+                )
                 trace.append({
                     "tool": self.contract.create_tool,
                     "job": job_id,
@@ -2058,13 +2223,7 @@ class _SidebarEndToEndHarness:
                     thread_id = getattr(
                         self.native,
                         self.contract.create_tool,
-                    )(
-                        prompt=job["registration_prompt"],
-                        project_id=project_id,
-                        source_cwd=job["cwd"],
-                        cwd=inbox_cwd,
-                        runtime_workspace_roots=(inbox_cwd, cwd),
-                    )
+                    )(**create_arguments)
                     created = True
                 except RuntimeError:
                     if self.production_codex_target is not None and (
@@ -2130,6 +2289,18 @@ class _SidebarEndToEndHarness:
                     or indexed.get("marker") != marker
                 ):
                     outcomes.append(fail_once("Bound task not yet indexed", thread_id))
+                    continue
+                if (
+                    indexed.get("project_id") != placement.project_id
+                    or _canonical_sidebar_path(indexed.get("cwd", ""))
+                    != placement.inbox_cwd
+                ):
+                    outcomes.append(
+                        fail_once(
+                            "Native task outside Session Inbox placement",
+                            thread_id,
+                        )
+                    )
                     continue
 
             rename_arguments = {"threadId": thread_id, "title": job["title"]}
@@ -3421,8 +3592,20 @@ def test_recovered_id_read_failure_settles_with_the_same_exact_id(
     ("needle", "replacement"),
     [
         (
-            "the saved project whose canonical path equals the job's exact cwd;",
-            "an arbitrary saved project;",
+            "For the leased job, select only the saved `Session Inbox` project whose "
+            "canonical path "
+            "equals the resolved canonical local `.hermes` inbox cwd",
+            "For the leased job, select the exact source cwd project first, then its "
+            "exact git root, and use the Session Inbox only as a fallback",
+        ),
+        (
+            '`create_thread({"prompt":"<registration_prompt verbatim>",'
+            '"cwd":"<resolved Session Inbox cwd>",'
+            '"runtimeWorkspaceRoots":["<resolved Session Inbox cwd>",'
+            '"<exact source cwd>"]})`',
+            '`create_thread({"prompt":"<registration_prompt verbatim>",'
+            '"target":{"type":"project","projectId":"<chosen projectId>",'
+            '"environment":{"type":"local"}}})`',
         ),
         (
             "try fail/release once with `bridge_temporarily_unavailable`",

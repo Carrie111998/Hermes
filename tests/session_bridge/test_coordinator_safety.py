@@ -781,10 +781,20 @@ def test_sidebar_expired_lease_stale_worker_cannot_commit_but_retains_exact_thre
                 {"limit": 1},
             )["jobs"][0]
             harness.now += 301.0
+            placement = harness.contract.resolve_placement(
+                {
+                    project["path"]: project["projectId"]
+                    for project in harness.native.list_projects()
+                },
+                cwd=_canonical_sidebar_path(source_cwd),
+                git_root=None,
+                inbox=_canonical_sidebar_path(harness.inbox),
+            )
             thread_id = harness.native.create_thread(
-                prompt=job["registration_prompt"],
-                project_id="session-inbox",
-                source_cwd=_canonical_sidebar_path(source_cwd),
+                **harness.contract.create_arguments(
+                    prompt=job["registration_prompt"],
+                    placement=placement,
+                )
             )
             response = _sidebar_rpc(
                 client,
