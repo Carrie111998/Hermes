@@ -329,7 +329,10 @@ export default function ProfilesPage() {
   const [modelChoices, setModelChoices] = useState<
     { provider: string; model: string; label: string }[] | null
   >(null);
-  const modelChoicesLoading = useRef(false);
+  // The model catalog is profile-scoped: provider/model availability can differ
+  // between profiles because each profile owns its own credentials/config.
+  const [modelChoicesScope, setModelChoicesScope] = useState<string | null>(null);
+  const modelChoicesLoading = useRef<string | null>(null);
   const [modelChoice, setModelChoice] = useState("");
   const closeCreateModal = useCallback(() => setCreateModalOpen(false), []);
   const createModalRef = useModalBehavior({
@@ -375,29 +378,45 @@ export default function ProfilesPage() {
   const modelKey = (provider: string | null, model: string | null) =>
     model ? `${provider ?? ""}\u0000${model}` : "";
 
-  const loadModelChoices = useCallback(() => {
-    if (modelChoices !== null || modelChoicesLoading.current) return;
-    modelChoicesLoading.current = true;
-    api
-      .getModelOptions()
-      .then((res) => {
-        const flat: { provider: string; model: string; label: string }[] = [];
-        for (const prov of res.providers ?? []) {
-          for (const m of prov.models ?? []) {
-            flat.push({
-              provider: prov.slug,
-              model: m,
-              label: `${prov.name} · ${m}`,
-            });
+  const loadModelChoices = useCallback(
+    (profile?: string) => {
+      const scope = profile ?? "";
+      if (modelChoices !== null && modelChoicesScope === scope) return;
+      if (modelChoicesLoading.current === scope) return;
+
+      // Clear the previous profile's catalog immediately. Keeping it visible
+      // while the new request is in flight could present profile A's models
+      // while editing profile B.
+      setModelChoices(null);
+      setModelChoicesScope(scope);
+      modelChoicesLoading.current = scope;
+      api
+        .getModelOptions(profile)
+        .then((res) => {
+          if (modelChoicesLoading.current !== scope) return;
+          const flat: { provider: string; model: string; label: string }[] = [];
+          for (const prov of res.providers ?? []) {
+            for (const m of prov.models ?? []) {
+              flat.push({
+                provider: prov.slug,
+                model: m,
+                label: `${prov.name} · ${m}`,
+              });
+            }
           }
-        }
-        setModelChoices(flat);
-      })
-      .catch(() => setModelChoices([]))
-      .finally(() => {
-        modelChoicesLoading.current = false;
-      });
-  }, [modelChoices]);
+          setModelChoices(flat);
+        })
+        .catch(() => {
+          if (modelChoicesLoading.current === scope) setModelChoices([]);
+        })
+        .finally(() => {
+          if (modelChoicesLoading.current === scope) {
+            modelChoicesLoading.current = null;
+          }
+        });
+    },
+    [modelChoices, modelChoicesScope],
+  );
 
   const load = useCallback(() => {
     Promise.all([api.getProfiles(), api.getActiveProfile().catch(() => null)])
@@ -664,7 +683,7 @@ export default function ProfilesPage() {
       setModelEditChoice(initialChoice);
       setModelEditInitialChoice(initialChoice);
       setReasoningEditChoice(p.reasoning_effort ?? "");
-      loadModelChoices();
+      loadModelChoices(p.name);
     },
     [closeEditor, editingModelFor, loadModelChoices],
   );
