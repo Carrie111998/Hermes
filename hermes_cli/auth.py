@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -8347,14 +8347,17 @@ def _minimax_pkce_pair() -> tuple:
 
 
 def _minimax_normalize_verification_uri(verification_uri: str) -> str:
-    """Return a browser-usable MiniMax OAuth authorization URL."""
-    stale_prefix = "https://www.minimax.io/oauth-authorize"
-    if verification_uri.startswith(stale_prefix):
-        return verification_uri.replace(
-            stale_prefix,
-            "https://platform.minimax.io/oauth-authorize",
-            1,
-        )
+    """Return a browser-usable MiniMax OAuth authorization URL.
+
+    MiniMax's device-code response has returned the deleted
+    ``www.minimax.io/oauth-authorize`` page even though the live authorize page
+    moved to ``platform.minimax.io``. Keep the workaround intentionally narrow:
+    only the stale host/path pair is rewritten, preserving query strings and
+    unrelated MiniMax URLs.
+    """
+    parsed = urlparse(verification_uri)
+    if parsed.scheme == "https" and parsed.netloc == "www.minimax.io" and parsed.path == "/oauth-authorize":
+        return urlunparse(parsed._replace(netloc="platform.minimax.io"))
     return verification_uri
 
 

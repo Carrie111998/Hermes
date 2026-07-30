@@ -128,7 +128,7 @@ def test_request_user_code_rewrites_stale_www_authorize_url():
     mock_response = _make_httpx_response(200, {
         "user_code": "ABC-123",
         "verification_uri": (
-            "https://www.minimax.io/oauth-authorize?client_id=abc&state=xyz"
+            "https://www.minimax.io/oauth-authorize?client_id=abc&state=xyz#device"
         ),
         "expired_in": 600,
         "state": state,
@@ -145,8 +145,30 @@ def test_request_user_code_rewrites_stale_www_authorize_url():
     )
 
     assert result["verification_uri"] == (
-        "https://platform.minimax.io/oauth-authorize?client_id=abc&state=xyz"
+        "https://platform.minimax.io/oauth-authorize?client_id=abc&state=xyz#device"
     )
+
+
+def test_request_user_code_preserves_unrelated_minimax_urls():
+    state = "test-state-abc"
+    mock_response = _make_httpx_response(200, {
+        "user_code": "ABC-123",
+        "verification_uri": "https://www.minimax.io/oauth-authorize-extra?next=/oauth-authorize",
+        "expired_in": 600,
+        "state": state,
+    })
+    client = MagicMock()
+    client.post.return_value = mock_response
+
+    result = _minimax_request_user_code(
+        client,
+        portal_base_url=MINIMAX_OAUTH_GLOBAL_BASE,
+        client_id=MINIMAX_OAUTH_CLIENT_ID,
+        code_challenge="test-challenge",
+        state=state,
+    )
+
+    assert result["verification_uri"] == "https://www.minimax.io/oauth-authorize-extra?next=/oauth-authorize"
 
 
 # ---------------------------------------------------------------------------
