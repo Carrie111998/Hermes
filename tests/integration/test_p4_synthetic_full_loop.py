@@ -186,7 +186,8 @@ def _run_full_loop(home: Path, run: int, monkeypatch) -> dict:
         ledger[envelope["external_id"]] = event_id
 
     adapter = EmailAdapter(
-        PlatformConfig(enabled=True, extra={"workflow_ingress_callback": ledger_email})
+        PlatformConfig(enabled=True),
+        workflow_ingress_callback=ledger_email,
     )
     adapter.handle_message = AsyncMock()
 
