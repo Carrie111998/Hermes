@@ -533,6 +533,115 @@ class TestSession:
         assert fields["permission_mode"] == "default"
         assert callable(fields["can_use_tool"])
 
+    def test_approval_required_still_delegates_when_approvals_are_manual(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultAllow
+        import hermes_cli.config as cfg
+
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        monkeypatch.setattr(
+            cfg, "load_config", lambda: {"approvals": {"mode": "manual"}}
+        )
+        approval_callback = MagicMock(return_value="once")
+        callback = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            approval_callback=approval_callback,
+            include_hermes_tools=False,
+        ).build_option_fields()["can_use_tool"]
+
+        assert callable(callback)
+        result = asyncio.run(
+            callback("Write", {"file_path": "/tmp/out", "content": "ok"}, None)
+        )
+        assert isinstance(result, PermissionResultAllow)
+        approval_callback.assert_called_once()
+
+    def test_approval_required_auto_allows_native_write_when_approvals_off(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultAllow
+        import hermes_cli.config as cfg
+
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        monkeypatch.setattr(cfg, "load_config", lambda: {"approvals": {"mode": "off"}})
+        approval_callback = MagicMock(
+            side_effect=AssertionError("approvals.mode=off must not prompt")
+        )
+        fields = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            approval_callback=approval_callback,
+            include_hermes_tools=False,
+        ).build_option_fields()
+
+        callback = fields["can_use_tool"]
+        assert callable(callback)
+        result = asyncio.run(
+            callback("Write", {"file_path": "/tmp/out", "content": "ok"}, None)
+        )
+        assert isinstance(result, PermissionResultAllow)
+        approval_callback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("tool_name", "tool_input"),
+        [
+            ("Write", {"file_path": "/tmp/out", "content": "ok"}),
+            ("Edit", {"file_path": "/tmp/out", "old_string": "o", "new_string": "n"}),
+            ("Bash", {"command": "printf ok"}),
+            ("NotebookEdit", {"notebook_path": "/tmp/out.ipynb", "new_source": "1"}),
+        ],
+    )
+    def test_approvals_off_installs_headless_native_mutator_bridge(
+        self, monkeypatch, tool_name, tool_input
+    ):
+        import asyncio
+
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultAllow
+        import hermes_cli.config as cfg
+
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        monkeypatch.setattr(cfg, "load_config", lambda: {"approvals": {"mode": "off"}})
+        fields = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            approval_callback=None,
+            include_hermes_tools=False,
+        ).build_option_fields()
+
+        assert fields["permission_mode"] == "default"
+        callback = fields["can_use_tool"]
+        assert callable(callback)
+        result = asyncio.run(callback(tool_name, tool_input, None))
+        assert isinstance(result, PermissionResultAllow)
+
+    def test_approvals_off_keeps_native_bash_hardline_floor(self, monkeypatch):
+        import asyncio
+
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultDeny
+        import hermes_cli.config as cfg
+
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        monkeypatch.setattr(cfg, "load_config", lambda: {"approvals": {"mode": "off"}})
+        approval_callback = MagicMock(return_value="once")
+        callback = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            approval_callback=approval_callback,
+            include_hermes_tools=False,
+        ).build_option_fields()["can_use_tool"]
+
+        assert callable(callback)
+        result = asyncio.run(callback("Bash", {"command": "rm -rf /"}, None))
+        assert isinstance(result, PermissionResultDeny)
+        assert "hardline" in result.message
+        approval_callback.assert_not_called()
+
     def test_auto_keeps_accept_edits_without_permission_callback(self, monkeypatch):
         monkeypatch.delenv("HERMES_TERMINAL_SECURITY_MODE", raising=False)
         fields = ClaudeAgentSdkSession(
@@ -653,6 +762,28 @@ class TestSession:
             session, tool_name, tool_input
         )
         approval_callback.assert_not_called()
+
+    def test_approvals_off_does_not_widen_native_read_only(self, monkeypatch):
+        import asyncio
+
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultDeny
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(cfg, "load_config", lambda: {"approvals": {"mode": "off"}})
+        callback = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            native_read_only=True,
+            approval_callback=None,
+            include_hermes_tools=False,
+        ).build_option_fields()["can_use_tool"]
+
+        assert callable(callback)
+        result = asyncio.run(
+            callback("Write", {"file_path": "/tmp/out", "content": "no"}, None)
+        )
+        assert isinstance(result, PermissionResultDeny)
+        assert "native read-only" in result.message
 
     def test_native_read_only_callback_denies_parent_traversal(self, tmp_path):
         workspace = tmp_path / "workspace"

@@ -68,6 +68,14 @@ _HERMES_TO_SDK_PERMISSION_MODE = {
     "yolo": "bypassPermissions",
 }
 
+
+def _approvals_mode_off() -> bool:
+    """Return the live Hermes approval opt-out without widening its meaning."""
+    from tools.approval import _get_approval_mode
+
+    return _get_approval_mode() == "off"
+
+
 # ``ClaudeAgentOptions.tools`` is the pinned SDK's base native-tool surface.
 # In native-read-only mode this is the entire tool surface: no MCP server or
 # allowed_tools entries are materialized. Pair the exact native set with
@@ -896,7 +904,9 @@ class ClaudeAgentSdkSession:
 
         can_use_tool = None
         if self._permission_mode == "default" and (
-            self._native_read_only or self._approval_callback is not None
+            self._native_read_only
+            or self._approval_callback is not None
+            or _approvals_mode_off()
         ):
             can_use_tool = self._make_can_use_tool()
 
@@ -964,8 +974,10 @@ class ClaudeAgentSdkSession:
     def _make_can_use_tool(self) -> Any:
         """Bridge SDK permission requests onto Hermes' fail-closed policy.
 
-        Native read-only denies every expansion request. Other modes delegate
-        to Hermes' approval callback and deny if that callback fails."""
+        Native read-only denies every expansion request. With Hermes approvals
+        off, ordinary requests are allowed without a prompt while Bash still
+        crosses the existing pre-bypass guard floor. Other modes delegate to
+        Hermes' approval callback and deny if that callback fails."""
         approval_callback = self._approval_callback
 
         async def _can_use_tool(tool_name: str, tool_input: dict, context: Any):
@@ -981,7 +993,35 @@ class ClaudeAgentSdkSession:
                     message="native read-only permission expansion denied"
                 )
 
-            assert approval_callback is not None
+            if _approvals_mode_off():
+                if tool_name == "Bash":
+                    command = tool_input.get("command")
+                    if not isinstance(command, str):
+                        return PermissionResultDeny(
+                            message="native Bash request has no string command"
+                        )
+                    from tools.approval import check_all_command_guards
+
+                    try:
+                        guard = await asyncio.to_thread(
+                            check_all_command_guards, command, "local"
+                        )
+                    except Exception:
+                        logger.exception("Hermes guard failed on native Bash request")
+                        return PermissionResultDeny(
+                            message="Hermes Bash guard failed closed"
+                        )
+                    if not guard.get("approved"):
+                        return PermissionResultDeny(
+                            message=guard.get("message")
+                            or "native Bash request blocked"
+                        )
+                return PermissionResultAllow()
+
+            if approval_callback is None:
+                return PermissionResultDeny(
+                    message="no Hermes approval callback is available"
+                )
             try:
                 choice = await asyncio.to_thread(
                     approval_callback,
