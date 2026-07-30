@@ -1110,7 +1110,7 @@ ClawRouter requires a USDC-funded wallet on Base or Solana for payment. All requ
 
 ### Neon AI Gateway — Branch-Scoped Hosted Models
 
-[Neon AI Gateway](https://neon.com/docs/ai-gateway/overview) is an OpenAI-compatible inference gateway provided by Neon. One Neon credential reaches models from OpenAI, Google, Meta, Databricks, and Alibaba without separate provider accounts. Best for: projects already running on Neon that want the same credential for the database and for inference.
+[Neon AI Gateway](https://neon.com/docs/ai-gateway/overview) is an OpenAI-compatible inference gateway provided by Neon. One Neon credential reaches models from OpenAI, Meta, Databricks, and Alibaba without separate provider accounts. Best for: projects already running on Neon that want the same credential for the database and for inference.
 
 The services in [Other Compatible Providers](#other-compatible-providers) each have one account-wide URL. Neon does not. Every branch gets its own gateway host, so a custom endpoint here points at exactly one branch.
 
@@ -1120,9 +1120,9 @@ The services in [Other Compatible Providers](#other-compatible-providers) each h
 
 ```yaml
 # ~/.hermes/config.yaml
-custom_providers:
-  - name: neon
-    base_url: "https://<your-neon-branch-host>/v1"   # NEON_AI_GATEWAY_BASE_URL plus /v1
+providers:
+  neon:
+    api: "https://<your-neon-branch-host>/v1"   # NEON_AI_GATEWAY_BASE_URL plus /v1
     key_env: NEON_AI_GATEWAY_TOKEN
     models:
       gpt-5-mini:
@@ -1142,19 +1142,19 @@ Only the token belongs in `.env`. The branch host is not a secret and stays in `
 
 `hermes model` → Custom endpoint builds the same kind of entry interactively: paste the branch host with `/v1` appended, then the credential, then a model ID. It writes the credential to `.env` under a name generated from the host, not `NEON_AI_GATEWAY_TOKEN`.
 
-**Model IDs** are short and carry no vendor prefix: `gpt-5-mini`, `gemini-3-flash`, `llama-4-maverick`, `gpt-oss-120b`, `qwen3-next-80b-a3b-instruct`. Neon answers `GET /v1/models`, so `hermes model` can populate the model list for you to choose from. Bare `/model custom` is a different path: it auto-selects only when an endpoint reports exactly one model, and Neon returns many, so name the model you want. Context windows and prices are in [Neon's model catalog](https://neon.com/docs/ai-gateway/models), which is also browsable on [models.dev](https://models.dev/providers/neon/).
+**Model IDs** are short and carry no vendor prefix: `gpt-5-mini`, `llama-4-maverick`, `gpt-oss-120b`, `qwen3-next-80b-a3b-instruct`. Neon answers `GET /v1/models`, so `hermes model` can populate the model list for you to choose from. It returns more IDs than those four, and not all of them run from Hermes: for one hosted family Neon rewrites the call into a native dialect that has no `stream_options` field, and Hermes sends `stream_options` on every OpenAI-compatible stream, so those models come back as `400 Unknown name "stream_options"`. Bare `/model custom` is a different path: it auto-selects only when an endpoint reports exactly one model, and Neon returns many, so name the model you want. Context windows and prices are in [Neon's model catalog](https://neon.com/docs/ai-gateway/models), which is also browsable on [models.dev](https://models.dev/providers/neon/).
 
-**Set `context_length` per model.** Neon returns `null` for `context_length` in its model list, so [context detection](#context-length-detection) has nothing to read from the endpoint and falls through to Hermes' broad family patterns, which know nothing about Neon. Some IDs land right and some do not: `llama-4-maverick` matches the generic Llama entry and comes out at 131,072 against a real 1M window, and `gpt-oss-120b` matches no family at all, so it takes the 256,000 probe-down default while the model actually stops at 131K. Neon's catalog gives 400K for `gpt-5-mini`, 1M for `gemini-3-flash` and `llama-4-maverick`, and 131K for `gpt-oss-120b` and `qwen3-next-80b-a3b-instruct`. Those figures are rounded, so configure the rounded-down value (`131000`, `400000`, `1000000`) to stay inside the real window.
+**Set `context_length` per model.** Neon returns `null` for `context_length` in its model list, so [context detection](#context-length-detection) has nothing to read from the endpoint and falls through to Hermes' broad family patterns, which know nothing about Neon. Some IDs land right and some do not: `llama-4-maverick` matches the generic Llama entry and comes out at 131,072 against a real 1M window, and `gpt-oss-120b` matches no family at all, so it takes the 256,000 probe-down default while the model actually stops at 131K. Neon's catalog gives 400K for `gpt-5-mini`, 1M for `llama-4-maverick`, and 131K for `gpt-oss-120b` and `qwen3-next-80b-a3b-instruct`. Those figures are rounded, so configure the rounded-down value (`131000`, `400000`, `1000000`) to stay inside the real window.
 
 **Several branches.** A credential works on the branch it was created on and on every branch descended from it, so one token covers a lineage. Give each branch its own named provider:
 
 ```yaml
-custom_providers:
-  - name: neon-main
-    base_url: "https://<your-main-branch-host>/v1"
+providers:
+  neon-main:
+    api: "https://<your-main-branch-host>/v1"
     key_env: NEON_AI_GATEWAY_TOKEN
-  - name: neon-preview
-    base_url: "https://<your-preview-branch-host>/v1"
+  neon-preview:
+    api: "https://<your-preview-branch-host>/v1"
     key_env: NEON_AI_GATEWAY_TOKEN
 ```
 
@@ -1169,7 +1169,7 @@ Neon AI Gateway is in beta, requires a paid Neon plan, and runs only in AWS US E
 :::
 
 :::note Response content shape
-Neon documents that a few of its models (Gemini 3.x, `gpt-oss-120b`, `qwen35-122b-a10b`) return `message.content` as an array of typed content blocks rather than a plain string. If a model replies with nothing visible, that is the first thing to check. `gpt-5-mini` returns a plain string.
+Neon documents that a few of its models, `gpt-oss-120b` and `qwen35-122b-a10b` among them, return `message.content` as an array of typed content blocks rather than a plain string. If a model replies with nothing visible, that is the first thing to check. `gpt-5-mini` returns a plain string.
 :::
 
 ---
