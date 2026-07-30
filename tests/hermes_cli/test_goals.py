@@ -121,6 +121,8 @@ class TestKanbanGoalLoopTransportFailure:
 
         assert result["outcome"] == "deferred_transient"
         assert result["turns_used"] == 1
+        assert result["runtime_outcome"].kind == "judge_transport_failure"
+        assert result["runtime_outcome"].is_transient
         assert run_turn_calls == []
         assert block_calls == []
 

@@ -174,6 +174,32 @@ def test_ex_tempfail_is_transient_worker_exit():
     assert outcome.is_transient
 
 
+def test_ex_tempfail_requeue_does_not_consume_failure_budgets(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="judge transport", assignee="worker")
+        task = kb.claim_task(
+            conn,
+            task_id,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:worker",
+        )
+        assert task is not None
+        pid = 99125
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, task_id))
+        conn.commit()
+        kb._record_worker_exit(pid, kb.KANBAN_RATE_LIMIT_EXIT_CODE << 8)
+
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert task.block_recurrences == 0
+        assert kb.detect_crashed_workers._last_runtime_outcomes[-1]["kind"] == "ex_tempfail"
+
+
 def test_ordinary_worker_exit_still_counts_as_failure(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
