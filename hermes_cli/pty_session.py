@@ -14,6 +14,7 @@ from typing import Optional
 
 WS_CLOSE_PROCESS_EXITED = 4410
 WS_CLOSE_SUPERSEDED = 4409
+_PTY_CLOSE_VERIFY_TIMEOUT_S = 5.0
 
 
 class RingBuffer:
@@ -111,12 +112,31 @@ class PtySession:
                 await self._drain_task
             except (asyncio.CancelledError, Exception):
                 pass
-        try:
-            # bridge.close() joins the child — blocking; keep it off the
-            # event loop (#53227).
-            await asyncio.to_thread(self.bridge.close)
-        except Exception:
-            pass
+
+        def _close_and_verify() -> None:
+            # Both production bridges expose a strict verify_closed() probe.
+            # Their close methods are intentionally tolerant of individual
+            # signal/reap errors, so successful return alone is not proof that
+            # the child exited.
+            self.bridge.close()
+            verify_closed = getattr(self.bridge, "verify_closed", None)
+            if not callable(verify_closed):
+                is_alive = getattr(self.bridge, "is_alive", None)
+                if callable(is_alive):
+                    verify_closed = lambda: not is_alive()
+            if not callable(verify_closed):
+                raise RuntimeError("PTY bridge cannot verify child termination")
+            deadline = time.monotonic() + _PTY_CLOSE_VERIFY_TIMEOUT_S
+            while not verify_closed() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if not verify_closed():
+                raise RuntimeError("PTY child did not terminate")
+
+        # bridge.close() and the bounded liveness wait are blocking; keep both
+        # off the event loop (#53227). Propagate failure so update quiescence
+        # cannot treat a surviving checkout/venv process as closed.
+        await asyncio.to_thread(_close_and_verify)
+        self.alive = False
 
 
 from typing import Callable, Dict, Tuple
@@ -179,7 +199,11 @@ class PtySessionRegistry:
                 and (now - s.last_detached_at) > self._ttl)
         ]
         for key in doomed:
-            await self._sessions.pop(key).close()
+            session = self._sessions.get(key)
+            if session is None:
+                continue
+            await session.close()
+            self._sessions.pop(key, None)
 
     def _reap_one_idle_or_raise(self) -> None:
         idle = [s for s in self._sessions.values()
@@ -192,4 +216,8 @@ class PtySessionRegistry:
 
     async def close_all(self) -> None:
         for key in list(self._sessions):
-            await self._sessions.pop(key).close()
+            session = self._sessions.get(key)
+            if session is None:
+                continue
+            await session.close()
+            self._sessions.pop(key, None)
