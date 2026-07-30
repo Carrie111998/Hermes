@@ -111,7 +111,7 @@ Expected: OpenAI Codex reports logged in, `ChatGPT` appears, and the pre-existin
 **Interfaces:**
 
 - Consumes: authenticated `anthropic` and `openai-codex` provider entries from Task 1.
-- Produces: `model.provider = anthropic`, `model.default = claude-opus-4-6`, no stale custom base URL, and one fallback `{provider: openai-codex, model: gpt-5.6-sol}`.
+- Produces: `model.provider = anthropic`, `model.default = claude-opus-5`, no stale custom base URL, and one fallback `{provider: openai-codex, model: gpt-5.6-sol}`.
 
 - [ ] **Step 1: Switch the primary provider and model through Hermes**
 
@@ -119,7 +119,7 @@ Run:
 
 ```powershell
 hermes config set model.provider anthropic
-hermes config set model.default claude-opus-4-6
+hermes config set model.default claude-opus-5
 hermes config unset model.base_url
 ```
 
@@ -148,14 +148,14 @@ hermes fallback list
 hermes config check
 ```
 
-Expected: Anthropic/`claude-opus-4-6` is primary, Codex/`gpt-5.6-sol` is fallback #1, the fallback value resolves as a list rather than a string, and configuration validation reports no routing error.
+Expected: Anthropic/`claude-opus-5` is primary, Codex/`gpt-5.6-sol` is fallback #1, the fallback value resolves as a list rather than a string, and configuration validation reports no routing error.
 
 - [ ] **Step 4: Verify the primary with a real one-shot prompt**
 
 Run:
 
 ```powershell
-hermes -q "Reply with exactly: HERMES_CLAUDE_PRIMARY_OK"
+hermes -z "Reply with exactly: HERMES_CLAUDE_PRIMARY_OK"
 ```
 
 Expected: exit code `0`, exact marker in the response, and no fallback activation message.
@@ -165,7 +165,7 @@ Expected: exit code `0`, exact marker in the response, and no fallback activatio
 Run:
 
 ```powershell
-hermes --provider openai-codex --model gpt-5.6-sol -q "Reply with exactly: HERMES_CHATGPT_FALLBACK_OK"
+hermes --provider openai-codex --model gpt-5.6-sol -z "Reply with exactly: HERMES_CHATGPT_FALLBACK_OK"
 ```
 
 Expected: exit code `0` and the exact fallback marker. Afterward, `hermes config get model.provider` must still return `anthropic`.
@@ -306,7 +306,7 @@ Report:
 
 ```text
 Hermes home: D:\AI-Foundry\Infrastructure\hermes\.hermes
-Primary: anthropic / claude-opus-4-6 / OAuth subscription
+Primary: anthropic / claude-opus-5 / OAuth subscription
 Fallback: openai-codex / gpt-5.6-sol / ChatGPT subscription
 Desktop executable: the absolute path emitted by Task 3 Step 2
 Desktop shortcut: the absolute path returned by Join-Path in Task 3 Step 3

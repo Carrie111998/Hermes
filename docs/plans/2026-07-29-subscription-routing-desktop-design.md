@@ -24,7 +24,8 @@ desktop package.
 ## Configuration flow
 
 1. Authenticate Hermes' `anthropic` provider with OAuth.
-2. Select an Anthropic subscription-backed model as the primary model.
+2. Select `claude-opus-5`, verified on the operator's authenticated Anthropic
+   model endpoint, as the primary model.
 3. Authenticate Hermes' `openai-codex` provider with OAuth.
 4. Add an OpenAI Codex subscription-backed model as the first fallback.
 5. Preserve the existing Copilot credential pool; do not make it primary or add
