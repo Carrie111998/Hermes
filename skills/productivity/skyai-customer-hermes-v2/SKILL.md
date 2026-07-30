@@ -1,6 +1,6 @@
 ---
 name: skyai-customer-hermes-v2
-description: Use when developing, operating, or QA-ing the SkyVision customer-facing SkyAI Hermes v2 runtime: keep customer dialogue public-safe, use SkyAI tools for catalog/slots, preserve Muncho boundaries, and turn live cases into reviewed improvements.
+description: "Use when developing, operating, or QA-ing the SkyVision customer-facing SkyAI Hermes v2 runtime: keep customer dialogue public-safe, use SkyAI tools for catalog/slots, preserve Muncho boundaries, and turn live cases into reviewed improvements."
 version: 0.1.0
 author: SkyVision
 license: MIT
