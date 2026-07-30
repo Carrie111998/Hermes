@@ -4,6 +4,8 @@ import json
 import select
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -144,6 +146,51 @@ def test_db_accepts_completed_clean_exact_head_without_claim(kanban_home, tmp_pa
         assert event.payload["head_sha"] == head
         assert event.payload["tree_sha"] == git_tree(repo)
         assert event.payload["implementation_run_id"]
+
+
+def test_committed_admission_freeze_persists_and_authorized_thaw_restores_modes(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    tracked = repo / "implemented.txt"
+    root_mode = repo.stat().st_mode & 0o7777
+    file_mode = tracked.stat().st_mode & 0o7777
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="durable freeze", workspace_kind="dir", workspace_path=str(repo))
+        with kb._workspace_admission_lock(repo, exclusive=True, task_id=task_id, head_sha=head) as lease:
+            assert not (repo.stat().st_mode & 0o222)
+            assert not (tracked.stat().st_mode & 0o222)
+            lease.commit()
+        assert not (repo.stat().st_mode & 0o222)
+        assert not (tracked.stat().st_mode & 0o222)
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        conn.commit()
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.thaw_frozen_workspace(conn, task_id, head_sha=head)
+    assert repo.stat().st_mode & 0o7777 == root_mode
+    assert tracked.stat().st_mode & 0o7777 == file_mode
+
+
+def test_rejected_evidence_is_bounded_and_redacted(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    secret = "SUPER-SECRET-" + ("x" * 10000)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="bounded rejection", workspace_kind="dir", workspace_path=str(repo))
+        with pytest.raises(kb.FrozenHeadReviewError):
+            kb.submit_frozen_head_for_review(
+                conn,
+                task_id,
+                head_sha=secret,
+                worktree_path=secret,
+                evidence={"head_sha": secret, "worktree_path": secret},
+                actor=secret,
+            )
+        event = kb.list_events(conn, task_id)[-1]
+        assert event is not None
+        payload = json.dumps(event.payload)
+        assert len(payload) < 2048
+        assert secret not in payload
+        assert event.payload["code"] == "FROZEN_HEAD_REVIEW_REJECTED"
+        assert "SUPER-SECRET" not in payload
 
 
 @pytest.mark.parametrize("status", ["scheduled", "ready"])
@@ -510,51 +557,78 @@ def test_git_snapshot_race_rejects_without_transition(
 
 @pytest.mark.parametrize("race", ["status", "workspace", "current_run", "claim", "pid", "run_id", "metadata"])
 def test_final_transaction_races_reject_atomically(
-    kanban_home, tmp_path, monkeypatch, race,
+    kanban_home, tmp_path, race,
 ):
     repo, head = make_repo(tmp_path)
     tree = git_tree(repo)
-    original_write_txn = kb.write_txn
-    injected = False
-
-    def inject_race(conn):
-        nonlocal injected
-        if not injected:
-            injected = True
-            if race == "status":
-                conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (task_id,))
-            elif race == "workspace":
-                conn.execute(
-                    "UPDATE tasks SET workspace_path=? WHERE id=?",
-                    (str(tmp_path / "different-worktree"), task_id),
-                )
-            elif race == "current_run":
-                conn.execute("UPDATE tasks SET current_run_id=999999 WHERE id=?", (task_id,))
-            elif race == "claim":
-                conn.execute("UPDATE tasks SET claim_lock='racer' WHERE id=?", (task_id,))
-            elif race == "pid":
-                conn.execute("UPDATE tasks SET worker_pid=424242 WHERE id=?", (task_id,))
-            elif race == "run_id":
-                kb._synthesize_ended_run(
-                    conn, task_id, outcome="completed", summary="newer run",
-                    metadata={"changed_files": ["implemented.txt"], "tests_run": 4,
-                              "head_sha": head, "tree_sha": tree},
-                )
-            elif race == "metadata":
-                conn.execute(
-                    "UPDATE task_runs SET metadata=? WHERE task_id=? AND outcome='completed'",
-                    (json.dumps({"changed_files": ["implemented.txt"], "tests_run": 4,
-                                 "head_sha": head, "tree_sha": tree}), task_id),
-                )
-            conn.commit()
-        return original_write_txn(conn)
-
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title=f"race {race}", workspace_kind="dir", workspace_path=str(repo))
         complete_with_evidence(conn, task_id, repo)
-        monkeypatch.setattr(kb, "write_txn", inject_race)
-        with pytest.raises(kb.FrozenHeadReviewError):
-            submit_valid_frozen_head(conn, task_id, head, repo)
+        run_row = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id=? AND outcome='completed' "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        assert run_row is not None
+        run_id = int(run_row["id"])
+        db_path = str(kb.kanban_db_path())
+        racer_code = """
+import json, sqlite3, sys, time
+db, task_id, race, run_id, head, tree, other_workspace = sys.argv[1:]
+conn = sqlite3.connect(db, timeout=30)
+conn.execute("BEGIN IMMEDIATE")
+print("READY", flush=True)
+sys.stdin.readline()
+if race == "status":
+    conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (task_id,))
+elif race == "workspace":
+    conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (other_workspace, task_id))
+elif race == "current_run":
+    conn.execute("UPDATE tasks SET current_run_id=999999 WHERE id=?", (task_id,))
+elif race == "claim":
+    conn.execute("UPDATE tasks SET claim_lock='racer' WHERE id=?", (task_id,))
+elif race == "pid":
+    conn.execute("UPDATE tasks SET worker_pid=424242 WHERE id=?", (task_id,))
+elif race == "run_id":
+    conn.execute('''INSERT INTO task_runs
+        (task_id, status, started_at, ended_at, outcome, summary, metadata)
+        SELECT task_id, 'done', started_at, started_at + 1, 'completed',
+               'newer run', metadata FROM task_runs WHERE id=?''', (int(run_id),))
+elif race == "metadata":
+    conn.execute("UPDATE task_runs SET metadata=? WHERE id=?", (json.dumps({
+        "changed_files": ["implemented.txt"], "tests_run": 4,
+        "head_sha": head, "tree_sha": tree}), int(run_id)))
+conn.commit()
+conn.close()
+"""
+        racer = subprocess.Popen(
+            [sys.executable, "-c", racer_code, db_path, task_id, race, str(run_id),
+             head, tree, str(tmp_path / "different-worktree")],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            wait_for_helper_ready(racer)
+            result: dict[str, BaseException] = {}
+
+            def submit() -> None:
+                try:
+                    with kb.connect_closing() as submit_conn:
+                        submit_valid_frozen_head(submit_conn, task_id, head, repo)
+                except BaseException as exc:  # assertion below checks the exact class
+                    result["error"] = exc
+
+            thread = threading.Thread(target=submit)
+            thread.start()
+            time.sleep(0.1)
+            assert racer.stdin is not None
+            racer.stdin.write("COMMIT\n")
+            racer.stdin.flush()
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+            assert isinstance(result.get("error"), kb.FrozenHeadReviewError)
+        finally:
+            if racer.poll() is None:
+                racer.kill()
+            racer.wait(timeout=5)
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status != "review"
 
@@ -592,3 +666,58 @@ def test_frozen_head_rejects_unrelated_blocked_state(kanban_home, tmp_path):
             submit_valid_frozen_head(conn, task_id, head, repo)
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "blocked"
+
+
+def test_reviewer_claim_request_changes_and_next_implementation_claim_lifecycle(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    tracked = repo / "implemented.txt"
+    original_file = tracked.stat().st_mode & 0o7777
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="review lifecycle", workspace_kind="dir", workspace_path=str(repo))
+        complete_with_evidence(conn, task_id, repo)
+        submit_valid_frozen_head(conn, task_id, head, repo)
+        assert kb.claim_review_task(conn, task_id, claimer="reviewer") is not None
+        assert not (repo.stat().st_mode & 0o222)
+        assert not (tracked.stat().st_mode & 0o222)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        run_id = task.current_run_id
+        assert kb.block_task(conn, task_id, reason="review-required: changes", expected_run_id=run_id)
+        assert kb.unblock_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert not (repo.stat().st_mode & 0o222)
+        assert kb.claim_task(conn, task_id, claimer="programmer") is not None
+        assert tracked.stat().st_mode & 0o7777 == original_file
+
+
+def test_terminal_review_completion_thaws_and_delete_requires_cleanup(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="terminal thaw", workspace_kind="dir", workspace_path=str(repo))
+        complete_with_evidence(conn, task_id, repo)
+        submit_valid_frozen_head(conn, task_id, head, repo)
+        with pytest.raises(kb.FrozenHeadReviewError):
+            kb.delete_task(conn, task_id)
+        assert kb.complete_task(conn, task_id, result="approved")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "done"
+        assert repo.stat().st_mode & 0o222
+        assert kb.delete_task(conn, task_id)
+
+
+def test_failed_implementation_thaw_blocks_without_spawn(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="thaw failure", workspace_kind="dir", workspace_path=str(repo))
+        complete_with_evidence(conn, task_id, repo)
+        submit_valid_frozen_head(conn, task_id, head, repo)
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        conn.commit()
+        manifests = kb._admission_state_root() / "manifests"
+        for manifest in manifests.glob("*.json"):
+            manifest.unlink()
+        assert kb.claim_task(conn, task_id, claimer="programmer") is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "blocked"
+        assert not (repo.stat().st_mode & 0o222)
