@@ -44,6 +44,59 @@ def test_preflight_strict_uses_intake_notice(monkeypatch):
     assert "intake required" in result["text"]
 
 
+def test_preflight_advisory_requires_intake_for_high_risk(monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setenv("HERMES_HARNESS_PREFLIGHT", "advisory")
+
+    result = plugin._handle_pre_gateway_dispatch(SimpleNamespace(text="请修改 OAuth token 存储并 force-push"))
+
+    assert result["action"] == "rewrite"
+    assert "intake required" in result["text"]
+
+
+def test_task_classifier_routes_research_without_harness():
+    plugin = _load_plugin()
+
+    result = plugin.classify_task("调研并对比三个 MCP server 方案")
+
+    assert result.task_type == "research"
+    assert result.harness_required is False
+    assert result.route == "research_then_report"
+
+
+def test_task_classifier_routes_multi_agent_as_intake_required():
+    plugin = _load_plugin()
+
+    result = plugin.classify_task("把这个功能拆成 Kanban 多代理并行执行")
+
+    assert result.task_type == "multi_agent_project"
+    assert result.harness_required is True
+    assert result.route == "intake_required"
+
+
+def test_task_classifier_routes_small_code_change():
+    plugin = _load_plugin()
+
+    result = plugin.classify_task("请做一个 small fix 并加测试")
+
+    assert result.task_type == "small_code_change"
+    assert result.harness_required is False
+    assert result.route == "bounded_engineering"
+
+
+def test_classify_cli_emits_json(capsys):
+    plugin = _load_plugin()
+
+    try:
+        plugin._handle_harness_cli(SimpleNamespace(harness_action="classify", text="重构认证流程", format="json"))
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    out = capsys.readouterr().out
+    assert '"task_type": "high_risk_change"' in out
+    assert '"route": "intake_required"' in out
+
+
 def test_preflight_uses_config_when_env_unset(monkeypatch):
     plugin = _load_plugin()
     monkeypatch.delenv("HERMES_HARNESS_PREFLIGHT", raising=False)

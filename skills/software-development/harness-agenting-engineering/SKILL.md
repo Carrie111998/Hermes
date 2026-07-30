@@ -185,6 +185,24 @@ Plain explanation/summarization/translation requests should not trigger the harn
 
 ### Explicit intake for larger tasks
 
+Use `classify` when a caller needs a stable advisory route before deciding
+whether to create a full intake. Classification does not dispatch work, write
+state, or replace the caller's own permission checks.
+
+```bash
+hermes harness classify --text "Refactor auth token storage and add tests" --format json
+```
+
+Core routes:
+
+| Route | Meaning |
+|---|---|
+| `answer_directly` | Plain chat; no Harness intake needed. |
+| `research_then_report` | Gather evidence and report assumptions/gaps. |
+| `bounded_engineering` | Small scoped code work with focused tests. |
+| `harness_advisory` | Larger engineering work; define scope and verification before editing. |
+| `intake_required` | High-risk, scheduled/ops, or multi-agent work; create/fill an intake before implementation. |
+
 ```bash
 hermes harness new \
   --title "Fix gateway preflight regression" \

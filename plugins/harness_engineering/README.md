@@ -29,3 +29,16 @@ harness_engineering:
 experiments and tests.
 
 The plugin registers `/intake`, `hermes harness ...`, and `pre_gateway_dispatch`.
+
+## Task classification
+
+Phase 2 adds `hermes harness classify` as an advisory-only classifier. It returns
+stable routing fields for chat, WebUI, gateway, or future Kanban intake without
+starting work, writing state, or changing dispatch behavior.
+
+```bash
+hermes harness classify --text "Refactor auth token storage and add tests" --format json
+```
+
+High-risk, multi-agent, or scheduled/ops tasks are marked `intake_required`;
+small code changes, research, and plain chat remain advisory/direct routes.
