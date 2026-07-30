@@ -70,6 +70,29 @@ class TestCronDeliveryRedaction:
         assert "3 tasks done" in delivered
         assert result is None
 
+    def _deliver_with_mirror(self, job, content):
+        """Drive a delivery with the mirror enabled, through the REAL
+        ``_maybe_mirror_cron_delivery``, capturing what reaches the
+        ``mirror_to_session`` sink. Mocking the mirror helper itself would hide
+        anything the sink splices in around the payload (e.g. the job-name
+        prefix), so only the outermost session write is stubbed."""
+        from cron.scheduler import _deliver_result
+
+        send_mock = AsyncMock(return_value={"success": True})
+        sink_mock = MagicMock(return_value=True)
+        with patch("gateway.config.load_gateway_config", return_value=_telegram_cfg()), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("cron.scheduler._cron_mirror_delivery_enabled", return_value=True), \
+             patch("cron.scheduler._target_matches_origin", return_value=True), \
+             patch("gateway.mirror.mirror_to_session", new=sink_mock), \
+             patch("sys.is_finalizing", return_value=False):
+            _deliver_result(job, content)
+
+        assert sink_mock.called, "mirror sink did not run — test would vacuously pass"
+        mirrored = " ".join(str(a) for a in sink_mock.call_args.args)
+        mirrored += " " + " ".join(str(v) for v in sink_mock.call_args.kwargs.values())
+        return mirrored
+
     def test_session_mirror_payload_redacts_secret(self):
         """The delivery mirror must not write an unredacted secret to the session.
 
@@ -79,25 +102,26 @@ class TestCronDeliveryRedaction:
         appended to the origin chat's session transcript — an unscanned value
         there is just as exposed as one sent to the chat, and survives longer.
         """
-        from cron.scheduler import _deliver_result
-
-        send_mock = AsyncMock(return_value={"success": True})
-        mirror_mock = MagicMock()
-        with patch("gateway.config.load_gateway_config", return_value=_telegram_cfg()), \
-             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
-             patch("cron.scheduler._cron_mirror_delivery_enabled", return_value=True), \
-             patch("cron.scheduler._target_matches_origin", return_value=True), \
-             patch("cron.scheduler._maybe_mirror_cron_delivery", new=mirror_mock), \
-             patch("sys.is_finalizing", return_value=False):
-            _deliver_result(_job(), f"Job finished. Token was {FAKE_SECRET} (oops).")
-
-        assert mirror_mock.called, "mirror path did not run — test would vacuously pass"
-        mirrored = " ".join(str(a) for a in mirror_mock.call_args.args)
-        mirrored += " " + " ".join(str(v) for v in mirror_mock.call_args.kwargs.values())
+        mirrored = self._deliver_with_mirror(
+            _job(), f"Job finished. Token was {FAKE_SECRET} (oops).",
+        )
         # An empty mirror payload would satisfy the secret assertion for the
         # wrong reason, so pin that the real body still went through.
         assert "Job finished." in mirrored, "mirror payload was empty — assertion below is vacuous"
         assert FAKE_SECRET not in mirrored, "secret reached the session mirror payload"
+
+    def test_session_mirror_job_name_does_not_leak_secret(self):
+        """The sink splices the job NAME around the redacted payload.
+
+        The name is user-controlled config; redacting only the body would leave
+        ``[Cron delivery: <name-with-secret>]`` re-leaking a credential right
+        next to the scrubbed text.
+        """
+        job = _job()
+        job["name"] = f"rotate {FAKE_SECRET} daily"
+        mirrored = self._deliver_with_mirror(job, "Job finished. All good.")
+        assert "[Cron delivery:" in mirrored, "sink prefix missing — assembly path not exercised"
+        assert FAKE_SECRET not in mirrored, "secret in the job name reached the session mirror"
 
     def test_redaction_survives_disabled_logging_preference(self, monkeypatch):
         """``security.redact_secrets: false`` must not disable delivery redaction.
