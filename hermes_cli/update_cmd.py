@@ -4656,26 +4656,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 try:
                     from hermes_cli.gateway import (
                         launchd_restart,
-                        get_launchd_label,
-                        get_launchd_plist_path,
+                        running_launchd_gateway_labels,
                     )
 
-                    plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
-                        check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
-                            capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                            timeout=5,
-                        )
-                        if check.returncode == 0:
-                            try:
-                                launchd_restart()
-                                restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
-                except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
+                    for launchd_label in running_launchd_gateway_labels():
+                        try:
+                            launchd_restart(launchd_label)
+                            restarted_services.append(launchd_label)
+                        except subprocess.CalledProcessError as e:
+                            failed_or_stale_units.append(launchd_label)
+                            stderr = (getattr(e, "stderr", "") or "").strip()
+                            print(
+                                f"  ⚠ Gateway restart failed for {launchd_label}: "
+                                f"{stderr}"
+                            )
+                        except subprocess.TimeoutExpired as e:
+                            failed_or_stale_units.append(launchd_label)
+                            print(
+                                f"  ⚠ launchctl timed out restarting {launchd_label} "
+                                f"({e.cmd if e.cmd else 'unknown command'}); "
+                                f"continuing with remaining gateways"
+                            )
+                except (FileNotFoundError, ImportError):
                     pass
 
             # --- Manual (non-service) gateways ---
