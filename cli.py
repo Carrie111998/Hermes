@@ -5903,7 +5903,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
                 if vim_mode_label:
                     frags.append(("class:status-bar-dim", " · "))
-                    frags.append(("class:status-bar-strong", vim_mode_label))
+                    vim_style = "class:status-bar-vim-normal" if vim_mode_label == "NORMAL" else "class:status-bar-vim-insert"
+                    frags.append((vim_style, vim_mode_label))
                 frags.append(("class:status-bar", " "))
             else:
                 percent = snapshot["context_percent"]
@@ -5946,7 +5947,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
                     if vim_mode_label:
                         frags.append(("class:status-bar-dim", " · "))
-                        frags.append(("class:status-bar-strong", vim_mode_label))
+                        vim_style = "class:status-bar-vim-normal" if vim_mode_label == "NORMAL" else "class:status-bar-vim-insert"
+                        frags.append((vim_style, vim_mode_label))
                     frags.append(("class:status-bar", " "))
                 else:
                     if snapshot["context_length"]:
@@ -6010,7 +6012,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
                     if vim_mode_label:
                         frags.append(("class:status-bar-dim", " │ "))
-                        frags.append(("class:status-bar-strong", vim_mode_label))
+                        vim_style = "class:status-bar-vim-normal" if vim_mode_label == "NORMAL" else "class:status-bar-vim-insert"
+                        frags.append((vim_style, vim_mode_label))
                     frags.append(("class:status-bar", " "))
 
             # Battery is the first status-bar element when enabled: prepend it
