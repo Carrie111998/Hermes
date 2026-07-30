@@ -993,6 +993,9 @@ platform_toolsets:
 #       channel_reply_modes:
 #         C0123456789: channel  # Flat replies + one shared channel session
 #         C9876543210: thread   # Thread-per-message
+#         C0111222333: project  # Flat when on-topic; unrelated work opens a thread
+#       project_route_min_confidence: 0.85  # Thread only above this confidence
+#       project_route_timeout: 10            # Auxiliary classifier timeout (seconds)
 #   webhook:
 #     extra:
 #       # Route scripts default to a 30 second timeout. Scripts must live under

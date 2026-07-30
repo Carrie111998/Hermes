@@ -1322,6 +1322,29 @@ class TestSlackReplyInThreadProgressRouting:
         adapter = SimpleNamespace(_effective_reply_in_thread=lambda: False)
         assert _slack_reply_in_thread_for_progress(adapter, "C_PROJECT") is False
 
+    @pytest.mark.parametrize(
+        ("source_thread_id", "expected"),
+        [(None, False), ("1700.001", True)],
+    )
+    def test_project_mode_follows_routed_source_thread(
+        self, source_thread_id, expected
+    ):
+        from gateway.run import _slack_reply_in_thread_for_progress
+
+        adapter = SimpleNamespace(
+            _reply_in_thread_for_source=(
+                lambda _chat_id, thread_id: thread_id is not None
+            )
+        )
+        assert (
+            _slack_reply_in_thread_for_progress(
+                adapter,
+                "C_PROJECT",
+                source_thread_id,
+            )
+            is expected
+        )
+
     def test_slack_reply_in_thread_false_drops_synthetic_thread(self):
         from gateway.run import _resolve_progress_thread_id
 

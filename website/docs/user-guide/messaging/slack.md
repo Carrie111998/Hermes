@@ -405,12 +405,20 @@ platforms:
       # of threads. Messages inside existing threads still reply in-thread.
       reply_in_thread: true
 
-      # Optional per-channel override. "channel" keeps top-level replies flat
-      # and shares one channel session; "thread" keeps thread-per-message mode.
+      # Optional per-channel override. "channel" keeps top-level replies flat;
+      # "thread" keeps thread-per-message mode; "project" keeps on-topic work
+      # flat but opens clearly unrelated work in a new thread/session.
       # Genuine replies inside an existing Slack thread always stay there.
       channel_reply_modes:
         C0123456789: channel
         C9876543210: thread
+        C0111222333: project
+
+      # Project-mode routing is conservative: uncertain/model-failure cases
+      # stay in the channel. Explicit "thread this" / "stay in the channel"
+      # instructions bypass the model call.
+      project_route_min_confidence: 0.85
+      project_route_timeout: 10
 
       # Also post thread replies to the main channel
       # (Slack's "Also send to channel" feature).
@@ -458,7 +466,9 @@ platforms:
 |-----|---------|-------------|
 | `platforms.slack.reply_to_mode` | `"first"` | Threading mode for multi-part messages: `"off"`, `"first"`, or `"all"` |
 | `platforms.slack.extra.reply_in_thread` | `true` | When `false`, channel messages get direct replies instead of threads. Messages inside existing threads still reply in-thread. |
-| `platforms.slack.extra.channel_reply_modes` | `{}` | Optional map of Slack channel IDs to `"channel"` or `"thread"`. Per-channel values override `reply_in_thread` for top-level session scope, progress/status placement, prompts, attachments, and final replies. Existing threads remain thread-scoped. |
+| `platforms.slack.extra.channel_reply_modes` | `{}` | Optional map of Slack channel IDs to `"channel"`, `"thread"`, or `"project"`. Project mode uses an auxiliary topic-classification call before session selection: on-topic turns share the channel session, while clearly unrelated turns use the current message as a new thread root. Existing threads remain thread-scoped. |
+| `platforms.slack.extra.project_route_min_confidence` | `0.85` | Minimum classifier confidence required to move a project-mode turn into a thread. Lower-confidence results stay in the channel. |
+| `platforms.slack.extra.project_route_timeout` | `10` | Timeout in seconds for the project topic-classification call. Failures stay in the channel. Configure its provider/model under `auxiliary.topic_router`. |
 | `platforms.slack.extra.reply_broadcast` | `false` | When `true`, thread replies are also posted to the main channel. Only the first chunk is broadcast. |
 | `platforms.slack.extra.rich_blocks` | `false` | When `true`, agent messages are rendered as [Block Kit](https://docs.slack.dev/block-kit/) blocks (headers, dividers, true nested lists, and native tables). A plain-text fallback is always sent. Tables over Slack's limits fall back to aligned monospace. No app reinstall required — it's a send-side change only. |
 | `platforms.slack.extra.feedback_buttons` | `false` | When `true` with `rich_blocks`, appends Slack-native feedback controls to final replies. |

@@ -666,11 +666,19 @@ def _resolve_progress_thread_id(
     return None
 
 
-def _slack_reply_in_thread_for_progress(adapter: Any, chat_id: Any) -> bool:
+def _slack_reply_in_thread_for_progress(
+    adapter: Any,
+    chat_id: Any,
+    source_thread_id: Any = None,
+) -> bool:
     """Resolve native/relay Slack reply mode for progress/status delivery."""
     if adapter is None:
         return True
     try:
+        source_mode = getattr(adapter, "_reply_in_thread_for_source", None)
+        if callable(source_mode):
+            return bool(source_mode(chat_id, source_thread_id))
+
         channel_mode = getattr(adapter, "_reply_in_thread_for_channel", None)
         if callable(channel_mode):
             return bool(channel_mode(chat_id))
@@ -23454,6 +23462,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _progress_reply_in_thread = _slack_reply_in_thread_for_progress(
                 _slack_adapter_for_progress,
                 source.chat_id,
+                source.thread_id,
             )
         _progress_thread_id = _resolve_progress_thread_id(
             source.platform, source.thread_id, event_message_id,
