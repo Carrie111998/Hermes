@@ -294,13 +294,16 @@ def run_oneshot(
     return 0
 
 
-def _create_session_db_for_oneshot():
+def _create_session_db_for_oneshot(persist_session: bool = True):
     """Best-effort SessionDB for ``hermes -z`` / oneshot mode.
 
     Oneshot bypasses ``HermesCLI._init_agent()``, so it must wire the SQLite
     session store itself. Without this, the ``session_search``/recall tool is
     advertised but every call returns "Session database not available.".
     """
+    if not persist_session:
+        return None
+
     try:
         from hermes_state import SessionDB
 
@@ -395,7 +398,12 @@ def _run_agent(
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
-    session_db = _create_session_db_for_oneshot()
+    from hermes_cli.config import resolve_session_persistence
+
+    persist_session = resolve_session_persistence(cfg)
+    session_db = _create_session_db_for_oneshot(
+        persist_session=persist_session
+    )
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -417,6 +425,7 @@ def _run_agent(
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
+            persist_session=persist_session,
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,

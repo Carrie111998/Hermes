@@ -616,6 +616,43 @@ When a session expires:
 
 ## Appendix: Key Configuration
 
+### Profile-scoped ephemeral sessions
+
+Hermes persists CLI and one-shot session transcripts by default. A restricted
+profile can disable that persistence explicitly:
+
+```yaml
+sessions:
+  persist: false
+```
+
+Or set it for one named profile:
+
+```bash
+hermes -p <profile> config set sessions.persist false
+```
+
+When `sessions.persist` is `false`, Hermes keeps the active transcript in
+memory for the lifetime of the process but does not create or update:
+
+- SQLite session rows, messages, tool calls, tool results, or FTS entries
+- per-session JSON transcript snapshots
+- API request-debug dump files containing prompt or context data
+- session-finalization records during shutdown
+
+Interactive and one-shot model inference and MCP tool calls continue to work.
+Session resume is rejected because no durable transcript exists.
+
+The setting defaults to `true`, so existing profiles retain their current
+persistent behavior. The value must be a YAML boolean; malformed values such
+as the string `"false"` are rejected rather than interpreted as truthy.
+
+This setting controls Hermes session-transcript persistence only. It does not
+disable unrelated terminal input history, ordinary application logs, tool-
+specific storage, or external memory providers. Restricted profiles should
+configure those features separately when their threat model requires it.
+
+
 | Config Key | Type | Default | Description |
 |---|---|---|---|
 | `group_sessions_per_user` | `bool` | `true` | Isolate group/channel sessions per user |
