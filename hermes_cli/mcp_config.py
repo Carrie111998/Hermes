@@ -524,7 +524,9 @@ def cmd_mcp_add(args):
         oauth_ok = False
         try:
             from tools.mcp_oauth_manager import get_manager
-            oauth_auth = get_manager().get_or_build_provider(name, url, None)
+            oauth_auth = get_manager().get_or_build_provider(
+                name, url, server_config.get("oauth")
+            )
             if oauth_auth:
                 server_config["auth"] = "oauth"
                 _success("OAuth configured (tokens will be acquired on first connection)")
@@ -850,10 +852,13 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     # an interactive OAuth round-trip. Floor at 315s — the OAuth callback
     # window (300s in mcp_oauth) plus headroom — matching the GUI re-auth
     # path in web_server.py so CLI and dashboard behave identically.
+    #
+    # force_interactive_oauth: `hermes mcp login` is *explicitly* user-
+    # initiated even when stdin isn't a TTY (Hermes desktop / agent-
+    # spawned terminals). Without this, OAuth refuses before opening a
+    # browser because _is_interactive() only checks sys.stdin.isatty().
     try:
-        preregistered_client = _has_preregistered_oauth_client(server_config)
-        if preregistered_client:
-            _force_oauth_login(name, server_config)
+        from tools.mcp_oauth import force_interactive_oauth
 
         _login_connect_timeout = server_config.get("connect_timeout")
         try:
@@ -861,9 +866,7 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         except (TypeError, ValueError):
             _login_connect_timeout = 0.0
         _login_connect_timeout = max(_login_connect_timeout, 315.0)
-        if preregistered_client:
-            tools = _probe_single_server(name, server_config)
-        else:
+        with force_interactive_oauth():
             tools = _probe_single_server(
                 name, server_config, connect_timeout=_login_connect_timeout
             )
@@ -903,7 +906,15 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             _success("Authenticated (server reported no tools)")
         return True
     except Exception as exc:
-        _error(f"Authentication failed: {exc}")
+        try:
+            from tools.mcp_oauth import humanize_oauth_registration_error
+
+            humanized = humanize_oauth_registration_error(
+                name, exc, server_url=url
+            )
+        except Exception:
+            humanized = None
+        _error(f"Authentication failed: {humanized or exc}")
         return False
 
 

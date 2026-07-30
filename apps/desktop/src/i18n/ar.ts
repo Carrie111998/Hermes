@@ -137,6 +137,7 @@ export const ar = defineLocale({
       noSpeechDetected: 'لم يتم اكتشاف كلام',
       playbackFailed: 'فشل تشغيل الصوت',
       recordingFailed: 'فشل التسجيل',
+      sayStopToEnd: phrase => `قل "${phrase}" لإنهاء المحادثة الصوتية.`,
       transcriptionFailed: 'فشل التفريغ النصي',
       transcriptionUnavailable: 'التفريغ النصي غير متاح.',
       tryRecordingAgain: 'حاول التسجيل مرة أخرى.',
@@ -149,7 +150,7 @@ export const ar = defineLocale({
       inputTitle: 'مطلوب إدخال',
       inputBody: 'ينتظر Hermes ردّك.',
       turnDoneTitle: 'أنهى Hermes',
-      turnDoneBody: 'الرد جاهز.',
+      turnDoneBody: '',
       turnErrorTitle: 'فشلت الجولة',
       backgroundDoneTitle: 'انتهت المهمة في الخلفية',
       backgroundFailedTitle: 'فشلت المهمة في الخلفية'
@@ -164,7 +165,6 @@ export const ar = defineLocale({
     search: 'بحث',
     searchTitle: 'البحث في الجلسات والعروض والإجراءات',
     swapSidebarSides: 'تبديل جانبي الأشرطة',
-    swapSidebarSidesTitle: 'تبديل موضعي شريط الجلسات ومستكشف الملفات',
     hideRightSidebar: 'إخفاء الشريط الأيمن',
     showRightSidebar: 'إظهار الشريط الأيمن',
     muteHaptics: 'كتم الاهتزازات',
@@ -231,6 +231,8 @@ export const ar = defineLocale({
       'view.closeTab': 'إغلاق علامة التبويب',
       'view.reopenTab': 'إعادة فتح علامة التبويب المغلقة',
       'view.terminalSelection': 'إرسال تحديد الطرفية إلى المحرّر',
+      'view.terminalCopy': 'نسخ تحديد الطرفية',
+      'view.terminalPaste': 'لصق في الطرفية',
       'view.closePreviewTab': 'إغلاق علامة تبويب المعاينة',
       'view.flipPanes': 'تبديل جانبي الشريط الجانبي',
       'appearance.toggleMode': 'تبديل الفاتح / الداكن',
@@ -319,7 +321,7 @@ export const ar = defineLocale({
       intro:
         'إشعارات سطح المكتب الأصلية، منفصلة عن التنبيهات داخل التطبيق. هذه محلية على الجهاز — كل حاسوب يحتفظ بإعداداته الخاصة.',
       enableAll: 'تفعيل الإشعارات',
-      enableAllDesc: 'مفتاح رئيسي. أوقفه لإسكات كل الإشعارات أدناه.',
+      enableAllDesc: 'إيقافه يصمت كل الإشعارات أدناه.',
       focusedHint: 'تنبيهات الاكتمال تظهر فقط عندما يكون Hermes في الخلفية.',
       kinds: {
         approval: {
@@ -336,7 +338,7 @@ export const ar = defineLocale({
         },
         turnError: {
           label: 'فشل الدور',
-          description: 'انتهى دور بخطأ.'
+          description: 'أخطاء الأدوار في الخلفية.'
         },
         backgroundDone: {
           label: 'اكتملت مهمة الخلفية',
@@ -611,6 +613,9 @@ export const ar = defineLocale({
       noneParen: '(لا شيء)',
       notSet: 'غير مضبوط',
       commaSeparated: 'قيم مفصولة بفواصل',
+      searchPlaceholder: 'بحث…',
+      noResults: 'لا توجد نتائج',
+      systemDefault: 'إعداد النظام الافتراضي',
       loading: 'جار تحميل إعدادات Hermes...',
       emptyTitle: 'لا توجد إعدادات',
       emptyDesc: 'لا يحتوي هذا القسم على إعدادات قابلة للتعديل.',
@@ -639,8 +644,7 @@ export const ar = defineLocale({
       saving: 'جار الحفظ'
     },
     envActions: {
-      actionsFor: label => `إجراءات ${label}`,
-      credentialActions: 'إجراءات بيانات الاعتماد',
+      actions: 'إجراءات',
       docs: 'الوثائق',
       hideValue: 'إخفاء القيمة',
       revealValue: 'إظهار القيمة',
@@ -1289,9 +1293,9 @@ export const ar = defineLocale({
     showAllProfiles: 'إظهار كل الملفات الشخصية',
     switchToProfile: name => `التبديل إلى ${name}`,
     manageProfiles: 'إدارة الملفات الشخصية',
-    actionsFor: name => `إجراءات ${name}`,
+    actions: 'إجراءات',
     color: 'اللون',
-    colorFor: name => `لون ${name}`,
+    colorFor: 'اللون',
     setColor: color => `ضبط اللون ${color}`,
     autoColor: 'لون تلقائي',
     noProfiles: 'لا توجد ملفات شخصية',
@@ -1420,7 +1424,7 @@ export const ar = defineLocale({
     showRuns: 'إظهار التشغيلات',
     hideRuns: 'إخفاء التشغيلات',
     runHistory: 'سجل التشغيل',
-    actionsFor: title => `إجراءات ${title}`,
+
     actionsTitle: 'الإجراءات',
     resume: 'استئناف',
     pause: 'إيقاف مؤقت',
@@ -1565,7 +1569,7 @@ export const ar = defineLocale({
       primaryBadge: 'أساسي',
       removeFolder: 'إزالة',
       create: 'إنشاء',
-      menu: 'إجراءات المشروع',
+      menu: 'إجراءات',
       menuRename: 'إعادة تسمية',
       menuAppearance: 'المظهر',
       noColor: 'بلا لون',
@@ -1619,7 +1623,7 @@ export const ar = defineLocale({
       archive: 'أرشفة',
       newWindow: 'فتح في نافذة جديدة',
       copyIdFailed: 'فشل نسخ المعرف',
-      actionsFor: title => `إجراءات ${title}`,
+
       sessionActions: 'إجراءات الجلسة',
       sessionRunning: 'الجلسة تعمل',
       needsInput: 'تحتاج إدخالا',
@@ -1635,7 +1639,7 @@ export const ar = defineLocale({
       renamed: 'تمت إعادة التسمية',
       renameFailed: 'فشلت إعادة التسمية',
       renameTitle: 'إعادة تسمية الجلسة',
-      renameDesc: 'اختر اسما جديدا لهذه الجلسة.',
+      renameDesc: '',
       untitledPlaceholder: 'جلسة بلا عنوان',
       ageNow: 'الآن',
       ageDay: 'يوم',
@@ -2071,7 +2075,7 @@ export const ar = defineLocale({
       gatewayConnecting: 'جار اتصال البوابة',
       gatewayOffline: 'البوابة غير متصلة',
       gatewayRestarting: 'جار إعادة التشغيل...',
-      gatewayTitle: 'حالة البوابة',
+      gatewayTitle: 'البوابة',
       agents: 'الوكلاء',
       closeAgents: 'إغلاق الوكلاء',
       openAgents: 'فتح الوكلاء',
@@ -2081,10 +2085,8 @@ export const ar = defineLocale({
       cron: 'المهام',
       openCron: 'فتح المهام المجدولة',
       turnRunning: 'الدور يعمل',
-      currentTurnElapsed: 'وقت الدور الحالي',
       contextUsage: 'استخدام السياق',
       session: 'الجلسة',
-      runtimeSessionElapsed: 'وقت الجلسة',
       yoloOn: 'YOLO مفعل',
       yoloOff: 'YOLO معطل',
       modelNone: 'لا نموذج',
@@ -2106,7 +2108,7 @@ export const ar = defineLocale({
     remotePickerTitle: 'اختر مجلدا بعيدا',
     remotePickerDescription: 'استعرض المجلدات على الخادم الخلفي المتصل.',
     remotePickerSelect: 'تحديد المجلد',
-    folderTip: cwd => `المجلد الحالي: ${cwd}`,
+    folderTip: cwd => cwd,
     openFolder: 'فتح مجلد',
     refreshTree: 'تحديث الشجرة',
     collapseAll: 'طي الكل',
@@ -2326,7 +2328,6 @@ export const ar = defineLocale({
       continueLabel: 'متابعة'
     },
     tool: {
-      code: 'الكود',
       copyCode: 'نسخ الكود',
       renderingImage: 'جار عرض الصورة...',
       copyOutput: 'نسخ الإخراج',
@@ -2348,6 +2349,7 @@ export const ar = defineLocale({
       statusError: 'خطأ',
       statusRecovered: 'تم الاسترداد',
       statusDone: 'تم',
+      memoryWriteNoted: 'تم تسجيل كتابة الذاكرة',
       actions: {
         read: 'قراءة',
         reading: 'جار القراءة',

@@ -175,7 +175,7 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # (gateway/run.py); the file/terminal-tool layer must do likewise so CLI
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
-_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona"})
+_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -1089,12 +1089,13 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona"}:
+            if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
                     "container_persistent": config.get("container_persistent", True),
+                    "vercel_runtime": config.get("vercel_runtime", ""),
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get(
                         "docker_mount_cwd_to_workspace", False
@@ -1167,12 +1168,10 @@ def read_file_tool(
         # blocking on input).  Pure path check — no I/O.
         device_base = None if Path(path).expanduser().is_absolute() else _resolve_base_dir(task_id)
         if _is_blocked_device(path, base_dir=device_base):
-            return json.dumps({
-                "error": (
-                    f"Cannot read '{path}': this is a device file that would "
-                    "block or produce infinite output."
-                ),
-            })
+            return tool_error(
+                f"Cannot read '{path}': this is a device file that would "
+                "block or produce infinite output."
+            )
 
         _resolved = _resolve_path_for_task(path, task_id)
 
@@ -1239,12 +1238,10 @@ def read_file_tool(
         # Block binary files by extension (no I/O).
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
-            return json.dumps({
-                "error": (
-                    f"Cannot read binary file '{path}' ({_ext}). "
-                    "Use vision_analyze for images, or terminal to inspect binary files."
-                ),
-            })
+            return tool_error(
+                f"Cannot read binary file '{path}' ({_ext}). "
+                "Use vision_analyze for images, or terminal to inspect binary files."
+            )
 
         # ── Hermes internal path guard ────────────────────────────────
         # Prevent prompt injection via catalog or hub metadata files,
@@ -1255,7 +1252,7 @@ def read_file_tool(
         # the Python process cwd, which can differ.
         block_error = get_read_block_error(str(_resolved))
         if block_error:
-            return json.dumps({"error": block_error})
+            return tool_error(block_error)
 
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
@@ -1299,33 +1296,25 @@ def read_file_tool(
                         _cap_read_tracker_data(task_data)
 
                     if hits >= 2:
-                        return json.dumps(
-                            {
-                                "error": (
-                                    f"BLOCKED: You have called read_file on this "
-                                    f"exact region {hits + 1} times and the file "
-                                    "has NOT changed. STOP calling read_file for "
-                                    "this path — the content from your earlier "
-                                    "read_file result in this conversation is "
-                                    "still current. Proceed with your task using "
-                                    "the information you already have."
-                                ),
-                                "path": path,
-                                "already_read": hits + 1,
-                            },
-                            ensure_ascii=False,
+                        return tool_error(
+                            f"BLOCKED: You have called read_file on this "
+                            f"exact region {hits + 1} times and the file "
+                            "has NOT changed. STOP calling read_file for "
+                            "this path — the content from your earlier "
+                            "read_file result in this conversation is "
+                            "still current. Proceed with your task using "
+                            "the information you already have.",
+                            path=path,
+                            already_read=hits + 1,
                         )
 
-                    return json.dumps(
-                        {
-                            "status": "unchanged",
-                            "message": _READ_DEDUP_STATUS_MESSAGE,
-                            "path": path,
-                            "dedup": True,
-                            "content_returned": False,
-                        },
-                        ensure_ascii=False,
-                    )
+                    return json.dumps({
+                        "status": "unchanged",
+                        "message": _READ_DEDUP_STATUS_MESSAGE,
+                        "path": path,
+                        "dedup": True,
+                        "content_returned": False,
+                    }, ensure_ascii=False)
             except OSError:
                 pass  # stat failed — fall through to full read
 
@@ -1449,17 +1438,12 @@ def read_file_tool(
 
         if count >= 4:
             # Hard block: stop returning content to break the loop
-            return json.dumps(
-                {
-                    "error": (
-                        f"BLOCKED: You have read this exact file region {count} times in a row. "
-                        "The content has NOT changed. You already have this information. "
-                        "STOP re-reading and proceed with your task."
-                    ),
-                    "path": path,
-                    "already_read": count,
-                },
-                ensure_ascii=False,
+            return tool_error(
+                f"BLOCKED: You have read this exact file region {count} times in a row. "
+                "The content has NOT changed. You already have this information. "
+                "STOP re-reading and proceed with your task.",
+                path=path,
+                already_read=count,
             )
         elif count >= 3:
             result_dict["_warning"] = (
@@ -1964,28 +1948,13 @@ def search_tool(
             count = task_data["consecutive"]
 
         if count >= 4:
-            return json.dumps(
-                {
-                    "error": (
-                        f"BLOCKED: You have run this exact search {count} times in a row. "
-                        "The results have NOT changed. You already have this information. "
-                        "STOP re-searching and proceed with your task."
-                    ),
-                    "pattern": pattern,
-                    "already_searched": count,
-                },
-                ensure_ascii=False,
+            return tool_error(
+                f"BLOCKED: You have run this exact search {count} times in a row. "
+                "The results have NOT changed. You already have this information. "
+                "STOP re-searching and proceed with your task.",
+                pattern=pattern,
+                already_searched=count,
             )
-
-        try:
-            resolved_path = _resolve_path_for_task(path, task_id)
-        except (OSError, ValueError, RuntimeError):
-            resolved_path = None
-        block_error = get_read_block_error(
-            str(resolved_path) if resolved_path else path
-        )
-        if block_error:
-            return json.dumps({"error": block_error}, ensure_ascii=False)
 
         try:
             resolved_path = _resolve_path_for_task(path, task_id)
@@ -1993,7 +1962,7 @@ def search_tool(
             resolved_path = None
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
-            return json.dumps({"error": block_error}, ensure_ascii=False)
+            return tool_error(block_error)
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(

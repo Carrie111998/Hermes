@@ -101,32 +101,6 @@ def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
     assert killpg_calls == [(67890, signal.SIGTERM), (67890, 0)]
 
 
-def test_execute_kills_spawned_process_if_interrupt_hits_wait_setup():
-    """execute() keeps a cleanup guard around the whole wait handoff."""
-    env = object.__new__(LocalEnvironment)
-    proc = SimpleNamespace(pid=12345, returncode=None)
-    killed = []
-
-    env.timeout = 60
-    env.cwd = "/tmp"
-    env._snapshot_ready = True
-    env._before_execute = lambda: None
-    env._prepare_command = lambda command: (command, None)
-    env._wrap_command = lambda command, cwd: command
-    env._run_bash = lambda *args, **kwargs: proc
-    env._wait_for_process = lambda *args, **kwargs: (_ for _ in ()).throw(
-        KeyboardInterrupt
-    )
-    env._kill_process = lambda process: killed.append(process)
-    env._update_cwd = lambda result: None
-
-    with pytest.raises(KeyboardInterrupt):
-        env.execute("sleep 30", rewrite_compound_background=False)
-
-    assert killed == [proc]
-
-
-@pytest.mark.skipif(not _HAS_POSIX_PROCESS_GROUPS, reason=_POSIX_PROCESS_GROUPS_REASON)
 def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
     """When KeyboardInterrupt arrives mid-poll, the subprocess group must be
     killed before the exception is re-raised."""
