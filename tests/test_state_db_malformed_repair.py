@@ -459,3 +459,59 @@ def test_select_cached_agent_history_still_fires_on_lost_user_turn():
     out = _select_cached_agent_history(persisted, live)
     assert out == live
     assert out is not live
+
+
+def test_select_cached_agent_history_ignores_user_merge_repair():
+    """Review finding on #72001 (teknium1): repair_message_sequence pass 2
+    merges consecutive USER messages too (text joined with a blank line), so
+    a persisted view can carry fewer user turns than the live list with zero
+    input lost. The guard must not read that as persistence loss."""
+    from gateway.run import _select_cached_agent_history
+
+    live = [
+        {"role": "user", "content": "first thought"},
+        {"role": "user", "content": "second thought"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    # Restore-time repair merged the double-send; every user byte survives.
+    persisted = [
+        {"role": "user", "content": "first thought\n\nsecond thought"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    assert _select_cached_agent_history(persisted, live) is persisted
+
+
+def test_select_cached_agent_history_fires_on_lost_user_content():
+    """Genuine loss: the persisted view is MISSING user input the live list
+    still holds — content, not turn counts, is the merge-proof yardstick."""
+    from gateway.run import _select_cached_agent_history
+
+    live = [
+        {"role": "user", "content": "kept"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "lost by the FTS write failure"},
+    ]
+    persisted = [
+        {"role": "user", "content": "kept"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    out = _select_cached_agent_history(persisted, live)
+    assert out == live and out is not live
+
+
+def test_select_cached_agent_history_counts_multimodal_user_messages():
+    """List-content (multimodal) user messages are never merged by repair —
+    a live one absent from the persisted view is loss even at equal text."""
+    from gateway.run import _select_cached_agent_history
+
+    live = [
+        {"role": "user", "content": "caption"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": [{"type": "image", "data": "..."}]},
+    ]
+    persisted = [
+        {"role": "user", "content": "caption"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    out = _select_cached_agent_history(persisted, live)
+    assert out == live and out is not live

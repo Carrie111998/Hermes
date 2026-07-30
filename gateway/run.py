@@ -1259,12 +1259,28 @@ def _build_gateway_agent_history(
     return agent_history, observed_context
 
 
-def _user_turn_count(history: List[Dict[str, Any]]) -> int:
-    """Count ``user`` turns — the loss-proof yardstick for the #50502 guard
-    (in-memory repairs merge only assistant/tool shapes)."""
-    return sum(
-        1 for m in history if isinstance(m, dict) and m.get("role") == "user"
-    )
+def _user_payload_volume(history: List[Dict[str, Any]]) -> tuple[int, int]:
+    """(text_chars, non_text_messages) of ``user`` turns — the merge-proof
+    yardstick for the #50502 guard.
+
+    Turn COUNTS are not repair-stable: ``repair_message_sequence`` pass 2
+    merges consecutive user messages (text joined with a blank line), so a
+    repaired persisted view can carry fewer user turns than the live list
+    with zero input lost. What every repair shape preserves is the user
+    CONTENT itself: text merges keep all bytes and only add join whitespace
+    (hence whitespace-insensitive char count), and multimodal list content
+    is never merged at all (hence a plain message count for those)."""
+    text_chars = 0
+    non_text = 0
+    for m in history:
+        if not (isinstance(m, dict) and m.get("role") == "user"):
+            continue
+        content = m.get("content", "")
+        if isinstance(content, str):
+            text_chars += len("".join(content.split()))
+        else:
+            non_text += 1
+    return text_chars, non_text
 
 
 def _select_cached_agent_history(
@@ -1286,18 +1302,20 @@ def _select_cached_agent_history(
     copy of the live transcript is returned.
 
     Raw length alone cannot distinguish real write loss from the
-    restore-time alternation repair: split assistant tool-call pairs arrive
-    MERGED in the persisted view but stay split in the live list (see
-    ``repair_message_sequence``), shrinking the disk-side count on every
-    tool-use turn with zero data lost. User turns are never merged by any
-    repair shape, so only a live user turn absent from the persisted view
-    marks genuine persistence loss. Assistant/tool-only loss with user-turn
-    parity intact is intentionally out of this guard's scope — raw length is
-    unusable under the repair, and user turns are the only merge-proof
-    yardstick.
+    restore-time alternation repair: ``repair_message_sequence`` merges both
+    split assistant tool-call pairs AND consecutive user messages in the
+    persisted view, shrinking disk-side counts with zero data lost — so
+    neither raw length nor user-turn counts are repair-stable. What every
+    repair shape preserves is user CONTENT (text merges keep all bytes,
+    multimodal list content is never merged), so only live user payload
+    absent from the persisted view marks genuine persistence loss (see
+    ``_user_payload_volume``). Assistant/tool-only loss with user-payload
+    parity intact is intentionally out of this guard's scope.
     """
     if isinstance(live_history, list) and len(live_history) > len(persisted_history):
-        if _user_turn_count(live_history) > _user_turn_count(persisted_history):
+        live_text, live_non_text = _user_payload_volume(live_history)
+        pers_text, pers_non_text = _user_payload_volume(persisted_history)
+        if live_text > pers_text or live_non_text > pers_non_text:
             return list(live_history)
     return persisted_history
 
