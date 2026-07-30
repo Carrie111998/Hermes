@@ -138,7 +138,8 @@ class TestTerminalIntegration:
             _HERMES_PROVIDER_ENV_BLOCKLIST,
         )
 
-        blocked_var = next(iter(_HERMES_PROVIDER_ENV_BLOCKLIST))
+        blocked_var = "OPENAI_API_KEY"
+        assert blocked_var in _HERMES_PROVIDER_ENV_BLOCKLIST
         # Attempt to register — must be silently refused (logged warning).
         register_env_passthrough([blocked_var])
 
@@ -193,7 +194,8 @@ class TestTerminalIntegration:
             _HERMES_PROVIDER_ENV_BLOCKLIST,
         )
 
-        blocked_var = next(iter(_HERMES_PROVIDER_ENV_BLOCKLIST))
+        blocked_var = "OPENAI_API_KEY"
+        assert blocked_var in _HERMES_PROVIDER_ENV_BLOCKLIST
         os.environ[blocked_var] = "secret_value"
         try:
             # Without passthrough — blocked
@@ -218,6 +220,50 @@ class TestTerminalIntegration:
         # Arbitrary skill-specific var
         register_env_passthrough(["MY_SKILL_CUSTOM_CONFIG"])
         assert is_env_passthrough("MY_SKILL_CUSTOM_CONFIG")
+
+    def test_bundled_plugin_var_requires_explicit_passthrough(
+        self, tmp_path, monkeypatch
+    ):
+        """Trusted plugin metadata makes exact vars eligible, not exposed."""
+        from tools.environments.local import (
+            _HERMES_PROVIDER_ENV_BLOCKLIST,
+            _HERMES_TERMINAL_PASSTHROUGH_ELIGIBLE,
+            _sanitize_subprocess_env,
+        )
+
+        buzz_vars = {
+            "BUZZ_RELAY_URL": "https://relay.example",
+            "BUZZ_PRIVATE_KEY": "test-private-key",
+            "BUZZ_AUTH_TAG": "test-auth-tag",
+        }
+        assert buzz_vars.keys() <= _HERMES_PROVIDER_ENV_BLOCKLIST
+        assert buzz_vars.keys() <= _HERMES_TERMINAL_PASSTHROUGH_ELIGIBLE
+
+        # Eligibility is not exposure: without explicit config, all stay
+        # blocked exactly like every other messaging credential.
+        result_before = _sanitize_subprocess_env(buzz_vars)
+        assert not (buzz_vars.keys() & result_before.keys())
+
+        config = {"terminal": {"env_passthrough": list(buzz_vars)}}
+        (tmp_path / "config.yaml").write_text(yaml.dump(config))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _ep_mod._config_passthrough = None
+
+        for name in buzz_vars:
+            assert is_env_passthrough(name)
+        result_after = _sanitize_subprocess_env(buzz_vars)
+        for name, value in buzz_vars.items():
+            assert result_after[name] == value
+
+    def test_manifest_eligibility_does_not_unlock_provider_credentials(
+        self, tmp_path, monkeypatch
+    ):
+        config = {"terminal": {"env_passthrough": ["OPENAI_API_KEY"]}}
+        (tmp_path / "config.yaml").write_text(yaml.dump(config))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _ep_mod._config_passthrough = None
+
+        assert not is_env_passthrough("OPENAI_API_KEY")
 
     def test_provider_blocklist_import_failure_fails_closed(self, monkeypatch):
         """If the dynamic provider blocklist can't be imported, provider

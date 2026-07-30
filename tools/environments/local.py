@@ -336,6 +336,32 @@ def _build_provider_env_blocklist() -> frozenset:
 
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 
+
+def _build_terminal_passthrough_eligible() -> frozenset[str]:
+    """Return trusted bundled-plugin vars eligible for explicit passthrough.
+
+    These names deliberately remain in ``_HERMES_PROVIDER_ENV_BLOCKLIST`` so
+    they are stripped by default. The metadata only lets
+    :mod:`tools.env_passthrough` honor an explicit user/runtime opt-in for the
+    named variable; it does not expose anything on its own. Platform plugin
+    manifests are bundled executable-code peers, unlike untrusted skill
+    frontmatter, so allowing them to define this narrow eligibility does not
+    create a new trust boundary.
+    """
+    try:
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+
+        return frozenset(
+            name
+            for name, metadata in OPTIONAL_ENV_VARS.items()
+            if metadata.get("terminal_passthrough") is True
+        )
+    except ImportError:
+        return frozenset()
+
+
+_HERMES_TERMINAL_PASSTHROUGH_ELIGIBLE = _build_terminal_passthrough_eligible()
+
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.
 # The gateway runs inside its own venv, so its process environment carries
 # VIRTUAL_ENV (and possibly CONDA_PREFIX). If those leak into commands the

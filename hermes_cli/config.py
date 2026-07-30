@@ -5292,6 +5292,13 @@ def _inject_platform_plugin_env_vars() -> None:
                     "url": meta.get("url") or None,
                     "password": is_secret,
                     "category": meta.get("category") or "messaging",
+                    # Trusted bundled platform plugins may declare that one of
+                    # their env vars is eligible for an *explicit* terminal
+                    # passthrough opt-in. Eligibility alone never exposes the
+                    # value: terminal.env_passthrough (or trusted runtime
+                    # registration) must still name it, and all undeclared
+                    # provider/messaging credentials remain non-bypassable.
+                    "terminal_passthrough": bool(meta.get("terminal_passthrough", False)),
                 }
     except Exception:
         pass
