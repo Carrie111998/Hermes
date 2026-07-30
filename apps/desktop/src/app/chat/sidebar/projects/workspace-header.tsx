@@ -24,7 +24,9 @@ function LaneLabel({ label, title }: { label: string; title?: string }) {
   const tail = label.slice(label.length - tailLen)
 
   return (
-    <span className="flex min-w-0" title={title}>
+    // overflow-hidden: the pinned tail is shrink-0, so at extreme narrow widths
+    // it must clip inside the label rather than push the trailing icons out.
+    <span className="flex min-w-0 overflow-hidden" title={title}>
       <span className="truncate">{head}</span>
       <span className="shrink-0 whitespace-pre">{tail}</span>
     </span>
@@ -116,7 +118,7 @@ export function WorkspaceMenu({ path, onRemove }: { path: null | string; onRemov
   const items = useWorkspaceItems({ onRemove, path })
 
   return (
-    <ActionsMenu ariaLabel={p.menu} contentClassName="w-48" items={items} tooltip={p.menu}>
+    <ActionsMenu ariaLabel={p.menu} contentClassName="w-48" items={items}>
       <button
         aria-label={p.menu}
         className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/workspace:opacity-100 data-[state=open]:opacity-100"

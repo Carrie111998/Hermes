@@ -24,9 +24,9 @@ import {
   PanelHeader,
   PanelList,
   PanelListRow,
+  type PanelMenuItem,
   PanelMeta,
   PanelPill,
-  PanelRowMenu,
   PanelSectionLabel
 } from '../overlays/panel'
 
@@ -130,22 +130,18 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
                 <ProfileRow
                   active={selected?.name === profile.name}
                   key={profile.name}
-                  menu={
-                    <PanelRowMenu
-                      items={
-                        profile.is_default
-                          ? []
-                          : [
-                              { icon: 'edit', label: p.renameMenu, onSelect: () => setPendingRename(profile) },
-                              {
-                                icon: 'trash',
-                                label: t.common.delete,
-                                onSelect: () => setPendingDelete(profile),
-                                tone: 'danger'
-                              }
-                            ]
-                      }
-                    />
+                  menuItems={
+                    profile.is_default
+                      ? []
+                      : [
+                          { icon: 'edit', label: p.renameMenu, onSelect: () => setPendingRename(profile) },
+                          {
+                            icon: 'trash',
+                            label: t.common.delete,
+                            onSelect: () => setPendingDelete(profile),
+                            tone: 'danger'
+                          }
+                        ]
                   }
                   onSelect={() => setSelectedName(profile.name)}
                   profile={profile}
@@ -192,12 +188,12 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
 
 function ProfileRow({
   active,
-  menu,
+  menuItems,
   onSelect,
   profile
 }: {
   active: boolean
-  menu?: React.ReactNode
+  menuItems: PanelMenuItem[]
   onSelect: () => void
   profile: ProfileInfo
 }) {
@@ -213,7 +209,8 @@ function ProfileRow({
           name={profile.name}
         />
       }
-      menu={menu}
+      menuItems={menuItems}
+      menuLabel={profile.name}
       onSelect={onSelect}
       rowKey={profile.name}
       title={profile.name}
