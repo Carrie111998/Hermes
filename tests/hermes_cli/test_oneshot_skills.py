@@ -37,7 +37,8 @@ def _patch_builder(monkeypatch, prompt, loaded, missing):
 
 class TestBuildOneshotSkillsPrompt:
     def test_no_skills_is_noop(self):
-        prompt, err = _build_oneshot_skills_prompt(None)
+        with mock.patch("builtins.__import__", side_effect=AssertionError):
+            prompt, err = _build_oneshot_skills_prompt(None)
         assert prompt == ""
         assert err is None
 

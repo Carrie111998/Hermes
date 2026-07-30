@@ -61,6 +61,9 @@ def _build_oneshot_skills_prompt(skills: object = None) -> tuple[str, str | None
     Returns (skills_prompt, fatal_error). fatal_error is a ready-to-print
     stderr message; when set the caller should exit 2 without running.
     """
+    if not skills:
+        return "", None
+
     try:
         from cli import _parse_skills_argument
     except Exception:
