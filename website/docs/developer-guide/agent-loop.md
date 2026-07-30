@@ -17,8 +17,10 @@ Inside `agent/conversation_loop.py`, the loop builds the turn context, calls the
 model, decides whether the response contains tool calls or final text, executes
 tools when needed, and finalizes the turn. Tool-call batches pass through
 `AIAgent._execute_tool_calls(...)`, which delegates sequential, concurrent, or
-segmented execution to `agent/tool_executor.py`; individual tool calls
-eventually reach `model_tools.handle_function_call(...)`.
+segmented execution to `agent/tool_executor.py`. Registry-dispatched tool calls
+pass through `model_tools.handle_function_call(...)`. Agent-runtime tools, such
+as `session_search` and `delegate_task`, are handled inline by
+`agent/tool_executor.py` and do not reach `handle_function_call(...)`.
 
 ## Core Responsibilities
 
@@ -176,21 +178,22 @@ assistant_message.tool_calls
 AIAgent._execute_tool_calls(...)
     ↓
 agent/tool_executor.py
-    ↓
-model_tools.handle_function_call(...)
-    ↓
-tools/registry.py dispatch
-    ↓
-append {"role": "tool", "content": result} to history
+    ├─ agent-runtime tools → handled inline
+    └─ registry-dispatched tools
+           ↓
+       model_tools.handle_function_call(...)
+           ↓
+       tools/registry.py dispatch
 ```
 
-`model_tools.handle_function_call(...)` applies tool middleware and hooks,
-dispatches the registered tool, and returns the tool result string that is
-appended to the conversation as a tool message.
+For registry-dispatched tools, `model_tools.handle_function_call(...)` routes
+the call through `tools/registry.py` and returns the tool result. The executor
+appends results from either execution path to the conversation as tool messages.
 
 ### Agent-Level Tools
 
-Some tools are intercepted by `run_agent.py` *before* reaching `handle_function_call()`:
+Some agent-runtime tools are handled inline by `agent/tool_executor.py` instead
+of passing through `model_tools.handle_function_call(...)`:
 
 | Tool | Why intercepted |
 |------|--------------------|
