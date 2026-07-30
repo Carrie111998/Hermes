@@ -279,6 +279,44 @@ def register(ctx):
 - `ctx.dispatch_tool(name, arguments)` — call any other tool (built-in or from another plugin) with the parent agent's context (approvals, credentials, task_id) wired up automatically. Useful from slash-command handlers that need to invoke `terminal`, `read_file`, or any other tool as if the model had called it directly.
 - If this function crashes, the plugin is disabled but Hermes continues fine
 
+### Project a declarative run-start event
+
+A plugin tool can opt into one small, user-facing event when it starts in the
+[`/v1/runs`](../../user-guide/features/api-server.md#runs-api-streaming-friendly-alternative)
+SSE API:
+
+```python
+ctx.register_tool(
+    name="report_intent",
+    toolset="example",
+    schema=REPORT_INTENT_SCHEMA,
+    handler=report_intent,
+    run_start_event={
+        "event": "client.intent",
+        "fields": ["text", "speech"],
+    },
+)
+```
+
+`run_start_event` must contain exactly `event` and `fields`. The event name is
+lowercase and namespaced (for example, `client.intent`); the reserved
+`approval`, `message`, `reasoning`, `run`, `subagent`, and `tool` namespaces
+cannot be used. `fields` is a non-empty, duplicate-free list or tuple of
+lowercase argument names. The SSE envelope fields `event`, `run_id`,
+`sequence`, `timestamp`, and `type` are reserved.
+
+When the tool starts, every declared field must be present in the tool-call
+arguments and be a string. Hermes omits undeclared arguments, force-redacts
+secrets and URL credentials, truncates each projected value to 160 characters,
+and emits the custom event with a per-run sequence number. If a declared value
+is missing or is not a string, the projected event is suppressed. The opted-in
+tool's generic `tool.started` and `tool.completed` events are also suppressed
+to avoid duplicate narration.
+
+Projection is limited to `GET /v1/runs/{run_id}/events`; it does not change the
+CLI, messaging gateways, chat-completions streams, Responses API, or session
+chat streams. It projects tool-call arguments only, never handler results.
+
 **`dispatch_tool` example — a slash command that runs a tool:**
 
 ```python
