@@ -96,11 +96,14 @@ POST /v1/runs/{id}/approval      Resolve a pending approval
 POST /v1/runs/{id}/stop          Interrupt the run
 GET  /v1/capabilities            Machine-readable feature flags
 GET  /v1/models                  Lists hermes-agent
+GET  /v1/profiles                Default-listener profile inventory
 GET  /api/model/options          Provider-aware picker inventory
 GET  /health, /health/detailed
 ```
 
 Setup, headers (`X-Hermes-Session-Id`, `X-Hermes-Session-Key`), and frontend wiring: [API Server](../user-guide/features/api-server).
+The API Server guide also defines the profile-inventory response fields,
+default-listener authority boundary, and stable error codes.
 
 ### Model catalog surfaces
 

@@ -202,6 +202,71 @@ Lists the agent as an available model. The advertised model name defaults to the
 enumerate every authenticated provider/model combination Hermes can route to,
 and it does not do pricing or capability enrichment.
 
+### GET /v1/profiles
+
+Returns a complete, bounded roster of Hermes profile identities for
+control-plane clients. The response includes only each profile's canonical ID
+and whether it is the default, active, or currently served profile. It never
+includes filesystem paths, credentials, provider/model configuration,
+descriptions, aliases, skills, or environment data.
+
+Global roster retrieval is intentionally restricted to the **default
+listener** and its `API_SERVER_KEY`:
+
+- Unprefixed `/v1/profiles` and `/p/default/v1/profiles` can return the global
+  roster when authenticated with the default listener's key.
+- When `gateway.multiplex_profiles` is enabled,
+  `/p/<named-profile>/v1/profiles` authenticates with that profile's own key
+  but returns `403`; the endpoint does not return sibling profile IDs. When
+  multiplexing is disabled, Hermes preserves the existing API-server behavior
+  of treating a prefixed path as the unprefixed listener route.
+- An API server started directly under a named profile also returns `403` for
+  the unprefixed inventory route.
+
+Example response:
+
+```json
+{
+  "object": "list",
+  "version": 1,
+  "complete": true,
+  "active_profile": "default",
+  "data": [
+    {
+      "id": "default",
+      "object": "hermes.profile",
+      "is_default": true,
+      "is_active": true,
+      "served": true
+    },
+    {
+      "id": "builder",
+      "object": "hermes.profile",
+      "is_default": false,
+      "is_active": false,
+      "served": true
+    }
+  ]
+}
+```
+
+Endpoint-owned errors use the standard API error envelope. Prefixed routing can
+also reject a request before it reaches the endpoint:
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| `401` | `gateway_auth_failed` | The bearer key is missing, invalid, or belongs to another routed profile. |
+| `404` | None | The existing multiplex router does not recognize the requested profile prefix. |
+| `403` | `profile_inventory_auth_required` | No API-server key is configured; this only applies to unsupported manual wiring and tests because normal startup requires a key. |
+| `403` | `profile_inventory_default_authority_required` | The request authenticated as a named profile, which cannot read the global roster. |
+| `409` | `profile_inventory_too_large` | The roster exceeds the bounded response limit. |
+| `503` | `profile_inventory_unavailable` | Hermes could not validate a complete, consistent snapshot. |
+
+The endpoint is advertised by `/v1/capabilities` through
+`profile_inventory`, `profile_inventory_version`, and
+`profile_inventory_scope`. Clients should require
+`profile_inventory: true` before requesting the roster.
+
 ### GET /api/model/options
 
 Hermes-aware clients can request the same curated provider/model inventory used
@@ -530,6 +595,10 @@ to the routed profile**:
 - Unprefixed routes and `/p/default/...` keep using the default profile's key.
 - A named profile with no `API_SERVER_KEY` of its own fails closed — its
   prefix is unreachable until you set one.
+- While multiplex routing is enabled, global `GET /v1/profiles` inventory is a
+  deliberate exception to mirrored route equivalence: only the default
+  listener has inventory authority. A correctly authenticated named-profile
+  route returns `403` without returning sibling profile IDs.
 
 :::warning Breaking change (July 2026)
 Before this fix, a valid default-profile key was accepted on any
