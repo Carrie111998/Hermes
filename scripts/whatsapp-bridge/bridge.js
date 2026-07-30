@@ -30,7 +30,7 @@ import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { classifyInboundAccessBeforeMedia, matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { matchesAllowedUser, parseAllowedUsers, prepareInboundMediaDispatch } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
@@ -667,10 +667,11 @@ async function startSocket() {
       }
 
       // Apply group policy before extractBridgeEvent() for ordinary inbound
-      // group messages. fromMe groups retain the existing early rejection.
-      // Python repeats this gate as defense in depth, but that later check is
-      // too late to prevent blocked-group media from touching the local cache.
-      const inboundAccess = classifyInboundAccessBeforeMedia({
+      // group messages. fromMe groups retain the existing early rejection at
+      // the top of this handler. Python repeats this gate as defense in depth,
+      // but that later check is too late to prevent blocked-group media from
+      // touching the local cache.
+      const mediaDispatch = prepareInboundMediaDispatch({
         isGroup,
         fromMe: !!msg.key.fromMe,
         chatId,
@@ -680,7 +681,9 @@ async function startSocket() {
         groupPolicy: WHATSAPP_GROUP_POLICY,
         groupAllowedUsers: GROUP_ALLOWED_USERS,
         sessionDir: SESSION_DIR,
+        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
       });
+      const inboundAccess = mediaDispatch.access;
       if (!inboundAccess.allowed) {
         try {
           console.log(JSON.stringify({
@@ -760,7 +763,7 @@ async function startSocket() {
         senderNumber,
         botIds,
         isGroup,
-        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
+        downloadMedia: mediaDispatch.downloadMedia,
         cacheDirs: {
           image: IMAGE_CACHE_DIR,
           document: DOCUMENT_CACHE_DIR,

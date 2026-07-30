@@ -89,8 +89,9 @@ export function classifyInboundAccessBeforeMedia({
   groupAllowedUsers,
   sessionDir,
 }) {
-  // Owner-authored group messages are rejected earlier in bridge.js. This
-  // classifies ordinary inbound groups before media extraction.
+  // Ordinary inbound group messages reach this classifier after the bridge's
+  // existing fromMe-group rejection. Keep their authorization ahead of media
+  // extraction so blocked-group attachments cannot touch disk.
   if (isGroup) {
     if (!matchesInboundWhatsAppGroup({
       chatId,
@@ -108,6 +109,18 @@ export function classifyInboundAccessBeforeMedia({
   }
 
   return { allowed: true };
+}
+
+export function prepareInboundMediaDispatch({ downloadMedia, ...accessInput }) {
+  const access = classifyInboundAccessBeforeMedia(accessInput);
+  const guardedDownloadMedia = async (...args) => {
+    if (!access?.allowed) {
+      throw new Error(access?.reason || 'media_download_rejected_before_access');
+    }
+    return downloadMedia(...args);
+  };
+
+  return { access, downloadMedia: guardedDownloadMedia };
 }
 
 export function matchesAllowedUser(senderId, allowedUsers, sessionDir) {
