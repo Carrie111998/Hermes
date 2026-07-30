@@ -411,11 +411,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
         self._group_policy = str(config.extra.get("group_policy") or os.getenv("WHATSAPP_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
-        read_receipts = config.extra.get("send_read_receipts", False)
-        self._send_read_receipts = (
-            read_receipts if isinstance(read_receipts, bool)
-            else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
-        )
+        read_receipts_env = os.getenv("WHATSAPP_SEND_READ_RECEIPTS")
+        if read_receipts_env is not None:
+            self._send_read_receipts = read_receipts_env.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            read_receipts = config.extra.get("send_read_receipts", False)
+            self._send_read_receipts = (
+                read_receipts if isinstance(read_receipts, bool)
+                else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
+            )
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = None
@@ -1796,6 +1800,8 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         os.environ["WHATSAPP_ALLOWED_USERS"] = str(af)
     if "group_policy" in whatsapp_cfg and not os.getenv("WHATSAPP_GROUP_POLICY"):
         os.environ["WHATSAPP_GROUP_POLICY"] = str(whatsapp_cfg["group_policy"]).lower()
+    if "send_read_receipts" in whatsapp_cfg and not os.getenv("WHATSAPP_SEND_READ_RECEIPTS"):
+        os.environ["WHATSAPP_SEND_READ_RECEIPTS"] = str(whatsapp_cfg["send_read_receipts"]).lower()
     gaf = whatsapp_cfg.get("group_allow_from")
     if gaf is not None and not os.getenv("WHATSAPP_GROUP_ALLOWED_USERS"):
         if isinstance(gaf, list):
