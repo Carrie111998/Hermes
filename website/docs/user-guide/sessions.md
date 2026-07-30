@@ -653,16 +653,22 @@ The SQLite database uses WAL mode for concurrent readers and a single writer, wh
 :::warning Sessions are per profile
 The paths above are relative to the **active profile's** `HERMES_HOME`, not to a single
 shared database. `~/.hermes/state.db` holds the default profile's sessions; a session
-started under profile `work` lives in `~/.hermes/profiles/work/state.db` and is invisible
-from any other profile. `hermes sessions list`, `/sessions`, `session_search`, and the
-dashboard all read the active profile's database only.
+started under profile `work` lives in its own `~/.hermes/profiles/work/state.db`.
 
-So if a session has vanished, check the other profiles before concluding it was lost:
+Nothing crosses profiles unless you ask it to. `hermes sessions list` and `/sessions` read
+the active profile's database and no other, so if a session has vanished, check the other
+profiles before concluding it was lost:
 
 ```bash
 hermes profile list
 hermes --profile work sessions list
 ```
+
+Where a cross-profile read is asked for, it works. `session_search` takes a `profile`
+argument and opens that profile's database read-only — this is how `@session:<profile>/<id>`
+links resolve — and given a session id with no profile attached, it falls back to scanning
+every profile's database to find the owner. The dashboard scopes its listings to whichever
+profile it has focused.
 
 Profile-scoped storage is also why `hermes profile create --clone-all` excludes
 `state.db` — history belongs to the source profile. See [Profiles](/user-guide/profiles).
