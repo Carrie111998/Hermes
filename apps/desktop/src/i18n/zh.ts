@@ -2078,6 +2078,8 @@ export const zh: Translations = {
     loading: '加载中…',
     loadMore: '加载更多',
     loadCount: step => `再加载 ${step} 个`,
+    messageCount: count => `${count} 条消息`,
+    toolCallCount: count => `${count} 次工具调用`,
     row: {
       pin: '置顶',
       unpin: '取消置顶',
