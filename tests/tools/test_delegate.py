@@ -3337,6 +3337,31 @@ class TestAcpResultClassification(unittest.TestCase):
         )
         self.assertEqual(result["status"], "completed")
 
+    def test_parenthesized_natural_language_summary_is_completed(self):
+        """Regression (review of #68515): the parenthetical in the
+        model-ID pattern used to accept arbitrary prose ([^)]{0,120}), so
+        "Claude (I completed the task)" -- a genuine, natural-language task
+        result that just happens to use parentheses -- matched the bare
+        model-ID expression and was misclassified as failed. The
+        parenthetical is now constrained to the same identifier-token
+        vocabulary as the unparenthesized variant/version tokens, so only
+        genuine metadata like "(Sonnet 4.5)" matches; common English words
+        inside the parens ("completed", "the", "task") don't fit that
+        grammar and the whole pattern fails to match."""
+        result = self._run_with_summary("Claude (I completed the task)")
+        self.assertEqual(result["status"], "completed", (
+            "A natural-language summary using parentheses must not be "
+            "misclassified as a bare model-ID disclosure"
+        ))
+
+    def test_genuine_parenthesized_model_id_is_still_failed(self):
+        """Sanity: this fix must not regress the case it was added FOR --
+        a genuine bare model-ID disclosure with version metadata in
+        parentheses (e.g. "Claude (Sonnet 4.5)") must still be classified
+        as failed."""
+        result = self._run_with_summary("Claude (Sonnet 4.5)")
+        self.assertEqual(result["status"], "failed")
+
     def test_acp_abort_marker_in_acp_context_is_failed(self):
         """ACP abort marker in ACP context must be classified as failed."""
         parent = _make_mock_parent(depth=0)

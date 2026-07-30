@@ -2168,11 +2168,24 @@ def _run_single_child(
             # misclassified: "I", "completed", "the", "task" etc. don't fit
             # the variant/version grammar, so the match can't reach the
             # end-of-string anchor and the whole pattern fails.
+            #
+            # The parenthetical is constrained to the SAME identifier-token
+            # vocabulary as the unparenthesized variant/version tokens above
+            # (rather than an earlier [^)]{0,120} accepting arbitrary prose),
+            # so it only matches genuine metadata like "(Sonnet 4.5)" or
+            # "(2024-10-22, preview)" -- a natural-language summary that
+            # happens to use parentheses, e.g. "Claude (I completed the
+            # task)", cannot match: "I", "completed", "the", "task" aren't
+            # identifier tokens, so the parenthetical (and therefore the
+            # whole end-anchored pattern) fails to match (review of #68515).
+            _ID_TOKEN = (
+                r"(?:sonnet|opus|haiku|pro|mini|flash|turbo|instruct|"
+                r"chat|preview|latest|\.\.\.|[\w.-]*\d[\w.-]*)"
+            )
             _MODEL_ID_RE = re.compile(
                 r"^(?:claude|gpt|gemini|sonnet|opus|haiku|mistral|deepseek|llama)"
-                r"(?:[\s:_/-]+(?:sonnet|opus|haiku|pro|mini|flash|turbo|instruct|"
-                r"chat|preview|latest|[\w.-]*\d[\w.-]*))*"
-                r"(?:\s*\([^)]{0,120}\))?"
+                rf"(?:[\s:_/-]+{_ID_TOKEN})*"
+                rf"(?:\s*\({_ID_TOKEN}(?:[\s,]+{_ID_TOKEN})*\))?"
                 r"\s*$",
                 re.IGNORECASE,
             )
