@@ -1,6 +1,24 @@
 export const OVERLAY_FALLBACK_WIDTH = 144
 
 /**
+ * Whether the WSL special case should SUPPRESS the Window Controls Overlay.
+ *
+ * WSLg was assumed to paint min/max/close via the RDP host's own frame, so the
+ * overlay was suppressed on WSL — but in practice common WSLg builds (e.g.
+ * 1.0.65) paint NO controls at all, leaving a dead frameless window with no
+ * way to minimize, maximize, or close it (#57614). The overlay is therefore
+ * requested on WSL by default; HERMES_DESKTOP_WSL_NO_WCO=1 restores the old
+ * suppression if some WSLg build ever double-paints controls.
+ *
+ * Native Windows never suppresses — only Linux-on-WSL is the special case.
+ *
+ * @param {{ isWindows?: boolean, isWsl?: boolean, wslNoWcoEnv?: string }} opts
+ */
+export function shouldSuppressWcoOnWsl({ isWindows = false, isWsl = false, wslNoWcoEnv = '' } = {}) {
+  return !isWindows && isWsl && wslNoWcoEnv === '1'
+}
+
+/**
  * Static pre-layout reservation (px) for the right-side native window-controls
  * overlay (min/max/close). Only a FALLBACK — once laid out the renderer reads
  * the exact width from navigator.windowControlsOverlay
