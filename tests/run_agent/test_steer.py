@@ -23,7 +23,9 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._pending_steer_chunks = []
     agent._pending_steer_is_gateway_session_ipc = False
+    agent._codex_native_pending_steer_chunks = []
     agent._steer_accepting = True
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
@@ -94,6 +96,20 @@ class TestSteerDrain:
         assert trusted is True
         assert agent._pending_steer is None
         assert agent._pending_steer_is_gateway_session_ipc is False
+
+    def test_mixed_steers_retain_independent_provenance(self):
+        agent = _bare_agent()
+        assert agent.steer("/stop") is True
+        assert agent.steer(
+            "/restart trusted task",
+            _gateway_session_ipc=True,
+        ) is True
+
+        assert agent._close_steer_admission_with_chunks() == [
+            ("/stop", False),
+            ("/restart trusted task", True),
+        ]
+        assert agent._pending_steer is None
 
 
 
@@ -232,6 +248,24 @@ class TestActiveTurnRedirect:
         )
         assert calls == ["/restart trusted task"]
         assert agent._pending_steer is None
+        assert [
+            (text, trusted)
+            for _token, text, trusted in (
+                agent._codex_native_pending_steer_chunks
+            )
+        ] == [("/restart trusted task", True)]
+
+    def test_rejected_codex_native_steer_is_not_retained(self):
+        agent = _bare_agent()
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = type(
+            "_CodexSession",
+            (),
+            {"request_steer": lambda self, text: False},
+        )()
+
+        assert agent.steer("too late") is False
+        assert agent._codex_native_pending_steer_chunks == []
 
 
     def test_redirect_during_tool_execution_uses_safe_steer_boundary(self):

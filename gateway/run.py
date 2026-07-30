@@ -2698,6 +2698,73 @@ def _event_for_leftover_gateway_session_ipc_steer(
     )
 
 
+def _leftover_steer_chunks(
+    result: dict[str, Any],
+) -> list[tuple[str, bool]]:
+    """Decode lossless steer handoff, with legacy single-value fallback."""
+    raw_chunks = result.get("pending_steer_chunks")
+    chunks: list[tuple[str, bool]] = []
+    if isinstance(raw_chunks, list):
+        for raw in raw_chunks:
+            if not isinstance(raw, dict):
+                continue
+            text = str(raw.get("text") or "").strip()
+            if text:
+                chunks.append(
+                    (
+                        text,
+                        bool(raw.get("gateway_session_ipc")),
+                    )
+                )
+    if chunks:
+        return chunks
+    text = str(result.get("pending_steer") or "").strip()
+    return (
+        [
+            (
+                text,
+                bool(result.get("pending_steer_is_gateway_session_ipc")),
+            )
+        ]
+        if text
+        else []
+    )
+
+
+def _event_for_leftover_steer(
+    text: str,
+    *,
+    trusted_session_ipc: bool,
+    source: SessionSource,
+) -> MessageEvent:
+    if trusted_session_ipc:
+        return _new_gateway_session_ipc_event(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+        )
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+
+
+def _events_for_leftover_steers(
+    result: dict[str, Any],
+    source: SessionSource,
+) -> list[MessageEvent]:
+    return [
+        _event_for_leftover_steer(
+            text,
+            trusted_session_ipc=trusted,
+            source=source,
+        )
+        for text, trusted in _leftover_steer_chunks(result)
+    ]
+
+
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
@@ -5129,38 +5196,68 @@ class TurnRunner:
             # The normal finalizer closes this at its last steer drain.  Also
             # close here so an exceptional gateway turn cannot leave a cached
             # agent accepting steers that no running loop can consume.
-            _close_with_provenance = getattr(
+            _close_with_chunks = getattr(
                 agent,
-                "_close_steer_admission_with_provenance",
+                "_close_steer_admission_with_chunks",
                 None,
             )
-            if callable(_close_with_provenance):
-                _unconsumed_steer, _steer_is_session_ipc = (
-                    _close_with_provenance()
-                )
+            if callable(_close_with_chunks):
+                _unconsumed_steer_chunks = _close_with_chunks()
             else:
-                _close_steer_admission = getattr(
+                _close_with_provenance = getattr(
                     agent,
-                    "_close_steer_admission",
+                    "_close_steer_admission_with_provenance",
                     None,
                 )
-                _unconsumed_steer = (
-                    _close_steer_admission()
-                    if callable(_close_steer_admission)
-                    else None
+                if callable(_close_with_provenance):
+                    _unconsumed_steer, _steer_is_session_ipc = (
+                        _close_with_provenance()
+                    )
+                else:
+                    _close_steer_admission = getattr(
+                        agent,
+                        "_close_steer_admission",
+                        None,
+                    )
+                    _unconsumed_steer = (
+                        _close_steer_admission()
+                        if callable(_close_steer_admission)
+                        else None
+                    )
+                    _steer_is_session_ipc = False
+                _unconsumed_steer_chunks = (
+                    [
+                        (
+                            str(_unconsumed_steer),
+                            _steer_is_session_ipc,
+                        )
+                    ]
+                    if str(_unconsumed_steer or "").strip()
+                    else []
                 )
-                _steer_is_session_ipc = False
             if (
                 not _conversation_completed
-                and str(_unconsumed_steer or "").strip()
+                and callable(
+                    getattr(
+                        agent,
+                        "_drain_codex_native_pending_steer_chunks",
+                        None,
+                    )
+                )
+            ):
+                _unconsumed_steer_chunks.extend(
+                    agent._drain_codex_native_pending_steer_chunks()
+                )
+            if (
+                not _conversation_completed
+                and _unconsumed_steer_chunks
             ):
                 try:
                     _preserve_future = asyncio.run_coroutine_threadsafe(
-                        self._runner._requeue_failed_turn_steer(
+                        self._runner._requeue_failed_turn_steers(
                             ctx.session_key,
                             ctx.source,
-                            str(_unconsumed_steer),
-                            trusted_session_ipc=_steer_is_session_ipc,
+                            _unconsumed_steer_chunks,
                         ),
                         ctx._loop_for_step,
                     )
@@ -8529,36 +8626,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         trusted_session_ipc: bool,
     ) -> bool:
         """Put an accepted steer first in line when its active turn raises."""
-        adapter = self._adapter_for_source(source)
-        pending_text = str(text or "").strip()
-        if adapter is None or not session_key or not pending_text:
-            return False
-        event = (
-            _new_gateway_session_ipc_event(
-                text=pending_text,
-                message_type=MessageType.TEXT,
-                source=source,
-                internal=True,
-            )
-            if trusted_session_ipc
-            else MessageEvent(
-                text=pending_text,
-                message_type=MessageType.TEXT,
-                source=source,
-            )
+        return await self._requeue_failed_turn_steers(
+            session_key,
+            source,
+            [(text, trusted_session_ipc)],
         )
+
+    async def _requeue_failed_turn_steers(
+        self,
+        session_key: str,
+        source: SessionSource,
+        chunks: list[tuple[str, bool]],
+    ) -> bool:
+        """Put accepted steers first in line without collapsing provenance."""
+        adapter = self._adapter_for_source(source)
+        events = [
+            _event_for_leftover_steer(
+                pending_text,
+                trusted_session_ipc=trusted,
+                source=source,
+            )
+            for text, trusted in chunks
+            if (pending_text := str(text or "").strip())
+        ]
+        if adapter is None or not session_key or not events:
+            return False
         with self._busy_queue_guard():
             pending_slot = getattr(adapter, "_pending_messages", None)
             if pending_slot is None:
                 return False
             existing = pending_slot.get(session_key)
-            if existing is not None:
-                # The accepted steer belonged to the failed active turn, so it
-                # precedes follow-ups already waiting for their own turns.
-                self._session_state(
-                    session_key
-                ).conversation.queued_events.insert(0, existing)
-            pending_slot[session_key] = event
+            queue = self._session_state(
+                session_key
+            ).conversation.queued_events
+            # Accepted steers belonged to the failed active turn, so all of
+            # them precede follow-ups already waiting for their own turns.
+            ordered = events + ([existing] if existing is not None else []) + queue
+            pending_slot[session_key] = ordered[0]
+            self._session_state(
+                session_key
+            ).conversation.queued_events = ordered[1:]
         return True
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
@@ -24780,13 +24887,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # and returned it in result["pending_steer"]. Deliver it as the
             # next user turn so it isn't silently dropped.
             if result and not pending and not pending_event:
-                _leftover_steer = result.get("pending_steer")
-                if _leftover_steer:
-                    pending = _leftover_steer
-                    pending_event = _event_for_leftover_gateway_session_ipc_steer(
-                        result,
-                        source,
-                    )
+                _leftover_events = _events_for_leftover_steers(result, source)
+                if _leftover_events:
+                    pending_event = _leftover_events[0]
+                    pending = pending_event.text
+                    if len(_leftover_events) > 1:
+                        adapter = self._adapter_for_source(source)
+                        with self._busy_queue_guard():
+                            pending_slot = (
+                                getattr(adapter, "_pending_messages", None)
+                                if adapter is not None
+                                else None
+                            )
+                            if pending_slot is not None and session_key:
+                                existing = pending_slot.get(session_key)
+                                queue = self._session_state(
+                                    session_key
+                                ).conversation.queued_events
+                                ordered = (
+                                    _leftover_events[1:]
+                                    + (
+                                        [existing]
+                                        if existing is not None
+                                        else []
+                                    )
+                                    + queue
+                                )
+                                pending_slot[session_key] = ordered[0]
+                                self._session_state(
+                                    session_key
+                                ).conversation.queued_events = ordered[1:]
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",

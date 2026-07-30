@@ -470,6 +470,35 @@ async def test_failed_turn_requeues_accepted_ipc_steer_before_followups():
     assert recovered.text == "/restart trusted recovery task"
     assert runner._queued_events[SESSION_KEY] == [existing, tail]
 
+@pytest.mark.asyncio
+async def test_failed_turn_requeues_mixed_steers_with_independent_trust():
+    runner, adapter = _runner(_entry())
+    existing = MessageEvent(
+        text="already waiting",
+        message_type=MessageType.TEXT,
+        source=_source(),
+    )
+    adapter._pending_messages[SESSION_KEY] = existing
+
+    preserved = await runner._requeue_failed_turn_steers(
+        SESSION_KEY,
+        _source(),
+        [
+            ("/stop", False),
+            ("/restart trusted recovery task", True),
+        ],
+    )
+
+    user_command = adapter._pending_messages[SESSION_KEY]
+    trusted_task, followup = runner._queued_events[SESSION_KEY]
+    assert preserved is True
+    assert gateway_run._pending_slash_is_command_leak(
+        user_command.text, user_command
+    ) is True
+    assert is_gateway_session_ipc_task(trusted_task)
+    assert trusted_task.text == "/restart trusted recovery task"
+    assert followup is existing
+
 
 @pytest.mark.asyncio
 async def test_busy_steer_queues_nonempty_text_when_admission_closed():
@@ -539,6 +568,33 @@ def test_leftover_gateway_ipc_steer_rebuilds_protected_event():
     assert is_gateway_session_ipc_task(event)
     assert event.is_command() is False
     assert gateway_run._pending_slash_is_command_leak(event.text, event) is False
+
+def test_mixed_leftover_steers_rebuild_separate_trust_domains():
+    events = gateway_run._events_for_leftover_steers(
+        {
+            "pending_steer": "/stop\n/restart trusted task",
+            "pending_steer_chunks": [
+                {"text": "/stop", "gateway_session_ipc": False},
+                {
+                    "text": "/restart trusted task",
+                    "gateway_session_ipc": True,
+                },
+            ],
+        },
+        _source(),
+    )
+
+    assert [event.text for event in events] == [
+        "/stop",
+        "/restart trusted task",
+    ]
+    assert gateway_run._pending_slash_is_command_leak(
+        events[0].text, events[0]
+    ) is True
+    assert is_gateway_session_ipc_task(events[1])
+    assert gateway_run._pending_slash_is_command_leak(
+        events[1].text, events[1]
+    ) is False
 
 
 @pytest.mark.asyncio

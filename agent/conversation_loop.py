@@ -1345,16 +1345,34 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
-        _drain_with_provenance = getattr(
-            agent, "_drain_pending_steer_with_provenance", None
-        )
-        if callable(_drain_with_provenance):
-            _pre_api_steer, _pre_api_steer_is_gateway_session_ipc = (
-                _drain_with_provenance()
+        _drain_chunks = getattr(agent, "_drain_pending_steer_chunks", None)
+        if callable(_drain_chunks):
+            _pre_api_steer_chunks = _drain_chunks()
+            _pre_api_steer = (
+                "\n".join(text for text, _trusted in _pre_api_steer_chunks)
+                or None
             )
         else:
-            _pre_api_steer = agent._drain_pending_steer()
-            _pre_api_steer_is_gateway_session_ipc = False
+            _drain_with_provenance = getattr(
+                agent, "_drain_pending_steer_with_provenance", None
+            )
+            if callable(_drain_with_provenance):
+                _pre_api_steer, _pre_api_steer_is_gateway_session_ipc = (
+                    _drain_with_provenance()
+                )
+            else:
+                _pre_api_steer = agent._drain_pending_steer()
+                _pre_api_steer_is_gateway_session_ipc = False
+            _pre_api_steer_chunks = (
+                [
+                    (
+                        _pre_api_steer,
+                        _pre_api_steer_is_gateway_session_ipc,
+                    )
+                ]
+                if _pre_api_steer
+                else []
+            )
         if _pre_api_steer:
             _injected = False
             for _si in range(len(messages) - 1, -1, -1):
@@ -1382,17 +1400,26 @@ def run_conversation(
             if not _injected:
                 # No tool message to inject into — put it back so
                 # the post-tool-execution drain picks it up later.
-                _restore_pending_steer = getattr(
-                    agent, "_restore_pending_steer", None
+                _restore_pending_steer_chunks = getattr(
+                    agent, "_restore_pending_steer_chunks", None
                 )
-                if callable(_restore_pending_steer):
+                if callable(_restore_pending_steer_chunks):
+                    _restore_pending_steer_chunks(_pre_api_steer_chunks)
+                else:
+                    _restore_pending_steer = getattr(
+                        agent, "_restore_pending_steer", None
+                    )
+                if (
+                    not callable(_restore_pending_steer_chunks)
+                    and callable(_restore_pending_steer)
+                ):
                     _restore_pending_steer(
                         _pre_api_steer,
                         is_gateway_session_ipc=(
                             _pre_api_steer_is_gateway_session_ipc
                         ),
                     )
-                else:
+                elif not callable(_restore_pending_steer_chunks):
                     _lock = getattr(agent, "_pending_steer_lock", None)
                     if _lock is not None:
                         with _lock:
