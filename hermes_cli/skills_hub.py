@@ -1081,19 +1081,22 @@ def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> N
     c.print(f"[dim]{update_count} update(s) available across {len(results)} checked skill(s)[/]\n")
 
 
-def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> None:
-    """Update hub-installed skills with upstream changes."""
+def do_update(
+    name: Optional[str] = None,
+    console: Optional[Console] = None,
+) -> bool:
+    """Update hub-installed skills, returning False on a policy refusal."""
     from tools.skills_hub import HubLockFile, check_for_skill_updates
 
     c = console or _console
     target = name if name is not None else "all installed skills"
     if _content_write_refused(f"update {target}", c):
-        return
+        return False
     lock = HubLockFile()
     updates = [entry for entry in check_for_skill_updates(name=name) if entry.get("status") == "update_available"]
     if not updates:
         c.print("[dim]No updates available.[/]\n")
-        return
+        return True
 
     for entry in updates:
         installed = lock.get_installed(entry["name"])
@@ -1115,6 +1118,7 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
         )
 
     c.print(f"[bold green]Updated {len(updates)} skill(s).[/]\n")
+    return True
 
 
 def do_audit(name: Optional[str] = None, console: Optional[Console] = None,
@@ -1768,7 +1772,7 @@ def do_snapshot_import(input_path: str, force: bool = False,
 # CLI argparse entry point
 # ---------------------------------------------------------------------------
 
-def skills_command(args) -> None:
+def skills_command(args) -> Optional[int]:
     """Router for `hermes skills <subcommand>` — called from hermes_cli/main.py."""
     action = getattr(args, "skills_action", None)
 
@@ -1791,7 +1795,8 @@ def skills_command(args) -> None:
     elif action == "check":
         do_check(name=getattr(args, "name", None))
     elif action == "update":
-        do_update(name=getattr(args, "name", None))
+        if not do_update(name=getattr(args, "name", None)):
+            return 2
     elif action == "audit":
         do_audit(name=getattr(args, "name", None),
                  deep=getattr(args, "deep", False))

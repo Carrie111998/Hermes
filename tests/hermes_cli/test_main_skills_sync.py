@@ -1,6 +1,7 @@
 """Startup behavior at the managed read-only skills boundary."""
 
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 import pytest
@@ -135,6 +136,28 @@ def test_main_oneshot_routes_preloaded_nested_skill(monkeypatch):
 
     assert captured["prompt"] == "Return the loaded skill name only."
     assert captured["skills"] == ["planning/ticket-decomposition"]
+
+
+def test_cmd_skills_propagates_policy_refusal_status(tmp_path, monkeypatch):
+    from hermes_cli import main as main_mod
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "skills:\n  content_mode: read_only\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert (
+        main_mod.cmd_skills(
+            SimpleNamespace(
+                skills_action="update",
+                name="planning/ticket-decomposition",
+            )
+        )
+        == 2
+    )
 
 
 @pytest.mark.asyncio

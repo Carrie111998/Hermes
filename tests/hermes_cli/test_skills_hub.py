@@ -123,8 +123,12 @@ def test_nested_update_refuses_before_remote_check(monkeypatch, tmp_path):
 
     sink = StringIO()
     console = Console(file=sink, force_terminal=False, color_system=None)
-    do_update(name="planning/ticket-decomposition", console=console)
+    result = do_update(
+        name="planning/ticket-decomposition",
+        console=console,
+    )
 
+    assert result is False
     assert "SKILLS_CONTENT_READ_ONLY" in sink.getvalue()
     after = {
         path.relative_to(home / "skills").as_posix(): path.read_bytes()
