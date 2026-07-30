@@ -1947,16 +1947,22 @@ def _tui_external_local_workspaces(tui_dir: Path) -> list[tuple[Path, Path]]:
     return sorted(local_workspaces.items(), key=lambda item: item[0].as_posix())
 
 
+def _iter_tui_workspace_inputs(relative: Path, workspace: Path):
+    """Yield copied workspace files, rejecting symlinks before they can escape."""
+    for path in workspace.rglob("*"):
+        workspace_relative = path.relative_to(workspace)
+        if any(part in {"node_modules", "dist"} for part in workspace_relative.parts):
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f"refusing symlink in TUI workspace: {path}")
+        if path.is_file():
+            yield relative / workspace_relative, path
+
+
 def _iter_tui_external_workspace_inputs(tui_dir: Path):
     """Yield files copied from external local workspaces into the cache build."""
     for relative, workspace in _tui_external_local_workspaces(tui_dir):
-        for path in workspace.rglob("*"):
-            if not path.is_file():
-                continue
-            workspace_relative = path.relative_to(workspace)
-            if any(part in {"node_modules", "dist"} for part in workspace_relative.parts):
-                continue
-            yield relative / workspace_relative, path
+        yield from _iter_tui_workspace_inputs(relative, workspace)
 
 
 def _tui_bundle_stamp(root: Path) -> str:
@@ -2007,6 +2013,34 @@ def _tui_cached_bundle_current(tui_dir: Path, cache_dir: Path) -> bool:
         return False
 
 
+def _tui_cache_lock_reclaimable(lock_dir: Path, *, stale_after: float) -> bool:
+    """Return whether an old cache lock has no live owner and may be removed."""
+    try:
+        if _time.time() - lock_dir.stat().st_mtime <= stale_after:
+            return False
+    except OSError:
+        return False
+
+    try:
+        fields = dict(
+            line.split("=", 1)
+            for line in (lock_dir / "owner").read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+        owner_pid = int(fields["pid"])
+        if owner_pid <= 0:
+            return True
+    except (OSError, KeyError, TypeError, ValueError):
+        return True
+
+    try:
+        from gateway.status import _pid_exists
+
+        return not _pid_exists(owner_pid)
+    except Exception:
+        return False
+
+
 def _ensure_tui_cached_bundle(
     tui_dir: Path,
     *,
@@ -2043,11 +2077,7 @@ def _ensure_tui_cached_bundle(
             )
             lock_acquired = True
         except FileExistsError:
-            try:
-                stale = _time.time() - lock_dir.stat().st_mtime > 1200
-            except OSError:
-                stale = False
-            if stale:
+            if _tui_cache_lock_reclaimable(lock_dir, stale_after=1200):
                 shutil.rmtree(lock_dir, ignore_errors=True)
                 continue
             if _time.monotonic() >= lock_deadline:
@@ -2098,7 +2128,10 @@ def _ensure_tui_cached_bundle(
                     workspace,
                     destination,
                     ignore=shutil.ignore_patterns("node_modules", "dist"),
+                    symlinks=True,
                 )
+                for _input in _iter_tui_workspace_inputs(relative, destination):
+                    pass
             if build_dir.exists():
                 shutil.rmtree(build_dir)
             tmp_build.replace(build_dir)

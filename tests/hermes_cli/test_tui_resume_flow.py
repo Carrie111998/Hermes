@@ -474,6 +474,63 @@ def test_tui_bundle_stamp_tracks_external_file_workspace(main_mod, tmp_path):
     assert main_mod._tui_bundle_stamp(tui_dir) != first
 
 
+def test_tui_bundle_stamp_rejects_symlinks_in_external_workspace(main_mod, tmp_path):
+    repo = tmp_path / "repo"
+    tui_dir = repo / "ui-tui"
+    shared_dir = repo / "apps" / "shared"
+    outside = tmp_path / "outside"
+    (tui_dir / "src").mkdir(parents=True)
+    shared_dir.mkdir(parents=True)
+    outside.mkdir()
+    (repo / "package.json").write_text(
+        '{"private":true,"workspaces":["apps/*","ui-tui"]}', encoding="utf-8"
+    )
+    (repo / "package-lock.json").write_text(
+        '{"name":"hermes-agent","lockfileVersion":3,"packages":{}}',
+        encoding="utf-8",
+    )
+    (tui_dir / "package.json").write_text(
+        '{"name":"hermes-tui","dependencies":'
+        '{"@hermes/shared":"file:../apps/shared"}}',
+        encoding="utf-8",
+    )
+    (outside / "secret.ts").write_text("export const secret = true\n", encoding="utf-8")
+    (shared_dir / "escape").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        main_mod._tui_bundle_stamp(tui_dir)
+
+
+def test_tui_cache_lock_is_not_reclaimable_while_owner_is_alive(
+    monkeypatch, main_mod, tmp_path
+):
+    from gateway import status as gateway_status
+
+    lock_dir = tmp_path / "tui-bundle.lock"
+    lock_dir.mkdir()
+    (lock_dir / "owner").write_text("pid=4242\nstarted=1\n", encoding="utf-8")
+    os.utime(lock_dir, (1, 1))
+    monkeypatch.setattr(main_mod._time, "time", lambda: 5000)
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda pid: pid == 4242)
+
+    assert not main_mod._tui_cache_lock_reclaimable(lock_dir, stale_after=1200)
+
+
+def test_tui_cache_lock_is_reclaimable_after_old_owner_exits(
+    monkeypatch, main_mod, tmp_path
+):
+    from gateway import status as gateway_status
+
+    lock_dir = tmp_path / "tui-bundle.lock"
+    lock_dir.mkdir()
+    (lock_dir / "owner").write_text("pid=4242\nstarted=1\n", encoding="utf-8")
+    os.utime(lock_dir, (1, 1))
+    monkeypatch.setattr(main_mod._time, "time", lambda: 5000)
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: False)
+
+    assert main_mod._tui_cache_lock_reclaimable(lock_dir, stale_after=1200)
+
+
 def test_tui_cache_refresh_keeps_previous_returned_generation_launchable(
     monkeypatch, main_mod, tmp_path
 ):
