@@ -100,6 +100,33 @@ _DEFAULT_FILE_RETRIES = 1
 _DURATIONS_FILE = "test_durations.json"
 
 
+def _split_file_list(value: str) -> List[str]:
+    """Split a colon-separated ``--files`` value without splitting drive roots."""
+    files: List[str] = []
+    entry_start = 0
+
+    for index, char in enumerate(value):
+        if char != ":":
+            continue
+        is_windows_drive = (
+            index == entry_start + 1
+            and value[entry_start].isalpha()
+            and index + 1 < len(value)
+            and value[index + 1] in ("/", "\\")
+        )
+        if is_windows_drive:
+            continue
+        entry = value[entry_start:index]
+        if entry.strip():
+            files.append(entry)
+        entry_start = index + 1
+
+    entry = value[entry_start:]
+    if entry.strip():
+        files.append(entry)
+    return files
+
+
 def _approximately_count_tests(
     files: List[Path], repo_root: Path
 ) -> dict[Path, int]:
@@ -816,7 +843,7 @@ def main() -> int:
 
     # --files: explicit file list from the CI generate job — skip discovery.
     if args.files:
-        files = [repo_root / f for f in args.files.split(":") if f.strip()]
+        files = [repo_root / f for f in _split_file_list(args.files)]
         roots = []
     else:
         # Resolve discovery roots: positional path args override --paths if any

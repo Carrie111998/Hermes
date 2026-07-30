@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts import run_tests_parallel
+
 
 # Both tests share the same handoff file: the leaker writes here, the
 # verifier reads here. We park it in $TMPDIR with a unique-per-run name
@@ -305,6 +307,27 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     # Discovery found the probe file (2 tests), proving the positional path
     # was consumed as a root, not forwarded to pytest as a bad flag.
     assert "test_flagprobe.py" in proc.stdout, proc.stdout
+
+
+def test_files_list_preserves_posix_and_relative_colon_syntax() -> None:
+    """Colon-separated POSIX and relative file lists keep their existing grammar."""
+    assert run_tests_parallel._split_file_list(
+        "/tmp/test_one.py:/opt/tests/test_two.py:tests/test_three.py"
+    ) == [
+        "/tmp/test_one.py",
+        "/opt/tests/test_two.py",
+        "tests/test_three.py",
+    ]
+
+
+def test_files_list_preserves_windows_drive_colons() -> None:
+    """Drive designators are path syntax, not separators between ``--files``."""
+    assert run_tests_parallel._split_file_list(
+        r"C:\temp\test_one.py:D:/work/tests/test_two.py"
+    ) == [
+        r"C:\temp\test_one.py",
+        "D:/work/tests/test_two.py",
+    ]
 
 
 def test_file_retry_self_heals_and_prints_both_attempts(tmp_path: Path) -> None:
