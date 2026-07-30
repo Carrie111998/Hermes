@@ -255,6 +255,127 @@ def _exited_status(code: int) -> int:
 
 
 
+def test_classify_worker_exit_recognizes_clean_exit_as_protocol_signal(
+    kanban_home,
+):
+    import hermes_cli.kanban_db as _kb
+
+    pid = 31337
+    _kb._record_worker_exit(pid, _exited_status(0))
+
+    assert _kb._classify_worker_exit(pid) == ("clean_exit", 0)
+
+
+
+def test_clean_worker_exit_without_terminal_transition_requeues_with_reason(
+    kanban_home, monkeypatch,
+):
+    """A worker returning rc=0 without complete/block must not ghost silently.
+
+    The dispatcher observes the reaped clean exit, notices the task is still
+    running, emits a protocol_violation event, returns the task to ready for a
+    bounded retry, and stamps a corrective reason for the next worker.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="clean-no-handoff", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        pid = 42420
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?",
+            (pid, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(0))
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert crashed == [tid]
+        assert getattr(_kb.detect_crashed_workers, "_last_auto_blocked", []) == []
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.worker_pid is None
+        assert task.claim_lock is None
+        assert task.last_failure_error is not None
+        assert "without calling kanban_complete or kanban_block" in task.last_failure_error
+        assert task.consecutive_failures == 0
+
+        events = kb.list_events(conn, tid)
+        protocol_events = [e for e in events if e.kind == "protocol_violation"]
+        assert len(protocol_events) == 1
+        assert protocol_events[0].payload == {
+            "pid": pid,
+            "claimer": f"{host}:worker",
+            "exit_code": 0,
+            "protocol_violation": True,
+        }
+        assert [e.kind for e in events if e.kind == "gave_up"] == []
+
+        runs = conn.execute(
+            "SELECT outcome, status, error, metadata FROM task_runs WHERE task_id=?",
+            (tid,),
+        ).fetchall()
+        assert len(runs) == 1
+        assert [(r["outcome"], r["status"]) for r in runs] == [("crashed", "crashed")]
+        assert runs[0]["error"] is not None
+        assert "protocol violation" in runs[0]["error"]
+        assert runs[0]["metadata"] is not None
+        assert '"protocol_violation": true' in runs[0]["metadata"]
+
+
+
+def test_repeated_clean_worker_exits_without_terminal_transition_auto_block(
+    kanban_home, monkeypatch,
+):
+    """A repeated no-complete/no-block clean exit trips the violation budget."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="repeat-clean-no-handoff", assignee="a")
+
+        for i in range(_kb._PROTOCOL_VIOLATION_FAILURE_LIMIT):
+            claim = kb.claim_task(conn, tid, claimer=f"{host}:worker-{i}")
+            assert claim is not None
+            pid = 42500 + i
+            conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=?",
+                (pid, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(pid, _exited_status(0))
+            kb.detect_crashed_workers(conn)
+
+        assert getattr(_kb.detect_crashed_workers, "_last_auto_blocked", []) == [tid]
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.worker_pid is None
+        assert task.claim_lock is None
+        assert task.last_failure_error is not None
+        assert "without calling kanban_complete or kanban_block" in task.last_failure_error
+        assert task.consecutive_failures == 1
+
+        events = kb.list_events(conn, tid)
+        assert len([e for e in events if e.kind == "protocol_violation"]) == 3
+        gave_up_events = [e for e in events if e.kind == "gave_up"]
+        assert len(gave_up_events) == 1
+        assert gave_up_events[0].payload is not None
+        assert gave_up_events[0].payload["trigger_outcome"] == "crashed"
+        assert gave_up_events[0].payload["protocol_violations"] == 3
+        assert gave_up_events[0].payload["protocol_violation_limit"] == 3
+        assert "protocol violation" in gave_up_events[0].payload["error"]
+
+
 
 def test_rate_limit_exit_requeues_without_counting_failure(
     kanban_home, monkeypatch,
