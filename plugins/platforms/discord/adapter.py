@@ -884,6 +884,10 @@ class DiscordAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
         self._client: Optional[commands.Bot] = None
+        # The Discord HTTP client is bound to the gateway's event loop. Sync
+        # tool handlers must schedule outbound work onto this loop rather than
+        # creating a private loop (aiohttp rejects that path).
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
@@ -1118,6 +1122,9 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         try:
+            # Preserve the gateway loop so sync tool handlers can schedule
+            # Discord HTTP work on the aiohttp session's owning loop.
+            self._event_loop = asyncio.get_running_loop()
             if not self._acquire_platform_lock('discord-bot-token', self.config.token, 'Discord bot token'):
                 return False
 
@@ -1679,6 +1686,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         self._running = False
         self._client = None
+        self._event_loop = None
         self._ready_event.clear()
         self._post_connect_task = None
         self._liveness_task = None

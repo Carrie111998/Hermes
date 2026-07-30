@@ -1,10 +1,11 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from plugins.platforms.discord.adapter import DiscordAdapter
 from tools import discord_approval_box_tool as approval_tool
 
@@ -55,3 +56,42 @@ async def test_discord_deliverable_approval_has_exactly_three_review_controls():
     assert "Needs Work" in sent["content"]
     assert "Reject" in sent["content"]
     assert sent["view"] is not None
+
+
+def test_approval_tool_schedules_delivery_on_gateway_loop(tmp_path, monkeypatch):
+    """Approval cards must use Discord's owning event loop, not _run_async."""
+    monkeypatch.setattr(approval_tool, "get_hermes_home", lambda: Path(tmp_path))
+    gateway_loop = object()
+
+    class CompletedFuture:
+        def result(self, timeout):
+            assert timeout == 30
+            return SimpleNamespace(success=True, message_id="1234")
+
+    async def send_deliverable_approval(**_kwargs):
+        return None
+
+    adapter = SimpleNamespace(
+        _event_loop=gateway_loop,
+        send_deliverable_approval=send_deliverable_approval,
+    )
+    runner = SimpleNamespace(adapters={Platform.DISCORD: adapter})
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+    scheduled = {}
+
+    def fake_schedule(coro, loop):
+        scheduled["loop"] = loop
+        coro.close()
+        return CompletedFuture()
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", fake_schedule)
+    payload = json.loads(approval_tool.discord_approval_box_tool({
+        "title": "Review me",
+        "body": "Draft is ready.",
+        "channel_id": "discord",
+    }))
+
+    assert payload["success"] is True
+    assert payload["message_id"] == "1234"
+    assert scheduled["loop"] is gateway_loop

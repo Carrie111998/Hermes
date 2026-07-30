@@ -154,14 +154,19 @@ def discord_approval_box_tool(args: Dict[str, Any], **_kw: Any) -> str:
         title=title, body=body, drive_url=drive_url, channel_id=channel_id,
     )
     try:
-        from model_tools import _run_async
-        result = _run_async(adapter.send_deliverable_approval(
+        # discord.py owns an aiohttp session bound to the gateway's event
+        # loop. _run_async creates a private loop, which breaks channel.send.
+        from agent.async_utils import safe_schedule_threadsafe
+        future = safe_schedule_threadsafe(adapter.send_deliverable_approval(
             chat_id=channel_id,
             title=record["title"],
             body=record["body"],
             drive_url=record["drive_url"],
             approval_id=record["id"],
-        ))
+        ), getattr(adapter, "_event_loop", None))
+        if future is None:
+            raise RuntimeError("Discord gateway event loop is unavailable")
+        result = future.result(timeout=30)
     except Exception as exc:
         try:
             _record_path(record["id"]).unlink(missing_ok=True)
