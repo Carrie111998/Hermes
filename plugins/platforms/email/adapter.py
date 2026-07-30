@@ -61,6 +61,61 @@ _AUTOMATED_HEADERS = {
     "List-Unsubscribe": lambda v: bool(v),
 }
 
+# Default subject/body regex patterns for emails that should be silently
+# skipped without involving the LLM. Operators can extend via the
+# EMAIL_SKIP_PATTERNS env var (comma-separated regexes).
+_DEFAULT_SKIP_PATTERNS: Tuple[str, ...] = (
+    # Order confirmations & shipping
+    r"订单.*已发[货送]", r"order.*(?:shipped|confirmed|dispatched)",
+    r"运单号|tracking\s*(?:number|no|#)",
+    # Payment / invoice
+    r"(?:支付|付款|扣款).*成功", r"payment\s*(?:received|confirmed|successful)",
+    r"invoice|receipt|收据|发票",
+    # Verification / security codes
+    r"验证码|verification\s*code|security\s*code",
+    r"登录验证|login\s*verification",
+    # Newsletters & marketing
+    r"newsletter|subscribe|unsubscribe|退订",
+    r"促销|优惠|折扣|sale\b|discount|promo",
+    r"专题活动|活动.*提[升高]|推广|广告|marketing",
+    r"效率.*提升|工作.*效率|周.*报|月.*报|日报",
+    # Social / platform notifications
+    r"(?:新消息|new\s+message|mentioned\s+you)",
+    r"(?:关注|followed|liked|commented)",
+    # Calendar / reminders
+    r"(?:提醒|reminder|upcoming|日程)",
+    # System / automated
+    r"noreply|no-reply|automated\s+message",
+    r"do\s*not\s*reply",
+)
+
+# Compiled regex cache — built lazily on first use
+_SKIP_REGEXES: Optional[List[re.Pattern]] = None
+
+
+def _load_skip_patterns() -> List[re.Pattern]:
+    """Compile skip regexes from defaults + EMAIL_SKIP_PATTERNS env var."""
+    global _SKIP_REGEXES
+    if _SKIP_REGEXES is not None:
+        return _SKIP_REGEXES
+
+    patterns = list(_DEFAULT_SKIP_PATTERNS)
+    extra = os.getenv("EMAIL_SKIP_PATTERNS", "").strip()
+    if extra:
+        patterns.extend(p.strip() for p in extra.split(",") if p.strip())
+
+    _SKIP_REGEXES = [re.compile(p, re.IGNORECASE) for p in patterns]
+    return _SKIP_REGEXES
+
+
+def _should_skip_email(subject: str, body: str) -> bool:
+    """Return True if this email matches skip patterns and should not reach the LLM."""
+    combined = f"{subject}\n{body}" if subject else body
+    for pat in _load_skip_patterns():
+        if pat.search(combined):
+            return True
+    return False
+
 # Gmail-safe max length per email body
 MAX_MESSAGE_LENGTH = 50_000
 
@@ -585,15 +640,17 @@ class EmailAdapter(BasePlatformAdapter):
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
             imap.login(self._address, self._password)
             _send_imap_id(imap)
-            # Mark all existing messages as seen so we only process new ones
+            # Seed _seen_uids with already-SEEN messages so they are not reprocessed.
+            # UNSEEN messages (e.g. arrived while adapter was down) are left for
+            # the poll loop to discover and handle.
             imap.select("INBOX")
-            status, data = imap.uid("search", None, "ALL")
+            status, data = imap.uid("search", None, "SEEN")
             if status == "OK" and data and data[0]:
                 for uid in data[0].split():
                     self._seen_uids.add(uid)
             # Keep only the most recent UIDs to prevent unbounded growth
             self._trim_seen_uids()
-            imap.logout()
+            imap.shutdown()
             logger.info("[Email] IMAP connection test passed. %d existing messages skipped.", len(self._seen_uids))
         except Exception as e:
             logger.error("[Email] IMAP connection failed: %s", e)
@@ -737,8 +794,12 @@ class EmailAdapter(BasePlatformAdapter):
                         "auth_reason": auth_reason,
                     })
             finally:
+                # Use shutdown() instead of logout() — logout() sends a LOGOUT
+                # command and waits for a response, which can hang indefinitely
+                # on a broken SSL connection (UNEXPECTED_EOF_WHILE_READING).
+                # shutdown() just closes the socket without server round-trip.
                 try:
-                    imap.logout()
+                    imap.shutdown()
                 except Exception:
                     pass
         except Exception as e:
@@ -840,10 +901,31 @@ class EmailAdapter(BasePlatformAdapter):
         body = msg_data["body"].strip()
         attachments = msg_data["attachments"]
 
-        # Build message text: include subject as context
-        text = body
+        # Pre-filter: skip emails matching notification/advertisement patterns
+        # without ever involving the LLM, saving tokens and latency.
+        if _should_skip_email(subject, body):
+            logger.info(
+                "[Email] Skipping (regex match): %s — %s",
+                sender_addr, subject[:80],
+            )
+            return
+
+        # Build message text: include subject as context.
+        # Tell the agent to use structured prefix so the adapter can skip
+        # replies when none are needed.
+        text = (
+            "[Email from "
+            + (msg_data["sender_name"] or sender_addr)
+            + ". First line of your response MUST be:\n"
+            "NEED_RESPONSE: true\n"
+            "or\n"
+            "NEED_RESPONSE: false\n"
+            "(then a blank line, then your message if true). "
+            "If there is NO question or task to address, USE FALSE.]\n\n"
+            + body
+        )
         if subject and not subject.startswith("Re:"):
-            text = f"[Subject: {subject}]\n\n{body}"
+            text = f"[Subject: {subject}]\n\n{text}"
 
         # Determine message type and media
         media_urls = []
@@ -867,6 +949,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._thread_context[sender_addr] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
+            "uid": msg_data["uid"],
         }
 
         source = self.build_source(
@@ -897,12 +980,36 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an email reply to the given address."""
+        """Send an email reply to the given address.
+
+        Parses a NEED_RESPONSE: true/false prefix.  When false, the adapter
+        does NOT send an email — it just marks the original as unseen and
+        returns a no-op success so the agent's output is not delivered.
+        """
+        import re as _re
+
+        need_response = True
+        body = content
+        m = _re.match(r"^NEED_RESPONSE:\s*(true|false)\s*(?:\n|$)", content, _re.IGNORECASE)
+        if m:
+            need_response = m.group(1).lower() == "true"
+            body = content[m.end():].strip()
+
+        if not need_response:
+            logger.info("[Email] NEED_RESPONSE=false — skipping send to %s", chat_id)
+            return SendResult(success=True, message_id="skipped-no-response-needed")
+
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None, self._send_email, chat_id, body, reply_to
             )
+            # After sending the reply, mark the original message back as UNSEEN
+            # so the user can still see it in their mail client.
+            ctx = self._thread_context.get(chat_id, {})
+            orig_uid = ctx.get("uid")
+            if orig_uid:
+                await loop.run_in_executor(None, self._mark_as_unseen, orig_uid)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error("[Email] Send failed to %s: %s", chat_id, e)
@@ -960,6 +1067,30 @@ class EmailAdapter(BasePlatformAdapter):
 
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
+
+    def _mark_as_unseen(self, uid: str) -> None:
+        """Mark a message as UNSEEN on the IMAP server so the user can see it.
+
+        Called after Hermes replies, so the original email doesn't appear as
+        read in the user's mail client.
+
+        Safe from re-processing: the UID is already in ``_seen_uids`` from
+        ``_fetch_new_messages``, so the next poll loop will skip it regardless
+        of IMAP flag state. This only changes the visual state in mail clients.
+        """
+        try:
+            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=15)
+            try:
+                imap.login(self._address, self._password)
+                imap.select("INBOX")
+                imap.uid("store", uid, "-FLAGS", "(\\Seen)")
+            finally:
+                try:
+                    imap.shutdown()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("[Email] Failed to mark UID %s as unseen: %s", uid, e)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Email has no typing indicator — no-op."""
