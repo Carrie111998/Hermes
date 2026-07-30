@@ -152,6 +152,7 @@ class ByValueMaterial:
 
 
 CredentialMaterial = ByReferenceMaterial | ByValueMaterial
+ByValueResolver: TypeAlias = Callable[[Mapping[str, Any]], Any]
 
 
 def _parse_datetime(value: Any, *, field_name: str) -> datetime | None:
@@ -223,7 +224,11 @@ def _timeout_seconds(
     return seconds
 
 
-def _material_from_row(row: Mapping[str, Any]) -> CredentialMaterial:
+def _material_from_row(
+    row: Mapping[str, Any],
+    *,
+    by_value_resolver: ByValueResolver | None = None,
+) -> CredentialMaterial:
     nested = row.get("material")
     if nested is not None:
         if not isinstance(nested, Mapping):
@@ -250,6 +255,12 @@ def _material_from_row(row: Mapping[str, Any]) -> CredentialMaterial:
     if mode == "by-value":
         if host_id not in (None, "") or reference_locator not in (None, ""):
             raise CredentialContractError("by-value material cannot include host-bound fields")
+        if isinstance(envelope, Mapping):
+            if by_value_resolver is None:
+                raise CredentialContractError(
+                    "sealed by-value material requires a configured resolver"
+                )
+            envelope = by_value_resolver(envelope)
         return ByValueMaterial(envelope)
     raise CredentialContractError(
         "material_mode must be exactly by-reference or by-value"
@@ -296,7 +307,12 @@ class CredentialRecord:
             raise CredentialContractError("timeout_after_seconds must be positive")
 
     @classmethod
-    def from_row(cls, row: Mapping[str, Any]) -> "CredentialRecord":
+    def from_row(
+        cls,
+        row: Mapping[str, Any],
+        *,
+        by_value_resolver: ByValueResolver | None = None,
+    ) -> "CredentialRecord":
         if not isinstance(row, Mapping):
             raise CredentialContractError("credential row must be an object")
         probe = row.get("probe") or {}
@@ -324,7 +340,10 @@ class CredentialRecord:
         return cls(
             credential_id=str(row.get("id", row.get("credential_id", ""))),
             driver_key=str(row.get("driver_key", "")),
-            material=_material_from_row(row),
+            material=_material_from_row(
+                row,
+                by_value_resolver=by_value_resolver,
+            ),
             expires_at=_parse_datetime(row.get("expires_at"), field_name="expires_at"),
             probe_contract=contract,
             reauth_state=state,
@@ -759,6 +778,36 @@ def configured_handoff_signer_from_environment() -> HandoffUrlSigner | None:
     return SignedHandoffUrlSigner(candidate)
 
 
+def configured_by_value_resolver_from_environment() -> ByValueResolver | None:
+    """Load the runtime bridge that opens Bedrock's sealed value envelope.
+
+    ``PA_CREDENTIALS_MATERIAL_RESOLVER`` names a callable as
+    ``package.module:attribute``. The callable receives the opaque
+    ``{"ciphertext": ..., "key_role": ...}`` object and returns the
+    serializable secret consumed by the selected driver. With no bridge,
+    sealed values fail closed instead of being mistaken for plaintext.
+    """
+    spec = os.getenv("PA_CREDENTIALS_MATERIAL_RESOLVER", "").strip()
+    if not spec:
+        return None
+    module_name, separator, attribute = spec.partition(":")
+    if not module_name or not separator or not attribute:
+        raise CredentialContractError(
+            "PA_CREDENTIALS_MATERIAL_RESOLVER must be package.module:callable"
+        )
+    try:
+        candidate = getattr(importlib.import_module(module_name), attribute)
+    except (ImportError, AttributeError) as exc:
+        raise CredentialContractError(
+            "PA_CREDENTIALS_MATERIAL_RESOLVER could not load its resolver bridge"
+        ) from exc
+    if not callable(candidate):
+        raise CredentialContractError(
+            "PA_CREDENTIALS_MATERIAL_RESOLVER must resolve to a callable"
+        )
+    return candidate
+
+
 EscalationHook = Callable[[CredentialRecord, ReauthResult], Awaitable[None] | None]
 TimeoutHook = Callable[[CredentialRecord], Awaitable[None] | None]
 
@@ -776,7 +825,11 @@ async def _invoke_hook(hook: Callable[..., Any] | None, *args: Any) -> None:
         logger.exception("PA credential lifecycle hook failed")
 
 
-def load_runtime_credentials(path: str | os.PathLike[str]) -> list[CredentialRecord]:
+def load_runtime_credentials(
+    path: str | os.PathLike[str],
+    *,
+    by_value_resolver: ByValueResolver | None = None,
+) -> list[CredentialRecord]:
     """Load the strict ``{ok: true, data: [...]}`` export envelope."""
     source = Path(path)
     with source.open("r", encoding="utf-8") as handle:
@@ -794,7 +847,10 @@ def load_runtime_credentials(path: str | os.PathLike[str]) -> list[CredentialRec
     if "data" not in payload or not isinstance(payload["data"], list):
         raise CredentialContractError("credential export envelope data must be a list")
     rows = payload["data"]
-    return [CredentialRecord.from_row(row) for row in rows]
+    return [
+        CredentialRecord.from_row(row, by_value_resolver=by_value_resolver)
+        for row in rows
+    ]
 
 
 class CredentialWatcher:
@@ -832,7 +888,15 @@ class CredentialWatcher:
         path = os.getenv("PA_CREDENTIALS_FILE")
         if not path or not Path(path).is_file():
             return cls([], enabled=False, **kwargs)
-        return cls(load_runtime_credentials(path), enabled=True, **kwargs)
+        by_value_resolver = kwargs.pop("by_value_resolver", None)
+        return cls(
+            load_runtime_credentials(
+                path,
+                by_value_resolver=by_value_resolver,
+            ),
+            enabled=True,
+            **kwargs,
+        )
 
     @property
     def task(self) -> asyncio.Task[None] | None:
@@ -1030,6 +1094,8 @@ def create_pa_credentials_watcher(**kwargs: Any) -> CredentialWatcher:
     """
     if "handoff_signer" not in kwargs:
         kwargs["handoff_signer"] = configured_handoff_signer_from_environment()
+    if "by_value_resolver" not in kwargs:
+        kwargs["by_value_resolver"] = configured_by_value_resolver_from_environment()
     if kwargs.get("handoff_signer") is not None and "carbon_auth" not in kwargs:
         kwargs["carbon_auth"] = CarbonAuthV1Client()
     return CredentialWatcher.from_environment(**kwargs)
@@ -1060,6 +1126,7 @@ __all__ = [
     "ReauthStateMachine",
     "SignedHandoffUrlSigner",
     "UnsafeProbeError",
+    "configured_by_value_resolver_from_environment",
     "configured_handoff_signer_from_environment",
     "create_pa_credentials_watcher",
     "load_runtime_credentials",

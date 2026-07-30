@@ -211,6 +211,30 @@ def test_human_driver_is_a_zero_side_effect_pending_stub():
     asyncio.run(run())
 
 
+def test_ilinked_singpass_stub_conforms_without_live_browser_or_network():
+    class ILinkedSingPassConformanceStub(HumanBrowserSessionDriver):
+        key = "ilinked-singpass-conformance-stub"
+
+    async def run():
+        driver: CredentialDriver = ILinkedSingPassConformanceStub()
+        record = _record(
+            driver_key=driver.key,
+            material=ByReferenceMaterial(
+                "synthetic-browser-host",
+                "synthetic/profile-only",
+            ),
+        )
+        probe = await driver.probe(record.material, now=datetime.now(UTC))
+        reauth = await driver.begin_reauth(record)
+        assert probe.status == "human-required"
+        assert probe.needs_reauth is True
+        assert reauth.state is ReauthState.PENDING_HUMAN
+        assert driver.probe_contract.non_destructive is True
+        assert "no browser or network action" in driver.probe_contract.safety_contract
+
+    asyncio.run(run())
+
+
 def test_carbon_auth_v1_posts_exact_request_shape():
     async def run():
         calls: list[tuple[str, dict]] = []
@@ -602,6 +626,60 @@ def test_runtime_loader_rejects_non_success_or_unexpected_envelopes(
         source.write_text(json.dumps(payload), encoding="utf-8")
         with pytest.raises(CredentialContractError):
             load_runtime_credentials(source)
+
+
+def test_runtime_loader_resolves_sealed_bedrock_value_before_bearer_probe(
+    tmp_path: Path,
+):
+    source = tmp_path / "sealed-export.json"
+    token = _jwt(datetime(2026, 10, 29, tzinfo=UTC))
+    envelope = {
+        "ciphertext": "synthetic-ciphertext",
+        "key_role": "agent:synthetic",
+    }
+    source.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "data": [
+                    {
+                        "id": "itos-synthetic",
+                        "driver_key": "bearer-jwt",
+                        "material_mode": "by-value",
+                        "material_envelope": envelope,
+                        "expires_at": "2026-10-29T00:00:00Z",
+                        "probe_cadence_seconds": 300,
+                        "probe_non_destructive": True,
+                        "probe_safety_contract": {
+                            "operation": "local-exp-read",
+                            "must_not": ["network", "mutate"],
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    seen = []
+    records = load_runtime_credentials(
+        source,
+        by_value_resolver=lambda value: seen.append(dict(value)) or token,
+    )
+    assert seen == [envelope]
+    result = asyncio.run(
+        BearerJwtDriver().probe(
+            records[0].material,
+            now=datetime(2026, 10, 28, tzinfo=UTC),
+        )
+    )
+    assert result.healthy is True
+    assert result.expires_at == datetime(2026, 10, 29, tzinfo=UTC)
+
+    with pytest.raises(
+        CredentialContractError,
+        match="sealed by-value material requires a configured resolver",
+    ):
+        load_runtime_credentials(source)
 
 
 def test_exact_runtime_export_envelope_preserves_metadata_and_watches(
