@@ -334,6 +334,41 @@ class TestDispatchMessage(unittest.TestCase):
         asyncio.run(adapter._dispatch_message(msg_data))
         adapter.handle_message.assert_not_called()
 
+    def test_disabled_category_policy_is_given_to_model_after_regex_miss(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._no_reply_keywords = "无需处理;for+your+records"
+        adapter._category_auto_reply = {
+            category: category != "promotions"
+            for category in adapter._category_auto_reply
+        }
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+        msg_data = {
+            "uid": b"43",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "Keep this on file",
+            "message_id": "<msg43@test.com>",
+            "in_reply_to": "",
+            "body": "Please archive this update.",
+            "attachments": [],
+            "date": "",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        self.assertEqual(len(captured_events), 1)
+        self.assertIn("Auto-reply is disabled for these message categories", captured_events[0].text)
+        self.assertIn('"promotions": "promotional, advertising', captured_events[0].text)
+        self.assertNotIn("无需处理", captured_events[0].text)
+        self.assertNotIn("for+your+records", captured_events[0].text)
+        self.assertIn("heuristic regular expressions", captured_events[0].text)
+
     def test_force_reply_keyword_overrides_category_filter(self):
         import asyncio
 

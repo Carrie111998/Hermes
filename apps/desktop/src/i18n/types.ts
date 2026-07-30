@@ -1251,6 +1251,8 @@ export interface Translations {
       keywordPlaceholder: string
       keywordSyntax: string
       clearKeywords: string
+      keywordConflictTitle: string
+      keywordConflictDescription: (group: string) => string
       decisionTitle: string
       strictDecision: string
       strictDecisionDescription: string

@@ -115,12 +115,14 @@ The adapter polls the IMAP inbox for UNSEEN messages at a configurable interval 
 
 ### Auto-reply Policy
 
-Email uses deterministic rules before invoking the model:
+Email uses fast local rules before invoking the model:
 
 1. A matching no-reply keyword group suppresses the message.
 2. A matching must-reply keyword group forces it through and requires a reply.
-3. Promotions, newsletters, transaction notices, security notices, social notifications, calendar notices, and recurring reports are suppressed unless their category switch is enabled.
-4. Unmatched messages reach the model. The model must return a structured `need_response` decision; false or malformed strict-mode output is blocked before SMTP.
+3. Promotions, newsletters, transaction notices, security notices, social notifications, calendar notices, and recurring reports are detected with heuristic regular expressions and suppressed unless their category switch is enabled.
+4. Unmatched messages reach the model. Categories whose switches are off are included as operator policy context so the model can catch semantic category matches missed by heuristic regexes. User-authored keyword groups remain local and are not added to the model prompt. The model must return a structured `need_response` decision; false or malformed strict-mode output is blocked before SMTP.
+
+Category detection is approximate. Disabling a category does not guarantee that its messages will never reach the model: a regex match is suppressed before the model, but wording outside the built-in patterns can be missed. Treat category switches as a low-cost pre-filter, not a complete semantic classifier.
 
 Configure these rules from **Dashboard → Channels → Email → Configure**, or with environment variables:
 

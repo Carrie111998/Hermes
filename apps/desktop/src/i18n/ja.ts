@@ -1390,7 +1390,8 @@ export const ja = defineLocale({
       title: '自動返信ポリシー',
       description: '返信を生成・送信する前に、どのメールを Agent に渡すか決定します。',
       categoriesTitle: 'メール分類',
-      categoriesDescription: '宣伝や自動通知は既定でブロックされ、明示的に許可した分類だけが自動返信の対象になります。',
+      categoriesDescription:
+        'カテゴリ判定は近似的なヒューリスティック正規表現です。カテゴリを無効にしても内容が Agent に届かない保証はなく、ローカルで一致した場合のみ事前に遮断されます。',
       allowCategory: '自動返信を許可',
       promotions: 'プロモーション',
       newsletters: 'ニュースレターとダイジェスト',
@@ -1400,7 +1401,8 @@ export const ja = defineLocale({
       calendar: 'カレンダー通知',
       reports: '定期レポート',
       keywordsTitle: 'キーワードルール',
-      keywordsDescription: 'Agent より先に評価されます。1 行につき 1 つのキーワードグループを入力します。',
+      keywordsDescription:
+        '手動キーワードグループはローカルでのみ文字列一致し、Agent のプロンプトには追加されません。',
       neverReply: '返信しない',
       neverReplyDescription: '一致したメールは、他のルールが返信を要求しても常にブロックします。',
       mustReply: '必ず返信',
@@ -1408,6 +1410,9 @@ export const ja = defineLocale({
       keywordPlaceholder: '1 行につき 1 グループ',
       keywordSyntax: '+ はすべての語への一致を表し、行同士はいずれかへの一致です。',
       clearKeywords: 'キーワードルールを消去',
+      keywordConflictTitle: 'キーワードルールの競合',
+      keywordConflictDescription: group =>
+        `「${group}」を「必ず返信」と「返信しない」の両方に設定することはできません。片方から削除してください。`,
       decisionTitle: 'Agent の判断',
       strictDecision: '構造化された返信判断を必須にする',
       strictDecisionDescription: '有効な構造で need_response: true が返された場合のみ送信します。',

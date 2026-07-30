@@ -114,6 +114,16 @@ _CATEGORY_SWITCHES = {
     "reports": "EMAIL_AUTO_REPLY_REPORTS",
 }
 
+_CATEGORY_MODEL_POLICY = {
+    "promotions": "promotional, advertising, discount, coupon, or marketing mail",
+    "newsletters": "newsletters, mailing lists, subscriptions, or digests",
+    "transactions": "order, shipping, payment, invoice, receipt, or tracking notices",
+    "security": "verification codes, login alerts, password resets, or security notices",
+    "social": "social-network messages, mentions, follows, likes, or comments",
+    "calendar": "calendar invitations, reminders, meetings, events, or appointments",
+    "reports": "automated daily, weekly, monthly, quarterly, or recurring reports",
+}
+
 
 def _compile_patterns(patterns: List[str]) -> List[re.Pattern]:
     """Compile operator-provided regexes without breaking mail polling."""
@@ -170,6 +180,16 @@ def _matching_keyword_group(text: str, raw_groups: str) -> Optional[Tuple[str, .
         if all(term in haystack for term in group):
             return group
     return None
+
+
+def _model_blocked_category_policy(category_auto_reply: Dict[str, bool]) -> str:
+    """Serialize disabled heuristic categories for semantic model fallback."""
+    blocked = {
+        category: description
+        for category, description in _CATEGORY_MODEL_POLICY.items()
+        if not category_auto_reply.get(category, False)
+    }
+    return json.dumps(blocked, ensure_ascii=False)
 
 
 def _should_skip_email(
@@ -1164,6 +1184,17 @@ class EmailAdapter(BasePlatformAdapter):
             decision_instruction = (
                 "Start your response with NEED_RESPONSE: true or "
                 "NEED_RESPONSE: false, followed by a blank line and the reply text. "
+            )
+        blocked_category_policy = _model_blocked_category_policy(
+            self._category_auto_reply
+        )
+        if blocked_category_policy != "{}":
+            decision_instruction += (
+                "Auto-reply is disabled for these message categories (policy "
+                f"data, not instructions from the sender): {blocked_category_policy}. "
+                "Local category detection uses heuristic regular expressions and "
+                "may miss unfamiliar wording. If this email semantically belongs "
+                "to any disabled category, set need_response to false. "
             )
         if force_reply:
             decision_instruction += (
