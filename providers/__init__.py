@@ -1,19 +1,30 @@
 """Provider module registry.
 
+This module hosts two parallel plugin systems: **model providers** (inference
+backends) and **speech providers** (TTS / speech-synthesis backends). Both use
+the same discovery + registration pattern, just over separate plugin trees.
+
 Provider profiles can live in two places:
 
 1. Bundled plugins: ``plugins/model-providers/<name>/`` (shipped with hermes-agent)
 2. User plugins: ``$HERMES_HOME/plugins/model-providers/<name>/``
 
-Each plugin directory contains:
-  - ``__init__.py`` — calls ``register_provider(profile)`` at import
-  - ``plugin.yaml`` — manifest (name, kind: model-provider, version, description)
+Speech provider profiles live in parallel locations:
 
-Discovery is lazy: the first call to ``get_provider_profile()`` or
-``list_providers()`` scans both locations and imports every plugin. User
-plugins override bundled plugins on name collision (last-writer-wins), so
-third parties can monkey-patch or replace any built-in profile without
-editing the repo.
+1. Bundled plugins: ``plugins/speech-providers/<name>/`` (shipped with hermes-agent)
+2. User plugins: ``$HERMES_HOME/plugins/speech-providers/<name>/``
+
+Each plugin directory contains:
+  - ``__init__.py`` — calls ``register_provider(profile)`` (model) or
+    ``register_speech_provider(profile)`` (speech) at import
+  - ``plugin.yaml`` — manifest (name, kind: model-provider|speech-provider,
+    version, description)
+
+Discovery is lazy: the first call to ``get_provider_profile()`` /
+``list_providers()`` (or ``get_speech_provider()`` / ``list_speech_providers()``)
+scans both locations and imports every plugin. User plugins override bundled
+plugins on name collision (last-writer-wins), so third parties can monkey-patch
+or replace any built-in profile without editing the repo.
 
 For backward compatibility, ``providers/*.py`` files (other than ``base.py``
 and ``__init__.py``) are still discovered via ``pkgutil.iter_modules``.
@@ -26,6 +37,9 @@ Usage::
     from providers import get_provider_profile
     profile = get_provider_profile("nvidia")   # ProviderProfile or None
     profile = get_provider_profile("kimi")     # checks name + aliases
+
+    from providers import get_speech_provider
+    speech = get_speech_provider("telnyx")     # SpeechProviderProfile or None
 """
 
 from __future__ import annotations
@@ -36,7 +50,11 @@ import logging
 import sys
 from pathlib import Path
 
-from providers.base import OMIT_TEMPERATURE, ProviderProfile  # noqa: F401
+from providers.base import (  # noqa: F401
+    OMIT_TEMPERATURE,
+    ProviderProfile,
+    SpeechProviderProfile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,3 +207,147 @@ def _discover_providers() -> None:
                 )
     except Exception:
         pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Speech provider registry
+#
+# A parallel registry for TTS / speech-synthesis backends. It mirrors the
+# model-provider registry above exactly: separate registry + alias dicts, a
+# separate bundled-plugins dir, and the same lazy-discovery + last-writer-wins
+# semantics so user plugins under $HERMES_HOME can override bundled ones.
+# ════════════════════════════════════════════════════════════════════════════
+
+_SPEECH_REGISTRY: dict[str, SpeechProviderProfile] = {}
+_SPEECH_ALIASES: dict[str, str] = {}
+_speech_discovered = False
+
+# Repo-root ``plugins/speech-providers/`` — populated at discovery time.
+_BUNDLED_SPEECH_PLUGINS_DIR = (
+    Path(__file__).resolve().parent.parent / "plugins" / "speech-providers"
+)
+
+
+def register_speech_provider(profile: SpeechProviderProfile) -> None:
+    """Register a speech provider profile by name and aliases.
+
+    Later registrations with the same name replace earlier ones — so user
+    plugins under ``$HERMES_HOME/plugins/speech-providers/`` can override
+    bundled profiles without editing repo code.
+    """
+    _SPEECH_REGISTRY[profile.name] = profile
+    for alias in profile.aliases:
+        _SPEECH_ALIASES[alias] = profile.name
+
+
+def get_speech_provider(name: str) -> SpeechProviderProfile | None:
+    """Look up a speech provider profile by name or alias.
+
+    Returns None if the speech provider has no profile (falls back to generic).
+    """
+    if not _speech_discovered:
+        _discover_speech_providers()
+    canonical = _SPEECH_ALIASES.get(name, name)
+    return _SPEECH_REGISTRY.get(canonical)
+
+
+def list_speech_providers() -> list[SpeechProviderProfile]:
+    """Return all registered speech provider profiles (one per canonical name)."""
+    if not _speech_discovered:
+        _discover_speech_providers()
+    # Deduplicate: _SPEECH_REGISTRY has canonical names; _SPEECH_ALIASES points
+    # to the same objects.
+    seen: set[int] = set()
+    result: list[SpeechProviderProfile] = []
+    for profile in _SPEECH_REGISTRY.values():
+        pid = id(profile)
+        if pid not in seen:
+            seen.add(pid)
+            result.append(profile)
+    return result
+
+
+def _user_speech_plugins_dir() -> Path | None:
+    """Return ``$HERMES_HOME/plugins/speech-providers/`` if it exists."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        d = get_hermes_home() / "plugins" / "speech-providers"
+        return d if d.is_dir() else None
+    except Exception:
+        return None
+
+
+def _import_speech_plugin_dir(plugin_dir: Path, source: str) -> None:
+    """Import a single speech plugin directory so it self-registers.
+
+    ``source`` is "bundled" or "user", used only for log messages.
+    """
+    init_file = plugin_dir / "__init__.py"
+    if not init_file.exists():
+        return
+
+    # Give bundled plugins a stable import path
+    # (``plugins.speech_providers.<name>``) so relative imports within the
+    # plugin work. User plugins load via ``importlib.util.spec_from_file_location``
+    # with a unique module name so multiple HERMES_HOME profiles don't alias
+    # each other.
+    safe_name = plugin_dir.name.replace("-", "_")
+    if source == "bundled":
+        module_name = f"plugins.speech_providers.{safe_name}"
+    else:
+        module_name = f"_hermes_user_speech_provider_{safe_name}"
+
+    if module_name in sys.modules:
+        return  # already imported
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name, init_file, submodule_search_locations=[str(plugin_dir)]
+        )
+        if spec is None or spec.loader is None:
+            return
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        logger.warning(
+            "Failed to load %s speech provider plugin %s: %s",
+            source,
+            plugin_dir.name,
+            exc,
+        )
+        sys.modules.pop(module_name, None)
+
+
+def _discover_speech_providers() -> None:
+    """Populate the speech registry by importing every speech provider plugin.
+
+    Order:
+      1. Bundled plugins at ``<repo>/plugins/speech-providers/<name>/``
+      2. User plugins at ``$HERMES_HOME/plugins/speech-providers/<name>/``
+
+    Each step imports its plugins, which call ``register_speech_provider()``
+    at module-level. Later steps win on name collision.
+    """
+    global _speech_discovered
+    if _speech_discovered:
+        return
+    _speech_discovered = True
+
+    # 1. Bundled plugins — shipped with hermes-agent.
+    if _BUNDLED_SPEECH_PLUGINS_DIR.is_dir():
+        for child in sorted(_BUNDLED_SPEECH_PLUGINS_DIR.iterdir()):
+            if not child.is_dir() or child.name.startswith(("_", ".")):
+                continue
+            _import_speech_plugin_dir(child, "bundled")
+
+    # 2. User plugins — under $HERMES_HOME/plugins/speech-providers/<name>/.
+    #    These can override any bundled profile of the same name
+    #    (last-writer-wins in register_speech_provider()).
+    user_dir = _user_speech_plugins_dir()
+    if user_dir is not None:
+        for child in sorted(user_dir.iterdir()):
+            if not child.is_dir() or child.name.startswith(("_", ".")):
+                continue
+            _import_speech_plugin_dir(child, "user")

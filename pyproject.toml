@@ -60,6 +60,9 @@ dependencies = [
   # (which is a silent killer on Windows — see CONTRIBUTING.md) and
   # `os.killpg` (which doesn't exist on Windows).
   "psutil==7.2.2",
+  # Telnyx WebSocket TTS provider (built-in). Required by the ``telnyx``
+  # TTS backend in tools/tts_tool.py; lightweight, widely-used, low-risk.
+  "websockets==15.0.1",
 ]
 
 [project.optional-dependencies]

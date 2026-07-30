@@ -164,3 +164,43 @@ class ProviderProfile:
         except Exception as exc:
             logger.debug("fetch_models(%s): %s", self.name, exc)
             return None
+
+
+@dataclass
+class SpeechProviderProfile:
+    """Declarative profile for a TTS/speech provider plugin.
+
+    A SpeechProviderProfile declares everything about a speech-synthesis
+    provider in one place: identity, auth, endpoints, voice catalog, and
+    output config. The speech transport reads this instead of receiving a
+    bag of boolean flags — mirroring how ProviderProfile serves inference
+    providers.
+
+    Speech profiles are DECLARATIVE — they describe the provider's static
+    behavior. They do NOT own audio playback, credential rotation, or
+    streaming. Those stay on the speech transport / calling agent.
+    """
+
+    # ── Identity ─────────────────────────────────────────────
+    name: str
+    aliases: tuple = ()
+
+    # ── Human-readable metadata ───────────────────────────────
+    display_name: str = ""       # e.g. "Telnyx" — shown in picker/labels
+    description: str = ""       # e.g. "Telnyx AI Voice" — picker subtitle
+    signup_url: str = ""        # e.g. "https://telnyx.com/" — shown during setup
+
+    # ── Auth & endpoints ─────────────────────────────────────
+    env_vars: tuple = ()
+    base_url: str = ""
+    auth_type: str = "api_key"  # api_key|bearer|oauth|none
+    default_headers: dict[str, str] = field(default_factory=dict)
+
+    # ── Voice catalog ─────────────────────────────────────────
+    default_voice: str = ""        # primary voice ID used when none requested
+    fallback_voices: tuple = ()    # ordered list tried when default fails
+    voice_families: tuple = ()     # grouping hints for voice pickers
+
+    # ── Output config ─────────────────────────────────────────
+    output_format: str = "mp3"      # default audio container/format
+    supports_streaming: bool = False  # True → transport may stream chunks

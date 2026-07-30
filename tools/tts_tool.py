@@ -13,6 +13,7 @@ Built-in TTS providers:
 - NeuTTS (local, free, no API key): On-device TTS via neutts
 - KittenTTS (local, free, no API key): On-device 25MB model
 - Piper (local, free, no API key): OHF-Voice/piper1-gpl neural VITS, 44 languages
+- Telnyx TTS: WebSocket streaming, MP3 output, needs TELNYX_API_KEY
 
 Custom command providers:
 - Users can declare any number of named providers with ``type: command``
@@ -50,8 +51,8 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional
-from urllib.parse import urljoin
+from typing import Callable, Dict, Any, List, Optional
+from urllib.parse import quote, urljoin
 
 from hermes_constants import display_hermes_home
 
@@ -177,6 +178,36 @@ GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
 GEMINI_TTS_SAMPLE_WIDTH = 2  # 16-bit PCM (L16)
 
+# Telnyx TTS (WebSocket streaming API). Voice config is read from
+# ``tts_config.get("telnyx", {})`` with keys ``voice`` and ``base_url``.
+TELNYX_TTS_DEFAULT_BASE_URL = "wss://api.telnyx.com/v2/text-to-speech"
+DEFAULT_TELNYX_VOICE = "Telnyx.NaturalHD.astra"
+
+# Curated voice catalog for offline discovery / documentation.
+TELNYX_TTS_VOICE_FAMILIES = (
+    "Telnyx.NaturalHD",
+    "Telnyx.Natural",
+    "Telnyx.KokoroTTS",
+    "Telnyx.Ultra",
+    "Telnyx.Qwen3TTS",
+    "Telnyx.LibriTTS",
+)
+
+TELNYX_FALLBACK_VOICES = (
+    "Telnyx.NaturalHD.astra",
+    "Telnyx.NaturalHD.luna",
+    "Telnyx.NaturalHD.orion",
+    "Telnyx.NaturalHD.celeste",
+    "Telnyx.NaturalHD.bond",
+    "Telnyx.NaturalHD.andromeda",
+    "Telnyx.NaturalHD.estelle",
+    "Telnyx.NaturalHD.baldur",
+    "Telnyx.KokoroTTS.af_alloy",
+    "Telnyx.KokoroTTS.af_bella",
+    "Telnyx.KokoroTTS.am_adam",
+    "Telnyx.KokoroTTS.am_michael",
+)
+
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
     return str(get_hermes_dir("cache/audio", "audio_cache"))
@@ -201,6 +232,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
     "piper": 5000,        # local VITS model, phoneme-based; practical cap
+    "telnyx": 5000,       # conservative; no published hard cap
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -347,6 +379,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "neutts",
     "kittentts",
     "piper",
+    "telnyx",
 })
 
 DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS = 120
@@ -1563,6 +1596,131 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
 
 # ===========================================================================
+# Provider: Telnyx (WebSocket streaming TTS)
+# ===========================================================================
+
+def _generate_telnyx_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio using the Telnyx WebSocket TTS API.
+
+    Connects to ``wss://api.telnyx.com/v2/text-to-speech/speech?voice=<voice>``
+    with a Bearer token, sends init / text / stop frames, and concatenates
+    base64-encoded MP3 chunks until ``isFinal`` is received. The resulting MP3
+    is written to *output_path*.
+
+    Args:
+        text:        The text to synthesize.
+        output_path: Destination path for the MP3 file.
+        tts_config:  The ``tts`` section from ``~/.hermes/config.yaml``. The
+                     ``telnyx`` sub-key may carry ``voice`` and ``base_url``.
+
+    Returns:
+        The value of *output_path*.
+
+    Raises:
+        ImportError:  If ``websockets`` is not installed.
+        ValueError:   If ``TELNYX_API_KEY`` is not set.
+        RuntimeError: If the WebSocket stream closes without yielding audio.
+    """
+    try:
+        import websockets  # noqa: PLC0415
+    except ImportError:
+        raise ImportError(
+            "Telnyx TTS requires the 'websockets' package. "
+            "Install it with:  pip install websockets"
+        )
+
+    import ssl
+
+    api_key = (get_env_value("TELNYX_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError(
+            "TELNYX_API_KEY is not set. "
+            "Create an API key at https://portal.telnyx.com/#/app/api-keys"
+        )
+
+    telnyx_cfg = tts_config.get("telnyx", {}) if isinstance(tts_config, dict) else {}
+    voice = (
+        str(telnyx_cfg.get("voice") or DEFAULT_TELNYX_VOICE).strip()
+        or DEFAULT_TELNYX_VOICE
+    )
+    base_url = str(
+        telnyx_cfg.get("base_url")
+        or get_env_value("TELNYX_TTS_BASE_URL")
+        or TELNYX_TTS_DEFAULT_BASE_URL
+    ).strip().rstrip("/")
+    ws_url = f"{base_url}/speech?voice={quote(voice, safe='')}"
+
+    async def _stream() -> List[bytes]:
+        ssl_ctx = ssl.create_default_context()
+        async with websockets.connect(
+            ws_url,
+            additional_headers={"Authorization": f"Bearer {api_key}"},
+            ssl=ssl_ctx,
+            open_timeout=15,
+            close_timeout=10,
+        ) as ws:
+            # 1. Init frame — required before content frames
+            await ws.send(json.dumps({"text": " "}))
+            # 2. Text frame
+            await ws.send(json.dumps({"text": text}))
+            # 3. Stop frame — empty text signals end-of-input
+            await ws.send(json.dumps({"text": ""}))
+
+            chunks: List[bytes] = []
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                # Accept common field name variants
+                audio_b64 = (
+                    msg.get("audio")
+                    or msg.get("data")
+                    or msg.get("audio_base64")
+                )
+                if audio_b64:
+                    is_streaming_chunk = msg.get("text") is None
+                    is_completion_blob = not is_streaming_chunk
+                    if is_completion_blob and chunks:
+                        # Some voice families send a duplicate complete blob after
+                        # streaming chunks. Keep the stream and skip the duplicate.
+                        pass
+                    else:
+                        chunks.append(base64.b64decode(audio_b64))
+                if msg.get("isFinal") or msg.get("is_final"):
+                    break
+            return chunks
+
+    try:
+        chunks = asyncio.run(_stream())
+    except RuntimeError:
+        # A running event loop exists (e.g., Jupyter, some async contexts).
+        loop = asyncio.new_event_loop()
+        try:
+            chunks = loop.run_until_complete(_stream())
+        finally:
+            loop.close()
+
+    if not chunks:
+        raise RuntimeError(
+            "Telnyx TTS returned no audio chunks. "
+            "Verify TELNYX_API_KEY is valid and the voice name is correct."
+        )
+
+    with open(output_path, "wb") as fh:
+        for chunk in chunks:
+            fh.write(chunk)
+
+    logger.info(
+        "Telnyx TTS: wrote %d bytes to %s (voice=%s)",
+        Path(output_path).stat().st_size,
+        output_path,
+        voice,
+    )
+    return output_path
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def text_to_speech_tool(
@@ -1740,6 +1898,10 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with Piper (local)...")
             _generate_piper_tts(text, file_str, tts_config)
+
+        elif provider == "telnyx":
+            logger.info("Generating speech with Telnyx TTS...")
+            _generate_telnyx_tts(text, file_str, tts_config)
 
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
