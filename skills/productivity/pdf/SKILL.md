@@ -104,7 +104,7 @@ story = [Paragraph("Report Title", styles["Title"]), Spacer(1, 12),
 doc.build(story)
 ```
 
-**Subscripts/superscripts:** nnever use Unicode sub/superscript characters (₀₁₂, ⁰¹²) — the built-in fonts lack the glyphs and render solid black boxes. Use `<sub>`/`<super>` markup inside `Paragraph` objects: `Paragraph("H<sub>2</sub>O", styles['Normal'])`. For canvas-drawn text, adjust font size and position manually.
+**Subscripts/superscripts:** avoid Unicode sub/superscript characters (₀₁₂, ⁰¹²) — the built-in fonts lack the glyphs and render solid black boxes. Use `<sub>`/`<super>` markup inside `Paragraph` objects: `Paragraph("H<sub>2</sub>O", styles['Normal'])`. For canvas-drawn text, adjust font size and position manually.
 
 ### Command-line tools
 
