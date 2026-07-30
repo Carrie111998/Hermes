@@ -112,6 +112,27 @@ def test_codex_only_path_requires_workspace():
     )
 
 
+def test_codex_only_path_accepts_pronounless_workspace_announcement():
+    """The default codex path keeps ACP-style action narration moving."""
+    a = _agent("auto", "codex_responses")
+    user = "add a migration"
+    msgs = [{"role": "user", "content": user}]
+    assert looks_like_codex_intermediate_ack(
+        a,
+        user,
+        "Creating the migration file in the repo now.",
+        msgs,
+        require_workspace=True,
+    )
+    assert not looks_like_codex_intermediate_ack(
+        a,
+        user,
+        "Testing complete. The repo is clean.",
+        msgs,
+        require_workspace=True,
+    )
+
+
 def test_multipart_user_message_does_not_crash_on_workspace_path():
     """#9562: vision requests forward ``user_message`` as a multi-part list.
 
@@ -155,6 +176,8 @@ def test_pronounless_action_announcements_continue_when_opted_in():
         "EXIT=1 — checking the actual log.",
         "Relaunching with corrected arguments.",
         "Running now (pid 19441, no early exit). Checking the log…",
+        "Brief written\nCreating the session now",
+        "Checking whether the service is healthy.",
     )
     for announcement in announcements:
         assert looks_like_codex_intermediate_ack(
@@ -179,6 +202,12 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Testing complete.",
         "Checking done.",
         "Running successful.",
+        "Testing the parser completed successfully.",
+        "Checking the logs finished with no errors.",
+        "Running the suite passed. 42 tests, 0 failures.",
+        "Running the suite in parallel with pytest-xdist is the fastest win.",
+        "Checking the CI logs would be the first step.",
+        "Reading the traceback tells you which parser rule failed.",
     )
     for final in final_answers:
         assert not looks_like_codex_intermediate_ack(
