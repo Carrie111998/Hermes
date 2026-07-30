@@ -4066,7 +4066,7 @@ async def gateway_drain(request: Request):
     ``POST /api/gateway/restart`` force path, which supersedes a drain.
     """
     from gateway.drain_control import (
-        clear_drain_request,
+        cancel_drain_request,
         drain_requested,
         write_drain_request,
     )
@@ -4083,9 +4083,30 @@ async def gateway_drain(request: Request):
     principal = getattr(principal_obj, "principal", None) or "dashboard"
 
     if action == "cancel":
-        existed = clear_drain_request()
-        _log.info("Gateway drain CANCEL requested by %s (existed=%s)", principal, existed)
-        return {"ok": True, "action": "cancel", "was_draining": existed}
+        outcome = cancel_drain_request()
+        if outcome == "protected":
+            _log.warning(
+                "Gateway drain CANCEL refused for %s: live update owns marker",
+                principal,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Gateway drain is owned by a live Hermes update and "
+                    "cannot be cancelled until that update finishes"
+                ),
+            )
+        existed = outcome == "cleared"
+        _log.info(
+            "Gateway drain CANCEL requested by %s (existed=%s)",
+            principal,
+            existed,
+        )
+        return {
+            "ok": True,
+            "action": "cancel",
+            "was_draining": existed,
+        }
 
     if action != "drain":
         raise HTTPException(

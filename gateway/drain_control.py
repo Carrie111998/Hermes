@@ -284,6 +284,46 @@ def clear_drain_request_if_matches(
         return _clear_drain_request_unlocked(home=home)
 
 
+def cancel_drain_request(
+    *,
+    home: Optional[Path] = None,
+) -> str:
+    """Cancel an operator drain without disrupting a live updater.
+
+    Returns ``"cleared"``, ``"absent"``, or ``"protected"``. Only a marker
+    whose updater PID and process-start fingerprint still identify the same
+    live process is protected; orphaned or legacy updater markers remain
+    cancellable.
+    """
+    with _drain_request_transaction(home):
+        current = _read_drain_request_unlocked(home=home)
+        if current is None:
+            return "absent"
+        if current.get("principal") == "hermes-update":
+            try:
+                owner_pid = int(current.get("owner_pid", 0) or 0)
+                owner_start_time = int(
+                    current.get("owner_start_time", 0) or 0
+                )
+            except (TypeError, ValueError):
+                owner_pid = 0
+                owner_start_time = 0
+            if owner_pid > 0 and owner_start_time > 0:
+                try:
+                    from gateway.status import get_process_start_time
+
+                    live_start_time = get_process_start_time(owner_pid)
+                except Exception:
+                    live_start_time = None
+                if live_start_time == owner_start_time:
+                    return "protected"
+        return (
+            "cleared"
+            if _clear_drain_request_unlocked(home=home)
+            else "absent"
+        )
+
+
 def _clear_drain_request_unlocked(*, home: Optional[Path] = None) -> bool:
     path = drain_request_path(home)
     try:
