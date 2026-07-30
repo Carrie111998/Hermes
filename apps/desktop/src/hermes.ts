@@ -9,6 +9,7 @@ import type {
   AutomationBlueprint,
   AuxiliaryModelsResponse,
   BackendUpdateCheckResponse,
+  BackupListResponse,
   ComputerUseStatus,
   ConfigSchemaResponse,
   CronDeliveryTarget,
@@ -20,6 +21,7 @@ import type {
   CustomEndpointUpdate,
   CustomEndpointValidationResponse,
   DebugShareResponse,
+  DrainResponse,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
   HermesConfig,
@@ -138,6 +140,8 @@ export type {
   AutomationBlueprintField,
   AuxiliaryModelsResponse,
   BackendUpdateCheckResponse,
+  BackupArchive,
+  BackupListResponse,
   ComputerUseCheck,
   ComputerUsePermissionSource,
   ComputerUseStatus,
@@ -154,6 +158,7 @@ export type {
   CustomEndpointUpdate,
   CustomEndpointValidationResponse,
   DebugShareResponse,
+  DrainResponse,
   ElevenLabsVoice,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
@@ -1532,6 +1537,15 @@ export function restartGateway(): Promise<ActionResponse> {
   })
 }
 
+export function gatewayDrain(action: 'drain' | 'cancel'): Promise<DrainResponse> {
+  return window.hermesDesktop.api<DrainResponse>({
+    ...profileScoped(),
+    path: '/api/gateway/drain',
+    method: 'POST',
+    body: { action }
+  })
+}
+
 export function updateHermes(): Promise<ActionResponse> {
   return window.hermesDesktop.api<ActionResponse>({
     ...profileScoped(),
@@ -1770,6 +1784,18 @@ export function runBackup(): Promise<ActionResponse & { archive?: string }> {
     method: 'POST',
     body: {}
   })
+}
+
+export function listBackups(): Promise<BackupListResponse> {
+  return window.hermesDesktop.api<BackupListResponse>({
+    path: '/api/ops/backup/list'
+  })
+}
+
+export function getBackupDownloadUrl(archivePath: string): string {
+  const params = new URLSearchParams({ archive: archivePath })
+
+  return `/api/ops/backup/download?${params.toString()}`
 }
 
 export function runDebugShare(): Promise<DebugShareResponse> {

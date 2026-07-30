@@ -1391,3 +1391,22 @@ export interface ModelAssignmentResponse {
   stale_aux?: StaleAuxAssignment[]
   tasks?: string[]
 }
+
+export interface DrainResponse {
+  ok: boolean
+  action: 'drain' | 'cancel'
+  draining?: boolean
+  was_draining?: boolean
+  requested_at?: string
+}
+
+export interface BackupArchive {
+  name: string
+  path: string
+  size: number
+  modified: string
+}
+
+export interface BackupListResponse {
+  backups: BackupArchive[]
+}

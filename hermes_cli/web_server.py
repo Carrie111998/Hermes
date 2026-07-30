@@ -12572,6 +12572,32 @@ def _new_dashboard_backup_path() -> Path:
     return _dashboard_backup_dir() / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
 
 
+def _list_backups() -> list[dict]:
+    """List existing backup archives in the dashboard backup directory."""
+    backup_dir = _dashboard_backup_dir()
+    if not backup_dir.is_dir():
+        return []
+    backups = []
+    try:
+        for entry in sorted(backup_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if entry.suffix == ".zip" and entry.is_file():
+                backups.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "size": entry.stat().st_size,
+                    "modified": datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc).isoformat(),
+                })
+    except OSError:
+        pass
+    return backups
+
+
+@app.get("/api/ops/backup/list")
+async def list_backups():
+    """List existing backup archives."""
+    return {"backups": _list_backups()}
+
+
 @app.post("/api/ops/backup")
 async def run_backup(body: BackupRequest):
     args = ["backup"]
