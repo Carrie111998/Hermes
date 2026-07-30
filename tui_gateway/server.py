@@ -7574,6 +7574,41 @@ def _(rid, params: dict) -> dict:
     })
 
 
+@method("group.message.rewind")
+def _(rid, params: dict) -> dict:
+    room_id = str(params.get("room_id") or "")
+    text = str(params.get("content") or "")
+    room = _groups().get_room(room_id)
+    if room is None:
+        return _err(rid, 4040, "group room not found")
+    old_session_ids = [
+        str(member["runtime_session_id"])
+        for member in room["members"]
+        if member.get("runtime_session_id")
+    ]
+    try:
+        raw_seq = params.get("seq")
+        if raw_seq is None:
+            raise ValueError("seq is required")
+        seq = int(raw_seq)
+        # Detach the abandoned runtimes before truncating. A late terminal event
+        # from an interrupted turn must not be projected back into the rewound
+        # room after its canonical tail has been deleted.
+        with _group_lock:
+            for sid in old_session_ids:
+                if done := _group_turn_done.pop(sid, None):
+                    done.set()
+                _group_projectors.pop(sid, None)
+                _group_session_targets.pop(sid, None)
+                _group_stream_ids.pop(sid, None)
+        result = _group_runtime().rewind_and_rerun(room_id, seq, text)
+        return _ok(rid, {**result, "room": _groups().get_room(room_id)})
+    except KeyError:
+        return _err(rid, 4040, "group room not found")
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        return _err(rid, 4000, str(exc))
+
+
 @method("group.stop")
 def _(rid, params: dict) -> dict:
     room_id = str(params.get("room_id") or "")

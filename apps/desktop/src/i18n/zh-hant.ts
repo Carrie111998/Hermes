@@ -1583,7 +1583,14 @@ export const zhHant = defineLocale({
     approval: '需要審批', run: '執行', reject: '拒絕', loadFailed: '無法載入群聊。',
     you: '你', agent: 'Agent', working: '工作中…', workspace: '工作區', noWorkspace: '不使用工作區',
     browseWorkspace: '瀏覽…', loadEarlier: '載入更早訊息', loadingEarlier: '正在載入更早訊息…',
-    compressed: '較早的上下文已壓縮。', summary: '上下文摘要'
+    compressed: '較早的上下文已壓縮。', compressionCount: count => `已壓縮 ${count} 次`, summary: '上下文摘要', copyQuestion: '複製問題',
+    restoreCheckpoint: '還原檢查點', restoreTitle: '還原到此檢查點？',
+    restoreBody: '此提示之後的所有訊息將從對話中移除，並從此處重新執行該提示。', restoreConfirm: '還原並重新執行',
+    contextPolicy: '上下文策略', contextPolicyHint: '壓縮觸發閾值 · 近期歷史 Token 預算 · 最少保留的近期訊息數。',
+    triggerTokens: '壓縮觸發 Token 數', maxHistoryTokens: '近期歷史 Token 預算', tailMessageCount: '保留的近期訊息數',
+    agentCount: count => `${count} 個智能體`, contextTriggerValue: tokens => `${tokens} 觸發壓縮`,
+    contextRecentValue: tokens => `${tokens} 近期歷史`, contextMessagesValue: count => `保留 ${count} 條訊息`,
+    composerHint: 'Enter 傳送 · Shift+Enter 換行 · @ 提及智能體', mentionAgents: '提及智能體'
   },
 
   artifactCard: {

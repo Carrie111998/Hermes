@@ -1980,13 +1980,20 @@ export const zh: Translations = {
   },
 
   groups: {
-    title: '群聊', createRoom: '创建房间', roomName: '房间名称', profiles: 'Profiles',
-    profilesHint: '用逗号分隔 Profile 名称', searchProfiles: '搜索 Profile', create: '创建', cancel: '取消', empty: '还没有群聊房间。',
+    title: '群聊', createRoom: '创建房间', roomName: '房间名称', profiles: '智能体',
+    profilesHint: '选择参与群聊的智能体', searchProfiles: '搜索智能体', create: '创建', cancel: '取消', empty: '还没有群聊房间。',
     message: '发送消息到房间', send: '发送', stop: '停止', delete: '删除房间', back: '所有房间',
     approval: '需要审批', run: '运行', reject: '拒绝', loadFailed: '无法加载群聊。',
-    you: '你', agent: 'Agent', working: '工作中…', workspace: '工作区', noWorkspace: '不使用工作区',
+    you: '你', agent: '智能体', working: '工作中…', workspace: '工作区', noWorkspace: '不使用工作区',
     browseWorkspace: '浏览…', loadEarlier: '加载更早消息', loadingEarlier: '正在加载更早消息…',
-    compressed: '更早的上下文已压缩。', summary: '上下文摘要'
+    compressed: '更早的上下文已压缩。', compressionCount: count => `已压缩 ${count} 次`, summary: '上下文摘要', copyQuestion: '复制问题',
+    restoreCheckpoint: '恢复检查点', restoreTitle: '恢复到此检查点？',
+    restoreBody: '此提示之后的所有消息将从对话中移除，并从此处重新运行该提示。', restoreConfirm: '恢复并重新运行',
+    contextPolicy: '上下文策略', contextPolicyHint: '压缩触发阈值 · 近期历史 Token 预算 · 最少保留的近期消息数。',
+    triggerTokens: '压缩触发 Token 数', maxHistoryTokens: '近期历史 Token 预算', tailMessageCount: '保留的近期消息数',
+    agentCount: count => `${count} 个智能体`, contextTriggerValue: tokens => `${tokens} 触发压缩`,
+    contextRecentValue: tokens => `${tokens} 近期历史`, contextMessagesValue: count => `保留 ${count} 条消息`,
+    composerHint: 'Enter 发送 · Shift+Enter 换行 · @ 提及智能体', mentionAgents: '提及智能体'
   },
 
   artifactCard: {

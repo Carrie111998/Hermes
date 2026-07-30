@@ -1,7 +1,7 @@
 import { assistantTextPart, type ChatMessagePart, type GatewayEventPayload, upsertToolPart } from '@/lib/chat-messages'
 import type { ApprovalRequest } from '@/store/prompts'
 
-export type GroupMessageStatus = 'streaming' | 'complete' | 'error' | 'approval'
+export type GroupMessageStatus = 'streaming' | 'complete' | 'error' | 'approval' | 'clarify'
 
 export interface GroupMessage {
   id: string
@@ -9,6 +9,7 @@ export interface GroupMessage {
   content: string
   parts: ChatMessagePart[]
   approval?: Pick<ApprovalRequest, 'allowPermanent' | 'choices' | 'command' | 'description' | 'smartDenied'>
+  clarify?: { requestId: string; question: string; choices: string[] | null }
   profile?: string
   runtimeSessionId?: string
   seq?: number
@@ -26,6 +27,10 @@ export interface GroupRoom {
   workspace?: string
   summary?: string
   contextStatus?: string
+  compressionCount?: number
+  triggerTokens?: number
+  maxHistoryTokens?: number
+  tailMessageCount?: number
 }
 
 export interface GroupState {
@@ -57,6 +62,20 @@ function normalizeApproval(value: unknown): GroupMessage['approval'] {
     command: text(raw.command),
     description: text(raw.description),
     smartDenied: Boolean(raw.smartDenied || raw.smart_denied)
+  }
+}
+
+function normalizeClarify(value: unknown): GroupMessage['clarify'] {
+  const raw = record(value)
+  const requestId = text(raw.request_id || raw.requestId)
+  const question = text(raw.question)
+
+  if (!requestId || !question) {return undefined}
+
+  return {
+    requestId,
+    question,
+    choices: Array.isArray(raw.choices) ? raw.choices.filter((choice): choice is string => typeof choice === 'string') : null
   }
 }
 
@@ -98,9 +117,10 @@ function normalizeMessage(value: unknown): GroupMessage | null {
     content,
     parts: normalizeSnapshotParts(raw.tools, content),
     approval: normalizeApproval(raw.approval),
+    clarify: normalizeClarify(raw.clarify),
     profile: text(raw.profile || raw.agent || raw.agent_id) || undefined,
     runtimeSessionId: text(raw.runtime_session_id || raw.session_id) || undefined,
-    status: raw.status === 'streaming' || raw.status === 'error' || raw.status === 'approval' ? raw.status : 'complete',
+    status: raw.status === 'streaming' || raw.status === 'error' || raw.status === 'approval' || raw.status === 'clarify' ? raw.status : 'complete',
     createdAt: typeof raw.created_at === 'number' ? raw.created_at : undefined,
     seq: typeof raw.seq === 'number' ? raw.seq : undefined
   }
@@ -124,7 +144,13 @@ export function normalizeGroupRoom(value: unknown): GroupRoom | null {
     id, name: text(raw.name) || id, profiles, messages, runningProfiles: running ? ['*'] : [], running,
     workspace: text(raw.workspace) || undefined,
     summary: text(raw.summary) || undefined,
-    contextStatus: text(raw.context_status || raw.contextStatus) || undefined
+    contextStatus: text(raw.context_status || raw.contextStatus) || undefined,
+    compressionCount: typeof (raw.compression_count ?? raw.compressionCount) === 'number'
+      ? Number(raw.compression_count ?? raw.compressionCount)
+      : undefined,
+    triggerTokens: typeof raw.trigger_tokens === 'number' ? raw.trigger_tokens : undefined,
+    maxHistoryTokens: typeof raw.max_history_tokens === 'number' ? raw.max_history_tokens : undefined,
+    tailMessageCount: typeof raw.tail_message_count === 'number' ? raw.tail_message_count : undefined
   }
 }
 
@@ -250,13 +276,15 @@ export function applyGroupEvent(state: GroupState, event: GroupEvent): GroupStat
   const isDelta = event.type.endsWith('.delta')
   const content = isDelta ? `${previous?.content ?? ''}${text(payload.text || payload.delta)}` : text(payload.content || payload.text) || previous?.content || ''
 
-  const status: GroupMessageStatus = event.type.includes('approval')
-    ? 'approval'
-    : event.type.endsWith('.error')
-      ? 'error'
-      : event.type.endsWith('.complete')
-        ? 'complete'
-        : 'streaming'
+  const status: GroupMessageStatus = event.type.includes('clarify')
+    ? 'clarify'
+    : event.type.includes('approval')
+      ? 'approval'
+      : event.type.endsWith('.error')
+        ? 'error'
+        : event.type.endsWith('.complete')
+          ? 'complete'
+          : 'streaming'
 
   const next: GroupMessage = {
     id: messageId,
@@ -274,6 +302,7 @@ export function applyGroupEvent(state: GroupState, event: GroupEvent): GroupStat
           smartDenied: Boolean(payload.smart_denied)
         }
       : previous?.approval,
+    clarify: event.type.includes('clarify') ? normalizeClarify(payload) : previous?.clarify,
     profile: text(payload.profile || payload.agent || payload.agent_id) || previous?.profile,
     runtimeSessionId: text(payload.runtime_session_id || payload.session_id) || previous?.runtimeSessionId,
     status,

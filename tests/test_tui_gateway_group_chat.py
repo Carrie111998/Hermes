@@ -26,6 +26,11 @@ def test_room_context_settings_and_summary_snapshot_persist_across_restart(tmp_p
     assert loaded["tail_message_count"] == 3
     assert loaded["summary"] == "## 已完成\n- 初始化"
     assert loaded["summary_through_seq"] == 17
+    assert loaded["compression_count"] == 1
+
+    reopened = GroupChatStore(db_path)
+    reopened.save_summary(room["id"], "## 已完成\n- 第二次压缩", through_seq=23)
+    assert reopened.get_room(room["id"])["compression_count"] == 2
 
 
 def test_room_create_rpc_accepts_context_limits(monkeypatch, tmp_path):
@@ -40,6 +45,16 @@ def test_room_create_rpc_accepts_context_limits(monkeypatch, tmp_path):
 
     assert (room["trigger_tokens"], room["max_history_tokens"], room["tail_message_count"]) == (
         1000, 700, 5
+    )
+
+
+def test_new_rooms_use_large_but_model_safe_context_defaults(tmp_path):
+    room = GroupChatStore(tmp_path / "defaults.sqlite3").create_room(
+        "Defaults", [{"profile": "default"}]
+    )
+
+    assert (room["trigger_tokens"], room["max_history_tokens"], room["tail_message_count"]) == (
+        128_000, 96_000, 20
     )
 
 
@@ -110,6 +125,74 @@ def test_group_timeline_rpc_exposes_canonical_cursor_page(monkeypatch, tmp_path)
     assert [message["content"] for message in response["messages"]] == ["done", "two"]
     assert response["has_more"] is True
     assert isinstance(response["before_seq"], int)
+
+
+def test_group_clarify_request_is_persisted_on_owning_agent_message(tmp_path):
+    store = GroupChatStore(tmp_path / "clarify.sqlite3")
+    room = store.create_room("Clarify", [{"profile": "planner"}])
+    store.append_event(room["id"], "message.start", {"message_id": "m1"}, "planner")
+    store.append_event(room["id"], "clarify.request", {
+        "message_id": "m1", "session_id": "runtime-1", "request_id": "ask-1",
+        "question": "Which platform?", "choices": ["iOS", "Android"],
+    }, "planner")
+
+    message = store.messages(room["id"])[0]
+
+    assert message["status"] == "clarify"
+    assert message["runtime_session_id"] == "runtime-1"
+    assert message["clarify"] == {
+        "request_id": "ask-1", "question": "Which platform?", "choices": ["iOS", "Android"]
+    }
+
+
+def test_rewind_truncates_from_user_checkpoint_and_starts_fresh_member_sessions(tmp_path):
+    store = GroupChatStore(tmp_path / "groups.sqlite3")
+    room = store.create_room("Rewind", [{
+        "profile": "planner", "runtime_session_id": "runtime-old", "stored_session_id": "stored-old"
+    }])
+    first = store.append_event(room["id"], "user.message", {"text": "design app"})
+    store.append_event(room["id"], "message.complete", {"message_id": "m1", "text": "old answer"}, "planner")
+    store.append_event(room["id"], "user.message", {"text": "later question"})
+    submitted = []
+    coordinator = GroupChatCoordinator(
+        store,
+        lambda _params: {"runtime_session_id": "runtime-new", "stored_session_id": "stored-new"},
+        lambda session_id, text, _emit: submitted.append((session_id, text)),
+        lambda _sid: True,
+        lambda *_: True,
+    )
+
+    result = coordinator.rewind_and_rerun(room["id"], first["seq"], "design app")
+    deadline = time.time() + 2
+    while not submitted and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert [message["content"] for message in store.messages(room["id"])] == ["design app"]
+    assert submitted == [("runtime-new", "design app")]
+    assert result["event"]["payload"]["text"] == "design app"
+    assert store.get_room(room["id"])["members"][0]["runtime_session_id"] == "runtime-new"
+
+
+def test_group_message_rewind_rpc_returns_fresh_room(monkeypatch, tmp_path):
+    store = GroupChatStore(tmp_path / "rpc.sqlite3")
+    room = store.create_room("RPC rewind", [{"profile": "planner"}])
+    checkpoint = store.append_event(room["id"], "user.message", {"text": "question"})
+    store.append_event(room["id"], "message.complete", {"message_id": "old", "text": "answer"}, "planner")
+
+    class Coordinator:
+        def rewind_and_rerun(self, room_id, seq, text):
+            store.truncate_from(room_id, seq)
+            event = store.append_event(room_id, "user.message", {"text": text})
+            return {"event": event, "targets": ["planner"]}
+
+    monkeypatch.setattr(server, "_group_store", store)
+    monkeypatch.setattr(server, "_group_coordinator", Coordinator())
+
+    response = server._methods["group.message.rewind"]("rewind", {
+        "room_id": room["id"], "seq": checkpoint["seq"], "content": "question"
+    })["result"]
+
+    assert [message["content"] for message in response["room"]["messages"]] == ["question"]
 
 
 def test_concurrent_compression_never_regresses_summary_cursor(tmp_path):
@@ -746,7 +829,7 @@ def test_same_profile_in_different_rooms_gets_independent_sessions(tmp_path):
 def test_group_rpc_methods_are_registered():
     expected = {
         "group.room.create", "group.room.list", "group.room.get", "group.room.delete",
-        "group.timeline", "group.send", "group.message.send", "group.stop", "group.run.interrupt",
+        "group.timeline", "group.send", "group.message.send", "group.message.rewind", "group.stop", "group.run.interrupt",
         "group.subscribe", "group.unsubscribe", "group.approval.respond",
     }
     assert expected <= set(server._methods)

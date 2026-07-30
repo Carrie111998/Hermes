@@ -1521,8 +1521,25 @@ export interface Translations {
     loadEarlier: string
     loadingEarlier: string
     compressed: string
+    compressionCount: (count: number) => string
     summary: string
-  },
+    copyQuestion: string
+    restoreCheckpoint: string
+    restoreTitle: string
+    restoreBody: string
+    restoreConfirm: string
+    contextPolicy: string
+    contextPolicyHint: string
+    triggerTokens: string
+    maxHistoryTokens: string
+    tailMessageCount: string
+    agentCount: (count: number) => string
+    contextTriggerValue: (tokens: string) => string
+    contextRecentValue: (tokens: string) => string
+    contextMessagesValue: (count: number) => string
+    composerHint: string
+    mentionAgents: string
+  }
 
   artifactCard: {
     kind: Record<'code' | 'html' | 'svg', string>

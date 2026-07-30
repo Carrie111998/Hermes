@@ -62,12 +62,14 @@ describe('group room event reconciliation', () => {
   it('normalizes workspace, compression status, summary, and message sequence', () => {
     const state = mergeGroupRoom(emptyGroupState(), {
       id: 'room-1', name: 'Room', profiles: ['planner'], workspace: '/work/launch',
-      summary: 'Earlier decisions were compressed.', context_status: 'compressed',
+      summary: 'Earlier decisions were compressed.', context_status: 'compressed', compression_count: 3,
+      trigger_tokens: 64000, max_history_tokens: 40000, tail_message_count: 20,
       messages: [{ id: 'm9', seq: 9, role: 'assistant', content: 'Latest' }]
     })
 
     expect(state.rooms['room-1']).toEqual(expect.objectContaining({
-      workspace: '/work/launch', summary: 'Earlier decisions were compressed.', contextStatus: 'compressed'
+      workspace: '/work/launch', summary: 'Earlier decisions were compressed.', contextStatus: 'compressed', compressionCount: 3,
+      triggerTokens: 64000, maxHistoryTokens: 40000, tailMessageCount: 20
     }))
     expect(state.rooms['room-1'].messages[0]).toEqual(expect.objectContaining({ seq: 9 }))
   })
@@ -127,6 +129,26 @@ describe('group room event reconciliation', () => {
         description: 'Delete file',
         choices: ['once', 'deny']
       })
+    }))
+  })
+
+  it('preserves clarify questions and choices on the owning agent message', () => {
+    let state = applyGroupEvent(emptyGroupState(), {
+      type: 'group.event',
+      payload: { room_id: 'room-1', member_profile: 'planner', type: 'message.start', payload: { message_id: 'm1' } }
+    })
+
+    state = applyGroupEvent(state, {
+      type: 'group.event',
+      payload: {
+        room_id: 'room-1', member_profile: 'planner', type: 'clarify.request',
+        payload: { message_id: 'm1', session_id: 'runtime-1', request_id: 'ask-1', question: 'Which platform?', choices: ['iOS', 'Android'] }
+      }
+    })
+
+    expect(state.rooms['room-1'].messages[0]).toEqual(expect.objectContaining({
+      status: 'clarify', runtimeSessionId: 'runtime-1',
+      clarify: { requestId: 'ask-1', question: 'Which platform?', choices: ['iOS', 'Android'] }
     }))
   })
 

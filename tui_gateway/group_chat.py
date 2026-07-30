@@ -16,9 +16,12 @@ from typing import Any, Callable
 class GroupChatStore:
     DEFAULT_MAX_MENTION_DEPTH = 4
     MAX_MENTION_DEPTH = 10
-    DEFAULT_TRIGGER_TOKENS = 48_000
-    DEFAULT_MAX_HISTORY_TOKENS = 32_000
-    DEFAULT_TAIL_MESSAGE_COUNT = 12
+    # Keep the room projection comfortably below common 128K–200K model
+    # windows. A 256K default would fail for smaller member models and would
+    # leave too little headroom for each agent's own session/tools/output.
+    DEFAULT_TRIGGER_TOKENS = 128_000
+    DEFAULT_MAX_HISTORY_TOKENS = 96_000
+    DEFAULT_TAIL_MESSAGE_COUNT = 20
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -33,11 +36,12 @@ class GroupChatStore:
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at REAL NOT NULL,
                     workspace TEXT,
                     max_mention_depth INTEGER NOT NULL DEFAULT 4,
-                    trigger_tokens INTEGER NOT NULL DEFAULT 48000,
-                    max_history_tokens INTEGER NOT NULL DEFAULT 32000,
-                    tail_message_count INTEGER NOT NULL DEFAULT 12,
+                    trigger_tokens INTEGER NOT NULL DEFAULT 128000,
+                    max_history_tokens INTEGER NOT NULL DEFAULT 96000,
+                    tail_message_count INTEGER NOT NULL DEFAULT 20,
                     summary TEXT NOT NULL DEFAULT '',
-                    summary_through_seq INTEGER NOT NULL DEFAULT 0
+                    summary_through_seq INTEGER NOT NULL DEFAULT 0,
+                    compression_count INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS group_members (
                     room_id TEXT NOT NULL, profile TEXT NOT NULL, name TEXT NOT NULL,
@@ -81,14 +85,18 @@ class GroupChatStore:
             }
             for name, definition in (
                 ("max_mention_depth", "INTEGER NOT NULL DEFAULT 4"),
-                ("trigger_tokens", "INTEGER NOT NULL DEFAULT 48000"),
-                ("max_history_tokens", "INTEGER NOT NULL DEFAULT 32000"),
-                ("tail_message_count", "INTEGER NOT NULL DEFAULT 12"),
+                ("trigger_tokens", "INTEGER NOT NULL DEFAULT 128000"),
+                ("max_history_tokens", "INTEGER NOT NULL DEFAULT 96000"),
+                ("tail_message_count", "INTEGER NOT NULL DEFAULT 20"),
                 ("summary", "TEXT NOT NULL DEFAULT ''"),
                 ("summary_through_seq", "INTEGER NOT NULL DEFAULT 0"),
+                ("compression_count", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in room_columns:
                     self._db.execute(f"ALTER TABLE group_rooms ADD COLUMN {name} {definition}")
+            self._db.execute(
+                "UPDATE group_rooms SET compression_count=1 WHERE summary<>'' AND compression_count=0"
+            )
 
     def close(self) -> None:
         self._db.close()
@@ -159,6 +167,7 @@ class GroupChatStore:
             "tail_message_count": room["tail_message_count"],
             "summary": room["summary"],
             "summary_through_seq": room["summary_through_seq"],
+            "compression_count": room["compression_count"],
             "members": member_list,
             "profiles": [member["profile"] for member in member_list],
             "messages": self.messages(room_id),
@@ -172,7 +181,9 @@ class GroupChatStore:
     def save_summary(self, room_id: str, summary: str, through_seq: int) -> None:
         with self._lock, self._db:
             cur = self._db.execute(
-                "UPDATE group_rooms SET summary=?, summary_through_seq=? WHERE id=?",
+                """UPDATE group_rooms
+                   SET summary=?, summary_through_seq=?, compression_count=compression_count+1
+                   WHERE id=?""",
                 (summary, int(through_seq), room_id),
             )
             if cur.rowcount == 0:
@@ -201,6 +212,34 @@ class GroupChatStore:
             self._db.execute(
                 "UPDATE group_members SET runtime_session_id=NULL WHERE room_id=? AND profile=?",
                 (room_id, profile),
+            )
+
+    def reset_member_sessions(self, room_id: str) -> None:
+        with self._lock, self._db:
+            self._db.execute(
+                "UPDATE group_members SET runtime_session_id=NULL, stored_session_id=NULL WHERE room_id=?",
+                (room_id,),
+            )
+
+    def truncate_from(self, room_id: str, seq: int) -> None:
+        with self._lock, self._db:
+            checkpoint = self._db.execute(
+                "SELECT event_type FROM group_timeline WHERE room_id=? AND seq=?",
+                (room_id, int(seq)),
+            ).fetchone()
+            if checkpoint is None or checkpoint["event_type"] != "user.message":
+                raise ValueError("checkpoint must identify a user message")
+            self._db.execute(
+                "DELETE FROM group_timeline WHERE room_id=? AND seq>=?",
+                (room_id, int(seq)),
+            )
+            self._db.execute("DELETE FROM group_projection_cursors WHERE room_id=?", (room_id,))
+            self._db.execute("DELETE FROM group_mention_dispatches WHERE room_id=?", (room_id,))
+            self._db.execute(
+                """UPDATE group_rooms
+                   SET summary='', summary_through_seq=0, compression_count=0
+                   WHERE id=?""",
+                (room_id,),
             )
 
     def delete_room(self, room_id: str) -> bool:
@@ -260,7 +299,7 @@ class GroupChatStore:
                 continue
             if not profile or event_type not in {
                 "message.start", "message.delta", "message.complete", "error", "agent.error",
-                "approval.request", "tool.start", "tool.progress", "tool.complete",
+                "approval.request", "clarify.request", "tool.start", "tool.progress", "tool.complete",
             }:
                 continue
             if event_type == "message.start" or profile not in active_by_profile:
@@ -315,6 +354,14 @@ class GroupChatStore:
                     "choices": payload.get("choices"),
                     "allow_permanent": payload.get("allow_permanent"),
                     "smart_denied": bool(payload.get("smart_denied")),
+                }
+            elif event_type == "clarify.request":
+                message["status"] = "clarify"
+                message["runtime_session_id"] = str(payload.get("session_id") or "")
+                message["clarify"] = {
+                    "request_id": str(payload.get("request_id") or ""),
+                    "question": str(payload.get("question") or ""),
+                    "choices": payload.get("choices") if isinstance(payload.get("choices"), list) else None,
                 }
         return messages
 
@@ -521,6 +568,23 @@ class GroupChatCoordinator:
                 continue
             self._pool.submit(self._run_member, room_id, member["profile"], session_id, text, 0)
         return {"event": user_event, "targets": [m["profile"] for m in targets]}
+
+    def rewind_and_rerun(self, room_id: str, seq: int, text: str) -> dict:
+        room = self.store.get_room(room_id)
+        if room is None:
+            raise KeyError(room_id)
+        if not text.strip():
+            raise ValueError("message content is required")
+        for member in room["members"]:
+            runtime_id = member.get("runtime_session_id")
+            if runtime_id:
+                try:
+                    self.interrupt(runtime_id)
+                except Exception:
+                    pass
+        self.store.truncate_from(room_id, seq)
+        self.store.reset_member_sessions(room_id)
+        return self.send(room_id, text)
 
     def _incremental_prompt(self, room_id: str, profile: str, text: str, boundary: int | None = None) -> str:
         room = self.store.get_room(room_id)
