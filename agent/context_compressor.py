@@ -5417,11 +5417,46 @@ This compaction should PRIORITISE preserving all information related to the focu
                 tail_messages.append(stripped)
 
         _merge_summary_into_tail = False
+
+        # --- template-visible role helpers (Mistral fix #74086) ---
+        # Mistral's chat template exempts tool-flow messages (role="tool" and
+        # role="assistant" carrying tool_calls) from its alternation check.
+        # Using the *literal* last/first role (which may be "tool") causes the
+        # summary to collide with the nearest template-counted role, producing
+        # "user→user" or "assistant→assistant" and a permanent HTTP 500.
+        # Compute the nearest *visible* role by skipping tool-flow messages.
+
+        def _nearest_visible_role_in_head(msgs: list[dict]) -> str:
+            """Last role in *msgs* that Mistral's template counts."""
+            for msg in reversed(msgs):
+                role = msg.get("role", "user")
+                if role == "tool":
+                    continue
+                if role == "assistant" and msg.get("tool_calls"):
+                    continue
+                return role
+            return "system"
+
+        def _nearest_visible_role_in_tail(msgs: list[dict]) -> Optional[str]:
+            """First role in *msgs* that Mistral's template counts."""
+            for msg in msgs:
+                role = msg.get("role", "user")
+                if role == "tool":
+                    continue
+                if role == "assistant" and msg.get("tool_calls"):
+                    continue
+                return role
+            return None
+
         # last_head_role reads the assembled (post-strip) head; first_tail_role
         # reads the assembled (post-strip) tail_messages — a stripped stale
         # handoff must not influence alternation-safe role selection.
-        last_head_role = compressed[-1].get("role", "user") if compressed else "user"
-        first_tail_role = tail_messages[0].get("role", "user") if tail_messages else None
+        last_head_role = (
+            _nearest_visible_role_in_head(compressed) if compressed else "user"
+        )
+        first_tail_role = (
+            _nearest_visible_role_in_tail(tail_messages) if tail_messages else None
+        )
         # When the only protected head message is the system prompt, the
         # summary becomes the first *visible* message in the API request
         # (most adapters — Anthropic, Bedrock — send the system prompt as
