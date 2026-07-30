@@ -80,6 +80,53 @@ class TestHermesTokenStorage:
         data = json.loads(token_path.read_text())
         assert data["access_token"] == "abc123"
 
+    def test_refresh_preserves_existing_refresh_token_when_omitted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("test-server")
+
+        initial_token = MagicMock()
+        initial_token.model_dump.return_value = {
+            "access_token": "old-access",
+            "token_type": "Bearer",
+            "refresh_token": "durable-refresh",
+        }
+        refreshed_token = MagicMock()
+        refreshed_token.model_dump.return_value = {
+            "access_token": "new-access",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+
+        asyncio.run(storage.set_tokens(initial_token))
+        asyncio.run(storage.set_tokens(refreshed_token))
+
+        data = json.loads((tmp_path / "mcp-tokens" / "test-server.json").read_text())
+        assert data["access_token"] == "new-access"
+        assert data["refresh_token"] == "durable-refresh"
+
+    def test_refresh_uses_explicit_new_refresh_token(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("test-server")
+
+        initial_token = MagicMock()
+        initial_token.model_dump.return_value = {
+            "access_token": "old-access",
+            "token_type": "Bearer",
+            "refresh_token": "old-refresh",
+        }
+        refreshed_token = MagicMock()
+        refreshed_token.model_dump.return_value = {
+            "access_token": "new-access",
+            "token_type": "Bearer",
+            "refresh_token": "rotated-refresh",
+        }
+
+        asyncio.run(storage.set_tokens(initial_token))
+        asyncio.run(storage.set_tokens(refreshed_token))
+
+        data = json.loads((tmp_path / "mcp-tokens" / "test-server.json").read_text())
+        assert data["refresh_token"] == "rotated-refresh"
+
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
     def test_token_file_created_with_0o600(self, tmp_path, monkeypatch):
         """Tokens must land on disk at 0o600 with no umask-default exposure window.
