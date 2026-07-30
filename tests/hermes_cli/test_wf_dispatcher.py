@@ -216,6 +216,96 @@ def test_workflow_advance_rejects_target_not_declared_by_current_step(tmp_path):
         conn.close()
 
 
+def test_stale_stage_worker_cannot_settle_successor_run(tmp_path):
+    conn = kb.connect(tmp_path / "board.sqlite")
+    try:
+        task_id, event_id = _workflow(conn)
+        first = kb.claim_task(conn, task_id)
+        assert first is not None
+        wf_engine.advance(
+            conn,
+            task_id,
+            to_step="two",
+            event_id=event_id,
+            expected_step="one",
+            expected_run_id=first.current_run_id,
+        )
+        second = kb.claim_task(conn, task_id)
+        assert second is not None
+
+        try:
+            wf_engine.exception(
+                conn,
+                task_id,
+                "late first-stage exception",
+                expected_step="one",
+                expected_run_id=first.current_run_id,
+            )
+        except wf_engine.WorkflowConflictError as exc:
+            assert "stale workflow step" in str(exc)
+        else:
+            raise AssertionError("stale stage worker settled the successor run")
+
+        row = conn.execute(
+            """
+            SELECT t.status, t.current_step_key, i.state
+              FROM tasks t JOIN wf_instance i ON i.task_id = t.id
+             WHERE t.id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        assert tuple(row) == ("running", "two", "advancing")
+    finally:
+        conn.close()
+
+
+def test_timeout_auto_block_maps_to_workflow_exception(
+    tmp_path,
+    monkeypatch,
+    all_assignees_spawnable,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    conn = kb.connect()
+    try:
+        task_id, _ = _workflow(conn)
+        conn.execute(
+            "UPDATE tasks SET max_retries = 1, max_runtime_seconds = 1 WHERE id = ?",
+            (task_id,),
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 779)
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = ?",
+            (int(kb.time.time()) - 10, claimed.current_run_id),
+        )
+        alive_checks = iter([True, False])
+        monkeypatch.setattr(
+            kb,
+            "_pid_alive",
+            lambda _pid: next(alive_checks, False),
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kw: None,
+            max_spawn=0,
+        )
+        assert task_id in result.timed_out
+        assert task_id in result.auto_blocked
+        row = conn.execute(
+            """
+            SELECT t.status, i.state
+              FROM tasks t JOIN wf_instance i ON i.task_id = t.id
+             WHERE t.id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        assert tuple(row) == ("blocked", "exception")
+    finally:
+        conn.close()
+
+
 def test_protocol_violation_auto_block_maps_to_workflow_exception(
     tmp_path, monkeypatch, all_assignees_spawnable,
 ):

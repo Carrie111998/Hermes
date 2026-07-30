@@ -606,6 +606,10 @@ class Task:
     # ``kanban.failure_limit`` config, and then to ``DEFAULT_FAILURE_LIMIT``.
     # Name matches the ``--max-retries`` CLI flag on ``kanban create``.
     max_retries: Optional[int] = None
+    # Dispatcher-only stage payload. Never persisted; populated from the
+    # exact connection that claimed the task so _default_spawn does not
+    # resolve a second board/database.
+    workflow_context: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -3332,6 +3336,7 @@ def enforce_max_runtime(
     """
     import signal
     timed_out: list[str] = []
+    auto_blocked: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
@@ -3415,7 +3420,7 @@ def enforce_max_runtime(
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
         if cur.rowcount == 1:
-            _record_task_failure(
+            auto = _record_task_failure(
                 conn, tid,
                 error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                 outcome="timed_out",
@@ -3423,6 +3428,9 @@ def enforce_max_runtime(
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed},
             )
+            if auto:
+                auto_blocked.append(tid)
+    enforce_max_runtime._last_auto_blocked = auto_blocked
     return timed_out
 
 
@@ -3897,6 +3905,9 @@ def dispatch_once(
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
     result.timed_out = enforce_max_runtime(conn)
+    _timeout_auto_blocked = getattr(enforce_max_runtime, "_last_auto_blocked", [])
+    if _timeout_auto_blocked:
+        result.auto_blocked.extend(_timeout_auto_blocked)
     result.promoted = recompute_ready(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -4039,7 +4050,7 @@ def _prepare_workflow_stage_turn(
 
     stage_context = wf_engine.context(conn, task.id)
     step = stage_context["step"]
-    runtime = _step_runtime_seconds(step, task.max_runtime_seconds)
+    runtime = _step_runtime_seconds(step, None)
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET max_runtime_seconds = ? WHERE id = ?",
@@ -4057,6 +4068,7 @@ def _prepare_workflow_stage_turn(
     refreshed = get_task(conn, task.id)
     if refreshed is None:
         raise KeyError(f"workflow task disappeared during dispatch: {task.id}")
+    refreshed.workflow_context = stage_context
     return refreshed
 
 
@@ -4073,7 +4085,16 @@ def _map_workflow_auto_blocks(
         if task is None or not task.workflow_template_id:
             continue
         reason = task.last_failure_error or "workflow worker circuit breaker tripped"
-        wf_engine.exception(conn, task_id, reason)
+        try:
+            wf_engine.exception(conn, task_id, reason)
+        except Exception as exc:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "workflow_exception_mapping_failed",
+                    {"error": str(exc)[:500]},
+                )
 
 
 def _rotate_worker_log(log_path: Path, max_bytes: int) -> None:
@@ -4154,12 +4175,13 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    workflow_context = None
+    workflow_context = task.workflow_context
     if task.workflow_template_id:
-        from hermes_cli import wf_engine
+        if workflow_context is None:
+            from hermes_cli import wf_engine
 
-        with contextlib.closing(connect(board=board)) as workflow_conn:
-            workflow_context = wf_engine.context(workflow_conn, task.id)
+            with contextlib.closing(connect(board=board)) as workflow_conn:
+                workflow_context = wf_engine.context(workflow_conn, task.id)
         event = workflow_context.get("event") or {}
         event_id = event.get("id")
         prompt = (
@@ -4216,6 +4238,7 @@ def _default_spawn(
     env["HERMES_PROFILE"] = profile_arg
     if task.workflow_template_id:
         env["HERMES_WORKFLOW_TASK"] = task.id
+        env["HERMES_WORKFLOW_STEP"] = str(task.current_step_key)
         event = (workflow_context or {}).get("event") or {}
         if event.get("id") is not None:
             env["HERMES_WORKFLOW_EVENT_ID"] = str(event["id"])

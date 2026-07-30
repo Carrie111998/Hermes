@@ -28,22 +28,55 @@ def workflow_worker(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "")
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import wf_engine
 
     kb._INITIALIZED_PATHS.clear()
     conn = kb.connect()
     try:
-        task_id = kb.create_task(
+        template_id, _ = wf_engine.register_template(
             conn,
-            title="synthetic workflow task",
-            assignee="workflow-worker",
+            {
+                "id": "synthetic-tools",
+                "correlation_keys": ["ref"],
+                "create_on": [{"type": "start"}],
+                "steps": [
+                    {
+                        "key": "start",
+                        "turn": {"brief": "synthetic"},
+                        "advance_to": "done",
+                    },
+                    {"key": "done"},
+                ],
+            },
+        )
+        event_id = wf_engine.ingest_event(
+            conn,
+            source="synthetic",
+            external_id="tools-start",
+            payload={"synthetic": True},
+            corr={"ref": "tools-1"},
+            event_type="start",
+        )
+        task_id = wf_engine.create_instance(
+            conn,
+            template_id=template_id,
+            entity_key="tools-1",
+            corr={"ref": "tools-1"},
+            vars={},
+            source_event_id=event_id,
         )
         conn.execute(
-            "UPDATE tasks SET workflow_template_id = ?, current_step_key = ? WHERE id = ?",
-            ("synthetic@1", "start", task_id),
+            "UPDATE tasks SET assignee = ? WHERE id = ?",
+            ("workflow-worker", task_id),
         )
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(task.claim_lock))
+    monkeypatch.setenv("HERMES_WORKFLOW_STEP", "start")
     return task_id
 
 
@@ -114,15 +147,15 @@ def test_handlers_default_to_owned_task_and_call_engine(monkeypatch, workflow_wo
         calls.append(("context", task_id))
         return {"task_id": task_id, "step": "start"}
 
-    def propose(conn, task_id, *, action, payload):
+    def propose(conn, task_id, *, action, payload, **_expected):
         calls.append(("propose", task_id, action, payload))
         return {"approval_id": "a1"}
 
-    def review(conn, task_id, *, reason, options):
+    def review(conn, task_id, *, reason, options, **_expected):
         calls.append(("review", task_id, reason, options))
         return {"review_id": "r1"}
 
-    def exception(conn, task_id, *, reason):
+    def exception(conn, task_id, *, reason, **_expected):
         calls.append(("exception", task_id, reason))
         return {"state": "exception"}
 
@@ -157,7 +190,7 @@ def test_advance_ledgers_then_advances_with_event_id(monkeypatch, workflow_worke
         calls.append(("ingest", kwargs))
         return 17
 
-    def advance(conn, task_id, *, to_step, event_id):
+    def advance(conn, task_id, *, to_step, event_id, **_expected):
         calls.append(("advance", task_id, to_step, event_id))
         return {"step": to_step}
 
@@ -215,7 +248,11 @@ def test_signal_uses_metadata_and_reports_duplicate(monkeypatch, workflow_worker
         "metadata": {"external_id": "mail-1", "event_type": "mail.received"},
         "body_ref": "synthetic://body",
     }
-    args = {"source": "email", "payload": payload, "corr": {"ref": "R1"}}
+    args = {
+        "source": "email",
+        "payload": payload,
+        "corr": {"ref": "tools-1"},
+    }
 
     first = json.loads(wt._handle_signal(args))
     second = json.loads(wt._handle_signal(args))
@@ -225,9 +262,52 @@ def test_signal_uses_metadata_and_reports_duplicate(monkeypatch, workflow_worker
         "source": "email",
         "external_id": "mail-1",
         "payload": payload,
-        "corr": {"ref": "R1"},
+        "corr": {"ref": "tools-1"},
         "event_type": "mail.received",
     }
+
+
+def test_signal_rejects_corr_outside_assigned_instance(
+    monkeypatch,
+    workflow_worker,
+):
+    from tools import wf_tools as wt
+
+    called = []
+    monkeypatch.setattr(
+        wt.wf_engine,
+        "ingest_event",
+        lambda *args, **kwargs: called.append((args, kwargs)),
+    )
+    result = json.loads(
+        wt._handle_signal(
+            {
+                "source": "email",
+                "payload": {"event_type": "mail.received"},
+                "corr": {"ref": "another-instance"},
+            }
+        )
+    )
+    assert "tool_error" in result
+    assert called == []
+
+
+def test_stale_workflow_run_is_refused_before_engine_call(
+    monkeypatch,
+    workflow_worker,
+):
+    from tools import wf_tools as wt
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999999")
+    called = []
+    monkeypatch.setattr(
+        wt.wf_engine,
+        "exception",
+        lambda *args, **kwargs: called.append((args, kwargs)),
+    )
+    result = json.loads(wt._handle_exception({"reason": "late"}))
+    assert "stale workflow worker stage turn" in result["tool_error"]
+    assert called == []
 
 
 def test_invalid_payloads_fail_closed(monkeypatch, workflow_worker):

@@ -241,6 +241,32 @@ def _instance(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
     return row
 
 
+def _assert_expected_turn(
+    task: sqlite3.Row,
+    *,
+    expected_step: str | None = None,
+    expected_run_id: int | None = None,
+) -> None:
+    """Reject a stale worker attempting to settle a successor stage run."""
+
+    if expected_step is not None and task["current_step_key"] != expected_step:
+        raise WorkflowConflictError(
+            f"stale workflow step: expected {expected_step!r}, "
+            f"found {task['current_step_key']!r}"
+        )
+    if expected_run_id is not None:
+        current_run_id = task["current_run_id"]
+        if (
+            task["status"] != "running"
+            or current_run_id is None
+            or int(current_run_id) != int(expected_run_id)
+        ):
+            raise WorkflowConflictError(
+                f"stale workflow run: expected {expected_run_id}, "
+                f"found {current_run_id}"
+            )
+
+
 def _cas_step(
     conn: sqlite3.Connection,
     task_id: str,
@@ -770,11 +796,24 @@ def apply_event(conn, event_id, task_id, *, expected_step: str) -> ApplyResult:
         )
 
 
-def advance(conn, task_id, *, to_step, event_id) -> None:
+def advance(
+    conn,
+    task_id,
+    *,
+    to_step,
+    event_id,
+    expected_step: str | None = None,
+    expected_run_id: int | None = None,
+) -> None:
     """Commit a worker-stage transition and enter the next stage."""
 
     with kanban_db.write_txn(conn):
         task = _task(conn, task_id)
+        _assert_expected_turn(
+            task,
+            expected_step=expected_step,
+            expected_run_id=expected_run_id,
+        )
         instance = _instance(conn, task_id)
         spec = _load_template(conn, instance["template_id"])
         current_step = task["current_step_key"]
@@ -925,11 +964,30 @@ def context(conn, task_id: str) -> dict:
     }
 
 
-def propose(conn, task_id: str, action: str, payload: dict) -> int:
+def correlation(conn, task_id: str) -> dict:
+    """Return the authoritative correlation scope for one workflow instance."""
+
+    return _load_json(_instance(conn, task_id)["corr"], {})
+
+
+def propose(
+    conn,
+    task_id: str,
+    action: str,
+    payload: dict,
+    *,
+    expected_step: str | None = None,
+    expected_run_id: int | None = None,
+) -> int:
     """Persist a complete approval proposal and park the instance."""
 
     with kanban_db.write_txn(conn):
         task = _task(conn, task_id)
+        _assert_expected_turn(
+            task,
+            expected_step=expected_step,
+            expected_run_id=expected_run_id,
+        )
         instance = _instance(conn, task_id)
         token = secrets.token_urlsafe(32)
         approval = conn.execute(
@@ -956,12 +1014,25 @@ def propose(conn, task_id: str, action: str, payload: dict) -> int:
         return int(approval.lastrowid)
 
 
-def review(conn, task_id: str, reason: str, options: Any = None) -> None:
+def review(
+    conn,
+    task_id: str,
+    reason: str,
+    options: Any = None,
+    *,
+    expected_step: str | None = None,
+    expected_run_id: int | None = None,
+) -> None:
     """Move a workflow instance into the human review state."""
 
     del options  # Reserved for the later adapter; no schema column is added.
     with kanban_db.write_txn(conn):
         task = _task(conn, task_id)
+        _assert_expected_turn(
+            task,
+            expected_step=expected_step,
+            expected_run_id=expected_run_id,
+        )
         _instance(conn, task_id)
         conn.execute(
             "UPDATE wf_instance SET state = 'needs_review', parked_since = ? WHERE task_id = ?",
@@ -971,11 +1042,23 @@ def review(conn, task_id: str, reason: str, options: Any = None) -> None:
         _assert_invariant(conn, task_id)
 
 
-def exception(conn, task_id: str, reason: str) -> None:
+def exception(
+    conn,
+    task_id: str,
+    reason: str,
+    *,
+    expected_step: str | None = None,
+    expected_run_id: int | None = None,
+) -> None:
     """Move a workflow instance into the resumable exception state."""
 
     with kanban_db.write_txn(conn):
         task = _task(conn, task_id)
+        _assert_expected_turn(
+            task,
+            expected_step=expected_step,
+            expected_run_id=expected_run_id,
+        )
         _instance(conn, task_id)
         conn.execute(
             "UPDATE wf_instance SET state = 'exception', parked_since = ? WHERE task_id = ?",
