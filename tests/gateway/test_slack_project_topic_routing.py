@@ -98,7 +98,7 @@ def test_explicit_keep_channel_skips_model_call():
     assert decision.source == "directive"
 
 
-def test_high_confidence_topic_drift_opens_thread():
+def test_high_confidence_unrelated_work_opens_thread():
     decision = classify_project_topic(
         channel_name="travel-japan-202609",
         channel_prompt="Plan the Japan trip.",
@@ -106,6 +106,55 @@ def test_high_confidence_topic_drift_opens_thread():
         call_fn=lambda **_kwargs: _response("thread", 0.96),
     )
     assert decision.use_thread is True
+
+
+def test_high_confidence_bounded_project_subtopic_opens_thread():
+    decision = classify_project_topic(
+        channel_name="travel-japan-202609",
+        channel_prompt="Plan the Japan trip.",
+        text="第三天晚上在新宿吃什么？比较三家餐厅后帮我定一家。",
+        call_fn=lambda **_kwargs: _response("thread", 0.97),
+    )
+    assert decision.use_thread is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "日本有哪些值得吃的东西？",
+        "把整个日本行程预算控制在一万元以内。",
+        "东京和大阪大概要各留几天？",
+    ],
+)
+def test_project_wide_or_broad_turns_stay_in_channel(text):
+    decision = classify_project_topic(
+        channel_name="travel-japan-202609",
+        channel_prompt="Plan the Japan trip.",
+        text=text,
+        call_fn=lambda **_kwargs: _response("channel", 0.97),
+    )
+    assert decision.use_thread is False
+
+
+def test_router_prompt_defines_branch_worthy_subtopics():
+    captured = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return _response("thread", 0.97)
+
+    classify_project_topic(
+        channel_name="travel-japan-202609",
+        channel_prompt="Plan the Japan trip.",
+        text="第三天晚餐在新宿选哪家？",
+        call_fn=capture,
+    )
+
+    system_prompt = captured["messages"][0]["content"]
+    assert "bounded subtopic inside the project" in system_prompt
+    assert "specific meal, hotel, flight, day" in system_prompt
+    assert "simple one-answer questions" in system_prompt
+    assert "Do not fragment the channel" in system_prompt
 
 
 def test_uncertain_topic_drift_fails_safe_to_channel():
