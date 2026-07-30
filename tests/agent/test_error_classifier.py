@@ -234,6 +234,27 @@ class TestClassifyApiError:
 
     # ── Rate limit ──
 
+    def test_429_usage_limit_transient_window_wording_stays_rate_limit(self):
+        """Periodic quota wording must not become terminal billing."""
+        messages = [
+            "Your API usage limit quota allows 60 requests per minute",
+            "Usage limit exceeded per minute quota",
+            "Quota available in 5 minutes",
+            "Requests per second limit exceeded",
+            "Usage limit will be reset after cooldown period",
+        ]
+        for message in messages:
+            result = classify_api_error(MockAPIError(message, status_code=429))
+            assert result.reason == FailoverReason.rate_limit, message
+            assert result.retryable is True, message
+
+    def test_429_underscore_rate_limit_stays_rate_limit(self):
+        result = classify_api_error(
+            MockAPIError("rate_limit exceeded", status_code=429)
+        )
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
     def test_429_rate_limit(self):
         e = MockAPIError("Too Many Requests", status_code=429)
         result = classify_api_error(e)

@@ -209,6 +209,10 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "resets at",
     "resets in",  # (#63021) "Your limit resets in 4hr 5min"
     "reset in",
+    "reset after",
+    "available in",
+    "per minute",
+    "per second",
     "wait",
     "requests remaining",
     "periodic",
@@ -222,6 +226,7 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
 _EXPLICIT_RATE_LIMIT_PATTERNS = [
     "rate limit",
     "rate-limit",
+    "rate_limit",
     "ratelimit",
 ]
 
