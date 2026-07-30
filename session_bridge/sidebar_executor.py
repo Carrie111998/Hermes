@@ -1761,6 +1761,8 @@ def _is_absolute_canonical_windows_path(value: object) -> bool:
         return False
     try:
         canonical = value.replace("/", "\\")
+        if canonical.casefold().startswith(("\\\\?\\", "\\\\.\\")):
+            return False
         drive, tail = ntpath.splitdrive(canonical)
         is_drive_qualified = (
             len(drive) == 2
