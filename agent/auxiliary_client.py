@@ -5579,8 +5579,10 @@ def resolve_provider_client(
         if custom_entry is None:
             custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
-            custom_base = (custom_entry.get("base_url") or "").strip()
-            custom_key = (custom_entry.get("api_key") or "").strip()
+            pinned_key = (explicit_api_key or "").strip() or None
+            pinned_base = (explicit_base_url or "").strip().rstrip("/") or None
+            custom_base = pinned_base or (custom_entry.get("base_url") or "").strip()
+            custom_key = pinned_key or (custom_entry.get("api_key") or "").strip()
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
                 custom_key = os.getenv(custom_key_env, "").strip()
