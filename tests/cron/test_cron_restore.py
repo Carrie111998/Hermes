@@ -98,6 +98,34 @@ def test_restore_preserves_repeat_progress_presence_null_and_notification_eviden
     assert not (temp_home / "cron" / "provider_notifications.jsonl").exists()
 
 
+def test_restore_roundtrip_accepts_comma_separated_delivery_from_lossless_record(temp_home):
+    snapshot = create_snapshot()
+    record = dict(snapshot["record"])
+    record["deliver"] = "telegram:123,discord:456"
+    snapshot["record"] = record
+    snapshot["presence"] = sorted(record)
+    snapshot["delivery"] = ["telegram:123", "discord:456"]
+    snapshot["deliver"] = ["telegram:123", "discord:456"]
+
+    restored = cli("cron", "restore", snapshot["id"], "--snapshot-stdin", "--json",
+                   input_text=json.dumps(snapshot))
+    assert restored.returncode == 0, restored.stdout
+    assert json.loads(restored.stdout) == snapshot
+
+
+def test_restore_roundtrip_accepts_absent_schedule_display_from_lossless_record(temp_home):
+    snapshot = create_snapshot()
+    record = dict(snapshot["record"])
+    record.pop("schedule_display")
+    snapshot["record"] = record
+    snapshot["presence"] = sorted(record)
+
+    restored = cli("cron", "restore", snapshot["id"], "--snapshot-stdin", "--json",
+                   input_text=json.dumps(snapshot))
+    assert restored.returncode == 0, restored.stdout
+    assert json.loads(restored.stdout) == snapshot
+
+
 @pytest.mark.parametrize("schedule", ["2026-07-31T10:00:00-04:00", "0 7 * * *"])
 def test_one_shot_and_cron_snapshots_are_versioned_and_restoreable(temp_home, schedule):
     snapshot = create_snapshot(schedule)

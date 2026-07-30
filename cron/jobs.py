@@ -1778,16 +1778,12 @@ def restore_job(job_id: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any
             invalid("CRON_RESTORE_SCHEDULE_MISMATCH")
         if snapshot.get("repeat_state") != record.get("repeat"):
             invalid("CRON_RESTORE_REPEAT_MISMATCH")
-        if snapshot.get("schedule") != record.get("schedule_display"):
-            invalid("CRON_RESTORE_SCHEDULE_MISMATCH")
         repeat_state = record.get("repeat")
         expected_repeat = repeat_state.get("times") if isinstance(repeat_state, dict) else None
         if snapshot.get("repeat") != expected_repeat:
             invalid("CRON_RESTORE_REPEAT_MISMATCH")
         if snapshot.get("run_at") != (record.get("schedule") or {}).get("run_at"):
             invalid("CRON_RESTORE_RUN_AT_MISMATCH")
-        if snapshot.get("delivery") != record.get("deliver"):
-            invalid("CRON_RESTORE_DELIVERY_MISMATCH")
         snapshot = record
     else:
         # Keep the pre-v2 input path for existing callers, but apply the same
