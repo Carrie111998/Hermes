@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -33,7 +33,7 @@ import { useI18n } from '@/i18n'
 import { AlertTriangle, Globe, Plus, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $profileScope } from '@/store/profile'
+import { $activeGatewayProfile } from '@/store/profile'
 import { runGatewayRestart } from '@/store/system-actions'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
@@ -78,12 +78,24 @@ interface WebhooksViewProps {
 }
 
 export function WebhooksView({ onClose }: WebhooksViewProps) {
+  const profile = useStore($activeGatewayProfile)
+
+  return <ProfileWebhooksView key={profile} onClose={onClose} profile={profile} />
+}
+
+interface ProfileWebhooksViewProps extends WebhooksViewProps {
+  profile: string
+}
+
+function ProfileWebhooksView({ onClose, profile }: ProfileWebhooksViewProps) {
   const { t } = useI18n()
   const w = t.webhooks
-  // Re-load when the active profile changes so REST routes to the right backend.
-  const profileScope = useStore($profileScope)
   const queryClient = useQueryClient()
-  const queryKey = useMemo(() => ['webhooks', profileScope] as const, [profileScope])
+  const queryKey = useMemo(() => ['webhooks', profile] as const, [profile])
+  const active = useRef(true)
+  const reloadTimer = useRef<null | number>(null)
+
+  const isActiveProfile = useCallback(() => active.current && $activeGatewayProfile.get() === profile, [profile])
 
   const [query, setQuery] = useState('')
   const [enabling, setEnabling] = useState(false)
@@ -106,6 +118,18 @@ export function WebhooksView({ onClose }: WebhooksViewProps) {
 
   const [pendingDelete, setPendingDelete] = useState<null | string>(null)
 
+  useEffect(() => {
+    active.current = true
+
+    return () => {
+      active.current = false
+
+      if (reloadTimer.current !== null) {
+        window.clearTimeout(reloadTimer.current)
+      }
+    }
+  }, [])
+
   const {
     data,
     error,
@@ -113,7 +137,7 @@ export function WebhooksView({ onClose }: WebhooksViewProps) {
     refetch
   } = useQuery({
     queryKey,
-    queryFn: getWebhooks
+    queryFn: () => getWebhooks(profile)
   })
 
   // React Query v5 dropped useQuery onError; surface a load failure toast once
@@ -134,46 +158,81 @@ export function WebhooksView({ onClose }: WebhooksViewProps) {
       try {
         await queryClient.invalidateQueries({ queryKey })
       } catch (err) {
-        if (!silent) {
+        if (!silent && isActiveProfile()) {
           notifyError(err, w.loadFailed)
         }
       }
     },
-    [queryClient, queryKey, w.loadFailed]
+    [isActiveProfile, queryClient, queryKey, w.loadFailed]
   )
+
+  const scheduleReload = useCallback(() => {
+    if (reloadTimer.current !== null) {
+      window.clearTimeout(reloadTimer.current)
+    }
+
+    reloadTimer.current = window.setTimeout(() => {
+      if (isActiveProfile()) {
+        void reload(true)
+      }
+    }, 4000)
+  }, [isActiveProfile, reload])
 
   useRefreshHotkey(() => void refetch())
 
   const restartGatewayNow = useCallback(async () => {
+    if (!isActiveProfile()) {
+      return
+    }
+
     setRestarting(true)
 
     try {
       await runGatewayRestart()
+
+      if (!isActiveProfile()) {
+        return
+      }
+
       setRestartNeeded(false)
       setRestartError(null)
       // Give the receiver a moment to bind before re-reading state.
-      window.setTimeout(() => void reload(true), 4000)
+      scheduleReload()
     } catch (err) {
+      if (!isActiveProfile()) {
+        return
+      }
+
       setRestartNeeded(true)
       setRestartError(String(err))
       notifyError(err, w.restartFailed(''))
     } finally {
-      setRestarting(false)
+      if (isActiveProfile()) {
+        setRestarting(false)
+      }
     }
-  }, [reload, w])
+  }, [isActiveProfile, scheduleReload, w])
 
   const handleEnable = useCallback(async () => {
+    if (!isActiveProfile()) {
+      return
+    }
+
     setEnabling(true)
     setRestartNeeded(false)
     setRestartError(null)
 
     try {
-      const result = await enableWebhooks()
+      const result = await enableWebhooks(profile)
       await reload(true)
+
+      if (!isActiveProfile()) {
+        return
+      }
 
       if (result.restart_started) {
         notify({ kind: 'success', message: w.enabledRestarting })
-        window.setTimeout(() => void reload(true), 4000)
+        scheduleReload()
       } else {
         const detail = result.restart_error ? `: ${result.restart_error}` : '.'
         setRestartNeeded(true)
@@ -181,11 +240,15 @@ export function WebhooksView({ onClose }: WebhooksViewProps) {
         notify({ kind: 'error', message: w.restartFailed(detail) })
       }
     } catch (err) {
-      notifyError(err, w.restartFailed(''))
+      if (isActiveProfile()) {
+        notifyError(err, w.restartFailed(''))
+      }
     } finally {
-      setEnabling(false)
+      if (isActiveProfile()) {
+        setEnabling(false)
+      }
     }
-  }, [reload, w])
+  }, [isActiveProfile, profile, reload, scheduleReload, w])
 
   const resetForm = useCallback(() => {
     setName('')
@@ -207,6 +270,10 @@ export function WebhooksView({ onClose }: WebhooksViewProps) {
   }, [creating])
 
   const handleCreate = useCallback(async () => {
+    if (!isActiveProfile()) {
+      return
+    }
+
     if (!name.trim()) {
       notify({ kind: 'error', message: w.nameRequired })
 
@@ -226,29 +293,45 @@ export function WebhooksView({ onClose }: WebhooksViewProps) {
         .map(s => s.trim())
         .filter(Boolean)
 
-      const res = await createWebhook({
-        deliver,
-        deliver_only: deliverOnly,
-        description: description.trim() || undefined,
-        events: eventsList.length ? eventsList : undefined,
-        name: name.trim(),
-        prompt: prompt.trim() || undefined,
-        skills: skillsList.length ? skillsList : undefined
-      })
+      const res = await createWebhook(
+        {
+          deliver,
+          deliver_only: deliverOnly,
+          description: description.trim() || undefined,
+          events: eventsList.length ? eventsList : undefined,
+          name: name.trim(),
+          prompt: prompt.trim() || undefined,
+          skills: skillsList.length ? skillsList : undefined
+        },
+        profile
+      )
+
+      void reload(true)
+
+      if (!isActiveProfile()) {
+        return
+      }
 
       notify({ kind: 'success', message: w.created })
       setCreated({ secret: res.secret, url: res.url })
       resetForm()
-      void reload(true)
     } catch (err) {
-      notifyError(err, w.createFailed(''))
+      if (isActiveProfile()) {
+        notifyError(err, w.createFailed(''))
+      }
     } finally {
-      setCreating(false)
+      if (isActiveProfile()) {
+        setCreating(false)
+      }
     }
-  }, [deliver, deliverOnly, description, events, name, prompt, reload, resetForm, skills, w])
+  }, [deliver, deliverOnly, description, events, isActiveProfile, name, profile, prompt, reload, resetForm, skills, w])
 
   const handleToggle = useCallback(
     async (subName: string, nextEnabled: boolean) => {
+      if (!isActiveProfile()) {
+        return
+      }
+
       // Optimistic cache paint; the invalidate below lets backend truth win.
       queryClient.setQueryData<WebhooksResponse>(queryKey, current =>
         current
@@ -260,34 +343,47 @@ export function WebhooksView({ onClose }: WebhooksViewProps) {
       )
 
       try {
-        await setWebhookEnabled(subName, nextEnabled)
-        notify({ kind: 'success', message: nextEnabled ? w.enabled(subName) : w.disabled(subName) })
+        await setWebhookEnabled(subName, nextEnabled, profile)
         void reload(true)
+
+        if (isActiveProfile()) {
+          notify({ kind: 'success', message: nextEnabled ? w.enabled(subName) : w.disabled(subName) })
+        }
       } catch (err) {
         await reload(true)
-        notifyError(err, w.toggleFailed(subName))
+
+        if (isActiveProfile()) {
+          notifyError(err, w.toggleFailed(subName))
+        }
       }
     },
-    [queryClient, queryKey, reload, w]
+    [isActiveProfile, profile, queryClient, queryKey, reload, w]
   )
 
   // ConfirmDialog owns the pending→done→close beat; throw to surface its inline
   // error and keep the dialog open. Success toast matches the cron delete idiom
   // (title + name).
   const handleDelete = useCallback(async () => {
-    if (!pendingDelete) {
+    if (!pendingDelete || !isActiveProfile()) {
       return
     }
 
     try {
-      await deleteWebhook(pendingDelete)
-      notify({ kind: 'success', title: w.deleted, message: pendingDelete })
+      await deleteWebhook(pendingDelete, profile)
       void reload(true)
+
+      if (isActiveProfile()) {
+        notify({ kind: 'success', title: w.deleted, message: pendingDelete })
+      }
     } catch (err) {
+      if (!isActiveProfile()) {
+        return
+      }
+
       notifyError(err, w.deleteFailed(pendingDelete))
       throw err
     }
-  }, [pendingDelete, reload, w])
+  }, [isActiveProfile, pendingDelete, profile, reload, w])
 
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase()
