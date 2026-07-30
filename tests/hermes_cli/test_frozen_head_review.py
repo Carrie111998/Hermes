@@ -28,6 +28,13 @@ def git_head(repo: Path) -> str:
     ).stdout.strip()
 
 
+def git_tree(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
 def make_repo(tmp_path: Path) -> tuple[Path, str]:
     repo = tmp_path / "implementation"
     repo.mkdir()
@@ -48,14 +55,17 @@ def complete_with_evidence(conn, task_id: str) -> None:
     )
 
 
-def evidence(head: str, repo: Path) -> dict:
-    return {
+def evidence(head: str, repo: Path, *, include_tree: bool = False) -> dict:
+    result = {
         "head_sha": head,
         "worktree_path": str(repo),
         "clean": True,
         "implementation_complete": True,
         "source": "frozen-head-cli",
     }
+    if include_tree:
+        result["tree_sha"] = git_tree(repo)
+    return result
 
 
 def test_db_accepts_completed_clean_exact_head_without_claim(kanban_home, tmp_path):
@@ -70,6 +80,7 @@ def test_db_accepts_completed_clean_exact_head_without_claim(kanban_home, tmp_pa
         event = kb.list_events(conn, task_id)[-1]
         assert event.kind == "review_submitted_frozen_head"
         assert event.payload["head_sha"] == head
+        assert event.payload["tree_sha"] == git_tree(repo)
         assert event.payload["implementation_run_id"]
 
 
@@ -90,6 +101,38 @@ def test_scheduled_ready_submit_directly_without_transition_dance(kanban_home, t
         assert kb.submit_frozen_head_for_review(
             conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
         )
+
+
+@pytest.mark.parametrize("status", ["scheduled", "ready", "todo", "done"])
+def test_every_accepted_dormant_state_is_explicitly_supported(kanban_home, tmp_path, status):
+    repo, head = make_repo(tmp_path)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title=f"accepted {status}", workspace_kind="dir", workspace_path=str(repo))
+        if status == "done":
+            complete_with_evidence(conn, task_id)
+        else:
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+            conn.commit()
+            kb._synthesize_ended_run(
+                conn, task_id, outcome="completed", summary="implementation complete",
+                metadata={"changed_files": ["implemented.txt"], "tests_run": 3},
+            )
+        assert kb.submit_frozen_head_for_review(
+            conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
+        )
+
+
+@pytest.mark.parametrize("status", ["triage", "running", "archived"])
+def test_non_dormant_states_are_rejected(kanban_home, tmp_path, status):
+    repo, head = make_repo(tmp_path)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title=f"reject {status}", workspace_kind="dir", workspace_path=str(repo))
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+        conn.commit()
+        with pytest.raises(kb.FrozenHeadReviewError, match="cannot be submitted"):
+            kb.submit_frozen_head_for_review(
+                conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
+            )
 
 
 @pytest.mark.parametrize(

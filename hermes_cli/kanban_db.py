@@ -4739,19 +4739,31 @@ def submit_task_for_review(
         return get_task(conn, task_id)
 
 
-def _worktree_writer_pids(worktree: Path) -> list[int]:
-    """Return non-control processes with a writable relationship to worktree."""
-    target = worktree.resolve()
-    control_pid = os.getpid()
-    found: set[int] = set()
+@dataclass(frozen=True)
+class _WorktreeWriterScan:
+    writers: tuple[int, ...]
+    complete: bool
+    unsupported: bool
+    errors: tuple[str, ...]
+
+
+def _worktree_writer_pids(worktree: Path) -> _WorktreeWriterScan:
+    """Inspect process writers; never report an empty result without proof."""
+    if sys.platform != "linux":
+        return _WorktreeWriterScan((), False, True, (f"unsupported platform: {sys.platform}",))
+    proc = Path("/proc")
     try:
-        pids = [int(p.name) for p in Path("/proc").iterdir() if p.name.isdigit()]
-    except OSError:
-        return []
-    for pid in pids:
-        if pid == control_pid:
+        entries = list(proc.iterdir())
+    except OSError as exc:
+        return _WorktreeWriterScan((), False, False, (f"cannot enumerate /proc: {exc}",))
+    target = worktree.resolve()
+    found: set[int] = set()
+    errors: list[str] = []
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
             continue
-        base = Path("/proc") / str(pid)
+        pid = int(entry.name)
+        base = proc / str(pid)
         try:
             cwd = (base / "cwd").resolve()
             if cwd == target or target in cwd.parents:
@@ -4760,20 +4772,48 @@ def _worktree_writer_pids(worktree: Path) -> list[int]:
                 resolved = fd.resolve()
                 if resolved != target and target not in resolved.parents:
                     continue
-                fdinfo = (base / "fdinfo" / fd.name).read_text()
-                flags_line = next((line for line in fdinfo.splitlines() if line.startswith("flags:")), "")
+                flags_line = next(
+                    (line for line in (base / "fdinfo" / fd.name).read_text().splitlines()
+                     if line.startswith("flags:")), ""
+                )
                 if flags_line and int(flags_line.split()[1], 8) & (os.O_WRONLY | os.O_RDWR):
                     found.add(pid)
             for line in (base / "maps").read_text().splitlines():
                 fields = line.split()
-                if len(fields) < 6 or "w" not in fields[1]:
+                if len(fields) < 6 or "w" not in fields[1] or "s" not in fields[1]:
                     continue
-                mapped = Path(" ".join(fields[5:])).resolve()
+                mapped_name = fields[5]
+                if not mapped_name.startswith("/"):
+                    continue
+                mapped = Path(mapped_name.removesuffix(" (deleted)")).resolve()
                 if mapped == target or target in mapped.parents:
                     found.add(pid)
-        except (OSError, ValueError, RuntimeError):
+        except FileNotFoundError:
             continue
-    return sorted(found)
+        except PermissionError as exc:
+            # hidepid/procfs policy can hide unrelated processes. Keep the
+            # diagnostic in the scan result; the proc mount remains usable.
+            errors.append(f"pid {pid}: {exc}")
+        except (OSError, ValueError, RuntimeError) as exc:
+            errors.append(f"pid {pid}: {exc}")
+    # Per-process permission diagnostics are retained, but the proc mount is
+    # still usable; only inability to enumerate or inspect the target process
+    # itself makes the scan incomplete.
+    return _WorktreeWriterScan(tuple(sorted(found)), True, False, tuple(errors))
+
+
+def _git_worktree_snapshot(path: Path) -> tuple[str, str, str]:
+    """Return exact HEAD, committed tree id, and complete porcelain status."""
+    def run(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), *args], check=True, capture_output=True,
+            text=True, timeout=10,
+        ).stdout
+    return (
+        run("rev-parse", "--verify", "HEAD").strip(),
+        run("rev-parse", "--verify", "HEAD^{tree}").strip(),
+        run("status", "--porcelain=v1", "--untracked-files=all"),
+    )
 
 
 def submit_frozen_head_for_review(
@@ -4821,6 +4861,9 @@ def submit_frozen_head_for_review(
     evidence = dict(evidence)
     if evidence.get("head_sha") != head_sha:
         reject("evidence head_sha must exactly match head_sha")
+    submitted_tree_sha = evidence.get("tree_sha", evidence.get("tree_hash"))
+    if submitted_tree_sha is not None and not isinstance(submitted_tree_sha, str):
+        reject("evidence tree_sha must be a string when supplied")
     if evidence.get("worktree_path"):
         try:
             evidence_path = Path(evidence["worktree_path"]).expanduser().resolve(strict=True)
@@ -4839,18 +4882,13 @@ def submit_frozen_head_for_review(
     if not path.is_dir():
         reject("worktree_path is not a directory")
     try:
-        verified_head = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
-            check=True, capture_output=True, text=True, timeout=10,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "-C", str(path), "status", "--porcelain=v1", "--untracked-files=all"],
-            check=True, capture_output=True, text=True, timeout=10,
-        ).stdout
+        verified_head, tree_sha, dirty = _git_worktree_snapshot(path)
     except (OSError, subprocess.SubprocessError) as exc:
         reject(f"unable to verify git worktree: {exc}")
     if verified_head.lower() != head_sha.lower():
         reject("worktree HEAD does not match exact head_sha")
+    if submitted_tree_sha is not None and tree_sha.lower() != submitted_tree_sha.lower():
+        reject("worktree tree_sha does not match exact tree_sha")
     if dirty:
         reject("worktree is dirty")
 
@@ -4871,9 +4909,18 @@ def submit_frozen_head_for_review(
         reject("worktree is unrelated to the task canonical workspace")
     if row["current_run_id"] is not None or row["claim_lock"] is not None or row["worker_pid"] is not None:
         reject("task has a live claim or current writer")
-    writer_pids = _worktree_writer_pids(submitted_path)
-    if writer_pids:
-        reject(f"worktree has active OS writers: {writer_pids}")
+    first_snapshot = (verified_head.lower(), tree_sha.lower(), dirty)
+    writer_scan = _worktree_writer_pids(submitted_path)
+    if not writer_scan.complete or writer_scan.unsupported:
+        reject(f"OS writer inspection incomplete or unsupported: {list(writer_scan.errors)}")
+    if writer_scan.writers:
+        reject(f"worktree has active OS writers: {list(writer_scan.writers)}")
+    try:
+        second_head, second_tree_sha, second_dirty = _git_worktree_snapshot(submitted_path)
+    except (OSError, subprocess.SubprocessError) as exc:
+        reject(f"unable to re-verify git worktree: {exc}")
+    if (second_head.lower(), second_tree_sha.lower(), second_dirty) != first_snapshot:
+        reject("git HEAD, tree, or full clean status changed during verification")
 
     run = conn.execute(
         "SELECT id, metadata FROM task_runs WHERE task_id = ? "
@@ -4892,14 +4939,25 @@ def submit_frozen_head_for_review(
         reject("completed implementation evidence requires changed_files and tests_run")
     if run_metadata.get("head_sha") and str(run_metadata["head_sha"]).lower() != head_sha.lower():
         reject("completed implementation evidence head_sha does not match exact head_sha")
+    run_tree_sha = run_metadata.get("tree_sha", run_metadata.get("tree_hash"))
+    if run_tree_sha is not None and str(run_tree_sha).lower() != second_tree_sha.lower():
+        reject("completed implementation evidence tree_sha does not match exact tree_sha")
+
+    original_identity = {
+        "status": row["status"], "workspace_path": row["workspace_path"],
+        "current_run_id": row["current_run_id"], "claim_lock": row["claim_lock"],
+        "worker_pid": row["worker_pid"],
+    }
 
     try:
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'review' WHERE id = ? "
-                "AND status IN ('scheduled', 'ready', 'todo', 'done') "
-                "AND current_run_id IS NULL AND claim_lock IS NULL AND worker_pid IS NULL",
-                (task_id,),
+                "UPDATE tasks SET status = 'review' WHERE id = ? AND status = ? "
+                "AND workspace_path IS ? AND current_run_id IS ? "
+                "AND claim_lock IS ? AND worker_pid IS ?",
+                (task_id, original_identity["status"], original_identity["workspace_path"],
+                 original_identity["current_run_id"], original_identity["claim_lock"],
+                 original_identity["worker_pid"]),
             )
             if cur.rowcount != 1:
                 raise FrozenHeadReviewError("task state changed while submitting frozen head")
@@ -4907,6 +4965,9 @@ def submit_frozen_head_for_review(
                 "route": "frozen_head",
                 "actor": actor,
                 "head_sha": head_sha,
+                "tree_sha": second_tree_sha,
+                "stable_head_sha": second_head,
+                "stable_tree_sha": second_tree_sha,
                 "worktree_path": str(path.resolve()),
                 "evidence": evidence,
                 "implementation_run_id": int(run["id"]),
