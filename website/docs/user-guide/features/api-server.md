@@ -365,13 +365,15 @@ OpenAI-style content-part array:
 }
 ```
 
-Runs accepts up to four inline PNG, JPEG, GIF, or WebP images, each up to 5
-MiB. It deliberately accepts only `data:image/...;base64` values—no web URLs,
-file uploads, or local paths—so this controllable endpoint cannot fetch a
-private network URL or inspect the Hermes host. The same Run keeps its usual
-status, events, approval, and stop controls. Discover the exact version and
-limits through `features.run_inline_images` and `endpoints.run_inline_images`
-in `/v1/capabilities` before sending images.
+Runs accept up to four inline PNG, JPEG, GIF, or WebP images, each up to 5
+MiB. The route has a 32 MiB request budget so all four images remain reachable
+after base64 and JSON expansion; the default 10 MB budget remains in force for
+other API routes. Runs deliberately accept only `data:image/...;base64`
+values—no web URLs, file uploads, or local paths—so this controllable endpoint
+cannot fetch a private network URL or inspect the Hermes host. The same Run
+keeps its usual status, events, approval, and stop controls. Discover the exact
+version and limits through `features.run_inline_images` and
+`endpoints.run_inline_images` in `/v1/capabilities` before sending images.
 
 ### GET /v1/runs/\{run_id\}
 

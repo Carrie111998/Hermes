@@ -139,6 +139,7 @@ _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 # path. The values are advertised through ``/v1/capabilities``.
 RUN_INLINE_IMAGE_MAX_COUNT = 4
 RUN_INLINE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+RUN_INLINE_IMAGE_REQUEST_MAX_BYTES = 32 * 1024 * 1024
 RUN_INLINE_IMAGE_MIME_TYPES = frozenset({
     "image/png",
     "image/jpeg",
@@ -149,6 +150,7 @@ _RUN_INLINE_IMAGE_DATA_URL_RE = re.compile(
     r"^data:(image/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$",
     re.IGNORECASE,
 )
+_RUN_SUBMISSION_PATH_RE = re.compile(r"^(?:/p/[^/]+)?/v1/runs$")
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1086,12 +1088,25 @@ def _reserve_pending_api_work(adapter):
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
-        """Reject overly large request bodies early based on Content-Length."""
+        """Apply the default body cap, with a fixed larger budget for Runs images."""
+        max_request_bytes = MAX_REQUEST_BYTES
+        if (
+            request.method == "POST"
+            and _RUN_SUBMISSION_PATH_RE.fullmatch(request.path)
+        ):
+            # Four 5 MiB images expand to about 28 MiB when base64 encoded.
+            # Clone only this fixed route so aiohttp's read-time cap matches
+            # the advertised Runs contract without widening any other API
+            # surface. The handler still validates count, decoded size, MIME,
+            # and transport before allocating a run.
+            max_request_bytes = RUN_INLINE_IMAGE_REQUEST_MAX_BYTES
+            request = request.clone(client_max_size=max_request_bytes)
+
         if request.method in {"POST", "PUT", "PATCH"}:
             cl = request.headers.get("Content-Length")
             if cl is not None:
                 try:
-                    if int(cl) > MAX_REQUEST_BYTES:
+                    if int(cl) > max_request_bytes:
                         return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
                 except ValueError:
                     return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
@@ -2976,6 +2991,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_inline_images_data_urls_only": True,
                 "run_inline_images_max_count": RUN_INLINE_IMAGE_MAX_COUNT,
                 "run_inline_images_max_bytes": RUN_INLINE_IMAGE_MAX_BYTES,
+                "run_inline_images_max_request_bytes": (
+                    RUN_INLINE_IMAGE_REQUEST_MAX_BYTES
+                ),
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -3012,6 +3030,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "mime_types": sorted(RUN_INLINE_IMAGE_MIME_TYPES),
                     "max_count": RUN_INLINE_IMAGE_MAX_COUNT,
                     "max_bytes_per_image": RUN_INLINE_IMAGE_MAX_BYTES,
+                    "max_request_bytes": RUN_INLINE_IMAGE_REQUEST_MAX_BYTES,
                 },
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -6868,6 +6887,37 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
         return True
 
+    def _build_http_application(self) -> "web.Application":
+        """Build the exact aiohttp application used by the live API server."""
+        mws = [
+            mw
+            for mw in (
+                self._make_profile_prefix_middleware(),
+                cors_middleware,
+                body_limit_middleware,
+                security_headers_middleware,
+            )
+            if mw is not None
+        ]
+        app = web.Application(
+            middlewares=mws,
+            client_max_size=MAX_REQUEST_BYTES,
+        )
+        # Native routes + multiplex /p/<profile>/… mirrors. Same handlers;
+        # the profile-prefix middleware validates the prefix and scopes
+        # config/credentials to that profile when multiplexing is on.
+        for method, path, handler in self._http_route_table():
+            app.router.add_route(method, path, handler)
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+        # Store the adapter after native routes are registered. Local
+        # Hermes-Relay bootstrap shims use this key as a feature-detection
+        # hook; registering native routes first lets those shims no-op instead
+        # of shadowing the upstream session-control handlers.
+        app["api_server_adapter"] = self
+        if self.gateway_runner is not None:
+            app["gateway_runner"] = self.gateway_runner
+        return app
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp web server."""
         if not AIOHTTP_AVAILABLE:
@@ -6898,31 +6948,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [
-                mw
-                for mw in (
-                    self._make_profile_prefix_middleware(),
-                    cors_middleware,
-                    body_limit_middleware,
-                    security_headers_middleware,
-                )
-                if mw is not None
-            ]
-            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
-            assert self._app is not None
-            # Native routes + multiplex /p/<profile>/… mirrors. Same handlers;
-            # the profile-prefix middleware validates the prefix and scopes
-            # config/credentials to that profile when multiplexing is on.
-            for method, path, handler in self._http_route_table():
-                self._app.router.add_route(method, path, handler)
-                self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
-            # Store the adapter after native routes are registered. Local Hermes-Relay
-            # bootstrap shims use this key as a feature-detection hook; registering
-            # native routes first lets those shims no-op instead of shadowing the
-            # upstream session-control handlers.
-            self._app["api_server_adapter"] = self
-            if self.gateway_runner is not None:
-                self._app["gateway_runner"] = self.gateway_runner
+            self._app = self._build_http_application()
 
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
