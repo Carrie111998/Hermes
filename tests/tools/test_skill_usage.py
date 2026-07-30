@@ -88,8 +88,39 @@ def test_get_record_missing_returns_empty_record(skills_home):
 
 def test_load_usage_handles_corrupt_file(skills_home):
     from tools.skill_usage import load_usage, _usage_file
+    _usage_file().parent.mkdir(parents=True, exist_ok=True)
     _usage_file().write_text("{ not json }", encoding="utf-8")
     assert load_usage() == {}
+
+
+def test_usage_writes_external_state_and_reads_legacy(skills_home):
+    from tools.skill_usage import load_usage, save_usage
+
+    legacy = skills_home / "skills" / ".usage.json"
+    legacy.write_text('{"legacy": {"use_count": 1}}', encoding="utf-8")
+    assert load_usage()["legacy"]["use_count"] == 1
+    assert not (skills_home / "state").exists()
+
+    save_usage({"new": {"use_count": 2}})
+    state_file = skills_home / "state" / "skills" / "usage.json"
+    assert state_file.exists()
+    assert load_usage()["new"]["use_count"] == 2
+
+
+def test_archive_refuses_before_content_mutation(skills_home, monkeypatch):
+    from tools import skill_usage
+
+    skill = _write_skill(skills_home / "skills", "managed-skill")
+    monkeypatch.setattr(
+        "tools.skills_policy.skills_content_mode",
+        lambda: "read_only",
+    )
+
+    ok, message = skill_usage.archive_skill("managed-skill")
+
+    assert ok is False
+    assert "SKILLS_CONTENT_READ_ONLY" in message
+    assert skill.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -363,4 +394,3 @@ def test_adopt_rejects_empty_name(skills_home):
     from tools.skill_usage import adopt_skill
 
     assert adopt_skill("")[0] is False
-

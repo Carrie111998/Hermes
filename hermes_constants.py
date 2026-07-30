@@ -1177,6 +1177,15 @@ def get_skills_dir() -> Path:
     return get_hermes_home() / "skills"
 
 
+def get_skills_state_dir() -> Path:
+    """Return the profile-scoped writable state directory for skills.
+
+    Skill discovery content and mutable runtime metadata intentionally have
+    different roots.  This helper only computes a path; it never creates it.
+    """
+    return get_hermes_home() / "state" / "skills"
+
+
 
 def get_env_path() -> Path:
     """Return the path to the ``.env`` file under HERMES_HOME."""

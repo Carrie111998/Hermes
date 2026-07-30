@@ -159,7 +159,11 @@ def test_real_temp_repo_and_home_install_e2e(served_repo, monkeypatch, tmp_path)
     assert (installed / "examples" / "endpoint-inventory.md").is_file()
     assert not (installed / "examples" / "not-installed.md").exists()
     assert (installed / "assets" / "logo.png").read_bytes() == b"\x89PNG\r\n\x1a\n\x00\xff"
-    entry = json.loads((home / "skills" / ".hub" / "lock.json").read_text())["installed"]["demo-bundle"]
+    entry = json.loads(
+        (
+            home / "state" / "skills" / "hub" / "lock.json"
+        ).read_text()
+    )["installed"]["demo-bundle"]
     assert entry["scan_provenance"]["source_url"] == url
     assert entry["scan_provenance"]["fresh"] is True
     assert "Scan provenance: fresh" in sink.getvalue()

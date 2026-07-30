@@ -87,11 +87,7 @@ def _load_usage() -> dict[str, dict[str, Any]]:
 
         return load_usage()
     except Exception:
-        path = get_hermes_home() / "skills" / ".usage.json"
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        return {}
 
 
 def _to_int_ts(value: Any) -> Optional[int]:

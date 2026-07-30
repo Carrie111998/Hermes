@@ -28,6 +28,21 @@ from agent.skill_utils import is_excluded_skill_path
 _console = Console()
 
 
+def _content_write_refused(operation: str, console: Console) -> bool:
+    """Print a stable refusal and return True when content is managed."""
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
+
+    try:
+        require_skills_content_writable(operation)
+    except SkillsContentPolicyError as exc:
+        console.print(f"[bold red]Error:[/] {exc}\n")
+        return True
+    return False
+
+
 def _display_source(r) -> str:
     """Human-facing source label for a result row.
 
@@ -520,6 +535,10 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     registry. Skill names are not namespaced across registries, so an
     unconstrained resolve can silently change a skill's provenance.
     """
+    c = console or _console
+    if _content_write_refused(f"install skill {identifier!r}", c):
+        return
+
     from tools.skills_hub import (
         GitHubAuth, create_source_router, ensure_hub_dirs,
         quarantine_bundle, install_from_quarantine, HubLockFile,
@@ -527,7 +546,6 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     )
     from tools.skills_guard import scan_skill_cached, should_allow_install, format_scan_report
 
-    c = console or _console
     ensure_hub_dirs()
 
     # Resolve which source adapter handles this identifier
@@ -956,13 +974,12 @@ def do_list(source_filter: str = "all",
     ``skills.disabled`` list because ``-p`` swaps ``HERMES_HOME`` at process
     start.  No explicit profile flag needed here.
     """
-    from tools.skills_hub import HubLockFile, ensure_hub_dirs
+    from tools.skills_hub import HubLockFile
     from tools.skills_sync import _read_manifest
     from tools.skills_tool import _find_all_skills
     from agent.skill_utils import get_disabled_skill_names
 
     c = console or _console
-    ensure_hub_dirs()
     lock = HubLockFile()
     hub_installed = {e["name"]: e for e in lock.list_installed()}
     builtin_names = set(_read_manifest())
@@ -1069,6 +1086,9 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
     from tools.skills_hub import HubLockFile, check_for_skill_updates
 
     c = console or _console
+    target = name if name is not None else "all installed skills"
+    if _content_write_refused(f"update {target}", c):
+        return
     lock = HubLockFile()
     updates = [entry for entry in check_for_skill_updates(name=name) if entry.get("status") == "update_available"]
     if not updates:
@@ -1186,6 +1206,8 @@ def do_reset(name: str, restore: bool = False,
     from tools.skills_sync import reset_bundled_skill
 
     c = console or _console
+    if _content_write_refused(f"reset bundled skill {name!r}", c):
+        return
 
     if not skip_confirm and restore:
         c.print(f"\n[bold]Restore '{name}' from bundled source?[/]")
@@ -1307,6 +1329,8 @@ def do_opt_out(remove: bool = False,
     )
 
     c = console or _console
+    if remove and _content_write_refused("remove pristine bundled skills", c):
+        return
 
     # Write the marker first (the always-safe part).
     res = set_bundled_skills_opt_out(True)
@@ -1380,8 +1404,11 @@ def do_opt_in(sync: bool = False,
 
     if sync:
         synced = sync_skills(quiet=True)
-        copied = len(synced.get("copied", []))
-        c.print(f"[dim]Re-seeded {copied} bundled skill(s).[/]")
+        if synced.get("skipped_read_only"):
+            c.print("[dim]Bundled sync skipped: skills.content_mode is read_only.[/]")
+        else:
+            copied = len(synced.get("copied", []))
+            c.print(f"[dim]Re-seeded {copied} bundled skill(s).[/]")
         if invalidate_cache:
             try:
                 from agent.prompt_builder import clear_skills_system_prompt_cache
@@ -1399,6 +1426,11 @@ def do_repair_official(name: str, restore: bool = False,
     from tools.skills_sync import restore_official_optional_skill
 
     c = console or _console
+    if restore and _content_write_refused(
+        f"restore official optional skill {name!r}",
+        c,
+    ):
+        return
     if restore and not skip_confirm:
         c.print(f"\n[bold]Restore official optional skill '{name}' from repo source?[/]")
         c.print("[dim]Existing matching active copies will be moved to a restore backup before copying the official source.[/]")
@@ -1689,6 +1721,8 @@ def do_snapshot_import(input_path: str, force: bool = False,
     from tools.skills_hub import TapsManager
 
     c = console or _console
+    if _content_write_refused("import skill snapshot", c):
+        return
     inp = Path(input_path)
     if not inp.exists():
         c.print(f"[bold red]Error:[/] File not found: {inp}\n")

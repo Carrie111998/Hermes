@@ -77,7 +77,12 @@ def test_snapshot_prunes_to_keep_count(backup_env, monkeypatch):
         monkeypatch.setattr(cb, "_utc_id", lambda now=None, _f=fid: _f)
         cb.snapshot_skills(reason=f"n{i}")
 
-    remaining = sorted(p.name for p in (backup_env["skills"] / ".curator_backups").iterdir())
+    remaining = sorted(
+        p.name
+        for p in (
+            backup_env["skills"].parent / "state" / "skills" / "curator-backups"
+        ).iterdir()
+    )
     # Newest 3 kept (lex order == date order for this id format)
     assert remaining == ids[2:], f"expected newest 3, got {remaining}"
 
@@ -128,11 +133,45 @@ def test_rollback_is_itself_undoable(backup_env):
         f"{[(r.get('id'), r.get('reason')) for r in rows]}"
     )
     # And the transient staging dir must be gone (it's implementation detail)
-    backups_dir = skills / ".curator_backups"
+    backups_dir = skills.parent / "state" / "skills" / "curator-backups"
     staging_dirs = [p for p in backups_dir.iterdir() if p.name.startswith(".rollback-staging-")]
     assert staging_dirs == [], (
         f"staging dir should be cleaned up on success, got: {staging_dirs}"
     )
+
+
+def test_rollback_refuses_managed_content_before_snapshot_or_move(
+    backup_env,
+    monkeypatch,
+):
+    cb = backup_env["cb"]
+    skills = backup_env["skills"]
+    original = _write_skill(skills, "managed-skill")
+    cb.snapshot_skills(reason="managed-baseline")
+    before = {
+        path.relative_to(skills).as_posix(): path.read_bytes()
+        for path in skills.rglob("*")
+        if path.is_file()
+    }
+    backup_count = len(cb.list_backups())
+    monkeypatch.setattr(
+        "tools.skills_policy.skills_content_mode",
+        lambda: "read_only",
+    )
+
+    ok, message, snapshot = cb.rollback()
+
+    assert ok is False
+    assert "SKILLS_CONTENT_READ_ONLY" in message
+    assert snapshot is None
+    assert original.exists()
+    assert len(cb.list_backups()) == backup_count
+    after = {
+        path.relative_to(skills).as_posix(): path.read_bytes()
+        for path in skills.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
 
 
 
@@ -388,7 +427,5 @@ def _three_ordered_snapshots(cb, skills, monkeypatch):
         assert cb.snapshot_skills(reason=snap_id) is not None
     monkeypatch.setattr(cb, "_utc_id", lambda now=None: "2026-05-09T00-00-00Z")
     return "2026-05-01T00-00-00Z"
-
-
 
 

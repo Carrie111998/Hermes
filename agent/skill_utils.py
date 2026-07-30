@@ -12,7 +12,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import get_config_path, get_skills_dir, is_termux
+from hermes_constants import (
+    get_config_path,
+    get_skills_dir,
+    get_skills_state_dir,
+    is_termux,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,16 +72,54 @@ ORG_PROVENANCE_FILE = ".org-provenance.json"
 ORG_BASELINE_FILE = ".org-baseline.json"
 
 
+def _skills_state_root_for(skills_dir: Path) -> Path:
+    """Resolve profile state without leaking real-profile state into test roots."""
+    try:
+        is_active_root = (
+            Path(skills_dir).resolve(strict=False)
+            == get_skills_dir().resolve(strict=False)
+        )
+    except OSError:
+        is_active_root = Path(skills_dir).absolute() == get_skills_dir().absolute()
+    if is_active_root:
+        return get_skills_state_dir()
+    # Explicit discovery roots are used by embedders and isolated behavior
+    # tests. Preserve the same HERMES_HOME-relative layout for those roots.
+    return Path(skills_dir).parent / "state" / "skills"
+
+
+def org_active_marker_path(skills_dir: Path) -> Path:
+    """Prefer the external active-org marker, then its legacy mirror path."""
+    path = _skills_state_root_for(skills_dir) / "sync" / "org" / "active-org"
+    if path.exists():
+        return path
+    return skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
+
+
 def read_active_org_id(skills_dir: Path) -> Optional[str]:
     """The org id whose mirror may resolve, or None (no org skills load)."""
     try:
-        marker = skills_dir / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
+        marker = org_active_marker_path(skills_dir)
         if not marker.exists():
             return None
         val = marker.read_text(encoding="utf-8").strip()
         return val or None
     except OSError:
         return None
+
+
+def org_provenance_path(skills_dir: Path, org_id: str) -> Path:
+    """Prefer external org provenance, then its legacy mirror sidecar."""
+    path = (
+        _skills_state_root_for(skills_dir)
+        / "sync"
+        / "org"
+        / org_id
+        / "provenance.json"
+    )
+    if path.exists():
+        return path
+    return skills_dir / ORG_MIRROR_DIR_NAME / org_id / ORG_PROVENANCE_FILE
 
 
 def is_org_mirror_path(path, skills_dir: Path) -> bool:

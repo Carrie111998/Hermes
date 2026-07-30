@@ -799,13 +799,12 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     try:
         active_skills_dir = _skills_dir()
         if not active_skills_dir.exists():
-            active_skills_dir.mkdir(parents=True, exist_ok=True)
             return json.dumps(
                 {
                     "success": True,
                     "skills": [],
                     "categories": [],
-                    "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
+                    "message": f"No skills found at {display_hermes_home()}/skills/.",
                 },
                 ensure_ascii=False,
             )
@@ -1572,8 +1571,8 @@ def skill_view(
         if skill_dir:
             try:
                 from agent.skill_utils import (
-                    ORG_PROVENANCE_FILE,
                     is_org_mirror_path,
+                    org_provenance_path,
                     org_id_of_path,
                 )
 
@@ -1584,11 +1583,8 @@ def skill_view(
                     if prov_org:
                         try:
                             prov = json.loads(
-                                (
-                                    active_skills_dir
-                                    / "_org"
-                                    / prov_org
-                                    / ORG_PROVENANCE_FILE
+                                org_provenance_path(
+                                    active_skills_dir, prov_org
                                 ).read_text(encoding="utf-8")
                             )
                             author = str(
