@@ -2814,7 +2814,7 @@ export const ruOverrides = {
       attachingFile: 'Прикрепление файла…'
     },
     approval: {
-      gatewayDisconnected: 'Шлюз Hermes не подключен',
+      gatewayDisconnected: 'Шлюз Hermes не подключён',
       sendFailed: 'Не удалось отправить ответ на подтверждение',
       run: 'Запустить',
       command: 'Команда',
@@ -2830,7 +2830,7 @@ export const ruOverrides = {
     },
     clarify: {
       notReady: 'Уточняющий запрос ещё не готов',
-      gatewayDisconnected: 'Шлюз Hermes не подключен',
+      gatewayDisconnected: 'Шлюз Hermes не подключён',
       sendFailed: 'Не удалось отправить ответ на уточнение',
       loadingQuestion: 'Загрузка вопроса…',
       other: 'Другое (введите ваш ответ)',
@@ -2953,7 +2953,7 @@ export const ruOverrides = {
   },
 
   prompts: {
-    gatewayDisconnected: 'Шлюз Hermes не подключен',
+    gatewayDisconnected: 'Шлюз Hermes не подключён',
     sudoSendFailed: 'Не удалось отправить пароль sudo',
     secretSendFailed: 'Не удалось отправить секрет',
     sudoTitle: 'Пароль администратора',
