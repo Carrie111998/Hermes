@@ -382,6 +382,34 @@ class TestPtyBridgeClose:
 
         assert bridge.verify_closed() is False
 
+    def test_descendant_exit_during_signal_is_not_a_scan_failure(
+        self, monkeypatch
+    ):
+        class _VanishingChild:
+            pid = 23456
+
+            @staticmethod
+            def is_running():
+                return True
+
+            @staticmethod
+            def status():
+                return psutil.STATUS_RUNNING
+
+        def vanished_pgid(pid):
+            raise ProcessLookupError
+
+        monkeypatch.setattr(os, "getpgid", vanished_pgid)
+
+        bridge = PtyBridge.__new__(PtyBridge)
+        bridge._pgid = 12345
+        bridge._descendants = {(23456, 1.0): _VanishingChild()}
+        bridge._descendant_scan_failed = False
+
+        bridge._signal_detached_descendants(signal.SIGTERM)
+
+        assert bridge._descendant_scan_failed is False
+
 
 @skip_on_windows
 class TestPtyBridgeEnv:

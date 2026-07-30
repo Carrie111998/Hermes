@@ -233,7 +233,7 @@ class PtyBridge:
         for proc in descendants:
             try:
                 tracked[(proc.pid, proc.create_time())] = proc
-            except psutil.NoSuchProcess:
+            except (psutil.NoSuchProcess, ProcessLookupError):
                 continue
             except (psutil.Error, OSError):
                 self._descendant_scan_failed = True
@@ -245,7 +245,7 @@ class PtyBridge:
             try:
                 if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
                     live.append(proc)
-            except psutil.NoSuchProcess:
+            except (psutil.NoSuchProcess, ProcessLookupError):
                 continue
             except (psutil.Error, OSError):
                 self._descendant_scan_failed = True
@@ -258,7 +258,7 @@ class PtyBridge:
                 if self._pgid is not None and os.getpgid(proc.pid) == self._pgid:
                     continue
                 proc.send_signal(sig)
-            except psutil.NoSuchProcess:
+            except (psutil.NoSuchProcess, ProcessLookupError):
                 continue
             except (psutil.Error, OSError):
                 self._descendant_scan_failed = True
