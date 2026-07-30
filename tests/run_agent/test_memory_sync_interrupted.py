@@ -111,7 +111,7 @@ class TestSyncExternalMemoryForTurn:
             final_response="new answer",
             interrupted=False,
             messages=authoritative,
-            messages_are_accumulated=True,
+            messages_are_authoritative=True,
         )
 
         delivered = agent._memory_manager.sync_all.call_args.kwargs["messages"]

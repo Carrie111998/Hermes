@@ -4177,7 +4177,7 @@ class AIAgent:
         final_response: Any,
         interrupted: bool,
         messages: list | None = None,
-        messages_are_accumulated: bool = False,
+        messages_are_authoritative: bool = False,
     ) -> None:
         """Mirror a completed turn into external memory providers.
 
@@ -4191,10 +4191,10 @@ class AIAgent:
         because the latter may carry injected skill content that bloats
         or breaks provider queries.
 
-        ``messages_are_accumulated`` distinguishes a caller-supplied/recovered
-        transcript from a history-less current exchange. The latter is merged
-        into provider-only session history so a backend recovering on the next
-        turn can inspect the exchange it missed.
+        ``messages_are_authoritative`` distinguishes a caller-supplied,
+        recovered, or compacted transcript from a history-less current
+        exchange. The latter is merged into provider-only session history so a
+        backend recovering on the next turn can inspect the exchange it missed.
 
         Interrupted turns are skipped entirely (#15218).  A partial
         assistant output, an aborted tool chain, or a mid-stream reset
@@ -4224,7 +4224,7 @@ class AIAgent:
         try:
             sync_messages = self._external_memory_transcript(
                 messages,
-                accumulated=messages_are_accumulated,
+                authoritative=messages_are_authoritative,
             )
             sync_kwargs = {"session_id": self.session_id or ""}
             if sync_messages is not None:
@@ -4250,7 +4250,7 @@ class AIAgent:
         self,
         messages: list | None,
         *,
-        accumulated: bool,
+        authoritative: bool,
     ) -> list | None:
         """Snapshot completed turns for provider reconciliation only.
 
@@ -4280,7 +4280,7 @@ class AIAgent:
         if previous_session_id != session_id:
             previous = []
 
-        if previous and not accumulated:
+        if previous and not authoritative:
             # A stateless turn may repeat the stable system prompt. Providers
             # need source turns, not a second mid-session system message.
             current_turn = [
@@ -8133,7 +8133,7 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
-        messages_are_accumulated: bool = False,
+        messages_are_authoritative: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
@@ -8145,7 +8145,7 @@ class AIAgent:
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=should_review_memory,
-            messages_are_accumulated=messages_are_accumulated,
+            messages_are_authoritative=messages_are_authoritative,
         )
 
 
