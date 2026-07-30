@@ -33,6 +33,8 @@ import {
   revealTreePane,
   setPaneCollapsed,
   setTreePaneHidden,
+  setTreeSideCollapsed,
+  treeSideOfPane,
   watchContributedPanes
 } from '@/components/pane-shell/tree/store'
 import { SidebarProvider } from '@/components/ui/sidebar'

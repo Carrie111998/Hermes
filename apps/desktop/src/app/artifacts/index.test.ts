@@ -1,5 +1,7 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { renderHook, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $projectScope } from '@/store/projects'
 import { $connection } from '@/store/session'
 import type { SessionInfo, SessionMessage } from '@/types/hermes'
 
@@ -11,6 +13,8 @@ import {
   collectArtifactsForSession,
   preferredArtifactProjectId
 } from './artifact-utils'
+
+import { enterArtifactProject, useProjectArtifacts } from './index'
 
 function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
@@ -161,5 +165,50 @@ describe('project artifact model', () => {
         projects
       })
     ).toBe('project-2')
+  })
+})
+
+describe('project artifact interactions', () => {
+  const project: SidebarProjectTree = {
+    id: 'p_project',
+    label: 'Hermes',
+    path: '/work/hermes',
+    repos: [],
+    sessionCount: 1,
+    previewSessions: [makeSession()]
+  }
+
+  beforeEach(() => {
+    $projectScope.set('__all_projects__')
+  })
+
+  afterEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('enters a selected project but leaves the all-projects view as a library-only scope', () => {
+    enterArtifactProject('/work/hermes')
+    enterArtifactProject('__all_artifact_projects__')
+
+    expect($projectScope.get()).toBe('/work/hermes')
+  })
+
+  it('reloads an expanded project when the all-projects refresh generation changes', async () => {
+    const loader = vi.fn().mockResolvedValue({
+      artifacts: [],
+      loadedSessions: 1,
+      sessions: project.previewSessions
+    })
+
+    const { rerender } = renderHook(
+      ({ refreshGeneration }) => useProjectArtifacts(project, 8, refreshGeneration, loader),
+      { initialProps: { refreshGeneration: 0 } }
+    )
+
+    await waitFor(() => expect(loader).toHaveBeenCalledOnce())
+
+    rerender({ refreshGeneration: 1 })
+
+    await waitFor(() => expect(loader).toHaveBeenCalledTimes(2))
   })
 })

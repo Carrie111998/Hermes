@@ -36,7 +36,7 @@ import { normalize } from '@/lib/text'
 import { fmtDayTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
-import { $activeProjectId, $projectScope, $projectTree, fetchProjectSessions } from '@/store/projects'
+import { $activeProjectId, $projectScope, $projectTree, enterProject, fetchProjectSessions } from '@/store/projects'
 import { $currentCwd, $selectedStoredSessionId } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -159,10 +159,38 @@ async function artifactsFromSessions(sessions: readonly SessionInfo[]): Promise<
   return artifacts
 }
 
+interface LoadedProjectArtifacts {
+  artifacts: ArtifactRecord[]
+  loadedSessions: number
+  sessions: SessionInfo[]
+}
+
+type ProjectArtifactsLoader = (
+  project: SidebarProjectTree,
+  batchSize: number
+) => Promise<LoadedProjectArtifacts>
+
+const loadProjectArtifacts: ProjectArtifactsLoader = async (project, batchSize) => {
+  const hydrated = await fetchProjectSessions(project.id)
+  const sessions = artifactSessionsForProject(hydrated ?? project)
+  const first = sessions.slice(0, batchSize)
+
+  return {
+    artifacts: await artifactsFromSessions(first),
+    loadedSessions: first.length,
+    sessions
+  }
+}
+
 /** Project-local progressive loader. It asks the backend for one authoritative
  * project membership tree, then reads message histories in bounded batches.
  * No global session list and no eager work for other projects. */
-function useProjectArtifacts(project: null | SidebarProjectTree, batchSize = PROJECT_SESSION_BATCH) {
+export function useProjectArtifacts(
+  project: null | SidebarProjectTree,
+  batchSize = PROJECT_SESSION_BATCH,
+  refreshGeneration = 0,
+  loader: ProjectArtifactsLoader = loadProjectArtifacts
+) {
   const [state, setState] = useState<ProjectArtifactsState>(EMPTY_PROJECT_ARTIFACTS)
   const [reload, setReload] = useState(0)
   const generationRef = useRef(0)
@@ -180,24 +208,13 @@ function useProjectArtifacts(project: null | SidebarProjectTree, batchSize = PRO
     }
 
     setState(EMPTY_PROJECT_ARTIFACTS)
-    void fetchProjectSessions(project.id)
-      .then(async hydrated => {
+    void loader(project, batchSize)
+      .then(loaded => {
         if (!active || generation !== generationRef.current) {
           return
         }
 
-        const sessions = artifactSessionsForProject(hydrated ?? project)
-        const first = sessions.slice(0, batchSize)
-        const artifacts = await artifactsFromSessions(first)
-
-        if (active && generation === generationRef.current) {
-          setState({
-            artifacts,
-            loadingMore: false,
-            loadedSessions: first.length,
-            sessions
-          })
-        }
+        setState({ ...loaded, loadingMore: false })
       })
       .catch(err => {
         if (active && generation === generationRef.current) {
@@ -209,7 +226,7 @@ function useProjectArtifacts(project: null | SidebarProjectTree, batchSize = PRO
     return () => {
       active = false
     }
-  }, [batchSize, project, reload])
+  }, [batchSize, loader, project, refreshGeneration, reload])
 
   const loadMore = useCallback(async () => {
     const next = state.sessions.slice(state.loadedSessions, state.loadedSessions + batchSize)
@@ -234,11 +251,19 @@ function useProjectArtifacts(project: null | SidebarProjectTree, batchSize = PRO
     }))
   }, [batchSize, state.loadedSessions, state.loadingMore, state.sessions])
 
+  const refresh = useCallback(() => setReload(value => value + 1), [])
+
   return {
     ...state,
     hasMore: state.loadedSessions < state.sessions.length,
     loadMore,
-    refresh: () => setReload(value => value + 1)
+    refresh
+  }
+}
+
+export function enterArtifactProject(projectId: string): void {
+  if (projectId !== ALL_ARTIFACT_PROJECTS) {
+    enterProject(projectId)
   }
 }
 
@@ -257,6 +282,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   const [failedImageIds, setFailedImageIds] = useState<Set<string>>(() => new Set())
   const [imagePage, setImagePage] = useState(1)
   const [filePage, setFilePage] = useState(1)
+  const [allProjectsRefreshGeneration, setAllProjectsRefreshGeneration] = useState(0)
 
   const preferredProject = useMemo(
     () =>
@@ -279,10 +305,13 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
 
   const selectedProject = projectTree.find(project => project.id === selectedProjectId) ?? null
   const projectArtifacts = useProjectArtifacts(selectedProject)
+  const refreshProjectArtifacts = projectArtifacts.refresh
   const artifacts = projectArtifacts.artifacts
 
   const setSelectedProject = useCallback(
     (projectId: string) => {
+      enterArtifactProject(projectId)
+
       const params = new URLSearchParams(location.search)
 
       if (projectId === preferredProject) {
@@ -303,7 +332,15 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     [location.hash, location.pathname, location.search, navigate, preferredProject]
   )
 
-  useRefreshHotkey(projectArtifacts.refresh)
+  const refreshArtifacts = useCallback(() => {
+    if (selectedProjectId === ALL_ARTIFACT_PROJECTS) {
+      setAllProjectsRefreshGeneration(value => value + 1)
+    } else {
+      refreshProjectArtifacts()
+    }
+  }, [refreshProjectArtifacts, selectedProjectId])
+
+  useRefreshHotkey(refreshArtifacts)
 
   useEffect(() => {
     setImagePage(1)
@@ -451,7 +488,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
             aria-label={refreshing ? a.refreshing : a.refresh}
             className="text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground"
             disabled={refreshing}
-            onClick={projectArtifacts.refresh}
+            onClick={refreshArtifacts}
             size="icon-titlebar"
             variant="ghost"
           >
@@ -504,6 +541,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
             onOpenProject={setSelectedProject}
             projects={projectTree}
             query={query}
+            refreshGeneration={allProjectsRefreshGeneration}
           />
         ) : !artifacts ? (
           <PageLoader label={a.indexingProject(selectedProject?.label ?? '')} />
@@ -587,7 +625,8 @@ function AllProjectsArtifacts({
   onOpenChat,
   onOpenProject,
   projects,
-  query
+  query,
+  refreshGeneration
 }: {
   filter: ArtifactFilter
   onOpenArtifact: (href: string) => void | Promise<void>
@@ -595,6 +634,7 @@ function AllProjectsArtifacts({
   onOpenProject: (projectId: string) => void
   projects: readonly SidebarProjectTree[]
   query: string
+  refreshGeneration: number
 }) {
   const { t } = useI18n()
   const [visibleProjects, setVisibleProjects] = useState(20)
@@ -612,6 +652,7 @@ function AllProjectsArtifacts({
             onOpenProject={onOpenProject}
             project={project}
             query={query}
+            refreshGeneration={refreshGeneration}
           />
         ))}
         {visibleProjects < projects.length && (
@@ -635,7 +676,8 @@ function ProjectArtifactGroup({
   onOpenChat,
   onOpenProject,
   project,
-  query
+  query,
+  refreshGeneration
 }: {
   filter: ArtifactFilter
   onOpenArtifact: (href: string) => void | Promise<void>
@@ -643,10 +685,11 @@ function ProjectArtifactGroup({
   onOpenProject: (projectId: string) => void
   project: SidebarProjectTree
   query: string
+  refreshGeneration: number
 }) {
   const { t } = useI18n()
   const [expanded, setExpanded] = useState(false)
-  const data = useProjectArtifacts(expanded ? project : null, 8)
+  const data = useProjectArtifacts(expanded ? project : null, 8, refreshGeneration)
 
   const visible = useMemo(() => {
     const q = normalize(query)
