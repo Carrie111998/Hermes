@@ -5074,6 +5074,7 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        _conversation_completed = False
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -5123,13 +5124,59 @@ class TurnRunner:
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            _conversation_completed = True
         finally:
             # The normal finalizer closes this at its last steer drain.  Also
             # close here so an exceptional gateway turn cannot leave a cached
             # agent accepting steers that no running loop can consume.
-            _close_steer_admission = getattr(agent, "_close_steer_admission", None)
-            if callable(_close_steer_admission):
-                _close_steer_admission()
+            _close_with_provenance = getattr(
+                agent,
+                "_close_steer_admission_with_provenance",
+                None,
+            )
+            if callable(_close_with_provenance):
+                _unconsumed_steer, _steer_is_session_ipc = (
+                    _close_with_provenance()
+                )
+            else:
+                _close_steer_admission = getattr(
+                    agent,
+                    "_close_steer_admission",
+                    None,
+                )
+                _unconsumed_steer = (
+                    _close_steer_admission()
+                    if callable(_close_steer_admission)
+                    else None
+                )
+                _steer_is_session_ipc = False
+            if (
+                not _conversation_completed
+                and str(_unconsumed_steer or "").strip()
+            ):
+                try:
+                    _preserve_future = asyncio.run_coroutine_threadsafe(
+                        self._runner._requeue_failed_turn_steer(
+                            ctx.session_key,
+                            ctx.source,
+                            str(_unconsumed_steer),
+                            trusted_session_ipc=_steer_is_session_ipc,
+                        ),
+                        ctx._loop_for_step,
+                    )
+                    if not _preserve_future.result(timeout=5.0):
+                        logger.error(
+                            "Could not preserve unconsumed steer after failed "
+                            "turn for session %s",
+                            ctx.session_key or "?",
+                        )
+                except Exception:
+                    # Preserve the original turn exception; this recovery path
+                    # must never replace it with a queueing failure.
+                    logger.exception(
+                        "Failed to preserve unconsumed steer for session %s",
+                        ctx.session_key or "?",
+                    )
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
             # threads don't hang past the end of the run (interrupt,
@@ -8471,6 +8518,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # The caller owns this mutation under _busy_queue_guard; do not infer
         # success from the aggregate depth, which sibling admissions can also
         # change before a second measurement.
+        return True
+
+    async def _requeue_failed_turn_steer(
+        self,
+        session_key: str,
+        source: SessionSource,
+        text: str,
+        *,
+        trusted_session_ipc: bool,
+    ) -> bool:
+        """Put an accepted steer first in line when its active turn raises."""
+        adapter = self._adapter_for_source(source)
+        pending_text = str(text or "").strip()
+        if adapter is None or not session_key or not pending_text:
+            return False
+        event = (
+            _new_gateway_session_ipc_event(
+                text=pending_text,
+                message_type=MessageType.TEXT,
+                source=source,
+                internal=True,
+            )
+            if trusted_session_ipc
+            else MessageEvent(
+                text=pending_text,
+                message_type=MessageType.TEXT,
+                source=source,
+            )
+        )
+        with self._busy_queue_guard():
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            if pending_slot is None:
+                return False
+            existing = pending_slot.get(session_key)
+            if existing is not None:
+                # The accepted steer belonged to the failed active turn, so it
+                # precedes follow-ups already waiting for their own turns.
+                self._session_state(
+                    session_key
+                ).conversation.queued_events.insert(0, existing)
+            pending_slot[session_key] = event
         return True
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
@@ -13970,7 +14058,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if accepted:
                 preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                 return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-            return "Steer rejected (empty payload)."
+            # Admission can close between the state lookup and steer().  The
+            # payload is known nonempty here, so preserve it as a next-turn
+            # event instead of misreporting an empty-payload rejection.
         # Running agent is missing or lacks steer() — fall back to queue.
         adapter = self._adapter_for_source(source)
         if adapter:
@@ -13983,6 +14073,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_context=event.channel_context,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
+        if running_agent:
+            return "Steer admission closed — /steer queued for the next turn."
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):

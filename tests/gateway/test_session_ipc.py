@@ -441,6 +441,59 @@ def test_internal_enqueue_reports_its_own_committed_mutation(monkeypatch):
     assert adapter._pending_messages[SESSION_KEY] is event
 
 
+@pytest.mark.asyncio
+async def test_failed_turn_requeues_accepted_ipc_steer_before_followups():
+    runner, adapter = _runner(_entry())
+    existing = MessageEvent(
+        text="already waiting",
+        message_type=MessageType.TEXT,
+        source=_source(),
+    )
+    tail = MessageEvent(
+        text="later follow-up",
+        message_type=MessageType.TEXT,
+        source=_source(),
+    )
+    adapter._pending_messages[SESSION_KEY] = existing
+    runner._queued_events[SESSION_KEY] = [tail]
+
+    preserved = await runner._requeue_failed_turn_steer(
+        SESSION_KEY,
+        _source(),
+        "/restart trusted recovery task",
+        trusted_session_ipc=True,
+    )
+
+    recovered = adapter._pending_messages[SESSION_KEY]
+    assert preserved is True
+    assert is_gateway_session_ipc_task(recovered)
+    assert recovered.text == "/restart trusted recovery task"
+    assert runner._queued_events[SESSION_KEY] == [existing, tail]
+
+
+@pytest.mark.asyncio
+async def test_busy_steer_queues_nonempty_text_when_admission_closed():
+    runner, adapter = _runner(_entry())
+    runner._running_agents[SESSION_KEY] = SimpleNamespace(
+        steer=Mock(return_value=False)
+    )
+    event = MessageEvent(
+        text="/steer keep this guidance",
+        message_type=MessageType.TEXT,
+        source=_source(),
+    )
+
+    response = await runner._busy_steer_command(
+        event,
+        SESSION_KEY,
+        event.source,
+    )
+
+    assert response == "Steer admission closed — /steer queued for the next turn."
+    queued = adapter._pending_messages[SESSION_KEY]
+    assert queued.text == "keep this guidance"
+
+
 def test_trusted_slash_task_survives_drain_as_inert_text_while_user_slash_is_blocked():
     runner, adapter = _runner(_entry())
     trusted = _new_gateway_session_ipc_event(
