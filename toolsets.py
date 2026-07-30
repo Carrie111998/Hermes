@@ -28,75 +28,58 @@ from typing import List, Dict, Any, Set, Optional
 
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
-#
-# Split into two tiers:
-#
-#   _HERMES_ALWAYS_CORE_TOOLS  — tools that must be in the model-visible
-#       schema on every call.  Removing any of these would break basic agent
-#       operation (file I/O, terminal, memory, web, skills, planning, etc.).
-#
-#   _HERMES_DEFERRABLE_CORE_TOOLS — tools that are "core" in the sense that
-#       they ship by default, but are only needed for specialised tasks
-#       (browser automation, image generation, TTS, smart-home, kanban,
-#       computer-use).  They are always visible with the current defaults, but
-#       can be pushed behind the tool_search catalog when
-#       ``tools.tool_search.defer_core: true`` is set in config.yaml.
-#       This can meaningfully reduce the per-call tool-schema payload
-#       (typically 20–25 tools / ~35–40 KB) while preserving full capability
-#       through the existing tool_search / tool_describe / tool_call bridge.
-#
-# _HERMES_CORE_TOOLS preserves the historical flat list so that all existing
-# code that imports it continues to work unchanged.
-
-_HERMES_ALWAYS_CORE_TOOLS = [
-    # Context & planning — needed on every turn for the agent to function
-    "memory",
-    "clarify",
-    "todo",
-    "session_search",
-    # Basic lookups — low schema weight, used constantly
+_HERMES_CORE_TOOLS = [
+    # Web
     "web_search", "web_extract",
     # Terminal + process management
     "terminal", "process",
     # Desktop GUI affordances: read the embedded terminal pane, close an agent's
-    # read-only terminal tab, open a URL/file in the preview pane, and focus a
-    # pane (all gated on HERMES_DESKTOP via check_fn — hidden outside the GUI).
-    "read_terminal", "close_terminal", "open_preview", "focus_pane",
-    # Skills management
+    # read-only terminal tab, open a URL/file in the preview pane, focus a
+    # pane, and react to a message with an emoji (all gated on HERMES_DESKTOP
+    # via check_fn — hidden outside the GUI).
+    "read_terminal", "close_terminal", "open_preview", "focus_pane", "react_to_message",
+    # File manipulation
+    "read_file", "write_file", "patch", "search_files",
+    # Vision + image generation
+    "vision_analyze", "image_generate",
+    # Skills
     "skills_list", "skill_view", "skill_manage",
-    # Code execution
-    "execute_code",
-    # Cronjob management
-    "cronjob",
-]
-
-_HERMES_DEFERRABLE_CORE_TOOLS = [
-    # File mutation tools
-    "write_file", "patch",
-    # Image generation — task-specific
-    "image_generate",
-    # Browser automation — 11 tools, significant schema weight
+    # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-    # Text-to-speech — task-specific
+    # Text-to-speech
     "text_to_speech",
+    # Planning & memory
+    "todo", "memory",
+    # NOTE: the desktop Project tools (project_list/create/switch) are
+    # deliberately NOT here. They only make sense where a GUI can follow the
+    # move, so they live in the `project` toolset and are enabled solely by the
+    # GUI gateway (tui_gateway/server.py::_load_enabled_toolsets) — keeping them
+    # off every CLI/messaging/cron schema (narrow waist).
+    # Session history search
+    "session_search",
+    # Clarifying questions
+    "clarify",
+    # Code execution + delegation
+    "execute_code", "delegate_task",
+    # Cronjob management
+    "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-    # Kanban multi-agent coordination (gated via check_fn)
+    # Kanban multi-agent coordination — only in schema when the agent is
+    # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
+    # profile explicitly enables the kanban toolset. Gated via check_fn in
+    # tools/kanban_tools.py.
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
-    # Computer use (gated on cua-driver being installed via check_fn)
+    # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
-
-# Flat list — preserves the historical public API.  All existing imports of
-# _HERMES_CORE_TOOLS continue to work and see the full combined set.
-_HERMES_CORE_TOOLS = _HERMES_ALWAYS_CORE_TOOLS + _HERMES_DEFERRABLE_CORE_TOOLS
 
 # Webhook events may originate from untrusted third-party content (for example,
 # public PR titles/comments). Keep the default webhook toolset intentionally
@@ -128,9 +111,11 @@ TOOLSETS = {
     "x_search": {
         "description": (
             "Search X (Twitter) posts and threads via xAI's built-in "
-            "x_search Responses tool. Available when xAI credentials are "
-            "configured (SuperGrok OAuth or XAI_API_KEY). Off by default; "
-            "enable in `hermes tools` → X (Twitter) Search."
+            "x_search Responses tool. Read-only public X discovery; use the "
+            "xurl skill for authenticated X API reads and account actions. "
+            "Available when xAI credentials are configured (SuperGrok OAuth "
+            "or XAI_API_KEY). Off by default; enable in `hermes tools` → "
+            "X (Twitter) Search."
         ),
         "tools": ["x_search"],
         "includes": []
