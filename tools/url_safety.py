@@ -37,6 +37,9 @@ from threading import BoundedSemaphore
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qsl, quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
 
+import httpx
+from httpx._utils import URLPattern, get_environment_proxies
+
 from hermes_constants import get_hermes_home_override
 from utils import is_truthy_value
 

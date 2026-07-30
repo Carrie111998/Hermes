@@ -1125,8 +1125,15 @@ class TestWriteApprovalMigration:
                         "skills:\n  write_mode: 'off'\n")
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-            assert raw["memory"]["write_approval"] is False
-            assert raw["skills"]["write_approval"] is False
+            loaded = load_config()
+            # write_approval=False equals the schema default, so it is NOT
+            # materialised to disk (lean-config invariant) — the legacy
+            # write_mode key is gone and the effective value resolves to False
+            # via load_config()'s deep-merge.
+            assert "write_mode" not in raw.get("memory", {})
+            assert "write_mode" not in raw.get("skills", {})
+            assert loaded["memory"]["write_approval"] is False
+            assert loaded["skills"]["write_approval"] is False
 
 
 class TestMigrationWriteInvariant:
