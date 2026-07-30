@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shlex
+from collections.abc import Collection
 from urllib.parse import unquote_plus
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,21 @@ _YAML_ASSIGN_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+_CLI_SENSITIVE_SPACE_VALUE_RE = re.compile(
+    r"(?<![A-Za-z0-9_\-])"
+    r"(--(?:password|passwd|secret|token|api[-_]key|client-secret))"
+    r"([ \t]+)"
+    r"(?:(['\"])([^\r\n'\"]*)\3|((?!--)[^\s'\"]+))",
+    re.IGNORECASE,
+)
+_CLI_SENSITIVE_EQUALS_VALUE_RE = re.compile(
+    r"(?<![A-Za-z0-9_\-])"
+    r"(--(?:password|passwd|secret|token|api[-_]key|client-secret))"
+    r"(=)"
+    r"(?:(['\"])([^\r\n'\"]*)\3|([^\s'\"]+))",
+    re.IGNORECASE,
+)
+
 # Word-boundary validation for the mixed/lowercase key patterns above
 # (_CFG_DOTTED_RE, _CFG_ANCHORED_RE, _YAML_ASSIGN_RE).
 #
@@ -258,6 +274,129 @@ def _key_has_secret_keyword(key: str) -> bool:
         if _is_word_start(key, m.start()) and _is_word_end(key, m.end()):
             return True
     return False
+
+
+def _normalize_sensitive_key(key: str) -> str:
+    """Canonicalize a caller-supplied exact sensitive key name."""
+    return key.strip().casefold().replace("-", "_")
+
+
+def _normalize_extra_sensitive_keys(
+    extra_sensitive_keys: Collection[str] | None,
+) -> frozenset[str]:
+    """Validate and normalize per-call exact sensitive keys.
+
+    Empty strings are ignored after ``strip()`` so an accidental blank entry
+    cannot create an empty-key pattern. ``str`` and ``bytes`` are rejected as
+    the top-level collection because they almost always mean the caller passed
+    one key directly instead of an iterable of keys.
+    """
+    if extra_sensitive_keys is None:
+        return frozenset()
+    if isinstance(extra_sensitive_keys, (str, bytes)):
+        raise TypeError("extra_sensitive_keys must be a collection of strings, not a string")
+    normalized: set[str] = set()
+    for key in extra_sensitive_keys:
+        if not isinstance(key, str):
+            raise TypeError("extra_sensitive_keys entries must be strings")
+        normalized_key = _normalize_sensitive_key(key)
+        if normalized_key:
+            normalized.add(normalized_key)
+    return frozenset(normalized)
+
+
+def _extra_key_matches(key: str, extra_sensitive_keys: frozenset[str]) -> bool:
+    """Return True only for an exact caller-supplied key match."""
+    return bool(extra_sensitive_keys) and _normalize_sensitive_key(key) in extra_sensitive_keys
+
+
+def _extra_sensitive_key_pattern(extra_sensitive_keys: frozenset[str]) -> str:
+    """Build a bounded regex alternation for exact per-call keys."""
+    variants = []
+    for key in sorted(extra_sensitive_keys, key=len, reverse=True):
+        parts = key.split("_")
+        variants.append(r"[-_]".join(re.escape(part) for part in parts))
+    return "(?:" + "|".join(variants) + ")"
+
+
+def _redact_extra_sensitive_key_values(text: str, extra_sensitive_keys: frozenset[str]) -> str:
+    """Redact KEY=value / JSON / YAML values for explicit per-call keys."""
+    if not extra_sensitive_keys or not text:
+        return text
+
+    key_pat = _extra_sensitive_key_pattern(extra_sensitive_keys)
+
+    def _mask_value(value: str) -> str:
+        return _mask_token(value) if value else value
+
+    if "=" in text:
+        assign_re = re.compile(
+            rf"(^[ \t]*(?:export[ \t]+)?|(?<![A-Za-z0-9_.\-]))({key_pat})(\s*=\s*)(['\"]?)([^\s&'\"]*)\4(?=[\s&]|$)",
+            re.IGNORECASE | re.MULTILINE,
+        )
+
+        def _redact_assignment(match: re.Match) -> str:
+            if not _extra_key_matches(match.group(2), extra_sensitive_keys):
+                return match.group(0)
+            return f"{match.group(1)}{match.group(2)}{match.group(3)}{match.group(4)}{_mask_value(match.group(5))}{match.group(4)}"
+
+        text = assign_re.sub(_redact_assignment, text)
+
+    if ":" in text:
+        json_re = re.compile(
+            rf'("({key_pat})"\s*:\s*")([^"]*)(")',
+            re.IGNORECASE,
+        )
+        yaml_unquoted_re = re.compile(
+            rf"(^[ \t]*({key_pat})(:[ \t]*)(?!['\"])([^\s&]+))",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        yaml_quoted_re = re.compile(
+            rf"(^[ \t]*({key_pat})(:[ \t]*)(['\"])([^\r\n'\"]*)\4)",
+            re.IGNORECASE | re.MULTILINE,
+        )
+
+        def _redact_json(match: re.Match) -> str:
+            if not _extra_key_matches(match.group(2), extra_sensitive_keys):
+                return match.group(0)
+            return f"{match.group(1)}{_mask_value(match.group(3))}{match.group(4)}"
+
+        def _redact_yaml_unquoted(match: re.Match) -> str:
+            if not _extra_key_matches(match.group(2), extra_sensitive_keys):
+                return match.group(0)
+            return f"{match.group(2)}{match.group(3)}{_mask_value(match.group(4))}"
+
+        def _redact_yaml_quoted(match: re.Match) -> str:
+            if not _extra_key_matches(match.group(2), extra_sensitive_keys):
+                return match.group(0)
+            return f"{match.group(2)}{match.group(3)}{match.group(4)}{_mask_value(match.group(5))}{match.group(4)}"
+
+        text = json_re.sub(_redact_json, text)
+        text = yaml_unquoted_re.sub(_redact_yaml_unquoted, text)
+        text = yaml_quoted_re.sub(_redact_yaml_quoted, text)
+
+    return text
+
+
+def _redact_cli_sensitive_space_values(text: str) -> str:
+    """Redact values passed with sensitive CLI flags."""
+    if "--" not in text:
+        return text
+
+    def _redact_flag_value(match: re.Match) -> str:
+        quote = match.group(3) or ""
+        quoted_value = match.group(4)
+        bare_value = match.group(5)
+        if quote:
+            if quoted_value == "":
+                return match.group(0)
+            return f"{match.group(1)}{match.group(2)}{quote}***{quote}"
+        if not bare_value:
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}***"
+
+    text = _CLI_SENSITIVE_SPACE_VALUE_RE.sub(_redact_flag_value, text)
+    return _CLI_SENSITIVE_EQUALS_VALUE_RE.sub(_redact_flag_value, text)
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
@@ -532,7 +671,7 @@ def _canonical_url_param_name(name: str) -> str:
     return decoded.casefold().replace("-", "_")
 
 
-def _redact_strict_url_credentials(text: str) -> str:
+def _redact_strict_url_credentials(text: str, *, redact_usernames: bool = False) -> str:
     """Redact credentials from absolute, relative, and network URL references.
 
     This is intentionally stricter than display/log redaction and is used only
@@ -549,7 +688,11 @@ def _redact_strict_url_credentials(text: str) -> str:
         userinfo = match.group(2)
         if ":" in userinfo:
             username, _, _password = userinfo.partition(":")
+            if redact_usernames:
+                return f"{match.group(1)}***:***@"
             return f"{match.group(1)}{username}:***@"
+        if redact_usernames:
+            return f"{match.group(1)}***@"
         return f"{match.group(1)}***@"
 
     text = _STRICT_URL_PARAM_RE.sub(_redact_param, text)
@@ -640,6 +783,8 @@ def redact_sensitive_text(
     code_file: bool = False,
     file_read: bool = False,
     redact_url_credentials: bool = False,
+    extra_sensitive_keys: Collection[str] | None = None,
+    redact_url_usernames: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -652,6 +797,14 @@ def redact_sensitive_text(
     additionally redact credential-named query parameters and ``user:pass@``
     URL userinfo. The default remains False because actionable OAuth callback,
     magic-link, and pre-signed URLs must survive ordinary tool flows unchanged.
+    Set redact_url_usernames=True with redact_url_credentials=True to also
+    hide usernames in URL userinfo; alone it has no effect.
+
+    Set extra_sensitive_keys={...} to add exact per-call key names to the
+    KEY=value / JSON / YAML redaction passes. Keys are stripped, casefolded,
+    and normalized so hyphens and underscores are equivalent. Empty keys are
+    ignored. This does not mutate global sensitive-key sets or persist between
+    calls.
 
     Set code_file=True to skip the ENV-assignment and JSON-field regex
     patterns when the text is known to be source code (e.g. MAX_TOKENS=***
@@ -691,6 +844,14 @@ def redact_sensitive_text(
     # paths either (it's config/data, not log lines).
     if file_read:
         code_file = True
+
+    normalized_extra_sensitive_keys = _normalize_extra_sensitive_keys(extra_sensitive_keys)
+
+    if normalized_extra_sensitive_keys:
+        text = _redact_extra_sensitive_key_values(text, normalized_extra_sensitive_keys)
+
+    if "--" in text:
+        text = _redact_cli_sensitive_space_values(text)
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
@@ -838,7 +999,7 @@ def redact_sensitive_text(
     # left to pass through per #34029.
 
     if redact_url_credentials:
-        text = _redact_strict_url_credentials(text)
+        text = _redact_strict_url_credentials(text, redact_usernames=redact_url_usernames)
 
     # Form-urlencoded bodies (only triggers on clean k=v&k=v inputs).
     if "&" in text and "=" in text:
