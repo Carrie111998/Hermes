@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { Dialog as DialogPrimitive } from 'radix-ui'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 import { HUD_HEADING, HUD_ITEM, HUD_POSITION, HUD_SURFACE, HUD_TEXT } from '@/app/floating-hud'
 import { setTerminalTakeover } from '@/app/right-sidebar/store'
@@ -98,11 +98,11 @@ import { MarketplaceThemePage } from './marketplace-theme-page'
 import { PetInlineToggle, PetPalettePage } from './pet-palette-page'
 
 interface PaletteItem {
-  /** Keybind action id — its live combo renders as a hotkey hint. */
+  /** Keybind action id  Eits live combo renders as a hotkey hint. */
   action?: string
   /** Renders a trailing check: this row IS the current setting (theme, mode). */
   active?: boolean
-  /** Muted text beside the label — state the row acts on (a version, a count). */
+  /** Muted text beside the label  Estate the row acts on (a version, a count). */
   detail?: string
   icon: IconComponent
   id: string
@@ -111,14 +111,14 @@ interface PaletteItem {
   keywords?: string[]
   label: string
   /**
-   * When set, ⌘/⌃-select (or ⌘-Enter) opens a new tab and ⇧⌘-select pops a
-   * window — matching sidebar session rows. Plain select stays in-place.
+   * When set, ⌁E⌁Eselect (or ⌁EEnter) opens a new tab and ⇧⌁Eselect pops a
+   * window  Ematching sidebar session rows. Plain select stays in-place.
    * Receives the last selector event so the modifiers can be read.
    */
   runWithEvent?: (event?: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }) => void
   /** Action to run when selected. Mutually exclusive with `to`. */
   run?: () => void
-  /** Open a nested palette page (VS Code-style "choose X → options"). */
+  /** Open a nested palette page (VS Code-style "choose X ↁEoptions"). */
   to?: string
 }
 
@@ -129,7 +129,7 @@ interface PaletteGroup {
   items: PaletteItem[]
 }
 
-// Nested page → its parent, so Back / Esc step up one level instead of closing
+// Nested page ↁEits parent, so Back / Esc step up one level instead of closing
 // the palette. Pages absent here go straight back to the root list.
 const PAGE_PARENTS: Record<string, string> = { 'install-theme': 'theme' }
 
@@ -152,15 +152,15 @@ interface SessionEntry {
 // leaving it as pure keyboard/selection machinery. (cmdk's own group
 // re-sorting silently no-ops: its sort() queries groups by an internal id that
 // never matches the heading text it writes into `data-value`, so groups always
-// keep source order — which put a generic keyword match like "Capabilities" on
+// keep source order  Ewhich put a generic keyword match like "Capabilities" on
 // top and the auto-highlight on it while an exact "Tools" row sat below.)
 //
 // cmdk still auto-selects the first DOM item whenever the search changes, so
 // rendering best-match-first is what puts the highlight on the best match.
 //
 // AND semantics: every typed word must appear in the label or keywords. The
-// grade rewards matches on the visible label — exact > prefix > whole word >
-// word prefix > substring > scattered terms > keyword-only — so typing "tools"
+// grade rewards matches on the visible label  Eexact > prefix > whole word >
+// word prefix > substring > scattered terms > keyword-only  Eso typing "tools"
 // selects the row that says Tools, not a row that hides it in keywords.
 const scoreItem = (item: PaletteItem, needle: string): number => {
   const label = item.label.toLowerCase()
@@ -197,7 +197,7 @@ const scoreItem = (item: PaletteItem, needle: string): number => {
     return 0.6
   }
 
-  // Matched only via keywords — the weakest, generic-row signal.
+  // Matched only via keywords  Ethe weakest, generic-row signal.
   return 0.4
 }
 
@@ -327,7 +327,7 @@ const THEME_MODES: ReadonlyArray<{ icon: IconComponent; mode: ThemeMode }> = [
 
 // Which Light/Dark groups a theme belongs in. Built-ins render in both modes
 // (the engine synthesises the missing side). Imported VS Code themes only carry
-// the variant(s) the extension shipped — a single dark theme like Dracula lives
+// the variant(s) the extension shipped  Ea single dark theme like Dracula lives
 // under Dark only, while a GitHub/Solarized family (light + dark) lives in both.
 function themeSupportsMode(name: string, target: 'light' | 'dark'): boolean {
   if (!isUserTheme(name)) {
@@ -357,7 +357,7 @@ export function CommandPalette() {
   const [search, setSearch] = useState('')
   const [page, setPage] = useState<string | null>(null)
 
-  // The Update row names the same install the statusbar names — same target
+  // The Update row names the same install the statusbar names  Esame target
   // selection, same resolver. Reduced to the label string: an in-flight apply
   // rewrites these stores on every progress line, and only a changed string
   // should rebuild the palette's groups.
@@ -386,8 +386,8 @@ export function CommandPalette() {
     }).label
   }, [backendApply, backendStatus, clientApply, clientStatus, connection?.mode, desktopVersion?.appVersion, t])
 
-  // cmdk's onSelect doesn't forward the triggering event — keep the last
-  // click/keydown modifiers so session rows can honour ⌘-Enter / ⌘-click.
+  // cmdk's onSelect doesn't forward the triggering event  Ekeep the last
+  // click/keydown modifiers so session rows can honour ⌁EEnter / ⌁Eclick.
   const lastSelectMods = useRef<{ ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }>({
     ctrlKey: false,
     metaKey: false,
@@ -441,7 +441,7 @@ export function CommandPalette() {
     }
   }, [open])
 
-  // Deep-link into a nested page (e.g. `/pet list` → pets picker).
+  // Deep-link into a nested page (e.g. `/pet list` ↁEpets picker).
   useEffect(() => {
     if (open && pendingPage) {
       setPage(pendingPage)
@@ -452,8 +452,8 @@ export function CommandPalette() {
   const go = useCallback((path: string) => () => navigateToWorkspacePage(navigate, path), [navigate])
 
   // Sessions: plain select = open beside what's already loaded (focus existing
-  // tile/main, else a new tab — main only when it's a blank draft);
-  // ⌘/⌃-select / ⌘-Enter = force a new tab; ⇧⌘ = own window. Same door as the
+  // tile/main, else a new tab  Emain only when it's a blank draft);
+  // ⌁E⌁Eselect / ⌁EEnter = force a new tab; ⇧⌁E= own window. Same door as the
   // sidebar, minus the sidebar's licence to spend main.
   const goSession = useCallback(
     (sessionId: string) => (event?: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }) => {
@@ -488,7 +488,7 @@ export function CommandPalette() {
     const settingsTab = (tab: string) => `${SETTINGS_ROUTE}?tab=${tab}`
     const cc = t.commandCenter
 
-    // The active repo's worktrees → "new conversation in <branch>". This is the
+    // The active repo's worktrees ↁE"new conversation in <branch>". This is the
     // ⌘K-typed "I want to work on <branch>" reflex: each entry seeds a fresh
     // session anchored to that worktree's checkout (requestStartWorkSession),
     // so git is the source of truth and edits land in the right tree.
@@ -689,7 +689,7 @@ export function CommandPalette() {
           }))
         ]
       },
-      // Registry-contributed rows (core features + plugins) — one group,
+      // Registry-contributed rows (core features + plugins)  Eone group,
       // omitted while nothing contributes.
       ...(contributedItems.length > 0
         ? [
@@ -710,7 +710,7 @@ export function CommandPalette() {
   }, [contributedItems, go, settingsSectionLabel, t, updateVersionLabel, worktrees])
 
   // The long, granular lists (settings fields, API keys, MCP servers, archived
-  // chats) only surface once the user types — otherwise they'd bury the
+  // chats) only surface once the user types  Eotherwise they'd bury the
   // navigation entries on an empty palette.
   const searchGroups = useMemo<PaletteGroup[]>(() => {
     if (!search.trim()) {
@@ -719,7 +719,7 @@ export function CommandPalette() {
 
     const result: PaletteGroup[] = []
 
-    // Paste a raw session id → jump straight to it, even if it predates the
+    // Paste a raw session id ↁEjump straight to it, even if it predates the
     // recent-200 window the lists below are built from.
     const directId = search.trim()
 
@@ -769,7 +769,7 @@ export function CommandPalette() {
       ]
     })
 
-    // Apply a theme directly from the root search (e.g. "nous" → Nous). Live
+    // Apply a theme directly from the root search (e.g. "nous" ↁENous). Live
     // preview via keepOpen, mirroring the nested theme picker. If the theme
     // can't render the current light/dark mode, flip to the one it supports.
     result.push({
@@ -985,7 +985,7 @@ export function CommandPalette() {
       item.run?.()
     }
 
-    // Clear stashed modifiers so a plain Enter after a ⌘-click isn't sticky.
+    // Clear stashed modifiers so a plain Enter after a ⌁Eclick isn't sticky.
     lastSelectMods.current = { ctrlKey: false, metaKey: false, shiftKey: false }
 
     if (!item.keepOpen) {

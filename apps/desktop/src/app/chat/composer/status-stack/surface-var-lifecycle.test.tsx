@@ -1,5 +1,5 @@
 import { act, cleanup, render } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { STATUS_STACK_VAR } from '@/app/chat/surface-vars'
@@ -8,7 +8,7 @@ import { $goalsBySession, type SessionGoal } from '@/store/goals'
 
 import { ComposerStatusStack } from './index'
 
-// The stack measures itself into a surface var — jsdom has no ResizeObserver.
+// The stack measures itself into a surface var  Ejsdom has no ResizeObserver.
 class ResizeObserverStub {
   observe() {}
   unobserve() {}
@@ -25,7 +25,7 @@ const goal = (): SessionGoal => ({ status: 'active', title: 'ship the feature', 
  * Regression: when the stack collapses (its last item finishes), React removes
  * the stack div BEFORE the layout-effect cleanup runs. Resolving the surface
  * from the ref at cleanup time then walks a DETACHED node, misses
- * [data-chat-surface], and clears the document root instead — the stale height
+ * [data-chat-surface], and clears the document root instead  Ethe stale height
  * stays on the surface and keeps inflating the thread's bottom clearance
  * (`--thread-last-message-clearance`) until the next publish. The effect must
  * capture its surface root while the node is still attached.
@@ -63,7 +63,7 @@ describe('ComposerStatusStack surface-var lifecycle', () => {
 
     const { surface } = renderOnSurface()
 
-    // jsdom measures 0 — the value is irrelevant, the target element is not.
+    // jsdom measures 0  Ethe value is irrelevant, the target element is not.
     expect(surface.style.getPropertyValue(STATUS_STACK_VAR)).toBe('0px')
     expect(document.documentElement.style.getPropertyValue(STATUS_STACK_VAR)).toBe('')
   })
@@ -74,7 +74,7 @@ describe('ComposerStatusStack surface-var lifecycle', () => {
     const { surface } = renderOnSurface()
     expect(surface.style.getPropertyValue(STATUS_STACK_VAR)).toBe('0px')
 
-    // Last status item goes away → the component renders null and React
+    // Last status item goes away ↁEthe component renders null and React
     // detaches the stack div before the cleanup runs.
     act(() => $goalsBySession.set({}))
 

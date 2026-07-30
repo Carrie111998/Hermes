@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router'
 
 import { codiconIcon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
@@ -63,7 +63,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
   const { hash, pathname, search } = useLocation()
 
   // MCP moved out of Settings into Capabilities (/skills?tab=mcp). Keep old
-  // `/settings?tab=mcp` deep links working — `useRouteEnumParam` would silently
+  // `/settings?tab=mcp` deep links working  E`useRouteEnumParam` would silently
   // coerce the unknown tab to the default view otherwise. Preserve `server=` so
   // an old bookmark still lands on (and highlights) the selected server.
   useEffect(() => {
@@ -84,7 +84,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
 
   // Jump to a section + its sub-view in one navigate. Two sequential setters
   // would each read the same stale `search` and the second would clobber the
-  // first's `tab` — so the sub-view never opened on narrow screens.
+  // first's `tab`  Eso the sub-view never opened on narrow screens.
   const openSubView = useCallback(
     (tab: SettingsViewId, param: string, value: string, fallback: string) => {
       const params = new URLSearchParams(search)
