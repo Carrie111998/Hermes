@@ -34,8 +34,11 @@ def test_no_editor_message_is_actionable(_isolated_hermes_home, capsys):
     assert "No editor found" in out
     # Names the editors it tried…
     assert "Tried:" in out
-    # …and each of the four documented next steps.
-    assert "EDITOR=" in out
+    # …and each of the three documented next steps.  Assert only the ``EDITOR``
+    # variable name: the hint must not pin shell-specific ``VAR=value`` syntax,
+    # nor name a concrete editor — every plausible one is a probed candidate, so
+    # reaching this branch proves it is absent.
+    assert "EDITOR" in out
     assert "hermes config set" in out
     assert "hermes config path" in out
 
