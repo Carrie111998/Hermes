@@ -10,6 +10,16 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # SQLite journal mode used by every Hermes database opener. WAL is the
+    # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
+    # not crash-safe (for example macOS virtiofs, NFS, or SMB).
+    "database": {
+        "journal_mode": "wal",
+        # Optional WAL sizing pragmas, applied when set to integers.
+        # None = SQLite defaults (autocheckpoint 1000 pages, no size limit).
+        "wal_autocheckpoint": None,
+        "journal_size_limit": None,
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
