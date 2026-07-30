@@ -3352,8 +3352,24 @@ class WorkflowEngine:
                                 break
 
                         if reviewer_for:
-                            # Reviewer passed — enrich upstream with test branch info
+                            # Check if review already passed (avoid infinite loop)
                             upstream_state = states[reviewer_for]
+                            if upstream_state.kanban_card_id:
+                                try:
+                                    with kanban_db.connect_closing(board=self.kanban_board) as _chk:
+                                        existing = _chk.execute(
+                                            "SELECT body FROM task_comments WHERE task_id = ? AND author = 'workflow-engine' ORDER BY created_at DESC LIMIT 1",
+                                            (upstream_state.kanban_card_id,)
+                                        ).fetchone()
+                                        if existing and "Review Passed" in (existing[0] or ""):
+                                            print(f"   ✓ {nid} completed — review already passed for {reviewer_for}, skipping")
+                                            pending.discard(nid)
+                                            reviewer_for = None
+                                except Exception:
+                                    pass
+
+                        if reviewer_for:
+                            # Reviewer completed — check result for pass/fail
                             reviewer_body = state.result or ""
                             print(f"   ✅ {nid} PASSED — enriching {reviewer_for} with review results")
                             if upstream_state.kanban_card_id:
@@ -3361,14 +3377,13 @@ class WorkflowEngine:
                                     with kanban_db.connect_closing(board=self.kanban_board) as conn:
                                         kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Passed ({nid}):\n{reviewer_body}")
                                         conn.execute(
-                                            "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
+                                            "UPDATE tasks SET status = 'done', completed_at = strftime('%s','now') WHERE id = ?",
                                             (upstream_state.kanban_card_id,)
                                         )
                                         conn.commit()
-                                    upstream_state.status = "ready"
-                                    upstream_state.completed_at = None
-                                    upstream_state.result = None
-                                    print(f"   ↩  {reviewer_for} enriched with pass results, reset to ready")
+                                    upstream_state.status = "done"
+                                    upstream_state.completed_at = state.completed_at
+                                    print(f"   ↩  {reviewer_for} enriched with pass results, marked done")
                                 except Exception as e:
                                     print(f"   ⚠  Failed to enrich upstream card: {e}")
 
