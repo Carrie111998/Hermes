@@ -47,6 +47,7 @@ fallback_model:
 
 | 提供商 | 值 | 要求 |
 |----------|-------|-------------|
+| AI Gateway | `ai-gateway` | `AI_GATEWAY_API_KEY` |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
 | Nous Portal | `nous` | `hermes setup --portal`（全新安装）或 `hermes auth add nous`（OAuth） |
 | OpenAI Codex | `openai-codex` | `hermes model`（ChatGPT OAuth） |
@@ -408,5 +409,5 @@ cronjob(
 | 审批分类 | 分层（见上文） | `auxiliary.approval` |
 | 标题生成 | 分层（见上文） | `auxiliary.title_generation` |
 | Triage Specifier | 分层（见上文） | `auxiliary.triage_specifier` |
-| 委派 | 继承父 Agent 的备用链；可选覆盖主提供商/模型 | 父 Agent；主路由覆盖：`delegation.provider` / `delegation.model` |
-| Cron 任务 | 仅每任务提供商覆盖（无自动备用） | 每任务 `provider` / `model` |
+| 委派 | 继承父 Agent 的 `fallback_providers` 链；可选覆盖提供商/模型 | `delegation.provider` / `delegation.model` |
+| Cron 任务 | 继承配置的 `fallback_providers` 链；可选按任务覆盖提供商 | 每任务 `provider` / `model` |
