@@ -2897,59 +2897,68 @@ def run_job(
     # _running_job_ids never runs, so the job stays wedged "running" until
     # the whole gateway process is restarted, silently skipping every
     # scheduled fire in between with "already running — skipping".
+    #
+    # When ``record_session`` is False (set per-job), we skip the SessionDB
+    # entirely.  The agent's ``_persist_disabled`` flag (set below after
+    # construction) prevents lazy session creation.  This is useful for
+    # high-frequency agent jobs (e.g. every-5-minute monitoring) whose
+    # output is delivered to a chat platform and does not need to be
+    # searchable in session history.
+    _record_session = job.get("record_session", True)
     _session_db = None
-    try:
-        from hermes_state import SessionDB
+    if _record_session:
+        try:
+            from hermes_state import SessionDB
 
-        # Resolve timeout: env override → config.yaml → default 10s.
-        # Mirrors the script_timeout_seconds resolution pattern.
-        _session_db_timeout: float | None = None
-        _raw_env_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
-        if _raw_env_timeout:
-            try:
-                _session_db_timeout = float(_raw_env_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using config/default",
-                    _raw_env_timeout,
-                )
-        if _session_db_timeout is None:
-            try:
-                from hermes_cli.config import load_config
-                _cfg = load_config() or {}
-                _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
-                _configured = _cron_cfg.get("session_db_timeout_seconds")
-                if _configured is not None:
-                    _session_db_timeout = float(_configured)
-            except Exception as exc:
-                logger.debug(
-                    "Failed to load cron.session_db_timeout_seconds from config: %s",
-                    exc,
-                )
-        if _session_db_timeout is None:
-            _session_db_timeout = 10.0
+            # Resolve timeout: env override → config.yaml → default 10s.
+            # Mirrors the script_timeout_seconds resolution pattern.
+            _session_db_timeout: float | None = None
+            _raw_env_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
+            if _raw_env_timeout:
+                try:
+                    _session_db_timeout = float(_raw_env_timeout)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using config/default",
+                        _raw_env_timeout,
+                    )
+            if _session_db_timeout is None:
+                try:
+                    from hermes_cli.config import load_config
+                    _cfg = load_config() or {}
+                    _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
+                    _configured = _cron_cfg.get("session_db_timeout_seconds")
+                    if _configured is not None:
+                        _session_db_timeout = float(_configured)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to load cron.session_db_timeout_seconds from config: %s",
+                        exc,
+                    )
+            if _session_db_timeout is None:
+                _session_db_timeout = 10.0
 
-        if _session_db_timeout > 0:
-            _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
-            finally:
-                # Don't wait for a wedged connect() to unwind — abandon the
-                # worker thread (same pattern as the agent inactivity timeout
-                # further down) rather than blocking shutdown on it too.
-                _session_db_pool.shutdown(wait=False)
-        else:
-            # 0 = unlimited (legacy behavior, opt-in for debugging)
-            _session_db = SessionDB()
-    except concurrent.futures.TimeoutError:
-        logger.error(
-            "Job '%s': SessionDB init did not return within %.0fs — proceeding "
-            "without a session store for this run instead of blocking it "
-            "forever",
-            job.get("id", "?"), _session_db_timeout,
-        )
-    except Exception as e:
-        logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+            if _session_db_timeout > 0:
+                _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                try:
+                    _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
+                finally:
+                    # Don't wait for a wedged connect() to unwind — abandon the
+                    # worker thread (same pattern as the agent inactivity timeout
+                    # further down) rather than blocking shutdown on it too.
+                    _session_db_pool.shutdown(wait=False)
+            else:
+                # 0 = unlimited (legacy behavior, opt-in for debugging)
+                _session_db = SessionDB()
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "Job '%s': SessionDB init did not return within %.0fs — proceeding "
+                "without a session store for this run instead of blocking it "
+                "forever",
+                job.get("id", "?"), _session_db_timeout,
+            )
+        except Exception as e:
+            logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
@@ -3506,7 +3515,14 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
+        # When ``record_session`` is False, disable session persistence so
+        # the agent runs the full LLM pipeline but no session entry is
+        # written to state.db.  The SessionDB was already skipped above;
+        # this flag prevents the agent from creating a session lazily.
+        if not _record_session:
+            agent._persist_disabled = True
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
