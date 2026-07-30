@@ -186,25 +186,60 @@ def test_actions_delegate_and_replay_is_conflict_without_second_outbox(workflow_
 
     def wrapped(*args, **kwargs):
         called["yes"] = True
+        called["args"] = args
         called["kwargs"] = kwargs
         return original(*args, **kwargs)
 
     monkeypatch.setattr(module.wf_engine, "decide_approval", wrapped)
     response = client.post(
         f"/api/plugins/workflow/action/approvals/{approval_id}",
-        json={"decision": "approved", "decided_by": "tester", "token": token},
+        json={"decision": "approved", "decided_by": "tester"},
     )
     assert response.status_code == 200, response.text
     assert called["yes"] is True
+    assert called["kwargs"]["decided_by"] == "tester"
+    assert called["args"][2] == token
     assert "token" not in response.text
     assert conn.execute("SELECT COUNT(*) FROM wf_outbox WHERE task_id = ?", (task_id,)).fetchone()[0] == 1
 
     replay = client.post(
         f"/api/plugins/workflow/action/approvals/{approval_id}",
-        json={"decision": "approved", "decided_by": "tester", "token": token},
+        json={"decision": "approved", "decided_by": "tester"},
     )
     assert replay.status_code == 409
     assert conn.execute("SELECT COUNT(*) FROM wf_outbox WHERE task_id = ?", (task_id,)).fetchone()[0] == 1
+
+
+def test_edited_approval_preserves_server_hidden_fields(workflow_env):
+    client, conn, _module = workflow_env
+    template_id, _ = wf_engine.register_template(conn, _spec())
+    task_id, approval_id, _token = _approval(
+        conn, template_id, "thread-hidden-edit"
+    )
+
+    response = client.post(
+        f"/api/plugins/workflow/action/approvals/{approval_id}",
+        json={
+            "decision": "edited_approved",
+            "decided_by": "tester",
+            "payload": {"body": "edited body"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    outbox = conn.execute(
+        "SELECT payload, status FROM wf_outbox WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    assert json.loads(outbox["payload"]) == {
+        "body": "edited body",
+        "secret": "cap-token",
+    }
+    assert outbox["status"] == "pending"
+    diff = conn.execute(
+        "SELECT decision_diff FROM wf_approval WHERE id = ?", (approval_id,)
+    ).fetchone()["decision_diff"]
+    assert json.loads(diff) == [
+        {"op": "replace", "path": "/body", "value": "edited body"}
+    ]
 
 
 def test_action_validation_not_found_and_resolve_delegation(workflow_env, monkeypatch):
@@ -212,7 +247,7 @@ def test_action_validation_not_found_and_resolve_delegation(workflow_env, monkey
     assert client.post("/api/plugins/workflow/action/approvals/999", json={}).status_code == 400
     assert client.post(
         "/api/plugins/workflow/action/approvals/999",
-        json={"decision": "wat", "decided_by": "tester", "token": "x"},
+        json={"decision": "wat", "decided_by": "tester"},
     ).status_code == 400
     assert client.post(
         "/api/plugins/workflow/action/events/999/resolve",
@@ -247,7 +282,7 @@ def test_mutations_ignore_board_query_parameter(workflow_env):
     _task_id, approval_id, token = _approval(conn, template_id, "thread-fixed-board")
     response = client.post(
         f"/api/plugins/workflow/action/approvals/{approval_id}?board=other",
-        json={"decision": "approved", "decided_by": "tester", "token": token},
+        json={"decision": "approved", "decided_by": "tester"},
     )
     assert response.status_code == 200, response.text
 

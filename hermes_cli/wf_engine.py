@@ -1315,12 +1315,36 @@ def resolve_event(
             )
         if task_id not in candidates:
             raise WorkflowConflictError("human-selected task is not a deterministic candidate")
-        _record_match(conn, int(event_id), "matched", task_id, method="human")
 
         task = _task(conn, task_id)
         instance = _instance(conn, task_id)
         spec = _load_template(conn, instance["template_id"])
         current_step = str(task["current_step_key"])
+        selected_hit = next(
+            (
+                hit
+                for hit in _candidate_key_hits(conn, event)
+                if str(hit["instance"]["task_id"]) == task_id
+            ),
+            None,
+        )
+        position = (
+            _match_position(conn, event, selected_hit, _now())
+            if selected_hit is not None
+            else None
+        )
+        if position == "future":
+            return _record_match(
+                conn,
+                int(event_id),
+                "buffered",
+                task_id,
+                method="human",
+                reason="human-selected event belongs to a future step",
+                candidates=candidates,
+            )
+
+        _record_match(conn, int(event_id), "matched", task_id, method="human")
         can_apply = _current_compatible(conn, task_id, current_step, event, spec)
         # Applying retains the original event as the transition cause. The
         # human resolution and application must commit in this same outer
@@ -1459,7 +1483,7 @@ def decide_approval(
             conn.execute(
                 """
                 INSERT INTO wf_outbox (task_id, action, payload, status, created_at)
-                VALUES (?, ?, ?, 'queued', ?)
+                VALUES (?, ?, ?, 'pending', ?)
                 """,
                 (approval["task_id"], approval["action"], _json(approved_payload), _now()),
             )

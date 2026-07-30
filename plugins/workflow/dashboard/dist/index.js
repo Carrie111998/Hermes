@@ -446,13 +446,11 @@
     var initialText = JSON.stringify(initial === undefined ? null : initial, null, 2);
     var [editing, setEditing] = hooks.useState(false);
     var [payload, setPayload] = hooks.useState(initialText);
-    var [token, setToken] = hooks.useState("");
     var [error, setError] = hooks.useState("");
     var submit = function (decision) {
       setError("");
-      var body = { decision: decision, decided_by: String(props.operator || "").trim(), token: token };
+      var body = { decision: decision, decided_by: String(props.operator || "").trim() };
       if (!body.decided_by) { setError("Operator identity is required."); return; }
-      if (!token.trim()) { setError("Authorization is required."); return; }
       if (decision === "edited_approved") {
         var parsed = parseObject(payload);
         if (parsed.error) { setError(parsed.error); return; }
@@ -471,9 +469,6 @@
       editing ? h("div", { className: "hermes-workflow-editor" },
         h(Label, { htmlFor: "workflow-payload-" + approvalId }, "Edited object"),
         h("textarea", { id: "workflow-payload-" + approvalId, value: payload, onChange: function (event) { setPayload(event.target.value); }, rows: 7, spellCheck: false, className: "hermes-workflow-json" })) : null,
-      h("div", { className: "hermes-workflow-token-field" },
-        h(Label, { htmlFor: "workflow-authorization-" + approvalId }, "Authorization"),
-        h(Input, { id: "workflow-authorization-" + approvalId, type: "password", value: token, onChange: function (event) { setToken(event.target.value); }, autoComplete: "off" })),
       error ? h("p", { className: "hermes-workflow-field-error", role: "alert" }, error) : null,
       h("div", { className: "hermes-workflow-action-footer" },
         h(Button, { size: "sm", disabled: props.busy, onClick: function () { submit("approved"); } }, "Approve"),

@@ -88,6 +88,33 @@ def _safe_payload(value: Any, *, _parse_serialized: bool = True) -> Any:
     return value
 
 
+def _restore_redacted_payload(original: Any, edited: Any) -> Any:
+    """Preserve server-hidden capability fields while applying a portal edit."""
+
+    if not isinstance(original, dict) or not isinstance(edited, dict):
+        return edited
+    merged: dict[str, Any] = {}
+    for key, value in edited.items():
+        normalized = str(key).strip().lower().replace("-", "_")
+        if normalized in _SENSITIVE_PAYLOAD_KEYS or normalized.endswith("_token"):
+            if key not in original or original[key] != value:
+                raise ValueError(f"portal edits cannot modify hidden field: {key}")
+            continue
+        if key in original:
+            merged[str(key)] = _restore_redacted_payload(original[key], value)
+        else:
+            merged[str(key)] = value
+    for key, value in original.items():
+        normalized = str(key).strip().lower().replace("-", "_")
+        if normalized in _SENSITIVE_PAYLOAD_KEYS or normalized.endswith("_token"):
+            merged[str(key)] = value
+        elif isinstance(value, dict) and key not in edited:
+            restored = _restore_redacted_payload(value, {})
+            if restored:
+                merged[str(key)] = restored
+    return merged
+
+
 def _workflow_steps(spec_text: str | None) -> list[dict[str, Any]]:
     spec = _json_object(spec_text, default={})
     if not isinstance(spec, dict):
@@ -603,10 +630,26 @@ async def decide_approval_action(approval_id: str, request: Request) -> dict[str
         if decision not in _APPROVAL_DECISIONS:
             raise HTTPException(status_code=400, detail="invalid approval decision")
         decided_by = _required_text(body, "decided_by")
-        token = _required_text(body, "token")
         payload = body.get("payload")
         if "payload" in body and payload is not None and not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="payload must be an object or null")
+        approval = conn.execute(
+            "SELECT payload, resume_token FROM wf_approval WHERE id = ?",
+            (approval_id_int,),
+        ).fetchone()
+        if approval is None:
+            raise HTTPException(status_code=404, detail="workflow approval not found")
+        token = approval["resume_token"]
+        if not isinstance(token, str) or not token:
+            raise HTTPException(status_code=409, detail="approval capability is unavailable")
+        if decision == "edited_approved":
+            original_payload = _json_object(approval["payload"], default=None)
+            if not isinstance(original_payload, dict):
+                raise HTTPException(status_code=409, detail="stored approval payload is invalid")
+            try:
+                payload = _restore_redacted_payload(original_payload, payload)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
             event_id = wf_engine.decide_approval(
                 conn,

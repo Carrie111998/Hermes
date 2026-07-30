@@ -135,7 +135,7 @@ def test_approval_decisions_are_one_shot_and_exact(tmp_path):
         assert decision_event is not None
         assert tuple(approval[:3]) == ("edited_approved", "reviewer", '[{"op":"replace","path":"/body","value":"edited"},{"op":"add","path":"/extra","value":1}]')
         assert approval[3] != token
-        assert tuple(outbox) == ("deliver", '{"body":"edited","extra":1}', "queued")
+        assert tuple(outbox) == ("deliver", '{"body":"edited","extra":1}', "pending")
         assert wf_engine.decide_approval(conn, approval_id, token, "edited_approved", decided_by="reviewer", payload={"body": "edited", "extra": 1}) is None
         assert conn.execute("SELECT COUNT(*) FROM wf_outbox WHERE task_id = ?", (task_id,)).fetchone()[0] == 1
 
@@ -215,6 +215,47 @@ def test_human_resolution_match_and_apply_roll_back_together(tmp_path, monkeypat
         assert conn.execute(
             "SELECT COUNT(*) FROM wf_event WHERE source = 'human_resolution'"
         ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_human_resolution_buffers_event_for_future_step(tmp_path):
+    conn = _conn(tmp_path)
+    try:
+        template, _ = wf_engine.register_template(conn, _wait_spec())
+        current = _instance(conn, template, "future-current")
+        future = _instance(conn, template, "future-selected")
+        conn.execute(
+            "UPDATE wf_instance SET corr = ? WHERE task_id IN (?, ?)",
+            ('{"key":"shared-future"}', current, future),
+        )
+        event_id = wf_engine.ingest_event(
+            conn,
+            source="intake",
+            external_id="future-human-pick",
+            payload={"x": 1},
+            corr={"key": "shared-future"},
+            event_type="arrived",
+        )
+        assert wf_engine.match_event(conn, event_id).kind == "ambiguous"
+
+        result = wf_engine.resolve_event(
+            conn, event_id, future, decided_by="reviewer"
+        )
+        assert result.kind == "buffered"
+        assert result.task_id == future
+        assert tuple(
+            conn.execute(
+                "SELECT status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+        ) == ("buffered", future, "human")
+
+        _at_waiting(conn, future)
+        row = conn.execute(
+            "SELECT status FROM wf_event WHERE id = ?", (event_id,)
+        ).fetchone()
+        assert row["status"] == "matched"
     finally:
         conn.close()
 

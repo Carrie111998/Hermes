@@ -326,7 +326,6 @@ def _run_full_loop(home: Path, run: int, monkeypatch) -> dict:
                 json={
                     "decision": "approved",
                     "decided_by": "synthetic-reviewer",
-                    "token": approved_token,
                 },
             )
             assert approved.status_code == 200, approved.text
@@ -343,7 +342,6 @@ def _run_full_loop(home: Path, run: int, monkeypatch) -> dict:
                 json={
                     "decision": "approved",
                     "decided_by": "synthetic-reviewer",
-                    "token": approved_token,
                 },
             )
             assert replay.status_code == 409
@@ -365,7 +363,6 @@ def _run_full_loop(home: Path, run: int, monkeypatch) -> dict:
                 json={
                     "decision": "edited_approved",
                     "decided_by": "synthetic-reviewer",
-                    "token": edited_token,
                     "payload": edited_payload,
                 },
             )
@@ -380,7 +377,7 @@ def _run_full_loop(home: Path, run: int, monkeypatch) -> dict:
             assert tuple(conn.execute(
                 "SELECT payload, status FROM wf_outbox WHERE task_id = ?",
                 (edited_task,),
-            ).fetchone()) == ('{"body":"edited","to":"recipient@example.test"}', "queued")
+            ).fetchone()) == ('{"body":"edited","to":"recipient@example.test"}', "pending")
 
             # Leave one card in each UI badge state so the response shape proves
             # the actual card/badge contract consumed by board and graph views.
