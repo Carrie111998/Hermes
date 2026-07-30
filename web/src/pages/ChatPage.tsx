@@ -36,6 +36,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
+import { planChatLearnSeed } from "@/lib/chat-learn-seed";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
@@ -193,6 +194,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const reconnectAttemptRef = useRef(0);
   const forceFreshPtyRef = useRef(false);
   const blockedInputNoticeRef = useRef(false);
+  const pendingLearnSeedRef = useRef<string | null>(null);
   const lastResumeReconnectAtRef = useRef(0);
   // True from the moment the connect effect begins until the socket resolves
   // (open or close). Guards the page-resume reconnect against firing during
@@ -307,6 +309,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
   const resumeParam = searchParams.get("resume");
+  const learnSeed = searchParams.get("learn");
   // Profile-scoped chat: spawn the PTY under the globally selected
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
@@ -977,25 +980,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // follow up with the authoritative measurement — at worst Ink
       // reflows once after the PTY boots, which is imperceptible.
       ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
-      // One-shot: a ?learn=<text> param (set by the Skills page "Learn a
-      // skill" panel) is typed into the composer as a /learn command once the
-      // PTY is up. /learn resolves via command.dispatch → a normal agent turn,
-      // so this reuses the existing composer path — no special PTY protocol.
-      const learnSeed = searchParams.get("learn");
-      if (learnSeed) {
-        const next = new URLSearchParams(searchParams);
-        next.delete("learn");
-        setSearchParams(next, { replace: true });
-        const cmd = `/learn ${learnSeed}`.trim();
-        // Delay so Ink's composer has mounted and grabbed focus before input.
-        setTimeout(() => {
-          try {
-            wsRef.current?.send(cmd + "\r");
-          } catch {
-            /* PTY not ready / closed — user can retype */
-          }
-        }, 800);
-      }
     };
 
     // Session resume: Ink's two-pass virtual scroll floods the PTY with
@@ -1226,6 +1210,46 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     scopedProfile,
     reconnectNonce,
   ]);
+
+  // ChatPage stays mounted while the dashboard navigates, so a Skills-page
+  // `?learn=` handoff may arrive after this PTY's one and only `onopen`.
+  // Deliver it from URL state independently of the connection lifecycle.
+  useEffect(() => {
+    const socket = wsRef.current;
+    const plan = planChatLearnSeed({
+      isActive,
+      ptyState,
+      searchParams,
+      socketReadyState: socket?.readyState ?? null,
+    });
+
+    if (!plan || !learnSeed || pendingLearnSeedRef.current === learnSeed) {
+      return;
+    }
+
+    pendingLearnSeedRef.current = learnSeed;
+    const timer = window.setTimeout(() => {
+      if (wsRef.current !== socket || socket.readyState !== WebSocket.OPEN) {
+        pendingLearnSeedRef.current = null;
+        return;
+      }
+
+      try {
+        socket.send(plan.command);
+        setSearchParams(plan.nextSearchParams, { replace: true });
+      } catch {
+        // Keep `learn` in the URL so reconnect/reactivation can retry.
+        pendingLearnSeedRef.current = null;
+      }
+    }, 800);
+
+    return () => {
+      window.clearTimeout(timer);
+      if (pendingLearnSeedRef.current === learnSeed) {
+        pendingLearnSeedRef.current = null;
+      }
+    };
+  }, [isActive, learnSeed, ptyState, searchParams, setSearchParams]);
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.
