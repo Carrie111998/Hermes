@@ -249,6 +249,32 @@ with kb.connect(db_path) as connection:
     assert len(rows) == 1
 
 
+def test_create_task_idempotent_replay_does_not_wait_for_writer_lock(
+    kanban_home, monkeypatch
+):
+    """An existing-key replay stays on the WAL read path under write contention."""
+    monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", "50")
+    with kb.connect() as replay_connection, kb.connect() as lock_holder:
+        task_id = kb.create_task(
+            replay_connection,
+            title="original webhook",
+            idempotency_key="sentry:org:existing-issue",
+        )
+        lock_holder.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        try:
+            replayed_id = kb.create_task(
+                replay_connection,
+                title="retried webhook",
+                idempotency_key="sentry:org:existing-issue",
+            )
+        finally:
+            lock_holder.rollback()
+
+    assert replayed_id == task_id
+    assert time.monotonic() - started < 0.5
+
+
 # ---------------------------------------------------------------------------
 # Links + dependency resolution
 # ---------------------------------------------------------------------------

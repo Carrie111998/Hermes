@@ -3036,6 +3036,20 @@ def create_task(
             )
         skills_list = cleaned
 
+    # Preserve the read-only replay fast path. Existing-key retries are common
+    # for webhook producers and should not wait behind an unrelated writer.
+    # The same lookup is repeated inside write_txn below to close the race when
+    # two creators both observe an absent key here.
+    if idempotency_key:
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (idempotency_key,),
+        ).fetchone()
+        if row:
+            return row["id"]
+
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
