@@ -821,18 +821,22 @@ def _parse_xai_amount(value: Any) -> Optional[float]:
     return amount if math.isfinite(amount) and amount >= 0 else None
 
 
-def _fetch_xai_oauth_account_usage() -> Optional[AccountUsageSnapshot]:
+def _fetch_xai_oauth_account_usage(
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
     """Fetch SuperGrok subscription usage from the Grok CLI billing API.
 
-    This is separate from metered xAI API usage. Only stored xAI OAuth
+    This is separate from metered xAI API usage. Only live or stored xAI OAuth
     credentials may be sent to the subscription billing host.
     """
-    from tools.xai_http import resolve_xai_http_credentials
+    token = str(api_key or "").strip()
+    if not token:
+        from tools.xai_http import resolve_xai_http_credentials
 
-    runtime = resolve_xai_http_credentials()
-    if runtime.get("provider") != "xai-oauth":
-        return None
-    token = str(runtime.get("api_key", "") or "").strip()
+        runtime = resolve_xai_http_credentials()
+        if runtime.get("provider") != "xai-oauth":
+            return None
+        token = str(runtime.get("api_key", "") or "").strip()
     if not token:
         return None
     headers = {
@@ -979,7 +983,7 @@ def fetch_account_usage(
         if normalized == "anthropic":
             return _fetch_anthropic_account_usage()
         if normalized == "xai-oauth":
-            return _fetch_xai_oauth_account_usage()
+            return _fetch_xai_oauth_account_usage(api_key=api_key)
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
     except Exception:

@@ -172,6 +172,37 @@ def test_fetch_account_usage_xai_oauth_billing(monkeypatch):
     assert "On-demand: 40 of 50 remaining" in snapshot.details
 
 
+def test_fetch_account_usage_xai_oauth_prefers_live_token(monkeypatch):
+    resolver_calls = 0
+
+    def resolve_credentials():
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return {"provider": "xai-oauth", "api_key": "pool-other-token"}
+
+    monkeypatch.setattr(
+        "tools.xai_http.resolve_xai_http_credentials",
+        resolve_credentials,
+        raising=False,
+    )
+
+    class _XaiClient(_Client):
+        def get(self, url, headers=None):
+            assert url == "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+            assert headers["Authorization"] == "Bearer active-session-token"
+            return _Response({"config": {}})
+
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda **kwargs: _XaiClient({}),
+    )
+
+    snapshot = fetch_account_usage("xai-oauth", api_key="active-session-token")
+
+    assert snapshot is not None
+    assert resolver_calls == 0
+
+
 def test_fetch_account_usage_xai_oauth_closes_client_on_request_error(monkeypatch):
     monkeypatch.setattr(
         "tools.xai_http.resolve_xai_http_credentials",
