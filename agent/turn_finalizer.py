@@ -311,7 +311,22 @@ def finalize_turn(
             except Exception:
                 _tail = None
             _tail_role = _tail.get("role") if isinstance(_tail, dict) else None
-            if _tail_role != "assistant":
+            # The empty-response terminal path sets final_response to a
+            # delivery-only labeled reasoning excerpt (e.g. "⚠️ The model
+            # produced only internal reasoning…").  It must NOT be appended
+            # as a new persisted assistant message — the excerpt is for the
+            # user's eyes only, not for transcript persistence.  Appending it
+            # makes future "continue" turns replay the reasoning as if it
+            # were a real response, causing empty-response loops.
+            #
+            # ``_drop_trailing_empty_response_scaffolding`` already stripped
+            # the ``(empty)`` sentinel, so the tail here is a prefill message,
+            # not the sentinel — without this guard the unconditional append
+            # would persist the excerpt as real assistant content.
+            _is_empty_response_exhausted = (
+                str(_turn_exit_reason) == "empty_response_exhausted"
+            )
+            if not _is_empty_response_exhausted and _tail_role != "assistant":
                 # Tail is not an assistant row — append the final response
                 # so the durable turn closes with the answer (#43849/#44100).
                 messages.append({"role": "assistant", "content": final_response})
