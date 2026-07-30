@@ -1,0 +1,455 @@
+# Hybrid Open-set Domain Router policy draft.
+# Documentation-only SSOT for future Hermes memory-routing implementation.
+version: 0.1.0
+name: hybrid_open_set_domain_router
+summary: >-
+  Hybrid policy for routing always-in-state, triggered, and external/archive
+  memory facts by domain, risk, and required-if-available profile slots.
+
+routing:
+  mode: hybrid_open_set
+  deterministic_first: true
+  open_set_fallback: true
+  default_domain: general
+  triggered_memory_location: turn_local_block
+  rewritten_query_rule: include_slot_names_not_memory_values
+  baseline_stratification:
+    required: true
+    field: memory_location
+    values:
+      - always
+      - overflow
+
+memory_tiers:
+  always_critical:
+    description: Facts that should remain visible across sessions when possible.
+    examples:
+      - severe allergies
+      - medication contraindications
+      - critical safety constraints
+      - persistent user preferences with high downside if missed
+  triggered_profile:
+    description: Facts injected only when a domain or risk route requires them.
+    examples:
+      - diet preferences for food questions
+      - pet species for home-safety questions
+      - brokerage/tax constraints for investing questions
+  archive_retrievable:
+    description: Searchable session or provider memory used for details and provenance.
+    examples:
+      - past implementation choices
+      - prior travel itineraries
+      - detailed notes that are not globally safety-critical
+  ephemeral_turn:
+    description: Short-lived facts relevant to the active task only.
+    examples:
+      - current comparison options
+      - temporary constraints
+      - draft assumptions
+
+risk_levels:
+  low:
+    description: Low downside if a relevant memory is missed.
+    routing_action: best_effort
+  medium:
+    description: User outcome may degrade or require rework if memory is missed.
+    routing_action: recall_required_if_available
+  high:
+    description: Safety, financial, privacy, or irreversible-impact downside is plausible.
+    routing_action: gate_required_if_available
+  critical:
+    description: Severe safety or security downside is plausible.
+    routing_action: gate_required_and_warn_on_unknown
+
+default_required_if_available: &default_required_if_available
+  - explicit_user_preferences
+  - hard_constraints
+  - confirmed_absent_facts
+  - supersedes_relationships
+
+domains:
+  general:
+    description: Fallback route for topics with no specific domain match.
+    risk_level: low
+    extends: []
+    triggers:
+      keywords: []
+      semantic_hints:
+        - broad advice
+        - generic writing
+        - open ended question
+    required_if_available: *default_required_if_available
+
+  food:
+    description: Recipes, meals, groceries, restaurants, nutrition planning.
+    risk_level: high
+    extends:
+      - general
+    triggers:
+      keywords:
+        - recipe
+        - meal
+        - restaurant
+        - grocery
+        - diet
+        - nutrition
+        - allergy
+        - allergen
+      semantic_hints:
+        - cooking recommendation
+        - eating suggestion
+        - ingredient substitution
+    required_if_available:
+      - food_allergies
+      - intolerances
+      - dietary_restrictions
+      - disliked_ingredients
+      - religious_or_ethical_food_rules
+      - household_member_food_constraints
+      - emergency_food_safety_notes
+
+  health:
+    description: Symptoms, medical questions, treatment, wellness, clinical risk.
+    risk_level: critical
+    extends:
+      - general
+    triggers:
+      keywords:
+        - symptom
+        - diagnosis
+        - doctor
+        - treatment
+        - pain
+        - illness
+        - surgery
+        - lab result
+      semantic_hints:
+        - medical advice
+        - health risk assessment
+        - interpreting symptoms
+    required_if_available:
+      - medical_conditions
+      - allergies
+      - current_medications
+      - pregnancy_or_child_constraints
+      - clinician_instructions
+      - emergency_red_flags
+      - care_access_preferences
+
+  medication:
+    description: Prescription, OTC, dosage, contraindication, interaction questions.
+    risk_level: critical
+    extends:
+      - health
+    triggers:
+      keywords:
+        - medication
+        - medicine
+        - prescription
+        - dosage
+        - dose
+        - ibuprofen
+        - acetaminophen
+        - antibiotic
+        - contraindication
+        - interaction
+      semantic_hints:
+        - drug recommendation
+        - medication schedule
+        - supplement interaction with medicine
+    required_if_available:
+      - current_medications
+      - medication_allergies
+      - contraindications
+      - chronic_conditions
+      - age_or_weight_constraints
+      - clinician_instructions
+      - pharmacy_or_access_constraints
+
+  supplement:
+    description: Vitamins, supplements, nutraceuticals, performance aids.
+    risk_level: high
+    extends:
+      - health
+    triggers:
+      keywords:
+        - supplement
+        - vitamin
+        - mineral
+        - herb
+        - nutraceutical
+        - creatine
+        - magnesium
+        - omega
+      semantic_hints:
+        - non-prescription health product
+        - supplement stack
+        - wellness product safety
+    required_if_available:
+      - current_medications
+      - medical_conditions
+      - supplement_allergies
+      - pregnancy_or_child_constraints
+      - clinician_instructions
+      - prior_adverse_reactions
+
+  pet_safety:
+    description: Pet care, plants, foods, household hazards, veterinary concerns.
+    risk_level: high
+    extends:
+      - general
+    triggers:
+      keywords:
+        - pet
+        - dog
+        - cat
+        - puppy
+        - kitten
+        - vet
+        - toxic
+        - plant
+        - lily
+      semantic_hints:
+        - animal safety
+        - pet food or plant risk
+        - household hazard for animals
+    required_if_available:
+      - pet_species
+      - pet_breed_size_age
+      - pet_medical_conditions
+      - known_pet_allergies
+      - household_plants
+      - vet_instructions
+
+  child_family:
+    description: Children, family logistics, caregiving, age-sensitive advice.
+    risk_level: high
+    extends:
+      - general
+    triggers:
+      keywords:
+        - child
+        - kid
+        - baby
+        - toddler
+        - family
+        - school
+        - childcare
+        - caregiver
+      semantic_hints:
+        - age-sensitive recommendation
+        - family scheduling
+        - child safety
+    required_if_available:
+      - household_members
+      - child_ages
+      - custody_or_school_constraints
+      - family_health_or_safety_constraints
+      - accessibility_needs
+      - caregiver_preferences
+
+  travel:
+    description: Trip planning, transport, lodging, visas, packing, local safety.
+    risk_level: medium
+    extends:
+      - general
+    triggers:
+      keywords:
+        - travel
+        - trip
+        - flight
+        - hotel
+        - visa
+        - passport
+        - itinerary
+        - packing
+      semantic_hints:
+        - destination planning
+        - travel logistics
+        - mobility or document constraints
+    required_if_available:
+      - passport_or_visa_constraints
+      - mobility_constraints
+      - travel_preferences
+      - loyalty_programs
+      - budget_constraints
+      - dietary_or_health_travel_constraints
+      - family_or_pet_travel_constraints
+
+  investing:
+    description: Investing, portfolio, asset allocation, tax, risk, trading decisions.
+    risk_level: high
+    extends:
+      - general
+    triggers:
+      keywords:
+        - invest
+        - portfolio
+        - stock
+        - bond
+        - ETF
+        - crypto
+        - allocation
+        - risk
+        - tax
+      semantic_hints:
+        - financial decision
+        - trade recommendation
+        - portfolio risk assessment
+    required_if_available:
+      - investment_objectives
+      - risk_tolerance
+      - time_horizon
+      - liquidity_needs
+      - tax_jurisdiction
+      - restricted_assets
+      - existing_positions
+      - leverage_or_margin_constraints
+
+  kr_stock:
+    description: Korean equities, KRX, Korean broker APIs, domestic stock analysis.
+    risk_level: high
+    extends:
+      - investing
+    triggers:
+      keywords:
+        - KRX
+        - KOSPI
+        - KOSDAQ
+        - 한국주식
+        - 국내주식
+        - 종목
+        - 수급
+        - 공매도
+        - 대차
+        - 신용잔고
+      semantic_hints:
+        - Korean stock analysis
+        - domestic brokerage or tax constraints
+        - Korean market microstructure
+    required_if_available:
+      - korean_brokerage_accounts
+      - current_kr_positions
+      - kr_tax_constraints
+      - preferred_kr_data_sources
+      - trading_time_constraints
+      - margin_or_credit_constraints
+      - watchlist_and_no_trade_list
+
+  coding_repo:
+    description: Software development in repositories, tests, git, deployment changes.
+    risk_level: medium
+    extends:
+      - general
+    triggers:
+      keywords:
+        - repo
+        - code
+        - test
+        - build
+        - git
+        - branch
+        - commit
+        - PR
+        - deploy
+      semantic_hints:
+        - repository modification
+        - implementation task
+        - debugging workflow
+    required_if_available:
+      - repo_path
+      - branch_or_worktree_rules
+      - project_test_commands
+      - coding_style_preferences
+      - deployment_constraints
+      - prior_bug_context
+      - do_not_modify_paths
+
+  security:
+    description: Credentials, auth, secrets, permissions, privacy, network exposure.
+    risk_level: critical
+    extends:
+      - coding_repo
+    triggers:
+      keywords:
+        - secret
+        - token
+        - password
+        - credential
+        - auth
+        - permission
+        - vulnerability
+        - firewall
+        - port
+      semantic_hints:
+        - security-sensitive configuration
+        - credentials or private data
+        - access control change
+    required_if_available:
+      - secret_handling_preferences
+      - allowed_credentials_locations
+      - security_policies
+      - production_vs_local_scope
+      - account_identifiers
+      - disclosure_constraints
+      - approval_requirements
+
+  home_lifestyle:
+    description: Home setup, household purchases, routines, environment, lifestyle choices.
+    risk_level: medium
+    extends:
+      - general
+    triggers:
+      keywords:
+        - home
+        - house
+        - apartment
+        - furniture
+        - routine
+        - lifestyle
+        - cleaning
+        - appliance
+      semantic_hints:
+        - household recommendation
+        - daily routine planning
+        - home environment constraint
+    required_if_available:
+      - household_members
+      - pets
+      - allergies
+      - budget_constraints
+      - space_constraints
+      - accessibility_needs
+      - aesthetic_preferences
+
+open_set:
+  proposal_queue: docs/features/memory-routing/proposals
+  min_confidence_for_new_domain: 0.72
+  require_human_review: true
+  proposal_fields:
+    - proposed_domain
+    - triggering_query
+    - rationale
+    - suggested_risk_level
+    - suggested_required_if_available
+    - duplicate_of
+
+write_path_tagging:
+  requirement_id: FR7
+  assign_on_memory_write:
+    - tier
+    - domain
+    - risk_level
+    - source
+    - confidence
+    - confirmed_at
+    - supersedes
+    - confirmed_absent
+
+cost_controls:
+  requirement_id: NFR5
+  classifier_budget:
+    max_added_latency_ms_p95: 250
+    max_added_prompt_tokens_per_turn: 350
+    cache_policy_files: true
+    skip_open_set_when_deterministic_confidence_at_least: 0.85
