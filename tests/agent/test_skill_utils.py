@@ -166,6 +166,32 @@ def test_pre_edit_snapshot_name_requires_canonical_task_id(tmp_path):
     assert is_excluded_skill_path(legitimate) is False
 
 
+def test_exclusions_are_relative_to_discovery_root(tmp_path):
+    """A snapshot-shaped profile/home parent must not hide its live skills."""
+    profile_home = tmp_path / "worker-pre-edit-snapshot-t_abcdef12"
+    skills_root = profile_home / "skills"
+    live = skills_root / "live-skill" / "SKILL.md"
+    live.parent.mkdir(parents=True)
+    live.write_text("---\nname: live-skill\n---\n", encoding="utf-8")
+
+    assert is_excluded_skill_path(live, root=skills_root) is False
+    assert is_excluded_skill_path(live) is True
+    outside = tmp_path / "outside" / "live-skill" / "SKILL.md"
+    assert is_excluded_skill_path(outside, root=skills_root) is False
+
+
+def test_legacy_snapshot_flat_files_use_only_recognized_skill_suffix(tmp_path):
+    snapshot_stem = "ghost-pre-edit-snapshot-t_abcdef12"
+    snapshot_md = tmp_path / f"{snapshot_stem}.md"
+    snapshot_txt = tmp_path / f"{snapshot_stem}.txt"
+    snapshot_md.write_text("stale", encoding="utf-8")
+    snapshot_txt.write_text("not a recognized legacy skill file", encoding="utf-8")
+
+    assert is_excluded_skill_path(snapshot_md, root=tmp_path) is True
+    assert is_excluded_skill_path(snapshot_txt, root=tmp_path) is False
+    assert list(iter_skill_index_files(tmp_path, snapshot_md.name)) == []
+
+
 # ── skill_matches_platform on Termux ──────────────────────────────────────
 
 

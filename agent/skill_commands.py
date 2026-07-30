@@ -399,7 +399,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         for scan_dir in dirs_to_scan:
             for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-                if is_excluded_skill_path(skill_md):
+                if is_excluded_skill_path(skill_md, root=scan_dir):
                     continue
                 try:
                     content = skill_md.read_text(encoding='utf-8')

@@ -719,7 +719,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # dirs_to_scan already resolved above for the signature.
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-            if _is_excluded_skill_path(skill_md):
+            if _is_excluded_skill_path(skill_md, root=scan_dir):
                 continue
 
             skill_dir = skill_md.parent
@@ -1130,8 +1130,12 @@ def skill_view(
                 and (direct_path / "SKILL.md").exists()
             ):
                 _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
-                direct_path.with_suffix(".md")
+            elif (
+                direct_path.with_suffix(".md").exists()
+                and not _is_excluded_skill_path(
+                    direct_path.with_suffix(".md"), root=search_dir
+                )
+                and not _is_skill_support_path(direct_path.with_suffix(".md"))
             ):
                 _record(None, direct_path.with_suffix(".md"))
 
@@ -1149,10 +1153,12 @@ def skill_view(
                     and (categorized_path / "SKILL.md").exists()
                 ):
                     _record(categorized_path, categorized_path / "SKILL.md")
-                elif categorized_path.with_suffix(
-                    ".md"
-                ).exists() and not _is_skill_support_path(
-                    categorized_path.with_suffix(".md")
+                elif (
+                    categorized_path.with_suffix(".md").exists()
+                    and not _is_excluded_skill_path(
+                        categorized_path.with_suffix(".md"), root=search_dir
+                    )
+                    and not _is_skill_support_path(categorized_path.with_suffix(".md"))
                 ):
                     _record(None, categorized_path.with_suffix(".md"))
 

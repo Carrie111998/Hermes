@@ -56,6 +56,10 @@ SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 _PRE_EDIT_SNAPSHOT_DIR_RE = re.compile(
     r"^[A-Za-z0-9_-]+-pre-edit-snapshot-t_[0-9a-f]+$"
 )
+# The legacy flat-file loader only recognizes ``.md`` files.  Apply the
+# snapshot convention to that filename's stem as well as to directory names,
+# but do not turn arbitrary future file extensions into exclusions.
+_LEGACY_SKILL_FILE_SUFFIXES = frozenset((".md",))
 
 # ── Org-shared skills (sync contract) ───────────────────────────
 # Org mirrors live under ~/.hermes/skills/_org/<org_id>/. Resolution is
@@ -117,15 +121,49 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
 
     Accepts a Path or string.
     """
-    try:
-        parts = path.parts  # Path
-    except AttributeError:
-        from pathlib import PurePath
-        parts = PurePath(str(path)).parts
+    relative, _root_obj = _lexical_relative_path(path, root)
+    if root is not None and relative.parts[:2] == ("..", "__outside_explicit_root__"):
+        return False
+    parts = relative.parts
     return (
         any(part in EXCLUDED_SKILL_DIRS for part in parts)
-        or any(_PRE_EDIT_SNAPSHOT_DIR_RE.fullmatch(part) for part in parts)
+        or any(_is_pre_edit_snapshot_component(part) for part in parts)
         or is_skill_support_path(path, root=root)
+    )
+
+
+def _lexical_relative_path(path, root: Optional[Path]) -> tuple[Path, Optional[Path]]:
+    """Return a lexical path relative to *root*, without resolving symlinks.
+
+    Absolute paths outside an explicit root are returned as ``(path, root)``
+    with a sentinel handled by callers; they must not inherit exclusions from
+    unrelated ancestors. Relative paths are identifiers relative to the root,
+    matching the scanner APIs' existing contract.
+    """
+    path_obj = path if isinstance(path, Path) else Path(str(path))
+    if root is None:
+        return path_obj, None
+    root_obj = root if isinstance(root, Path) else Path(str(root))
+    root_lex = Path(os.path.abspath(os.fspath(root_obj)))
+    if path_obj.is_absolute():
+        path_lex = Path(os.path.abspath(os.fspath(path_obj)))
+        try:
+            return path_lex.relative_to(root_lex), root_lex
+        except ValueError:
+            # An explicit outside-root path is intentionally not classified by
+            # this root's exclusions. Keep an unmistakable marker for callers.
+            return Path("..", "__outside_explicit_root__", *path_lex.parts), root_lex
+    return Path(os.path.normpath(os.fspath(path_obj))), root_lex
+
+
+def _is_pre_edit_snapshot_component(component: str) -> bool:
+    """Match snapshot directories and recognized legacy flat-file stems."""
+    if _PRE_EDIT_SNAPSHOT_DIR_RE.fullmatch(component):
+        return True
+    suffix = Path(component).suffix.lower()
+    return (
+        suffix in _LEGACY_SKILL_FILE_SUFFIXES
+        and bool(_PRE_EDIT_SNAPSHOT_DIR_RE.fullmatch(Path(component).stem))
     )
 
 
@@ -143,16 +181,19 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
     discoverable because their ``scripts`` component is not directly under a
     directory that contains ``SKILL.md``.
     """
-    path_obj = path if isinstance(path, Path) else Path(str(path))
-    parts = path_obj.parts
+    relative, root_obj = _lexical_relative_path(path, root)
+    if root is not None and relative.parts[:2] == ("..", "__outside_explicit_root__"):
+        return False
+    parts = relative.parts
     # Last component may be a file or candidate skill directory name. Only
     # components before the leaf can be containing support directories.
     for idx, part in enumerate(parts[:-1]):
         if part not in SKILL_SUPPORT_DIRS or idx == 0:
             continue
         skill_root = Path(*parts[:idx])
-        if root is not None and not path_obj.is_absolute():
-            skill_root = root / skill_root
+        if root is not None:
+            assert root_obj is not None
+            skill_root = root_obj / skill_root
         if (skill_root / "SKILL.md").exists():
             return True
     return False
@@ -898,11 +939,13 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             d
             for d in dirs
             if d not in EXCLUDED_SKILL_DIRS
-            and not _PRE_EDIT_SNAPSHOT_DIR_RE.fullmatch(d)
+            and not _is_pre_edit_snapshot_component(d)
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
         if filename in files:
-            matches.append(os.path.join(root, filename))
+            candidate = Path(root) / filename
+            if not is_excluded_skill_path(candidate, root=skills_dir):
+                matches.append(os.path.join(root, filename))
     for path in sorted(matches):
         yield Path(path)
 

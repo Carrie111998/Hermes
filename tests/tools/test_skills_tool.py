@@ -350,7 +350,25 @@ class TestSkillView:
         assert "LIVE" in result["content"]
         assert "STALE" not in result["content"]
 
-    def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
+    def test_view_accepts_relative_and_categorized_legacy_flat_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            (tmp_path / "legacy-skill.md").write_text(
+                "---\nname: legacy-flat\ndescription: active\n---\n\nLIVE\n",
+                encoding="utf-8",
+            )
+            (tmp_path / "category" / "legacy-flat.md").parent.mkdir()
+            (tmp_path / "category" / "legacy-flat.md").write_text(
+                "---\nname: category-legacy-flat\ndescription: active\n---\n\nCATEGORIZED\n",
+                encoding="utf-8",
+            )
+            relative = json.loads(skill_view("legacy-skill"))
+            categorized = json.loads(skill_view("category:legacy-flat"))
+
+        assert relative["success"] is True
+        assert "LIVE" in relative["content"]
+        assert categorized["success"] is True
+        assert "CATEGORIZED" in categorized["content"]
+
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
                 tmp_path,

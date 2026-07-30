@@ -533,7 +533,7 @@ def _all_local_skill_names() -> List[str]:
         if not root.exists():
             return []
         for skill_md in root.rglob("SKILL.md"):
-            if skill_md.is_symlink() or is_excluded_skill_path(skill_md):
+            if skill_md.is_symlink() or is_excluded_skill_path(skill_md, root=root):
                 continue
             name: Optional[str] = None
             try:
@@ -1658,7 +1658,7 @@ def list_org_skill_names() -> List[str]:
         if not root.is_dir():
             return names
         for skill_md in root.rglob("SKILL.md"):
-            if is_excluded_skill_path(skill_md):
+            if is_excluded_skill_path(skill_md, root=root):
                 continue
             rel = skill_md.parent.relative_to(root)
             if rel.parts:
