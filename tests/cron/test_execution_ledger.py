@@ -328,7 +328,7 @@ def test_cronjob_formatter_exposes_newer_unknown_attempt_over_stale_success(
     import sqlite3
 
     import cron.jobs as jobs
-    from tools.cronjob_tools import _format_job
+    from tools.cronjob_tools import cronjob
 
     monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
@@ -350,7 +350,8 @@ def test_cronjob_formatter_exposes_newer_unknown_attempt_over_stale_success(
         )
     assert executions.recover_interrupted_executions() == 1
 
-    formatted = _format_job(jobs.list_jobs(include_disabled=True)[0])
+    list_response = json.loads(cronjob(action="list", include_disabled=True))
+    formatted = list_response["jobs"][0]
 
     # The job summary remains useful as historical completion data, but the
     # model-facing shape must also carry the newer occurrence's truth.
@@ -359,3 +360,24 @@ def test_cronjob_formatter_exposes_newer_unknown_attempt_over_stale_success(
     assert formatted["latest_execution"]["id"] == attempt["id"]
     assert formatted["latest_execution"]["status"] == "unknown"
     assert formatted["latest_execution"]["claimed_at"] > completed_at
+
+
+def test_cronjob_pause_response_exposes_latest_execution(monkeypatch, tmp_path):
+    """Non-list action responses use the same ledger truth as list results."""
+    import cron.jobs as jobs
+    from tools.cronjob_tools import cronjob
+
+    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    job = jobs.create_job(prompt="pause me", schedule="every 1h", name="pause")
+    record = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(record["id"])
+
+    response = json.loads(cronjob(action="pause", job_id=job["id"]))
+
+    assert response["success"] is True
+    assert response["job"]["latest_execution"]["id"] == record["id"]
+    assert response["job"]["latest_execution"]["status"] == "running"
