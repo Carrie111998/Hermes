@@ -1614,41 +1614,78 @@ def restore_job(job_id: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any
     interchange format, not a bag of updates. Validate and translate it before
     taking the store lock so malformed input cannot cause a partial mutation.
     """
-    if not isinstance(job_id, str) or not job_id or not isinstance(snapshot, dict):
-        raise ValueError("cron restore requires a job id and object snapshot")
-    if snapshot.get("id") != job_id:
-        raise ValueError("cron restore snapshot id does not match job id")
+    def invalid(code: str):
+        raise ValueError(code)
+    if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", job_id):
+        invalid("CRON_RESTORE_INVALID_ID")
+    if not isinstance(snapshot, dict):
+        invalid("CRON_RESTORE_INVALID_SNAPSHOT")
+    versioned = snapshot.get("schema_version") == 2 and isinstance(snapshot.get("record"), dict)
+    if versioned:
+        versioned_keys = {
+            "schema_version", "record", "presence", "id", "name", "enabled", "state",
+            "schedule", "run_at", "next_run_at", "repeat", "repeat_state", "delivery",
+            "deliver", "platform", "recipient", "thread", "script", "skills", "no_agent",
+            "prompt", "model", "provider", "workdir",
+        }
+        if set(snapshot) - versioned_keys:
+            invalid("CRON_RESTORE_UNKNOWN_FIELD")
+        record = snapshot["record"]
+        for field in ("id", "name", "enabled", "state", "script", "skills", "no_agent", "prompt", "model", "provider", "workdir"):
+            if field in snapshot and snapshot.get(field) != record.get(field):
+                invalid("CRON_RESTORE_RECORD_MISMATCH")
+        record = copy.deepcopy(snapshot["record"])
+        if snapshot.get("presence") != sorted(record):
+            invalid("CRON_RESTORE_INVALID_PRESENCE")
+        if record.get("id") != job_id:
+            invalid("CRON_RESTORE_ID_MISMATCH")
+        snapshot = record
+    elif snapshot.get("id") != job_id:
+        invalid("CRON_RESTORE_ID_MISMATCH")
     allowed = {
         "id", "name", "enabled", "state", "schedule", "run_at", "next_run_at",
         "repeat", "delivery", "deliver", "platform", "recipient", "thread",
         "script", "skills", "no_agent", "prompt", "model", "provider", "workdir",
     }
     unknown = set(snapshot) - allowed
+    if versioned:
+        unknown = set()
     if unknown:
-        raise ValueError(f"cron restore snapshot has unknown fields: {', '.join(sorted(unknown))}")
+        invalid("CRON_RESTORE_UNKNOWN_FIELD")
     if not isinstance(snapshot.get("name"), (str, type(None))):
-        raise ValueError("cron restore name must be a string or null")
+        invalid("CRON_RESTORE_INVALID_NAME")
     if not isinstance(snapshot.get("enabled"), bool):
-        raise ValueError("cron restore enabled must be boolean")
+        invalid("CRON_RESTORE_INVALID_ENABLED")
     state = snapshot.get("state")
     if state not in {"scheduled", "paused", "completed"}:
-        raise ValueError("cron restore state is invalid")
+        invalid("CRON_RESTORE_INVALID_STATE")
     if state == "paused" and snapshot["enabled"]:
-        raise ValueError("cron restore paused job cannot be enabled")
+        invalid("CRON_RESTORE_INVALID_STATE")
     if state in {"scheduled", "completed"} and not snapshot["enabled"]:
-        raise ValueError("cron restore scheduled/completed job must be enabled")
+        invalid("CRON_RESTORE_INVALID_STATE")
     if state == "completed":
-        raise ValueError("cron restore cannot restore a completed job")
+        invalid("CRON_RESTORE_INVALID_STATE")
     schedule = snapshot.get("schedule")
-    if not isinstance(schedule, str) or not schedule.strip():
-        raise ValueError("cron restore schedule must be a non-empty string")
-    try:
-        parsed_schedule = parse_schedule(schedule)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"cron restore schedule is invalid: {exc}") from exc
+    if versioned and isinstance(schedule, dict):
+        parsed_schedule = copy.deepcopy(schedule)
+        if parsed_schedule.get("kind") not in {"once", "interval", "cron"}:
+            invalid("CRON_RESTORE_INVALID_SCHEDULE")
+    else:
+        if not isinstance(schedule, str) or not schedule.strip():
+            invalid("CRON_RESTORE_INVALID_SCHEDULE")
+        try:
+            parsed_schedule = parse_schedule(schedule)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("CRON_RESTORE_INVALID_SCHEDULE") from exc
     repeat = snapshot.get("repeat")
+    repeat_completed = 0
+    if versioned and isinstance(repeat, dict):
+        repeat_completed = repeat.get("completed", 0)
+        repeat = repeat.get("times")
     if repeat is not None and (isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 0):
-        raise ValueError("cron restore repeat must be a non-negative integer or null")
+        raise ValueError("CRON_RESTORE_INVALID_REPEAT")
+    if isinstance(repeat_completed, bool) or not isinstance(repeat_completed, int) or repeat_completed < 0:
+        raise ValueError("CRON_RESTORE_INVALID_REPEAT")
     skills = snapshot.get("skills")
     if not isinstance(skills, list) or any(not isinstance(skill, str) for skill in skills):
         raise ValueError("cron restore skills must be a list of strings")
@@ -1670,11 +1707,23 @@ def restore_job(job_id: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any
         raise ValueError("cron restore no_agent job requires a non-empty script")
     if snapshot.get("no_agent") is not True and not str(snapshot.get("prompt") or "").strip() and not skills:
         raise ValueError("cron restore active agent requires a non-empty prompt or skills")
+    if versioned:
+        # The versioned record is already the persisted representation.  Do not
+        # rebuild it through the legacy create/edit projection: that would
+        # silently drop accepted metadata and collapse absent/null fields.
+        with _jobs_lock():
+            jobs = load_jobs()
+            for index, current in enumerate(jobs):
+                if current.get("id") == job_id:
+                    jobs[index] = copy.deepcopy(snapshot)
+                    save_jobs(jobs)
+                    return copy.deepcopy(snapshot)
+        return None
     restored = {
         "id": job_id, "name": snapshot["name"], "enabled": snapshot["enabled"],
         "state": state, "schedule": parsed_schedule,
-        "schedule_display": schedule, "next_run_at": next_run_at,
-        "repeat": None if repeat is None else {"times": repeat, "completed": 0},
+        "schedule_display": (schedule if isinstance(schedule, str) else parsed_schedule.get("display", parsed_schedule.get("value", "?"))), "next_run_at": next_run_at,
+        "repeat": None if repeat is None else {"times": repeat, "completed": repeat_completed},
         "deliver": delivery, "script": snapshot.get("script"), "skills": list(skills),
         "no_agent": snapshot.get("no_agent", False), "prompt": snapshot.get("prompt"),
         "model": snapshot.get("model"), "provider": snapshot.get("provider"),

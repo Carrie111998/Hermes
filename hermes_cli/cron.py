@@ -97,7 +97,8 @@ def _warn_if_gateway_not_running() -> None:
 
 
 def _canonical_job(job: dict) -> dict:
-    """Return the stable persisted-job shape used by automation clients."""
+    """Return a lossless, versioned persisted-job shape."""
+    record = json.loads(json.dumps(job, ensure_ascii=False))
     repeat = job.get("repeat") or {}
     schedule = job.get("schedule") or {}
     raw_deliver = job.get("deliver") or job.get("delivery") or "local"
@@ -120,7 +121,10 @@ def _canonical_job(job: dict) -> dict:
         if len(parts) >= 2 and parts[0] in {"telegram", "discord", "signal"}:
             platform, recipient = parts[0], parts[1]
             thread = parts[2] if len(parts) == 3 else None
-    return {
+    result = {
+        "schema_version": 2,
+        "record": record,
+        "presence": sorted(record),
         "id": job.get("id"), "name": job.get("name"),
         "enabled": bool(job.get("enabled", True)),
         "state": job.get("state", "scheduled"),
@@ -133,6 +137,25 @@ def _canonical_job(job: dict) -> dict:
         "prompt": job.get("prompt"), "model": job.get("model"),
         "provider": job.get("provider"), "workdir": job.get("workdir"),
     }
+    result["schedule"] = json.loads(json.dumps(job.get("schedule")))
+    result["repeat_state"] = json.loads(json.dumps(job.get("repeat")))
+    return result
+
+
+def cron_show(job_id: str, *, json_mode: bool = False) -> int:
+    from cron.jobs import load_jobs
+    job = next((item for item in load_jobs() if item.get("id") == job_id), None)
+    if job is None:
+        print(color("Job not found", Colors.RED))
+        return 1
+    canonical = _canonical_job(job)
+    if json_mode:
+        print(json.dumps(canonical, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"{canonical['id']}  {canonical['name']}")
+        print(f"  Schedule: {canonical.get('schedule_display', '?')}")
+        print(f"  State: {canonical.get('state', '?')}")
+    return 0
 
 
 def cron_list(show_all: bool = False, *, json_mode: bool = False):
@@ -530,8 +553,11 @@ def cron_restore(args):
             raise ValueError("cron restore snapshot exceeds 64 KiB")
         snapshot_text = raw.decode("utf-8")
         restored = restore_job(args.job_id, json.loads(snapshot_text))
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        print(color(f"Failed to restore job: {exc}", Colors.RED))
+    except json.JSONDecodeError:
+        print(color("Failed to restore job: invalid JSON", Colors.RED))
+        return 1
+    except (ValueError, TypeError):
+        print(color("Failed to restore job: invalid snapshot", Colors.RED))
         return 1
     if restored is None:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
@@ -574,6 +600,9 @@ def cron_command(args):
 
     if subcmd == "restore":
         return cron_restore(args)
+
+    if subcmd == "show":
+        return cron_show(args.job_id, json_mode=bool(getattr(args, "json", False)))
 
     if subcmd == "pause":
         return _job_action("pause", args.job_id, "Paused")
