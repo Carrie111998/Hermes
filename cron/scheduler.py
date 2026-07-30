@@ -1447,6 +1447,29 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _redact_cron_payload(text: str, what: str) -> str:
+    """Fail-closed secret redaction for anything a cron job emits outward.
+
+    Both outward paths — the chat message and the session mirror — must apply
+    the same policy, so the policy lives in one place.
+
+    ``force=True`` because this is a safety boundary, not logging: the
+    ``security.redact_secrets`` preference governs how much is scrubbed from
+    the user's own logs, and must not be able to turn off scrubbing on the way
+    out to a chat (same reasoning as ``tools/delegation_live_log.py``).
+    Empty input is returned as-is; any failure inside the redactor replaces the
+    payload entirely rather than letting an unscanned value through.
+    """
+    if not text:
+        return text
+    try:
+        from agent.redact import redact_sensitive_text
+        return redact_sensitive_text(text, force=True)
+    except Exception as e:
+        logger.warning("Failed to redact secrets from cron %s: %s", what, e)
+        return "[REDACTED - redaction failed]"
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1519,13 +1542,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # (e.g. echoed a failing curl with an API key, or summarised a config file)
     # sent it verbatim to the chat. Redacting once here covers every platform
     # and both send paths.
-    if cleaned_delivery_content:
-        try:
-            from agent.redact import redact_sensitive_text
-            cleaned_delivery_content = redact_sensitive_text(cleaned_delivery_content)
-        except Exception as e:
-            logger.warning("Failed to redact secrets from cron delivery content: %s", e)
-            cleaned_delivery_content = "[REDACTED - redaction failed]"
+    cleaned_delivery_content = _redact_cron_payload(
+        cleaned_delivery_content, "delivery content",
+    )
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -1539,6 +1558,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if mirror_enabled:
         _, mirror_text = BasePlatformAdapter.extract_media(content)
         mirror_text = (mirror_text or "").strip()
+        # This payload is derived from the raw `content`, not from
+        # `cleaned_delivery_content`, so it does NOT inherit the redaction
+        # above. Without this, enabling the mirror writes an unredacted
+        # credential into the origin session transcript even though the chat
+        # message itself was clean — and a transcript outlives the message.
+        mirror_text = _redact_cron_payload(mirror_text, "mirror payload")
 
     try:
         config = load_gateway_config()

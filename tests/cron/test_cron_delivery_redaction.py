@@ -70,6 +70,70 @@ class TestCronDeliveryRedaction:
         assert "3 tasks done" in delivered
         assert result is None
 
+    def test_session_mirror_payload_redacts_secret(self):
+        """The delivery mirror must not write an unredacted secret to the session.
+
+        ``mirror_text`` is derived from the raw ``content``, not from
+        ``cleaned_delivery_content``, so it does not inherit the delivery-path
+        redaction. With ``cron.mirror_delivery`` enabled the mirror payload is
+        appended to the origin chat's session transcript — an unscanned value
+        there is just as exposed as one sent to the chat, and survives longer.
+        """
+        from cron.scheduler import _deliver_result
+
+        send_mock = AsyncMock(return_value={"success": True})
+        mirror_mock = MagicMock()
+        with patch("gateway.config.load_gateway_config", return_value=_telegram_cfg()), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("cron.scheduler._cron_mirror_delivery_enabled", return_value=True), \
+             patch("cron.scheduler._target_matches_origin", return_value=True), \
+             patch("cron.scheduler._maybe_mirror_cron_delivery", new=mirror_mock), \
+             patch("sys.is_finalizing", return_value=False):
+            _deliver_result(_job(), f"Job finished. Token was {FAKE_SECRET} (oops).")
+
+        assert mirror_mock.called, "mirror path did not run — test would vacuously pass"
+        mirrored = " ".join(str(a) for a in mirror_mock.call_args.args)
+        mirrored += " " + " ".join(str(v) for v in mirror_mock.call_args.kwargs.values())
+        # An empty mirror payload would satisfy the secret assertion for the
+        # wrong reason, so pin that the real body still went through.
+        assert "Job finished." in mirrored, "mirror payload was empty — assertion below is vacuous"
+        assert FAKE_SECRET not in mirrored, "secret reached the session mirror payload"
+
+    def test_redaction_survives_disabled_logging_preference(self, monkeypatch):
+        """``security.redact_secrets: false`` must not disable delivery redaction.
+
+        That preference governs how much is scrubbed from the user's own logs.
+        Delivery is an egress boundary, so it redacts with ``force=True`` — the
+        same rule the other safety boundaries in the tree already follow (e.g.
+        ``tools/delegation_live_log.py``, ``tools/approval.py``). Without it a
+        user who turned down log scrubbing would silently also turn off secret
+        scrubbing on the way out to the chat.
+        """
+        import importlib
+
+        import agent.redact
+
+        monkeypatch.setenv("HERMES_REDACT_SECRETS", "false")
+        importlib.reload(agent.redact)
+        try:
+            from cron.scheduler import _deliver_result
+
+            send_mock = AsyncMock(return_value={"success": True})
+            with patch("gateway.config.load_gateway_config", return_value=_telegram_cfg()), \
+                 patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+                 patch("sys.is_finalizing", return_value=False):
+                _deliver_result(_job(), f"Job finished. Token was {FAKE_SECRET} (oops).")
+
+            send_mock.assert_called_once()
+            delivered = " ".join(str(a) for a in send_mock.call_args.args)
+            delivered += " " + " ".join(str(v) for v in send_mock.call_args.kwargs.values())
+            assert FAKE_SECRET not in delivered, (
+                "logging preference disabled delivery redaction — needs force=True"
+            )
+        finally:
+            monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
+            importlib.reload(agent.redact)
+
     def test_redaction_failure_does_not_leak(self):
         """If the redactor itself raises, the delivery must fail closed rather
         than send the unscanned text."""
