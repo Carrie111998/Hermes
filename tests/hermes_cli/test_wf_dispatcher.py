@@ -205,7 +205,14 @@ def test_workflow_advance_rejects_target_not_declared_by_current_step(tmp_path):
         task_id, event_id = _workflow(conn)
         assert kb.claim_task(conn, task_id) is not None
         try:
-            wf_engine.advance(conn, task_id, to_step="one", event_id=event_id)
+            wf_engine.advance_stage_turn(
+                conn,
+                task_id,
+                to_step="one",
+                event_id=event_id,
+                expected_step="one",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
+            )
         except wf_engine.WorkflowConflictError as exc:
             assert "may advance only to 'two'" in str(exc)
         else:
@@ -222,7 +229,7 @@ def test_stale_stage_worker_cannot_settle_successor_run(tmp_path):
         task_id, event_id = _workflow(conn)
         first = kb.claim_task(conn, task_id)
         assert first is not None
-        wf_engine.advance(
+        wf_engine.advance_stage_turn(
             conn,
             task_id,
             to_step="two",

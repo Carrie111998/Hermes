@@ -185,7 +185,7 @@ def _handle_advance(args: dict, **_kw: Any) -> str:
         )
         if event_id is None:
             return _error("wf_advance event was already recorded")
-        result = _engine_function("advance")(
+        result = _engine_function("advance_stage_turn")(
             conn,
             task_id,
             to_step=to_step,

@@ -796,17 +796,57 @@ def apply_event(conn, event_id, task_id, *, expected_step: str) -> ApplyResult:
         )
 
 
-def advance(
+def advance(conn, task_id, *, to_step, event_id) -> None:
+    """Commit a transition through the frozen engine API.
+
+    Correlator and coordinator callers may use this primitive to apply a
+    template-valid transition.  Worker turns use :func:`advance_stage_turn`,
+    which additionally fences the run and enforces its declared target.
+    """
+
+    _advance(
+        conn,
+        task_id,
+        to_step=to_step,
+        event_id=event_id,
+        expected_step=None,
+        expected_run_id=None,
+        enforce_declared_target=False,
+    )
+
+
+def advance_stage_turn(
     conn,
     task_id,
     *,
     to_step,
     event_id,
-    expected_step: str | None = None,
-    expected_run_id: int | None = None,
+    expected_step: str,
+    expected_run_id: int,
 ) -> None:
-    """Commit a worker-stage transition and enter the next stage."""
+    """Commit a fenced worker-stage transition to its declared target."""
 
+    _advance(
+        conn,
+        task_id,
+        to_step=to_step,
+        event_id=event_id,
+        expected_step=expected_step,
+        expected_run_id=expected_run_id,
+        enforce_declared_target=True,
+    )
+
+
+def _advance(
+    conn,
+    task_id,
+    *,
+    to_step,
+    event_id,
+    expected_step: str | None,
+    expected_run_id: int | None,
+    enforce_declared_target: bool,
+) -> None:
     with kanban_db.write_txn(conn):
         task = _task(conn, task_id)
         _assert_expected_turn(
@@ -821,7 +861,7 @@ def advance(
             raise WorkflowConflictError(f"workflow task has no current step: {task_id}")
         current_spec = _step(spec, str(current_step))
         declared_target = current_spec.get("advance_to")
-        if str(to_step) != str(declared_target):
+        if enforce_declared_target and str(to_step) != str(declared_target):
             raise WorkflowConflictError(
                 f"workflow step {current_step!r} may advance only to "
                 f"{declared_target!r}, not {to_step!r}"

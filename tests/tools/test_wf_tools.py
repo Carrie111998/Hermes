@@ -195,7 +195,7 @@ def test_advance_ledgers_then_advances_with_event_id(monkeypatch, workflow_worke
         return {"step": to_step}
 
     monkeypatch.setattr(wt.wf_engine, "ingest_event", ingest)
-    monkeypatch.setattr(wt.wf_engine, "advance", advance)
+    monkeypatch.setattr(wt.wf_engine, "advance_stage_turn", advance)
     result = json.loads(wt._handle_advance({
         "to_step": "next", "evidence": {"ref": "synthetic"},
     }))
