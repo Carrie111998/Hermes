@@ -2994,13 +2994,18 @@ def looks_like_codex_intermediate_ack(
     # rather than with a first-person lead-in: "Brief written. Creating the
     # session now." Keep this deliberately narrower than the general action
     # vocabulary: a present-participle clause must begin the response or follow
-    # a sentence/status delimiter, and questions are never auto-continued.
+    # a sentence/status delimiter, completed-report predicates (for example,
+    # "Testing completed successfully") stay final, and questions are never
+    # auto-continued.
     has_pronounless_action = bool(
         "?" not in assistant_text
         and re.search(
             r"(?:^|[.!…—–-]\s+)(?:(?:re)?launching|(?:re)?starting|creating|"
             r"checking|running|writing|opening|reading|inspecting|reviewing|"
-            r"testing|debugging|searching|fixing)\b",
+            r"testing|debugging|searching|fixing)\b"
+            r"(?!\s+(?:(?:(?:has|have|had)\s+)?(?:completed|finished|"
+            r"succeeded|failed|passed)|(?:is|was|were)\s+(?:complete|finished|"
+            r"successful|done))\b)",
             assistant_text,
         )
     )

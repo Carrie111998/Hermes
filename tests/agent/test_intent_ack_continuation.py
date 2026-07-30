@@ -171,6 +171,11 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Nothing to do here.",
         "Interesting result; no action is needed.",
         "Done. The deployment succeeded.",
+        "Testing completed successfully.",
+        "Checking finished with no issues.",
+        "Testing has completed successfully.",
+        "Checking is complete.",
+        "Running was successful.",
     )
     for final in final_answers:
         assert not looks_like_codex_intermediate_ack(
