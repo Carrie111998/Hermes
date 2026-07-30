@@ -1,6 +1,6 @@
 ---
 name: verification-loop
-description: "Comprehensive verification system: build, types, lint, tests, security, diff review. Use after completing features, before PRs, or after refactoring."
+description: 'Comprehensive verification system: build, types, lint, tests, security, diff review. Use after completing features, before PRs, or after refactoring.'
 version: 1.0.0
 author: Hermes Agent (adapted from ECC)
 license: MIT
@@ -18,6 +18,7 @@ A comprehensive verification system for Hermes Agent sessions.
 ## When to Use
 
 Invoke this skill:
+
 - After completing a feature or significant code change
 - Before creating a PR
 - When you want to ensure quality gates pass
@@ -74,6 +75,7 @@ scripts/run_tests.sh 2>&1 | tail -50
 ```
 
 For other projects:
+
 ```bash
 npm run test 2>&1 | tail -50
 # OR
@@ -81,6 +83,7 @@ pytest -x -q 2>&1 | tail -50
 ```
 
 Report:
+
 - Total tests: X
 - Passed: X
 - Failed: X
@@ -107,6 +110,7 @@ git diff HEAD~1 --name-only
 ```
 
 Review each changed file for:
+
 - Unintended changes
 - Missing error handling
 - Potential edge cases
@@ -152,6 +156,7 @@ Issues to Fix:
 ## Continuous Mode
 
 For long sessions, run verification at checkpoints:
+
 - After completing each function
 - After finishing a component
 - Before moving to next task

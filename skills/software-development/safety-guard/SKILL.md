@@ -1,6 +1,6 @@
 ---
 name: safety-guard
-description: "Prevent destructive operations when working on production systems or running agents autonomously. Use for cron jobs, kanban workers, and unattended agent sessions."
+description: 'Prevent destructive operations when working on production systems or running agents autonomously. Use for cron jobs, kanban workers, and unattended agent sessions.'
 version: 1.0.0
 author: Hermes Agent (adapted from ECC)
 license: MIT
@@ -11,13 +11,13 @@ metadata:
     related_skills: [verification-loop, systematic-debugging]
     config:
       safety_guard.enabled:
-        description: "Enable safety guard for autonomous agent sessions"
+        description: 'Enable safety guard for autonomous agent sessions'
         type: boolean
         default: false
       safety_guard.frozen_dir:
-        description: "Restrict file writes to this directory tree"
+        description: 'Restrict file writes to this directory tree'
         type: string
-        default: ""
+        default: ''
 ---
 
 # Safety Guard — Prevent Destructive Operations
@@ -38,6 +38,7 @@ Three modes of protection:
 Intercepts destructive commands before execution and warns:
 
 **Watched patterns:**
+
 - `rm -rf` (especially `/`, `~`, or project root)
 - `git push --force`
 - `git reset --hard`
@@ -67,6 +68,7 @@ Both protections active. Maximum safety for autonomous agents. Agents can read a
 Enable safety guard for all cron sessions by default. Cron agents run unattended — a destructive command could cause real damage before anyone notices.
 
 In `config.yaml`:
+
 ```yaml
 cron:
   safety_guard_enabled: true
@@ -75,10 +77,11 @@ cron:
 ### For Kanban Workers
 
 Kanban workers process tasks autonomously. Enable guard mode to restrict writes to the project directory:
+
 ```yaml
 kanban:
   safety_guard_enabled: true
-  safety_guard_frozen_dir: "/path/to/project"
+  safety_guard_frozen_dir: '/path/to/project'
 ```
 
 ### For Delegation
@@ -97,6 +100,7 @@ When using Hermes's `terminal` tool, apply these checks before executing:
 ### Using the write_file tool
 
 When using Hermes's `write_file` tool in freeze mode:
+
 1. Check if target path is within the frozen directory
 2. If outside, block and explain: "Write blocked: path is outside frozen directory [dir]"
 3. Suggest moving the file or expanding the frozen directory
@@ -105,16 +109,16 @@ When using Hermes's `write_file` tool in freeze mode:
 
 Before executing ANY of these, pause and verify:
 
-| Command | Check |
-|---|---|
-| `rm -rf <path>` | Is `<path>` within the project? Is it a critical directory? |
-| `git push --force` | Is this `origin/main` or `origin/master`? |
-| `git reset --hard` | Are there uncommitted changes? |
-| `DROP TABLE` / `DROP DATABASE` | Is this production? Is there a backup? |
-| `docker system prune -a` | Will this remove running containers? |
-| `kubectl delete` | Is this a production namespace? |
-| `chmod 777` | Why does this need world-writable? |
-| `npm publish` | Is this intentional? What's the version bump? |
+| Command                        | Check                                                       |
+| ------------------------------ | ----------------------------------------------------------- |
+| `rm -rf <path>`                | Is `<path>` within the project? Is it a critical directory? |
+| `git push --force`             | Is this `origin/main` or `origin/master`?                   |
+| `git reset --hard`             | Are there uncommitted changes?                              |
+| `DROP TABLE` / `DROP DATABASE` | Is this production? Is there a backup?                      |
+| `docker system prune -a`       | Will this remove running containers?                        |
+| `kubectl delete`               | Is this a production namespace?                             |
+| `chmod 777`                    | Why does this need world-writable?                          |
+| `npm publish`                  | Is this intentional? What's the version bump?               |
 
 ## Autonomous Agent Safety Rules
 
@@ -131,11 +135,13 @@ When running as an autonomous agent (cron, kanban, unattended):
 ## Recovery
 
 If a destructive operation was blocked:
+
 1. The agent explains what was blocked and why
 2. The agent suggests a safer alternative
 3. The user can explicitly approve with `/approve`
 
 If a destructive operation was accidentally executed:
+
 1. Check git reflog for recoverable state
 2. Check database backups
 3. Report what happened and what was lost

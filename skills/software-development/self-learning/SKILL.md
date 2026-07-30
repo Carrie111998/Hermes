@@ -36,7 +36,7 @@ Not every lesson deserves a whole skill — triage first:
 - **A single standalone fact or one-line correction** (an env var name, a path, one gotcha) → record it in Hermes memory via the `memory` tool instead; a whole skill is overkill for a one-liner.
 - **A genuinely one-off thing** unlikely to recur → skip it.
 
-When you do harvest, capture the **failures too**, not just the win: the approaches you ruled out and *why* often save more time next session than the golden path itself.
+When you do harvest, capture the **failures too**, not just the win: the approaches you ruled out and _why_ often save more time next session than the golden path itself.
 
 ## Promotion Rule: Don't Enshrine Guesses
 
@@ -71,6 +71,7 @@ Whoever writes the skill needs THIS conversation's context — it's the only pla
 > You are harvesting a skill. Your ONLY job is to write a new Hermes skill capturing the golden path we just worked out in this conversation: **[one-line description of the workflow]**.
 >
 > Hard rules:
+>
 > - Write ONLY under `skills/<category>/<skill-name>/`. Do NOT modify project source, run builds, install anything, or resume the original task.
 > - First read `skills/software-development/hermes-agent-skill-authoring/SKILL.md` for the Hermes skill format, then author `SKILL.md` to that spec, plus any `references/` or `scripts/` files the procedure warrants.
 > - Capture the PROCEDURE — commands, paths, the required order, gotchas — not a one-off answer. Generalize so it works next time.
@@ -91,9 +92,9 @@ Whoever writes the skill needs THIS conversation's context — it's the only pla
 
 ## Gotchas
 
-- **Secrets never go in a skill file.** Skills get committed and open-sourced. Point to *where* the secret lives; never reproduce the value.
+- **Secrets never go in a skill file.** Skills get committed and open-sourced. Point to _where_ the secret lives; never reproduce the value.
 - **`name` must equal the directory name**, and be lowercase `a-z`/`0-9`/hyphens only — no leading, trailing, or doubled hyphens.
 - **Don't duplicate.** If a near-identical skill (or memory) already exists, update it instead of spawning a second one.
 - **Capture procedures, not answers.** "Join orders to customers for EMEA" is useless next time; "how to find the right tables and build the query" is the skill.
-- **Keep `SKILL.md` tight** (< 500 lines, < ~5000 tokens). Push detail into `references/` and tell the reader *when* to load each file.
+- **Keep `SKILL.md` tight** (< 500 lines, < ~5000 tokens). Push detail into `references/` and tell the reader _when_ to load each file.
 - **The Hermes curator** tracks agent-created skills. They'll be reviewed for staleness and may be archived if unused. Pin important ones.

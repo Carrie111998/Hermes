@@ -1,6 +1,6 @@
 ---
 name: gstack-review
-description: "Pre-landing PR review with structural-issue checklist + 8 specialist lenses. Use when asked to review a PR, code review, check diff, or pre-landing review."
+description: 'Pre-landing PR review with structural-issue checklist + 8 specialist lenses. Use when asked to review a PR, code review, check diff, or pre-landing review.'
 version: 1.0.0
 author: Hermes Agent (adapted from garrytan/gstack, MIT)
 license: MIT
@@ -24,6 +24,7 @@ Analyze the current branch's diff against the base branch for **structural issue
 ### Step 0: Detect base branch
 
 Determine the base branch:
+
 - **GitHub:** `gh pr view --json baseRefName -q .baseRefName` (if PR exists); else `gh repo view --json defaultBranchRef -q .defaultBranchRef.name`
 - **Git-native fallback:** `git symbolic-ref refs/remotes/origin/HEAD` → strip prefix; else try `origin/main`, then `origin/master`; else default to `main`
 
@@ -62,6 +63,7 @@ Read [`reference/checklist.md`](reference/checklist.md). **If the file cannot be
 Apply the CRITICAL categories from [`reference/checklist.md`](reference/checklist.md) against the diff:
 
 **Pass 1 (CRITICAL — highest severity):**
+
 - SQL & Data Safety
 - Race Conditions & Concurrency
 - LLM Output Trust Boundary
