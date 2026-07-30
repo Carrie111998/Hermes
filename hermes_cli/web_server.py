@@ -4157,11 +4157,14 @@ async def update_hermes():
             "update_command": message,
         }
 
+    quiesce_acquired = False
     try:
         await _begin_dashboard_update_quiesce()
+        quiesce_acquired = True
         proc = _spawn_hermes_action(["update"], "hermes-update")
     except Exception as exc:
-        _end_dashboard_update_quiesce()
+        if quiesce_acquired:
+            _end_dashboard_update_quiesce()
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
     watcher = asyncio.create_task(_watch_dashboard_update_quiesce(proc))

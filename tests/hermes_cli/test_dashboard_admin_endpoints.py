@@ -9,6 +9,7 @@ visible to the CLI data layer), not specific catalog values.
 
 import asyncio
 import os
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -1058,3 +1059,44 @@ async def test_dashboard_quiesce_closes_and_drains_websockets():
         ws._end_dashboard_update_quiesce()
         if not websocket_task.done():
             websocket_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_update_failure_keeps_active_quiesce(monkeypatch):
+    """A losing update request must not release the winner's admission gate."""
+    from fastapi import HTTPException
+
+    import hermes_cli.web_server as ws
+
+    ws._end_dashboard_update_quiesce()
+    finished = threading.Event()
+
+    class _FakeProc:
+        pid = 1234
+
+        def wait(self):
+            finished.wait(timeout=1)
+            return 0
+
+    spawn = MagicMock(return_value=_FakeProc())
+    monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+    monkeypatch.setattr(ws, "detect_install_method", lambda _root: "source")
+    monkeypatch.setattr(ws, "_spawn_hermes_action", spawn)
+
+    try:
+        results = await asyncio.gather(
+            ws.update_hermes(),
+            ws.update_hermes(),
+            return_exceptions=True,
+        )
+
+        assert sum(isinstance(result, dict) and result["ok"] for result in results) == 1
+        assert sum(isinstance(result, HTTPException) for result in results) == 1
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+        spawn.assert_called_once_with(["update"], "hermes-update")
+    finally:
+        finished.set()
+        watchers = tuple(ws._DASHBOARD_UPDATE_WATCHERS)
+        if watchers:
+            await asyncio.gather(*watchers, return_exceptions=True)
+        ws._end_dashboard_update_quiesce()
