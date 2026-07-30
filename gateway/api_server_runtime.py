@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from gateway.api_server_shared import AIOHTTP_AVAILABLE, web
+from gateway.runtime_contract import runtime_error_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -1309,7 +1310,10 @@ class APIServerRuntimeMixin:
             raise
         except Exception as exc:
             logger.exception("Run Orchestrator runtime run failed: %s", run_id)
-            session.emit("error", {"code": "runtime_unavailable", "message": str(exc)})
+            session.emit(
+                "error",
+                runtime_error_envelope("runtime_unavailable", support_id=run_id),
+            )
         finally:
             with _SESSIONS_LOCK:
                 _SESSIONS.pop(run_id, None)

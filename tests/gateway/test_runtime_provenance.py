@@ -153,5 +153,12 @@ async def test_healthz_exposes_provenance_without_api_key():
         "provenance_errors",
     } <= body.keys()
     assert body["service_name"] == "hermes-runtime"
+    assert body["runtime_protocol_version"] == "1"
+    assert "error" in body["runtime_frame_types"]
+    assert {
+        "delegated_tools",
+        "interrupt",
+        "system_context.replace",
+    } <= set(body["runtime_capabilities"])
     assert body["status"] == "ok"
     assert secret not in json.dumps(body)

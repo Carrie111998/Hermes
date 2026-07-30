@@ -15,6 +15,7 @@ from gateway.runtime_provenance import (
     RuntimeProvenanceConfig,
     collect_runtime_provenance,
 )
+from gateway.runtime_contract import runtime_health_contract
 
 
 _API_SERVER_CLI_INHERITED_TOOLSETS = frozenset({"video_gen"})
@@ -538,6 +539,7 @@ class APIServerCoreMixin:
             {
                 "status": "ok",
                 "platform": "hermes-agent",
+                **runtime_health_contract(),
                 **self._runtime_provenance.to_dict(),
             }
         )
