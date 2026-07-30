@@ -2,7 +2,8 @@
 
 from unittest.mock import patch
 
-from hermes_cli.model_switch import switch_model
+from hermes_cli.model_switch import list_authenticated_providers, switch_model
+import hermes_cli.models as models_mod
 
 
 _REJECTED = {
@@ -46,3 +47,83 @@ def test_saved_openrouter_model_cannot_override_policy_rejection():
 
     assert result.success is False
     assert result.error_message == "blocked by OpenRouter policy"
+
+
+class _CatalogResponse:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return self._data
+
+
+def _list_openrouter(
+    monkeypatch,
+    tmp_path,
+    *,
+    response: bytes | Exception,
+    user_providers=None,
+):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(models_mod, "_provider_models_cache_path", lambda: tmp_path / "models.json")
+    monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {"openrouter": "openrouter"})
+    monkeypatch.setattr(
+        "agent.models_dev.fetch_models_dev",
+        lambda: {"openrouter": {"name": "OpenRouter", "env": ["OPENROUTER_API_KEY"]}},
+    )
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.setattr(models_mod, "CANONICAL_PROVIDERS", [])
+    monkeypatch.setattr(
+        "hermes_cli.model_catalog.get_curated_openrouter_models",
+        lambda: [("curated/model", "recommended"), ("verified/model", "")],
+    )
+    models_mod.clear_provider_models_cache("openrouter")
+
+    def _open(*_args, **_kwargs):
+        if isinstance(response, Exception):
+            raise response
+        return _CatalogResponse(response)
+
+    with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=_open):
+        return list_authenticated_providers(user_providers=user_providers or {})
+
+
+def test_unavailable_openrouter_catalog_yields_no_curated_picker_models(monkeypatch, tmp_path):
+    providers = _list_openrouter(
+        monkeypatch,
+        tmp_path,
+        response=OSError("offline"),
+    )
+
+    openrouter = next(provider for provider in providers if provider["slug"] == "openrouter")
+    assert openrouter["models"] == []
+    assert openrouter["total_models"] == 0
+
+
+def test_openrouter_declarations_only_reorder_verified_catalog(monkeypatch, tmp_path):
+    providers = _list_openrouter(
+        monkeypatch,
+        tmp_path,
+        user_providers={
+            "openrouter": {
+                "enabled": True,
+                "models": ["blocked/model", "verified/model"],
+            }
+        },
+        response=(
+            b'{"data":['
+            b'{"id":"curated/model","supported_parameters":["tools"]},'
+            b'{"id":"verified/model","supported_parameters":["tools"]}'
+            b']}'
+        ),
+    )
+
+    openrouter = next(provider for provider in providers if provider["slug"] == "openrouter")
+    assert openrouter["models"] == ["verified/model", "curated/model"]
+    assert "blocked/model" not in openrouter["models"]

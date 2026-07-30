@@ -2219,10 +2219,13 @@ def list_authenticated_providers(
 
         # Unified pathway: route through cached_provider_model_ids() so the
         # /model picker sees the SAME list `hermes model` would build, with
-        # disk caching to keep the picker open snappy. Falls back to the
-        # curated static list when the live fetcher returns nothing.
+        # disk caching to keep the picker open snappy.
         model_ids = cached_provider_model_ids(hermes_id)
-        if not model_ids:
+        # OpenRouter's authenticated /models/user response is authoritative.
+        # Curated/static entries only order and describe IDs already present in
+        # that verified set; they must not become an offline authorization
+        # fallback. Other providers retain their ordinary fallback behavior.
+        if not model_ids and hermes_id != "openrouter":
             model_ids = curated.get(hermes_id, [])
             if hermes_id in _MODELS_DEV_PREFERRED:
                 model_ids = _merge_with_models_dev(hermes_id, model_ids)
@@ -2234,6 +2237,13 @@ def list_authenticated_providers(
             configured = user_providers.get(hermes_id)
             if isinstance(configured, dict):
                 configured_models = _declared_model_ids(configured.get("models"))
+        if hermes_id == "openrouter":
+            verified_by_lower = {model_id.lower(): model_id for model_id in model_ids}
+            configured_models = [
+                verified_by_lower[model_id.lower()]
+                for model_id in configured_models
+                if model_id.lower() in verified_by_lower
+            ]
         model_ids = list(dict.fromkeys([*configured_models, *model_ids]))
         total = len(model_ids)
         if hermes_id in _UNCAPPED_PICKER_PROVIDERS:

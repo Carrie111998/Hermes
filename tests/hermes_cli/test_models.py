@@ -102,6 +102,34 @@ class TestFetchOpenRouterModels:
 
         assert models == []
 
+    def test_force_refresh_failure_invalidates_same_key_memory_cache(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        key_fp = _models_mod._openrouter_api_key_fingerprint("test-key")
+        monkeypatch.setattr(
+            _models_mod,
+            "_openrouter_catalog_cache",
+            [("stale/model", "recommended")],
+        )
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache_at", _models_mod.time.time())
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache_key_fp", key_fp)
+        monkeypatch.setattr(
+            _models_mod,
+            "_openrouter_policy_catalog_cache",
+            {"stale/model": {"supported_parameters": ["tools"]}},
+        )
+        monkeypatch.setattr(_models_mod, "_openrouter_policy_catalog_cache_at", _models_mod.time.time())
+        monkeypatch.setattr(_models_mod, "_openrouter_policy_catalog_cache_key_fp", key_fp)
+
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None),
+            patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=OSError("offline")),
+        ):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        assert models == []
+        assert _models_mod._openrouter_catalog_cache is None
+        assert _models_mod._openrouter_policy_catalog_cache is None
+
     def test_filters_out_models_without_tool_support(self, monkeypatch):
         """Models whose supported_parameters omits 'tools' must not appear in the picker.
 
@@ -422,6 +450,92 @@ class TestOpenRouterPolicyCatalog:
         assert first == ["account-a/model"]
         assert second == []
         assert fetch.call_count == 2
+
+    def test_failed_forced_openrouter_refresh_removes_stale_disk_entry(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli.models import cached_provider_model_ids
+
+        cache_path = tmp_path / "provider_models.json"
+        monkeypatch.setattr(_models_mod, "_provider_models_cache_path", lambda: cache_path)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        fp = _models_mod._credential_fingerprint("openrouter")
+        _models_mod._save_provider_models_cache(
+            {
+                "openrouter": {
+                    "fp": fp,
+                    "at": _models_mod.time.time()
+                    - _models_mod._OPENROUTER_CATALOG_CACHE_TTL
+                    - 1,
+                    "models": ["stale/model"],
+                },
+                "other": {"fp": "other", "at": 0, "models": ["keep/model"]},
+            }
+        )
+
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None),
+            patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=OSError("offline")),
+        ):
+            models = cached_provider_model_ids("openrouter", force_refresh=True)
+
+        cache = _models_mod._load_provider_models_cache()
+        assert models == []
+        assert "openrouter" not in cache
+        assert cache["other"]["models"] == ["keep/model"]
+
+    def test_unmarked_openrouter_disk_entry_is_not_treated_as_verified(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli.models import cached_provider_model_ids
+
+        cache_path = tmp_path / "provider_models.json"
+        monkeypatch.setattr(_models_mod, "_provider_models_cache_path", lambda: cache_path)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        _models_mod._save_provider_models_cache(
+            {
+                "openrouter": {
+                    "fp": _models_mod._credential_fingerprint("openrouter"),
+                    "at": _models_mod.time.time(),
+                    "models": ["legacy-unverified/model"],
+                }
+            }
+        )
+
+        with patch.object(_models_mod, "provider_model_ids", return_value=[]) as refresh:
+            models = cached_provider_model_ids("openrouter")
+
+        assert models == []
+        refresh.assert_called_once_with("openrouter", force_refresh=False)
+        assert "openrouter" not in _models_mod._load_provider_models_cache()
+
+    def test_fresh_verified_openrouter_disk_entry_remains_cacheable(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_cli.models import cached_provider_model_ids
+
+        cache_path = tmp_path / "provider_models.json"
+        monkeypatch.setattr(_models_mod, "_provider_models_cache_path", lambda: cache_path)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        _models_mod._save_provider_models_cache(
+            {
+                "openrouter": {
+                    "fp": _models_mod._credential_fingerprint("openrouter"),
+                    "at": _models_mod.time.time(),
+                    "models": ["verified/model"],
+                    "source": _models_mod._OPENROUTER_POLICY_CACHE_SOURCE,
+                }
+            }
+        )
+
+        with patch.object(
+            _models_mod,
+            "provider_model_ids",
+            side_effect=AssertionError("fresh verified cache should be reused"),
+        ):
+            models = cached_provider_model_ids("openrouter")
+
+        assert models == ["verified/model"]
 
     def test_provider_model_cache_fingerprint_tracks_openai_api_key_alias(self, monkeypatch):
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)

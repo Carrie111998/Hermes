@@ -109,6 +109,7 @@ _openrouter_policy_catalog_cache_at: float = 0.0
 _openrouter_policy_catalog_cache_key_fp: str | None = None
 _OPENROUTER_USER_MODELS_URL = "https://openrouter.ai/api/v1/models/user"
 _OPENROUTER_CATALOG_CACHE_TTL = 300.0
+_OPENROUTER_POLICY_CACHE_SOURCE = "authenticated-models-user-tools-v1"
 
 # Fallback Vercel AI Gateway snapshot used when the live catalog is unavailable.
 # OSS / open-weight models prioritized first, then closed-source by family.
@@ -1541,6 +1542,34 @@ def _openrouter_model_supports_tools(item: Any) -> bool:
     return any(isinstance(param, str) and param == "tools" for param in params)
 
 
+def _invalidate_openrouter_failed_verification(key_fp: str | None) -> None:
+    """Drop OpenRouter cache state after current policy verification fails."""
+    global _openrouter_catalog_cache, _openrouter_catalog_cache_at
+    global _openrouter_catalog_cache_key_fp
+    global _openrouter_policy_catalog_cache, _openrouter_policy_catalog_cache_at
+    global _openrouter_policy_catalog_cache_key_fp
+
+    if key_fp is None or _openrouter_catalog_cache_key_fp == key_fp:
+        _openrouter_catalog_cache = None
+        _openrouter_catalog_cache_at = 0.0
+        _openrouter_catalog_cache_key_fp = None
+    if key_fp is None or _openrouter_policy_catalog_cache_key_fp == key_fp:
+        _openrouter_policy_catalog_cache = None
+        _openrouter_policy_catalog_cache_at = 0.0
+        _openrouter_policy_catalog_cache_key_fp = None
+
+    # The generic provider cache has a longer TTL than the policy cache. Once
+    # a current verification attempt fails, its OpenRouter entry is no longer
+    # an authorization source and must not survive for a later picker open.
+    try:
+        cache = _load_provider_models_cache()
+        if "openrouter" in cache:
+            del cache["openrouter"]
+            _save_provider_models_cache(cache)
+    except Exception:
+        pass
+
+
 def _fetch_openrouter_policy_catalog(
     timeout: float = 8.0,
     *,
@@ -1563,6 +1592,7 @@ def _fetch_openrouter_policy_catalog(
         explicit_base_url=base_url,
     )
     if not resolved_api_key:
+        _invalidate_openrouter_failed_verification(None)
         return None
     key_fp = _openrouter_api_key_fingerprint(resolved_api_key)
 
@@ -1587,10 +1617,12 @@ def _fetch_openrouter_policy_catalog(
         with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())
     except Exception:
+        _invalidate_openrouter_failed_verification(key_fp)
         return None
 
     items = payload.get("data", []) if isinstance(payload, dict) else []
     if not isinstance(items, list):
+        _invalidate_openrouter_failed_verification(key_fp)
         return None
 
     catalog: dict[str, dict[str, Any]] = {}
@@ -1638,11 +1670,11 @@ def fetch_openrouter_models(
     every additional tool-capable model returned by OpenRouter's authenticated
     policy-aware catalog.
 
-    The picker is intentionally fail-closed: if the authenticated
-    policy-aware catalog cannot be fetched, it returns a stale filtered picker
-    cache when available, otherwise an empty list. It never falls back to the
-    unfiltered public catalog or a static snapshot that could violate the
-    account's current privacy settings.
+    The picker is intentionally fail-closed: if a required authenticated
+    policy refresh fails, it returns an empty list and invalidates stale cache
+    state for that credential. It never falls back to the unfiltered public
+    catalog or a static snapshot that could violate the account's current
+    privacy settings.
     """
     global _openrouter_catalog_cache, _openrouter_catalog_cache_at
     global _openrouter_catalog_cache_key_fp
@@ -1673,8 +1705,6 @@ def fetch_openrouter_models(
         force_refresh=force_refresh,
     )
     if live_by_id is None:
-        if _openrouter_catalog_cache_key_fp == key_fp:
-            return list(_openrouter_catalog_cache or [])
         return []
 
     ordered_ids = list(preferred_ids)
@@ -3412,18 +3442,28 @@ def cached_provider_model_ids(
     fp = _credential_fingerprint(normalized)
     entry = cache.get(normalized)
     now = time.time()
+    effective_ttl = ttl_seconds
+    if normalized == "openrouter":
+        effective_ttl = min(effective_ttl, int(_OPENROUTER_CATALOG_CACHE_TTL))
 
     if (
         not force_refresh
         and isinstance(entry, dict)
         and entry.get("fp") == fp
+        and (
+            normalized != "openrouter"
+            or entry.get("source") == _OPENROUTER_POLICY_CACHE_SOURCE
+        )
         and isinstance(entry.get("models"), list)
         and entry["models"]
     ):
         age = now - float(entry.get("at", 0))
-        if age < ttl_seconds:
+        if age < effective_ttl:
             return list(entry["models"])
-        if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
+        if (
+            normalized != "openrouter"
+            and age < _PROVIDER_MODELS_STALE_SERVE_MAX
+        ):
             # Stale-while-revalidate: serve the expired entry immediately so
             # interactive picker opens never block on serial /v1/models
             # round-trips; refresh the cache off-thread for the next open.
@@ -3433,17 +3473,29 @@ def cached_provider_model_ids(
     # Cache miss / stale / forced refresh — call the live path.
     live = provider_model_ids(normalized, force_refresh=force_refresh)
     if live:
-        cache[normalized] = {
+        cache_entry = {
             "fp": fp,
             "at": now,
             "models": list(live),
         }
+        if normalized == "openrouter":
+            cache_entry["source"] = _OPENROUTER_POLICY_CACHE_SOURCE
+        cache[normalized] = cache_entry
         _save_provider_models_cache(cache)
         return list(live)
 
-    # Live fetch returned nothing. If we have a stale entry with the
-    # SAME fingerprint, prefer it over an empty result — stale data
-    # beats no data when the network is flaky.
+    # OpenRouter's authenticated catalog is an authorization boundary. A
+    # failed current refresh must invalidate its disk entry rather than revive
+    # stale IDs. Other providers retain the ordinary availability fallback.
+    if normalized == "openrouter":
+        if normalized in cache:
+            del cache[normalized]
+            _save_provider_models_cache(cache)
+        return []
+
+    # Live fetch returned nothing. If we have a stale entry with the SAME
+    # fingerprint, prefer it over an empty result for non-authoritative
+    # providers — stale data beats no data when the network is flaky.
     if (
         isinstance(entry, dict)
         and entry.get("fp") == fp
