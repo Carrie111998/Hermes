@@ -99,7 +99,7 @@ export function RenameProfileDialog({
               aria-invalid={invalid}
               autoFocus
               id="rename-profile-name"
-              onChange={event => setName(event.target.value)}
+              onChange={event => setName(event.target.value.toLowerCase())}
               value={name}
             />
             <FieldHint error={invalid}>{p.nameHint}</FieldHint>
