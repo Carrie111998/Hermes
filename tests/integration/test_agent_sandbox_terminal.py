@@ -22,6 +22,12 @@ except ImportError:
 if not os.getenv("AGENT_SANDBOX_CONNECTION_CONFIG"):
     pytest.skip("AGENT_SANDBOX_CONNECTION_CONFIG not set", allow_module_level=True)
 
+if not os.getenv("AGENT_SANDBOX_NAMESPACE"):
+    pytest.skip("AGENT_SANDBOX_NAMESPACE not set", allow_module_level=True)
+
+if not os.getenv("AGENT_SANDBOX_WARMPOOL"):
+    pytest.skip("AGENT_SANDBOX_WARMPOOL not set", allow_module_level=True)
+
 # Import terminal_tool via importlib to avoid tools/__init__.py side effects
 import importlib.util
 

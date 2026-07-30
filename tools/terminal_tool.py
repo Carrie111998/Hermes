@@ -1472,6 +1472,8 @@ def _get_env_config() -> Dict[str, Any]:
         "agent_sandbox_connection_config": _parse_env_var(
             "AGENT_SANDBOX_CONNECTION_CONFIG", "{}", json.loads, "valid JSON"
         ),
+        "agent_sandbox_warmpool": os.getenv("AGENT_SANDBOX_WARMPOOL", "python-sandbox-warmpool"),
+        "agent_sandbox_namespace": os.getenv("AGENT_SANDBOX_NAMESPACE", "default"),
     }
 
 
@@ -1621,6 +1623,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         from tools.environments.agent_sandbox import AgentSandboxBackend as _AgentSandboxBackend
         return _AgentSandboxBackend(
             cwd=cwd, timeout=timeout, task_id=task_id,
+            warmpool=cc["agent_sandbox_warmpool"],
+            namespace=cc["agent_sandbox_namespace"],
             connection_config_args=cc["agent_sandbox_connection_config"],
             persistent_filesystem=persistent,
         )
@@ -2317,6 +2321,8 @@ def terminal_tool(
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
                                 "agent_sandbox_connection_config": config.get("agent_sandbox_connection_config", {}),
+                                "agent_sandbox_warmpool": config.get("agent_sandbox_warmpool", "python-sandbox-warmpool"),
+                                "agent_sandbox_namespace": config.get("agent_sandbox_namespace", "default"),
                             }
 
                         local_config = None

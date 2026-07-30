@@ -691,6 +691,8 @@ def load_cli_config() -> Dict[str, Any]:
         "sudo_password": "SUDO_PASSWORD",
         # agent-sandbox configuration (works with agent-sandbox backend)
         "agent_sandbox_connection_config": "AGENT_SANDBOX_CONNECTION_CONFIG",
+        "agent_sandbox_warmpool": "AGENT_SANDBOX_WARMPOOL",
+        "agent_sandbox_namespace": "AGENT_SANDBOX_NAMESPACE",
     }
 
     # Bridge config → env vars for terminal_tool. TERMINAL_CWD is force-exported

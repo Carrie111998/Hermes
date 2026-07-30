@@ -50,9 +50,11 @@ class AgentSandboxBackend(BaseEnvironment):
     def __init__(
         self,
         cwd: str,
+        warmpool: str,
         connection_config_args: ConnectionConfigParams,
         timeout: int = 60,
         task_id: str = "default",
+        namespace: str = "default",
         persistent_filesystem: bool = False
     ):
         super().__init__(cwd=cwd, timeout=timeout)
@@ -120,7 +122,8 @@ class AgentSandboxBackend(BaseEnvironment):
                 self._sandbox = None
         if self._sandbox is None:
             self._sandbox = self.client.create_sandbox(
-                warmpool="simple-sandbox-warmpool",
+                warmpool=warmpool,
+                namespace=namespace,
                 labels={"hermes_task_id": task_id},
             )
         self._sync_manager = FileSyncManager(

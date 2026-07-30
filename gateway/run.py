@@ -1906,6 +1906,8 @@ if _config_path.exists():
                 "sandbox_dir": "TERMINAL_SANDBOX_DIR",
                 "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
                 "agent_sandbox_connection_config": "AGENT_SANDBOX_CONNECTION_CONFIG",
+                "agent_sandbox_warmpool": "AGENT_SANDBOX_WARMPOOL",
+                "agent_sandbox_namespace": "AGENT_SANDBOX_NAMESPACE",
             }
             for _cfg_key, _env_var in _terminal_env_map.items():
                 if _cfg_key in _terminal_cfg:
