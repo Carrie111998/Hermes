@@ -111,3 +111,91 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert str(media_file) in images_kwargs["images"][0][0]
 
 
+
+
+class TestPostStreamFooterCaption:
+    """#74547: with streaming, the runtime footer was always sent as a separate
+    trailing text message even when the turn delivered photos. It must ride the
+    last photo's caption instead, and the helper reports whether it did so the
+    caller can skip the trailing send."""
+
+    @pytest.mark.asyncio
+    async def test_footer_rides_last_photo_caption(self, tmp_path, monkeypatch):
+        media_file = _allowed_media_path(tmp_path, monkeypatch, "sunset.png")
+        adapter = _adapter()
+
+        attached = await GatewayRunner._deliver_media_from_response(
+            _fake_runner({}),
+            f"Here you go.\nMEDIA:{media_file}",
+            _event(),
+            adapter,
+            footer_line="model-x │ 306K/1M │ 29%",
+        )
+
+        assert attached is True
+        images = adapter.send_multiple_images.await_args.kwargs["images"]
+        assert images[-1][1] == "model-x │ 306K/1M │ 29%"
+
+    @pytest.mark.asyncio
+    async def test_no_media_returns_false_for_trailing_send(self):
+        adapter = _adapter()
+
+        attached = await GatewayRunner._deliver_media_from_response(
+            _fake_runner({}),
+            "Just text, no attachments.",
+            _event(),
+            adapter,
+            footer_line="model-x │ 306K/1M │ 29%",
+        )
+
+        assert attached is False
+        adapter.send_multiple_images.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_image_media_does_not_claim_the_footer(self, tmp_path, monkeypatch):
+        media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+        adapter = _adapter()
+
+        attached = await GatewayRunner._deliver_media_from_response(
+            _fake_runner({}),
+            f"MEDIA:{media_file}",
+            _event(),
+            adapter,
+            footer_line="model-x │ 306K/1M │ 29%",
+        )
+
+        assert attached is False
+        adapter.send_document.assert_awaited_once()
+        assert "footer" not in str(adapter.send_document.await_args.kwargs)
+
+    @pytest.mark.asyncio
+    async def test_failed_photo_send_returns_false(self, tmp_path, monkeypatch):
+        media_file = _allowed_media_path(tmp_path, monkeypatch, "chart.png")
+        adapter = _adapter()
+        adapter.send_multiple_images = AsyncMock(side_effect=RuntimeError("api down"))
+
+        attached = await GatewayRunner._deliver_media_from_response(
+            _fake_runner({}),
+            f"MEDIA:{media_file}",
+            _event(),
+            adapter,
+            footer_line="model-x │ 306K/1M │ 29%",
+        )
+
+        assert attached is False
+
+    @pytest.mark.asyncio
+    async def test_without_footer_captions_stay_empty(self, tmp_path, monkeypatch):
+        media_file = _allowed_media_path(tmp_path, monkeypatch, "photo.png")
+        adapter = _adapter()
+
+        attached = await GatewayRunner._deliver_media_from_response(
+            _fake_runner({}),
+            f"MEDIA:{media_file}",
+            _event(),
+            adapter,
+        )
+
+        assert attached is False
+        images = adapter.send_multiple_images.await_args.kwargs["images"]
+        assert all(alt == "" for _, alt in images)
