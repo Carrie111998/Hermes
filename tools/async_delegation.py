@@ -1256,6 +1256,101 @@ def _retain_group_event_keys(evt: Dict[str, Any], event_keys: List[str]) -> None
     )
 
 
+def get_event_delivery_retry_delay(
+    evt: Dict[str, Any], *, now: Optional[float] = None
+) -> Optional[float]:
+    """Return a bounded delay for an unclaimed pending event, else ``None``.
+
+    A failed claim is ambiguous: another live process may own the pending row,
+    or this queue entry may be a duplicate whose durable row is already
+    delivered/dropped. Consumers use this oracle before deferred requeue so a
+    quick restart waits only for the remaining lease without spinning. Grouped
+    envelopes are narrowed to rows that are still pending.
+    """
+
+    if evt.get("type") != "async_delegation":
+        return None
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return None
+    current = time.time() if now is None else float(now)
+    event_keys = _event_delivery_keys(evt)
+    pending_rows: List[tuple[str, Optional[str], Optional[float]]] = []
+
+    with _DB_LOCK, _transaction() as conn:
+        if "delivery_event_keys" in evt:
+            if not event_keys:
+                return None
+            placeholders = ",".join("?" for _ in event_keys)
+            rows = conn.execute(
+                f"""SELECT event_key, delivery_state, delivery_claim,
+                           delivery_claimed_at
+                    FROM async_delegation_events
+                    WHERE delegation_id=? AND event_key IN ({placeholders})""",
+                (delegation_id, *event_keys),
+            ).fetchall()
+            by_key = {str(row[0]): row for row in rows}
+            if len(by_key) != len(event_keys):
+                return None
+            pending_keys = [
+                key for key in event_keys if str(by_key[key][1]) == "pending"
+            ]
+            if not pending_keys:
+                return None
+            _retain_group_event_keys(evt, pending_keys)
+            pending_rows = [
+                (
+                    key,
+                    str(by_key[key][2]) if by_key[key][2] else None,
+                    float(by_key[key][3]) if by_key[key][3] is not None else None,
+                )
+                for key in pending_keys
+            ]
+        elif event_keys:
+            row = conn.execute(
+                """SELECT delivery_state, delivery_claim, delivery_claimed_at
+                   FROM async_delegation_events
+                   WHERE delegation_id=? AND event_key=?""",
+                (delegation_id, event_keys[0]),
+            ).fetchone()
+            if row is None or str(row[0]) != "pending":
+                return None
+            pending_rows = [
+                (
+                    event_keys[0],
+                    str(row[1]) if row[1] else None,
+                    float(row[2]) if row[2] is not None else None,
+                )
+            ]
+        else:
+            row = conn.execute(
+                """SELECT delivery_state, delivery_claim, delivery_claimed_at
+                   FROM async_delegations WHERE delegation_id=?""",
+                (delegation_id,),
+            ).fetchone()
+            if row is None or str(row[0]) != "pending":
+                return None
+            pending_rows = [
+                (
+                    "aggregate",
+                    str(row[1]) if row[1] else None,
+                    float(row[2]) if row[2] is not None else None,
+                )
+            ]
+
+    # A short guard covers claim races and strict SQL '<' lease comparison.
+    delay = 0.05
+    for _event_key, claim, claimed_at in pending_rows:
+        if not claim:
+            continue
+        if claimed_at is None:
+            delay = max(delay, float(_DELIVERY_CLAIM_LEASE_SECONDS))
+            continue
+        remaining = float(_DELIVERY_CLAIM_LEASE_SECONDS) - (current - claimed_at)
+        delay = max(delay, remaining)
+    return max(0.05, delay) + 0.05
+
+
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
     if not claim_id or evt.get("type") != "async_delegation":
         return False

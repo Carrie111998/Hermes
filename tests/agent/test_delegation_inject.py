@@ -980,6 +980,28 @@ def test_restart_dedups_inject_already_persisted_in_active_history():
     assert _event_state(delegation_id, "task:0") == ("delivered", 2)
 
 
+def test_same_turn_claim_conflict_defers_pending_event(monkeypatch):
+    delegation_id = _record()
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "leased elsewhere")
+    )
+    deferred = []
+    monkeypatch.setattr(ad, "claim_event_delivery", lambda *_args: None)
+    monkeypatch.setattr(
+        process_registry,
+        "defer_unclaimed_delivery",
+        lambda evt: deferred.append(evt) or True,
+    )
+
+    messages = [{"role": "tool", "tool_call_id": "tc", "content": "done"}]
+    assert drain_ready_injects(SimpleNamespace(), messages, "turn-current") == 0
+
+    assert len(deferred) == 1
+    assert deferred[0]["delegation_id"] == delegation_id
+    assert deferred[0]["delivery_event_key"] == "task:0"
+    assert len(messages) == 1
+
+
 def test_formatter_failure_does_not_consume_delivery_attempts(monkeypatch):
     delegation_id = _record()
     assert ad.publish_batch_child_completion(
@@ -1019,6 +1041,89 @@ def test_pending_child_event_restores_with_same_durable_identity(tmp_path, monke
     assert claim
     ad.complete_event_delivery(event, claim)
     assert ad.restore_undelivered_completions(restored_queue) == 0
+
+
+def test_quick_restart_requeues_after_live_delivery_lease_expires(
+    tmp_path, monkeypatch
+):
+    """A restored live-claimed row wakes without another process restart."""
+    import queue as queue_module
+
+    import tools.process_registry as registry_mod
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_LEASE_SECONDS", 0.15)
+    monkeypatch.setattr(
+        registry_mod, "CHECKPOINT_PATH", tmp_path / "processes.json"
+    )
+
+    delegation_id = _record(goals=("survive quick restart",))
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "restored after lease")
+    )
+    original = process_registry.completion_queue.get_nowait()
+    old_claim = ad.claim_event_delivery(original, "old-process")
+    assert old_claim
+
+    restarted = registry_mod.ProcessRegistry()
+    restored = restarted.completion_queue.get_nowait()
+    assert restored["restored"] is True
+    assert ad.claim_event_delivery(restored, "new-process") is None
+
+    assert restarted.defer_unclaimed_delivery(restored) is True
+    with pytest.raises(queue_module.Empty):
+        restarted.completion_queue.get_nowait()
+
+    woke = restarted.completion_queue.get(timeout=1)
+    assert woke["delegation_id"] == delegation_id
+    assert woke["delivery_event_key"] == "task:0"
+    new_claim = ad.claim_event_delivery(woke, "new-process")
+    assert new_claim
+    assert ad.complete_event_delivery(woke, new_claim)
+    assert _event_state(delegation_id, "task:0") == ("delivered", 2)
+    assert restarted.defer_unclaimed_delivery(woke) is False
+    with pytest.raises(queue_module.Empty):
+        restarted.completion_queue.get_nowait()
+
+
+def test_live_lease_retry_prunes_terminal_group_sibling(tmp_path, monkeypatch):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_LEASE_SECONDS", 0.15)
+
+    delegation_id = _record(
+        goals=("already delivered", "still leased"), delivery="after_turn"
+    )
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "delivered result")
+    )
+    assert ad.publish_batch_child_completion(
+        delegation_id, 1, _child(1, "leased result")
+    )
+    children = [
+        process_registry.completion_queue.get_nowait(),
+        process_registry.completion_queue.get_nowait(),
+    ]
+    grouped = ad.coalesce_ready_after_turn_events(children)[0]
+    by_key = {event["delivery_event_key"]: event for event in children}
+
+    delivered_claim = ad.claim_event_delivery(by_key["task:0"], "first-consumer")
+    assert delivered_claim
+    assert ad.complete_event_delivery(by_key["task:0"], delivered_claim)
+    live_claim = ad.claim_event_delivery(by_key["task:1"], "old-process")
+    assert live_claim
+    assert ad.claim_event_delivery(grouped, "new-process") is None
+
+    assert process_registry.defer_unclaimed_delivery(grouped)
+    assert grouped["delivery_event_keys"] == ["task:1"]
+    assert [result["task_index"] for result in grouped["results"]] == [1]
+
+    woke = process_registry.completion_queue.get(timeout=1)
+    assert woke["delivery_event_keys"] == ["task:1"]
+    retry_claim = ad.claim_event_delivery(woke, "new-process")
+    assert retry_claim
+    assert ad.complete_event_delivery(woke, retry_claim)
+    assert _event_state(delegation_id, "task:0") == ("delivered", 1)
+    assert _event_state(delegation_id, "task:1") == ("delivered", 2)
 
 
 def test_model_schema_defaults_after_turn_and_dispatch_forwards_explicit_mode(monkeypatch):

@@ -173,13 +173,17 @@ Synchronous single-task delegation from an orchestrator runs directly without th
 
 When a background delegation finishes, Hermes stores its completion event in
 the active profile's `state.db` before publishing it to the shared completion
-queue. `inject` batches use one execution record plus independently claimable
-child-delivery records; `after_turn` keeps one aggregate delivery record. If
+queue. Both `inject` and `after_turn` batches use one execution record plus
+independently claimable child-delivery records. At an idle `after_turn` boundary,
+currently-ready child rows are folded into a transient grouped envelope; the
+envelope is not a second aggregate database row. Legacy aggregate records from
+older Hermes versions remain deliverable through the compatibility path. If
 Hermes restarts after completion but before delivery, pending events are
 restored and routed through the same ownership checks. Competing consumers use
 a durable claim, so only the consumer that successfully appends or accepts the
-synthetic turn acknowledges each event; failed attempts release the claim for
-retry.
+synthetic turn acknowledges each event. Failed attempts release the claim for
+retry; a restored row whose previous process still owns a live lease is
+rescheduled for the lease boundary without spinning the completion queue.
 
 This does not resume child execution after a crash. A delegation whose owner
 process disappears while it is still running is recorded as `unknown`, because

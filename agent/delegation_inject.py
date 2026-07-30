@@ -345,8 +345,10 @@ def drain_ready_injects(agent: Any, messages: list[dict[str, Any]], turn_id: str
 
             claim_id = claim_event_delivery(event, f"conversation-loop:{os.getpid()}")
             if claim_id is None:
-                # A competing CLI/gateway process already owns this durable event,
-                # or it was delivered from a duplicate restored queue entry.
+                # A live lease can belong to a process that died shortly before
+                # this process restored the row. Defer until that lease expires;
+                # terminal duplicate rows are classified and discarded.
+                process_registry.defer_unclaimed_delivery(event)
                 continue
             event_id = _event_identity(event)
             if _durable_event_is_in_history(messages, event_id):

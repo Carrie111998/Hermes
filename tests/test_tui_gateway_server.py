@@ -13245,6 +13245,12 @@ def test_tui_claim_loss_does_not_leave_session_busy(monkeypatch):
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
     monkeypatch.setattr(registry_mod, "format_process_notification", lambda _evt: "ready")
     monkeypatch.setattr(delegation_mod, "claim_event_delivery", lambda *_args: None)
+    deferred = []
+    monkeypatch.setattr(
+        process_registry,
+        "defer_unclaimed_delivery",
+        lambda evt: deferred.append(evt) or True,
+    )
     monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
 
     sid = "sid-tui-claim-loss"
@@ -13264,6 +13270,7 @@ def test_tui_claim_loss_does_not_leave_session_busy(monkeypatch):
         server._notification_poller_loop(stop_poller, sid, sess)
 
         assert sess["running"] is False
+        assert deferred == [event]
         assert isolated_queue.empty()
     finally:
         server._sessions.pop(sid, None)

@@ -29,6 +29,7 @@ Usage:
     process_registry.kill(session.id)
 """
 
+import heapq
 import json
 import logging
 import os
@@ -178,6 +179,15 @@ class ProcessRegistry:
         # that route/claim completion events hold this lock only for the bounded
         # dequeue -> decision handoff, never while an agent/model turn runs.
         self.completion_routing_lock = threading.RLock()
+        # Durable events that lose a claim race must not disappear until the
+        # next process restart, but immediate requeue would make fast TUI
+        # pollers spin. One lazy daemon scheduler owns all delayed retries for
+        # this registry. Exact durable identities are deduplicated in the heap.
+        self._deferred_completion_condition = threading.Condition()
+        self._deferred_completion_heap: list[tuple[float, int, tuple, dict]] = []
+        self._deferred_completion_deadlines: dict[tuple, float] = {}
+        self._deferred_completion_sequence = 0
+        self._deferred_completion_thread: Optional[threading.Thread] = None
         # Rehydrate durable delegation completions only at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
         try:
@@ -1238,6 +1248,90 @@ class ProcessRegistry:
         return session_id in self._completion_consumed or (
             skip_poll_observed and session_id in self._poll_observed
         )
+
+    @staticmethod
+    def _deferred_completion_key(event: dict) -> tuple:
+        raw_keys = event.get("delivery_event_keys")
+        if isinstance(raw_keys, (list, tuple)):
+            event_keys = tuple(str(key) for key in raw_keys if key)
+        else:
+            event_key = str(event.get("delivery_event_key") or "")
+            event_keys = (event_key,) if event_key else ("aggregate",)
+        return (
+            "async_delegation",
+            str(event.get("delegation_id") or ""),
+            event_keys,
+        )
+
+    def defer_unclaimed_delivery(self, event: dict) -> bool:
+        """Requeue a pending durable event after its competing lease expires.
+
+        ``claim_event_delivery()`` returning ``None`` is not enough to drop the
+        RAM copy: after a quick restart the old process's lease can still be
+        live. Terminal duplicates return ``False`` and disappear; pending rows
+        enter one deduplicated heap and wake under the routing lock.
+        """
+
+        try:
+            from tools.async_delegation import get_event_delivery_retry_delay
+
+            delay = get_event_delivery_retry_delay(event)
+        except Exception:
+            logger.exception("Could not classify unclaimed delegation event")
+            return False
+        if delay is None:
+            return False
+
+        key = self._deferred_completion_key(event)
+        if not key[1]:
+            return False
+        deadline = time.monotonic() + max(0.05, float(delay))
+        with self._deferred_completion_condition:
+            existing = self._deferred_completion_deadlines.get(key)
+            if existing is not None and existing <= deadline:
+                return True
+            self._deferred_completion_sequence += 1
+            self._deferred_completion_deadlines[key] = deadline
+            heapq.heappush(
+                self._deferred_completion_heap,
+                (
+                    deadline,
+                    self._deferred_completion_sequence,
+                    key,
+                    event,
+                ),
+            )
+            thread = self._deferred_completion_thread
+            if thread is None or not thread.is_alive():
+                thread = threading.Thread(
+                    target=self._deferred_completion_loop,
+                    name="completion-lease-retry",
+                    daemon=True,
+                )
+                self._deferred_completion_thread = thread
+                thread.start()
+            self._deferred_completion_condition.notify()
+        return True
+
+    def _deferred_completion_loop(self) -> None:
+        while True:
+            with self._deferred_completion_condition:
+                while not self._deferred_completion_heap:
+                    self._deferred_completion_condition.wait()
+                deadline, _sequence, key, event = self._deferred_completion_heap[0]
+                current = self._deferred_completion_deadlines.get(key)
+                if current != deadline:
+                    heapq.heappop(self._deferred_completion_heap)
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    self._deferred_completion_condition.wait(timeout=remaining)
+                    continue
+                heapq.heappop(self._deferred_completion_heap)
+                self._deferred_completion_deadlines.pop(key, None)
+
+            with self.completion_routing_lock:
+                self.completion_queue.put(event)
 
     def collect_ready_after_turn_siblings(self, seed: dict) -> dict:
         """Fold queued ready siblings into one transient after-turn envelope.

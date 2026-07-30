@@ -8754,11 +8754,12 @@ def _notification_poller_loop(
 
                                         _claim = claim_event_delivery(evt, "tui-poller")
                                         if _claim is None:
-                                            # The active loop or another durable
-                                            # consumer won the event. Do not mark
-                                            # this TUI session busy for work it
-                                            # will never dispatch.
-                                            _route_action = "claimed_elsewhere"
+                                            # Keep a live-claimed restored row out
+                                            # of the hot poll loop until its lease
+                                            # expires. Terminal duplicates are
+                                            # discarded by the durable classifier.
+                                            process_registry.defer_unclaimed_delivery(evt)
+                                            _route_action = "deferred_claim"
                                         else:
                                             session["running"] = True
                                             _route_action = "dispatch"
@@ -8868,7 +8869,9 @@ def _notification_poller_loop(
                     from tools.async_delegation import claim_event_delivery
 
                     _claim = claim_event_delivery(evt, "tui-poller")
-                    if _claim is not None:
+                    if _claim is None:
+                        process_registry.defer_unclaimed_delivery(evt)
+                    else:
                         session["running"] = True
                         _shutdown_action = "dispatch"
 
@@ -9759,17 +9762,21 @@ def _run_prompt_submit(
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
+            from tools.async_delegation import (
+                claim_event_delivery, complete_event_delivery, release_event_delivery,
+            )
             for index, (_evt, synth) in enumerate(drained):
+                _claim = None
                 with session["history_lock"]:
                     if session.get("running"):
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
                         break
-                    session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
+                    _claim = claim_event_delivery(_evt, "tui-post-turn")
+                    if _claim is None:
+                        process_registry.defer_unclaimed_delivery(_evt)
+                    else:
+                        session["running"] = True
                 if _claim is None:
                     continue
                 try:

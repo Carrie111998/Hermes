@@ -21024,6 +21024,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         evt, f"gateway:{id(self)}"
                     ) or ""
                     if not durable_claim_id:
+                        from tools.process_registry import process_registry
+
+                        process_registry.defer_unclaimed_delivery(evt)
                         return None
                 except Exception as exc:
                     logger.warning(
@@ -21165,8 +21168,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # consume watch/completion events here (other drains own them),
                 # so requeue anything that isn't ours.
                 requeue = []
-                async_events = []
+                idle_events = []
                 with _pr.completion_routing_lock:
+                    async_events = []
                     while not _pr.completion_queue.empty():
                         try:
                             evt = _pr.completion_queue.get_nowait()
@@ -21178,40 +21182,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             requeue.append(evt)
                     for evt in requeue:
                         _pr.completion_queue.put(evt)
-                from tools.async_delegation import coalesce_ready_after_turn_events
 
-                async_events = coalesce_ready_after_turn_events(async_events)
-                for evt in async_events:
-                    self._enrich_async_delegation_routing(evt)
-                    # Busy-session routing:
-                    # - inject for the matching active turn stays queued for the
-                    #   conversation loop's safe-boundary drain;
-                    # - after_turn stays queued until that foreground turn ends.
-                    # A requeued after-turn envelope is re-coalescible, so siblings
-                    # that finish meanwhile join the same next-boundary delivery.
-                    _rd = str(evt.get("result_delivery") or "after_turn").strip().lower()
-                    _route_key = str(evt.get("session_key") or "").strip()
-                    _event_turn_id = str(evt.get("parent_turn_id") or "")
-                    _running_parent = getattr(self, "_running_agents", {}).get(
-                        _route_key
+                    from tools.async_delegation import (
+                        coalesce_ready_after_turn_events,
                     )
-                    if _running_parent is _AGENT_PENDING_SENTINEL:
-                        _pr.completion_queue.put(evt)
-                        continue
-                    if _rd == "after_turn" and _running_parent is not None:
-                        _pr.completion_queue.put(evt)
-                        continue
-                    if (
-                        _rd == "inject"
-                        and _running_parent is not None
-                        and _event_turn_id
-                        and str(
-                            getattr(_running_parent, "_active_turn_id", "") or ""
+
+                    async_events = coalesce_ready_after_turn_events(async_events)
+                    for evt in async_events:
+                        self._enrich_async_delegation_routing(evt)
+                        # Busy-session routing is part of the same queue
+                        # reservation as dequeue/coalescing. Otherwise the active
+                        # conversation loop can observe a temporary-empty queue
+                        # and miss an inject that was already ready at its safe
+                        # boundary.
+                        _rd = str(
+                            evt.get("result_delivery") or "after_turn"
+                        ).strip().lower()
+                        _route_key = str(evt.get("session_key") or "").strip()
+                        _event_turn_id = str(evt.get("parent_turn_id") or "")
+                        _running_parent = getattr(self, "_running_agents", {}).get(
+                            _route_key
                         )
-                        == _event_turn_id
-                    ):
-                        _pr.completion_queue.put(evt)
-                        continue
+                        if _running_parent is _AGENT_PENDING_SENTINEL:
+                            _pr.completion_queue.put(evt)
+                            continue
+                        if _rd == "after_turn" and _running_parent is not None:
+                            _pr.completion_queue.put(evt)
+                            continue
+                        if (
+                            _rd == "inject"
+                            and _running_parent is not None
+                            and _event_turn_id
+                            and str(
+                                getattr(_running_parent, "_active_turn_id", "") or ""
+                            )
+                            == _event_turn_id
+                        ):
+                            _pr.completion_queue.put(evt)
+                            continue
+                        idle_events.append(evt)
+
+                # Formatting and adapter/network delivery must never hold the
+                # routing lock. Only events classified idle above leave it.
+                for evt in idle_events:
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
