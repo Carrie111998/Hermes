@@ -2845,7 +2845,7 @@ def create_task(
     """Create a new task and optionally link it under parent tasks.
 
     Returns the new task id.  Status is ``ready`` when there are no
-    parents (or all parents already ``done``), otherwise ``todo``.
+    parents (or all parents are ``done``/``archived``), otherwise ``todo``.
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
@@ -3092,13 +3092,13 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
+                        # If any parent is not terminal, we're todo.
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
+                        if any(r["status"] not in {"done", "archived"} for r in rows):
                             task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
@@ -8159,7 +8159,7 @@ def _dispatch_once_locked(
       1. Reclaim stale running tasks (TTL expired).
       2. Reclaim stale running tasks (no recent heartbeat).
       3. Reclaim crashed running tasks (host-local PID no longer alive).
-      3. Promote todo -> ready where all parents are done.
+      3. Promote todo -> ready where all parents are done or archived.
       4. For each ready task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent

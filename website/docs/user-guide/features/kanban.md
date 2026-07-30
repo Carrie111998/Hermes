@@ -60,7 +60,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
 - **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
-- **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
+- **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done` or `archived`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
@@ -266,7 +266,7 @@ hermes kanban block    t_abc "need input" --ids t_def t_hij
 ```
 
 :::note Where an unblocked task lands
-`unblock` itself only ever moves a task to **`ready`** (all parents `done`) or
+`unblock` itself only ever moves a task to **`ready`** (all parents `done` or `archived`) or
 **`todo`** (a parent is still open — the task is dependency-gated and the
 dispatcher auto-promotes it once the parent finishes). It never routes to
 `triage`.
@@ -301,7 +301,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_attachments` | List a task's attachments. | — |
 | `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
-| `kanban_unblock` | (Orchestrators) move a blocked task to `ready` when all parents are done, or `todo` while any parent remains open. | `task_id` |
+| `kanban_unblock` | (Orchestrators) move a blocked task to `ready` when all parents are done or archived, or `todo` while any parent remains open. | `task_id` |
 
 A typical worker turn looks like:
 
@@ -967,7 +967,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | Kind | Payload | When |
 |---|---|---|
 | `created` | `{assignee, status, parents, tenant}` | Task inserted. `run_id` is `NULL`. |
-| `promoted` | — | `todo → ready` because all parents hit `done`. `run_id` is `NULL`. |
+| `promoted` | — | `todo → ready` because all parents hit `done` or `archived`. `run_id` is `NULL`. |
 | `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
 | `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`dependency`, `needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |

@@ -115,7 +115,7 @@ def run() -> int:
                 undone = conn.execute(
                     "SELECT l.parent_id, p.status FROM task_links l "
                     "JOIN tasks p ON p.id = l.parent_id "
-                    "WHERE l.child_id = ? AND p.status != 'done'",
+                    "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived')",
                     (tid,),
                 ).fetchall()
                 if undone:

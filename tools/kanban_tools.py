@@ -2006,8 +2006,8 @@ KANBAN_CREATE_SCHEMA = {
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
-        "Unblock a Kanban task. It moves to ready when all parents are done, "
-        "or todo while any parent remains open. Orchestrator-only — only "
+        "Unblock a Kanban task. It moves to ready when all parents are done "
+        "or archived, or todo while any parent remains open. Orchestrator-only — only "
         "profiles with the kanban toolset can unblock routed work; "
         "dispatcher-spawned task workers never see this tool."
     ),

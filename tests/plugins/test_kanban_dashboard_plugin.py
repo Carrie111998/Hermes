@@ -224,6 +224,34 @@ def test_task_detail_includes_links_and_events(client):
 # ---------------------------------------------------------------------------
 
 
+def test_dashboard_archived_parent_satisfies_create_and_ready_guard(client):
+    """Dashboard creation and direct promotion share terminal-parent rules."""
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "archived parent"},
+    ).json()["task"]
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "done"},
+    ).status_code == 200
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "archived"},
+    ).status_code == 200
+
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "late child", "parents": [parent["id"]]},
+    ).json()["task"]
+    assert child["status"] == "ready"
+
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}", json={"status": "todo"},
+    ).status_code == 200
+    promoted = client.patch(
+        f"/api/plugins/kanban/tasks/{child['id']}", json={"status": "ready"},
+    )
+    assert promoted.status_code == 200
+    assert promoted.json()["task"]["status"] == "ready"
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 

@@ -933,8 +933,7 @@ def _(home, kb):
 
 @scenario("parent_in_different_status_states")
 def _(home, kb):
-    """recompute_ready promotes a todo child only if ALL parents are
-    in 'done'. Verify against parents in every non-done state."""
+    """recompute_ready promotes a child when every parent is terminal."""
     kb.init_db()
     conn = kb.connect()
     try:
@@ -957,8 +956,8 @@ def _(home, kb):
             (p_running, "todo"),
             (p_blocked, "todo"),
             (p_triage, "todo"),
-            (p_archived, "todo"),  # archived != done!
-            (p_done, "ready"),     # only done parent unblocks child
+            (p_archived, "ready"),
+            (p_done, "ready"),
         ]:
             child = kb.create_task(
                 conn, title=f"child-of-{parent}", assignee="w", parents=[parent],
@@ -969,7 +968,7 @@ def _(home, kb):
                 f"child of {parent} ({kb.get_task(conn, parent).status}): "
                 f"expected {expected}, got {actual}"
             )
-        print("  child promotion correctly gated on parent.status == 'done'")
+        print("  child promotion correctly gated on terminal parent status")
     finally:
         conn.close()
 

@@ -163,6 +163,19 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_create_task_with_archived_parent_is_ready(kanban_home):
+    """Archived parents are terminal when inferring a new child's status."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="archived parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+
+        child = kb.create_task(conn, title="child", parents=[parent])
+        created = kb.get_task(conn, child)
+
+    assert created is not None
+    assert created.status == "ready"
+
 
 # ---------------------------------------------------------------------------
 # Links + dependency resolution
