@@ -547,22 +547,21 @@ class WorkflowEngine:
                     if node.timeout_minutes is not None else None
                 ),
             )
-            # Attach files based on node's attachment_index.
-            # If attachment_index is set, attach only that specific file.
-            # If None, attach all current attachments (first-layer default).
-            all_attachments = getattr(self, "_current_attachments", [])
+            # Attach files based on node's attachment field.
+            # _current_attachments is a dict of {name: filepath}.
+            # If node.attachment is set, look up that key.
+            # If None, attach all (first-layer default).
+            all_attachments = getattr(self, "_current_attachments", {})
+            if isinstance(all_attachments, list):
+                # Backward compat: convert old list format to dict
+                all_attachments = {str(i): p for i, p in enumerate(all_attachments)}
             if node.attachment is not None:
-                # Attach only the specified index
-                import re as _re
-                _m = _re.match(r"attachments\[(\d+)\]", node.attachment)
-                idx = int(_m.group(1)) if _m else -1
-                if 0 <= idx < len(all_attachments):
-                    attachments_to_attach = [all_attachments[idx]]
-                else:
-                    attachments_to_attach = []
+                # Look up by name
+                fpath = all_attachments.get(node.attachment)
+                attachments_to_attach = [fpath] if fpath else []
             else:
                 # Attach all (first-layer behavior)
-                attachments_to_attach = all_attachments
+                attachments_to_attach = list(all_attachments.values())
             for fpath in attachments_to_attach:
                 try:
                     from pathlib import Path as _P
@@ -1363,7 +1362,7 @@ class WorkflowEngine:
             "current_layer": current_layer,
             "layers": layers,
             "context": context or {},
-            "attachments": attachments or [],
+            "attachments": attachments or {},
             "states": {nid: {
                 "node_id": s.node_id,
                 "status": s.status,
@@ -2542,7 +2541,7 @@ class WorkflowEngine:
                 # Restore attachments from saved state so the supervisor
                 # subprocess can attach files to first-layer cards.
                 if not attachments and "attachments" in saved:
-                    attachments = saved["attachments"]
+                    attachments = saved.get("attachments", {})
                     self._current_attachments = attachments
                 states = {
                     nid: NodeState(
@@ -2626,7 +2625,7 @@ class WorkflowEngine:
         # ── Fire-and-forget: create cards, detect loop zones, spawn supervisor ──
         # Store attachments on the engine instance so create_kanban_card
         # can access them without threading through every method signature.
-        self._current_attachments = attachments or []
+        self._current_attachments = attachments or {}
         # Capture session info once — used for subscription routing and state persistence.
         # Session info: parameter > context["_session_info"] > ContextVars/file fallback
         _session_info = (
