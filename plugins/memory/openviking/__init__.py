@@ -2991,10 +2991,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
             thread.start()
 
     def _session_needs_commit(self, sid: str, turn_count: int) -> bool:
-        # Already-committed sessions never need a second commit, regardless of
-        # the turn counter — a racing sync_turn can re-increment _turn_count
-        # after a commit+reset, so the committed-guard must win over turn_count.
+        # Already-committed sessions: only allow a second commit if new turns
+        # have arrived since the previous commit. This is required for in-place
+        # compression (the default), which keeps the same session ID across
+        # compression — without this relaxation, a session can only be committed
+        # once in its lifetime, and all post-compression turns would be lost.
         if self._has_committed_session(sid):
+            if turn_count > 0:
+                return True
             return False
         if turn_count > 0:
             return True
