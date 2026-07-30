@@ -409,6 +409,64 @@ def _explain(
 
 
 # ---------------------------------------------------------------------------
+# Event builder (pure helper)
+# ---------------------------------------------------------------------------
+
+
+def build_observation(
+    *,
+    tool_name: str,
+    args: Mapping[str, Any] | None,
+    result: str | None,
+    failed: bool,
+    verification_status: str | None = None,
+    api_call_count: int = 0,
+    session_id: str = "",
+    model: str = "",
+    provider: str = "",
+) -> TrajectoryObservation:
+    """Build a ``TrajectoryObservation`` from raw tool call data.
+
+    Reuses the canonical hashing from ``tool_guardrails`` so hashes are
+    consistent with the loop guardrail subsystem. Never stores raw args
+    or results — only their hashes.
+
+    ``progress_kind`` is derived from the result:
+    - ``file_mutation_landed`` when a file mutation result proves success
+    - ``verification_failed`` / ``verification_passed`` when the caller
+      passes ``verification_status``
+    - ``none`` otherwise
+    """
+    from agent.tool_guardrails import ToolCallSignature, _result_hash
+    from agent.tool_result_classification import file_mutation_result_landed
+
+    signature = ToolCallSignature.from_call(tool_name, args or {})
+    r_hash = _result_hash(result)
+
+    progress_kind = "none"
+    if not failed and file_mutation_result_landed(tool_name, result):
+        progress_kind = "file_mutation_landed"
+
+    if verification_status == "failed":
+        progress_kind = "verification_failed"
+    elif verification_status == "passed":
+        progress_kind = "verification_passed"
+
+    return TrajectoryObservation(
+        tool_name=tool_name,
+        args_hash=signature.args_hash,
+        result_hash=r_hash,
+        failed=failed,
+        progress_kind=progress_kind,
+        verification_status=verification_status,
+        api_call_count=api_call_count,
+        session_id=session_id,
+        model=model,
+        provider=provider,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Config parsing helpers (private)
 # ---------------------------------------------------------------------------
 

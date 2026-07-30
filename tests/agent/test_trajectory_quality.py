@@ -11,6 +11,7 @@ from agent.trajectory_quality import (
     TrajectoryQualityController,
     TrajectoryObservation,
     TrajectoryQualityDecision,
+    build_observation,
 )
 
 
@@ -263,3 +264,65 @@ def test_deescalate_on_progress_lowers_one_step():
         )
     )
     assert ctrl.level == "continue"
+
+
+# ---------------------------------------------------------------------------
+# S3 — Event builder helpers
+# ---------------------------------------------------------------------------
+
+
+def test_build_observation_args_hash_stable_under_reordering():
+    """The args_hash must be the same regardless of dict key order."""
+    obs1 = build_observation(
+        tool_name="terminal",
+        args={"command": "ls", "workdir": "/tmp"},
+        result='{"exit_code": 0}',
+        failed=False,
+    )
+    obs2 = build_observation(
+        tool_name="terminal",
+        args={"workdir": "/tmp", "command": "ls"},
+        result='{"exit_code": 0}',
+        failed=False,
+    )
+    assert obs1.args_hash == obs2.args_hash
+
+
+def test_build_observation_secret_not_in_observation_fields():
+    """A secret in args must not appear in the observation as plaintext."""
+    secret = "sk-super-secret-key-1234567890"
+    obs = build_observation(
+        tool_name="terminal",
+        args={"command": f"echo {secret}"},
+        result='{"exit_code": 0}',
+        failed=False,
+    )
+    # The observation holds only a hash — the secret must not be present
+    # in any field or in the dataclass repr.
+    import dataclasses
+
+    dump = dataclasses.asdict(obs)
+    joined = " ".join(str(v) for v in dump.values())
+    assert secret not in joined
+    assert secret not in repr(obs)
+
+
+def test_build_observation_file_mutation_lands_progress():
+    obs = build_observation(
+        tool_name="write_file",
+        args={"path": "/tmp/x", "content": "hi"},
+        result='{"bytes_written": 2}',
+        failed=False,
+    )
+    assert obs.progress_kind == "file_mutation_landed"
+
+
+def test_build_observation_failed_result():
+    obs = build_observation(
+        tool_name="terminal",
+        args={"command": "false"},
+        result='{"exit_code": 1, "output": "error"}',
+        failed=True,
+    )
+    assert obs.failed is True
+    assert obs.progress_kind == "none"
