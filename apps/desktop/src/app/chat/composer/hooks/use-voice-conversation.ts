@@ -73,6 +73,7 @@ export function useVoiceConversation({
   const bargeCapturePendingRef = useRef(false)
   const bargedRef = useRef(false)
   const speechStartSequenceRef = useRef(0)
+  const speechStoppedDuringStartupRef = useRef(false)
   const enabledRef = useRef(enabled)
   const mutedRef = useRef(muted)
   const busyRef = useRef(busy)
@@ -286,9 +287,11 @@ export function useVoiceConversation({
       // voice-playback sequence has advanced past what we captured at speech
       // start — don't auto-start the next sentence, the user chose to stop.
       const stoppedByUser =
+        speechStoppedDuringStartupRef.current ||
         speechStartSequenceRef.current > 0 && $voicePlayback.get().sequence > speechStartSequenceRef.current
 
       speechStartSequenceRef.current = 0
+      speechStoppedDuringStartupRef.current = false
 
       if (enabledRef.current && !stoppedByUser) {
         pendingStartRef.current = true
@@ -458,9 +461,13 @@ export function useVoiceConversation({
         // this is a safety net for read-aloud-style entries into the loop.
         ensureBargeMonitor()
 
+        const playback = playSpeechText(response.text, { source: 'voice-conversation' })
+        // Starting playback stops any prior audio synchronously, which advances
+        // the sequence. Capture it after that normal initialization so only a
+        // later user stop prevents re-arming the microphone.
         speechStartSequenceRef.current = $voicePlayback.get().sequence
 
-        void playSpeechText(response.text, { source: 'voice-conversation' })
+        void playback
           .catch(error => notifyError(error, voiceCopy.playbackFailed))
           .finally(() => {
             if (responseIdRef.current === responseId) {
@@ -484,7 +491,7 @@ export function useVoiceConversation({
     (responseId: string) => {
       responseIdRef.current = responseId
       spokenSourceLengthRef.current = 0
-      speechStartSequenceRef.current = $voicePlayback.get().sequence
+      speechStoppedDuringStartupRef.current = false
       setStatus('speaking')
 
       // VAD barge-in: the user talking over the reply cuts playback, drops
@@ -494,9 +501,15 @@ export function useVoiceConversation({
       ensureBargeMonitor()
 
       void (async () => {
-        const session = await startSpeechStream({ source: 'voice-conversation' })
+        const sequenceBeforeStreamStart = $voicePlayback.get().sequence
+
+        const session = await startSpeechStream({
+          isCurrent: () => responseIdRef.current === responseId,
+          source: 'voice-conversation'
+        })
 
         // The session may resolve after the loop moved on (barge, disable).
+        // Do not let a stale startup overwrite the active reply's tracking.
         if (responseIdRef.current !== responseId) {
           if (session) {
             stopVoicePlayback()
@@ -504,6 +517,16 @@ export function useVoiceConversation({
 
           return
         }
+
+        // startSpeechStream synchronously stops prior playback before opening
+        // its socket, which advances the sequence once. If it advanced more
+        // than once while its URL was resolving, an external stop happened and
+        // must still prevent this reply from re-arming the microphone.
+        const sequenceAfterStreamStart = $voicePlayback.get().sequence
+        const expectedStartupAdvance = session ? 1 : 0
+        speechStoppedDuringStartupRef.current =
+          sequenceAfterStreamStart > sequenceBeforeStreamStart + expectedStartupAdvance
+        speechStartSequenceRef.current = sequenceAfterStreamStart
 
         if (!session) {
           // No streaming backend/provider: speak the whole reply once it lands.

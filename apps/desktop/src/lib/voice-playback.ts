@@ -65,6 +65,8 @@ function currentState(
 }
 
 export interface VoicePlaybackOptions {
+  /** Returns false when an async playback request has been superseded. */
+  isCurrent?: () => boolean
   messageId?: string | null
   source: VoicePlaybackSource
 }
@@ -322,16 +324,16 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
  * whole-text `playSpeechText`.
  */
 export async function startSpeechStream(options: VoicePlaybackOptions): Promise<null | SpeechStreamSession> {
-  const wsUrl = await resolveSpeakStreamUrl()
+  const url = await resolveSpeakStreamUrl()
 
-  if (!wsUrl) {
+  if (!url || options.isCurrent?.() === false) {
     return null
   }
 
   stopVoicePlayback()
   setVoicePlaybackState(currentState('preparing', options))
 
-  const session = openSpeechStream(wsUrl, options)
+  const session = openSpeechStream(url, options)
 
   void session.done.then(outcome => {
     if (outcome === 'done') {

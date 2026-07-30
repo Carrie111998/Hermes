@@ -2,6 +2,8 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { BargeMonitorCallbacks } from '@/lib/voice-barge-in'
+import { type SpeechStreamSession, startSpeechStream } from '@/lib/voice-playback'
+import { $voicePlayback } from '@/store/voice-playback'
 
 import type { MicRecording } from './use-mic-recorder'
 import { useVoiceConversation } from './use-voice-conversation'
@@ -262,5 +264,192 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     hook.rerender({ busy: true })
 
     expect(monitorCalls.length).toBe(armed)
+  })
+
+  it('re-arms after a normally completed streamed reply', async () => {
+    let response: { id: string; pending: boolean; text: string } | null = null
+    const onBusyChange: { current: (busy: boolean) => void } = { current: () => undefined }
+    let resolveStream: (outcome: 'done' | 'fallback') => void = () => undefined
+
+    const done = new Promise<'done' | 'fallback'>(resolve => {
+      resolveStream = resolve
+    })
+
+    const stream: SpeechStreamSession = { append: vi.fn(), done, finish: vi.fn() }
+
+    vi.mocked(startSpeechStream).mockImplementation(async () => {
+      $voicePlayback.set({
+        audioElement: null,
+        messageId: null,
+        sequence: $voicePlayback.get().sequence + 1,
+        source: 'voice-conversation',
+        status: 'preparing'
+      })
+
+      return stream
+    })
+
+    $voicePlayback.set({
+      audioElement: null,
+      messageId: null,
+      sequence: 10,
+      source: null,
+      status: 'idle'
+    })
+
+    const hook = renderHook(
+      ({ busy }: HookProps) =>
+        useVoiceConversation({
+          busy,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          onSubmit: vi.fn(async () => onBusyChange.current(true)),
+          onTranscribeAudio: vi.fn(async () => 'start the test'),
+          pendingResponse: () => response
+        }),
+      { initialProps: { busy: false } }
+    )
+
+    onBusyChange.current = busy => hook.rerender({ busy })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await waitFor(() => expect(hook.result.current.status).toBe('listening'))
+
+    micHandle.stop.mockResolvedValueOnce({
+      audio: new Blob(['q'], { type: 'audio/webm' }),
+      durationMs: 900,
+      heardSpeech: true
+    })
+    await act(async () => {
+      hook.result.current.stopTurn()
+    })
+    await waitFor(() => expect(hook.result.current.status).toBe('thinking'))
+
+    response = { id: 'reply-1', pending: false, text: 'A completed streamed reply.' }
+    hook.rerender({ busy: false })
+    await waitFor(() => expect(hook.result.current.status).toBe('speaking'))
+
+    await act(async () => {
+      resolveStream('done')
+      await done
+    })
+
+    await waitFor(() => expect(micHandle.start).toHaveBeenCalledTimes(2))
+  })
+
+  it('does not re-arm when playback stops while stream startup is pending', async () => {
+    let response: { id: string; pending: boolean; text: string } | null = null
+    const onBusyChange: { current: (busy: boolean) => void } = { current: () => undefined }
+    let resolveStart: (session: SpeechStreamSession) => void = () => undefined
+
+    const start = new Promise<SpeechStreamSession>(resolve => {
+      resolveStart = resolve
+    })
+
+    let resolveStream: (outcome: 'done' | 'fallback') => void = () => undefined
+
+    const done = new Promise<'done' | 'fallback'>(resolve => {
+      resolveStream = resolve
+    })
+
+    const stream: SpeechStreamSession = { append: vi.fn(), done, finish: vi.fn() }
+
+    vi.mocked(startSpeechStream).mockImplementation(async () => start)
+    $voicePlayback.set({ audioElement: null, messageId: null, sequence: 0, source: null, status: 'idle' })
+
+    const hook = renderHook(
+      ({ busy }: HookProps) =>
+        useVoiceConversation({
+          busy,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          onSubmit: vi.fn(async () => onBusyChange.current(true)),
+          onTranscribeAudio: vi.fn(async () => 'start the test'),
+          pendingResponse: () => response
+        }),
+      { initialProps: { busy: false } }
+    )
+
+    onBusyChange.current = busy => hook.rerender({ busy })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    micHandle.stop.mockResolvedValueOnce({
+      audio: new Blob(['q'], { type: 'audio/webm' }),
+      durationMs: 900,
+      heardSpeech: true
+    })
+    await act(async () => {
+      hook.result.current.stopTurn()
+    })
+    await waitFor(() => expect(hook.result.current.status).toBe('thinking'))
+
+    response = { id: 'reply-1', pending: false, text: 'A reply.' }
+    hook.rerender({ busy: false })
+    await waitFor(() => expect(hook.result.current.status).toBe('speaking'))
+
+    await act(async () => {
+      // The user stops while resolving the stream URL; stream startup then
+      // performs its own stop before returning the session.
+      $voicePlayback.set({ audioElement: null, messageId: null, sequence: 1, source: null, status: 'idle' })
+      $voicePlayback.set({ audioElement: null, messageId: null, sequence: 2, source: null, status: 'preparing' })
+      resolveStart(stream)
+      await start
+      resolveStream('done')
+      await done
+    })
+
+    await waitFor(() => expect(hook.result.current.status).toBe('idle'))
+    expect(micHandle.start).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves a startup stop when streaming falls back to whole-text playback', async () => {
+    let response: { id: string; pending: boolean; text: string } | null = null
+    const onBusyChange: { current: (busy: boolean) => void } = { current: () => undefined }
+
+    vi.mocked(startSpeechStream).mockImplementation(async () => {
+      // The user stops while the stream URL is resolving; no stream opens.
+      $voicePlayback.set({ audioElement: null, messageId: null, sequence: 1, source: null, status: 'idle' })
+
+      return null
+    })
+    $voicePlayback.set({ audioElement: null, messageId: null, sequence: 0, source: null, status: 'idle' })
+
+    const hook = renderHook(
+      ({ busy }: HookProps) =>
+        useVoiceConversation({
+          busy,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          onSubmit: vi.fn(async () => onBusyChange.current(true)),
+          onTranscribeAudio: vi.fn(async () => 'start the test'),
+          pendingResponse: () => response
+        }),
+      { initialProps: { busy: false } }
+    )
+
+    onBusyChange.current = busy => hook.rerender({ busy })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    micHandle.stop.mockResolvedValueOnce({
+      audio: new Blob(['q'], { type: 'audio/webm' }),
+      durationMs: 900,
+      heardSpeech: true
+    })
+    await act(async () => {
+      hook.result.current.stopTurn()
+    })
+    await waitFor(() => expect(hook.result.current.status).toBe('thinking'))
+
+    response = { id: 'reply-1', pending: false, text: 'A reply.' }
+    hook.rerender({ busy: false })
+
+    await waitFor(() => expect(hook.result.current.status).toBe('idle'))
+    expect(micHandle.start).toHaveBeenCalledTimes(1)
   })
 })
