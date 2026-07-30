@@ -149,11 +149,10 @@ async def test_streamed_goal_response_judges_and_sends_status_immediately(hermes
 
     GoalManager(session_entry.session_id).set("ship the feature")
     with patch("hermes_cli.goals.judge_goal", return_value=("done", "the feature shipped", False, None, False)):
-        await runner._post_turn_goal_continuation(
+        await runner._post_streamed_goal_turn(
             session_entry=session_entry,
             source=src,
             final_response="I shipped the feature.",
-            response_already_delivered=True,
         )
 
     assert len(adapter.sends) == 1

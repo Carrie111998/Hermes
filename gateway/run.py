@@ -17285,15 +17285,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # already completed platform delivery, so a post-delivery
                 # callback registered now would never fire.
                 if response.strip():
-                    try:
-                        await self._post_turn_goal_continuation(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=response,
-                            response_already_delivered=True,
-                        )
-                    except Exception as _goal_exc:
-                        logger.debug("goal continuation hook after streamed response failed: %s", _goal_exc)
+                    await self._post_streamed_goal_turn(
+                        session_entry=session_entry,
+                        source=source,
+                        final_response=response,
+                    )
                 return None
 
             return response
@@ -17994,6 +17990,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
+
+    async def _post_streamed_goal_turn(
+        self,
+        *,
+        session_entry: Any,
+        source: Any,
+        final_response: str,
+    ) -> None:
+        """Judge a response whose streaming delivery already completed.
+
+        ``_handle_message_with_agent`` returns ``None`` for an already-sent
+        response, so the ordinary outer turn hook cannot see its final text.
+        Keep this boundary explicit and tested; status delivery must be direct
+        because the adapter's post-delivery callback has already fired.
+        """
+        try:
+            await self._post_turn_goal_continuation(
+                session_entry=session_entry,
+                source=source,
+                final_response=final_response,
+                response_already_delivered=True,
+            )
+        except Exception as exc:
+            logger.debug("goal continuation hook after streamed response failed: %s", exc)
 
 
 
