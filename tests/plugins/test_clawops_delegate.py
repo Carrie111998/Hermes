@@ -1418,29 +1418,102 @@ def test_delegate_rejects_unknown_topic_without_creating_task(tmp_path, monkeypa
 
 
 def test_scheduled_delegate_resolves_explicit_context_alias(tmp_path, monkeypatch):
+    from gateway.session_context import (
+        begin_cron_run_state,
+        get_cron_functional_error,
+    )
+
+    begin_cron_run_state()
     registry = tmp_path / "registry.yaml"
     registry.write_text(
         "version: 1\ncontexts:\n"
         "  - platform: telegram\n    chat_id: chat-2\n    thread_id: '2'\n"
         "    topic_name: 二手拍賣\n    project: secondhand_commerce\n"
-        "    aliases: [auction_listing]\n    memory_namespace: topic:2/secondhand\n",
+        "    aliases: [auction_listing]\n    memory_namespace: topic:2/secondhand\n"
+        "  - platform: telegram\n    chat_id: chat-2\n    thread_id: '3'\n"
+        "    topic_name: 二手拍賣備援\n    project: secondhand_commerce\n"
+        "    aliases: [auction_listing_alt]\n"
+        "    memory_namespace: topic:3/secondhand\n",
         encoding="utf-8",
     )
     db_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_THREAD_CONTEXT_REGISTRY", str(registry))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    session_values = {
+        "HERMES_SESSION_PLATFORM": "",
+        "HERMES_SESSION_SOURCE": "cron",
+        "HERMES_SESSION_KEY": "cron:4be652d3f356",
+        "HERMES_SESSION_ID": "cron_4be652d3f356_20260730_213000",
+    }
     monkeypatch.setattr(
         "plugins.openclaw_bridge.clawops_delegate.get_session_env",
-        lambda key, default="": {"HERMES_SESSION_PLATFORM": "cron"}.get(key, default),
+        lambda key, default="": session_values.get(key, default),
     )
     args = _args()
     args["context_alias"] = "auction_listing"
-    args["request_instance_id"] = "cron-auction-listing-run-1"
     from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
 
     result = json.loads(handle_clawops_delegate(args))
     assert result["status"] == "queued"
     assert result["project"] == "secondhand_commerce"
+
+    replay = json.loads(handle_clawops_delegate(args))
+    assert replay["status"] == "queued"
+    assert replay["execution_task_id"] == result["execution_task_id"]
+    assert replay["grace_review_task_id"] == result["grace_review_task_id"]
+
+    equivalent_args = dict(args)
+    equivalent_args["context_alias"] = "  auction_listing  "
+    equivalent = json.loads(handle_clawops_delegate(equivalent_args))
+    assert equivalent["status"] == "queued"
+    assert equivalent["execution_task_id"] == result["execution_task_id"]
+
+    alternate_context_args = dict(args)
+    alternate_context_args["context_alias"] = "auction_listing_alt"
+    alternate_context = json.loads(
+        handle_clawops_delegate(alternate_context_args)
+    )
+    assert alternate_context["status"] == "queued"
+    assert alternate_context["execution_task_id"] != result["execution_task_id"]
+
+    distinct_args = dict(args)
+    distinct_args["grace_interpretation"] = "完成另一份獨立文件核對"
+    distinct_args["objective"] = "完成另一份獨立文件核對"
+    distinct_args["deliverables"] = ["另一份核對報告"]
+    distinct = json.loads(handle_clawops_delegate(distinct_args))
+    assert distinct["status"] == "queued"
+    assert distinct["execution_task_id"] != result["execution_task_id"]
+
+    spoofed_args = dict(args)
+    spoofed_args["request_instance_id"] = "550e8400-e29b-41d4-a716-446655440000"
+    spoofed = json.loads(handle_clawops_delegate(spoofed_args))
+    assert spoofed["status"] == "rejected"
+    assert "scheduler-derived instance" in spoofed["reason"]
+    assert "scheduler-derived instance" in get_cron_functional_error()
+
+    def fail_database_open(*_args, **_kwargs):
+        raise OSError("database unavailable")
+
+    with monkeypatch.context() as retry_patch:
+        retry_patch.setattr(kb, "connect_closing", fail_database_open)
+        with pytest.raises(OSError, match="database unavailable"):
+            handle_clawops_delegate(args)
+    assert get_cron_functional_error() == "database unavailable"
+
+    def fail_without_message(*_args, **_kwargs):
+        raise RuntimeError
+
+    with monkeypatch.context() as retry_patch:
+        retry_patch.setattr(kb, "connect_closing", fail_without_message)
+        empty_failure = json.loads(handle_clawops_delegate(args))
+    assert empty_failure["status"] == "rejected"
+    assert empty_failure["reason"] == "RuntimeError"
+    assert get_cron_functional_error() == "RuntimeError"
+
+    recovered = json.loads(handle_clawops_delegate(args))
+    assert recovered["status"] == "queued"
+    assert recovered["execution_task_id"] == result["execution_task_id"]
+    assert get_cron_functional_error() == ""
 
 
 def test_scheduled_high_risk_browser_delegate_gets_task_scoped_authorization(

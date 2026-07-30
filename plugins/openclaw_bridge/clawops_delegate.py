@@ -9,7 +9,10 @@ import secrets
 import time
 from typing import Any
 
-from gateway.session_context import get_session_env
+from gateway.session_context import (
+    get_session_env,
+    record_cron_functional_error,
+)
 from hermes_cli import kanban_db as kb
 from proactive.grace_task_compiler import compile_and_delegate
 from proactive.hubops_routing import (
@@ -392,11 +395,14 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
     ).strip()
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
     session_platform = platform
+    session_source = get_session_env("HERMES_SESSION_SOURCE", "").strip().lower()
+    scheduled_turn = session_source == "cron" or session_platform == "cron"
     chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
     thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
     user_id = get_session_env("HERMES_SESSION_USER_ID", "")
     session_key = get_session_env("HERMES_SESSION_KEY", "")
     session_id = get_session_env("HERMES_SESSION_ID", "")
+    trusted_cron_session_id = session_id if session_source == "cron" else ""
     message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
     message_text = get_session_env("HERMES_SESSION_MESSAGE_TEXT", "")
     internal_turn = (
@@ -512,6 +518,18 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         project = str(context["project"])
         topic_name = str(context["topic_name"])
         namespace = str(context.get("memory_namespace") or f"topic:{chat_id}:{thread_id}/{project}")
+        scheduled_identity = (
+            {
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "project": project,
+                "topic_name": topic_name,
+                "memory_namespace": namespace,
+            }
+            if scheduled_turn
+            else {}
+        )
         if (
             not internal_turn
             and origin_review_id
@@ -535,13 +553,17 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             board = None if resolved_board == kb.DEFAULT_BOARD else resolved_board
         elif requested_callback_board:
             board = requested_callback_board
-        if session_platform == "cron":
-            scheduled_identity = str(args.get("context_alias") or project).strip()
-            session_key = session_key or f"cron:{scheduled_identity}"
-            session_id = session_id or f"cron:{scheduled_identity}"
+        if scheduled_turn:
+            session_key = session_key or f"cron:{project}"
+            session_id = session_id or f"cron:{project}"
         goal, scope, verification, stop_rules, memory = _canonical_sections(args)
         task_type = str(args.get("task_type") or "")
         risk_level = str(args.get("risk_level") or "")
+        external_targets = [
+            str(item).strip()
+            for item in list(args.get("external_targets") or [])
+            if str(item).strip()
+        ]
         supplied_request_instance = str(
             args.get("request_instance_id") or ""
         ).strip()
@@ -575,7 +597,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     f"{origin_review_id}:{origin_event_id}"
                 ).encode("utf-8")
             ).hexdigest()[:32]
-        elif session_platform != "cron" and message_id:
+        elif not scheduled_turn and message_id:
             request_instance_id = "gri_" + hashlib.sha256(
                 (
                     f"message:{session_platform}:{session_key}:{message_id}"
@@ -589,7 +611,53 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     "Chat request_instance_id must match the authenticated "
                     "message-derived instance."
                 )
-        elif session_platform == "cron" and supplied_request_instance:
+        elif scheduled_turn and trusted_cron_session_id:
+            scheduled_contract_discriminator = hashlib.sha256(
+                json.dumps(
+                    {
+                        "identity": scheduled_identity,
+                        "board": str(board or "default"),
+                        "original_request": str(
+                            args.get("original_request") or ""
+                        ).strip(),
+                        "grace_interpretation": str(
+                            args.get("grace_interpretation") or ""
+                        ).strip(),
+                        "trigger": str(args.get("trigger") or "").strip(),
+                        "goal": goal,
+                        "scope": scope,
+                        "verification": verification,
+                        "stop_rules": stop_rules,
+                        "memory": memory,
+                        "task_type": task_type,
+                        "risk_level": risk_level,
+                        "completion_mode": str(
+                            args.get("completion_mode") or ""
+                        ).strip(),
+                        "external_targets": external_targets,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            request_instance_id = "gri_" + hashlib.sha256(
+                (
+                    f"cron:{trusted_cron_session_id}:"
+                    f"{scheduled_contract_discriminator}"
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+            if (
+                supplied_request_instance
+                and supplied_request_instance != request_instance_id
+            ):
+                raise ValueError(
+                    "Scheduled request_instance_id must match the trusted "
+                    "scheduler-derived instance."
+                )
+        elif scheduled_turn and supplied_request_instance:
+            # Compatibility for direct scheduled callers that predate the
+            # trusted HERMES_SESSION_SOURCE/session-id binding.
             request_instance_id = supplied_request_instance
         else:
             raise ValueError(
@@ -607,7 +675,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "request_instance_id": request_instance_id,
                 "requested_by": (
                     "trusted_scheduled_job"
-                    if session_platform == "cron"
+                    if scheduled_turn
                     else "authenticated_user"
                 ),
                 "compiled_by": "Grace",
@@ -630,11 +698,6 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             },
             "completion_mode": str(args.get("completion_mode") or "").strip(),
         }
-        external_targets = [
-            str(item).strip()
-            for item in list(args.get("external_targets") or [])
-            if str(item).strip()
-        ]
         if external_targets:
             contract["external_targets"] = external_targets
         preliminary_contract = validate_loop_contract(contract)
@@ -853,7 +916,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
         effective_approved = False
         approval_provenance: dict[str, Any] = {}
-        if session_platform == "cron" and approval_needed:
+        if scheduled_turn and approval_needed:
             raise ValueError(
                 "Scheduled jobs cannot authorize external actions with approved=true. "
                 "A persisted owner approval bound to this exact contract is required."
@@ -862,7 +925,7 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             raise ValueError(
                 "External-action delegation requires explicit external_targets."
             )
-        if session_platform != "cron" and approval_needed:
+        if not scheduled_turn and approval_needed:
             if not message_id or not session_key or not session_id:
                 raise ValueError(
                     "External-action approval requires an authenticated user context "
@@ -898,6 +961,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     board=board,
                 )
                 if replay is not None:
+                    if scheduled_turn:
+                        record_cron_functional_error("")
                     return replay
                 with kb.connect_closing(board=board) as conn:
                     challenge = kb.create_grace_approval_challenge(
@@ -1008,6 +1073,8 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             board=board,
         )
         if replay is not None:
+            if scheduled_turn:
+                record_cron_functional_error("")
             return replay
         delegation_id = str(delegation["delegation_id"])
         build_owner = "builder_" + secrets.token_hex(12)
@@ -1052,10 +1119,21 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 )
             raise
     except (ValueError, TypeError, RuntimeError) as exc:
+        reason = str(exc).strip() or type(exc).__name__
+        if scheduled_turn:
+            record_cron_functional_error(reason)
         return json.dumps(
-            {"status": "rejected", "reason": str(exc), "task_created": False},
+            {"status": "rejected", "reason": reason, "task_created": False},
             ensure_ascii=False,
         )
+    except Exception as exc:
+        if scheduled_turn:
+            record_cron_functional_error(
+                str(exc).strip() or type(exc).__name__
+            )
+        raise
+    if scheduled_turn:
+        record_cron_functional_error("")
     return json.dumps(
         {
             "status": "queued",

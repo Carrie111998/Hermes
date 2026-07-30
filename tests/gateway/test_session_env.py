@@ -125,6 +125,25 @@ def test_session_source_uses_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_SOURCE") == ""
 
 
+def test_cron_functional_error_propagates_from_copied_tool_context():
+    from contextvars import copy_context
+
+    from gateway.session_context import (
+        begin_cron_run_state,
+        get_cron_functional_error,
+        record_cron_functional_error,
+    )
+
+    begin_cron_run_state()
+    copied = copy_context()
+    copied.run(record_cron_functional_error, "delegation rejected")
+
+    assert get_cron_functional_error() == "delegation rejected"
+
+    copied.run(record_cron_functional_error, "")
+    assert get_cron_functional_error() == ""
+
+
 def test_clear_session_env_restores_previous_state(monkeypatch):
     """_clear_session_env should restore contextvars to their pre-handler values."""
     runner = object.__new__(GatewayRunner)
