@@ -165,6 +165,19 @@ class _NativeDelivery:
             cwd=_INBOX_CWD,
         )
 
+    def read_thread_initial_prompt(
+        self,
+        *,
+        thread_id: str,
+        deadline: float,
+    ) -> str:
+        assert deadline > self._clock()
+        projection = self._world.projections[thread_id]
+        first_message = projection.messages[0]
+        assert first_message.role == "user"
+        assert isinstance(first_message.content, str)
+        return first_message.content
+
     def rename_thread(
         self,
         *,

@@ -19,6 +19,7 @@ from .sidebar import (
     SidebarCandidate,
     VerifiedSidebarThread,
     build_registration_prompt,
+    decode_sidebar_registration_identity,
     sidebar_create_recovery_key,
     validate_sidebar_create_reservation,
 )
@@ -1253,6 +1254,53 @@ class SidebarExecutor:
                 lease_token=lease_token,
                 thread_id=thread_id,
                 error_code="placement_mismatch",
+            )
+
+        try:
+            initial_prompt = self._native.read_thread_initial_prompt(
+                thread_id=thread_id,
+                deadline=operation_deadline,
+            )
+            registration_identity = decode_sidebar_registration_identity(
+                initial_prompt,
+                self._marker_secret,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except NativeCreateRejected as exc:
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                thread_id=thread_id,
+                error_code=exc.code,
+            )
+        except ValueError:
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                thread_id=thread_id,
+                error_code="source_identity_mismatch",
+            )
+        except Exception:
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                thread_id=thread_id,
+                error_code="native_task_not_indexed",
+            )
+        if (
+            registration_identity.source_session_id != candidate.source_session_id
+            or registration_identity.bridge_id != candidate.bridge_id
+            or not placement_paths_equivalent(
+                registration_identity.source_cwd,
+                candidate.cwd,
+            )
+        ):
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                thread_id=thread_id,
+                error_code="source_identity_mismatch",
             )
 
         if verified.projection is not None:

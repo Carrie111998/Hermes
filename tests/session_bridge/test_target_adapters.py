@@ -18,6 +18,7 @@ if os.name == "nt" and "USERPROFILE" not in os.environ:
     os.environ["USERPROFILE"] = os.environ["HOME"]
 
 import session_bridge.characterize as characterize_module
+import session_bridge.sidebar as sidebar_module
 from session_bridge.claude_adapter import (
     AmbiguousPlaceholderCreation,
     ClaudeSourceAdapter,
@@ -50,7 +51,12 @@ from session_bridge.models import (
     SessionProjection,
     encode_bridge_marker,
 )
-from session_bridge.sidebar import VerifiedSidebarThread
+from session_bridge.sidebar import (
+    SidebarCandidate,
+    VerifiedSidebarThread,
+    build_registration_prompt,
+    sidebar_bridge_id,
+)
 
 
 SECRET = b"target-adapter-test-secret"
@@ -504,6 +510,68 @@ def _sidebar_expected(
         target_provider=Provider.CODEX,
         policy_generation=1,
     )
+
+
+def _registration_prompt(*, cwd: str) -> str:
+    source_session_id = "claude:source-1"
+    candidate = SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=Provider.CLAUDE,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title="[Claude] Source identity",
+        cwd=cwd,
+        git_root=cwd,
+        git_branch="main",
+        git_head="a" * 40,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=candidate.bridge_id,
+            source_session_id=source_session_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        SECRET,
+    )
+    return build_registration_prompt(candidate, marker)
+
+
+def test_decode_sidebar_registration_identity_authenticates_exact_metadata(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    prompt = _registration_prompt(cwd=str(source.resolve()))
+
+    identity = sidebar_module.decode_sidebar_registration_identity(
+        prompt,
+        SECRET,
+    )
+    assert identity.source_session_id == "claude:source-1"
+    assert identity.source_cwd == str(source.resolve())
+    assert identity.bridge_id == sidebar_bridge_id("claude:source-1")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda prompt: prompt + "\nextra",
+        lambda prompt: prompt.replace("Source cwd: ", "Source directory: ", 1),
+        lambda _prompt: _registration_prompt(cwd="../noncanonical"),
+    ],
+)
+def test_decode_sidebar_registration_identity_rejects_malformed_or_noncanonical_prompt(
+    tmp_path: Path,
+    mutate,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    prompt = mutate(_registration_prompt(cwd=str(source.resolve())))
+
+    with pytest.raises(ValueError, match="registration identity"):
+        sidebar_module.decode_sidebar_registration_identity(prompt, SECRET)
 
 
 def test_sidebar_thread_verifier_reads_only_exact_authenticated_thread() -> None:
@@ -1119,6 +1187,36 @@ def test_sidebar_recovery_key_lookup_rejects_matching_thread_in_wrong_cwd(
         verifier.find_by_recovery_key(
             recovery_key,
             expected_cwd=str(expected_cwd),
+            deadline=30.0,
+        )
+
+    assert raised.value.code == "codex_thread_conflict"
+
+
+def test_sidebar_recovery_key_lookup_rejects_source_cwd_instead_of_inbox(
+    tmp_path: Path,
+) -> None:
+    recovery_key = "hermes-session-bridge-create-v1:source-instead-of-inbox"
+    inbox_cwd = tmp_path / "inbox"
+    source_cwd = tmp_path / "source"
+    inbox_cwd.mkdir()
+    source_cwd.mkdir()
+    row = _codex_inventory(cwd=str(source_cwd.resolve()))["data"][0]
+    row["threadSource"] = recovery_key
+    client = FakeRequestClient({
+        "thread/list": [{"data": [row]}, {"data": []}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_recovery_key(
+            recovery_key,
+            expected_cwd=str(inbox_cwd.resolve()),
             deadline=30.0,
         )
 

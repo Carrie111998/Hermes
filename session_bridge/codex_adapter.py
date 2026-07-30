@@ -32,6 +32,10 @@ from .claude_adapter import (
     _same_filesystem_location,
 )
 from .sidebar import VerifiedSidebarThread
+from .sidebar_placement import (
+    filesystem_path_identity,
+    placement_paths_equivalent,
+)
 
 
 _PARSER_VERSION = 1
@@ -336,10 +340,7 @@ class SidebarThreadVerifier:
         cwd = _nonempty_string(expected_cwd)
         if cwd is None or cwd != expected_cwd:
             raise ValueError("Codex recovery cwd is malformed")
-        try:
-            if not Path(cwd).expanduser().is_absolute():
-                raise ValueError("Codex recovery cwd must be absolute")
-        except (OSError, TypeError, ValueError):
+        if filesystem_path_identity(cwd) is None:
             raise ValueError("Codex recovery cwd must be absolute") from None
         try:
             summaries = self._source_adapter.list_sidebar_inventory(
@@ -353,7 +354,7 @@ class SidebarThreadVerifier:
         except Exception:
             raise SidebarVerificationError("bridge_temporarily_unavailable") from None
         matches = [summary for summary in summaries if summary.thread_source == key]
-        if any(not _same_filesystem_location(summary.cwd, cwd) for summary in matches):
+        if any(not placement_paths_equivalent(summary.cwd, cwd) for summary in matches):
             raise SidebarVerificationError("codex_thread_conflict")
         native_ids = {summary.native_id for summary in matches}
         if len(native_ids) > 1:

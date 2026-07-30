@@ -1703,6 +1703,7 @@ class FakeNative:
         after_create: Callable[[], None] | None = None,
         register_error: Exception | None = None,
         preflight_error: Exception | None = None,
+        initial_prompt: str | None = None,
     ) -> None:
         self.events = events
         self.create_result = create_result
@@ -1713,10 +1714,12 @@ class FakeNative:
         self.after_create = after_create
         self.register_error = register_error
         self.preflight_error = preflight_error
+        self.initial_prompt = initial_prompt
         self.preflight_calls = 0
         self.create_calls = 0
         self.created_prompts: list[str] = []
         self.registered_prompts: list[str] = []
+        self.initial_prompt_reads: list[str] = []
 
     def preflight(self, *, deadline: float) -> None:
         del deadline
@@ -1781,6 +1784,15 @@ class FakeNative:
             status=NativeThreadStatus(status),
             cwd=self.read_cwd,
         )
+
+    def read_thread_initial_prompt(
+        self, *, thread_id: str, deadline: float
+    ) -> str:
+        del deadline
+        self.initial_prompt_reads.append(thread_id)
+        if self.initial_prompt is not None:
+            return self.initial_prompt
+        return self.registered_prompts[-1]
 
     def rename_thread(self, *, thread_id: str, title: str, deadline: float) -> None:
         assert title.startswith("[Claude]")
@@ -1915,6 +1927,69 @@ def test_final_verification_rejects_projection_in_source_placement() -> None:
         error_code="placement_mismatch",
     )
     assert not any(event[0] in {"index", "rename", "commit"} for event in events)
+
+
+def test_final_verification_rejects_authenticated_registration_source_cwd_mismatch() -> (
+    None
+):
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+    expected = BridgeMarkerPayload(
+        bridge_id=sidebar_bridge_id(SOURCE_1),
+        source_session_id=SOURCE_1,
+        target_provider=Provider.CODEX,
+        policy_generation=1,
+    )
+    marker = encode_bridge_marker(expected, SECRET)
+    wrong_source = (
+        "C:/other-source" if os.name == "nt" else "/srv/other-session-source"
+    )
+    initial_prompt = build_registration_prompt(
+        _candidate(SOURCE_1, cwd=wrong_source),
+        marker,
+    )
+    native = FakeNative(events, initial_prompt=initial_prompt)
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="failed",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+        error_code="source_identity_mismatch",
+    )
+    assert native.initial_prompt_reads == [THREAD_1]
+    assert not any(event[0] in {"index", "rename", "commit"} for event in events)
+
+
+def test_final_verification_accepts_exact_inbox_and_authenticated_source_identity() -> (
+    None
+):
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+    native = FakeNative(events)
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="visible",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+    )
+    assert native.initial_prompt_reads == [THREAD_1]
+    assert store.failures == []
 
 
 def test_idle_cycle_records_broker_heartbeat_under_the_executor_lock() -> None:

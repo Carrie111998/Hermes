@@ -24,6 +24,7 @@ from .models import (
     canonical_session_id,
     decode_bridge_marker,
 )
+from .sidebar_placement import filesystem_path_identity
 
 
 ACK_OR_CONTROL_ONLY = frozenset({
@@ -94,6 +95,13 @@ class SidebarCandidate:
     git_head: str | None
     worktree_id: str | None
     eligible_at: float
+
+
+@dataclass(frozen=True)
+class SidebarRegistrationIdentity:
+    source_session_id: str
+    source_cwd: str
+    bridge_id: str
 
 
 @dataclass(frozen=True)
@@ -512,42 +520,56 @@ def classify_sidebar_initial_prompt(
 
     if type(marker_secret) is not bytes or not marker_secret:
         raise ValueError("sidebar marker secret must be non-empty bytes")
-    if not isinstance(value, str):
+    exact = _exact_registration_and_kind(value)
+    if exact is None:
         return SidebarInitialPromptKind.UNRELATED
-
-    if _is_exact_registration_block(value):
-        registration = value
-        kind = SidebarInitialPromptKind.LEGACY_PLACEHOLDER
-    elif (
-        value.count(_READABLE_REGISTRATION_DELIMITER) == 1
-        and is_registration_prompt(value)
-    ):
-        _rendered, bridge_block = value.split(
-            _READABLE_REGISTRATION_DELIMITER,
-            1,
-        )
-        bridge_lines = bridge_block.split("\n")
-        registration = "\n".join(bridge_lines[4:])
-        kind = SidebarInitialPromptKind.READABLE_REGISTRATION
-    else:
-        return SidebarInitialPromptKind.UNRELATED
-
-    lines = registration.split("\n")
     try:
+        decode_sidebar_registration_identity(value, marker_secret)
+    except ValueError:
+        return SidebarInitialPromptKind.UNRELATED
+    return exact[1]
+
+
+def decode_sidebar_registration_identity(
+    prompt: object,
+    marker_secret: bytes,
+) -> SidebarRegistrationIdentity:
+    """Decode exact registration metadata only after marker authentication."""
+
+    try:
+        if type(marker_secret) is not bytes or not marker_secret:
+            raise ValueError
+        exact = _exact_registration_and_kind(prompt)
+        if exact is None:
+            raise ValueError
+        registration, _kind = exact
+        lines = registration.split("\n")
         marker = _prompt_line_value(lines[2], "Signed marker: ")
         source = _decode_canonical_prompt_field(lines[3], "Source session ID: ")
+        source_cwd = _decode_canonical_prompt_field(lines[5], "Source cwd: ")
         payload = decode_bridge_marker(marker, marker_secret)
         if (
             not isinstance(source, str)
+            or not isinstance(source_cwd, str)
+            or (
+                filesystem_path_identity(source_cwd, platform="windows") is None
+                and filesystem_path_identity(source_cwd, platform="posix") is None
+            )
             or payload.source_session_id != source
             or payload.bridge_id != sidebar_bridge_id(source)
             or payload.target_provider is not Provider.CODEX
             or payload.policy_generation != 1
         ):
-            return SidebarInitialPromptKind.UNRELATED
-    except (InvalidBridgeMarker, TypeError, ValueError):
-        return SidebarInitialPromptKind.UNRELATED
-    return kind
+            raise ValueError
+        return SidebarRegistrationIdentity(
+            source_session_id=source,
+            source_cwd=source_cwd,
+            bridge_id=payload.bridge_id,
+        )
+    except (InvalidBridgeMarker, TypeError, ValueError) as exc:
+        raise ValueError(
+            "sidebar registration identity is malformed or unauthenticated"
+        ) from exc
 
 
 def build_hydration_message(
@@ -852,6 +874,29 @@ def _is_exact_registration_block(value: object) -> bool:
         return build_registration_prompt(candidate, marker) == value
     except (TypeError, ValueError):
         return False
+
+
+def _exact_registration_and_kind(
+    value: object,
+) -> tuple[str, SidebarInitialPromptKind] | None:
+    if not isinstance(value, str):
+        return None
+    if _is_exact_registration_block(value):
+        return value, SidebarInitialPromptKind.LEGACY_PLACEHOLDER
+    if (
+        value.count(_READABLE_REGISTRATION_DELIMITER) != 1
+        or not is_registration_prompt(value)
+    ):
+        return None
+    _rendered, bridge_block = value.split(
+        _READABLE_REGISTRATION_DELIMITER,
+        1,
+    )
+    bridge_lines = bridge_block.split("\n")
+    return (
+        "\n".join(bridge_lines[4:]),
+        SidebarInitialPromptKind.READABLE_REGISTRATION,
+    )
 
 
 def _prompt_line_value(line: str, prefix: str) -> str:
