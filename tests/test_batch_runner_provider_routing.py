@@ -39,6 +39,7 @@ def test_explicit_api_key_and_base_url_take_precedence(monkeypatch):
     assert runtime == {
         "model": "gpt-5.5",
         "provider": None,
+        "requested_provider": None,
         "api_mode": None,
         "api_key": "sk-explicit",
         "base_url": "https://gateway.example/v1",
@@ -97,6 +98,7 @@ def test_missing_runtime_fields_inherit_configured_codex(monkeypatch):
     ]
     assert runtime["model"] == "gpt-5.5"
     assert runtime["provider"] == "openai-codex"
+    assert runtime["requested_provider"] == "openai-codex"
     assert runtime["api_mode"] == "codex_responses"
     assert runtime["base_url"] == "https://chatgpt.com/backend-api/codex"
     assert runtime["api_key"] == "jwt-token"
@@ -151,9 +153,114 @@ def test_real_runtime_resolution_inherits_codex_from_temp_hermes_home(
 
     assert runtime["model"] == "gpt-5.5"
     assert runtime["provider"] == "openai-codex"
+    assert runtime["requested_provider"] == "openai-codex"
     assert runtime["api_mode"] == "codex_responses"
     assert runtime["base_url"] == "https://chatgpt.com/backend-api/codex"
     assert runtime["api_key"] == "test-codex-access-token"
+
+
+def test_named_custom_provider_uses_resolved_model_and_preserves_identity(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "custom:relay",
+                "default": "relay",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "model": "actual-wire-model",
+            "provider": "custom",
+            "requested_provider": "custom:relay",
+            "api_mode": "chat_completions",
+            "api_key": "relay-key",
+            "base_url": "https://relay.example/v1",
+            "source": "custom_provider:relay",
+        },
+    )
+
+    runtime = batch_runner._resolve_batch_runtime(
+        {
+            "model": None,
+            "provider": None,
+            "api_mode": None,
+            "api_key": None,
+            "base_url": None,
+        }
+    )
+
+    assert runtime["model"] == "actual-wire-model"
+    assert runtime["provider"] == "custom"
+    assert runtime["requested_provider"] == "custom:relay"
+
+
+def test_real_named_custom_provider_resolution_uses_wire_model(
+    tmp_path,
+    monkeypatch,
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom:relay\n"
+        "  default: relay\n"
+        "providers:\n"
+        "  relay:\n"
+        "    base_url: https://relay.example/v1\n"
+        "    api_key: relay-key\n"
+        "    default_model: actual-wire-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    runtime = batch_runner._resolve_batch_runtime(
+        {
+            "model": None,
+            "provider": None,
+            "api_mode": None,
+            "api_key": None,
+            "base_url": None,
+        }
+    )
+
+    assert runtime["model"] == "actual-wire-model"
+    assert runtime["provider"] == "custom"
+    assert runtime["requested_provider"] == "custom:relay"
+    assert runtime["base_url"] == "https://relay.example/v1"
+    assert runtime["api_key"] == "relay-key"
+
+
+def test_explicit_model_wins_over_named_provider_default(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "model": "provider-default-model",
+            "provider": "custom",
+            "requested_provider": "custom:relay",
+            "api_mode": "chat_completions",
+            "api_key": "relay-key",
+            "base_url": "https://relay.example/v1",
+            "source": "custom_provider:relay",
+        },
+    )
+
+    runtime = batch_runner._resolve_batch_runtime(
+        {
+            "model": "user-selected-model",
+            "provider": "custom:relay",
+            "api_mode": None,
+            "api_key": None,
+            "base_url": None,
+        }
+    )
+
+    assert runtime["model"] == "user-selected-model"
+    assert runtime["requested_provider"] == "custom:relay"
 
 
 def test_partial_explicit_runtime_uses_configured_provider(monkeypatch):
@@ -293,6 +400,7 @@ def test_process_prompt_passes_resolved_provider_transport_and_pool(monkeypatch)
         lambda _config: {
             "model": "gpt-5.5",
             "provider": "openai-codex",
+            "requested_provider": "openai-codex",
             "api_mode": "codex_responses",
             "api_key": "jwt-token",
             "base_url": "https://chatgpt.com/backend-api/codex",
@@ -330,6 +438,7 @@ def test_process_prompt_passes_resolved_provider_transport_and_pool(monkeypatch)
     assert result["success"] is True
     assert captured["model"] == "gpt-5.5"
     assert captured["provider"] == "openai-codex"
+    assert captured["requested_provider"] == "openai-codex"
     assert captured["api_mode"] == "codex_responses"
     assert captured["base_url"] == "https://chatgpt.com/backend-api/codex"
     assert captured["api_key"] == "jwt-token"

@@ -128,6 +128,7 @@ def _resolve_batch_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "model": model,
             "provider": provider,
+            "requested_provider": provider,
             "api_mode": api_mode,
             "api_key": api_key,
             "base_url": base_url,
@@ -158,9 +159,37 @@ def _resolve_batch_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
         explicit_base_url=base_url,
         target_model=model,
     )
+    resolved_requested_provider = (
+        _optional_text(runtime.get("requested_provider"))
+        or requested_provider
+        or configured_provider
+        or _optional_text(runtime.get("provider"))
+    )
+    provider_aliases = {
+        alias.lower()
+        for alias in (
+            provider,
+            requested_provider,
+            configured_provider,
+            resolved_requested_provider,
+        )
+        if alias
+    }
+    provider_aliases.update(
+        alias.split(":", 1)[1]
+        for alias in tuple(provider_aliases)
+        if alias.startswith("custom:") and alias.split(":", 1)[1]
+    )
+    runtime_model = _optional_text(runtime.get("model"))
+    effective_model = (
+        runtime_model
+        if runtime_model and model.lower() in provider_aliases
+        else model
+    )
     return {
-        "model": model,
+        "model": effective_model,
         "provider": _optional_text(runtime.get("provider")),
+        "requested_provider": resolved_requested_provider,
         "api_mode": api_mode or _optional_text(runtime.get("api_mode")),
         "api_key": runtime.get("api_key"),
         "base_url": _optional_text(runtime.get("base_url")),
@@ -474,6 +503,7 @@ def _process_single_prompt(
             base_url=runtime["base_url"],
             api_key=runtime["api_key"],
             provider=runtime["provider"],
+            requested_provider=runtime.get("requested_provider"),
             api_mode=runtime["api_mode"],
             credential_pool=runtime["credential_pool"],
             model=runtime["model"],
