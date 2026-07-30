@@ -13,16 +13,14 @@ import {
 
 function payload(text = 'log duty') {
   return {
-    version: 1 as const,
+    version: 2 as const,
     event_id: 'event-1',
-    issued_at: '2026-07-21T15:00:00.000Z',
+    observed_at: '2026-07-21T15:00:00.000Z',
     installation_id: 'install-1',
     os_account: 'darwin:501',
     app_identity: 'TEAM:io.hermes.desktop',
     app_instance_id: 'instance-1',
-    profile: 'default',
     window_id: '7',
-    session_id: 'session-1',
     text_hash: desktopTextHash(text)
   }
 }
@@ -33,24 +31,24 @@ test('desktop prompt signatures bind every payload field', () => {
   const signature = signDesktopPayload(keys.privateKeyPem, signed)
 
   assert.equal(verifyDesktopPayload(keys.publicKeyPem, signed, signature), true)
-  assert.equal(verifyDesktopPayload(keys.publicKeyPem, { ...signed, profile: 'other' }, signature), false)
+  assert.equal(verifyDesktopPayload(keys.publicKeyPem, { ...signed, window_id: '8' }, signature), false)
   assert.match(desktopPublicKeyFingerprint(keys.publicKeyPem), /^[a-f0-9]{64}$/)
 })
 
-test('trusted gesture is one-use and recovery cannot change text or profile', () => {
+test('trusted gesture is route-independent, recoverable, and immutable', () => {
   const ledger = new TrustedGestureLedger()
   const now = 1_000
   const firstHash = desktopTextHash('first')
 
-  assert.equal(ledger.eventIdFor(7, firstHash, 'default', 'session-1', now), null)
-  ledger.note(7, firstHash, now)
-  const eventId = ledger.eventIdFor(7, firstHash, 'default', 'session-1', now + 1)
+  const begun = ledger.begin(7, '3', firstHash, now)
 
-  assert.ok(eventId)
-  assert.equal(ledger.eventIdFor(7, firstHash, 'default', 'session-1', now + 2), eventId)
-  assert.equal(ledger.eventIdFor(7, firstHash, 'default', 'session-2', now + 2), null)
-  assert.equal(ledger.eventIdFor(7, desktopTextHash('changed'), 'default', 'session-1', now + 2), null)
-  assert.equal(ledger.eventIdFor(7, firstHash, 'other', 'session-1', now + 2), null)
+  assert.ok(begun)
+  assert.deepEqual(ledger.mint(7, begun.gestureToken, firstHash, now + 1), begun)
+  assert.deepEqual(ledger.mint(7, begun.gestureToken, firstHash, now + 60_000), begun)
+  assert.equal(ledger.mint(8, begun.gestureToken, firstHash, now + 2), null)
+  assert.equal(ledger.mint(7, begun.gestureToken, desktopTextHash('changed'), now + 2), null)
+  assert.equal('profile' in payload(), false)
+  assert.equal('session_id' in payload(), false)
 })
 
 test('trusted composer gesture cannot authorize substituted renderer text', () => {
@@ -58,7 +56,29 @@ test('trusted composer gesture cannot authorize substituted renderer text', () =
   const now = 1_000
   const intended = desktopTextHash('log my duty')
 
-  ledger.note(7, intended, now)
-  assert.equal(ledger.eventIdFor(7, desktopTextHash('delete everything'), 'default', 'session-1', now + 1), null)
-  assert.ok(ledger.eventIdFor(7, intended, 'default', 'session-1', now + 2))
+  const begun = ledger.begin(7, '3', intended, now)
+
+  assert.ok(begun)
+  assert.equal(
+    ledger.mint(7, begun.gestureToken, desktopTextHash('delete everything'), now + 1),
+    null
+  )
+  assert.ok(ledger.mint(7, begun.gestureToken, intended, now + 2))
+})
+
+test('retired, expired, and superseded gestures fail closed', () => {
+  const ledger = new TrustedGestureLedger()
+  const now = 1_000
+  const textHash = desktopTextHash('log my duty')
+  const first = ledger.begin(7, '3', textHash, now)
+
+  assert.ok(first)
+  assert.equal(ledger.retire(7, first.gestureToken, first.eventId), true)
+  assert.equal(ledger.mint(7, first.gestureToken, textHash, now + 1), null)
+
+  const second = ledger.begin(7, '3', textHash, now + 1_000)
+
+  assert.ok(second)
+  assert.notEqual(second.eventId, first.eventId)
+  assert.equal(ledger.mint(7, second.gestureToken, textHash, now + 10 * 60_000 + 1_001), null)
 })

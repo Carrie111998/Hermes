@@ -392,6 +392,44 @@ class TestAgentExecution:
             task_id="session-123",
         )
 
+    @pytest.mark.asyncio
+    async def test_run_agent_scopes_proxy_surface_context_to_one_turn(self, adapter):
+        seen = {}
+        mock_agent = MagicMock()
+
+        def run_conversation(**_kwargs):
+            seen["context"] = dict(mock_agent._gateway_event_context)
+            seen["platform"] = mock_agent.platform
+            seen["user_id"] = mock_agent._user_id
+            return {"final_response": "ok"}
+
+        mock_agent.platform = "api_server"
+        mock_agent._user_id = ""
+        mock_agent.run_conversation.side_effect = run_conversation
+        surface_context = {
+            "platform": "telegram",
+            "sender_id": "42",
+            "accepted_text": "hello",
+            "source_messages": [{"raw_event_id": "event-1"}],
+        }
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+                surface_context=surface_context,
+            )
+
+        assert seen == {
+            "context": surface_context,
+            "platform": "telegram",
+            "user_id": "42",
+        }
+        assert mock_agent._gateway_event_context == {}
+        assert mock_agent.platform == "api_server"
+        assert mock_agent._user_id == ""
+
 
 class TestRunEventCallback:
 
@@ -742,6 +780,62 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 400
             data = await resp.json()
             assert "messages" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_authenticated_gateway_proxy_context_reaches_agent(self, auth_adapter):
+        surface_context = {
+            "platform": "telegram",
+            "sender_id": "42",
+            "accepted_text": "hello",
+            "source_messages": [{"raw_event_id": "event-1"}],
+        }
+
+        async def _mock_run_agent(**_kwargs):
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                auth_adapter, "_run_agent", side_effect=_mock_run_agent
+            ) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Gateway-Proxy": "1",
+                    },
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "hermes_surface_context": surface_context,
+                    },
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["surface_context"] == surface_context
+
+    @pytest.mark.asyncio
+    async def test_gateway_proxy_context_requires_configured_auth(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Gateway-Proxy": "1"},
+                json={
+                    "model": "test",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "hermes_surface_context": {
+                        "platform": "telegram",
+                        "accepted_text": "hello",
+                        "source_messages": [{"raw_event_id": "event-1"}],
+                    },
+                },
+            )
+
+        assert resp.status == 403
 
 
     @pytest.mark.asyncio
@@ -2616,5 +2710,4 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
 

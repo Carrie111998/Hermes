@@ -87,6 +87,9 @@ async def test_near_limit_command_is_batched_not_dispatched():
     # Must NOT dispatch immediately — a continuation chunk is almost certain.
     adapter.handle_message.assert_not_awaited()
     assert len(adapter._pending_text_batches) == 1
+    pending = next(iter(adapter._pending_text_batches.values()))
+    occurred_at = pending.metadata["platform_event_members"][0]["occurred_at"]
+    assert occurred_at.endswith("+00:00")
 
 
 @pytest.mark.asyncio

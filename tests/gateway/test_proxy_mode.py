@@ -159,11 +159,16 @@ class TestRunAgentProxyDispatch:
             session_id="test-session-123",
             session_key="test-key",
             run_generation=7,
+            surface_context={"platform": "matrix", "source_messages": [{}]},
         )
 
         assert result["final_response"] == "Hello from remote!"
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
+        assert runner._run_agent_via_proxy.call_args.kwargs["surface_context"] == {
+            "platform": "matrix",
+            "source_messages": [{}],
+        }
 
 
 class TestRunAgentViaProxy:
@@ -175,6 +180,11 @@ class TestRunAgentViaProxy:
         monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
         runner = _make_runner()
         source = _make_source()
+        surface_context = {
+            "platform": "matrix",
+            "accepted_text": "How are you?",
+            "source_messages": [{"raw_event_id": "event-1"}],
+        }
 
         resp = _FakeSSEResponse(
             status=200,
@@ -198,6 +208,7 @@ class TestRunAgentViaProxy:
                         ],
                         source=source,
                         session_id="session-abc",
+                        surface_context=surface_context,
                     )
 
         # Verify request URL
@@ -208,6 +219,8 @@ class TestRunAgentViaProxy:
 
         # Verify session ID header
         assert session.captured_headers["X-Hermes-Session-Id"] == "session-abc"
+        assert session.captured_headers["X-Hermes-Gateway-Proxy"] == "1"
+        assert session.captured_json["hermes_surface_context"] == surface_context
 
         # Verify messages include system, history, and current message
         messages = session.captured_json["messages"]
@@ -221,6 +234,36 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_omits_surface_context_without_authenticated_proxy(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://generic:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        runner = _make_runner()
+        response = _FakeSSEResponse(
+            status=200,
+            sse_chunks=["data: [DONE]\n\n"],
+        )
+        session = _FakeSession(response)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    await runner._run_agent_via_proxy(
+                        message="hello",
+                        context_prompt="",
+                        history=[],
+                        source=_make_source(),
+                        session_id="session-abc",
+                        surface_context={
+                            "platform": "matrix",
+                            "accepted_text": "hello",
+                            "source_messages": [{"raw_event_id": "event-1"}],
+                        },
+                    )
+
+        assert "X-Hermes-Gateway-Proxy" not in session.captured_headers
+        assert "hermes_surface_context" not in session.captured_json
 
 
     @pytest.mark.asyncio
@@ -294,4 +337,3 @@ class TestEnvVarRegistration:
         info = OPTIONAL_ENV_VARS["GATEWAY_PROXY_URL"]
         assert info["category"] == "messaging"
         assert info["password"] is False
-

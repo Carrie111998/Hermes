@@ -382,7 +382,9 @@ def register(ctx):
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility — new parameters may be added in future versions without breaking your plugin.
 - If a callback **crashes**, it's logged and skipped. Other hooks and the agent continue normally. A misbehaving plugin can never break the agent.
-- Two hooks' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, and [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call. All other hooks are fire-and-forget observers.
+- Return values are event-specific. The quick reference below identifies the
+  hooks that block, rewrite, inject, or verify context; hooks marked `ignored`
+  are fire-and-forget observers.
 - Observer callbacks receive `telemetry_schema_version` automatically. When present, `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are separate correlation fields. Treat `api_request_id` as an opaque identifier; do not parse its string format.
 
 ### Quick reference
@@ -400,6 +402,8 @@ def register(ctx):
 | [`on_session_reset`](#on_session_reset) | Gateway swaps in a fresh session key (e.g. `/new`, `/reset`) | ignored |
 | [`subagent_start`](#subagent_start) | A `delegate_task` child has been constructed and is about to run | ignored |
 | [`subagent_stop`](#subagent_stop) | A `delegate_task` child has exited | ignored |
+| [`pre_platform_event_enqueue`](#pre_platform_event_enqueue) | A supported platform adapter is about to debounce or aggregate an inbound event | ignored |
+| [`pre_prompt_submit`](#pre_prompt_submit) | Desktop accepted a signed prompt gesture, after text sanitization and authoritative route lookup | Exactly one `{"surface_context": dict}` result may attach verified turn context |
 | [`pre_gateway_dispatch`](#pre_gateway_dispatch) | Gateway received a user message, before auth + dispatch | `{"action": "skip" \| "rewrite" \| "allow", ...}` to influence flow |
 | [`pre_approval_request`](#pre_approval_request) | An approval decision is requested, including smart-mode auto decisions | ignored |
 | [`post_approval_response`](#post_approval_response) | An approval decision is made (or a prompt times out) | ignored |
@@ -1005,6 +1009,66 @@ def register(ctx):
 :::info
 With heavy delegation (e.g. orchestrator roles × 5 leaves × nested depth), `subagent_stop` fires many times per turn. Keep your callback fast; push expensive work to a background queue.
 :::
+
+---
+
+### `pre_platform_event_enqueue`
+
+Fires immediately before a supported platform adapter places a user-authored
+event into an adapter-side debounce or aggregation queue. Telegram text and
+long-command batching currently use this seam.
+
+```python
+def my_callback(event, adapter, **kwargs):
+```
+
+The callback receives the normalized `MessageEvent` and active platform
+adapter. Its return value is ignored. A plugin may durably record identifiers
+or add bounded, non-authorizing metadata to the event, but it must not treat
+this observer hook as permission to execute an action. Hook failures are logged
+and ordinary message delivery continues.
+
+For adapters that aggregate multiple events, each member crosses this hook
+before aggregation. The gateway later carries the ordered member metadata and
+accepted text into that turn's internal surface context. When gateway proxy
+mode is active, this context crosses to the remote Hermes API peer only when
+`GATEWAY_PROXY_KEY` authentication is configured.
+
+---
+
+### `pre_prompt_submit`
+
+Fires for a Desktop `prompt.submit` only when the packaged Desktop supplied a
+signed, main-process provenance envelope. It runs after gateway session lookup
+and input sanitization, before queueing or agent dispatch.
+
+```python
+def my_callback(
+    provenance: dict,
+    session_id: str,
+    task_id: str,
+    raw_user_message: str,
+    accepted_user_message: str,
+    user_message: str,
+    profile: str,
+    platform: str,
+    **kwargs,
+):
+```
+
+`raw_user_message` is the exact renderer text covered by Desktop provenance.
+`accepted_user_message` and its compatibility alias `user_message` are the
+sanitized text the gateway accepted. `profile`, `session_id`, and `task_id`
+come from the gateway route, not from the signed gesture.
+
+A verifier may return exactly `{"surface_context": {...}}`. Hermes attaches the
+context only when exactly one plugin returns a valid result, its
+`accepted_text` exactly matches `accepted_user_message`, and it contains one to
+sixteen dictionary `source_messages`. Missing or invalid provenance, verifier
+errors, multiple authorities, or mismatched text leave ordinary chat unchanged.
+
+This is a product-neutral verification seam. Third-party protocols, action
+types, and status experiences belong in standalone plugins.
 
 ---
 

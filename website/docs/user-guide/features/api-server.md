@@ -665,4 +665,11 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 
 The API server also serves as the backend for **gateway proxy mode**. When another Hermes gateway instance is configured with `GATEWAY_PROXY_URL` pointing at this API server, it forwards all messages here instead of running its own agent. This enables split deployments — for example, a Docker container handling Matrix E2EE that relays to a host-side agent.
 
+Authenticated Hermes-to-Hermes proxies also preserve plugin-verified platform
+surface context for the current turn. The thin gateway sends that extension
+only when `GATEWAY_PROXY_KEY` is configured, and the API server accepts it only
+when the bearer key is enabled and the explicit Hermes proxy marker is present.
+Without proxy authentication, ordinary chat still works but the optional
+verified context is omitted so dependent plugin capabilities fail closed.
+
 See [Matrix Proxy Mode](/user-guide/messaging/matrix#proxy-mode-e2ee-on-macos) for the full setup guide.

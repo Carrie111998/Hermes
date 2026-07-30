@@ -1,4 +1,4 @@
-import { execFile, execFileSync, spawn, spawnSync } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -77,6 +77,10 @@ import {
 } from './connection-config'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
+import {
+  cacheAsyncResult,
+  resolveMacCodeSigningIdentity
+} from './desktop-app-identity'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import {
   desktopPublicKeyFingerprint,
@@ -6815,7 +6819,7 @@ function readDesktopConnectionConfig() {
   // Check if file changed on disk since last read (e.g. modified by another
   // process or an external tool).  Our own writes update the cache inline
   // via writeDesktopConnectionConfig, but external changes would be missed.
-  let mtime = null
+  let mtime: null | number
 
   try {
     mtime = fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs
@@ -6897,45 +6901,31 @@ function writeActiveDesktopProfile(name) {
   return value || null
 }
 
-let directActionAppIdentityCache = null
-
-function directActionAppIdentity() {
-  if (directActionAppIdentityCache) {
-    return directActionAppIdentityCache
-  }
-
-  if (!IS_PACKAGED) {
-    throw new Error('desktop direct-action provenance is disabled for development builds')
-  }
-
-  if (!IS_MAC) {
-    throw new Error('desktop direct-action provenance requires verified macOS code signing')
-  }
-
-  const bundlePath = path.resolve(path.dirname(process.execPath), '../..')
-  const verified = spawnSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', bundlePath], {
-    encoding: 'utf8',
-    timeout: 5_000
+function runCodesign(args): Promise<{
+  error: Error | null
+  stderr: string
+  stdout: string
+}> {
+  return new Promise(resolve => {
+    execFile(
+      '/usr/bin/codesign',
+      args,
+      { encoding: 'utf8', timeout: 5_000 },
+      (error, stdout, stderr) => {
+        resolve({ error, stderr: stderr || '', stdout: stdout || '' })
+      }
+    )
   })
-  const result = spawnSync('/usr/bin/codesign', ['-dv', '--verbose=4', bundlePath], {
-    encoding: 'utf8',
-    timeout: 5_000
-  })
-  const details = `${result.stdout || ''}\n${result.stderr || ''}`
-  const identifier = details.match(/^Identifier=(.+)$/m)?.[1]?.trim() || ''
-  const team = details.match(/^TeamIdentifier=(.+)$/m)?.[1]?.trim() || ''
-
-  if (verified.status !== 0 || !identifier || !team || team === 'not set') {
-    throw new Error('desktop application signing identity is unavailable')
-  }
-
-  // The installation signing key is the revocable enrollment credential. Keep the
-  // code-signing identity stable across normal app updates so in-flight status
-  // deliveries remain claimable after an upgrade.
-  directActionAppIdentityCache = `${team}:${identifier}`
-
-  return directActionAppIdentityCache
 }
+
+const directActionAppIdentity = cacheAsyncResult(() =>
+  resolveMacCodeSigningIdentity({
+    bundlePath: path.resolve(path.dirname(process.execPath), '../..'),
+    isMac: IS_MAC,
+    isPackaged: IS_PACKAGED,
+    runCodesign
+  })
+)
 
 function readOrCreateDirectActionIdentity() {
   let stored = null
@@ -6955,7 +6945,9 @@ function readOrCreateDirectActionIdentity() {
     stored = JSON.parse(fs.readFileSync(DIRECT_ACTION_IDENTITY_PATH, 'utf8'))
   } catch (error) {
     if (error?.code !== 'ENOENT') {
-      throw new Error('desktop direct-action identity is unreadable')
+      throw new Error('desktop direct-action identity is unreadable', {
+        cause: error
+      })
     }
   }
 
@@ -6984,7 +6976,7 @@ function readOrCreateDirectActionIdentity() {
       throw new Error('desktop direct-action identity is invalid')
     }
 
-    let publishedPublicKey = ''
+    let publishedPublicKey: string
 
     try {
       publishedPublicKey = fs.readFileSync(DIRECT_ACTION_PUBLIC_KEY_PATH, 'utf8')
@@ -7046,7 +7038,7 @@ function directActionOsAccount() {
   return `${process.platform}:${account}`
 }
 
-function directActionPublicIdentity(profile = primaryProfileKey()) {
+async function directActionPublicIdentity(profile = primaryProfileKey()) {
   const identity = readOrCreateDirectActionIdentity()
 
   return {
@@ -7055,7 +7047,7 @@ function directActionPublicIdentity(profile = primaryProfileKey()) {
     surfaceAccount: identity.installationId,
     surfacePrincipal: directActionOsAccount(),
     chatOrWindow: `desktop:${identity.installationId}`,
-    appIdentity: directActionAppIdentity(),
+    appIdentity: await directActionAppIdentity(),
     profile,
     publicKeyFingerprint: desktopPublicKeyFingerprint(identity.publicKeyPem),
     publicKeyPath: DIRECT_ACTION_PUBLIC_KEY_PATH,
@@ -7086,53 +7078,42 @@ function trustedDirectActionFrame(event) {
   }
 }
 
-function mintDirectActionPrompt(event, request) {
+async function mintDirectActionPrompt(event, request) {
   if (!trustedDirectActionFrame(event) || !request || typeof request !== 'object') {
     return null
   }
 
-  const sessionId = typeof request.sessionId === 'string' ? request.sessionId.trim() : ''
   const text = typeof request.text === 'string' ? request.text : ''
-  const requestedProfile = typeof request.profile === 'string' ? request.profile.trim() : ''
-  const profile = requestedProfile || primaryProfileKey()
+  const gestureToken = typeof request.gestureToken === 'string' ? request.gestureToken : ''
 
-  if (
-    !sessionId ||
-    sessionId.length > 190 ||
-    !text ||
-    text.length > 8_192 ||
-    (profile !== 'default' && !PROFILE_NAME_RE.test(profile)) ||
-    (profile !== primaryProfileKey() && !backendPool.has(profile))
-  ) {
+  if (!gestureToken || gestureToken.length > 128 || !text || text.length > 8_192) {
     return null
   }
 
   const textHash = desktopTextHash(text)
-  const eventId = directActionGestures.eventIdFor(event.sender.id, textHash, profile, sessionId)
 
-  if (!eventId) {
+  const receipt = directActionGestures.mint(
+    event.sender.id,
+    gestureToken,
+    textHash
+  )
+
+  if (!receipt) {
     return null
   }
 
   const identity = readOrCreateDirectActionIdentity()
-  const win = BrowserWindow.fromWebContents(event.sender)
 
   const payload: DesktopPromptPayload = {
-    version: 1,
-    event_id: eventId,
-    issued_at: new Date().toISOString(),
+    version: 2,
+    event_id: receipt.eventId,
+    observed_at: receipt.observedAt,
     installation_id: identity.installationId,
     os_account: directActionOsAccount(),
-    app_identity: directActionAppIdentity(),
+    app_identity: await directActionAppIdentity(),
     app_instance_id: DIRECT_ACTION_APP_INSTANCE_ID,
-    profile,
-    window_id: String(win?.id || ''),
-    session_id: sessionId,
+    window_id: receipt.windowId,
     text_hash: textHash
-  }
-
-  if (!payload.window_id) {
-    return null
   }
 
   return {
@@ -8025,7 +8006,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
   // for local we fall back to the resolved/started backend.
   let baseUrl
   let token = null
-  let authMode = 'token'
+  let authMode: string
 
   if (wantRemote && block?.url) {
     baseUrl = normalizeRemoteBaseUrl(block.url)
@@ -9621,12 +9602,28 @@ function createWindow() {
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
-ipcMain.on('hermes:direct-action:trusted-gesture', (event, payload) => {
+ipcMain.handle('hermes:direct-action:begin', async (event, payload) => {
   const text = payload && typeof payload.text === 'string' ? payload.text : ''
+  const win = BrowserWindow.fromWebContents(event.sender)
 
-  if (trustedDirectActionFrame(event) && text && text.length <= 8_192) {
-    directActionGestures.note(event.sender.id, desktopTextHash(text))
+  if (
+    !trustedDirectActionFrame(event) ||
+    !win ||
+    !text ||
+    text.length > 8_192
+  ) {
+    return null
   }
+
+  const receipt = directActionGestures.begin(
+    event.sender.id,
+    String(win.id),
+    desktopTextHash(text)
+  )
+
+  return receipt
+    ? { eventId: receipt.eventId, gestureToken: receipt.gestureToken }
+    : null
 })
 ipcMain.handle('hermes:direct-action:identity', async (event, profile) => {
   if (!trustedDirectActionFrame(event)) {
@@ -9644,17 +9641,29 @@ ipcMain.handle('hermes:direct-action:identity', async (event, profile) => {
   }
 
   try {
-    return directActionPublicIdentity(resolved)
+    return await directActionPublicIdentity(resolved)
   } catch {
     return null
   }
 })
 ipcMain.handle('hermes:direct-action:mint-prompt', async (event, request) => {
   try {
-    return mintDirectActionPrompt(event, request)
+    return await mintDirectActionPrompt(event, request)
   } catch {
     return null
   }
+})
+ipcMain.handle('hermes:direct-action:retire', async (event, request) => {
+  if (!trustedDirectActionFrame(event) || !request || typeof request !== 'object') {
+    return false
+  }
+
+  const gestureToken =
+    typeof request.gestureToken === 'string' ? request.gestureToken : ''
+
+  const eventId = typeof request.eventId === 'string' ? request.eventId : ''
+
+  return directActionGestures.retire(event.sender.id, gestureToken, eventId)
 })
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
@@ -10961,7 +10970,9 @@ ipcMain.handle('hermes:setting:defaultProjectDir:set', async (_event, dir) => {
     try {
       fs.mkdirSync(next, { recursive: true })
     } catch (error) {
-      throw new Error(`Could not create directory: ${error.message}`)
+      throw new Error(`Could not create directory: ${error.message}`, {
+        cause: error
+      })
     }
   }
 
@@ -11947,6 +11958,14 @@ app.on('open-url', (event, url) => {
 })
 
 app.whenReady().then(() => {
+  // Codesign verification is asynchronous and cached. Prewarming it here keeps
+  // the first eligible send off Electron's main-process critical path.
+  void directActionAppIdentity().catch(error => {
+    rememberLog(
+      `[direct-action] application identity unavailable: ${error?.message || error}`
+    )
+  })
+
   const systemCa = installWindowsSystemCaTrust(tls)
 
   if (systemCa.applied) {

@@ -182,8 +182,11 @@ VALID_HOOKS: Set[str] = {
     "pre_platform_event_enqueue",
     # Desktop ingress provenance. Fired by the TUI/dashboard prompt handler
     # after session lookup and text sanitization, before queueing or dispatch.
+    # Kwargs include the exact raw renderer text, accepted/sanitized text, and
+    # the gateway-authoritative profile/session/task route.
     # A trusted plugin may return {"surface_context": {...}}; absent/invalid
-    # provenance leaves the ordinary chat path unchanged.
+    # provenance, multiple authorities, or an accepted-text mismatch leaves the
+    # ordinary chat path unchanged.
     "pre_prompt_submit",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,

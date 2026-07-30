@@ -25,6 +25,7 @@ def _context(text: str, event_id: str) -> dict:
 
 def test_prompt_hook_accepts_one_exact_plugin_verified_context(monkeypatch):
     text = "log procedure"
+    raw_text = "\x1b[200~log procedure\x1b[201~"
     context = _context(text, "event-1")
 
     def invoke(name, **kwargs):
@@ -32,6 +33,9 @@ def test_prompt_hook_accepts_one_exact_plugin_verified_context(monkeypatch):
         assert kwargs["session_id"] == "runtime-1"
         assert kwargs["task_id"] == "stored-1"
         assert kwargs["user_message"] == text
+        assert kwargs["raw_user_message"] == raw_text
+        assert kwargs["accepted_user_message"] == text
+        assert isinstance(kwargs["profile"], str)
         return [{"surface_context": context}]
 
     monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", invoke)
@@ -39,7 +43,8 @@ def test_prompt_hook_accepts_one_exact_plugin_verified_context(monkeypatch):
         {"desktop_provenance": {"signed": True}},
         sid="runtime-1",
         session={"session_key": "stored-1"},
-        text=text,
+        raw_text=raw_text,
+        accepted_text=text,
     ) == context
 
 
@@ -54,7 +59,11 @@ def test_prompt_hook_fails_closed_for_mismatch_or_multiple_authorities(monkeypat
         ],
     )
     assert server._prompt_surface_context(
-        {"desktop_provenance": {}}, sid="r", session={"session_key": "s"}, text=text
+        {"desktop_provenance": {}},
+        sid="r",
+        session={"session_key": "s"},
+        raw_text=text,
+        accepted_text=text,
     ) is None
 
     monkeypatch.setattr(
@@ -64,7 +73,11 @@ def test_prompt_hook_fails_closed_for_mismatch_or_multiple_authorities(monkeypat
         ],
     )
     assert server._prompt_surface_context(
-        {"desktop_provenance": {}}, sid="r", session={"session_key": "s"}, text=text
+        {"desktop_provenance": {}},
+        sid="r",
+        session={"session_key": "s"},
+        raw_text=text,
+        accepted_text=text,
     ) is None
 
     monkeypatch.setattr(
@@ -74,7 +87,11 @@ def test_prompt_hook_fails_closed_for_mismatch_or_multiple_authorities(monkeypat
         ],
     )
     assert server._prompt_surface_context(
-        {"desktop_provenance": {}}, sid="r", session={"session_key": "s"}, text=text
+        {"desktop_provenance": {}},
+        sid="r",
+        session={"session_key": "s"},
+        raw_text=text,
+        accepted_text=text,
     ) is None
 
 

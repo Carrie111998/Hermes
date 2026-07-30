@@ -1,20 +1,18 @@
 import crypto from 'node:crypto'
 
-export const DIRECT_ACTION_PROVENANCE_VERSION = 1
-export const DIRECT_ACTION_GESTURE_TTL_MS = 5_000
-export const DIRECT_ACTION_RECOVERY_TTL_MS = 120_000
+export const DIRECT_ACTION_PROVENANCE_VERSION = 2
+export const DIRECT_ACTION_GESTURE_TTL_MS = 10 * 60_000
+const DIRECT_ACTION_GESTURE_DEDUPE_MS = 500
 
 export interface DesktopPromptPayload {
-  version: 1
+  version: 2
   event_id: string
-  issued_at: string
+  observed_at: string
   installation_id: string
   os_account: string
   app_identity: string
   app_instance_id: string
-  profile: string
   window_id: string
-  session_id: string
   text_hash: string
 }
 
@@ -69,75 +67,119 @@ export function verifyDesktopPayload(publicKeyPem: string, payload: DesktopPromp
   }
 }
 
-interface RecoveryReceipt {
+export interface TrustedGestureReceipt {
   eventId: string
   expiresAt: number
-  profile: string
-  sessionId: string
+  gestureToken: string
+  observedAt: string
   textHash: string
-}
-
-interface TrustedGesture {
-  expiresAt: number
-  textHash: string
+  webContentsId: number
+  windowId: string
 }
 
 /**
- * A native trusted gesture mints one durable event identity. Transport/session
- * recovery may re-sign that same identity for the same text/profile, but can
- * never turn it into authority for different content.
+ * A native trusted gesture mints one route-independent event identity.
+ * Transport and runtime-session recovery reuse the immutable receipt, while
+ * changed content, another window, retirement, or expiry fail closed.
  */
 export class TrustedGestureLedger {
-  private readonly gestures = new Map<number, TrustedGesture>()
-  private readonly recoveries = new Map<number, RecoveryReceipt>()
+  private readonly receipts = new Map<string, TrustedGestureReceipt>()
+  private readonly currentByWebContents = new Map<number, string>()
 
-  note(webContentsId: number, textHash: string, now = Date.now()): void {
-    if (!textHash) {
-      return
+  private prune(now: number): void {
+    for (const [token, receipt] of this.receipts) {
+      if (receipt.expiresAt < now) {
+        this.receipts.delete(token)
+
+        if (this.currentByWebContents.get(receipt.webContentsId) === token) {
+          this.currentByWebContents.delete(receipt.webContentsId)
+        }
+      }
     }
-
-    this.gestures.set(webContentsId, {
-      expiresAt: now + DIRECT_ACTION_GESTURE_TTL_MS,
-      textHash
-    })
   }
 
-  eventIdFor(
+  begin(
     webContentsId: number,
+    windowId: string,
     textHash: string,
-    profile: string,
-    sessionId: string,
     now = Date.now()
-  ): string | null {
-    const gesture = this.gestures.get(webContentsId)
-
-    if (gesture && gesture.expiresAt >= now && gesture.textHash === textHash) {
-      this.gestures.delete(webContentsId)
-      const eventId = crypto.randomUUID()
-
-      this.recoveries.set(webContentsId, {
-        eventId,
-        expiresAt: now + DIRECT_ACTION_RECOVERY_TTL_MS,
-        profile,
-        sessionId,
-        textHash
-      })
-
-      return eventId
+  ): TrustedGestureReceipt | null {
+    if (!textHash || !windowId) {
+      return null
     }
 
-    const recovery = this.recoveries.get(webContentsId)
+    this.prune(now)
+    const currentToken = this.currentByWebContents.get(webContentsId)
+    const current = currentToken ? this.receipts.get(currentToken) : null
 
     if (
-      recovery &&
-      recovery.expiresAt >= now &&
-      recovery.profile === profile &&
-      recovery.sessionId === sessionId &&
-      recovery.textHash === textHash
+      current &&
+      current.windowId === windowId &&
+      current.textHash === textHash &&
+      Date.parse(current.observedAt) + DIRECT_ACTION_GESTURE_DEDUPE_MS >= now
     ) {
-      return recovery.eventId
+      return { ...current }
     }
 
-    return null
+    if (currentToken) {
+      this.receipts.delete(currentToken)
+    }
+
+    const gestureToken = crypto.randomBytes(32).toString('base64url')
+
+    const receipt: TrustedGestureReceipt = {
+      eventId: crypto.randomUUID(),
+      expiresAt: now + DIRECT_ACTION_GESTURE_TTL_MS,
+      gestureToken,
+      observedAt: new Date(now).toISOString(),
+      textHash,
+      webContentsId,
+      windowId
+    }
+
+    this.receipts.set(gestureToken, receipt)
+    this.currentByWebContents.set(webContentsId, gestureToken)
+
+    return { ...receipt }
+  }
+
+  mint(
+    webContentsId: number,
+    gestureToken: string,
+    textHash: string,
+    now = Date.now()
+  ): TrustedGestureReceipt | null {
+    this.prune(now)
+    const receipt = this.receipts.get(gestureToken)
+
+    return receipt &&
+      receipt.webContentsId === webContentsId &&
+      receipt.textHash === textHash
+      ? { ...receipt }
+      : null
+  }
+
+  retire(
+    webContentsId: number,
+    gestureToken: string,
+    eventId: string
+  ): boolean {
+    const receipt = this.receipts.get(gestureToken)
+
+    if (
+      !receipt ||
+      receipt.webContentsId !== webContentsId ||
+      receipt.eventId !== eventId
+    ) {
+      return false
+    }
+
+    this.receipts.delete(gestureToken)
+
+    if (this.currentByWebContents.get(webContentsId) === gestureToken) {
+      this.currentByWebContents.delete(webContentsId)
+    }
+
+    return true
   }
 }

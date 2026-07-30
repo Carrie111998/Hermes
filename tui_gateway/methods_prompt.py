@@ -112,7 +112,11 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     surface_context = _prompt_surface_context(
-        params, sid=sid, session=session, text=text
+        params,
+        sid=sid,
+        session=session,
+        raw_text=raw_text,
+        accepted_text=text,
     )
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)

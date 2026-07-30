@@ -922,6 +922,46 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+def _validated_proxy_surface_context(
+    value: Any, user_message: Any
+) -> Optional[Dict[str, Any]]:
+    """Return one bounded, JSON-only context forwarded by a Hermes gateway.
+
+    Authentication and the explicit proxy marker are checked by the request
+    handler. This helper validates the payload contract before it crosses into
+    agent/plugin state.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not isinstance(user_message, str):
+        raise ValueError("invalid Hermes gateway proxy context")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid Hermes gateway proxy context") from exc
+    if len(encoded.encode("utf-8")) > 131_072:
+        raise ValueError("Hermes gateway proxy context is too large")
+    context = json.loads(encoded)
+    platform = context.get("platform") or context.get("surface")
+    members = context.get("source_messages")
+    if (
+        not isinstance(platform, str)
+        or not platform
+        or len(platform) > 32
+        or context.get("accepted_text") != user_message
+        or not isinstance(members, list)
+        or not 1 <= len(members) <= 16
+        or not all(isinstance(member, dict) for member in members)
+    ):
+        raise ValueError("invalid Hermes gateway proxy context")
+    return context
+
+
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
@@ -3762,6 +3802,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        proxy_surface_context = None
+        if "hermes_surface_context" in body:
+            if (
+                request.headers.get("X-Hermes-Gateway-Proxy") != "1"
+                or not self._expected_api_key()
+            ):
+                return web.json_response(
+                    _openai_error(
+                        "Hermes gateway proxy context requires authenticated proxy mode"
+                    ),
+                    status=403,
+                )
+            try:
+                proxy_surface_context = _validated_proxy_surface_context(
+                    body.get("hermes_surface_context"), user_message
+                )
+            except ValueError as exc:
+                return web.json_response(_openai_error(str(exc)), status=400)
+
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
         # is independent of X-Hermes-Session-Id: the key persists across
@@ -3935,6 +3994,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                surface_context=proxy_surface_context,
                 **agent_overrides,
                 route=route,
             ))
@@ -3956,6 +4016,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                surface_context=proxy_surface_context,
                 **agent_overrides,
                 route=route,
             )
@@ -3964,7 +4025,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if idempotency_key:
             fp = _make_request_fingerprint(
                 body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                keys=[
+                    "model",
+                    "provider",
+                    "model_options",
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "stream",
+                    "hermes_surface_context",
+                ],
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
@@ -5774,6 +5844,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        surface_context: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5834,11 +5905,28 @@ class APIServerAdapter(BasePlatformAdapter):
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    original_platform = getattr(agent, "platform", "")
+                    original_user_id = getattr(agent, "_user_id", "")
+                    agent._gateway_event_context = dict(surface_context or {})
+                    if surface_context:
+                        agent.platform = str(
+                            surface_context.get("platform")
+                            or surface_context.get("surface")
+                            or original_platform
+                        )
+                        agent._user_id = str(
+                            surface_context.get("sender_id") or original_user_id
+                        )
+                    try:
+                        result = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id=effective_task_id,
+                        )
+                    finally:
+                        agent._gateway_event_context = {}
+                        agent.platform = original_platform
+                        agent._user_id = original_user_id
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

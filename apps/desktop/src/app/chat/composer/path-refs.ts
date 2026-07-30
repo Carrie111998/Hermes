@@ -11,58 +11,18 @@
  */
 import type { KeyboardEvent } from 'react'
 
-import { quoteRefValue, REF_RE, refChipElement, replaceBeforeCaret } from './rich-editor'
+import {
+  BARE_PATH_RE,
+  barePathRef,
+  pathifyRefs
+} from '../../../../shared/composer-submit-text'
+
+import { refChipElement, replaceBeforeCaret } from './rich-editor'
 import { textBeforeCaret } from './text-utils'
 
-// A `/` is required, exactly like URL_RE requires an explicit scheme: `@teknium1`
-// and `@diff` are a handle and a simple ref, not paths, and guessing wrong turns
-// someone's name into a file reference. A separator is the cheap signal that the
-// user meant a path. The token also can't start with a `:` kind prefix — that is
-// already a typed ref and REF_RE owns it.
-const BARE_PATH_RE = /(?<![\w@/])@((?!(?:file|folder|url|image|tool|line|terminal|session|git):)[^\s@:]*\/[^\s@:]*)/g
 const TYPED_BARE_PATH_RE = new RegExp(`${BARE_PATH_RE.source}$`)
 
-/** Trailing `/` means a directory — that's how the gateway's completion emits
- *  folders, and what Tab-descending leaves behind. */
-export function barePathRef(path: string) {
-  const trimmed = path.replace(/\/+$/, '')
-
-  return trimmed ? `@${path.endsWith('/') ? 'folder' : 'file'}:${quoteRefValue(trimmed)}` : null
-}
-
-/** Rewrite bare `@path` tokens as typed `@file:`/`@folder:` directives, leaving
- *  anything already inside a directive alone. Returns `text` unchanged when
- *  there are none. */
-export function pathifyRefs(text: string) {
-  if (!text.includes('@')) {
-    return text
-  }
-
-  REF_RE.lastIndex = 0
-
-  const fenced = Array.from(text.matchAll(REF_RE)).map(match => {
-    const start = match.index ?? 0
-
-    return { end: start + match[0].length, start }
-  })
-
-  let out = ''
-  let cursor = 0
-
-  for (const match of text.matchAll(BARE_PATH_RE)) {
-    const start = match.index ?? 0
-    const ref = barePathRef(match[1] || '')
-
-    if (!ref || fenced.some(span => start >= span.start && start < span.end)) {
-      continue
-    }
-
-    out += `${text.slice(cursor, start)}${ref}`
-    cursor = start + match[0].length
-  }
-
-  return out + text.slice(cursor)
-}
+export { barePathRef, pathifyRefs }
 
 /** A plain space finishing a typed `@path` commits it as a chip, so a hand-typed
  *  path chips the same way a picked one does. Returns whether it ran, so a

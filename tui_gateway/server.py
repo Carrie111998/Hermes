@@ -1368,12 +1368,25 @@ def _emit(event: str, sid: str, payload: dict | None = None):
 
 
 def _prompt_surface_context(
-    params: dict, *, sid: str, session: dict, text: object
+    params: dict,
+    *,
+    sid: str,
+    session: dict,
+    raw_text: object,
+    accepted_text: object,
 ) -> dict | None:
     """Resolve one plugin-verified context for a Desktop prompt."""
     provenance = params.get("desktop_provenance")
-    if not isinstance(provenance, dict) or not isinstance(text, str):
+    if (
+        not isinstance(provenance, dict)
+        or not isinstance(raw_text, str)
+        or not isinstance(accepted_text, str)
+    ):
         return None
+    profile_home = str(session.get("profile_home") or "")
+    profile = _response_profile_name(
+        Path(profile_home).name if profile_home else None
+    )
     try:
         from hermes_cli.lifecycle import invoke_hook
 
@@ -1382,7 +1395,10 @@ def _prompt_surface_context(
             provenance=dict(provenance),
             session_id=sid,
             task_id=str(session.get("session_key") or sid),
-            user_message=text,
+            user_message=accepted_text,
+            raw_user_message=raw_text,
+            accepted_user_message=accepted_text,
+            profile=profile,
             platform="desktop",
         )
     except Exception:
@@ -1394,7 +1410,7 @@ def _prompt_surface_context(
         if isinstance(result, dict)
         and set(result) == {"surface_context"}
         and isinstance(result["surface_context"], dict)
-        and result["surface_context"].get("accepted_text") == text
+        and result["surface_context"].get("accepted_text") == accepted_text
         and isinstance(result["surface_context"].get("source_messages"), list)
         and 1 <= len(result["surface_context"]["source_messages"]) <= 16
         and all(

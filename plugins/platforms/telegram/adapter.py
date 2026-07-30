@@ -8692,28 +8692,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
-        # Resolve DM-topic recovery before the durable receipt seam so the
-        # recorded thread and the eventual session lane cannot disagree.
-        await asyncio.to_thread(self._apply_topic_recovery, event)
-        self._attach_platform_event_member(event)
-        try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-
-            # The callback may durably record a receipt. Keep synchronous
-            # plugin/database work off Telegram's event loop while preserving
-            # the strict before-enqueue ordering.
-            await asyncio.to_thread(
-                _invoke_hook,
-                "pre_platform_event_enqueue",
-                event=event,
-                adapter=self,
-            )
-        except Exception as exc:
-            # Hooks are observational and authority consumers fail closed when
-            # a matching receipt is absent. Transport delivery itself remains
-            # available if an unrelated plugin is broken.
-            logger.warning("pre_platform_event_enqueue invocation failed: %s", exc)
-        self._enqueue_text_event(event)
+        await self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -8745,7 +8724,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # before dispatch; short commands (/stop, /approve, ...) keep the
         # immediate path and are never delayed.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
-            self._enqueue_text_event(event)
+            await self._enqueue_text_event(event)
             return
         await self.handle_message(event)
 
@@ -8800,8 +8779,7 @@ class TelegramAdapter(BasePlatformAdapter):
     # Text message aggregation (handles Telegram client-side splits)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _attach_platform_event_member(event: MessageEvent) -> None:
+    def _attach_platform_event_member(self, event: MessageEvent) -> None:
         """Attach one sanitized, ordered provenance member to ``event``.
 
         ``raw_message`` is intentionally excluded: it may contain credentials,
@@ -8810,7 +8788,11 @@ class TelegramAdapter(BasePlatformAdapter):
         accepted aggregate matches this exact ordered source set. A durable
         receipt plugin is expected to persist only the hash and identifiers.
         """
-        timestamp = event.timestamp
+        # ``MessageEvent.timestamp`` is typed as a datetime, but synthetic
+        # Telegram messages and lightweight test doubles may explicitly carry
+        # ``date=None``.  The enqueue seam must still produce an ordered,
+        # timezone-aware occurrence time instead of breaking message delivery.
+        timestamp = event.timestamp or datetime.now(timezone.utc)
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
         else:
@@ -8858,12 +8840,10 @@ class TelegramAdapter(BasePlatformAdapter):
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching.
 
-        Applies the installed topic-recovery hook first so DM-topic batches
-        coalesce on (and dispatch to) the recovered lane rather than the
-        raw inbound ``message_thread_id`` Telegram may have attached.
+        The enqueue choke point applies topic recovery before calling this
+        helper so batches coalesce on (and dispatch to) the recovered lane.
         """
         from gateway.session import build_session_key
-        self._apply_topic_recovery(event)
         return build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
@@ -8871,17 +8851,41 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    async def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
         When Telegram splits a long user message into multiple updates,
         they arrive within a few hundred milliseconds.  This method
         concatenates them and waits for a short quiet period before
-        dispatching the combined message.
+        dispatching the combined message. Every text-batched event — including
+        a long COMMAND first chunk — crosses the same provenance seam here.
         """
         if self._should_drop_delayed_delivery():
             logger.debug("[Telegram] Dropping text batch enqueue after disconnect started")
             return
+
+        # Resolve DM-topic recovery before the durable receipt seam so the
+        # recorded thread and the eventual session lane cannot disagree.
+        await asyncio.to_thread(self._apply_topic_recovery, event)
+        if not isinstance(event.metadata.get("platform_event_members"), list):
+            self._attach_platform_event_member(event)
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+            # The callback may durably record a receipt. Keep synchronous
+            # plugin/database work off Telegram's event loop while preserving
+            # the strict before-enqueue ordering.
+            await asyncio.to_thread(
+                _invoke_hook,
+                "pre_platform_event_enqueue",
+                event=event,
+                adapter=self,
+            )
+        except Exception as exc:
+            # Hooks are observational and authority consumers fail closed when
+            # a matching receipt is absent. Transport delivery itself remains
+            # available if an unrelated plugin is broken.
+            logger.warning("pre_platform_event_enqueue invocation failed: %s", exc)
 
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)

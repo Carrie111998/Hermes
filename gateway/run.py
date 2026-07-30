@@ -22740,6 +22740,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        surface_context: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -22773,6 +22774,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
 
         proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
+        forwarded_surface_context = surface_context if proxy_key else None
+        if surface_context and not proxy_key:
+            # Preserve ordinary proxy chat when provenance cannot cross the
+            # authenticated peer boundary. The companion capability fails
+            # closed because its context is omitted.
+            logger.warning(
+                "Gateway proxy surface context omitted because GATEWAY_PROXY_KEY is not configured"
+            )
 
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
@@ -22809,12 +22818,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+        if forwarded_surface_context:
+            # This extension is accepted only by an authenticated Hermes API
+            # peer. Generic OpenAI-compatible servers never see it.
+            headers["X-Hermes-Gateway-Proxy"] = "1"
 
         body = {
             "model": "hermes-agent",
             "messages": api_messages,
             "stream": True,
         }
+        if forwarded_surface_context:
+            body["hermes_surface_context"] = dict(forwarded_surface_context)
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -23201,6 +23216,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                surface_context=surface_context,
             )
 
         from run_agent import AIAgent

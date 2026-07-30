@@ -30,10 +30,9 @@ declare global {
       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
       getDirectActionIdentity: (profile?: null | string) => Promise<DesktopDirectActionIdentity | null>
       mintDirectActionPrompt: (request: {
-        profile?: null | string
-        sessionId: string
         text: string
       }) => Promise<DesktopDirectActionProvenance | null>
+      retireDirectActionPrompt: (eventId: string) => Promise<boolean>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
       // with an error code when the sessionId is empty/invalid. `watch` opens
@@ -519,16 +518,14 @@ export interface DesktopDirectActionIdentity {
 
 export interface DesktopDirectActionProvenance {
   payload: {
-    version: 1
+    version: 2
     event_id: string
-    issued_at: string
+    observed_at: string
     installation_id: string
     os_account: string
     app_identity: string
     app_instance_id: string
-    profile: string
     window_id: string
-    session_id: string
     text_hash: string
   }
   public_key_fingerprint: string

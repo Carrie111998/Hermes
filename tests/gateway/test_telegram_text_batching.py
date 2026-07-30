@@ -79,7 +79,7 @@ class TestTextBatching:
         adapter = _make_adapter()
         event = _make_event("hello world")
 
-        adapter._enqueue_text_event(event)
+        await adapter._enqueue_text_event(event)
 
         # Not dispatched yet
         adapter.handle_message.assert_not_called()
@@ -96,9 +96,9 @@ class TestTextBatching:
         """Two rapid messages from the same chat should be merged."""
         adapter = _make_adapter()
 
-        adapter._enqueue_text_event(_make_event("This is part one of a long"))
+        await adapter._enqueue_text_event(_make_event("This is part one of a long"))
         await asyncio.sleep(0.02)  # small gap, within batch window
-        adapter._enqueue_text_event(_make_event("message that was split by Telegram."))
+        await adapter._enqueue_text_event(_make_event("message that was split by Telegram."))
 
         # Not dispatched yet (timer restarted)
         adapter.handle_message.assert_not_called()
@@ -116,11 +116,11 @@ class TestTextBatching:
         """Three rapid messages should all merge."""
         adapter = _make_adapter()
 
-        adapter._enqueue_text_event(_make_event("chunk 1"))
+        await adapter._enqueue_text_event(_make_event("chunk 1"))
         await asyncio.sleep(0.02)
-        adapter._enqueue_text_event(_make_event("chunk 2"))
+        await adapter._enqueue_text_event(_make_event("chunk 2"))
         await asyncio.sleep(0.02)
-        adapter._enqueue_text_event(_make_event("chunk 3"))
+        await adapter._enqueue_text_event(_make_event("chunk 3"))
 
         await asyncio.sleep(0.2)
 
@@ -136,9 +136,9 @@ class TestTextBatching:
         first = _with_member(_make_event("chunk 1"), "update-1", "message-1")
         second = _with_member(_make_event("chunk 2"), "update-2", "message-2")
 
-        adapter._enqueue_text_event(first)
+        await adapter._enqueue_text_event(first)
         await asyncio.sleep(0.02)
-        adapter._enqueue_text_event(second)
+        await adapter._enqueue_text_event(second)
         await asyncio.sleep(0.2)
 
         dispatched = adapter.handle_message.call_args[0][0]
@@ -164,6 +164,34 @@ class TestTextBatching:
         assert [row["text"] for row in context["source_messages"]] == [
             "chunk 1",
             "chunk 2",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_long_command_first_chunk_keeps_complete_provenance(self):
+        adapter = _make_adapter()
+        first = _make_event("/queue " + "a" * adapter._SPLIT_THRESHOLD)
+        first_text = first.text
+        first.message_type = MessageType.COMMAND
+        first.platform_update_id = "update-command"
+        first.message_id = "message-command"
+        second = _make_event("continuation")
+        second.platform_update_id = "update-text"
+        second.message_id = "message-text"
+
+        await adapter._enqueue_text_event(first)
+        await asyncio.sleep(0.02)
+        await adapter._enqueue_text_event(second)
+        await asyncio.sleep(0.2)
+
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert dispatched.text.endswith("\ncontinuation")
+        assert [
+            member["raw_event_id"]
+            for member in dispatched.metadata["platform_event_members"]
+        ] == ["update-command", "update-text"]
+        assert dispatched._platform_event_member_texts == [
+            first_text,
+            "continuation",
         ]
 
 
