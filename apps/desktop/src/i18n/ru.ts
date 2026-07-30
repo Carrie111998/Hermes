@@ -809,7 +809,7 @@ export const ruOverrides = {
       disableServer: name => `Отключить «${name}»`,
       serverEnabled: name => `Сервер «${name}» включён. Изменение применяется к новым сессиям.`,
       serverDisabled: name => `Сервер «${name}» отключён. Изменение применяется к новым сессиям.`,
-      toggleFailed: name => `Не удалось переключить «${name}»`,
+      toggleFailed: (name, enabled) => `Не удалось ${enabled ? 'включить' : 'отключить'} «${name}»`,
       tabServers: 'Серверы',
       tabCatalog: 'Каталог',
       catalogLoading: 'Загрузка каталога…',
@@ -1047,7 +1047,7 @@ export const ruOverrides = {
     visionModelLink: 'Выбрать модель для анализа изображений в разделе «Настройки» → «Модели»',
     toolsetsEnabled: (enabled, total) => `${enabled}/${total} наборов включено`,
     configureToolset: label => `Настроить ${label}`,
-    toggleToolset: label => `Переключить набор ${label}`,
+    toggleToolset: (label, enabled) => `${enabled ? 'Включить' : 'Отключить'} набор инструментов «${label}»`,
     skillsLoadFailed: 'Не удалось загрузить навыки',
     toolsetsRefreshFailed: 'Не удалось обновить наборы инструментов',
     skillEnabled: 'Навык включён',
@@ -1220,7 +1220,7 @@ export const ruOverrides = {
       installed: 'Установлен',
       generatedTag: 'Сгенерирован',
       adoptFailed: 'Не удалось приручить питомца',
-      toggleFailed: 'Не удалось переключить питомца',
+      toggleFailed: enabled => `Не удалось ${enabled ? 'включить' : 'выключить'} питомца`,
       noneAvailable: 'Нет доступных питомцев — выберите питомца ниже, чтобы установить его.'
     },
     generatePet: {
@@ -1567,7 +1567,7 @@ export const ruOverrides = {
     deleteDescPrefix: 'Подписка «',
     deleteDescSuffix: '» будет удалена безвозвратно. Это действие нельзя отменить.',
     deleteFailed: (name: string) => `Не удалось удалить «${name}»`,
-    toggleFailed: (name: string) => `Не удалось обновить «${name}»`,
+    toggleFailed: (name: string, enabled: boolean) => `Не удалось ${enabled ? 'включить' : 'отключить'} «${name}»`,
     newSubscription: 'Новая подписка',
     restarting: 'Перезапуск шлюза…',
     restartNeeded: 'Вебхуки включены, но шлюзу нужен перезапуск, чтобы приёмник заработал.',
@@ -1968,7 +1968,7 @@ export const ruOverrides = {
       forceRemove: 'Удалить принудительно',
       enter: label => `Открыть ${label}`,
       reorder: label => `Переупорядочить ${label}`,
-      toggle: label => `Переключить сессии ${label}`,
+      toggle: (label, open) => `${open ? 'Показать' : 'Скрыть'} сессии проекта «${label}»`,
       back: 'Все проекты'
     },
     newSessionIn: label => `Новая сессия в ${label}`,
@@ -2739,12 +2739,6 @@ export const ruOverrides = {
     closeToRight: 'Закрыть справа',
     closeAll: 'Закрыть все',
     newSessionTab: 'Новая вкладка сессии',
-    split: dir => `Разделить ${dir}`,
-    move: dir => `Переместить ${dir}`,
-    dirUp: 'вверх',
-    dirDown: 'вниз',
-    dirLeft: 'влево',
-    dirRight: 'вправо',
     pluginDisabled: pluginId => `Плагин «${pluginId}» отключён`,
     pluginDisabledBody: 'Включите плагин в разделе «Настройки» → «Плагины», чтобы вернуть панель.',
     missingPane: paneId => `Панель не найдена: ${paneId}`,
@@ -2793,6 +2787,8 @@ export const ruOverrides = {
       branchNewChat: 'Создать ответвление в новом чате',
       react: 'Добавить реакцию',
       dismissError: 'Скрыть ошибку',
+      filesChanged: count => countRu(count, 'файл изменён', 'файла изменены', 'файлов изменено'),
+      reviewChanges: 'Просмотреть',
       readAloudFailed: 'Ошибка озвучки',
       preparingAudio: 'Подготовка аудио',
       stopReading: 'Остановить чтение',
@@ -3060,7 +3056,7 @@ export const ruOverrides = {
     sidebar: {
       title: 'Боковая панель',
       description: 'Боковая панель содержит сессии, навыки, мессенджеры и артефакты.',
-      toggle: 'Переключить боковую панель'
+      toggle: open => (open ? 'Показать боковую панель' : 'Скрыть боковую панель')
     }
   }
 } satisfies TranslationOverrides

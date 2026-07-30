@@ -61,6 +61,10 @@ describe('Russian locale', () => {
     expect(ru.messaging.pendingAria(2)).toBe('2 запроса на доступ ожидают подтверждения')
     expect(ru.messaging.pendingAria(11)).toBe('11 запросов на доступ ожидают подтверждения')
     expect(ru.messaging.pendingAria(21)).toBe('21 запрос на доступ ожидает подтверждения')
+    expect(ru.assistant.thread.filesChanged(1)).toBe('1 файл изменён')
+    expect(ru.assistant.thread.filesChanged(2)).toBe('2 файла изменены')
+    expect(ru.assistant.thread.filesChanged(11)).toBe('11 файлов изменено')
+    expect(ru.assistant.thread.filesChanged(21)).toBe('21 файл изменён')
   })
 
   it('keeps pending actions compatible with their rendered status', () => {
