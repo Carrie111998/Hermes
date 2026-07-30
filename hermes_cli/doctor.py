@@ -1232,6 +1232,7 @@ def run_doctor(args):
 
     try:
         from hermes_cli.auth import (
+            get_claude_cli_provider_status,
             get_nous_auth_status,
             get_codex_auth_status,
             get_minimax_oauth_auth_status,
@@ -1260,6 +1261,20 @@ def run_doctor(args):
                     "(optional — only required to import tokens "
                     "from an existing Codex CLI login)"
                 )
+
+        claude_status = get_claude_cli_provider_status()
+        if claude_status.get("logged_in"):
+            check_ok(
+                "Claude Code subscription",
+                "({subscription}, {version})".format(
+                    subscription=claude_status.get("subscription_type") or "logged in",
+                    version=claude_status.get("version") or "version unknown",
+                ),
+            )
+        else:
+            check_warn("Claude Code subscription", "(not available)")
+            if claude_status.get("error"):
+                check_info(claude_status["error"])
 
         minimax_status = get_minimax_oauth_auth_status()
         if minimax_status.get("logged_in"):
