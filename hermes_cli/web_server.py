@@ -146,6 +146,38 @@ _SPEAK_STREAM_QUEUE_MAX_FRAMES = 64
 _SPEAK_STREAM_QUEUE_WAIT_SECONDS = 1.0
 _SPEAK_STREAM_IDS = itertools.count(1)
 
+
+async def _next_speak_stream_item(
+    chunks: "asyncio.Queue[tuple[str, Any]]", cancelled: "asyncio.Event"
+) -> Optional[tuple[str, Any]]:
+    """Wait for output or cancellation without using the output queue as a signal.
+
+    Producer refill runs from a worker thread via ``run_coroutine_threadsafe``.
+    A cancellation sentinel inserted with ``put_nowait`` can therefore race a
+    refill and raise ``QueueFull`` after the consumer drained the queue.  Keep
+    cancellation out-of-band so a full output queue cannot strand the writer.
+    """
+    if cancelled.is_set():
+        return None
+
+    item_task = asyncio.create_task(chunks.get())
+    cancel_task = asyncio.create_task(cancelled.wait())
+    done, _ = await asyncio.wait(
+        {item_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    if cancel_task in done:
+        item_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await item_task
+        return None
+
+    cancel_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await cancel_task
+    return item_task.result()
+
+
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -4549,6 +4581,17 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
             await ws.close()
         return
 
+    # Versioned speak-stream sessions promise fail-closed upstream stop. A
+    # legacy adapter may still be useful to the CLI/local speaker, but it
+    # cannot safely participate in this route because its remote request may
+    # outlive a client barge-in. Fall back before emitting a v1 ``start``.
+    upstream_cancellable = bool(getattr(streamer, "upstream_cancellable", False))
+    if not upstream_cancellable:
+        with contextlib.suppress(Exception):
+            await ws.send_json({"type": "fallback"})
+            await ws.close()
+        return
+
     try:
         from tools.tts_streaming import AudioFormat
 
@@ -4580,21 +4623,46 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
             "channels": channels,
             "initial_buffer_ms": _SPEAK_STREAM_INITIAL_BUFFER_MS,
             "max_buffer_ms": _SPEAK_STREAM_MAX_BUFFER_MS,
+            # Reaching v1 start means the fail-closed gate above has already
+            # admitted an adapter with an active upstream-close contract.
+            "upstream_cancellable": upstream_cancellable,
+            "capabilities": {"upstream_cancellable": upstream_cancellable},
         }
     )
 
     stop = threading.Event()
     text_q: queue.Queue = queue.Queue()  # str deltas; None = end-of-text
     # ``AudioFrame`` instances are kept in the queue until the writer has sent
-    # both their metadata and binary payload.  The terminal tuple is always
-    # enqueued after the producer has stopped, so end/error ordering is stable.
+    # both their metadata and binary payload.  Normal end/error tuples are
+    # enqueued after the producer has stopped, so ordering is stable; client
+    # cancellation uses the separate event below and never competes for space.
     chunks: asyncio.Queue = asyncio.Queue(maxsize=_SPEAK_STREAM_QUEUE_MAX_FRAMES)
+    cancelled = asyncio.Event()
+    cancel_lock = threading.Lock()
+    cancel_invoked = False
     totals = {"frames": 0, "samples": 0}
     synthesis_started = time.monotonic()
     producer_failure: dict[str, str] = {}
 
     def _elapsed_ms() -> float:
         return round(max(0.0, time.monotonic() - synthesis_started) * 1000.0, 3)
+
+    def _cancel_stream() -> None:
+        """Stop local work and close the accepted upstream response once."""
+        nonlocal cancel_invoked
+        stop.set()
+        cancelled.set()
+        text_q.put(None)  # unblock a producer waiting for more text
+        with cancel_lock:
+            if cancel_invoked:
+                return
+            cancel_invoked = True
+        cancel = getattr(streamer, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                _log.warning("speak-stream provider cancellation failed", exc_info=True)
 
     def _queue_put(item: tuple[str, Any], *, ignore_stop: bool = False) -> bool:
         """Put an item into the async queue, applying bounded backpressure."""
@@ -4668,6 +4736,8 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
                 if not cleaned:
                     continue
                 for piece in _split_text_for_speak_stream(cleaned, cap):
+                    if stop.is_set():
+                        return
                     for chunk in streamer.stream(piece):
                         if stop.is_set():
                             return
@@ -4708,23 +4778,15 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
                     text_q.put(None)
         except Exception:
             pass
-        stop.set()
-        cancel = getattr(streamer, "cancel", None)
-        if callable(cancel):
-            with contextlib.suppress(Exception):
-                cancel()
-        text_q.put(None)  # unblock the producer
-        while True:
-            try:
-                chunks.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        chunks.put_nowait(("cancelled", None))
+        _cancel_stream()
 
     pump = asyncio.ensure_future(_pump_client())
     try:
         while True:
-            kind, item = await chunks.get()
+            next_item = await _next_speak_stream_item(chunks, cancelled)
+            if next_item is None:
+                break
+            kind, item = next_item
             if kind == "frame":
                 frame = item
                 await ws.send_json(
@@ -4776,9 +4838,10 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
-        stop.set()
-        text_q.put(None)
+        _cancel_stream()
         pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
         with contextlib.suppress(Exception):
             await ws.close()
 

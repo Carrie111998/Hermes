@@ -18,8 +18,10 @@ The streaming pipeline has four parts:
 3. **TTS provider** — a registered `StreamingTTSProvider` turns each sentence
    into raw PCM chunks (int16 mono at the provider's declared `sample_rate`)
 4. **Audio sink** — `sounddevice.OutputStream` for local playback
-   (`tools.tts_tool.stream_tts_to_speaker`), or a gateway platform adapter's
-   `write_streaming_tts` seam (`gateway/streaming_tts_consumer.py`)
+   (`tools.tts_tool.stream_tts_to_speaker`), a gateway platform adapter's
+   `write_streaming_tts` seam (`gateway/streaming_tts_consumer.py`), or the
+   Desktop's single bounded AudioWorklet clock behind
+   `/api/audio/speak-stream`.
 
 Providers with no chunked API still get per-*sentence* playback via the proven
 sync `text_to_speech_tool` path, so edge (the default) is conversational too.
@@ -34,8 +36,8 @@ swaps your voice for a different provider just to get streaming.
 
 To override, set `tts.streaming.provider` in your `config.yaml`:
 
-- a provider name (`elevenlabs`, `gemini`, `openai`, `xai`) pins that streamer
-- `auto` walks the priority list `elevenlabs → gemini → openai → xai` and uses
+- a provider name (`elevenlabs`, `gemini`, `openai`, `xai`, `finite_fish`) pins that streamer
+- `auto` walks the priority list `elevenlabs → gemini → openai → xai → finite_fish` and uses
   the first one whose credentials resolve — an explicit opt-in to "best
   chunked voice available"
 
@@ -57,12 +59,43 @@ tts:
 | openai      | chunked HTTP (`with_streaming_response`, `pcm`) | yes | `tts.openai.api_key` → env → managed gateway |
 | gemini      | SSE (`streamGenerateContent?alt=sse`) | yes         | `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
 | xai         | WebSocket (`wss://api.x.ai/v1/tts`)   | yes         | xAI OAuth or `XAI_API_KEY` |
+| finite_fish | streamed HTTP WAV (`/audio/speech`)   | request-streaming | `tts.finite_fish.base_url` + provider secret resolution for the API key |
 | edge, piper, kitten, neutts, mistral, minimax, deepinfra, … | — | no (per-sentence sync fallback) | as usual |
+
+`finite_fish` is wired through the same provider-neutral adapter and framing
+path, but its request-streaming behavior is not realtime-qualified. A usable
+HTTP stream is not an admission decision: realtime claims require separate
+qualification evidence for time-to-first-audio, throughput/RTF, jitter,
+underruns, cancellation, and concurrency.
 
 All credential lookups go through `resolve_provider_secret()`
 (config > env/.env > credential pool) — never bare env reads. Streamed bodies
 are capped at 16 MiB per sentence, mirroring the sync providers' bounded
 upstream-body invariant.
+
+## Desktop WebSocket contract
+
+The Desktop requests `/api/audio/speak-stream` and accepts a stream only after
+an explicit `start` frame with `protocol: "hermes.audio.v1"`. The gateway
+emits that versioned start only for adapters advertising upstream cancellation;
+other adapters fail closed to the existing whole-response `fallback` path. It
+then sends one JSON `audio` metadata frame followed by one binary, little-endian
+16-bit PCM payload for every frame, with monotonic `sequence`, `sample_offset`,
+and `sample_count`; the stream ends with `end`, `error`, or `fallback`. The
+gateway normalizes arbitrary provider chunks into 20 ms frames and applies a
+bounded output queue.
+
+Desktop buffers those frames in one adaptive AudioWorklet ring. It waits for
+the negotiated startup target (or an ended stream), raises the target after an
+underrun, and drains the same clock at end-of-stream. `stop` or WebSocket
+disconnect cuts local playback immediately, closes the accepted provider
+response, and never emits a normal `end`. A provider or transport failure
+before any audio starts uses the existing whole-response playback fallback; an
+explicit stop is a barge-in and does not replay the response. Noncancellable
+adapters remain available to the CLI/local speaker, where they retain the
+legacy per-sentence behavior.
+Older gateways that do not send the versioned `start` frame stay on the legacy
+raw-PCM scheduler.
 
 ## Adding a new streaming provider
 

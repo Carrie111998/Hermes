@@ -9,7 +9,9 @@
 - Feature branch: `codex/provider-neutral-streaming-tts`
 - Human owner: plebdev
 - Started: 2026-07-30
-- Current status: branch review complete; publication pending
+- Current status: implementation review is complete through committed
+  hardening `97238bf73`; PR #75014 is open; the follow-up is verified and
+  ready for its issue commit.
 - Skill setup status: GitHub issue tracker inferred from origin; root and Desktop
   AGENTS guidance loaded; no repo-local Plebdev issue/triage/domain adapter exists.
 
@@ -25,13 +27,16 @@ Audio as the first conforming front-door provider.
 - ADRs: `docs/plans/provider-neutral-streaming-tts.md`
 - Prototype source branch, if any: none; direct cadence evidence answered the
   design question.
-- Spec issue: pending publication.
-- Tickets: four delivery slices in the spec; delegated approval recorded below.
-- Ticket sessions: pending.
+- Spec issue: https://github.com/NousResearch/hermes-agent/issues/75029.
+- Tickets: four approved delivery slices published in dependency order as
+  #75030, #75031, #75032, and #75033.
+- Ticket sessions: recorded below; final follow-up commit pending.
 - Agent briefs: three Luna-high read-only architecture briefs in current task.
 - Review packets: Luna-high standards/spec reviews completed; all P1/P2 findings resolved.
-- Local CodeRabbit report: one round completed; nine findings addressed and reverified.
-- PR URL: pending.
+- Local CodeRabbit report: initial nine findings and follow-up rounds of zero,
+  three, and one finding were processed; every worthy finding was addressed
+  and the affected checks were rerun.
+- PR URL: https://github.com/NousResearch/hermes-agent/pull/75014 (OPEN).
 
 ## Commands
 
@@ -48,7 +53,7 @@ Audio as the first conforming front-door provider.
 | Frame contract | AFK | complete | Luna + CodeRabbit | fixed | yes |
 | Gateway transport | AFK | complete | Luna + CodeRabbit | fixed | yes |
 | Desktop playout | AFK | complete | Luna + CodeRabbit | fixed | yes |
-| Fish qualification | AFK + production handoff | pending | pending | pending | no |
+| Fish qualification | AFK + production handoff | request-streaming measured; realtime thresholds failed; public admission probe failed | Spark PR #218 + Luna audit | sustained RTF > 1 and max gap > threshold; authenticated public route returned 429 | raw transport only |
 
 ## Parked HITL Slices
 
@@ -56,13 +61,24 @@ Audio as the first conforming front-door provider.
 | --- | --- | --- | --- | --- |
 | Live promotion | Feature Dev production boundary | live route only | separate promotion loop | out of feature PR |
 
+The provider-neutral qualification probe is merged in
+`finitecomputer/spark-cluster` PR #218. Raw Fish produced a valid incremental
+WAV stream, but the thresholded run measured total RTF about 2.02, steady RTF
+about 1.95, and a maximum inter-chunk gap about 2.31 seconds. A fresh
+authenticated public-front-door probe on 2026-07-30 returned HTTP 429. This is
+evidence for request-streaming transport conformance and against a realtime
+claim; it is not Front-Door Model Promotion evidence or admission.
+
 ## Issue Session Ledger
 
 | Issue | Fixed point | Worker session | Commit | Review result | Checks |
 | --- | --- | --- | --- | --- | --- |
-| Frame + gateway | `07447bd5d` | Luna worker | `45f895572` | passed after fixes | 39 Python tests |
-| Desktop playout | `45f895572` | Luna worker | `75fdf2acf` | passed after fixes | 12 focused Vitest + typecheck + build |
-| Design record | `75fdf2acf` | orchestrator | `695c2a772` | passed | docs review |
+| Frame + gateway | `c9de69c6d` | Luna worker | `4a1cca7b6` | passed after fixes | 39 Python tests |
+| Desktop playout | `4a1cca7b6` | Luna worker | `93b780fd5` | passed after fixes | 12 focused Vitest + typecheck + build |
+| Design record | `93b780fd5` | orchestrator | `e80796df2` | passed | docs review |
+| Playout/cancellation hardening | `e80796df2` | delegated worker | `97238bf73` | passed | focused Desktop/Python tests + typecheck |
+| Integration/docs follow-up | `97238bf73` | Luna worker | pending (uncommitted) | passed pending final review | 15 Desktop + 75 Python tests, typecheck, build |
+| Provider cancellation contract | `97238bf73` | Luna worker | pending (uncommitted) | passed pending final review | included in 75 Python tests |
 
 ## Open Questions
 

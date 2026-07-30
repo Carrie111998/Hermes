@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from urllib.parse import urlencode
 
@@ -38,6 +40,7 @@ def _url(token: str | None = None) -> str:
 class _FakeStreamer:
     sample_rate = 24000
     channels = 1
+    upstream_cancellable = True
 
     def __init__(self, chunks):
         self.chunks = chunks
@@ -62,6 +65,20 @@ def _patch_provider(monkeypatch, streamer, cap=4000):
     monkeypatch.setattr("tools.tts_tool._resolve_max_text_length", lambda provider, cfg: cap)
 
 
+def test_cancellation_signal_does_not_compete_with_a_full_output_queue():
+    chunks: asyncio.Queue[tuple[str, object]] = asyncio.Queue(maxsize=1)
+    frame_item = ("frame", object())
+    chunks.put_nowait(frame_item)
+    cancelled = asyncio.Event()
+    cancelled.set()
+
+    assert asyncio.run(web_server._next_speak_stream_item(chunks, cancelled)) is None
+    # Cancellation itself never attempts a racy put_nowait sentinel or raises
+    # QueueFull, even if a producer has already filled the output queue.
+    assert chunks.qsize() == 1
+    assert chunks.get_nowait() == frame_item
+
+
 
 
 
@@ -79,6 +96,8 @@ def test_streams_pcm_frames_then_end(stream_client, monkeypatch):
         assert start["channels"] == 1
         assert start["stream_id"] > 0
         assert start["initial_buffer_ms"] < start["max_buffer_ms"]
+        assert start["upstream_cancellable"] is True
+        assert start["capabilities"]["upstream_cancellable"] is True
 
         conn.send_text(json.dumps({"text": "Hello there.", "done": True}))
         metadata = conn.receive_json()
@@ -98,6 +117,20 @@ def test_streams_pcm_frames_then_end(stream_client, monkeypatch):
         assert end["samples"] == end["sample_count"] == 960
 
     assert streamer.requests == ["Hello there."]
+
+
+def test_non_cancellable_provider_falls_back_before_v1_start(stream_client, monkeypatch):
+    class _LegacyStreamer(_FakeStreamer):
+        upstream_cancellable = False
+
+    streamer = _LegacyStreamer([b"\x00\x00" * 480])
+    _patch_provider(monkeypatch, streamer)
+
+    with stream_client.websocket_connect(_url()) as conn:
+        assert conn.receive_json() == {"type": "fallback"}
+        assert conn.receive()["type"] == "websocket.close"
+
+    assert streamer.requests == []
 
 
 
@@ -174,6 +207,40 @@ def test_type_stop_frame_cancels_without_end(stream_client, monkeypatch):
         assert conn.receive()["type"] == "websocket.close"
 
     release.set()
+
+
+def test_server_send_failure_cancels_blocked_provider(stream_client, monkeypatch):
+    release = threading.Event()
+    cancel_called = threading.Event()
+
+    class _BlockingCancellableStreamer(_FakeStreamer):
+        def stream(self, text):
+            self.requests.append(text)
+            yield b"\x00\x00" * 480
+            release.wait(timeout=2)
+
+        def cancel(self):
+            cancel_called.set()
+            release.set()
+
+    streamer = _BlockingCancellableStreamer([])
+    _patch_provider(monkeypatch, streamer)
+    original_send_json = web_server.WebSocket.send_json
+
+    async def _fail_audio_send(ws, data, *args, **kwargs):
+        if data.get("type") == "audio":
+            raise RuntimeError("simulated client send failure")
+        return await original_send_json(ws, data, *args, **kwargs)
+
+    monkeypatch.setattr(web_server.WebSocket, "send_json", _fail_audio_send)
+
+    with stream_client.websocket_connect(_url()) as conn:
+        assert conn.receive_json()["type"] == "start"
+        conn.send_text(json.dumps({"text": "Cancel when the writer fails."}))
+        assert conn.receive()["type"] == "websocket.close"
+
+    assert cancel_called.wait(timeout=1)
+    assert release.is_set()
 
 
 def test_split_text_respects_cap_and_preserves_content():

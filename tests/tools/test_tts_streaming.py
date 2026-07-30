@@ -109,6 +109,167 @@ def test_finite_fish_cancel_closes_the_active_http_response():
     response.close.assert_called_once_with()
 
 
+def test_streaming_provider_cancellation_capability_is_explicit():
+    for provider_name, provider_class in ts._REGISTRY.items():
+        capability = provider_class.upstream_cancellable
+        assert isinstance(capability, bool), provider_name
+
+
+def test_openai_cancel_latch_closes_response_assigned_after_cancel(monkeypatch):
+    import openai
+
+    create_started = threading.Event()
+    release_create = threading.Event()
+    response_closed = threading.Event()
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def close(self):
+            response_closed.set()
+
+        def iter_bytes(self):
+            yield b"\x00\x00"
+
+    response = _Response()
+
+    class _Create:
+        def create(self, **_kwargs):
+            create_started.set()
+            release_create.wait(timeout=2)
+            return response
+
+    class _OpenAI:
+        def __init__(self, **_kwargs):
+            self.audio = MagicMock()
+            self.audio.speech.with_streaming_response = _Create()
+
+    monkeypatch.setattr(openai, "OpenAI", _OpenAI)
+    streamer = ts.OpenAIStreamer({}, {})
+    errors = []
+
+    def _consume():
+        try:
+            list(streamer.stream("cancel race"))
+        except Exception as exc:  # pragma: no cover - defensive
+            errors.append(exc)
+
+    worker = threading.Thread(target=_consume)
+    worker.start()
+    assert create_started.wait(timeout=2)
+    streamer.cancel()
+    release_create.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert not errors
+    response_closed.wait(timeout=1)
+    assert response_closed.is_set()
+    # The latch is idempotent and does not close the already-detached handle twice.
+    streamer.cancel()
+
+
+def test_openai_cancel_closes_active_response_cross_thread(monkeypatch):
+    import openai
+
+    response_started = threading.Event()
+    release_iter = threading.Event()
+    response_closed = threading.Event()
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def close(self):
+            response_closed.set()
+            release_iter.set()
+
+        def iter_bytes(self):
+            response_started.set()
+            release_iter.wait(timeout=2)
+            return iter(())
+
+    class _Create:
+        @staticmethod
+        def create(**_kwargs):
+            return _Response()
+
+    class _OpenAI:
+        def __init__(self, **_kwargs):
+            self.audio = MagicMock()
+            self.audio.speech.with_streaming_response = _Create()
+
+    monkeypatch.setattr(openai, "OpenAI", _OpenAI)
+    streamer = ts.OpenAIStreamer({}, {})
+    worker = threading.Thread(target=lambda: list(streamer.stream("active cancel")))
+    worker.start()
+    assert response_started.wait(timeout=2)
+    streamer.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert response_closed.is_set()
+
+
+def test_gemini_cancel_closes_active_response_cross_thread(monkeypatch):
+    import requests
+
+    response_started = threading.Event()
+    release_iter = threading.Event()
+    response_closed = threading.Event()
+
+    class _Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def close(self):
+            response_closed.set()
+            release_iter.set()
+
+        def iter_lines(self, **_kwargs):
+            response_started.set()
+            release_iter.wait(timeout=2)
+            return iter(())
+
+    response = _Response()
+    monkeypatch.setattr(requests, "post", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(ts, "_resolve_key", lambda *_args: "gemini-key")
+
+    streamer = ts.GeminiStreamer({}, {})
+    errors = []
+
+    def _consume():
+        try:
+            list(streamer.stream("cancel active"))
+        except Exception as exc:  # pragma: no cover - defensive
+            errors.append(exc)
+
+    worker = threading.Thread(target=_consume)
+    worker.start()
+    assert response_started.wait(timeout=2)
+    streamer.cancel()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert not errors
+    assert response_closed.is_set()
+
+
 # ── SentenceChunker ──────────────────────────────────────────────────────
 
 

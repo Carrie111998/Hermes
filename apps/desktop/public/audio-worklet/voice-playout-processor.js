@@ -45,6 +45,18 @@ class HermesVoicePlayoutProcessor extends AudioWorkletProcessor {
       return !this.cancelled
     }
 
+    // A terminal drain may arrive after an underrun paused the clock.  There
+    // is no audio left to render in that state, so acknowledge the request
+    // even though normal playback is paused; otherwise the client waits for
+    // a `drained` message that can never be produced.
+    if (!this.started && this.drainRequest !== null && this.queuedSamples === 0) {
+      channel.fill(0)
+      this.port.postMessage({ id: this.drainRequest, type: 'drained' })
+      this.drainRequest = null
+      this.drainReady = false
+      return !this.cancelled
+    }
+
     if (!this.started) {
       channel.fill(0)
       return !this.cancelled
@@ -99,3 +111,7 @@ class HermesVoicePlayoutProcessor extends AudioWorkletProcessor {
 }
 
 registerProcessor('hermes-voice-playout', HermesVoicePlayoutProcessor)
+
+// Exporting the processor keeps the worklet's behavior directly testable in
+// the renderer suite; AudioWorklet ignores module exports at runtime.
+export { HermesVoicePlayoutProcessor }

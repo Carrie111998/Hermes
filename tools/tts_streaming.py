@@ -323,6 +323,10 @@ class StreamingTTSProvider(ABC):
     sample_rate: int = 24000
     channels: int = 1
     sample_width: int = 2  # bytes/sample (int16)
+    # ``True`` means ``cancel()`` can actively close an in-flight upstream
+    # response.  False is honest local cancellation only: the transport stops
+    # forwarding audio, but the provider request is allowed to finish.
+    upstream_cancellable: bool = False
 
     def __init__(self, tts_config: Dict, section: Dict):
         self.tts_config = tts_config
@@ -357,7 +361,67 @@ class StreamingTTSProvider(ABC):
         )
 
     def cancel(self) -> None:
-        """Best-effort interruption of an active provider stream."""
+        """Idempotent, thread-safe best-effort cancellation contract.
+
+        Non-cancellable adapters intentionally keep this as a no-op.  The
+        transport and caller still stop locally; they must not claim that the
+        remote request was interrupted.
+        """
+
+
+class _ResponseCancellationMixin:
+    """Close a public response handle safely across a streaming worker race."""
+
+    upstream_cancellable = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._response_lock = threading.Lock()
+        self._active_response = None
+        self._cancel_requested = False
+
+    def _begin_response(self) -> bool:
+        """Start one operation, preserving a cancellation that won a race."""
+        with self._response_lock:
+            # A cancelled provider instance is not reused for another request.
+            # This is intentional: callers cancel the whole speech session,
+            # and retaining the latch covers cancel-before-handle assignment.
+            return not self._cancel_requested
+
+    def _attach_response(self, response) -> bool:
+        """Publish *response* unless cancellation already won the race."""
+        with self._response_lock:
+            if self._cancel_requested:
+                close = True
+            else:
+                self._active_response = response
+                close = False
+        if close:
+            try:
+                response.close()
+            except Exception:
+                # SDK response types do not share a narrower close-error
+                # hierarchy; retain the unexpected adapter failure while
+                # cancellation itself remains non-raising.
+                logger.warning("Streaming provider response close failed", exc_info=True)
+            return False
+        return True
+
+    def _detach_response(self, response) -> None:
+        with self._response_lock:
+            if self._active_response is response:
+                self._active_response = None
+
+    def cancel(self) -> None:
+        """Set the latch and close the active public response at most once."""
+        with self._response_lock:
+            self._cancel_requested = True
+            response, self._active_response = self._active_response, None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                logger.warning("Streaming provider response close failed", exc_info=True)
 
 
 _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
@@ -401,13 +465,21 @@ def resolve_streaming_provider(
     1. ``tts.streaming.provider`` (config knob) when set:
        * a provider name pins that exact streamer (or ``None`` if unusable);
        * ``auto`` walks the priority list (``elevenlabs → gemini → openai
-         → xai``) and returns the first usable streamer — an explicit
-         opt-in to "give me the best chunked voice available".
+         → xai → finite_fish``) and returns the first usable streamer — an
+         explicit opt-in to "give me the best chunked voice available".
+         ``finite_fish`` is a request-streaming S2 Pro adapter (streamed WAV
+         decoded to canonical PCM); its presence here does not claim that
+         Fish has passed Hermes' realtime qualification gates.
     2. Otherwise the *configured* TTS provider (or ``preferred`` override).
        ``None`` means "no chunked API for this provider" — the dispatcher
        then speaks per-sentence via the sync path, preserving the user's
        chosen voice. We never silently swap to a different provider just
-       to get streaming.
+       to get streaming. The gateway's ``hermes.audio.v1`` transport frames
+       every usable stream into 20 ms metadata-plus-binary PCM pairs; Desktop
+       plays those frames from one bounded, adaptive AudioWorklet clock. A
+       client stop/disconnect invokes the provider's best-effort ``cancel``
+       hook; provider/transport failure before audio starts degrades to the
+       existing whole-response fallback.
     """
     streaming_cfg = tts_config.get("streaming") or {}
     pinned = str(streaming_cfg.get("provider") or "").lower().strip()
@@ -433,6 +505,7 @@ class ElevenLabsStreamer(StreamingTTSProvider):
     """ElevenLabs chunked HTTP → pcm_24000 (the original reference path)."""
 
     sample_rate = 24000
+    upstream_cancellable = False
 
     @staticmethod
     def available() -> bool:
@@ -492,10 +565,11 @@ def _finite_fish_config_base_url() -> str:
 
 
 @register("openai")
-class OpenAIStreamer(StreamingTTSProvider):
+class OpenAIStreamer(_ResponseCancellationMixin, StreamingTTSProvider):
     """OpenAI speech with ``response_format=pcm`` (24 kHz mono int16)."""
 
     sample_rate = 24000
+    upstream_cancellable = True
 
     @staticmethod
     def available() -> bool:
@@ -503,6 +577,9 @@ class OpenAIStreamer(StreamingTTSProvider):
 
     def stream(self, text: str) -> Iterator[bytes]:
         from openai import OpenAI
+
+        if not self._begin_response():
+            return
 
         client = OpenAI(
             api_key=(self.section.get("api_key") or resolve_openai_audio_api_key()),
@@ -520,19 +597,20 @@ class OpenAIStreamer(StreamingTTSProvider):
             input=text,
             response_format="pcm",
         ) as response:
-            yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
+            if not self._attach_response(response):
+                return
+            try:
+                yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
+            finally:
+                self._detach_response(response)
 
 
 @register("finite_fish")
-class FiniteFishStreamer(StreamingTTSProvider):
+class FiniteFishStreamer(_ResponseCancellationMixin, StreamingTTSProvider):
     """Finite Fish S2 Pro streaming WAV, exposed as canonical raw PCM."""
 
     sample_rate = 44100
-
-    def __init__(self, tts_config: Dict, section: Dict):
-        super().__init__(tts_config, section)
-        self._response_lock = threading.Lock()
-        self._active_response = None
+    upstream_cancellable = True
 
     @staticmethod
     def available() -> bool:
@@ -540,6 +618,9 @@ class FiniteFishStreamer(StreamingTTSProvider):
 
     def stream(self, text: str) -> Iterator[bytes]:
         import requests
+
+        if not self._begin_response():
+            return
 
         api_key = str(
             self.section.get("api_key")
@@ -574,8 +655,8 @@ class FiniteFishStreamer(StreamingTTSProvider):
             stream=True,
             timeout=(10, 600),
         ) as response:
-            with self._response_lock:
-                self._active_response = response
+            if not self._attach_response(response):
+                return
             try:
                 response.raise_for_status()
                 content_type = response.headers.get("Content-Type", "").split(";", 1)[0]
@@ -592,15 +673,7 @@ class FiniteFishStreamer(StreamingTTSProvider):
                     _streaming_wav_pcm(chunks), "Finite Fish streaming TTS"
                 )
             finally:
-                with self._response_lock:
-                    if self._active_response is response:
-                        self._active_response = None
-
-    def cancel(self) -> None:
-        with self._response_lock:
-            response = self._active_response
-        if response is not None:
-            response.close()
+                self._detach_response(response)
 
 
 def _streaming_wav_pcm(chunks: Iterator[bytes]) -> Iterator[bytes]:
@@ -672,7 +745,7 @@ def _capped(chunks: Iterator[bytes], label: str) -> Iterator[bytes]:
 
 
 @register("gemini")
-class GeminiStreamer(StreamingTTSProvider):
+class GeminiStreamer(_ResponseCancellationMixin, StreamingTTSProvider):
     """Gemini ``streamGenerateContent?alt=sse`` → base64 PCM chunks (24 kHz).
 
     Salvaged from PR #47588 (@Cdddo) and rebased onto the post-campaign
@@ -681,6 +754,7 @@ class GeminiStreamer(StreamingTTSProvider):
     """
 
     sample_rate = 24000
+    upstream_cancellable = True
 
     @staticmethod
     def available() -> bool:
@@ -694,6 +768,9 @@ class GeminiStreamer(StreamingTTSProvider):
         import json as _json
 
         import requests
+
+        if not self._begin_response():
+            return
 
         from tools.tts_tool import (
             DEFAULT_GEMINI_TTS_BASE_URL,
@@ -736,24 +813,29 @@ class GeminiStreamer(StreamingTTSProvider):
                 timeout=60,
                 stream=True,
             ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines(decode_unicode=True):
-                    if not line or not line.startswith("data: "):
-                        continue
-                    try:
-                        event = _json.loads(line[len("data: "):])
-                        parts = event["candidates"][0]["content"]["parts"]
-                    except (ValueError, KeyError, IndexError, TypeError):
-                        continue
-                    for part in parts:
-                        inline = part.get("inlineData") or part.get("inline_data") or {}
-                        b64 = inline.get("data", "")
-                        if not b64:
+                if not self._attach_response(response):
+                    return
+                try:
+                    response.raise_for_status()
+                    for line in response.iter_lines(decode_unicode=True):
+                        if not line or not line.startswith("data: "):
                             continue
                         try:
-                            yield base64.b64decode(b64)
-                        except (ValueError, TypeError) as exc:
-                            logger.warning("Gemini SSE: bad base64 audio: %s", exc)
+                            event = _json.loads(line[len("data: "):])
+                            parts = event["candidates"][0]["content"]["parts"]
+                        except (ValueError, KeyError, IndexError, TypeError):
+                            continue
+                        for part in parts:
+                            inline = part.get("inlineData") or part.get("inline_data") or {}
+                            b64 = inline.get("data", "")
+                            if not b64:
+                                continue
+                            try:
+                                yield base64.b64decode(b64)
+                            except (ValueError, TypeError) as exc:
+                                logger.warning("Gemini SSE: bad base64 audio: %s", exc)
+                finally:
+                    self._detach_response(response)
 
         yield from _capped(_sse_chunks(), "Gemini streaming TTS")
 
@@ -771,6 +853,7 @@ class XAIStreamer(StreamingTTSProvider):
     """
 
     sample_rate = 24000
+    upstream_cancellable = False
 
     @staticmethod
     def available() -> bool:
