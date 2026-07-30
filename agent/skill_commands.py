@@ -378,8 +378,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform
-    _skill_commands_platform = _resolve_skill_commands_platform()
-    _skill_commands = {}
+    platform = _resolve_skill_commands_platform()
+    # Build into a local map and publish once, at the end. Writing straight
+    # into the global made a scan's partial results visible to everything
+    # else in the process: a second, overlapping scan deduped against its own
+    # (empty) ``seen_names`` but collided against the first scan's already-
+    # published slugs, logging one bogus "already claimed" warning per skill —
+    # each naming the same skill as its own incumbent (#74574).
+    commands: Dict[str, Dict[str, Any]] = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
@@ -447,14 +453,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # slug (e.g. "git_helper" vs "git-helper"). First-wins
                     # preserves local-before-external precedence.
                     cmd_key = f"/{cmd_name}"
-                    if cmd_key in _skill_commands:
+                    if cmd_key in commands:
                         logger.warning(
                             "Skill %r maps to slash command %s already claimed "
                             "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, _skill_commands[cmd_key]["name"],
+                            name, cmd_key, commands[cmd_key]["name"],
                         )
                         continue
-                    _skill_commands[cmd_key] = {
+                    commands[cmd_key] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
@@ -464,7 +470,12 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
-    return _skill_commands
+    # Publish the finished map and the platform it was scanned for together,
+    # so ``get_skill_commands`` can never observe a new platform tag against a
+    # stale map (or vice versa).
+    _skill_commands = commands
+    _skill_commands_platform = platform
+    return commands
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
