@@ -2765,6 +2765,34 @@ def _events_for_leftover_steers(
     ]
 
 
+def _prioritize_leftover_steers(
+    result: dict[str, Any],
+    source: SessionSource,
+    pending_event: MessageEvent | None,
+    pending_text: str | None,
+) -> tuple[MessageEvent | None, str | None, list[MessageEvent], bool]:
+    """Choose the next recovered steer and defer every later follow-up."""
+    leftovers = [
+        event
+        for event in _events_for_leftover_steers(result, source)
+        if not _pending_slash_is_command_leak(event.text, event)
+    ]
+    if not leftovers:
+        return pending_event, pending_text, [], False
+    deferred = leftovers[1:]
+    if pending_event is not None:
+        deferred.append(pending_event)
+    elif pending_text:
+        deferred.append(
+            MessageEvent(
+                text=pending_text,
+                message_type=MessageType.TEXT,
+                source=source,
+            )
+        )
+    return leftovers[0], leftovers[0].text, deferred, True
+
+
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
@@ -8617,6 +8645,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # change before a second measurement.
         return True
 
+    def _prepend_pending_events(
+        self,
+        session_key: str,
+        events: list[MessageEvent],
+        adapter: Any,
+    ) -> bool:
+        """Place recovered events ahead of every later queued follow-up."""
+        if adapter is None or not session_key or not events:
+            return False
+        with self._busy_queue_guard():
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            if pending_slot is None:
+                return False
+            existing = pending_slot.get(session_key)
+            queue = self._session_state(
+                session_key
+            ).conversation.queued_events
+            ordered = events + ([existing] if existing is not None else []) + queue
+            pending_slot[session_key] = ordered[0]
+            self._session_state(
+                session_key
+            ).conversation.queued_events = ordered[1:]
+        return True
+
     async def _requeue_failed_turn_steer(
         self,
         session_key: str,
@@ -8651,22 +8703,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ]
         if adapter is None or not session_key or not events:
             return False
-        with self._busy_queue_guard():
-            pending_slot = getattr(adapter, "_pending_messages", None)
-            if pending_slot is None:
-                return False
-            existing = pending_slot.get(session_key)
-            queue = self._session_state(
-                session_key
-            ).conversation.queued_events
-            # Accepted steers belonged to the failed active turn, so all of
-            # them precede follow-ups already waiting for their own turns.
-            ordered = events + ([existing] if existing is not None else []) + queue
-            pending_slot[session_key] = ordered[0]
-            self._session_state(
-                session_key
-            ).conversation.queued_events = ordered[1:]
-        return True
+        # Accepted steers belonged to the failed active turn, so all of them
+        # precede follow-ups already waiting for their own turns.
+        return self._prepend_pending_events(session_key, events, adapter)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -24857,67 +24896,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     else:
                         pending = interrupt_message
-                elif pending_event:
-                    # Transcribe audio media on the dequeued event BEFORE it is
-                    # handed back as the next user turn, so queued/interrupting
-                    # voice messages drain with the real transcript instead of
-                    # a file-path placeholder. When configured, echo each
-                    # transcript back to the user in the same 🎙️ format as
-                    # fresh voice messages.
-                    _pending_text = pending_event.text or ""
-                    _media_urls = getattr(pending_event, "media_urls", None) or []
-                    if self._pending_event_audio_paths(pending_event):
-                        pending, _ = await self._transcribe_and_echo_pending_voice(
-                            pending_event,
-                            adapter,
-                            source,
-                            _pending_text,
-                            log_context="Voice-drain",
-                            metadata={"thread_id": source.thread_id} if source.thread_id else None,
-                        )
-                        if not pending:
-                            pending = _build_media_placeholder(pending_event)
-                    else:
-                        pending = _pending_text or _build_media_placeholder(pending_event)
-                    if pending:
-                        logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
             # Leftover /steer: if a steer arrived after the last tool batch
             # (e.g. during the final API call), the agent couldn't inject it
-            # and returned it in result["pending_steer"]. Deliver it as the
-            # next user turn so it isn't silently dropped.
-            if result and not pending and not pending_event:
-                _leftover_events = _events_for_leftover_steers(result, source)
-                if _leftover_events:
-                    pending_event = _leftover_events[0]
-                    pending = pending_event.text
-                    if len(_leftover_events) > 1:
-                        adapter = self._adapter_for_source(source)
-                        with self._busy_queue_guard():
-                            pending_slot = (
-                                getattr(adapter, "_pending_messages", None)
-                                if adapter is not None
-                                else None
-                            )
-                            if pending_slot is not None and session_key:
-                                existing = pending_slot.get(session_key)
-                                queue = self._session_state(
-                                    session_key
-                                ).conversation.queued_events
-                                ordered = (
-                                    _leftover_events[1:]
-                                    + (
-                                        [existing]
-                                        if existing is not None
-                                        else []
-                                    )
-                                    + queue
-                                )
-                                pending_slot[session_key] = ordered[0]
-                                self._session_state(
-                                    session_key
-                                ).conversation.queued_events = ordered[1:]
-                    logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+            # and returned it in result["pending_steer_chunks"]. It belongs to
+            # the just-finished turn, so deliver it before follow-ups already
+            # waiting in the adapter queue. Keep each recovered event separate
+            # so an ordinary slash command cannot discard a trusted IPC task.
+            pending_event, pending, deferred, _recovered_steer_is_next = (
+                _prioritize_leftover_steers(
+                    result,
+                    source,
+                    pending_event,
+                    pending,
+                )
+                if result
+                else (pending_event, pending, [], False)
+            )
+            if deferred:
+                self._prepend_pending_events(
+                    session_key,
+                    deferred,
+                    adapter,
+                )
+            if _recovered_steer_is_next and pending_event is not None:
+                if deferred:
+                    logger.debug(
+                        "Deferred %d queued follow-up(s) behind recovered steer",
+                        len(deferred),
+                    )
+                logger.debug(
+                    "Delivering leftover /steer as next turn: '%s...'",
+                    pending[:40],
+                )
+            elif pending_event:
+                # Transcribe audio media only after recovered steers have been
+                # prioritized. If the media event is deferred, it stays intact
+                # and is transcribed exactly once when its own turn is next.
+                _pending_text = pending_event.text or ""
+                _media_urls = getattr(pending_event, "media_urls", None) or []
+                if self._pending_event_audio_paths(pending_event):
+                    pending, _ = await self._transcribe_and_echo_pending_voice(
+                        pending_event,
+                        adapter,
+                        source,
+                        _pending_text,
+                        log_context="Voice-drain",
+                        metadata={"thread_id": source.thread_id} if source.thread_id else None,
+                    )
+                    if not pending:
+                        pending = _build_media_placeholder(pending_event)
+                else:
+                    pending = _pending_text or _build_media_placeholder(pending_event)
+                if pending:
+                    logger.debug(
+                        "Processing queued message after agent completion: '%s...'",
+                        pending[:40],
+                    )
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent

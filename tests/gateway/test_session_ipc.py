@@ -597,6 +597,65 @@ def test_mixed_leftover_steers_rebuild_separate_trust_domains():
     ) is False
 
 
+def test_recovered_ipc_steer_precedes_already_pending_followup():
+    followup = MessageEvent(
+        text="later follow-up",
+        message_type=MessageType.TEXT,
+        source=_source(),
+    )
+
+    next_event, next_text, deferred, recovered = (
+        gateway_run._prioritize_leftover_steers(
+            {
+                "pending_steer_chunks": [
+                    {
+                        "text": "/restart trusted task",
+                        "gateway_session_ipc": True,
+                    }
+                ]
+            },
+            _source(),
+            followup,
+            followup.text,
+        )
+    )
+
+    assert recovered is True
+    assert is_gateway_session_ipc_task(next_event)
+    assert next_text == "/restart trusted task"
+    assert deferred == [followup]
+
+
+def test_dropped_user_command_does_not_strand_recovered_ipc_steer():
+    followup = MessageEvent(
+        text="later follow-up",
+        message_type=MessageType.TEXT,
+        source=_source(),
+    )
+
+    next_event, next_text, deferred, recovered = (
+        gateway_run._prioritize_leftover_steers(
+            {
+                "pending_steer_chunks": [
+                    {"text": "/stop", "gateway_session_ipc": False},
+                    {
+                        "text": "/restart trusted task",
+                        "gateway_session_ipc": True,
+                    },
+                ]
+            },
+            _source(),
+            followup,
+            followup.text,
+        )
+    )
+
+    assert recovered is True
+    assert is_gateway_session_ipc_task(next_event)
+    assert next_text == "/restart trusted task"
+    assert deferred == [followup]
+
+
 @pytest.mark.asyncio
 async def test_missing_exact_route_fails_closed():
     runner, adapter = _runner()
