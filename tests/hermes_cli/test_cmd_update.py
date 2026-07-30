@@ -1,5 +1,6 @@
 """Tests for cmd_update — branch fallback when remote branch doesn't exist."""
 
+import argparse
 import hashlib
 import subprocess
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli.main import cmd_update, PROJECT_ROOT
+from hermes_cli.subcommands.update import build_update_parser
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
@@ -38,6 +40,37 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 @pytest.fixture
 def mock_args():
     return SimpleNamespace()
+
+
+def _build_update_test_parser(cmd_update_handler):
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    build_update_parser(subparsers, cmd_update=cmd_update_handler)
+    return parser
+
+
+def test_release_commit_parser_propagates_with_release():
+    parser = _build_update_test_parser(lambda _args: None)
+
+    args = parser.parse_args(
+        ["update", "--release", "v2026.5.29", "--release-commit", "b" * 40]
+    )
+
+    assert args.release == "v2026.5.29"
+    assert args.release_commit == "b" * 40
+
+
+def test_release_commit_parser_rejects_without_release(capsys):
+    dispatched = []
+    parser = _build_update_test_parser(lambda args: dispatched.append(args))
+    args = parser.parse_args(["update", "--release-commit", "b" * 40])
+
+    with pytest.raises(SystemExit) as exc:
+        args.func(args)
+
+    assert exc.value.code == 2
+    assert "--release-commit requires --release" in capsys.readouterr().err
+    assert dispatched == []
 
 
 # ---------------------------------------------------------------------------

@@ -3321,6 +3321,13 @@ def _normalize_managed_eol(git_cmd, repo_root):
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    if (
+        getattr(args, "release_commit", None)
+        and getattr(args, "release", None) is None
+    ):
+        print("✗ --release-commit requires --release.")
+        sys.exit(1)
+
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))
