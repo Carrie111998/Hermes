@@ -56,6 +56,7 @@ export function useComposerGhost(opts: {
   const seqRef = useRef(0)
 
   // Fire exactly once per completed turn: on the busy → idle transition.
+  // eslint-disable-next-line no-restricted-syntax -- this records a prop edge and request token, not an atom mirror
   useEffect(() => {
     const wasBusy = prevBusyRef.current
     prevBusyRef.current = busy
@@ -94,6 +95,7 @@ export function useComposerGhost(opts: {
   }, [empty])
 
   // A different conversation invalidates any in-flight or shown suggestion.
+  // eslint-disable-next-line no-restricted-syntax -- this invalidates a request token and does not mirror reactive state
   useEffect(() => {
     seqRef.current += 1
     setGhost('')

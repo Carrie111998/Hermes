@@ -9,9 +9,8 @@ import { asRpcResult } from '../lib/rpc.js'
  *  composer is empty, ask the gateway's deterministic `complete.suggest`
  *  for a likely reply and surface the first candidate as ghost text in the
  *  placeholder slot. Tab accepts it into real input; Esc dismisses it until
- *  the next turn; typing simply hides it (deleting back to empty brings it
- *  back). Suggestions are decorative: any RPC failure resolves to "no
- *  ghost", never an error.
+ *  the next turn; typing clears it. Suggestions are decorative: any RPC
+ *  failure resolves to "no ghost", never an error.
  */
 
 export interface SuggestCandidate {
@@ -78,7 +77,7 @@ export function useGhostSuggestion(
 
     gw.request<SuggestResponse>('complete.suggest', { session_id: sid })
       .then(raw => {
-        if (seq !== seqRef.current) {
+        if (seq !== seqRef.current || getSessionId() !== sid) {
           return
         }
 
@@ -88,6 +87,15 @@ export function useGhostSuggestion(
         // Decorative feature: failures must never reach the composer.
       })
   }, [blocked, getSessionId, gw])
+
+  useEffect(() => {
+    if (input !== '') {
+      // Invalidate both a shown suggestion and any request that was started
+      // while the composer was empty. Deleting the text must not resurrect it.
+      seqRef.current += 1
+      setGhost('')
+    }
+  }, [input])
 
   const acceptGhost = useCallback((): null | string => {
     if (!ghostVisible({ blocked, dismissed, ghost, input })) {

@@ -1,6 +1,10 @@
-import { describe, expect, it } from 'vitest'
+// @vitest-environment jsdom
 
-import { firstCandidateText, ghostVisible } from '../hooks/useGhostSuggestion.js'
+import { act, renderHook, waitFor } from '@testing-library/react'
+import { describe, expect, it, vi } from 'vitest'
+
+import type { GatewayClient } from '../gatewayClient.js'
+import { firstCandidateText, ghostVisible, useGhostSuggestion } from '../hooks/useGhostSuggestion.js'
 
 describe('firstCandidateText', () => {
   it('returns the first candidate from a result envelope', () => {
@@ -48,5 +52,63 @@ describe('ghostVisible', () => {
 
   it('never shows an empty ghost', () => {
     expect(ghostVisible({ ...base, ghost: '' })).toBe(false)
+  })
+})
+
+describe('useGhostSuggestion', () => {
+  it('drops a delayed response after the selected session changes', async () => {
+    let resolveRequest: (value: unknown) => void = () => {}
+    let sessionId = 'session-a'
+
+    const gateway = {
+      request: vi.fn(
+        () =>
+          new Promise(resolve => {
+            resolveRequest = resolve
+          })
+      )
+    } as unknown as GatewayClient
+
+    const getSessionId = () => sessionId
+
+    const { result, rerender } = renderHook(
+      ({ blocked }) => useGhostSuggestion('', blocked, gateway, getSessionId),
+      { initialProps: { blocked: true } }
+    )
+
+    rerender({ blocked: false })
+    expect(gateway.request).toHaveBeenCalledWith('complete.suggest', { session_id: 'session-a' })
+
+    sessionId = 'session-b'
+    await act(async () => {
+      resolveRequest({ candidates: [{ kind: 'confirm', text: 'Yes, go ahead' }] })
+      await Promise.resolve()
+    })
+
+    expect(result.current.ghost).toBe('')
+  })
+
+  it('does not resurrect a suggestion after typing and deleting', async () => {
+    const gateway = {
+      request: vi.fn().mockResolvedValue({
+        candidates: [{ kind: 'confirm', text: 'Yes, go ahead' }]
+      })
+    } as unknown as GatewayClient
+
+    const getSessionId = () => 'session-a'
+
+    const { result, rerender } = renderHook(
+      ({ blocked, input }) => useGhostSuggestion(input, blocked, gateway, getSessionId),
+      { initialProps: { blocked: true, input: '' } }
+    )
+
+    rerender({ blocked: false, input: '' })
+    await waitFor(() => expect(result.current.ghost).toBe('Yes, go ahead'))
+
+    rerender({ blocked: false, input: 'n' })
+    expect(result.current.ghost).toBe('')
+
+    rerender({ blocked: false, input: '' })
+    expect(result.current.ghost).toBe('')
   })
 })
