@@ -533,6 +533,22 @@ def test_recursion_cap_preserves_deferred_head_behind_recovered_steer():
     assert runner._queued_events[SESSION_KEY] == [deferred, tail]
 
 
+def test_early_interrupt_result_requires_failed_turn_steer_recovery():
+    assert gateway_run._conversation_result_completed(
+        {
+            "completed": False,
+            "interrupted": True,
+            "final_response": "Operation interrupted during retry.",
+        }
+    ) is False
+    assert gateway_run._conversation_result_completed(
+        {
+            "completed": True,
+            "final_response": "Done.",
+        }
+    ) is True
+
+
 @pytest.mark.asyncio
 async def test_busy_steer_queues_nonempty_text_when_admission_closed():
     runner, adapter = _runner(_entry())

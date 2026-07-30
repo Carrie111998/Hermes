@@ -2731,6 +2731,16 @@ def _leftover_steer_chunks(
     )
 
 
+def _conversation_result_completed(result: dict[str, Any]) -> bool:
+    """Whether a returned agent result completed its logical turn.
+
+    ``run_conversation()`` returning is not enough: retry/backoff interrupt
+    paths return early with ``completed=False`` and bypass the normal turn
+    finalizer. Those results still need the failed-turn steer recovery handoff.
+    """
+    return bool(result.get("completed", True))
+
+
 def _event_for_leftover_steer(
     text: str,
     *,
@@ -5219,7 +5229,7 @@ class TurnRunner:
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
-            _conversation_completed = True
+            _conversation_completed = _conversation_result_completed(result)
         finally:
             # The normal finalizer closes this at its last steer drain.  Also
             # close here so an exceptional gateway turn cannot leave a cached
