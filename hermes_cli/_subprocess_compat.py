@@ -421,9 +421,11 @@ def bounded_captured_run(
     probe.
 
     On timeout / communicate failure returns ``CompletedProcess`` with
-    ``returncode=-1`` and empty streams (does not raise). Spawn failures
-    (``FileNotFoundError``, ...) propagate so callers can distinguish "not
-    installed" from "timed out".
+    ``returncode=-1`` and empty stdout (does not raise). ``stderr`` carries a
+    short diagnostic (``timed out after Ns`` or the communicate error text) so
+    callers like ``_bash_starts`` can still populate probe-detail caches.
+    Spawn failures (``FileNotFoundError``, ...) propagate so callers can
+    distinguish "not installed" from "timed out".
     """
     _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     if env is not None:
@@ -440,7 +442,7 @@ def bounded_captured_run(
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
-    except Exception:
+    except Exception as exc:
         # Timeout OR any other communicate() failure (torn-down pipe, decode
         # error): terminate the child + descendants and drain bounded. Leaving
         # it running would leak the same suspended-descendant class this guards.
@@ -449,7 +451,11 @@ def bounded_captured_run(
             proc.communicate(timeout=1)
         except Exception:
             pass
-        return subprocess.CompletedProcess(list(argv), -1, "", "")
+        if isinstance(exc, subprocess.TimeoutExpired):
+            detail = f"timed out after {timeout}s"
+        else:
+            detail = (str(exc) or type(exc).__name__)[:2000]
+        return subprocess.CompletedProcess(list(argv), -1, "", detail)
     return subprocess.CompletedProcess(
         list(argv),
         proc.returncode if proc.returncode is not None else -1,

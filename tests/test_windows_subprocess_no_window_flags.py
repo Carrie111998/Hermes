@@ -1,11 +1,42 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 
 _CREATE_NO_WINDOW = 0x08000000
+
+
+def _run_with_retained_stdin(cmd, *, env, cwd, timeout=10):
+    """Run *cmd* while keeping the stdin writer open (ACP JSON-RPC-like)."""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        env=env,
+    )
+    try:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            stderr = proc.stderr.read() if proc.stderr else ""
+            raise AssertionError(
+                f"helper hung under retained stdin writer (stderr={stderr!r})"
+            )
+        stdout = proc.stdout.read() if proc.stdout else ""
+        stderr = proc.stderr.read() if proc.stderr else ""
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
 
 
 class _Completed:
@@ -202,27 +233,46 @@ def test_bounded_captured_run_timeout_tree_kills_on_windows(monkeypatch):
     result = _subprocess_compat.bounded_captured_run(["bash", "-c", "true"], timeout=15)
     assert result.returncode == -1
     assert result.stdout == ""
-    assert result.stderr == ""
+    assert result.stderr == "timed out after 15s"
     assert events == ["comm:15", "kill", "comm:1"]
     kills = [c for c, _ in taskkills if c and c[0] == "taskkill"]
     assert kills == [["taskkill", "/T", "/F", "/PID", "5150"]], taskkills
 
 
+def test_bounded_git_probe_timeout_returns_empty(monkeypatch):
+    """Wrapper must fail open to "" when the shared helper times out."""
+    from hermes_cli import _subprocess_compat
+
+    def _timeout_run(argv, *, timeout, env=None):
+        return subprocess.CompletedProcess(list(argv), -1, "", f"timed out after {timeout}s")
+
+    monkeypatch.setattr(_subprocess_compat, "bounded_captured_run", _timeout_run)
+    assert _subprocess_compat.bounded_git_probe(["git", "status"], timeout=1.5) == ""
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+def test_bounded_captured_run_returns_under_retained_stdin():
+    """ACP/TUI hosts keep stdin open; probes must use DEVNULL or hang forever."""
+    blocker = (
+        "import sys\n"
+        "# Block if stdin is an open pipe with no EOF (inherited ACP stdin).\n"
+        "sys.stdin.buffer.read(1)\n"
+        "raise SystemExit(0)\n"
+    )
+    helper = (
+        "from hermes_cli._subprocess_compat import bounded_captured_run\n"
+        "import sys\n"
+        f"r = bounded_captured_run([sys.executable, '-c', {blocker!r}], timeout=5)\n"
+        "print(r.returncode)\n"
+    )
+    repo_root = str(Path(__file__).resolve().parents[1])
+    proc = _run_with_retained_stdin(
+        [sys.executable, "-c", helper],
+        env={**os.environ, "PYTHONPATH": repo_root},
+        cwd=repo_root,
+        timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0"
 
 
 def test_shell_hooks_hide_hook_command_windows(monkeypatch):

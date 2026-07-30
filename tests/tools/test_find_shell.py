@@ -157,7 +157,7 @@ class TestBashStartsBoundedProbe:
         assert captured["argv"][:3] == [str(bash), "--noprofile", "--norc"]
         assert "-c" in captured["argv"]
 
-    def test_bash_starts_timeout_fails_open(self, tmp_path, monkeypatch):
+    def test_bash_starts_timeout_returns_false_with_detail(self, tmp_path, monkeypatch):
         import tools.environments.local as local_mod
 
         bash = tmp_path / "bash"
@@ -167,40 +167,72 @@ class TestBashStartsBoundedProbe:
         local_mod._bash_probe_details_cache.clear()
 
         def _fake_bounded(argv, *, timeout, env=None):
-            return subprocess.CompletedProcess(list(argv), -1, "", "")
+            return subprocess.CompletedProcess(
+                list(argv), -1, "", f"timed out after {timeout}s"
+            )
 
         monkeypatch.setattr(local_mod, "bounded_captured_run", _fake_bounded)
         assert local_mod._bash_starts(str(bash)) is False
+        assert "timed out after 15s" in local_mod._bash_probe_details_cache[str(bash)]
 
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="shebang fake-bash is not CreateProcess-executable on Windows",
-    )
     def test_bash_starts_returns_under_retained_stdin(self, tmp_path):
         """Regression: retained open stdin must not stall the bash probe."""
-        fake_bash = tmp_path / "bash"
-        fake_bash.write_text(
-            "#!{}\n"
-            "import sys\n"
-            "# Block if stdin is an open pipe with no EOF (inherited ACP stdin).\n"
-            "sys.stdin.buffer.read(1)\n"
-            "sys.exit(0)\n".format(sys.executable),
-            encoding="utf-8",
-        )
-        fake_bash.chmod(0o755)
+        if sys.platform == "win32":
+            # CreateProcess cannot run a shebang script. Drive the same
+            # DEVNULL contract through _bash_starts by rewriting the spawn to a
+            # python stdin-blocker while keeping the real bounded_captured_run.
+            bash = tmp_path / "bash.exe"
+            bash.write_text("", encoding="utf-8")
+            blocker = (
+                "import sys\n"
+                "sys.stdin.buffer.read(1)\n"
+                "raise SystemExit(0)\n"
+            )
+            helper = (
+                "import sys\n"
+                "from hermes_cli import _subprocess_compat as sc\n"
+                "from tools.environments import local as local_mod\n"
+                "orig = sc.bounded_captured_run\n"
+                f"blocker = {blocker!r}\n"
+                "def _wrap(argv, *, timeout, env=None):\n"
+                "    assert argv[:3] == [sys.argv[1], '--noprofile', '--norc']\n"
+                "    return orig([sys.executable, '-c', blocker], timeout=timeout, env=env)\n"
+                "sc.bounded_captured_run = _wrap\n"
+                "local_mod.bounded_captured_run = _wrap\n"
+                "local_mod._bash_starts_cache.clear()\n"
+                "print(local_mod._bash_starts(sys.argv[1]))\n"
+            )
+            repo_root = str(Path(__file__).resolve().parents[2])
+            proc = _run_with_retained_stdin(
+                [sys.executable, "-c", helper, str(bash)],
+                env={**os.environ, "PYTHONPATH": repo_root},
+                cwd=repo_root,
+                timeout=10,
+            )
+        else:
+            fake_bash = tmp_path / "bash"
+            fake_bash.write_text(
+                "#!{}\n"
+                "import sys\n"
+                "# Block if stdin is an open pipe with no EOF (inherited ACP stdin).\n"
+                "sys.stdin.buffer.read(1)\n"
+                "sys.exit(0)\n".format(sys.executable),
+                encoding="utf-8",
+            )
+            fake_bash.chmod(0o755)
 
-        helper = (
-            "from tools.environments.local import _bash_starts, _bash_starts_cache\n"
-            "_bash_starts_cache.clear()\n"
-            f"print(_bash_starts({str(fake_bash)!r}))\n"
-        )
-        repo_root = str(Path(__file__).resolve().parents[2])
-        proc = _run_with_retained_stdin(
-            [sys.executable, "-c", helper],
-            env={**os.environ, "PYTHONPATH": repo_root},
-            cwd=repo_root,
-            timeout=10,
-        )
+            helper = (
+                "from tools.environments.local import _bash_starts, _bash_starts_cache\n"
+                "_bash_starts_cache.clear()\n"
+                f"print(_bash_starts({str(fake_bash)!r}))\n"
+            )
+            repo_root = str(Path(__file__).resolve().parents[2])
+            proc = _run_with_retained_stdin(
+                [sys.executable, "-c", helper],
+                env={**os.environ, "PYTHONPATH": repo_root},
+                cwd=repo_root,
+                timeout=10,
+            )
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout.strip() == "True"
 
