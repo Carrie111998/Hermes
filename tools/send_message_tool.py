@@ -398,6 +398,16 @@ def _handle_send(args):
                 f"Try using a numeric channel ID instead."
             )
 
+    # Teams persists inbound channel-thread origins using Bot Framework's
+    # composite ``<conversation>;messageid=<activity>`` value.  Sending needs
+    # the split conversation/thread pair, but mirroring must use the persisted
+    # composite origin or it cannot find the receiving gateway session.
+    mirror_chat_id = None
+    mirror_thread_id = thread_id
+    if platform_name == "teams" and chat_id and thread_id:
+        mirror_chat_id = f"{chat_id};messageid={thread_id}"
+        mirror_thread_id = None
+
     from tools.interrupt import is_interrupted
     if is_interrupted():
         return tool_error("Interrupted")
@@ -517,10 +527,10 @@ def _handle_send(args):
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
                 if mirror_to_session(
                     platform_name,
-                    chat_id,
+                    mirror_chat_id or chat_id,
                     mirror_text,
                     source_label=source_label,
-                    thread_id=thread_id,
+                    thread_id=mirror_thread_id,
                     user_id=user_id,
                 ):
                     result["mirrored"] = True

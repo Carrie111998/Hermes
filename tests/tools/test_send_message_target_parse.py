@@ -88,7 +88,7 @@ def test_send_message_routes_discovered_teams_thread_target() -> None:
          patch("gateway.channel_directory.resolve_channel_name", side_effect=AssertionError("native Teams target should not use directory resolution")), \
          patch("model_tools._run_async", side_effect=_run_async_immediately), \
          patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
-         patch("gateway.mirror.mirror_to_session", return_value=True):
+         patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
         result = json.loads(
             send_message_tool(
                 {
@@ -109,6 +109,14 @@ def test_send_message_routes_discovered_teams_thread_target() -> None:
         media_files=[],
         force_document=False,
     )
+    mirror_mock.assert_called_once_with(
+        "teams",
+        "19:channel@thread.tacv2;messageid=1780267076971",
+        "hello thread",
+        source_label="cli",
+        thread_id=None,
+        user_id=None,
+    )
 
 
 def test_send_message_routes_directory_resolved_teams_thread_target() -> None:
@@ -124,7 +132,7 @@ def test_send_message_routes_directory_resolved_teams_thread_target() -> None:
          patch("gateway.channel_directory.resolve_channel_name", return_value="19:channel@thread.tacv2;messageid=1780267076971"), \
          patch("model_tools._run_async", side_effect=_run_async_immediately), \
          patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
-         patch("gateway.mirror.mirror_to_session", return_value=True):
+         patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
         result = json.loads(
             send_message_tool(
                 {
@@ -144,6 +152,14 @@ def test_send_message_routes_directory_resolved_teams_thread_target() -> None:
         thread_id="1780267076971",
         media_files=[],
         force_document=False,
+    )
+    mirror_mock.assert_called_once_with(
+        "teams",
+        "19:channel@thread.tacv2;messageid=1780267076971",
+        "hello thread",
+        source_label="cli",
+        thread_id=None,
+        user_id=None,
     )
 
 
