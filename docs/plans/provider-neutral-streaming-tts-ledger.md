@@ -9,9 +9,8 @@
 - Feature branch: `codex/provider-neutral-streaming-tts`
 - Human owner: plebdev
 - Started: 2026-07-30
-- Current status: implementation review is complete through committed
-  hardening `97238bf73`; PR #75014 is open; the follow-up is verified and
-  ready for its issue commit.
+- Current status: implementation and local review are complete through
+  follow-up commit `47f249aa1`; PR #75014 is open pending upstream review.
 - Skill setup status: GitHub issue tracker inferred from origin; root and Desktop
   AGENTS guidance loaded; no repo-local Plebdev issue/triage/domain adapter exists.
 
@@ -30,7 +29,7 @@ Audio as the first conforming front-door provider.
 - Spec issue: https://github.com/NousResearch/hermes-agent/issues/75029.
 - Tickets: four approved delivery slices published in dependency order as
   #75030, #75031, #75032, and #75033.
-- Ticket sessions: recorded below; final follow-up commit pending.
+- Ticket sessions: recorded below and committed.
 - Agent briefs: three Luna-high read-only architecture briefs in current task.
 - Review packets: Luna-high standards/spec reviews completed; all P1/P2 findings resolved.
 - Local CodeRabbit report: initial nine findings and follow-up rounds of zero,
@@ -73,12 +72,12 @@ claim; it is not Front-Door Model Promotion evidence or admission.
 
 | Issue | Fixed point | Worker session | Commit | Review result | Checks |
 | --- | --- | --- | --- | --- | --- |
-| Frame + gateway | `c9de69c6d` | Luna worker | `4a1cca7b6` | passed after fixes | 39 Python tests |
-| Desktop playout | `4a1cca7b6` | Luna worker | `93b780fd5` | passed after fixes | 12 focused Vitest + typecheck + build |
-| Design record | `93b780fd5` | orchestrator | `e80796df2` | passed | docs review |
-| Playout/cancellation hardening | `e80796df2` | delegated worker | `97238bf73` | passed | focused Desktop/Python tests + typecheck |
-| Integration/docs follow-up | `97238bf73` | Luna worker | pending (uncommitted) | passed pending final review | 15 Desktop + 75 Python tests, typecheck, build |
-| Provider cancellation contract | `97238bf73` | Luna worker | pending (uncommitted) | passed pending final review | included in 75 Python tests |
+| Frame + gateway | `c9de69c6d` | Luna worker | `dd2e84929` | passed after fixes | 39 Python tests |
+| Desktop playout | `dd2e84929` | Luna worker | `70087f6bc` | passed after fixes | 12 focused Vitest + typecheck + build |
+| Design record | `70087f6bc` | orchestrator | `79c74999b` | passed | docs review |
+| Playout/cancellation hardening | `79c74999b` | delegated worker | `a468f23f1` | passed | focused Desktop/Python tests + typecheck |
+| Integration/docs follow-up | `a468f23f1` | Luna worker | `47f249aa1` | passed after standards/spec/CodeRabbit review | 16 Desktop + 77 Python tests, typecheck, build |
+| Provider cancellation contract | `a468f23f1` | Luna worker | `47f249aa1` | passed after fail-closed/send-failure fixes | included in 77 Python tests |
 
 ## Open Questions
 
