@@ -6369,6 +6369,17 @@ class AIAgent:
             "to change strategy instead of repeating the same call."
         )
 
+    def _trajectory_quality_halt_response(self, decision) -> str:
+        """Controlled halt response for trajectory quality stop level."""
+        tool = decision.tool_name or "a tool"
+        return (
+            f"I stopped tool thrash for this turn because trajectory quality "
+            f"routing escalated to a stop ({decision.reason_code}) after "
+            f"{decision.count} non-progressing attempts on {tool}. The current "
+            "model appears to be thrashing; try a stronger model via /model "
+            "or start a clean session."
+        )
+
     def _append_guardrail_observation(
         self,
         tool_name: str,
@@ -6387,7 +6398,102 @@ class AIAgent:
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
+        # Feed the same structured observation to the trajectory quality
+        # router (parallel observer — does not mutate tool_result/messages).
+        self._observe_trajectory_quality(
+            tool_name, function_args, function_result, failed=failed
+        )
         return function_result
+
+    def _observe_trajectory_quality(
+        self,
+        tool_name: str,
+        function_args: dict,
+        function_result: str,
+        *,
+        failed: bool,
+    ) -> None:
+        """Feed a structured tool-result observation to the quality router.
+
+        No-op when the controller is absent or disabled. Never mutates
+        messages, tool_result, toolsets, or the system prompt. Never calls
+        ``switch_model`` or ``try_activate_fallback``.
+        """
+        ctrl = getattr(self, "_trajectory_quality", None)
+        if ctrl is None or not ctrl.config.enabled:
+            return
+
+        try:
+            from agent.trajectory_quality import build_observation
+
+            obs = build_observation(
+                tool_name=tool_name,
+                args=function_args,
+                result=function_result,
+                failed=failed,
+                api_call_count=getattr(self, "api_call_count", 0),
+                session_id=getattr(self, "session_id", "") or "",
+                model=getattr(self, "model", "") or "",
+                provider=getattr(self, "provider", "") or "",
+            )
+            decision = ctrl.observe(obs)
+        except Exception:
+            logging.debug("trajectory quality observe failed", exc_info=True)
+            return
+
+        if decision is None:
+            return
+
+        # Persist the decision (fail-open).
+        store = getattr(self, "_trajectory_quality_store", None)
+        if store is not None:
+            try:
+                store.record(
+                    decision,
+                    session_id=getattr(self, "session_id", "") or "",
+                    api_call_count=getattr(self, "api_call_count", 0),
+                )
+            except Exception:
+                logging.debug("trajectory quality store record failed", exc_info=True)
+
+        # Stash the recommendation for status emission.
+        self._pending_trajectory_quality_recommendation = decision
+
+        # Emit a user-visible status notice (never into the transcript).
+        self._emit_trajectory_quality_status(decision)
+
+        # Soft-stop at ladder stop level.
+        if decision.action == "stop" and ctrl.config.execute_stop:
+            self._trajectory_quality_halt_decision = decision
+
+    def _emit_trajectory_quality_status(self, decision) -> None:
+        """Emit a one-line status notice for a quality routing decision."""
+        if decision.action == "continue":
+            return
+        prefix = "Trajectory quality"
+        if decision.action == "recommend_stronger_model":
+            msg = (
+                f"{prefix}: recommend stronger model "
+                f"({decision.reason_code} on {decision.tool_name}"
+                f"x{decision.count})."
+            )
+            if decision.recommended_model:
+                msg += f" Try /model {decision.recommended_model}."
+            else:
+                msg += " Try /model for a stronger model."
+        elif decision.action == "recommend_clean_restart":
+            msg = (
+                f"{prefix}: recommend a clean session restart "
+                f"({decision.reason_code}; context thrash detected)."
+            )
+        elif decision.action == "stop":
+            msg = (
+                f"{prefix}: stopping tool thrash for this turn "
+                f"({decision.reason_code})."
+            )
+        else:
+            msg = f"{prefix}: {decision.action} ({decision.reason_code})."
+        self._emit_status(msg)
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         self._set_tool_guardrail_halt(decision)

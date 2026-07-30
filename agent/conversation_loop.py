@@ -5273,6 +5273,29 @@ def run_conversation(
                                 pass
                     break
 
+                # Trajectory quality soft-stop: when the quality ladder
+                # reaches ``stop`` and ``execute_stop`` is enabled, halt
+                # further tool thrash for this turn (mirrors the guardrail
+                # halt path but with quality-specific wording).
+                _tqr_halt = getattr(agent, "_trajectory_quality_halt_decision", None)
+                if _tqr_halt is not None:
+                    _turn_exit_reason = "trajectory_quality_halt"
+                    final_response = agent._trajectory_quality_halt_response(_tqr_halt)
+                    agent._emit_status(
+                        f"⚠️ Trajectory quality halted {_tqr_halt.tool_name}: "
+                        f"{_tqr_halt.reason_code}"
+                    )
+                    messages.append({"role": "assistant", "content": final_response})
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                    break
+
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
                 # entire conversation.
