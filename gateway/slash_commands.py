@@ -2310,13 +2310,14 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
-            session_overrides = getattr(self, "_session_model_overrides", None)
-            if not isinstance(session_overrides, dict):
-                session_overrides = {}
-                setattr(self, "_session_model_overrides", session_overrides)
-            session_overrides[session_key] = resolved_override
-            if hasattr(self, "_pending_one_turn_model_restores"):
-                self._pending_one_turn_model_restores.pop(session_key, None)
+            # SessionFieldView is a MutableMapping, not a dict. Treating the
+            # compatibility descriptor as a plain dict creates an instance
+            # shadow and bypasses the canonical SessionState registry. Write
+            # the conversation authority directly so runtime resolution,
+            # session cleanup, and durable write-through all agree.
+            conversation = getattr(self, "_session_state")(session_key).conversation
+            conversation.model_override = resolved_override
+            conversation.one_turn_restore = None
 
             # Write-through the non-secret parts (model/provider/base_url) to
             # the session store so the override survives a gateway restart.
