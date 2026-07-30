@@ -177,13 +177,13 @@ class FactRetriever:
         for row in rows:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
-            # Unbind probe key from fact to see if entity is structurally present
-            residual = hrr.unbind(fact_vec, probe_key)
-            # Compare residual against content signal
-            role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-            content_vec = hrr.bind(hrr.encode_text(fact["content"], self.hrr_dim), role_content)
-            sim = hrr.similarity(residual, content_vec)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
+            # Direct similarity check — unbind does not compose through
+            # the non-linear bundle (circular mean of complex exponentials),
+            # so the previous unbind-through-bundle approach collapsed to noise.
+            sim = hrr.similarity(fact_vec, probe_key)
+            # Score by raw similarity only; trust is already a minimum filter
+            # in the SQL WHERE clause and multiplying it drowns signal below noise.
+            fact["score"] = (sim + 1.0) / 2.0
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -472,7 +472,7 @@ class FactRetriever:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
             sim = hrr.similarity(target_vec, fact_vec)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
+            fact["score"] = (sim + 1.0) / 2.0
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)

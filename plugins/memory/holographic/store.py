@@ -83,12 +83,36 @@ _TRUST_MAX       =  1.0
 
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+_RE_SINGLE_CAP   = re.compile(r'\b([A-Z][a-z]{2,})\b')  # Single-word proper nouns e.g. "Nevaeh", "Jake"
+_RE_HYPHENATED   = re.compile(r'\b([A-Z][a-z]+(?:-[A-Za-z][a-z]*)+)\b')  # Hyphenated e.g. "Pi-hole"
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
 _RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
 _RE_AKA          = re.compile(
     r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
     re.IGNORECASE,
 )
+
+# Stoplist: common English words that happen to be capitalized but aren't entities.
+# Excludes function words, pronouns, conjunctions, prepositions, quantifiers, and
+# sentence-starters that would pollute entity extraction. Deliberately kept small —
+# false positives (missing a real entity) are worse than false negatives (storing a
+# common word as an entity, which just adds noise to the HRR bundle).
+_ENTITY_STOPLIST: frozenset[str] = frozenset({
+    "The", "A", "An", "This", "That", "These", "Those",
+    "It", "He", "She", "They", "We", "You", "I", "Me", "Us", "Him", "Her", "Them",
+    "Is", "Are", "Was", "Were", "Be", "Been", "Has", "Have", "Had",
+    "Do", "Does", "Did", "Will", "Would", "Can", "Could", "Should", "May", "Might",
+    "Not", "No", "Yes", "But", "And", "Or", "Nor",
+    "If", "In", "On", "At", "To", "For", "With", "From", "By", "As", "Of", "Into", "Over",
+    "All", "Any", "Some", "Each", "Both", "Few", "Many", "Most", "Other", "Such",
+    "Only", "Own", "Same", "So", "Than", "Too", "Very", "Just",
+    "Now", "Then", "Also", "Even", "Still", "Yet", "Like", "Get", "Got",
+    "One", "Two", "Three", "First", "Last", "New", "Old", "More", "Less",
+    "After", "Before", "During", "Since", "Until", "While",
+    "About", "Above", "Across", "Again", "Against", "Along", "Among", "Around",
+    "Here", "There", "Where", "When", "Why", "How", "What", "Which", "Who",
+    "However", "Therefore", "Because", "Although", "Though", "Unless", "Whether",
+})
 
 
 def _clamp_trust(value: float) -> float:
@@ -449,9 +473,11 @@ class MemoryStore:
 
         Rules applied (in order):
         1. Capitalized multi-word phrases  e.g. "John Doe"
-        2. Double-quoted terms             e.g. "Python"
-        3. Single-quoted terms             e.g. 'pytest'
-        4. AKA patterns                    e.g. "Guido aka BDFL" -> two entities
+        2. Single capitalized words (≥3 chars, not in stoplist)  e.g. "Nevaeh"
+        3. Hyphenated capitalized phrases  e.g. "Pi-hole"
+        4. Double-quoted terms             e.g. "Python"
+        5. Single-quoted terms             e.g. 'pytest'
+        6. AKA patterns                    e.g. "Guido aka BDFL" -> two entities
 
         Returns a deduplicated list preserving first-seen order.
         """
@@ -465,6 +491,14 @@ class MemoryStore:
                 candidates.append(stripped)
 
         for m in _RE_CAPITALIZED.finditer(text):
+            _add(m.group(1))
+
+        for m in _RE_SINGLE_CAP.finditer(text):
+            word = m.group(1)
+            if word not in _ENTITY_STOPLIST:
+                _add(word)
+
+        for m in _RE_HYPHENATED.finditer(text):
             _add(m.group(1))
 
         for m in _RE_DOUBLE_QUOTE.finditer(text):
