@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
 from copy import deepcopy
+import io
+from pathlib import Path
 from types import SimpleNamespace
 import threading
 import time
 from typing import Any
 import uuid
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent import delegation_inject as inject
 from agent.delegation_inject import (
     acknowledge_pending_injects,
     drain_ready_injects,
@@ -20,6 +25,8 @@ from agent.delegation_inject import (
 from tools import async_delegation as ad
 from tools import delegate_tool
 from tools.process_registry import process_registry
+from hermes_state import SessionDB
+from run_agent import AIAgent
 
 
 @pytest.fixture(autouse=True)
@@ -111,6 +118,61 @@ def _durable_event_keys(delegation_id: str):
                 (delegation_id,),
             ).fetchall()
         ]
+
+
+def _loop_response(*, content, finish_reason="stop", tool_calls=None):
+    message = SimpleNamespace(content=content, tool_calls=tool_calls)
+    choice = SimpleNamespace(message=message, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def _loop_tool_call():
+    return SimpleNamespace(
+        id="call-inject",
+        type="function",
+        function=SimpleNamespace(name="terminal", arguments="{}"),
+    )
+
+
+def _make_loop_agent(tmp_path: Path) -> AIAgent:
+    tool_defs = [
+        {
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "description": "test boundary",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        patch("run_agent.get_tool_definitions", return_value=tool_defs),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            provider="openai",
+            api_mode="chat_completions",
+            model="test/model",
+            quiet_mode=True,
+            max_iterations=4,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=SessionDB(db_path=tmp_path / "state.db"),
+            session_id=f"inject-loop-{uuid.uuid4().hex}",
+        )
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent._disable_streaming = True
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.tool_delay = 0
+    agent.valid_tool_names = {"terminal"}
+    return agent
 
 
 def test_inject_drain_rotates_unrelated_queue_items_and_coalesces_ready_children():
@@ -453,6 +515,27 @@ def test_recovery_with_partial_inject_children_emits_only_terminal_gap_event():
     assert "1/2 batch child results" in terminal["error"]
 
 
+def test_recovery_requires_exact_expected_batch_child_keys():
+    delegation_id = _record(goals=("A", "B"))
+    assert ad.publish_batch_child_completion(delegation_id, 0, _child(0, "A"))
+    process_registry.completion_queue.get_nowait()
+    with ad._records_lock:
+        event_record = dict(ad._records[delegation_id])
+    rogue = ad._build_batch_child_event(event_record, 99, _child(99, "rogue"))
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert ad._insert_batch_event(conn, rogue, now=time.time())
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=99999999, owner_started_at=0 "
+            "WHERE delegation_id=?",
+            (delegation_id,),
+        )
+
+    assert ad.recover_abandoned_delegations() == 1
+
+    assert _parent_state(delegation_id) == ("unknown", "delivered")
+    assert _durable_event_keys(delegation_id) == ["task:0", "task:99", "terminal"]
+
+
 def test_child_timeout_error_is_injectable_and_durable():
     delegation_id = _record()
     assert ad.publish_batch_child_completion(
@@ -486,6 +569,224 @@ def test_unconsumed_ram_inject_is_removed_released_and_requeued():
     assert messages == [original]
     assert [event["delegation_id"] for event in _queue_contents()] == [delegation_id]
     assert _event_state(delegation_id, "task:0") == ("pending", 1)
+
+
+def test_compression_copy_is_removed_by_durable_event_identity_on_release():
+    delegation_id = _record()
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "copy-safe rollback")
+    )
+    original = {"role": "tool", "tool_call_id": "tc", "content": "done"}
+    messages = [original]
+    agent = SimpleNamespace()
+
+    assert drain_ready_injects(agent, messages, "turn-current") == 1
+    messages[:] = deepcopy(messages)
+    assert messages[-1] is not agent._pending_delegation_inject_claims[0]["message"]
+
+    assert release_pending_injects(agent, messages, turn_id="turn-current") == 1
+    assert messages == [original]
+    assert [event["delegation_id"] for event in _queue_contents()] == [delegation_id]
+
+
+def test_failed_ack_keeps_ram_claim_for_later_reconciliation(monkeypatch):
+    delegation_id = _record()
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "ack must commit")
+    )
+    messages = [{"role": "tool", "tool_call_id": "tc", "content": "done"}]
+    agent = SimpleNamespace()
+    assert drain_ready_injects(agent, messages, "turn-current") == 1
+
+    monkeypatch.setattr(ad, "complete_event_delivery", lambda *_args: False)
+    assert acknowledge_pending_injects(agent, turn_id="turn-current") == 0
+    assert len(agent._pending_delegation_inject_claims) == 1
+    assert _event_state(delegation_id, "task:0") == ("pending", 1)
+
+
+def test_failed_release_neither_requeues_nor_forgets_claim(monkeypatch):
+    delegation_id = _record()
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "release must commit")
+    )
+    original = {"role": "tool", "tool_call_id": "tc", "content": "done"}
+    messages = [original]
+    agent = SimpleNamespace()
+    assert drain_ready_injects(agent, messages, "turn-current") == 1
+
+    monkeypatch.setattr(ad, "release_event_delivery", lambda *_args: False)
+    assert release_pending_injects(agent, messages, turn_id="turn-current") == 0
+    assert messages == [original]
+    assert process_registry.completion_queue.empty()
+    assert len(agent._pending_delegation_inject_claims) == 1
+
+
+def test_durable_claim_renewal_prevents_expiry_steal():
+    delegation_id = _record()
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "renew durable lease")
+    )
+    event = process_registry.completion_queue.get_nowait()
+    claim = ad.claim_event_delivery(event, "slow-main")
+    assert claim
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegation_events SET delivery_claimed_at=0 "
+            "WHERE delegation_id=? AND event_key='task:0'",
+            (delegation_id,),
+        )
+
+    assert ad.renew_event_delivery(event, claim) is True
+    assert ad.claim_event_delivery(event, "competing-main") is None
+    assert ad.complete_event_delivery(event, claim) is True
+
+
+def test_pending_claim_heartbeat_renews_until_ack(monkeypatch):
+    delegation_id = _record()
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "slow provider")
+    )
+    renewed = threading.Event()
+
+    def fake_renew(_event, _claim_id):
+        renewed.set()
+        return True
+
+    monkeypatch.setattr(ad, "renew_event_delivery", fake_renew, raising=False)
+    monkeypatch.setattr(
+        inject, "_CLAIM_HEARTBEAT_INTERVAL_SECONDS", 0.01, raising=False
+    )
+    messages = [{"role": "tool", "tool_call_id": "tc", "content": "done"}]
+    agent = SimpleNamespace()
+
+    assert drain_ready_injects(agent, messages, "turn-current") == 1
+    assert inject.ensure_pending_inject_heartbeat(agent) is True
+    assert renewed.wait(timeout=1), "pending inject claim was not renewed"
+    assert acknowledge_pending_injects(agent, turn_id="turn-current") == 1
+    heartbeat = agent._delegation_inject_claim_heartbeat
+    heartbeat["thread"].join(timeout=1)
+    assert not heartbeat["thread"].is_alive()
+
+
+def test_run_conversation_inject_transport_normalize_and_ack(monkeypatch, tmp_path):
+    agent = _make_loop_agent(tmp_path)
+    requests = []
+    responses = [
+        _loop_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_loop_tool_call()],
+        ),
+        _loop_response(content="model consumed LIVE_LOOP_INJECT"),
+    ]
+
+    def create(**kwargs):
+        requests.append(deepcopy(kwargs["messages"]))
+        return responses.pop(0)
+
+    agent.client.chat.completions.create.side_effect = create
+    published = {}
+
+    def handle_tool(*_args, **_kwargs):
+        delegation_id = _record(turn_id=str(agent._active_turn_id))
+        published["delegation_id"] = delegation_id
+        assert ad.publish_batch_child_completion(
+            delegation_id, 0, _child(0, "LIVE_LOOP_INJECT")
+        )
+        return "tool boundary complete"
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=handle_tool),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("exercise inject lifecycle")
+
+    delegation_id = published["delegation_id"]
+    assert result["completed"] is True
+    assert len(requests) == 2
+    assert "LIVE_LOOP_INJECT" in str(requests[1])
+    assert _event_state(delegation_id, "task:0") == ("delivered", 1)
+    assert not agent._pending_delegation_inject_claims
+    heartbeat = agent._delegation_inject_claim_heartbeat
+    heartbeat["thread"].join(timeout=1)
+    assert not heartbeat["thread"].is_alive()
+
+
+def test_run_conversation_compression_copy_then_provider_error_releases(
+    monkeypatch, tmp_path
+):
+    agent = _make_loop_agent(tmp_path)
+    calls = {"provider": 0, "compress": 0, "marker_compress": 0}
+    provider_error = RuntimeError("provider rejected request")
+    provider_error.status_code = 400
+
+    def create(**_kwargs):
+        calls["provider"] += 1
+        if calls["provider"] == 1:
+            return _loop_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_loop_tool_call()],
+            )
+        raise provider_error
+
+    agent.client.chat.completions.create.side_effect = create
+    published = {}
+
+    def handle_tool(*_args, **_kwargs):
+        delegation_id = _record(turn_id=str(agent._active_turn_id))
+        published["delegation_id"] = delegation_id
+        assert ad.publish_batch_child_completion(
+            delegation_id, 0, _child(0, "COPY_THEN_RELEASE")
+        )
+        agent.compression_enabled = True
+        agent.context_compressor.should_compress = lambda _tokens: True
+        return "tool boundary complete"
+
+    def copy_compress(messages, system_message, **_kwargs):
+        calls["compress"] += 1
+        if "COPY_THEN_RELEASE" not in str(messages):
+            # The post-tool compression boundary runs before the next loop-top
+            # drain. Only the following pre-API pass exercises copied injects.
+            return messages, system_message
+        calls["marker_compress"] += 1
+        heartbeat = agent._delegation_inject_claim_heartbeat
+        assert heartbeat["thread"].is_alive()
+        assert not heartbeat["stop"].is_set()
+        agent.compression_enabled = False
+        return deepcopy(messages), system_message
+
+    def persist_without_unconsumed_inject(messages, *_args, **_kwargs):
+        assert "COPY_THEN_RELEASE" not in str(messages)
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=handle_tool),
+        patch.object(agent, "_compress_context", side_effect=copy_compress),
+        patch.object(
+            agent,
+            "_persist_session",
+            side_effect=persist_without_unconsumed_inject,
+        ),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("exercise rollback lifecycle")
+
+    delegation_id = published["delegation_id"]
+    assert result["failed"] is True
+    assert calls["compress"] >= 2
+    assert calls["marker_compress"] == 1
+    assert "COPY_THEN_RELEASE" not in str(agent._session_messages)
+    assert _event_state(delegation_id, "task:0") == ("pending", 1)
+    assert any(
+        event.get("delegation_id") == delegation_id for event in _queue_contents()
+    )
+    assert not agent._pending_delegation_inject_claims
+    heartbeat = agent._delegation_inject_claim_heartbeat
+    heartbeat["thread"].join(timeout=1)
+    assert not heartbeat["thread"].is_alive()
 
 
 def test_restart_dedups_inject_already_persisted_in_active_history():

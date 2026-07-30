@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 _GRACE_TURN_ATTR = "_delegation_reconciliation_grace_turn_id"
 _PENDING_CLAIMS_ATTR = "_pending_delegation_inject_claims"
+_CLAIM_HEARTBEAT_ATTR = "_delegation_inject_claim_heartbeat"
+_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 60.0
 
 
 def _event_identity(event: dict[str, Any]) -> str:
@@ -46,6 +49,66 @@ def _durable_event_is_in_history(
     )
 
 
+def _stop_claim_heartbeat_if_idle(agent: Any) -> None:
+    if getattr(agent, _PENDING_CLAIMS_ATTR, None):
+        return
+    heartbeat = getattr(agent, _CLAIM_HEARTBEAT_ATTR, None)
+    if isinstance(heartbeat, dict):
+        stop = heartbeat.get("stop")
+        if isinstance(stop, threading.Event):
+            stop.set()
+
+
+def ensure_pending_inject_heartbeat(agent: Any) -> bool:
+    """Renew live same-turn claims throughout provider retries and backoff."""
+
+    if not getattr(agent, _PENDING_CLAIMS_ATTR, None):
+        return False
+    existing = getattr(agent, _CLAIM_HEARTBEAT_ATTR, None)
+    if isinstance(existing, dict):
+        thread = existing.get("thread")
+        existing_stop = existing.get("stop")
+        if (
+            isinstance(thread, threading.Thread)
+            and thread.is_alive()
+            and isinstance(existing_stop, threading.Event)
+            and not existing_stop.is_set()
+        ):
+            return True
+
+    stop = threading.Event()
+
+    def _heartbeat() -> None:
+        from tools.async_delegation import renew_event_delivery
+
+        while not stop.wait(_CLAIM_HEARTBEAT_INTERVAL_SECONDS):
+            pending = list(getattr(agent, _PENDING_CLAIMS_ATTR, []) or [])
+            if not pending:
+                break
+            for entry in pending:
+                try:
+                    if not renew_event_delivery(entry["event"], entry["claim_id"]):
+                        logger.warning(
+                            "Could not renew same-turn delegation claim %s",
+                            entry.get("event_id"),
+                        )
+                except Exception:
+                    logger.warning(
+                        "Failed to renew same-turn delegation claim %s",
+                        entry.get("event_id"),
+                        exc_info=True,
+                    )
+
+    thread = threading.Thread(
+        target=_heartbeat,
+        daemon=True,
+        name="delegation-inject-claim-heartbeat",
+    )
+    setattr(agent, _CLAIM_HEARTBEAT_ATTR, {"stop": stop, "thread": thread})
+    thread.start()
+    return True
+
+
 def acknowledge_pending_injects(agent: Any, *, turn_id: str | None = None) -> int:
     """Acknowledge inject claims after a provider consumed their message."""
 
@@ -58,9 +121,16 @@ def acknowledge_pending_injects(agent: Any, *, turn_id: str | None = None) -> in
         if turn_id is not None and str(entry.get("turn_id") or "") != str(turn_id):
             keep.append(entry)
             continue
-        complete_event_delivery(entry["event"], entry["claim_id"])
-        acknowledged += 1
+        if complete_event_delivery(entry["event"], entry["claim_id"]):
+            acknowledged += 1
+        else:
+            keep.append(entry)
+            logger.warning(
+                "Provider consumed delegation inject %s but durable ack did not commit",
+                entry.get("event_id"),
+            )
     setattr(agent, _PENDING_CLAIMS_ATTR, keep)
+    _stop_claim_heartbeat_if_idle(agent)
     return acknowledged
 
 
@@ -74,14 +144,15 @@ def release_pending_injects(
 
     from tools.async_delegation import (
         complete_event_delivery,
+        get_event_delivery_state,
         release_event_delivery,
     )
     from tools.process_registry import process_registry
 
     pending = list(getattr(agent, _PENDING_CLAIMS_ATTR, []) or [])
     keep: list[dict[str, Any]] = []
-    removable_message_ids: set[int] = set()
-    released = 0
+    removable_event_ids: set[str] = set()
+    settled = 0
     for entry in pending:
         if turn_id is not None and str(entry.get("turn_id") or "") != str(turn_id):
             keep.append(entry)
@@ -89,20 +160,36 @@ def release_pending_injects(
         event = entry["event"]
         event_id = str(entry["event_id"])
         if _durable_event_is_in_history(messages, event_id):
-            complete_event_delivery(event, entry["claim_id"])
+            if complete_event_delivery(event, entry["claim_id"]):
+                settled += 1
+            else:
+                keep.append(entry)
         else:
-            release_event_delivery(event, entry["claim_id"])
-            process_registry.completion_queue.put(event)
-            removable_message_ids.add(id(entry["message"]))
-        released += 1
+            # Remove the unconsumed marker by durable identity even when
+            # compression replaced the Python dict object.
+            removable_event_ids.add(event_id)
+            committed = release_event_delivery(event, entry["claim_id"])
+            state = get_event_delivery_state(event)
+            if committed:
+                # At the attempt cap release transitions to dropped, not pending.
+                if state == "pending":
+                    process_registry.completion_queue.put(event)
+                settled += 1
+            elif state == "delivered":
+                settled += 1
+            else:
+                keep.append(entry)
 
-    if removable_message_ids:
+    if removable_event_ids:
         messages[:] = [
-            message for message in messages if id(message) not in removable_message_ids
+            message
+            for message in messages
+            if not (_message_event_ids(message) & removable_event_ids)
         ]
         agent._session_messages = messages
     setattr(agent, _PENDING_CLAIMS_ATTR, keep)
-    return released
+    _stop_claim_heartbeat_if_idle(agent)
+    return settled
 
 
 def _normal_budget_available(agent: Any) -> bool:
@@ -208,6 +295,7 @@ def drain_ready_injects(agent: Any, messages: list[dict[str, Any]], turn_id: str
     from tools.async_delegation import (
         claim_event_delivery,
         complete_event_delivery,
+        get_event_delivery_state,
         release_event_delivery,
     )
     from tools.process_registry import _format_async_delegation, process_registry
@@ -286,8 +374,9 @@ def drain_ready_injects(agent: Any, messages: list[dict[str, Any]], turn_id: str
         agent._session_messages = messages
     except Exception:
         for event, claim_id, _text, _event_id in accepted:
-            release_event_delivery(event, claim_id)
-            completion_queue.put(event)
+            if release_event_delivery(event, claim_id):
+                if get_event_delivery_state(event) == "pending":
+                    completion_queue.put(event)
         raise
 
     pending = list(getattr(agent, _PENDING_CLAIMS_ATTR, []) or [])

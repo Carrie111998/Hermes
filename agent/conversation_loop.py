@@ -1259,14 +1259,28 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    def _release_unconsumed_injects() -> None:
+        try:
+            from agent.delegation_inject import release_pending_injects
+
+            release_pending_injects(agent, messages, turn_id=turn_id)
+        except Exception:
+            logger.debug("Failed to settle unconsumed inject claims", exc_info=True)
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Safe boundary: the previous assistant tool-call block (if any) and
         # every corresponding tool result have already been appended. Drain
         # only already-ready results from this foreground turn.
         try:
-            from agent.delegation_inject import drain_ready_injects
+            from agent.delegation_inject import (
+                drain_ready_injects,
+                ensure_pending_inject_heartbeat,
+            )
 
             drain_ready_injects(agent, messages, turn_id)
+            # Start the lease before context assembly/compression; those steps
+            # can themselves be slow for very large parent histories.
+            ensure_pending_inject_heartbeat(agent)
         except Exception:
             logger.debug("Same-turn delegation inject drain failed", exc_info=True)
 
@@ -5040,6 +5054,10 @@ def run_conversation(
                             force=True,
                         )
                     logger.error(f"{agent.log_prefix}Non-retryable client error: {api_error}")
+                    # The provider did not consume a normalized response. Remove
+                    # RAM-only inject markers and release their durable claims
+                    # before any terminal-error persistence can mark them saved.
+                    _release_unconsumed_injects()
                     # Skip session persistence when the error is likely
                     # context-overflow related (status 400 + large session).
                     # Persisting the failed user message would make the
@@ -5250,6 +5268,7 @@ def run_conversation(
                         agent._dump_api_request_debug(
                             api_kwargs, reason="max_retries_exhausted", error=api_error,
                         )
+                    _release_unconsumed_injects()
                     agent._persist_session(messages, conversation_history)
                     _billing_block = None
                     if classified.reason == FailoverReason.billing:

@@ -84,6 +84,10 @@ _MAX_DURABLE_PENDING = 1000
 # attempts so an unroutable row converges to a terminal 'dropped' state
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
+# Durable claims are leases, not ownership transfers. Active same-turn injects
+# renew this timestamp while the provider request/retry lifecycle is alive;
+# after a process crash the absent heartbeat lets another consumer recover it.
+_DELIVERY_CLAIM_LEASE_SECONDS = 300
 _DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -605,20 +609,30 @@ def recover_abandoned_delegations() -> int:
                 # A crash after one or more child inserts must preserve that wire
                 # shape instead of manufacturing a contradictory parent unknown.
                 child_rows = conn.execute(
-                    """SELECT event_json FROM async_delegation_events
+                    """SELECT event_key, event_json FROM async_delegation_events
                        WHERE delegation_id=? AND event_key LIKE 'task:%'
                        ORDER BY event_key""",
                     (delegation_id,),
                 ).fetchall()
-                child_results: list[Dict[str, Any]] = []
-                for (child_payload,) in child_rows:
+                goals = list(task.get("goals") or [])
+                expected_child_keys = [f"task:{index}" for index in range(len(goals))]
+                child_results_by_key: dict[str, Dict[str, Any]] = {}
+                for event_key, child_payload in child_rows:
+                    if event_key not in expected_child_keys:
+                        continue
                     child_event = json.loads(child_payload or "{}")
                     results = child_event.get("results") or []
                     if results and isinstance(results[0], dict):
-                        child_results.append(results[0])
+                        child_results_by_key[event_key] = results[0]
 
-                goals = list(task.get("goals") or [])
-                complete_children = bool(goals) and len(child_results) >= len(goals)
+                child_results = [
+                    child_results_by_key[key]
+                    for key in expected_child_keys
+                    if key in child_results_by_key
+                ]
+                complete_children = bool(expected_child_keys) and all(
+                    key in child_results_by_key for key in expected_child_keys
+                )
                 status = "completed" if complete_children else "unknown"
                 recovery_error = None
                 if not complete_children:
@@ -769,7 +783,13 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+            (
+                claim_id,
+                now,
+                now,
+                delegation_id,
+                now - _DELIVERY_CLAIM_LEASE_SECONDS,
+            ),
         )
         return cur.rowcount == 1
 
@@ -784,7 +804,14 @@ def _claim_child_event(delegation_id: str, event_key: str, claim_id: str) -> boo
                WHERE delegation_id=? AND event_key=?
                  AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, event_key, now - 300),
+            (
+                claim_id,
+                now,
+                now,
+                delegation_id,
+                event_key,
+                now - _DELIVERY_CLAIM_LEASE_SECONDS,
+            ),
         )
         return cur.rowcount == 1
 
@@ -803,6 +830,60 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     else:
         claimed = claim_completion_delivery(delegation_id, claim_id)
     return claim_id if claimed else None
+
+
+def renew_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
+    """Renew the lease held by the exact consumer claim."""
+
+    if not claim_id or evt.get("type") != "async_delegation":
+        return False
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return False
+    event_key = str(evt.get("delivery_event_key") or "")
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        if event_key:
+            cur = conn.execute(
+                """UPDATE async_delegation_events
+                   SET delivery_claimed_at=?, updated_at=?
+                   WHERE delegation_id=? AND event_key=?
+                     AND delivery_state='pending' AND delivery_claim=?""",
+                (now, now, delegation_id, event_key, claim_id),
+            )
+        else:
+            cur = conn.execute(
+                """UPDATE async_delegations
+                   SET delivery_claimed_at=?, updated_at=?
+                   WHERE delegation_id=? AND delivery_state='pending'
+                     AND delivery_claim=?""",
+                (now, now, delegation_id, claim_id),
+            )
+        return cur.rowcount == 1
+
+
+def get_event_delivery_state(evt: Dict[str, Any]) -> Optional[str]:
+    """Return the durable state for one aggregate or child event."""
+
+    if evt.get("type") != "async_delegation":
+        return None
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return None
+    event_key = str(evt.get("delivery_event_key") or "")
+    with _DB_LOCK, _transaction() as conn:
+        if event_key:
+            row = conn.execute(
+                """SELECT delivery_state FROM async_delegation_events
+                   WHERE delegation_id=? AND event_key=?""",
+                (delegation_id, event_key),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+                (delegation_id,),
+            ).fetchone()
+    return str(row[0]) if row is not None else None
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -918,26 +999,26 @@ def _release_child_event(delegation_id: str, event_key: str, claim_id: str) -> b
         return cur.rowcount == 1
 
 
-def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
     if not claim_id or evt.get("type") != "async_delegation":
-        return
+        return False
     delegation_id = str(evt.get("delegation_id") or "")
     event_key = str(evt.get("delivery_event_key") or "")
     if event_key:
-        _complete_child_event(delegation_id, event_key, claim_id)
+        completed = _complete_child_event(delegation_id, event_key, claim_id)
     else:
-        complete_completion_delivery(delegation_id, claim_id)
+        completed = complete_completion_delivery(delegation_id, claim_id)
+    return completed or get_event_delivery_state(evt) == "delivered"
 
 
-def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
     if not claim_id or evt.get("type") != "async_delegation":
-        return
+        return False
     delegation_id = str(evt.get("delegation_id") or "")
     event_key = str(evt.get("delivery_event_key") or "")
     if event_key:
-        _release_child_event(delegation_id, event_key, claim_id)
-    else:
-        release_completion_delivery(delegation_id, claim_id)
+        return _release_child_event(delegation_id, event_key, claim_id)
+    return release_completion_delivery(delegation_id, claim_id)
 
 
 def drop_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
