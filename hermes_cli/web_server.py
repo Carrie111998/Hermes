@@ -461,6 +461,22 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
+def _extra_accepted_hosts() -> frozenset:
+    """Hostnames accepted in addition to the bound host (operator opt-in).
+
+    ``HERMES_DASHBOARD_EXTRA_HOSTS`` is a comma-separated list of hostnames
+    the operator explicitly trusts: the public name of a reverse proxy or
+    tunnel (nginx, Tailscale Serve, Cloudflare Tunnel) in front of a
+    loopback-bound dashboard. The proxy rewrites the ``Host`` header, but a
+    browser sets the WebSocket ``Origin`` header to the public hostname and
+    no proxy can rewrite it — so WS upgrades are refused without this
+    opt-in (see #70059). Read per call so long-lived processes and tests
+    see changes without a restart.
+    """
+    raw = os.environ.get("HERMES_DASHBOARD_EXTRA_HOSTS", "")
+    return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+
+
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     """True if the Host header targets the interface we bound to.
 
@@ -489,6 +505,11 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     else:
         host_only = h.rsplit(":", 1)[0] if ":" in h else h
     host_only = host_only.lower()
+
+    # Operator-trusted extra hostnames (reverse proxy / tunnel fronting a
+    # loopback bind) — see _extra_accepted_hosts.
+    if host_only in _extra_accepted_hosts():
+        return True
 
     # 0.0.0.0 bind means operator explicitly opted into all-interfaces
     # (requires --insecure per web_server.start_server). No Host-layer

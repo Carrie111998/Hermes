@@ -137,3 +137,53 @@ class TestWebSocketHostOriginGuard:
             },
         ):
             pass
+
+class TestExtraAcceptedHosts:
+    """HERMES_DASHBOARD_EXTRA_HOSTS — operator-trusted reverse-proxy /
+    tunnel hostnames in front of a loopback bind (#70059).
+
+    The proxy rewrites the Host header, but the browser-set WebSocket
+    Origin header carries the public hostname and cannot be rewritten by
+    any proxy — without this opt-in every WS upgrade is refused with
+    ``origin_mismatch``."""
+
+    def test_extra_host_accepted_on_loopback_bind(self, monkeypatch):
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv("HERMES_DASHBOARD_EXTRA_HOSTS", "atlas.example.com")
+        assert _is_accepted_host("atlas.example.com", "127.0.0.1")
+        assert _is_accepted_host("atlas.example.com:9119", "127.0.0.1")
+        # Case-insensitive, like every other host comparison here
+        assert _is_accepted_host("Atlas.Example.COM", "127.0.0.1")
+
+    def test_other_hosts_still_rejected(self, monkeypatch):
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv("HERMES_DASHBOARD_EXTRA_HOSTS", "atlas.example.com")
+        assert not _is_accepted_host("evil.example", "127.0.0.1")
+        # Loopback aliases keep working on a loopback bind
+        assert _is_accepted_host("localhost:9119", "127.0.0.1")
+
+    def test_unset_env_keeps_strict_behaviour(self, monkeypatch):
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.delenv("HERMES_DASHBOARD_EXTRA_HOSTS", raising=False)
+        assert not _is_accepted_host("atlas.example.com", "127.0.0.1")
+
+    def test_comma_separated_list_with_whitespace(self, monkeypatch):
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_EXTRA_HOSTS",
+            " atlas.example.com , hermes.tail1234.ts.net ",
+        )
+        assert _is_accepted_host("atlas.example.com", "127.0.0.1")
+        assert _is_accepted_host("hermes.tail1234.ts.net", "127.0.0.1")
+        assert not _is_accepted_host("other.example.com", "127.0.0.1")
+
+    def test_empty_entries_ignored(self, monkeypatch):
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv("HERMES_DASHBOARD_EXTRA_HOSTS", " , ,")
+        assert not _is_accepted_host("", "127.0.0.1")
+        assert not _is_accepted_host("evil.example", "127.0.0.1")
