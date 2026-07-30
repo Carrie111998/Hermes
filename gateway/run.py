@@ -4804,6 +4804,13 @@ class TurnRunner:
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+            if not ctx._status_adapter:
+                logger.warning(
+                    "Approval prompt skipped: no delivery adapter available for %s/%s",
+                    ctx.source.platform,
+                    ctx.session_key,
+                )
+                return
             # Pause the typing indicator while the agent waits for
             # user approval.  Critical for Slack's Assistant API where
             # assistant_threads_setStatus disables the compose box — the
@@ -23575,7 +23582,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self._adapter_for_source(source)
+        _status_adapter = self._delivery_adapter_for_source(source)
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are

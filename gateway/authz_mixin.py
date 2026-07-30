@@ -125,6 +125,41 @@ class GatewayAuthorizationMixin:
             getattr(source, "profile", None),
         )
 
+    def _delivery_adapter_for_source(self, source: Optional[SessionSource]):
+        """Resolve an adapter for delivery (status, typing, approval, reply).
+
+        Unlike ``_adapter_for_source``, which returns ``None`` in multiplex
+        mode when a secondary profile owns no adapter for the source's platform
+        (correct for authorization — fail closed), this method falls back to the
+        default profile's adapter for the same platform so that approval prompts,
+        typing indicators, status messages, and replies are still delivered.
+
+        Returns the transport adapter, the profile-scoped adapter, the default
+        profile's same-platform adapter, or ``None`` if no adapter is registered
+        for the platform at all.
+        """
+        if source is None:
+            return None
+        # 1. Prefer the transport adapter that owns the source's connection.
+        adapter = self._registered_transport_adapter(source)
+        if adapter is not None:
+            return adapter
+        # 2. Try the authorization-aware lookup (profile-scoped adapter).
+        platform = getattr(source, "platform", None)
+        profile = getattr(source, "profile", None)
+        adapter = self._authorization_adapter(platform, profile)
+        if adapter is not None:
+            return adapter
+        # 3. Fallback: use the default profile's same-platform adapter so
+        #    delivery still reaches the user even when a secondary profile
+        #    has no dedicated adapter for this platform (multiplex mode).
+        if platform is not None:
+            adapters = getattr(self, "adapters", None) or {}
+            adapter = adapters.get(platform)
+            if adapter is not None:
+                return adapter
+        return None
+
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.
 
