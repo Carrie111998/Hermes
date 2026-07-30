@@ -100,14 +100,21 @@ def test_nemo_relay_is_not_a_base_dependency():
 
     # scripts/install.sh installs '.[all]' on non-Termux platforms, so pulling
     # Relay in through [all] would reintroduce the Alpine install failure even
-    # with the base dependency removed. [all] entries are self-referential
-    # (``hermes-agent[cron]``), so this checks requested *extras* --
-    # _distribution_name strips them and would always yield "hermes-agent".
+    # with the base dependency removed. Relay can reach [all] by two routes and
+    # neither matcher alone covers both:
+    #   - a self-referential extra (``hermes-agent[nemo-relay]``), which
+    #     _distribution_name reduces to "hermes-agent";
+    #   - a direct distribution entry (``nemo-relay>=...``), for which
+    #     _requested_extras returns no extras at all.
+    # Union both so either form fails the guard.
     all_extra = data["project"]["optional-dependencies"]["all"]
-    pulled_extras = {extra for dep in all_extra for extra in _requested_extras(dep)}
-    assert "nemo-relay" not in pulled_extras, (
-        "[all] must not pull nemo-relay: scripts/install.sh installs '.[all]' "
-        "on non-Termux platforms, which would break musl installs again"
+    reachable = {extra for dep in all_extra for extra in _requested_extras(dep)} | {
+        _distribution_name(dep) for dep in all_extra
+    }
+    assert "nemo-relay" not in reachable, (
+        "[all] must not pull nemo-relay, whether as an extra or as a direct "
+        "entry: scripts/install.sh installs '.[all]' on non-Termux platforms, "
+        "which would break musl installs again"
     )
 
 
