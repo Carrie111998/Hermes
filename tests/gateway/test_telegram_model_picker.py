@@ -84,6 +84,35 @@ class TestTelegramModelPicker:
             ("gpt-5.6-sol", "mm:2"),
         ]
 
+    def test_model_keyboard_disambiguates_colliding_truncated_labels(self, monkeypatch):
+        import plugins.platforms.telegram.adapter as tg
+
+        built = []
+
+        class _RecordingButton:
+            def __init__(self, text, callback_data=None, **kwargs):
+                built.append((text, callback_data))
+
+        class _RecordingMarkup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(tg, "InlineKeyboardButton", _RecordingButton)
+        monkeypatch.setattr(tg, "InlineKeyboardMarkup", _RecordingMarkup)
+
+        model_ids = [
+            "provider-" + "x" * 28 + "a/claude-opus-5-" + "y" * 40,
+            "provider-" + "x" * 28 + "b/claude-opus-5-" + "y" * 40,
+        ]
+
+        _make_adapter()._build_model_keyboard(model_ids, 0)
+
+        assert built[:2] == [
+            (model_ids[0][:35] + "...", "mm:0"),
+            (model_ids[1][:32] + "...[1]", "mm:1"),
+        ]
+        assert built[0][0] != built[1][0]
+
     def test_model_picker_callback_receives_original_colliding_id(self):
         import asyncio
 
