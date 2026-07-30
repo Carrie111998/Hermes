@@ -694,6 +694,26 @@ async def test_base_send_image_fallback_preserves_metadata():
 
 
 @pytest.mark.asyncio
+async def test_successful_topic_send_reports_effective_destination():
+    adapter = _make_adapter()
+
+    async def mock_send_message(**kwargs):
+        return SimpleNamespace(message_id=41)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content="topic message",
+        metadata={"thread_id": "17585"},
+    )
+
+    assert result.success is True
+    assert result.effective_thread_id == "17585"
+    assert result.thread_fallback is False
+
+
+@pytest.mark.asyncio
 async def test_thread_fallback_only_fires_once():
     """After clearing thread_id, subsequent chunks should also use None."""
     adapter = _make_adapter()
@@ -701,16 +721,16 @@ async def test_thread_fallback_only_fires_once():
     call_log = []
 
     async def mock_send_message(**kwargs):
-        call_log.append(dict(kwargs))
-        tid = kwargs.get("message_thread_id")
-        if tid is not None:
+        call_log.append(kwargs)
+        # First two calls (initial + retry) fail with thread error
+        if len(call_log) <= 2:
             raise FakeBadRequest("Message thread not found")
-        return SimpleNamespace(message_id=42)
+        return SimpleNamespace(message_id=100 + len(call_log))
 
     adapter._bot = SimpleNamespace(send_message=mock_send_message)
 
-    # Send a long message that gets split into chunks
-    long_msg = "A" * 5000  # Exceeds Telegram's 4096 limit
+    # Long enough to split into 2 chunks
+    long_msg = "A" * 5000
     result = await adapter.send(
         chat_id="-100123",
         content=long_msg,
@@ -718,9 +738,45 @@ async def test_thread_fallback_only_fires_once():
     )
 
     assert result.success is True
+    assert result.effective_thread_id is None
+    assert result.thread_fallback is True
+    assert [call.get("message_thread_id") for call in call_log] == [
+        99999, 99999, None, None,
+    ]
     # First chunk: attempt with thread → fail → retry without → succeed
     # Second chunk: should use thread_id=None directly (effective_thread_id
     # was cleared per-chunk but the metadata doesn't change between chunks)
     # The key point: the message was delivered despite the invalid thread
+
+
+@pytest.mark.asyncio
+async def test_direct_message_topic_fallback_persists_across_chunks():
+    """A rejected direct_messages_topic_id must stay dropped after chunk one."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        if kwargs.get("direct_messages_topic_id") is not None:
+            raise FakeBadRequest("Message thread not found")
+        return SimpleNamespace(message_id=200 + len(call_log))
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="B" * 5000,
+        metadata={
+            "thread_id": "99999",
+            "direct_messages_topic_id": "99999",
+        },
+    )
+
+    assert result.success is True
+    assert result.effective_thread_id is None
+    assert result.thread_fallback is True
+    assert [call.get("direct_messages_topic_id") for call in call_log] == [
+        99999, 99999, None, None,
+    ]
 
 

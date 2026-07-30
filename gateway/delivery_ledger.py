@@ -51,6 +51,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.sqlite_util import add_column_if_missing
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             last_error TEXT,
             provider_message_id TEXT,
             delivery_route TEXT,
-            chunk_count INTEGER
+            chunk_count INTEGER,
+            effective_thread_id TEXT,
+            thread_fallback INTEGER
         )"""
     )
     # Additive migration for ledgers created before delivery receipts were
@@ -124,10 +127,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("provider_message_id", "TEXT"),
         ("delivery_route", "TEXT"),
         ("chunk_count", "INTEGER"),
+        ("effective_thread_id", "TEXT"),
+        ("thread_fallback", "INTEGER"),
     ):
         if name not in columns:
-            conn.execute(
-                f"ALTER TABLE delivery_obligations ADD COLUMN {name} {sql_type}"
+            add_column_if_missing(
+                conn,
+                "delivery_obligations",
+                name,
+                f"{name} {sql_type}",
             )
 
 
@@ -240,6 +248,8 @@ def mark_delivered(
     provider_message_id: Any = None,
     delivery_route: Any = None,
     chunk_count: Any = None,
+    effective_thread_id: Any = None,
+    thread_fallback: Any = None,
 ) -> None:
     """Mark an obligation delivered and persist a content-free provider ACK.
 
@@ -267,19 +277,33 @@ def mark_delivered(
     ):
         safe_chunk_count = chunk_count
 
+    safe_effective_thread_id = None
+    if isinstance(effective_thread_id, (str, int)) and not isinstance(
+        effective_thread_id, bool
+    ):
+        safe_effective_thread_id = str(effective_thread_id)[:200]
+
+    safe_thread_fallback = None
+    if isinstance(thread_fallback, bool):
+        safe_thread_fallback = int(thread_fallback)
+
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations
                SET state='delivered', updated_at=?, last_error=NULL,
                    provider_message_id=COALESCE(?, provider_message_id),
                    delivery_route=COALESCE(?, delivery_route),
-                   chunk_count=COALESCE(?, chunk_count)
+                   chunk_count=COALESCE(?, chunk_count),
+                   effective_thread_id=COALESCE(?, effective_thread_id),
+                   thread_fallback=COALESCE(?, thread_fallback)
                WHERE obligation_id=?""",
             (
                 time.time(),
                 safe_message_id,
                 safe_route,
                 safe_chunk_count,
+                safe_effective_thread_id,
+                safe_thread_fallback,
                 obligation_id,
             ),
         )
@@ -424,7 +448,8 @@ def debug_rows(limit: int = 20) -> str:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, state, attempts,
                       created_at, updated_at, last_error, provider_message_id,
-                      delivery_route, chunk_count
+                      delivery_route, chunk_count, effective_thread_id,
+                      thread_fallback
                FROM delivery_obligations
                ORDER BY updated_at DESC LIMIT ?""",
             (limit,),
@@ -436,7 +461,8 @@ def debug_rows(limit: int = 20) -> str:
                 "state": r[3], "attempts": r[4], "created_at": r[5],
                 "updated_at": r[6], "last_error": r[7],
                 "provider_message_id": r[8], "delivery_route": r[9],
-                "chunk_count": r[10],
+                "chunk_count": r[10], "effective_thread_id": r[11],
+                "thread_fallback": None if r[12] is None else bool(r[12]),
             }
             for r in rows
         ],

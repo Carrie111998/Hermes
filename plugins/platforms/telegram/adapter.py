@@ -1875,6 +1875,18 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=str(message_id) if message_id is not None else None,
             delivery_route="telegram.rich",
             chunk_count=1,
+            effective_thread_id=(
+                str(
+                    thread_kwargs.get("message_thread_id")
+                    or thread_kwargs.get("direct_messages_topic_id")
+                )
+                if (
+                    thread_kwargs.get("message_thread_id") is not None
+                    or thread_kwargs.get("direct_messages_topic_id") is not None
+                )
+                else None
+            ),
+            thread_fallback=False,
         )
 
     async def _try_edit_rich(
@@ -4437,10 +4449,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_message_id=reply_to_id,
                     reply_to_mode=self._reply_to_mode,
                 )
-                if used_thread_fallback and thread_kwargs.get("message_thread_id") is not None:
-                    thread_kwargs = dict(thread_kwargs)
-                    thread_kwargs["message_thread_id"] = None
+                if used_thread_fallback:
+                    # Once any Telegram topic route has been rejected, keep all
+                    # later multipart chunks on the parent chat.  This covers
+                    # both forum ``message_thread_id`` and Bot API direct-message
+                    # ``direct_messages_topic_id`` routing.
+                    thread_kwargs = {}
                 effective_thread_id = thread_kwargs.get("message_thread_id")
+                if effective_thread_id is None:
+                    effective_thread_id = thread_kwargs.get(
+                        "direct_messages_topic_id"
+                    )
 
                 msg = None
                 chunk_delivery_route = "telegram.markdown_v2"
@@ -4517,7 +4536,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                                 used_thread_fallback = True
                                 effective_thread_id = None
-                                thread_kwargs = {"message_thread_id": None}
+                                thread_kwargs = {}
                                 continue
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
@@ -4539,6 +4558,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                 )
                                 reply_to_id = None
                                 if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
+                                    if effective_thread_id is not None:
+                                        used_thread_fallback = True
                                     thread_kwargs = {}
                                     effective_thread_id = None
                                 else:
@@ -4634,6 +4655,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 continuation_message_ids=tuple(message_ids[1:]),
                 delivery_route=delivery_route,
                 chunk_count=len(message_ids),
+                effective_thread_id=(
+                    str(effective_thread_id)
+                    if effective_thread_id is not None
+                    else None
+                ),
+                thread_fallback=used_thread_fallback,
             )
             
         except Exception as e:

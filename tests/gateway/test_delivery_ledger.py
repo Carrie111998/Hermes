@@ -44,14 +44,16 @@ def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
             """SELECT state, attempts, owner_pid, content,
-                      provider_message_id, delivery_route, chunk_count
+                      provider_message_id, delivery_route, chunk_count,
+                      effective_thread_id, thread_fallback
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
         ).fetchone()
     return None if r is None else {
         "state": r[0], "attempts": r[1], "owner_pid": r[2], "content": r[3],
         "provider_message_id": r[4], "delivery_route": r[5],
-        "chunk_count": r[6],
+        "chunk_count": r[6], "effective_thread_id": r[7],
+        "thread_fallback": r[8],
     }
 
 
@@ -79,12 +81,16 @@ class TestStateMachine:
             provider_message_id=481,
             delivery_route="telegram.markdown_v2",
             chunk_count=2,
+            effective_thread_id="17585",
+            thread_fallback=False,
         )
         row = _row("ob-1")
         assert row["state"] == "delivered"
         assert row["provider_message_id"] == "481"
         assert row["delivery_route"] == "telegram.markdown_v2"
         assert row["chunk_count"] == 2
+        assert row["effective_thread_id"] == "17585"
+        assert row["thread_fallback"] == 0
 
     def test_idempotent_mark_without_receipt_does_not_erase_receipt(self):
         _record()
@@ -93,6 +99,7 @@ class TestStateMachine:
             provider_message_id="481",
             delivery_route="telegram.rich",
             chunk_count=1,
+            thread_fallback=True,
         )
         dl.mark_delivered("ob-1")
 
@@ -100,6 +107,7 @@ class TestStateMachine:
         assert row["provider_message_id"] == "481"
         assert row["delivery_route"] == "telegram.rich"
         assert row["chunk_count"] == 1
+        assert row["thread_fallback"] == 1
 
     def test_receipt_rejects_unstructured_metadata(self):
         _record()
@@ -108,6 +116,8 @@ class TestStateMachine:
             provider_message_id=object(),
             delivery_route="telegram.rich token=must-not-persist",
             chunk_count="one",
+            effective_thread_id=object(),
+            thread_fallback="yes",
         )
 
         row = _row("ob-1")
@@ -115,6 +125,8 @@ class TestStateMachine:
         assert row["provider_message_id"] is None
         assert row["delivery_route"] is None
         assert row["chunk_count"] is None
+        assert row["effective_thread_id"] is None
+        assert row["thread_fallback"] is None
 
     def test_failed_records_error(self):
         _record()
@@ -179,6 +191,7 @@ class TestSchemaMigration:
 
         assert {
             "provider_message_id", "delivery_route", "chunk_count",
+            "effective_thread_id", "thread_fallback",
         } <= columns
         assert state == "pending"
 
@@ -191,6 +204,7 @@ class TestDebugRows:
             provider_message_id="481",
             delivery_route="telegram.rich",
             chunk_count=1,
+            thread_fallback=True,
         )
 
         [row] = json.loads(dl.debug_rows())
@@ -198,6 +212,8 @@ class TestDebugRows:
         assert row["provider_message_id"] == "481"
         assert row["delivery_route"] == "telegram.rich"
         assert row["chunk_count"] == 1
+        assert row["effective_thread_id"] is None
+        assert row["thread_fallback"] is True
         assert "content" not in row
         assert "private final answer" not in dl.debug_rows()
 
@@ -265,6 +281,8 @@ class TestGatewayRedeliverySweep:
                 message_id="m-recovered" if success else None,
                 delivery_route="slack.web_api" if success else None,
                 chunk_count=1 if success else None,
+                effective_thread_id="171.001" if success else None,
+                thread_fallback=False if success else None,
             )
         )
         return adapter
@@ -287,6 +305,8 @@ class TestGatewayRedeliverySweep:
         assert row["provider_message_id"] == "m-recovered"
         assert row["delivery_route"] == "slack.web_api"
         assert row["chunk_count"] == 1
+        assert row["effective_thread_id"] == "171.001"
+        assert row["thread_fallback"] == 0
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
         )

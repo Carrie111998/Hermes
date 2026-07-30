@@ -2235,9 +2235,14 @@ class SendResult:
     # inspect ``raw_response`` (which is adapter-specific and may contain
     # provider payloads). ``delivery_route`` is a short namespaced enum such
     # as ``telegram.rich``; ``chunk_count`` counts provider-acknowledged
-    # messages, not chunks merely planned before the send.
+    # messages, not chunks merely planned before the send. For routed platforms,
+    # ``effective_thread_id`` is the destination acknowledged by the provider,
+    # while ``thread_fallback`` records whether delivery dropped the requested
+    # thread/topic to reach the parent chat.
     delivery_route: Optional[str] = None
     chunk_count: Optional[int] = None
+    effective_thread_id: Optional[str] = None
+    thread_fallback: Optional[bool] = None
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -6096,6 +6101,12 @@ class BasePlatformAdapter(ABC):
                                     ),
                                     chunk_count=getattr(
                                         result, "chunk_count", None
+                                    ),
+                                    effective_thread_id=getattr(
+                                        result, "effective_thread_id", None
+                                    ),
+                                    thread_fallback=getattr(
+                                        result, "thread_fallback", None
                                     ),
                                 )
                             else:
