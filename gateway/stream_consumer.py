@@ -172,16 +172,6 @@ class GatewayStreamConsumer:
     # progressive edits for the remainder of the stream.
     _MAX_FLOOD_STRIKES = 3
 
-    # Hard ceiling on how many separate platform messages a fallback/overflow
-    # send may produce.  When a response would split into more chunks than
-    # this, the consumer aborts the bulk send and instead delivers ONE short
-    # safe message.  Without this cap a large accumulated buffer (e.g. the
-    # full system prompt echoed back, or an oversized model reply) becomes a
-    # flood of ~100 separate Telegram messages.  10 is well above any
-    # legitimate single reply that needs split delivery yet far below the
-    # flood territory.
-    _MAX_FALLBACK_CHUNKS = 10
-
     # Reasoning/thinking tags that models emit inline in content.
     # Must stay in sync with cli.py _OPEN_TAGS/_CLOSE_TAGS and
     # run_agent.py _strip_think_blocks() tag variants.
@@ -842,18 +832,6 @@ class GatewayStreamConsumer:
                         _len_fn(self._accumulated) > _safe_limit
                         and self._message_id is None
                     ):
-                        # Flood guard for fallback mode: when edits are broken
-                        # (flood-control strikes exhausted / fallback promoted)
-                        # a huge buffer would otherwise be chunked into dozens
-                        # of separate messages.  Refuse and deliver ONE safe
-                        # message instead.
-                        if self._fallback_final_send:
-                            _cap_chunks = self.adapter.truncate_message(
-                                self._accumulated, _safe_limit, len_fn=_len_fn,
-                            )
-                            if len(_cap_chunks) > self._MAX_FALLBACK_CHUNKS:
-                                await self._send_fallback_too_large()
-                                return
                         # No existing message to edit (first message or after a
                         # segment break).  Seal only the overflowing head chunks
                         # as fixed messages, then keep the trailing chunk in
@@ -1335,34 +1313,6 @@ class GatewayStreamConsumer:
             self._message_id = str(result.message_id)
             self._last_sent_text = _safe
 
-    async def _send_fallback_too_large(self) -> None:
-        """Deliver a single safe message when a response is too large to send.
-
-        Used by the fallback-send flood guard (``_MAX_FALLBACK_CHUNKS``).  The
-        oversized accumulated buffer is discarded and replaced with one short
-        message so the user is never flooded with dozens of split messages.
-        Marked delivered so the gateway's normal final-send path does not
-        re-deliver the raw (equally oversized) buffer.
-        """
-        _safe = (
-            "⚠️ The response was too large to deliver safely. "
-            "Please try again — the full answer will be regenerated."
-        )
-        try:
-            result = await self.adapter.send(
-                chat_id=self.chat_id,
-                content=_safe,
-                metadata=self._metadata_for_send(final=True),
-            )
-        except Exception:
-            result = None
-        self._already_sent = True
-        self._final_response_sent = True
-        self._final_content_delivered = True
-        if result and result.success and result.message_id:
-            self._message_id = str(result.message_id)
-            self._last_sent_text = _safe
-
     async def _send_fallback_final(self, text: str) -> None:
         """Send the final continuation after streaming edits stop working.
 
@@ -1460,16 +1410,6 @@ class GatewayStreamConsumer:
                 logger.debug("per-chat limit resolution failed: %s", e)
         safe_limit = max(500, raw_limit - 100)
         chunks = self._split_text_chunks(continuation, safe_limit, len_fn=_len_fn)
-
-        # Flood guard: refuse to blast an oversized buffer as dozens of
-        # separate messages.  When the response would split into more chunks
-        # than the cap, deliver ONE short safe message instead.  This catches
-        # the non-API-error case (e.g. the model returns a huge reply and
-        # Telegram network flapping promotes us to fallback mode) so the user
-        # never gets a 100-message dump.
-        if len(chunks) > self._MAX_FALLBACK_CHUNKS:
-            await self._send_fallback_too_large()
-            return
 
         stale_message_id = self._message_id  # partial message to clean up
         last_message_id: Optional[str] = None
