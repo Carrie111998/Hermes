@@ -33,7 +33,10 @@ describe('credential-key-ui helpers and KeyField render contracts', () => {
     is_password: true,
     redacted_value: '••••1234',
     description: 'Test API key',
-    url: 'https://example.com'
+    url: 'https://example.com',
+    advanced: false,
+    category: 'provider',
+    tools: []
   }
 
   it('correctly identifies key variable names and password fields', () => {
