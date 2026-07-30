@@ -13977,6 +13977,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         input_rule_bot,
         voice_status_bar,
         completions_menu,
+        search_toolbar=None,
     ) -> list:
         """Assemble the ordered list of children for the root ``HSplit``.
 
@@ -14001,6 +14002,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 input_rule_top,
                 image_bar,
                 input_area,
+                search_toolbar,
                 input_rule_bot,
                 voice_status_bar,
                 completions_menu,
@@ -15008,6 +15010,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 os.kill(0, _sig.SIGTSTP)
             run_in_terminal(_suspend)
 
+        # ── Vi mode command and search bindings ────────────────────
+        # When input_mode is 'vi', add keybindings for : (command palette)
+        # and / (search) that work like in vim/OpenCode.
+        from prompt_toolkit.filters import vi_navigation_mode, emacs_mode
+        
+        @kb.add(':', filter=vi_navigation_mode)
+        def handle_vi_command(event):
+            """Open command palette (like : in vim/OpenCode).
+            
+            In vi mode, : in NAVIGATION mode opens a command line. Here we
+            repurpose it to show available slash commands via autocomplete.
+            """
+            buf = event.app.current_buffer
+            # Insert '/' to trigger slash command autocomplete
+            buf.insert_text('/')
+            # The autocomplete will show available commands
+        
+        @kb.add('/', filter=vi_navigation_mode)
+        def handle_vi_search(event):
+            """Start incremental search (like / in vim).
+            
+            In vim, / starts forward search. In prompt_toolkit VI mode,
+            we trigger the search by starting search mode.
+            """
+            from prompt_toolkit.search import start_search
+            start_search(event.app.current_buffer)
+
         # Voice push-to-talk key: configurable via config.yaml (voice.record_key)
         # Default: Ctrl+B (avoids conflict with Ctrl+R readline reverse-search).
         # Config spellings (ctrl/control/alt/option/opt) are normalized to
@@ -15226,6 +15255,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             command_filter=cli_ref._command_available,
             skill_bundles_provider=lambda: get_skill_bundles(),
         )
+        
+        # Create search toolbar for vi mode / search
+        from prompt_toolkit.widgets import SearchToolbar
+        search_toolbar = SearchToolbar()
+        
         input_area = TextArea(
             height=Dimension(min=1, max=8, preferred=1),
             prompt=get_prompt,
@@ -15246,6 +15280,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 history_suggest=AutoSuggestFromHistory(),
                 completer=_completer,
             ),
+            search_field=search_toolbar,
         )
         # Keep prompt_toolkit on its simple tempfile path. Setting
         # buffer.tempfile = "prompt.md" triggers its complex-tempfile branch,
@@ -15991,6 +16026,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     input_rule_bot=input_rule_bot,
                     voice_status_bar=voice_status_bar,
                     completions_menu=completions_menu,
+                    search_toolbar=search_toolbar,
                 )
             )
         )
