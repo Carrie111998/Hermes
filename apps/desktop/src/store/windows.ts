@@ -51,6 +51,19 @@ export function isWatchWindow(): boolean {
   return result
 }
 
+/** Authoritative owner carried by a profile-qualified secondary-session URL. */
+export function secondaryWindowProfile(): string | undefined {
+  if (!isSecondaryWindow()) {
+    return undefined
+  }
+
+  try {
+    return new URLSearchParams(window.location.search).get('profile')?.trim() || undefined
+  } catch {
+    return undefined
+  }
+}
+
 // True when running inside the Electron desktop shell (the preload bridge is
 // present). The "open in new window" affordance is desktop-only.
 export function canOpenSessionWindow(): boolean {
@@ -81,7 +94,10 @@ async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage:
 // Open (or focus) a standalone OS window for a single chat session. No-ops
 // gracefully outside Electron so callers can wire it unconditionally.
 // `watch: true` opens a spectator window (lazy resume, live-mirror stream).
-export async function openSessionInNewWindow(sessionId: string, opts?: { watch?: boolean }): Promise<void> {
+export async function openSessionInNewWindow(
+  sessionId: string,
+  opts?: { profile?: string; watch?: boolean }
+): Promise<void> {
   if (!sessionId || !canOpenSessionWindow()) {
     return
   }

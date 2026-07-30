@@ -127,6 +127,7 @@ export const zh: Translations = {
     updateReadyMessage: count => `有 ${count} 项新更改可用。`,
     seeWhatsNew: '查看更新内容',
     errors: {
+      copySttRecoveryCommand: '复制恢复命令',
       elevenLabsNeedsKey: 'ElevenLabs STT 需要 ELEVENLABS_API_KEY。',
       elevenLabsRejectedKey: 'ElevenLabs 拒绝了该 API key (401)。',
       gatewayAuthFailed: '网关认证失败 — 请检查你的 API_SERVER_KEY。',
@@ -134,7 +135,8 @@ export const zh: Translations = {
       microphonePermission: '麦克风权限已被拒绝。',
       openaiRejectedApiKey: 'OpenAI 拒绝了该 API key。',
       openaiRejectedApiKeyWithStatus: status => `OpenAI 拒绝了该 API key (${status} invalid_api_key)。`,
-      openaiTtsNeedsKey: 'OpenAI TTS 需要 VOICE_TOOLS_OPENAI_KEY 或 OPENAI_API_KEY。'
+      openaiTtsNeedsKey: 'OpenAI TTS 需要 VOICE_TOOLS_OPENAI_KEY 或 OPENAI_API_KEY。',
+      sttRecordingPreserved: recoveryId => `录音已保留，可用于恢复（ID：${recoveryId}）。`
     },
     voice: {
       configureSpeechToText: '配置语音转文字后即可使用语音模式。',
@@ -566,6 +568,12 @@ export const zh: Translations = {
       stt: {
         enabled: '语音转文字',
         provider: '语音转文字提供方',
+        recovery: {
+          enabled: '保留失败的录音',
+          retentionHours: '恢复保留时长',
+          maxEntries: '恢复录音数量上限',
+          maxTotalMb: '恢复存储上限'
+        },
         local: {
           model: '本地转写模型',
           language: '转写语言'
@@ -712,6 +720,12 @@ export const zh: Translations = {
       },
       stt: {
         enabled: '启用本地或提供方支持的语音转写。',
+        recovery: {
+          enabled: '以私密且有界的方式保留桌面端转写失败的录音。',
+          retentionHours: '失败录音可恢复的小时数。文件会在 Hermes 下次访问缓存时清理。设为 0 可禁用恢复。',
+          maxEntries: '每个配置文件最多保留的失败录音数量。',
+          maxTotalMb: '每个配置文件用于失败录音的最大存储空间（MiB）。'
+        },
         elevenlabs: {
           languageCode: '可选的 ISO-639-3 语言代码。留空让 ElevenLabs 自动检测。'
         }

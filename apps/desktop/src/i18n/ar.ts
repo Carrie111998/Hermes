@@ -115,13 +115,15 @@ export const ar = defineLocale({
     updateReadyMessage: count => `${count} تغيير جديد متاح.`,
     seeWhatsNew: 'عرض الجديد',
     errors: {
+      copySttRecoveryCommand: 'نسخ أمر الاستعادة',
       elevenLabsNeedsKey: 'يتطلب ElevenLabs STT المفتاح ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'رفض ElevenLabs مفتاح API (401).',
       methodNotAllowed: 'رفضت خلفية سطح المكتب هذا الطلب (405 Method Not Allowed). جرب إعادة تشغيل Hermes Desktop.',
       microphonePermission: 'تم رفض إذن الميكروفون.',
       openaiRejectedApiKey: 'رفض OpenAI مفتاح API.',
       openaiRejectedApiKeyWithStatus: status => `رفض OpenAI مفتاح API (${status} invalid_api_key).`,
-      openaiTtsNeedsKey: 'يتطلب OpenAI TTS المفتاح VOICE_TOOLS_OPENAI_KEY أو OPENAI_API_KEY.'
+      openaiTtsNeedsKey: 'يتطلب OpenAI TTS المفتاح VOICE_TOOLS_OPENAI_KEY أو OPENAI_API_KEY.',
+      sttRecordingPreserved: recoveryId => `تم الاحتفاظ بالتسجيل للاستعادة (المعرف: ${recoveryId}).`
     },
     voice: {
       configureSpeechToText: 'اضبط تحويل الكلام إلى نص لاستخدام وضع الصوت.',
@@ -503,6 +505,10 @@ export const ar = defineLocale({
       'voice.autoTts': 'قراءة الردود صوتياً',
       'stt.enabled': 'تحويل الكلام إلى نص',
       'stt.provider': 'مزود تحويل الكلام إلى نص',
+      'stt.recovery.enabled': 'الاحتفاظ بالتسجيلات الفاشلة',
+      'stt.recovery.retentionHours': 'مدة الاحتفاظ للاستعادة',
+      'stt.recovery.maxEntries': 'حد تسجيلات الاستعادة',
+      'stt.recovery.maxTotalMb': 'حد مساحة تخزين الاستعادة',
       'stt.local.model': 'نموذج التفريغ المحلي',
       'stt.local.language': 'لغة التفريغ',
       'stt.openai.model': 'نموذج OpenAI STT',
@@ -580,6 +586,11 @@ export const ar = defineLocale({
       'tts.xai.language': 'رمز لغة النطق، مثل en.',
       'tts.neutts.device': 'جهاز الاستدلال المحلي لـ NeuTTS.',
       'stt.enabled': 'يفعل التفريغ الصوتي المحلي أو عبر مزود.',
+      'stt.recovery.enabled': 'يحتفظ بصورة خاصة ومحدودة من تسجيلات سطح المكتب عند فشل التفريغ.',
+      'stt.recovery.retentionHours':
+        'عدد الساعات التي تظل فيها التسجيلات الفاشلة قابلة للاستعادة. تنظف الملفات عند وصول Hermes التالي إلى ذاكرة التخزين المؤقت. القيمة 0 تعطل الاستعادة.',
+      'stt.recovery.maxEntries': 'الحد الأقصى لعدد التسجيلات الفاشلة المحتفظ بها لكل ملف شخصي.',
+      'stt.recovery.maxTotalMb': 'الحد الأقصى لمساحة التسجيلات الفاشلة بالميبيبايت لكل ملف شخصي.',
       'stt.elevenlabs.languageCode': 'رمز لغة ISO-639-3 اختياري. اتركه فارغاً للاكتشاف التلقائي.',
       'updates.nonInteractiveLocalChanges':
         'عندما يحدّث Hermes نفسه من التطبيق دون موجه طرفية، احتفظ بتعديلات المصدر المحلية أو تجاهلها.'

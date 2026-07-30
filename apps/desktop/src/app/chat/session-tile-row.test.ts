@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { $sessions } from '@/store/session'
+import { $sessionTiles } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
+import { tileOwnerProfile } from './session-tile'
 import { listTileSessionRow } from './session-tile-actions'
 
 const STORED = 'stored-tab'
@@ -41,8 +43,20 @@ function seed(preview: string, sessions: SessionInfo[] = $sessions.get()) {
 }
 
 describe('listTileSessionRow', () => {
-  beforeEach(() => $sessions.set([]))
-  afterEach(() => $sessions.set([]))
+  beforeEach(() => {
+    $sessions.set([])
+    $sessionTiles.set([])
+  })
+  afterEach(() => {
+    $sessions.set([])
+    $sessionTiles.set([])
+  })
+
+  it('keeps the persisted owner after the session row ages out of bounded caches', () => {
+    $sessionTiles.set([{ profile: 'medical', storedSessionId: STORED }])
+
+    expect(tileOwnerProfile(STORED)).toBe('medical')
+  })
 
   it("lists an unlisted ⌘T tab from the user's first message", () => {
     expect(seed('fix the tab titles')).toBe(true)

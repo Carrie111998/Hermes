@@ -172,6 +172,7 @@ export interface Translations {
     updateReadyMessage: (count: number) => string
     seeWhatsNew: string
     errors: {
+      copySttRecoveryCommand: string
       elevenLabsNeedsKey: string
       elevenLabsRejectedKey: string
       gatewayAuthFailed: string
@@ -180,6 +181,7 @@ export interface Translations {
       openaiRejectedApiKey: string
       openaiRejectedApiKeyWithStatus: (status: string) => string
       openaiTtsNeedsKey: string
+      sttRecordingPreserved: (recoveryId: string) => string
     }
     voice: {
       configureSpeechToText: string

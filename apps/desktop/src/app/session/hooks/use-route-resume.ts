@@ -3,6 +3,7 @@ import { type MutableRefObject, useEffect, useRef } from 'react'
 import { isNewChatRoute } from '@/app/routes'
 import { setResumeExhaustedSessionId } from '@/store/session'
 import { markSelectionRestore } from '@/store/session-states'
+import { secondaryWindowProfile } from '@/store/windows'
 
 interface RouteResumeOptions {
   activeSessionId: string | null
@@ -12,7 +13,7 @@ interface RouteResumeOptions {
   freshDraftReady: boolean
   gatewayState: string | undefined
   locationPathname: string
-  resumeSession: (sessionId: string, focus: boolean) => Promise<unknown>
+  resumeSession: (sessionId: string, focus: boolean, profile?: string) => Promise<unknown>
   // Stored-session id whose most recent resume failed terminally (set by
   // useSessionActions, mirrored from $resumeFailedSessionId). While this equals
   // routedSessionId the window would otherwise latch on the loader forever, so
@@ -83,6 +84,7 @@ export function useRouteResume({
   selectedStoredSessionIdRef,
   startFreshSessionDraft
 }: RouteResumeOptions) {
+  const routeOwnerProfile = secondaryWindowProfile()
   const lastPathnameRef = useRef<string | null>(null)
   const seenGatewayStateRef = useRef(false)
   const wasGatewayOpenRef = useRef(false)
@@ -165,7 +167,9 @@ export function useRouteResume({
         }
 
         bootResumeRef.current = false
-        void resumeSession(routedSessionId, true)
+        void (routeOwnerProfile
+          ? resumeSession(routedSessionId, true, routeOwnerProfile)
+          : resumeSession(routedSessionId, true))
       }
 
       return
@@ -190,6 +194,7 @@ export function useRouteResume({
     gatewayState,
     locationPathname,
     resumeSession,
+    routeOwnerProfile,
     routedSessionId,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionId,
@@ -288,7 +293,7 @@ export function useRouteResume({
       // having fired. A flapping backend could then hit MAX in a couple of
       // re-renders with far fewer than MAX real attempts. (Point 3)
       retryAttemptRef.current += 1
-      void resumeSession(sessionId, true)
+      void (routeOwnerProfile ? resumeSession(sessionId, true, routeOwnerProfile) : resumeSession(sessionId, true))
     }, resumeRetryDelayMs(attempt))
 
     return () => clearTimeout(timer)
@@ -300,6 +305,7 @@ export function useRouteResume({
     resumeSession,
     resumeFailedSessionId,
     resumeExhaustedSessionId,
+    routeOwnerProfile,
     routedSessionId,
     selectedStoredSessionIdRef
   ])

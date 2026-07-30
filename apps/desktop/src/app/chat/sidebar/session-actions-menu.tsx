@@ -172,7 +172,7 @@ function useSessionActions({
               // Stack into the MAIN zone as a tab (center dock; the strip
               // sticky-shows on gain) — the door to the tab bar. Focuses first
               // if the session is already on screen.
-              openSession(sessionId, () => undefined, 'tab')
+              openSession(sessionId, () => undefined, 'tab', profile)
             }
           })
         ]
@@ -185,7 +185,7 @@ function useSessionActions({
             label: r.newWindow,
             onSelect: () => {
               triggerHaptic('selection')
-              openSession(sessionId, () => undefined, 'window')
+              openSession(sessionId, () => undefined, 'window', profile)
             }
           })
         ]

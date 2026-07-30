@@ -37,6 +37,7 @@ describe('Hermes REST helpers', () => {
 
   beforeEach(() => {
     resetSidebarBatchCapability()
+    setApiRequestProfile(null)
     api = vi.fn().mockResolvedValue(emptySessionsResponse)
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
@@ -389,6 +390,24 @@ describe('Hermes REST helpers', () => {
       path: '/api/audio/transcribe',
       timeoutMs: AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS
     })
+  })
+
+  it('routes transcription to an explicitly owning profile', async () => {
+    api.mockResolvedValueOnce({
+      ok: true,
+      provider: 'openai',
+      transcript: 'profiled transcription'
+    })
+    setApiRequestProfile('active-profile')
+
+    await transcribeAudio('data:audio/webm;base64,AA==', 'audio/webm', 'session-owner')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/audio/transcribe',
+        profile: 'session-owner'
+      })
+    )
   })
 
   it('defaults model options to configured providers only', async () => {

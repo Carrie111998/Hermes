@@ -1557,11 +1557,15 @@ export function getActionStatus(name: string, lines = 200): Promise<ActionStatus
   })
 }
 
-export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<AudioTranscriptionResponse> {
+export function transcribeAudio(
+  dataUrl: string,
+  mimeType?: string,
+  profile?: string
+): Promise<AudioTranscriptionResponse> {
   return window.hermesDesktop.api<AudioTranscriptionResponse>({
+    ...profileScoped(profile),
     path: '/api/audio/transcribe',
     method: 'POST',
-    ...profileScoped(),
     body: {
       data_url: dataUrl,
       mime_type: mimeType

@@ -65,7 +65,7 @@ import {
 } from '@/store/session'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord } from '@/store/wake-word'
-import { isSecondaryWindow } from '@/store/windows'
+import { isSecondaryWindow, secondaryWindowProfile } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
 import { requestComposerInsert } from '../chat/composer/focus'
@@ -863,7 +863,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     // Already on screen (open tile, or the main session)? Jump to its tab;
     // otherwise load it into main. Same door every other session link uses.
     onResumeSession: sessionId => openSession(sessionId, navigate),
-    onRetryResume: sessionId => void resumeSession(sessionId, true),
+    onRetryResume: sessionId => {
+      const profile = secondaryWindowProfile()
+
+      void (profile ? resumeSession(sessionId, true, profile) : resumeSession(sessionId, true))
+    },
     onSteer: steerPrompt,
     onSubmit: submitText,
     onThreadMessagesChange: handleThreadMessagesChange,

@@ -151,6 +151,25 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
+    def test_clone_all_excludes_stt_recovery_cache(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / "memories").mkdir(exist_ok=True)
+        (default_home / "memories" / "note.md").write_text("remember this")
+        recovery_audio = (
+            default_home
+            / ".cache"
+            / "stt-recovery"
+            / ("a" * 32)
+            / "audio.webm"
+        )
+        recovery_audio.parent.mkdir(parents=True)
+        recovery_audio.write_bytes(b"private voice")
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        assert (profile_dir / "memories" / "note.md").read_text() == "remember this"
+        assert not (profile_dir / ".cache").exists()
+
 
 
 
@@ -600,6 +619,15 @@ class TestExportImport:
         mem_dir = default_dir / "memories"
         mem_dir.mkdir(exist_ok=True)
         (mem_dir / "MEMORY.md").write_text("remember this")
+        recovery_audio = (
+            default_dir
+            / ".cache"
+            / "stt-recovery"
+            / ("b" * 32)
+            / "audio.webm"
+        )
+        recovery_audio.parent.mkdir(parents=True)
+        recovery_audio.write_bytes(b"private voice")
 
         output = tmp_path / "export" / "default.tar.gz"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -612,6 +640,27 @@ class TestExportImport:
         assert "default/.env" not in names  # credentials excluded
         assert "default/SOUL.md" in names
         assert "default/memories/MEMORY.md" in names
+        assert not any("stt-recovery" in name for name in names)
+
+    def test_named_export_excludes_stt_recovery_cache(self, profile_env, tmp_path):
+        profile_dir = create_profile("coder", no_alias=True)
+        recovery_audio = (
+            profile_dir
+            / ".cache"
+            / "stt-recovery"
+            / ("c" * 32)
+            / "audio.webm"
+        )
+        recovery_audio.parent.mkdir(parents=True)
+        recovery_audio.write_bytes(b"private voice")
+
+        output = tmp_path / "export" / "coder.tar.gz"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        export_profile("coder", str(output))
+
+        with tarfile.open(str(output), "r:gz") as tf:
+            names = tf.getnames()
+        assert not any("stt-recovery" in name for name in names)
 
 
     def test_export_default_handles_broken_symlinks(self, profile_env, tmp_path):
@@ -814,6 +863,5 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "coder", "writer"}
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
-
 
 

@@ -51,9 +51,20 @@ function chatWindowWebPreferences(preloadPath: string) {
 // renderer reads the flag from window.location.search to suppress the install /
 // onboarding overlays and the global session sidebar. `watch=1` marks a
 // spectator window (e.g. a running subagent's session): the renderer resumes it
-// lazily so the gateway never builds an agent just to stream into it.
-function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath, watch }: any = {}) {
-  const query = `?win=secondary${watch ? '&watch=1' : ''}`
+// lazily so the gateway never builds an agent just to stream into it. `profile`
+// binds the otherwise non-global stored id to the database that owns it.
+function buildSessionWindowUrl(sessionId: string, { devServer, profile, rendererIndexPath, watch }: any = {}) {
+  const params = new URLSearchParams({ win: 'secondary' })
+
+  if (watch) {
+    params.set('watch', '1')
+  }
+
+  if (typeof profile === 'string' && profile.trim()) {
+    params.set('profile', profile.trim())
+  }
+
+  const query = `?${params.toString()}`
   const route = `#/${encodeURIComponent(sessionId)}`
 
   if (devServer) {
@@ -87,20 +98,26 @@ function instanceWindowBounds(base: { x: number; y: number; width: number; heigh
   }
 }
 
-// A small registry keyed by sessionId that guarantees one window per chat:
-// opening a session that already has a live window focuses it instead of
-// spawning a duplicate, and a window removes itself from the registry when it
-// closes. The actual BrowserWindow construction is injected (the `factory`) so
-// this module stays free of Electron and is unit-testable.
+// A small registry keyed by profile + sessionId that guarantees one window per
+// chat identity: reopening the same identity focuses it, while an equal id from
+// another profile gets its own window. A window removes itself from the registry
+// when it closes. BrowserWindow construction is injected (`factory`) so this
+// module stays free of Electron and is unit-testable.
 function createSessionWindowRegistry() {
   const windows = new Map()
 
-  function openOrFocus(sessionId, factory) {
-    const key = typeof sessionId === 'string' ? sessionId.trim() : ''
+  const identityKey = (sessionId, profile) =>
+    JSON.stringify([typeof profile === 'string' ? profile.trim() || null : null, sessionId])
 
-    if (!key) {
+  function openOrFocus(sessionId, factory, profile = undefined) {
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : ''
+    const normalizedProfile = typeof profile === 'string' ? profile.trim() : ''
+
+    if (!normalizedSessionId) {
       return null
     }
+
+    const key = identityKey(normalizedSessionId, normalizedProfile)
 
     const existing = windows.get(key)
 
@@ -119,7 +136,7 @@ function createSessionWindowRegistry() {
       return existing
     }
 
-    const win = factory(key)
+    const win = factory(normalizedSessionId)
 
     if (!win) {
       return null
@@ -139,8 +156,8 @@ function createSessionWindowRegistry() {
 
   return {
     openOrFocus,
-    get: key => windows.get(key),
-    has: key => windows.has(key),
+    get: (sessionId, profile = undefined) => windows.get(identityKey(sessionId, profile)),
+    has: (sessionId, profile = undefined) => windows.has(identityKey(sessionId, profile)),
     get size() {
       return windows.size
     }

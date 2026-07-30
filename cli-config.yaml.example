@@ -1150,6 +1150,13 @@ platform_toolsets:
 # Set the corresponding API key in .env: GROQ_API_KEY, OPENAI_API_KEY, or MISTRAL_API_KEY.
 stt:
   enabled: true
+  # Desktop recordings are retained only after failed transcription. The
+  # private per-profile cache is excluded from backups and pruned oldest-first.
+  recovery:
+    enabled: true
+    retention_hours: 24       # 0 disables retention; hard-capped at 7 days
+    max_entries: 50           # hard-capped at 500 recordings
+    max_total_mb: 500         # hard-capped at 2048 MiB
   # provider: "local"          # auto-detected if omitted
   local:
     model: "base"              # tiny | base | small | medium | large-v3 | turbo

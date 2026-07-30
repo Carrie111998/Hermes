@@ -443,7 +443,7 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
  *  from under the chat you're reading). Lazy-imports so the composer's rich
  *  editor can pull this module in without booting the profile/REST stack. */
 function openSessionRef(value: string) {
-  const { sessionId } = parseSessionRefValue(value)
+  const { profile, sessionId } = parseSessionRefValue(value)
 
   if (!sessionId) {
     return
@@ -451,7 +451,7 @@ function openSessionRef(value: string) {
 
   triggerHaptic('selection')
   // navigate is unused for the `tab` intent (focus-or-tile only).
-  void import('@/app/open-session').then(({ openSession }) => openSession(sessionId, () => undefined, 'tab'))
+  void import('@/app/open-session').then(({ openSession }) => openSession(sessionId, () => undefined, 'tab', profile))
 }
 
 /** A `@session:<profile>/<id>` reference in the user transcript (directive
