@@ -63,7 +63,11 @@ def build_write_denied_paths(home: str) -> set[str]:
             # Webhook subscription HMAC secrets (read-denied alongside auth.json).
             str(hermes_home / "webhook_subscriptions.json"),
             str(hermes_root / "webhook_subscriptions.json"),
-            # Bitwarden Secrets Manager encrypted disk cache.
+            # Bitwarden Secrets Manager disk caches. The plaintext cache stores
+            # secret values and is read-denied via get_read_block_error(); keep
+            # the write side symmetric with the encrypted cache variant.
+            str(hermes_home / "cache" / "bws_cache.json"),
+            str(hermes_root / "cache" / "bws_cache.json"),
             str(hermes_home / "cache" / "bws_cache.enc.json"),
             str(hermes_root / "cache" / "bws_cache.enc.json"),
             os.path.join(home, ".netrc"),

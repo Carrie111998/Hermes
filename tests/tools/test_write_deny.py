@@ -22,6 +22,27 @@ class TestWriteDenyExactPaths:
         assert _is_write_denied(path) is True
 
 
+    def test_hermes_env(self):
+        # ``.env`` under the active HERMES_HOME (profile-aware, not just
+        # ``~/.hermes``) must be write-denied. The hermetic test conftest
+        # points HERMES_HOME at a tempdir — resolve via get_hermes_home()
+        # to match the denylist.
+        from hermes_constants import get_hermes_home
+        path = str(get_hermes_home() / ".env")
+        assert _is_write_denied(path) is True
+
+    def test_plaintext_bitwarden_cache(self):
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "cache" / "bws_cache.json"
+        assert _is_write_denied(str(path)) is True
+
+    def test_encrypted_bitwarden_cache(self):
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "cache" / "bws_cache.enc.json"
+        assert _is_write_denied(str(path)) is True
+
     def test_hermes_root_env_when_running_under_profile(self, tmp_path, monkeypatch):
         """Top-level ``<root>/.env`` stays write-denied even when running under
         a profile (#15981).
@@ -142,3 +163,23 @@ class TestWriteDenyCredentialStore:
         assert get_default_hermes_root() == root
 
         assert _is_write_denied(str(global_auth)) is True
+
+    def test_plaintext_bitwarden_cache_denied_at_root_when_running_under_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """Top-level <root>/cache/bws_cache.json stores plaintext Bitwarden
+        secret values and stays write-denied even when a profile is active."""
+        root = tmp_path / "hermes_root"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        global_cache = root / "cache" / "bws_cache.json"
+        global_cache.parent.mkdir(parents=True)
+        global_cache.write_text('{"item": "PLAINTEXT_SECRET_VALUE"}\n')
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        from hermes_constants import get_hermes_home, get_default_hermes_root
+        assert get_hermes_home() == profile_home
+        assert get_default_hermes_root() == root
+
+        assert _is_write_denied(str(global_cache)) is True
