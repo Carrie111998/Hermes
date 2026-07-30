@@ -364,6 +364,15 @@ class TestTrackForgetQuick:
         assert summary["deleted"] == 1
         assert not p.exists()
 
+    def test_quick_preserves_empty_ops_tree(self, _isolate_env):
+        dg = _load_lib()
+        durable_empty = _isolate_env / "ops" / "model-routing" / "reports"
+        durable_empty.mkdir(parents=True)
+
+        dg.quick()
+
+        assert durable_empty.exists()
+
 
     def test_forget_removes_entry(self, _isolate_env):
         dg = _load_lib()

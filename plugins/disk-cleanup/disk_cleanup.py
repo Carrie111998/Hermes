@@ -149,7 +149,7 @@ ALLOWED_CATEGORIES = {
 }
 
 _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
-    "logs", "memories", "sessions", "cron", "cronjobs",
+    "logs", "memories", "sessions", "cron", "cronjobs", "ops",
     "cache", "skills", "plugins", "disk-cleanup", "optional-skills",
     "hermes-agent", "backups", "profiles", ".worktrees",
 })
