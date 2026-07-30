@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ntpath
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 class SidebarPlacementError(ValueError):
@@ -21,6 +21,59 @@ class SidebarPlacement:
     placement_generation: int
 
 
+def ordinary_windows_path_identity(value: object) -> str | None:
+    """Return an ordinary Windows filesystem-path identity without I/O.
+
+    The caller keeps its own canonical spelling; this value exists only for
+    validation and case/separator-insensitive comparison.
+    """
+
+    if type(value) is not str or not value:
+        return None
+    try:
+        canonical = value.replace("/", "\\")
+        if canonical.casefold().startswith(("\\\\?\\", "\\\\.\\")):
+            return None
+        drive, tail = ntpath.splitdrive(canonical)
+        is_drive_qualified = (
+            len(drive) == 2
+            and drive[1] == ":"
+            and "A" <= drive[0].upper() <= "Z"
+            and tail.startswith("\\")
+        )
+        unc_parts = drive.lstrip("\\").split("\\")
+        is_unc_qualified = (
+            drive.startswith("\\\\")
+            and len(unc_parts) == 2
+            and all(unc_parts)
+            and unc_parts[1].casefold() not in {"pipe", "mailslot", "ipc$"}
+            and (not tail or tail.startswith("\\"))
+        )
+        identity = ntpath.normcase(ntpath.normpath(canonical))
+        if (
+            not (is_drive_qualified or is_unc_qualified)
+            or identity != ntpath.normcase(canonical)
+            or PureWindowsPath(canonical).is_reserved()
+        ):
+            return None
+        components = [part for part in tail.lstrip("\\").split("\\") if part]
+        reserved_names = {
+            "con", "prn", "aux", "nul",
+            *(f"com{number}" for number in range(1, 10)),
+            *(f"lpt{number}" for number in range(1, 10)),
+        }
+        if any(
+            component.endswith((".", " "))
+            or ":" in component
+            or component.split(".", 1)[0].casefold() in reserved_names
+            for component in components
+        ):
+            return None
+        return identity
+    except (TypeError, ValueError):
+        return None
+
+
 def resolve_sidebar_placement(
     configured_inbox_cwd: str,
     hermes_home: Path | str,
@@ -34,8 +87,14 @@ def resolve_sidebar_placement(
         raise SidebarPlacementError("source_identity_mismatch")
     source = _resolve_source(source_cwd)
 
+    inbox_identity = ordinary_windows_path_identity(str(inbox))
+    source_identity = ordinary_windows_path_identity(str(source))
+    if inbox_identity is None:
+        raise SidebarPlacementError("inbox_unavailable")
+    if source_identity is None:
+        raise SidebarPlacementError("source_identity_mismatch")
     roots = (str(inbox),)
-    if _windows_identity(inbox) != _windows_identity(source):
+    if inbox_identity != source_identity:
         roots += (str(source),)
     return SidebarPlacement(
         inbox_cwd=str(inbox),
@@ -61,6 +120,8 @@ def _resolve_canonical_inbox(configured_inbox_cwd: str, hermes_home: Path | str)
         or not home.is_dir()
         or configured_inbox_cwd != str(inbox)
         or _windows_identity(inbox) != _windows_identity(home)
+        or ordinary_windows_path_identity(str(inbox)) is None
+        or ordinary_windows_path_identity(str(home)) is None
     ):
         raise SidebarPlacementError("inbox_unavailable")
     return inbox
@@ -78,8 +139,13 @@ def _resolve_source(source_cwd: str) -> Path:
         raise SidebarPlacementError("source_identity_mismatch") from None
     if not source.is_dir():
         raise SidebarPlacementError("source_identity_mismatch")
+    if ordinary_windows_path_identity(str(source)) is None:
+        raise SidebarPlacementError("source_identity_mismatch")
     return source
 
 
 def _windows_identity(path: Path) -> str:
-    return ntpath.normcase(ntpath.normpath(str(path)))
+    identity = ordinary_windows_path_identity(str(path))
+    if identity is None:
+        raise ValueError("path has no ordinary Windows identity")
+    return identity

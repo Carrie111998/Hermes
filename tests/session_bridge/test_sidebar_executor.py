@@ -304,6 +304,15 @@ def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
             ),
             placement_generation=1,
         ),
+        SidebarPlacement(
+            inbox_cwd="\\\\server\\pipe\\session-inbox",
+            local_host="local",
+            runtime_workspace_roots=(
+                "\\\\server\\pipe\\session-inbox",
+                "C:/source",
+            ),
+            placement_generation=1,
+        ),
     ],
 )
 def test_codex_delivery_rejects_malformed_placement_before_create_dispatch(
@@ -449,6 +458,18 @@ def test_sidebar_executor_settles_placement_failure_before_reservation() -> None
                 local_host="local",
                 runtime_workspace_roots=(
                     "\\\\.\\pipe\\session-inbox",
+                    "C:/source",
+                ),
+                placement_generation=1,
+            ),
+            False,
+        ),
+        (
+            SidebarPlacement(
+                inbox_cwd="\\\\server\\pipe\\session-inbox",
+                local_host="local",
+                runtime_workspace_roots=(
+                    "\\\\server\\pipe\\session-inbox",
                     "C:/source",
                 ),
                 placement_generation=1,

@@ -8,8 +8,49 @@ import pytest
 from session_bridge.sidebar_placement import (
     SidebarPlacementError,
     _windows_identity,
+    ordinary_windows_path_identity,
     resolve_sidebar_placement,
 )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("C:/Users/diego/.hermes", "c:\\users\\diego\\.hermes"),
+        ("c:\\USERS\\diego\\.hermes", "c:\\users\\diego\\.hermes"),
+        ("\\\\server\\share\\workspace", "\\\\server\\share\\workspace"),
+    ],
+)
+def test_ordinary_windows_path_identity_normalizes_ordinary_filesystem_paths(
+    value: str,
+    expected: str,
+) -> None:
+    assert ordinary_windows_path_identity(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "relative/path",
+        "\\Users\\diego\\.hermes",
+        "C:Users\\diego\\.hermes",
+        "C:/Users/diego/../diego/.hermes",
+        "C:/Users/diego/.hermes/.",
+        "\\\\?\\C:\\Users\\diego\\.hermes",
+        "\\\\.\\pipe\\session-inbox",
+        "\\\\server\\pipe\\session-inbox",
+        "\\\\server\\mailslot\\session-inbox",
+        "\\\\server\\IPC$\\session-inbox",
+        "C:/con",
+        "C:/workspace/trailing.",
+        "C:/workspace/trailing ",
+        "C:/workspace/name:stream",
+    ],
+)
+def test_ordinary_windows_path_identity_rejects_nonfilesystem_spellings(
+    value: str,
+) -> None:
+    assert ordinary_windows_path_identity(value) is None
 
 
 def test_resolve_sidebar_placement_keeps_source_out_of_identity(tmp_path: Path) -> None:

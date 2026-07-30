@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 import hmac
 import math
-import ntpath
 import os
 import re
 import sqlite3
@@ -24,7 +23,11 @@ from .sidebar import (
     sidebar_create_recovery_key,
     validate_sidebar_create_reservation,
 )
-from .sidebar_placement import SidebarPlacement, SidebarPlacementError
+from .sidebar_placement import (
+    SidebarPlacement,
+    SidebarPlacementError,
+    ordinary_windows_path_identity,
+)
 from .store import (
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
@@ -1726,7 +1729,7 @@ def _validated_sidebar_placement(
         raise SidebarPlacementError("inbox_unavailable")
     try:
         inbox_cwd = _required_text(placement.inbox_cwd, "sidebar inbox cwd")
-        if not _is_absolute_canonical_windows_path(inbox_cwd):
+        if ordinary_windows_path_identity(inbox_cwd) is None:
             raise SidebarPlacementError("inbox_unavailable")
         if (
             placement.local_host != "local"
@@ -1738,9 +1741,9 @@ def _validated_sidebar_placement(
         if type(roots) is not tuple or len(roots) not in {1, 2}:
             raise SidebarPlacementError("inbox_unavailable")
         if any(
-            not _is_absolute_canonical_windows_path(
+            ordinary_windows_path_identity(
                 _required_text(root, "sidebar runtime workspace root")
-            )
+            ) is None
             for root in roots
         ):
             raise SidebarPlacementError("inbox_unavailable")
@@ -1754,35 +1757,6 @@ def _validated_sidebar_placement(
     except (AttributeError, TypeError, ValueError) as exc:
         raise SidebarPlacementError("inbox_unavailable") from exc
     return placement
-
-
-def _is_absolute_canonical_windows_path(value: object) -> bool:
-    if type(value) is not str or not value:
-        return False
-    try:
-        canonical = value.replace("/", "\\")
-        if canonical.casefold().startswith(("\\\\?\\", "\\\\.\\")):
-            return False
-        drive, tail = ntpath.splitdrive(canonical)
-        is_drive_qualified = (
-            len(drive) == 2
-            and drive[1] == ":"
-            and "A" <= drive[0].upper() <= "Z"
-            and tail.startswith("\\")
-        )
-        unc_parts = drive.lstrip("\\").split("\\")
-        is_unc_qualified = (
-            drive.startswith("\\\\")
-            and len(unc_parts) == 2
-            and all(unc_parts)
-            and (not tail or tail.startswith("\\"))
-        )
-        return (
-            (is_drive_qualified or is_unc_qualified)
-            and ntpath.normcase(ntpath.normpath(canonical)) == ntpath.normcase(canonical)
-        )
-    except (TypeError, ValueError):
-        return False
 
 
 def _finite_time(value: object) -> float:
