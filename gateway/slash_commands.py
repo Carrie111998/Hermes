@@ -2445,9 +2445,10 @@ class GatewaySlashCommandsMixin:
             /codex-runtime codex_app_server — codex subprocess runtime
             /codex-runtime on / off         — synonyms
 
-        On change, the cached agent for this session is evicted so the next
-        message creates a fresh AIAgent with the new api_mode wired in
-        (avoids prompt-cache invalidation mid-session)."""
+        Runtime changes are persisted for the next conversation boundary.
+        The current cached agent must keep its original runtime so a config
+        toggle cannot replace its model-visible context mid-session. Users
+        apply the new runtime explicitly with /new or /reset."""
         from hermes_cli import codex_runtime_switch as crs
 
         raw_args = event.get_command_args().strip() if event else ""
@@ -2467,16 +2468,6 @@ class GatewaySlashCommandsMixin:
             new_value,
             persist_callback=(save_config if new_value is not None else None),
         )
-
-        # On a real change, evict the cached agent so the new runtime takes
-        # effect on the next message rather than waiting for cache TTL.
-        if result.success and new_value is not None and result.requires_new_session:
-            try:
-                session_key = self._session_key_for_source(event.source)
-                self._evict_cached_agent(session_key)
-            except Exception:
-                logger.debug("could not evict cached agent after codex-runtime change",
-                             exc_info=True)
 
         prefix = "✓" if result.success else "✗"
         return f"{prefix} {result.message}"

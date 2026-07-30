@@ -194,6 +194,13 @@ class TestNotificationPollerLoopKanbanWiring:
         import threading
         import tui_gateway.server as server
 
+        # Production pollers are attached only after the exact session record
+        # and its agent are live in the registry. The lifecycle-safe delivery
+        # path deliberately rejects bare/stale records so a reused short SID
+        # cannot receive an old poller's notification.
+        session.setdefault("agent", object())
+        monkeypatch.setitem(server._sessions, "sid-poller-test", session)
+
         emits: list = []
         submits: list = []
         monkeypatch.setattr(server, "_KANBAN_POLL_SECONDS", 0.01)

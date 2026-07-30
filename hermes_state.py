@@ -25,6 +25,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -127,6 +128,91 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     except (PermissionError, OSError, OverflowError):
         return False
     return False
+
+
+def _codex_turn_lease_process_start_time(pid: int) -> Optional[int]:
+    """Return a stable start-time fingerprint for ``pid``, or ``None``.
+
+    A PID alone is not an ownership identity because operating systems reuse
+    PIDs. Linux exposes field 22 of ``/proc/<pid>/stat``; macOS and Windows
+    use psutil's process creation time, quantized to centiseconds. Any probe
+    doubt is reported as ``None`` so lease acquisition/recovery can fail
+    closed instead of guessing that an owner died.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # proc_pid_stat(5) encloses comm in parentheses, and comm itself may
+        # contain spaces or ')'. Parse fields only after the final ')' so field
+        # 22 (starttime) remains stable; a naïve split shifts the index.
+        comm_end = stat_text.rfind(")")
+        if comm_end < 0:
+            raise ValueError("malformed /proc stat")
+        fields_after_comm = stat_text[comm_end + 1 :].strip().split()
+        # The suffix begins at field 3 (state), so field 22 is index 19.
+        return int(fields_after_comm[19])
+    except (FileNotFoundError, IndexError, PermissionError, ValueError, OSError):
+        # Do not mix Linux /proc starttime ticks with psutil epoch seconds.
+        # Comparing fingerprints from different units can make a live owner
+        # look like a reused PID and permit an unsafe stale-lease takeover.
+        # On Linux, an unreadable /proc identity is therefore inconclusive.
+        if sys.platform.startswith("linux"):
+            return None
+
+    if psutil is None:
+        return None
+    try:
+        return int(round(psutil.Process(pid).create_time() * 100))
+    except Exception:
+        return None
+
+
+def _codex_turn_lease_owner_is_alive(
+    owner_pid: Any,
+    owner_started_at: Any,
+) -> Optional[bool]:
+    """Return ``True``/``False`` only when lease-owner identity is provable.
+
+    ``None`` means the process probe was inconclusive. Callers must treat that
+    as alive and keep the lease: a false-death decision can put two app-server
+    clients on one Codex thread, while a conservative keep merely delays
+    recovery until process identity can be checked again.
+    """
+    try:
+        pid = int(owner_pid)
+        expected_start = int(owner_started_at)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0 or expected_start <= 0:
+        return None
+
+    current_start = _codex_turn_lease_process_start_time(pid)
+    if current_start is not None:
+        return current_start == expected_start
+
+    # A missing start-time probe can mean either "gone" or "unreadable".
+    # psutil.pid_exists is the cross-platform discriminator; unlike
+    # os.kill(pid, 0), it is safe on native Windows.
+    if psutil is None:
+        return None
+    try:
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        return None
+
+
+def _normalize_codex_turn_lease_holder(holder_uuid: Any) -> Optional[str]:
+    """Return a canonical UUID string for a lease holder."""
+    try:
+        return str(uuid.UUID(str(holder_uuid or "").strip()))
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _scrub_surrogates(value: Any) -> Any:
@@ -738,6 +824,26 @@ def apply_wal_with_fallback(
             raise WalUnsupportedError(str(exc)) from exc
         _log_wal_fallback_once(db_label, exc)
         return _set_delete_journal_mode(conn, reason="fallback")
+
+
+def _set_delete_journal_mode(
+    conn: sqlite3.Connection,
+    *,
+    reason: str,
+) -> str:
+    """Switch to DELETE mode and verify SQLite accepted the transition."""
+    row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+    actual = (
+        str(row[0]).strip().lower()
+        if row and row[0] is not None
+        else ""
+    )
+    if actual != "delete":
+        raise sqlite3.OperationalError(
+            "could not set journal_mode=delete during "
+            f"{reason} (got {actual or 'no result'})"
+        )
+    return actual
 
 
 def _apply_delete_for_wal_reset_bug(
@@ -1526,6 +1632,10 @@ class CompressionSessionClosedError(RuntimeError):
 
 class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
+
+
+class _CodexTurnLeaseBindConflict(RuntimeError):
+    """Abort an atomic Codex thread bind without committing partial state."""
 
 
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
@@ -3238,6 +3348,547 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
         self._execute_write(_do)
+
+    def get_codex_thread_id(self, session_id: str) -> Optional[str]:
+        """Return the Codex app-server thread bound to a Hermes session.
+
+        ``sessions.thread_id`` is reserved for the messaging origin
+        (Telegram topic, Discord thread, and similar gateway routing). Codex's
+        app-server thread is a separate persistence domain whose rollout owns
+        native compaction state, so it must never reuse that routing column.
+        """
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT codex_thread_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        value = (
+            row["codex_thread_id"]
+            if isinstance(row, sqlite3.Row)
+            else row[0]
+        )
+        value = str(value or "").strip()
+        return value or None
+
+    def bind_codex_thread_id(self, session_id: str, thread_id: str) -> bool:
+        """Atomically bind one canonical Codex thread to a Hermes session.
+
+        The first writer wins. Rebinding the same value is idempotent, while a
+        different existing value or a thread already bound to another session
+        is rejected. BEGIN IMMEDIATE serializes the application-level global
+        uniqueness check with the update.
+        """
+        session_id = str(session_id or "").strip()
+        thread_id = str(thread_id or "").strip()
+        if not session_id or not thread_id:
+            return False
+
+        def _do(conn):
+            duplicate = conn.execute(
+                "SELECT id FROM sessions "
+                "WHERE codex_thread_id = ? AND id != ? LIMIT 1",
+                (thread_id, session_id),
+            ).fetchone()
+            if duplicate is not None:
+                return False
+            cursor = conn.execute(
+                "UPDATE sessions SET codex_thread_id = ? "
+                "WHERE id = ? AND (codex_thread_id IS NULL "
+                "OR codex_thread_id = '' OR codex_thread_id = ?)",
+                (thread_id, session_id, thread_id),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    # ──────────────────────────────────────────────────────────────────
+    # Codex app-server turn leases
+    # ──────────────────────────────────────────────────────────────────
+    # Codex currently assumes that only one app-server client drives a
+    # persisted thread at a time. The API server and CLI can otherwise create
+    # separate app-server processes that both resume the same thread and start
+    # concurrent turns. These state.db leases are therefore a correctness
+    # boundary, not a throughput hint: every error returns False and the caller
+    # must refuse to start/resume/compact the Codex thread.
+
+    def bind_codex_thread_under_lease(
+        self,
+        session_id: str,
+        holder_uuid: str,
+        thread_id: str,
+    ) -> bool:
+        """Atomically bind a newly-started Codex thread under its lease.
+
+        The session's first-writer-wins binding and the provisional lease's
+        nullable thread ID are updated in the same BEGIN IMMEDIATE transaction.
+        The exact holder UUID, PID, and process-start fingerprint must still
+        own the lease. The thread must not be bound to any other session or
+        lease. Any conflict, SQLite error, or timeout rolls back both updates
+        and returns ``False``.
+        """
+        session_id = str(session_id or "").strip()
+        thread_id = str(thread_id or "").strip()
+        holder = _normalize_codex_turn_lease_holder(holder_uuid)
+        if not session_id or not thread_id or holder is None:
+            return False
+
+        owner_pid = os.getpid()
+        owner_started_at = _codex_turn_lease_process_start_time(owner_pid)
+        if owner_started_at is None:
+            return False
+
+        def _do(conn):
+            lease = conn.execute(
+                "SELECT codex_thread_id FROM codex_turn_leases "
+                "WHERE session_id = ? AND holder_uuid = ? AND owner_pid = ? "
+                "AND owner_started_at = ?",
+                (session_id, holder, owner_pid, owner_started_at),
+            ).fetchone()
+            if lease is None:
+                return False
+            leased_thread_id = str(lease["codex_thread_id"] or "").strip()
+            if leased_thread_id and leased_thread_id != thread_id:
+                return False
+
+            session = conn.execute(
+                "SELECT codex_thread_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                return False
+            bound_thread_id = str(session["codex_thread_id"] or "").strip()
+            if bound_thread_id and bound_thread_id != thread_id:
+                return False
+
+            duplicate_session = conn.execute(
+                "SELECT id FROM sessions "
+                "WHERE codex_thread_id = ? AND id != ? LIMIT 1",
+                (thread_id, session_id),
+            ).fetchone()
+            duplicate_lease = conn.execute(
+                "SELECT session_id FROM codex_turn_leases "
+                "WHERE codex_thread_id = ? AND session_id != ? LIMIT 1",
+                (thread_id, session_id),
+            ).fetchone()
+            if duplicate_session is not None or duplicate_lease is not None:
+                return False
+
+            bound = conn.execute(
+                "UPDATE sessions SET codex_thread_id = ? "
+                "WHERE id = ? AND (codex_thread_id IS NULL "
+                "OR codex_thread_id = '' OR codex_thread_id = ?)",
+                (thread_id, session_id, thread_id),
+            )
+            if bound.rowcount != 1:
+                raise _CodexTurnLeaseBindConflict
+
+            attached = conn.execute(
+                "UPDATE codex_turn_leases SET codex_thread_id = ? "
+                "WHERE session_id = ? AND holder_uuid = ? AND owner_pid = ? "
+                "AND owner_started_at = ? AND (codex_thread_id IS NULL "
+                "OR codex_thread_id = ?)",
+                (
+                    thread_id,
+                    session_id,
+                    holder,
+                    owner_pid,
+                    owner_started_at,
+                    thread_id,
+                ),
+            )
+            if attached.rowcount != 1:
+                raise _CodexTurnLeaseBindConflict
+            return True
+
+        try:
+            return bool(self._execute_write(_do, patience_s=2.0))
+        except (_CodexTurnLeaseBindConflict, sqlite3.Error, TimeoutError) as exc:
+            logger.warning(
+                "bind_codex_thread_under_lease(%s, %s) failed closed: %s",
+                session_id,
+                thread_id,
+                exc,
+            )
+            return False
+
+    def try_acquire_codex_turn_lease(
+        self,
+        session_id: str,
+        holder_uuid: str,
+        *,
+        codex_thread_id: Optional[str] = None,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Atomically acquire exclusive use of one Hermes/Codex turn.
+
+        ``session_id`` is the primary lease identity because ``thread/start``
+        must acquire before Codex has returned a thread ID. If the session is
+        already bound, the durable binding is copied into the lease. A
+        supplied ``codex_thread_id`` is accepted only when it exactly matches
+        that binding; the nullable UNIQUE column then also prevents two Hermes
+        sessions from driving the same known Codex thread.
+
+        A stale row is reclaimed only when BOTH conditions hold:
+
+        * its TTL has expired; and
+        * its ``(owner_pid, owner_started_at)`` identity is provably dead or
+          the PID has been reused.
+
+        Probe doubt and a live process both keep the row. In particular, a
+        slow refresher in this process cannot let a sibling holder steal an
+        otherwise live lease merely because the TTL elapsed.
+
+        ``holder_uuid`` is normalized and must be a valid UUID. The owner PID
+        and process-start fingerprint are captured internally so callers
+        cannot accidentally create a lease that they cannot refresh/release.
+        All SQLite, lock-timeout, and process-identity failures return
+        ``False`` (fail closed).
+        """
+        session_id = str(session_id or "").strip()
+        requested_thread_id = str(codex_thread_id or "").strip() or None
+        holder = _normalize_codex_turn_lease_holder(holder_uuid)
+        try:
+            ttl = float(ttl_seconds)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not session_id
+            or holder is None
+            or not (ttl > 0.0)
+            or ttl == float("inf")
+        ):
+            return False
+
+        owner_pid = os.getpid()
+        owner_started_at = _codex_turn_lease_process_start_time(owner_pid)
+        if owner_started_at is None:
+            logger.error(
+                "codex turn lease: could not fingerprint owner process; "
+                "refusing acquisition for session=%s",
+                session_id,
+            )
+            return False
+
+        now = time.time()
+        expires_at = now + ttl
+
+        def _do(conn):
+            binding = conn.execute(
+                "SELECT codex_thread_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if binding is None:
+                return False
+            bound_thread_id = str(
+                (
+                    binding["codex_thread_id"]
+                    if isinstance(binding, sqlite3.Row)
+                    else binding[0]
+                )
+                or ""
+            ).strip()
+            bound_thread_id = bound_thread_id or None
+            if (
+                requested_thread_id is not None
+                and bound_thread_id != requested_thread_id
+            ):
+                return False
+            effective_thread_id = requested_thread_id or bound_thread_id
+            if effective_thread_id is not None:
+                duplicate_binding = conn.execute(
+                    "SELECT id FROM sessions "
+                    "WHERE codex_thread_id = ? AND id != ? LIMIT 1",
+                    (effective_thread_id, session_id),
+                ).fetchone()
+                if duplicate_binding is not None:
+                    return False
+
+            if effective_thread_id is None:
+                rows = conn.execute(
+                    "SELECT session_id, codex_thread_id, holder_uuid, owner_pid, "
+                    "owner_started_at, acquired_at, refreshed_at, expires_at "
+                    "FROM codex_turn_leases WHERE session_id = ?",
+                    (session_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT session_id, codex_thread_id, holder_uuid, owner_pid, "
+                    "owner_started_at, acquired_at, refreshed_at, expires_at "
+                    "FROM codex_turn_leases "
+                    "WHERE session_id = ? OR codex_thread_id = ?",
+                    (session_id, effective_thread_id),
+                ).fetchall()
+            # Two rows can only arise from a damaged/manually-edited database
+            # where each unique key points at a different lease. Never choose
+            # a winner heuristically.
+            if len(rows) > 1:
+                return False
+
+            if rows:
+                row = rows[0]
+                existing_session_id = str(row["session_id"])
+                existing_thread_id = (
+                    str(row["codex_thread_id"]).strip()
+                    if row["codex_thread_id"] is not None
+                    else None
+                )
+                existing_holder = str(row["holder_uuid"])
+                existing_pid = int(row["owner_pid"])
+                existing_started_at = int(row["owner_started_at"])
+                existing_expires_at = float(row["expires_at"])
+
+                same_owner = (
+                    existing_session_id == session_id
+                    and existing_holder == holder
+                    and existing_pid == owner_pid
+                    and existing_started_at == owner_started_at
+                )
+                if same_owner:
+                    if (
+                        existing_thread_id is not None
+                        and existing_thread_id != effective_thread_id
+                    ):
+                        return False
+                    cursor = conn.execute(
+                        "UPDATE codex_turn_leases "
+                        "SET codex_thread_id = COALESCE(codex_thread_id, ?), "
+                        "refreshed_at = ?, expires_at = ? "
+                        "WHERE session_id = ? "
+                        "AND holder_uuid = ? AND owner_pid = ? "
+                        "AND owner_started_at = ?",
+                        (
+                            effective_thread_id,
+                            now,
+                            expires_at,
+                            session_id,
+                            holder,
+                            owner_pid,
+                            owner_started_at,
+                        ),
+                    )
+                    return cursor.rowcount == 1
+
+                if existing_expires_at >= now:
+                    return False
+                owner_alive = _codex_turn_lease_owner_is_alive(
+                    existing_pid,
+                    existing_started_at,
+                )
+                if owner_alive is not False:
+                    return False
+
+                deleted = conn.execute(
+                    "DELETE FROM codex_turn_leases "
+                    "WHERE session_id = ? AND holder_uuid = ? AND owner_pid = ? "
+                    "AND owner_started_at = ? AND expires_at = ?",
+                    (
+                        existing_session_id,
+                        existing_holder,
+                        existing_pid,
+                        existing_started_at,
+                        existing_expires_at,
+                    ),
+                )
+                if deleted.rowcount != 1:
+                    return False
+
+            try:
+                inserted = conn.execute(
+                    "INSERT INTO codex_turn_leases "
+                    "(session_id, codex_thread_id, holder_uuid, owner_pid, "
+                    "owner_started_at, acquired_at, refreshed_at, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        effective_thread_id,
+                        holder,
+                        owner_pid,
+                        owner_started_at,
+                        now,
+                        now,
+                        expires_at,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # A binding/uniqueness race or missing session row is ordinary
+                # lease contention from the caller's perspective: fail closed.
+                return False
+            return inserted.rowcount == 1
+
+        try:
+            return bool(self._execute_write(_do, patience_s=2.0))
+        except (sqlite3.Error, TimeoutError) as exc:
+            logger.warning(
+                "try_acquire_codex_turn_lease(%s, thread=%s) failed closed: %s",
+                session_id,
+                requested_thread_id,
+                exc,
+            )
+            return False
+
+    def refresh_codex_turn_lease(
+        self,
+        session_id: str,
+        holder_uuid: str,
+        *,
+        codex_thread_id: Optional[str] = None,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Extend an owned lease and attach its durable Codex ID when known."""
+        session_id = str(session_id or "").strip()
+        requested_thread_id = str(codex_thread_id or "").strip() or None
+        holder = _normalize_codex_turn_lease_holder(holder_uuid)
+        try:
+            ttl = float(ttl_seconds)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not session_id
+            or holder is None
+            or not (ttl > 0.0)
+            or ttl == float("inf")
+        ):
+            return False
+
+        owner_pid = os.getpid()
+        owner_started_at = _codex_turn_lease_process_start_time(owner_pid)
+        if owner_started_at is None:
+            return False
+        now = time.time()
+
+        def _do(conn):
+            binding = conn.execute(
+                "SELECT codex_thread_id FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if binding is None:
+                return False
+            bound_thread_id = str(
+                (
+                    binding["codex_thread_id"]
+                    if isinstance(binding, sqlite3.Row)
+                    else binding[0]
+                )
+                or ""
+            ).strip() or None
+            if (
+                requested_thread_id is not None
+                and bound_thread_id != requested_thread_id
+            ):
+                return False
+            effective_thread_id = requested_thread_id or bound_thread_id
+
+            lease = conn.execute(
+                "SELECT codex_thread_id FROM codex_turn_leases "
+                "WHERE session_id = ? AND holder_uuid = ? AND owner_pid = ? "
+                "AND owner_started_at = ?",
+                (session_id, holder, owner_pid, owner_started_at),
+            ).fetchone()
+            if lease is None:
+                return False
+            leased_thread_id = (
+                str(lease["codex_thread_id"]).strip()
+                if lease["codex_thread_id"] is not None
+                else None
+            )
+            if (
+                leased_thread_id is not None
+                and leased_thread_id != effective_thread_id
+            ):
+                return False
+
+            cursor = conn.execute(
+                "UPDATE codex_turn_leases "
+                "SET codex_thread_id = COALESCE(codex_thread_id, ?), "
+                "refreshed_at = ?, expires_at = ? "
+                "WHERE session_id = ? AND holder_uuid = ? AND owner_pid = ? "
+                "AND owner_started_at = ?",
+                (
+                    effective_thread_id,
+                    now,
+                    now + ttl,
+                    session_id,
+                    holder,
+                    owner_pid,
+                    owner_started_at,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        try:
+            return bool(self._execute_write(_do, patience_s=2.0))
+        except (sqlite3.Error, TimeoutError) as exc:
+            logger.warning(
+                "refresh_codex_turn_lease(%s, thread=%s) failed closed: %s",
+                session_id,
+                requested_thread_id,
+                exc,
+            )
+            return False
+
+    def release_codex_turn_lease(
+        self,
+        session_id: str,
+        holder_uuid: str,
+    ) -> bool:
+        """Release the lease iff this exact UUID and process identity owns it."""
+        session_id = str(session_id or "").strip()
+        holder = _normalize_codex_turn_lease_holder(holder_uuid)
+        if not session_id or holder is None:
+            return False
+
+        owner_pid = os.getpid()
+        owner_started_at = _codex_turn_lease_process_start_time(owner_pid)
+        if owner_started_at is None:
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                "DELETE FROM codex_turn_leases "
+                "WHERE session_id = ? AND holder_uuid = ? AND owner_pid = ? "
+                "AND owner_started_at = ?",
+                (
+                    session_id,
+                    holder,
+                    owner_pid,
+                    owner_started_at,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        try:
+            return bool(self._execute_write(_do, patience_s=2.0))
+        except (sqlite3.Error, TimeoutError) as exc:
+            logger.warning(
+                "release_codex_turn_lease(%s) failed closed: %s",
+                session_id,
+                exc,
+            )
+            return False
+
+    def get_codex_turn_lease(
+        self,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the stored Codex turn lease for diagnostics."""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return None
+        try:
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT session_id, codex_thread_id, holder_uuid, owner_pid, "
+                    "owner_started_at, acquired_at, refreshed_at, expires_at "
+                    "FROM codex_turn_leases WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+        except (sqlite3.Error, TimeoutError):
+            return None
+        return dict(row) if row is not None else None
 
     def promote_to_session_reset(
         self, session_id: str, reason: str = "session_reset"

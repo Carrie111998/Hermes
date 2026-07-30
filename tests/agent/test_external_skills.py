@@ -31,7 +31,9 @@ def hermes_home(tmp_path):
 
 class TestGetExternalSkillsDirs:
     def test_empty_config(self, hermes_home):
-        (hermes_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+        (hermes_home / "config.yaml").write_text(
+            "skills:\n  external_dirs: []\n", encoding="utf-8"
+        )
         with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
             from agent.skill_utils import get_external_skills_dirs
             result = get_external_skills_dirs()

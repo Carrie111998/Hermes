@@ -148,7 +148,10 @@ class TestFindAllSkillsFiltering:
         skill_dir = tmp_path / "my-skill"
         skill_dir.mkdir()
         skill_md = skill_dir / "SKILL.md"
-        skill_md.write_text("---\nname: my-skill\ndescription: A test skill\n---\nContent")
+        skill_md.write_text(
+            "---\nname: my-skill\ndescription: A test skill\n---\nContent",
+            encoding="utf-8",
+        )
         # Point SKILLS_DIR at the real tempdir so iter_skill_index_files
         # (which uses os.walk) can actually find the file.
         import tools.skills_tool as _st

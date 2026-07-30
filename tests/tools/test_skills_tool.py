@@ -44,7 +44,7 @@ description: Description for {name}.
 
 {body}
 """
-    (skill_dir / "SKILL.md").write_text(content)
+    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
     return skill_dir
 
 
@@ -884,7 +884,9 @@ class TestSkillView:
             skill_dir = _make_skill(tmp_path, "my-skill")
             refs_dir = skill_dir / "references"
             refs_dir.mkdir()
-            (refs_dir / "api.md").write_text("# API Docs\nEndpoint info.")
+            (refs_dir / "api.md").write_text(
+                "# API Docs\nEndpoint info.", encoding="utf-8"
+            )
 
             existing = json.loads(skill_view("my-skill", file_path="references/api.md"))
             skill = json.loads(skill_view("my-skill"))
@@ -901,7 +903,9 @@ class TestSkillView:
             refs_dir = skill_dir / "references"
             refs_dir.mkdir()
             for index in reversed(range(MAX_LINKED_FILES_PER_CATEGORY + 5)):
-                (refs_dir / f"{index:03d}.md").write_text("reference")
+                (refs_dir / f"{index:03d}.md").write_text(
+                    "reference", encoding="utf-8"
+                )
             raw = skill_view("my-skill", file_path="references/nope.md")
         result = json.loads(raw)
         assert result["success"] is False
@@ -938,7 +942,9 @@ class TestSkillView:
             assets_dir = skill_dir / "assets"
             assets_dir.mkdir()
             for index in reversed(range(MAX_LINKED_FILES_PER_CATEGORY + 5)):
-                (assets_dir / f"{index:03d}.txt").write_text("asset")
+                (assets_dir / f"{index:03d}.txt").write_text(
+                    "asset", encoding="utf-8"
+                )
             raw = skill_view("many-assets")
 
         result = json.loads(raw)
@@ -1055,7 +1061,9 @@ class TestSkillView:
             replacement_skill / "SKILL.md",
         )
         (original_skill / "assets").mkdir()
-        (original_skill / "assets" / "original.txt").write_text("original")
+        (original_skill / "assets" / "original.txt").write_text(
+            "original", encoding="utf-8"
+        )
         (replacement_skill / "assets").mkdir()
         (replacement_skill / "assets" / "replacement.txt").write_text(
             "replacement"
@@ -1709,7 +1717,9 @@ class TestSkillViewCollisionDetection:
             / "sketch.md"
         )
         support_file.parent.mkdir(parents=True, exist_ok=True)
-        support_file.write_text("# Sketch style support doc\n")
+        support_file.write_text(
+            "# Sketch style support doc\n", encoding="utf-8"
+        )
         _make_skill(local_dir, "sketch", category="creative", body="REAL SKETCH SKILL")
 
         p1, p2 = self._patch_dirs(local_dir, [external_dir])

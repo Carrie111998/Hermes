@@ -108,7 +108,7 @@ class TestListingCollisionsAndLabels:
         skills.mkdir(parents=True, exist_ok=True)
         monkeypatch.setattr(pb, "get_skills_dir", lambda: skills, raising=True)
         monkeypatch.setattr(
-            pb, "get_all_skills_dirs", lambda: [skills], raising=True
+            pb, "get_all_skills_dirs", lambda **_kwargs: [skills], raising=True
         )
         monkeypatch.setattr(pb, "get_disabled_skill_names", lambda *a, **k: set())
         monkeypatch.setattr(
@@ -171,7 +171,7 @@ class TestOrgSkillsAreEditableInPlace:
         _mark_active(skills, "org-1")
         monkeypatch.setattr(smt, "_skills_dir", lambda: skills)
         monkeypatch.setattr(
-            _sku, "get_all_skills_dirs", lambda: [skills], raising=True
+            _sku, "get_all_skills_dirs", lambda **_kwargs: [skills], raising=True
         )
         return smt, skills, d
 

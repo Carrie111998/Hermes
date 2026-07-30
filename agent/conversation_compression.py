@@ -2702,6 +2702,16 @@ def _compress_context_via_codex_app_server(
         _complete_compaction_lifecycle()
         raise
 
+    if (
+        not getattr(result, "interrupted", False)
+        and not getattr(result, "error", None)
+        and not getattr(result, "compacted", False)
+    ):
+        result.error = (
+            "Codex completed the compact turn without the required "
+            "contextCompaction event"
+        )
+
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
         _activity_heartbeat.stop("context compression failed")
     else:

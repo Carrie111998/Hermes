@@ -7,8 +7,9 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import threading
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from typing import Any, Optional
 
 import pytest
@@ -16,7 +17,9 @@ import pytest
 import agent.transports.codex_app_server_session as session_mod
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
+    TurnResult,
     _ServerRequestRouting,
+    _apply_compaction_notification,
     _approval_choice_to_codex_decision,
     _coerce_turn_input_text,
 )
@@ -38,9 +41,11 @@ class FakeClient:
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
         self._request_handler = None  # Optional[Callable[[str, dict], dict]]
+        self.initialize_kwargs: dict[str, Any] = {}
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
+        self.initialize_kwargs = dict(kwargs)
         self._initialized = True
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
@@ -53,6 +58,13 @@ class FakeClient:
         if method == "thread/start":
             return {"thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "thread/resume":
+            return {
+                "thread": {
+                    "id": (params or {}).get("threadId"),
+                    "sessionId": "thread-tree-root",
+                }
+            }
         if method == "turn/start":
             return {"turn": {"id": "turn-fake-001"}}
         if method == "turn/interrupt":
@@ -126,6 +138,21 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
     )
 
 
+def queue_completion_after_response(client: FakeClient) -> None:
+    """Model the official ordering: approval response precedes terminal."""
+    original_respond = client.respond
+
+    def respond(request_id, result):
+        original_respond(request_id, result)
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+    client.respond = respond
+
+
 # ---- choice mapping ----
 
 class TestApprovalChoiceMapping:
@@ -152,6 +179,124 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_lease_contention_fails_before_client_construction(self):
+        client_factory = MagicMock(
+            side_effect=AssertionError("client must not be constructed")
+        )
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=client_factory,
+            lease_acquire=lambda: False,
+        )
+
+        result = session.run_turn("blocked", turn_timeout=0.1)
+
+        assert result.should_retire is True
+        assert result.error and "another Hermes/Codex client" in result.error
+        client_factory.assert_not_called()
+
+    def test_lease_heartbeat_and_close_release_are_ordered_and_idempotent(self):
+        client = FakeClient()
+        order = []
+        refresh_seen = threading.Event()
+        original_close = client.close
+
+        def close_client():
+            order.append("client-close")
+            original_close()
+
+        def refresh():
+            order.append("refresh")
+            refresh_seen.set()
+            return True
+
+        def release():
+            assert client._closed is True
+            order.append("release")
+            return True
+
+        client.close = close_client
+        session = make_session(
+            client,
+            lease_acquire=lambda: order.append("acquire") or True,
+            lease_refresh=refresh,
+            lease_release=release,
+            lease_refresh_interval=0.01,
+        )
+
+        assert session.ensure_started() == "thread-fake-001"
+        assert refresh_seen.wait(timeout=1.0)
+        session.close()
+        session.close()
+
+        assert order[0] == "acquire"
+        assert order.count("release") == 1
+        assert order.index("client-close") < order.index("release")
+
+    def test_lease_refresh_failure_retires_active_turn(self):
+        client = FakeClient()
+        released = []
+        session = make_session(
+            client,
+            lease_acquire=lambda: True,
+            lease_refresh=lambda: False,
+            lease_release=lambda: released.append(True) or True,
+            lease_refresh_interval=0.01,
+        )
+
+        result = session.run_turn(
+            "wait for lease failure",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.01,
+        )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "lease refresh failed" in result.error
+        assert client._closed is True
+        assert released == [True]
+
+    def test_transient_lease_release_failure_is_retried(self):
+        client = FakeClient()
+        released = threading.Event()
+        attempts = []
+
+        def release():
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1:
+                return False
+            released.set()
+            return True
+
+        session = make_session(
+            client,
+            lease_acquire=lambda: True,
+            lease_release=release,
+        )
+        session.ensure_started()
+
+        session.close()
+
+        assert released.wait(timeout=1.0)
+        assert attempts == [1, 2]
+
+    def test_thread_binding_failure_closes_client_and_releases_lease(self):
+        client = FakeClient()
+        released = []
+        session = make_session(
+            client,
+            on_thread_ready=MagicMock(side_effect=RuntimeError("db failed")),
+            lease_acquire=lambda: True,
+            lease_release=lambda: released.append(True) or True,
+        )
+
+        result = session.run_turn("must fail", turn_timeout=0.1)
+
+        assert result.should_retire is True
+        assert result.error and "could not persist" in result.error
+        assert client._closed is True
+        assert released == [True]
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -174,6 +319,132 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_thread_resume_skips_full_turn_history_and_is_idempotent(self):
+        client = FakeClient()
+        s = make_session(client, resume_thread_id="thread-saved-001")
+
+        assert s.ensure_started() == "thread-saved-001"
+        assert s.ensure_started() == "thread-saved-001"
+        assert client.initialize_kwargs["capabilities"] == {
+            "experimentalApi": True
+        }
+        assert [
+            request for request in client.requests
+            if request[0] == "thread/resume"
+        ] == [
+            (
+                "thread/resume",
+                {
+                    "threadId": "thread-saved-001",
+                    "excludeTurns": True,
+                },
+            )
+        ]
+        assert not any(method == "thread/start" for method, _ in client.requests)
+
+    def test_thread_start_does_not_opt_into_experimental_api(self):
+        client = FakeClient()
+        s = make_session(client)
+
+        assert s.ensure_started() == "thread-fake-001"
+        assert client.initialize_kwargs["capabilities"] is None
+
+    def test_thread_resume_accepts_exact_top_level_thread_id_compatibility(self):
+        client = FakeClient()
+        client._request_handler = lambda method, params: {
+            "threadId": params["threadId"]
+        }
+        s = make_session(client, resume_thread_id="thread-saved-001")
+
+        assert s.ensure_started() == "thread-saved-001"
+        assert client.requests == [
+            (
+                "thread/resume",
+                {
+                    "threadId": "thread-saved-001",
+                    "excludeTurns": True,
+                },
+            )
+        ]
+        assert not any(method == "thread/start" for method, _ in client.requests)
+
+    def test_thread_resume_rejects_canonical_id_mismatch(self):
+        client = FakeClient()
+
+        def mismatched_resume(method, params):
+            assert method == "thread/resume"
+            return {
+                "thread": {
+                    "id": "thread-other",
+                    "sessionId": params["threadId"],
+                }
+            }
+
+        client._request_handler = mismatched_resume
+        s = make_session(client, resume_thread_id="thread-saved-001")
+
+        with pytest.raises(session_mod.CodexAppServerError, match="different thread id"):
+            s.ensure_started()
+        assert not any(method == "thread/start" for method, _ in client.requests)
+
+    def test_thread_resume_does_not_accept_session_id_as_thread_id(self):
+        client = FakeClient()
+        client._request_handler = lambda method, params: {
+            "thread": {"sessionId": params["threadId"]}
+        }
+        s = make_session(client, resume_thread_id="thread-saved-001")
+
+        with pytest.raises(session_mod.CodexAppServerError, match="no thread id"):
+            s.ensure_started()
+        assert not any(method == "thread/start" for method, _ in client.requests)
+
+    def test_thread_ready_callback_runs_once_before_first_turn(self):
+        client = FakeClient()
+        order = []
+
+        def request_handler(method, params):
+            order.append(method)
+            if method == "thread/start":
+                return {"thread": {"id": "thread-new"}}
+            if method == "turn/start":
+                return {"turn": {"id": "turn-new"}}
+            return {}
+
+        client._request_handler = request_handler
+        s = make_session(
+            client,
+            on_thread_ready=lambda thread_id: order.append(
+                f"persist:{thread_id}"
+            ),
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-new",
+            turn={"id": "turn-new", "status": "completed", "error": None},
+        )
+
+        s.run_turn("hello", turn_timeout=2.0)
+
+        assert order[:3] == [
+            "thread/start",
+            "persist:thread-new",
+            "turn/start",
+        ]
+        assert order.count("persist:thread-new") == 1
+
+    def test_thread_ready_callback_failure_blocks_first_turn(self):
+        client = FakeClient()
+
+        def fail_binding(_thread_id):
+            raise RuntimeError("database unavailable")
+
+        s = make_session(client, on_thread_ready=fail_binding)
+        result = s.run_turn("hello", turn_timeout=2.0)
+
+        assert result.should_retire is True
+        assert "startup failed" in result.error
+        assert not any(method == "turn/start" for method, _ in client.requests)
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -186,6 +457,26 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_resume_failure_returns_retiring_error_without_new_thread(self):
+        client = FakeClient()
+
+        def fail_resume(method, params):
+            assert method == "thread/resume"
+            raise session_mod.CodexAppServerError(
+                code=-32000,
+                message="stored rollout unavailable",
+            )
+
+        client._request_handler = fail_resume
+        s = make_session(client, resume_thread_id="thread-saved-001")
+
+        result = s.run_turn("hello", turn_timeout=2.0)
+
+        assert result.should_retire is True
+        assert "stored rollout unavailable" in result.error
+        assert not any(method == "thread/start" for method, _ in client.requests)
+        assert not any(method == "turn/start" for method, _ in client.requests)
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
@@ -208,6 +499,166 @@ class TestRunTurn:
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
+
+    def test_interrupt_waits_for_matching_terminal_before_close(self):
+        client = FakeClient()
+        events = []
+        session = make_session(client)
+        original_close = client.close
+        original_take_notification = client.take_notification
+
+        def close():
+            events.append("closed")
+            original_close()
+
+        def request_handler(method: str, params: dict) -> dict:
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "turn/start":
+                session.request_interrupt()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/interrupt":
+                events.append("interrupt_rpc_response")
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="thread-fake-001",
+                    turn={
+                        "id": "turn-fake-001",
+                        "status": "interrupted",
+                        "error": None,
+                    },
+                )
+                client.queue_notification(
+                    "item/completed",
+                    threadId="thread-fake-001",
+                    turnId="turn-next-001",
+                    item={
+                        "type": "agentMessage",
+                        "id": "next-message",
+                        "text": "must remain queued",
+                    },
+                )
+                return {}
+            return {}
+
+        def take_notification(timeout: float = 0.0):
+            note = original_take_notification(timeout)
+            if note is not None and note.get("method") == "turn/completed":
+                events.append("terminal_seen")
+            return note
+
+        client.close = close
+        client._request_handler = request_handler
+        client.take_notification = take_notification
+
+        result = session.run_turn(
+            "stop",
+            turn_timeout=2.0,
+            interrupt_grace_timeout=0.2,
+        )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert events == [
+            "interrupt_rpc_response",
+            "terminal_seen",
+            "closed",
+        ]
+        assert client._notifications[0]["params"]["turnId"] == "turn-next-001"
+
+    def test_interrupt_drops_stale_approval_after_terminal(self):
+        client = FakeClient()
+        approval_calls = []
+        session = make_session(
+            client,
+            approval_callback=lambda *args, **kwargs: approval_calls.append(
+                (args, kwargs)
+            )
+            or "once",
+        )
+
+        def request_handler(method: str, params: dict) -> dict:
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "turn/start":
+                session.request_interrupt()
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/interrupt":
+                client.queue_server_request(
+                    "item/commandExecution/requestApproval",
+                    request_id="stale-approval",
+                    threadId="thread-fake-001",
+                    turnId="turn-fake-001",
+                    command="echo stale",
+                    cwd="/tmp",
+                )
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="thread-fake-001",
+                    turn={
+                        "id": "turn-fake-001",
+                        "status": "interrupted",
+                        "error": None,
+                    },
+                )
+                return {}
+            return {}
+
+        client._request_handler = request_handler
+
+        result = session.run_turn(
+            "stop",
+            turn_timeout=2.0,
+            interrupt_grace_timeout=0.2,
+        )
+
+        assert result.interrupted is True
+        assert client._closed is True
+        assert approval_calls == []
+        assert client.responses == []
+
+    def test_unscoped_turn_items_terminal_and_usage_are_ignored(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "stale", "text": "stale"},
+        )
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            tokenUsage={"last": {"totalTokens": 999}},
+        )
+        client.queue_notification(
+            "turn/completed",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            item={"type": "agentMessage", "id": "m1", "text": "current"},
+        )
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            tokenUsage={"last": {"totalTokens": 12}},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.final_text == "current"
+        assert result.token_usage_last == {"totalTokens": 12}
 
 
 
@@ -392,6 +843,214 @@ class TestRunTurn:
 
 
 class TestCompactThread:
+    def test_compaction_started_is_not_a_completed_boundary(self):
+        result = TurnResult()
+        started = {
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-fake-001",
+                "turnId": "compact-turn-1",
+                "item": {
+                    "type": "contextCompaction",
+                    "id": "compact-item-1",
+                },
+            },
+        }
+
+        _apply_compaction_notification(result, started)
+
+        assert result.compacted is False
+
+        completed = {
+            **started,
+            "method": "item/completed",
+        }
+        _apply_compaction_notification(result, completed)
+        assert result.compacted is True
+
+    def test_compact_thread_honors_interrupt_before_rpc(self):
+        client = FakeClient()
+        session = make_session(client)
+        session.request_interrupt()
+
+        result = session.compact_thread(turn_timeout=2.0)
+
+        assert result.interrupted is True
+        assert result.should_retire is False
+        assert not any(
+            method == "thread/compact/start"
+            for method, _params in client.requests
+        )
+
+    def test_compact_thread_lease_lost_during_startup_retires(self):
+        client = FakeClient()
+        refresh_failed = threading.Event()
+
+        def refresh():
+            refresh_failed.set()
+            return False
+
+        def request_handler(method: str, params: dict) -> dict:
+            if method == "thread/start":
+                assert refresh_failed.wait(timeout=1.0)
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            return {}
+
+        client._request_handler = request_handler
+        released = []
+        session = make_session(
+            client,
+            lease_acquire=lambda: True,
+            lease_refresh=refresh,
+            lease_release=lambda: released.append(True) or True,
+            lease_refresh_interval=0.01,
+        )
+
+        result = session.compact_thread(turn_timeout=0.1)
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "lease was lost" in result.error
+        assert client._closed is True
+        assert released == [True]
+        assert not any(
+            method == "thread/compact/start"
+            for method, _params in client.requests
+        )
+
+    def test_compact_thread_interrupt_before_turn_id_drains_terminal(self):
+        client = FakeClient()
+        session = make_session(client)
+
+        def request_handler(method: str, params: dict) -> dict:
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"},
+                }
+            if method == "thread/compact/start":
+                session.request_interrupt()
+                client.queue_notification(
+                    "turn/started",
+                    threadId="thread-fake-001",
+                    turn={"id": "compact-turn-1"},
+                )
+                return {}
+            if method == "turn/interrupt":
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="thread-fake-001",
+                    turn={
+                        "id": "compact-turn-1",
+                        "status": "interrupted",
+                        "error": None,
+                    },
+                )
+                return {}
+            return {}
+
+        client._request_handler = request_handler
+
+        result = session.compact_thread(
+            turn_timeout=2.0,
+            interrupt_grace_timeout=0.2,
+        )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error == "compact turn interrupted"
+        assert client._closed is True
+        assert (
+            "turn/interrupt",
+            {
+                "threadId": "thread-fake-001",
+                "turnId": "compact-turn-1",
+            },
+        ) in client.requests
+
+    def test_compact_thread_interrupt_after_turn_id_retires_client(self):
+        client = FakeClient()
+        session = make_session(client)
+        client.queue_notification(
+            "turn/started",
+            threadId="thread-fake-001",
+            turn={"id": "compact-turn-1"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "compact-turn-1",
+                "status": "interrupted",
+                "error": None,
+            },
+        )
+
+        original_take_notification = client.take_notification
+
+        def take_notification(timeout: float = 0.0):
+            note = original_take_notification(timeout)
+            if note is not None and note.get("method") == "turn/started":
+                session.request_interrupt()
+            return note
+
+        client.take_notification = take_notification
+
+        result = session.compact_thread(
+            turn_timeout=2.0,
+            interrupt_grace_timeout=0.2,
+        )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert client._closed is True
+        assert (
+            "turn/interrupt",
+            {
+                "threadId": "thread-fake-001",
+                "turnId": "compact-turn-1",
+            },
+        ) in client.requests
+
+    def test_compact_thread_rejects_unscoped_boundary_and_terminal(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/started",
+            threadId="thread-fake-001",
+            turn={"id": "compact-turn-1"},
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "contextCompaction", "id": "stale-boundary"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            turn={"id": "compact-turn-1", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="thread-fake-001",
+            turnId="compact-turn-1",
+            item={"type": "contextCompaction", "id": "current-boundary"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "compact-turn-1",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        result = make_session(client).compact_thread(turn_timeout=2.0)
+
+        assert result.compacted is True
+        assert result.error is None
+
     def test_compact_thread_sends_rpc_and_waits_for_completion(self):
         client = FakeClient()
         client.queue_notification(
@@ -437,6 +1096,32 @@ class TestCompactThread:
         assert r.final_text == "compacted"
         assert r.token_usage_last["totalTokens"] == 12
         assert r.model_context_window == 200000
+
+    def test_compact_thread_ignores_stale_unscoped_deprecated_boundary(self):
+        client = FakeClient()
+        client.queue_notification(
+            "thread/compacted",
+            threadId="thread-fake-001",
+        )
+        client.queue_notification(
+            "turn/started",
+            threadId="thread-fake-001",
+            turn={"id": "compact-turn-current"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "compact-turn-current",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        result = make_session(client).compact_thread(turn_timeout=2.0)
+
+        assert result.turn_id == "compact-turn-current"
+        assert result.compacted is False
 
     def test_compact_thread_ignores_foreign_child_completion(self):
         client = FakeClient()
@@ -511,15 +1196,27 @@ class TestServerRequestRouting:
     def test_unknown_server_request_replied_with_error(self):
         client = FakeClient()
         client.queue_server_request("totally/unknown", request_id="req-3")
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
+        original_respond_error = client.respond_error
+
+        def respond_error(request_id, code, message, data=None):
+            original_respond_error(request_id, code, message, data)
+            client.queue_notification(
+                "turn/completed",
+                threadId="t",
+                turn={"id": "tu1", "status": "completed", "error": None},
+            )
+
+        client.respond_error = respond_error
         s = make_session(client)
-        s.run_turn("hi", turn_timeout=1.0)
+        result = s.run_turn("hi", turn_timeout=0.05)
         assert any(
             rid == "req-3" and code == -32601
             for (rid, code, _msg) in client.error_responses
+        )
+        assert result.error is None
+        assert result.interrupted is False
+        assert not any(
+            method == "turn/interrupt" for method, _params in client.requests
         )
 
     def test_on_event_fires_during_approval_drain(self):
@@ -538,6 +1235,8 @@ class TestServerRequestRouting:
         # request — the session sees both during a single drain loop.
         client.queue_notification(
             "item/started",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
             item={
                 "type": "commandExecution",
                 "id": "exec-1",
@@ -586,10 +1285,7 @@ class TestServerRequestRouting:
         client = FakeClient()
         client.queue_server_request("item/commandExecution/requestApproval", request_id="r1",
                                     command="ls", cwd="/")
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
+        queue_completion_after_response(client)
         # No callback, but routing says auto-approve. Should approve.
         s = make_session(client, request_routing=_ServerRequestRouting(
             auto_approve_exec=True))
@@ -612,10 +1308,7 @@ class TestApprovalPromptEnrichment:
             "item/commandExecution/requestApproval", request_id="r1",
             command="ls",  # no cwd
         )
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
+        queue_completion_after_response(client)
         captured = {}
         def cb(command, description, *, allow_permanent=True):
             captured["description"] = description
@@ -646,10 +1339,7 @@ class TestApprovalPromptEnrichment:
             startedAtMs=1234567890,
             reason="add and update files",
         )
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
+        queue_completion_after_response(client)
         captured = {}
         def cb(command, description, *, allow_permanent=True):
             captured["command"] = command
@@ -674,10 +1364,7 @@ class TestApprovalPromptEnrichment:
             startedAtMs=1234567890,
             reason="apply some changes",
         )
-        client.queue_notification(
-            "turn/completed", threadId="t",
-            turn={"id": "tu1", "status": "completed", "error": None},
-        )
+        queue_completion_after_response(client)
         captured = {}
         def cb(command, description, *, allow_permanent=True):
             captured["command"] = command
@@ -746,16 +1433,21 @@ class TestSessionRetirement:
         )
         s = make_session(client)
         monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+
+        def monotonic_clock():
+            return next(monotonic_values, 1000.2)
+
         with patch.object(
             session_mod.time,
             "monotonic",
-            side_effect=lambda: next(monotonic_values),
+            side_effect=monotonic_clock,
         ):
             r = s.run_turn(
                 "tool then silence",
                 turn_timeout=5.0,
                 notification_poll_timeout=0.0,
                 post_tool_quiet_timeout=0.15,
+                interrupt_grace_timeout=0.0,
             )
         assert r.interrupted is True
         assert r.should_retire is True
@@ -895,4 +1587,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

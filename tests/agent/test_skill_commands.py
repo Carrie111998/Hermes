@@ -37,7 +37,7 @@ description: Description for {name}.
 
 {body}
 """
-    (skill_dir / "SKILL.md").write_text(content)
+    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
     return skill_dir
 
 
@@ -963,7 +963,9 @@ class TestBuildSkillInvocationMessage:
             skill_dir = _make_skill(tmp_path, "test-skill")
             references = skill_dir / "references"
             references.mkdir()
-            (references / "api.md").write_text("reference")
+            (references / "api.md").write_text(
+                "reference", encoding="utf-8"
+            )
             scan_skill_commands()
             msg = build_skill_invocation_message("/test-skill", "do stuff")
 
@@ -988,7 +990,9 @@ class TestSkillDirectoryHeader:
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             skill_dir = _make_skill(tmp_path, "scripted-skill")
             (skill_dir / "scripts").mkdir()
-            (skill_dir / "scripts" / "run.js").write_text("console.log('hi')")
+            (skill_dir / "scripts" / "run.js").write_text(
+                "console.log('hi')", encoding="utf-8"
+            )
             scan_skill_commands()
             msg = build_skill_invocation_message("/scripted-skill")
 
@@ -1007,7 +1011,9 @@ class TestSkillDirectoryHeader:
             assets = skill_dir / "assets"
             assets.mkdir()
             for index in range(limit + 5):
-                (assets / f"{index:03d}.txt").write_text("asset")
+                (assets / f"{index:03d}.txt").write_text(
+                    "asset", encoding="utf-8"
+                )
             scan_skill_commands()
             msg = build_skill_invocation_message("/asset-heavy")
 
@@ -1308,4 +1314,3 @@ class TestStackedSkillCommands:
         assert loaded == ["skill-a"]
         assert missing == ["gone"]
         assert "Skills missing (skipped): gone" in msg
-

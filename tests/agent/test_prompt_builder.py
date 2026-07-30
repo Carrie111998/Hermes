@@ -223,7 +223,9 @@ class TestParseSkillFile:
     def test_long_description_truncated(self, tmp_path):
         skill_file = tmp_path / "SKILL.md"
         long_desc = "A" * 100
-        skill_file.write_text(f"---\ndescription: {long_desc}\n---\n")
+        skill_file.write_text(
+            f"---\ndescription: {long_desc}\n---\n", encoding="utf-8"
+        )
         _, _, desc = _parse_skill_file(skill_file)
         assert len(desc) <= 60
         assert desc.endswith("...")
@@ -231,7 +233,9 @@ class TestParseSkillFile:
 
     def test_logs_parse_failures_and_returns_defaults(self, tmp_path, monkeypatch, caplog):
         skill_file = tmp_path / "SKILL.md"
-        skill_file.write_text("---\nname: broken\n---\n")
+        skill_file.write_text(
+            "---\nname: broken\n---\n", encoding="utf-8"
+        )
 
         def boom(*args, **kwargs):
             raise OSError("read exploded")
@@ -383,7 +387,10 @@ class TestBuildSkillsSystemPrompt:
 
         bad_file = tmp_path / "skills" / "coding" / "bad" / "SKILL.md"
         bad_file.parent.mkdir()
-        bad_file.write_text("---\nname: bad\ndescription: unreadable\n---\n")
+        bad_file.write_text(
+            "---\nname: bad\ndescription: unreadable\n---\n",
+            encoding="utf-8",
+        )
         original_reader = prompt_builder.read_strict_skill_index_file
 
         def fail_only_bad_file(path, *args, **kwargs):
@@ -462,7 +469,10 @@ class TestBuildSkillsSystemPrompt:
         external_skill = external_root / "external" / "SKILL.md"
         local_skill.parent.mkdir(parents=True)
         external_skill.parent.mkdir(parents=True)
-        local_skill.write_text("---\nname: local\ndescription: Local skill\n---\n")
+        local_skill.write_text(
+            "---\nname: local\ndescription: Local skill\n---\n",
+            encoding="utf-8",
+        )
         external_skill.write_text(
             "---\nname: external\ndescription: External skill\n---\n"
         )
@@ -529,7 +539,10 @@ class TestBuildSkillsSystemPrompt:
         external_skill = external_root / "external" / "SKILL.md"
         local_skill.parent.mkdir(parents=True)
         external_skill.parent.mkdir(parents=True)
-        local_skill.write_text("---\nname: local\ndescription: Local skill\n---\n")
+        local_skill.write_text(
+            "---\nname: local\ndescription: Local skill\n---\n",
+            encoding="utf-8",
+        )
         external_skill.write_text(
             "---\nname: external\ndescription: External skill\n---\n"
         )
@@ -568,7 +581,10 @@ class TestBuildSkillsSystemPrompt:
         external_skill = external_root / "external" / "SKILL.md"
         local_skill.parent.mkdir(parents=True)
         external_skill.parent.mkdir(parents=True)
-        local_skill.write_text("---\nname: local\ndescription: Local skill\n---\n")
+        local_skill.write_text(
+            "---\nname: local\ndescription: Local skill\n---\n",
+            encoding="utf-8",
+        )
         external_skill.write_text(
             "---\nname: external\ndescription: External skill\n---\n"
         )
@@ -642,7 +658,9 @@ class TestBuildSkillsSystemPrompt:
         for subdir in ["search", "search"]:
             d = cat_dir / subdir
             d.mkdir(parents=True, exist_ok=True)
-            (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
+            (d / "SKILL.md").write_text(
+                "---\ndescription: Search stuff\n---\n", encoding="utf-8"
+            )
         result = build_skills_system_prompt()
         # "search" should appear only once per category
         assert result.count("- search") == 1
@@ -835,7 +853,9 @@ class TestBuildContextFilesPrompt:
         assert "Hermes Agent" in result
 
     def test_loads_agents_md(self, tmp_path):
-        (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
+        (tmp_path / "AGENTS.md").write_text(
+            "Use Ruff for linting.", encoding="utf-8"
+        )
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Ruff for linting" in result
         assert "Project Context" in result
@@ -848,7 +868,9 @@ class TestBuildContextFilesPrompt:
         import agent.runtime_cwd as rt
 
         monkeypatch.setattr(rt, "_PACKAGE_ROOT", tmp_path.resolve())
-        (tmp_path / "AGENTS.md").write_text("Never give up on the right solution.")
+        (tmp_path / "AGENTS.md").write_text(
+            "Never give up on the right solution.", encoding="utf-8"
+        )
         monkeypatch.chdir(tmp_path)
         result = build_context_files_prompt(cwd=None, skip_soul=True)
         assert "Never give up" not in result
@@ -883,7 +905,9 @@ class TestBuildContextFilesPrompt:
 
 
     def test_loads_claude_md(self, tmp_path):
-        (tmp_path / "CLAUDE.md").write_text("Use type hints everywhere.")
+        (tmp_path / "CLAUDE.md").write_text(
+            "Use type hints everywhere.", encoding="utf-8"
+        )
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "type hints" in result
         assert "CLAUDE.md" in result
@@ -897,8 +921,8 @@ class TestBuildContextFilesPrompt:
     def test_claude_md_uppercase_takes_priority(self, tmp_path):
         uppercase = tmp_path / "CLAUDE.md"
         lowercase = tmp_path / "claude.md"
-        uppercase.write_text("From uppercase.")
-        lowercase.write_text("From lowercase.")
+        uppercase.write_text("From uppercase.", encoding="utf-8")
+        lowercase.write_text("From lowercase.", encoding="utf-8")
         if uppercase.samefile(lowercase):
             pytest.skip("filesystem is case-insensitive")
         result = build_context_files_prompt(cwd=str(tmp_path))
@@ -916,14 +940,16 @@ class TestBuildContextFilesPrompt:
 
 class TestFindHermesMd:
     def test_finds_in_cwd(self, tmp_path):
-        (tmp_path / ".hermes.md").write_text("rules")
+        (tmp_path / ".hermes.md").write_text("rules", encoding="utf-8")
         assert _find_hermes_md(tmp_path) == tmp_path / ".hermes.md"
 
 
 
     def test_walks_to_git_root(self, tmp_path):
         (tmp_path / ".git").mkdir()
-        (tmp_path / ".hermes.md").write_text("root rules")
+        (tmp_path / ".hermes.md").write_text(
+            "root rules", encoding="utf-8"
+        )
         sub = tmp_path / "a" / "b"
         sub.mkdir(parents=True)
         assert _find_hermes_md(sub) == tmp_path / ".hermes.md"
@@ -941,7 +967,9 @@ class TestFindHermesMd:
 
         parent = tmp_path / "parent"
         parent.mkdir()
-        (parent / ".hermes.md").write_text("planted by another user")
+        (parent / ".hermes.md").write_text(
+            "planted by another user", encoding="utf-8"
+        )
         cwd = parent / "work"
         cwd.mkdir()
         # No git root anywhere up the tree.

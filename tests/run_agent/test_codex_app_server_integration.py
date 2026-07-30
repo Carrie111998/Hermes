@@ -12,6 +12,8 @@ Verifies that:
 
 from __future__ import annotations
 
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +21,7 @@ import pytest
 
 import run_agent
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+from hermes_state import SessionDB
 
 
 @pytest.fixture
@@ -54,7 +57,11 @@ def _make_codex_agent(**kwargs):
     """Construct an AIAgent in codex_app_server mode without contacting any
     real provider. We pass api_mode explicitly so the constructor takes the
     fast path for direct credentials."""
-    return run_agent.AIAgent(
+    owned_session_db = None
+    if "session_db" not in kwargs:
+        owned_session_db = SessionDB(Path(":memory:"))
+        kwargs["session_db"] = owned_session_db
+    agent = run_agent.AIAgent(
         api_key="stub",
         base_url="https://stub.invalid",
         provider="openai",
@@ -64,6 +71,9 @@ def _make_codex_agent(**kwargs):
         skip_memory=True,
         **kwargs,
     )
+    # Keep the in-memory database alive for the agent's whole test lifetime.
+    agent._test_owned_session_db = owned_session_db
+    return agent
 
 
 class TestApiModeAccepted:
@@ -85,6 +95,241 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
+
+    @pytest.mark.parametrize(
+        ("interrupted", "error"),
+        [
+            (False, "turn failed after start"),
+            (True, None),
+        ],
+    )
+    def test_started_turn_failure_still_counts_one_api_call(
+        self, monkeypatch, interrupted, error
+    ):
+        def failed_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                error=error,
+                interrupted=interrupted,
+                turn_id="turn-started-1",
+                thread_id="thread-started-1",
+                should_retire=True,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", failed_turn)
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("count this request")
+
+        assert result["completed"] is False
+        assert result["api_calls"] == 1
+        assert agent.session_api_calls == 1
+
+    def test_codex_thread_binding_resumes_after_agent_recreation(
+        self, monkeypatch, tmp_path
+    ):
+        instances = []
+
+        class RecordingSession:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.thread_id = (
+                    kwargs.get("resume_thread_id") or "thread-persisted-1"
+                )
+                self.closed = False
+                self.lease_acquired = False
+                instances.append(self)
+
+            def run_turn(self, user_input, **_kwargs):
+                acquire = self.kwargs.get("lease_acquire")
+                if acquire is not None and not self.lease_acquired:
+                    assert acquire()
+                    self.lease_acquired = True
+                callback = self.kwargs.get("on_thread_ready")
+                if callback is not None:
+                    callback(self.thread_id)
+                return TurnResult(
+                    final_text=f"done:{user_input}",
+                    projected_messages=[
+                        {"role": "assistant", "content": f"done:{user_input}"}
+                    ],
+                    turn_id=f"turn-{len(instances)}",
+                    thread_id=self.thread_id,
+                )
+
+            def close(self):
+                self.closed = True
+                if self.lease_acquired:
+                    release = self.kwargs.get("lease_release")
+                    assert release is not None and release()
+                    self.lease_acquired = False
+
+        monkeypatch.setattr(
+            "agent.transports.codex_app_server_session.CodexAppServerSession",
+            RecordingSession,
+        )
+
+        db = SessionDB(tmp_path / "state.db")
+        sid = "hermes-session-1"
+        db.create_session(session_id=sid, source="telegram", model="codex")
+        try:
+            first = _make_codex_agent(session_db=db, session_id=sid)
+            with patch.object(first, "_spawn_background_review", return_value=None):
+                first_result = first.run_conversation("first")
+            first.release_clients()
+
+            assert first_result["completed"] is True
+            assert db.get_codex_thread_id(sid) == "thread-persisted-1"
+            assert instances[0].kwargs["resume_thread_id"] is None
+            assert instances[0].closed is True
+
+            second = _make_codex_agent(session_db=db, session_id=sid)
+            with patch.object(second, "_spawn_background_review", return_value=None):
+                second_result = second.run_conversation("second")
+            second.release_clients()
+
+            assert second_result["completed"] is True
+            assert instances[1].kwargs["resume_thread_id"] == "thread-persisted-1"
+            assert db.get_codex_thread_id(sid) == "thread-persisted-1"
+        finally:
+            db.close()
+
+    @pytest.mark.parametrize("failure_mode", ["binding_read", "missing_row"])
+    def test_codex_thread_start_fails_closed_when_binding_state_is_unavailable(
+        self, monkeypatch, tmp_path, failure_mode
+    ):
+        db = SessionDB(tmp_path / f"{failure_mode}.db")
+        sid = f"hermes-{failure_mode}"
+        if failure_mode == "binding_read":
+            db.create_session(session_id=sid, source="telegram", model="codex")
+            monkeypatch.setattr(
+                db,
+                "get_codex_thread_id",
+                MagicMock(side_effect=RuntimeError("binding read failed")),
+            )
+
+        session_factory = MagicMock(
+            side_effect=AssertionError(
+                "CodexAppServerSession must not be constructed"
+            )
+        )
+        monkeypatch.setattr(
+            "agent.transports.codex_app_server_session.CodexAppServerSession",
+            session_factory,
+        )
+
+        agent = _make_codex_agent(session_db=db, session_id=sid)
+        # Exercise the exact cold-rebuild state: the AIAgent believes its
+        # persistence row is already owned by the surrounding session store.
+        # A missing row must be detected explicitly rather than interpreted as
+        # an unbound session that is safe to attach to a fresh Codex thread.
+        agent._session_db_created = True
+        try:
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                result = agent.run_conversation("must not start")
+
+            session_factory.assert_not_called()
+            assert getattr(agent, "_codex_session", None) is None
+            assert result["completed"] is False
+            assert result["partial"] is True
+            assert result["api_calls"] == 0
+            assert "refused to start a new thread" in result["error"]
+        finally:
+            agent.release_clients()
+            db.close()
+
+    def test_codex_thread_start_fails_closed_when_session_creation_fails(
+        self, monkeypatch, tmp_path
+    ):
+        db = SessionDB(tmp_path / "create_failure.db")
+        sid = "hermes-create-failure"
+        session_factory = MagicMock(
+            side_effect=AssertionError(
+                "CodexAppServerSession must not be constructed"
+            )
+        )
+        monkeypatch.setattr(
+            "agent.transports.codex_app_server_session.CodexAppServerSession",
+            session_factory,
+        )
+
+        agent = _make_codex_agent(session_db=db, session_id=sid)
+        monkeypatch.setattr(agent, "_ensure_db_session", MagicMock())
+        try:
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                result = agent.run_conversation("must not start")
+
+            agent._ensure_db_session.assert_called()
+            session_factory.assert_not_called()
+            assert getattr(agent, "_codex_session", None) is None
+            assert result["completed"] is False
+            assert result["partial"] is True
+            assert result["api_calls"] == 0
+            assert "refused to start a new thread" in result["error"]
+        finally:
+            agent.release_clients()
+            db.close()
+
+    def test_codex_turn_lease_contention_runs_no_app_server_rpc(
+        self, monkeypatch, tmp_path
+    ):
+        db = SessionDB(tmp_path / "lease_contention.db")
+        sid = "hermes-lease-contention"
+        holder = str(uuid.uuid4())
+        db.create_session(session_id=sid, source="telegram", model="codex")
+        assert db.try_acquire_codex_turn_lease(sid, holder)
+
+        client_factory = MagicMock(
+            side_effect=AssertionError("Codex client must not be constructed")
+        )
+        monkeypatch.setattr(
+            "agent.transports.codex_app_server_session.CodexAppServerClient",
+            client_factory,
+        )
+
+        agent = _make_codex_agent(session_db=db, session_id=sid)
+        try:
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                result = agent.run_conversation("must serialize")
+
+            assert result["completed"] is False
+            assert result["partial"] is True
+            assert result["api_calls"] == 0
+            assert "another Hermes/Codex client" in result["error"]
+            client_factory.assert_not_called()
+        finally:
+            agent.release_clients()
+            assert db.release_codex_turn_lease(sid, holder)
+            db.close()
+
+    @pytest.mark.parametrize("missing", ["session_db", "session_id"])
+    def test_codex_thread_start_fails_closed_without_durable_session_identity(
+        self, monkeypatch, missing
+    ):
+        session_factory = MagicMock(
+            side_effect=AssertionError(
+                "CodexAppServerSession must not be constructed"
+            )
+        )
+        monkeypatch.setattr(
+            "agent.transports.codex_app_server_session.CodexAppServerSession",
+            session_factory,
+        )
+
+        agent = _make_codex_agent()
+        if missing == "session_db":
+            agent._session_db = None
+        else:
+            agent.session_id = None
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("must not start")
+
+        session_factory.assert_not_called()
+        assert getattr(agent, "_codex_session", None) is None
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["api_calls"] == 0
+        assert "refused to start a new thread" in result["error"]
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
@@ -747,6 +992,28 @@ class TestSessionRetirementOnRunAgent:
         assert agent._codex_session is None
         assert result["completed"] is False
         assert "codex segfaulted" in result["error"]
+
+    def test_release_clients_closes_codex_session_idempotently(self):
+        agent = _make_codex_agent()
+        codex_session = MagicMock()
+        agent._codex_session = codex_session
+
+        agent.release_clients()
+        agent.release_clients()
+
+        codex_session.close.assert_called_once_with()
+        assert agent._codex_session is None
+
+    def test_close_closes_codex_session_idempotently(self):
+        agent = _make_codex_agent()
+        codex_session = MagicMock()
+        agent._codex_session = codex_session
+
+        agent.close()
+        agent.close()
+
+        codex_session.close.assert_called_once_with()
+        assert agent._codex_session is None
 
 
 class TestCodexToolProgressBridge:

@@ -3890,6 +3890,22 @@ class AIAgent:
         except Exception:
             pass
 
+    def _close_codex_app_server_session(self) -> None:
+        """Close and detach the cached Codex app-server subprocess.
+
+        The canonical thread id is persisted in SessionDB, so a rebuilt agent
+        can resume the rollout. Detach before closing to make repeated or
+        re-entrant cleanup idempotent even if the transport close path raises.
+        """
+        codex_session = getattr(self, "_codex_session", None)
+        self._codex_session = None
+        if codex_session is None:
+            return
+        try:
+            codex_session.close()
+        except Exception:
+            pass
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -3906,6 +3922,8 @@ class AIAgent:
         We DO close:
           - OpenAI/httpx client pool (big chunk of held memory + sockets;
             the rebuilt agent gets a fresh client anyway)
+          - Codex app-server subprocess (its persisted thread is resumed by
+            the rebuilt agent)
           - Active child subagents (per-turn artefacts; safe to drop)
 
         Safe to call multiple times.  Distinct from close() — which is the
@@ -3950,6 +3968,12 @@ class AIAgent:
         except Exception:
             pass
 
+        # A soft cache eviction discards this AIAgent instance. Keeping its
+        # app-server child alive would leak a subprocess and two competing
+        # owners could later drive the same Hermes session. The durable
+        # codex_thread_id binding lets the replacement resume safely.
+        self._close_codex_app_server_session()
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 
@@ -3965,6 +3989,10 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
+
+        # 0. Retire the per-agent Codex app-server subprocess. Its thread
+        # binding remains durable for explicit session resume.
+        self._close_codex_app_server_session()
 
         # 1. Kill background processes for this task
         try:

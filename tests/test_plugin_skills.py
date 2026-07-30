@@ -69,7 +69,9 @@ class TestPluginSkillRegistry:
     def test_register_and_find(self, pm, tmp_path):
         skill_md = tmp_path / "foo" / "SKILL.md"
         skill_md.parent.mkdir()
-        skill_md.write_text("---\nname: foo\n---\nBody.\n")
+        skill_md.write_text(
+            "---\nname: foo\n---\nBody.\n", encoding="utf-8"
+        )
 
         pm._plugin_skills["myplugin:foo"] = {
             "path": skill_md,
@@ -85,7 +87,9 @@ class TestPluginSkillRegistry:
         for name in ["bar", "foo", "baz"]:
             md = tmp_path / name / "SKILL.md"
             md.parent.mkdir()
-            md.write_text(f"---\nname: {name}\n---\n")
+            md.write_text(
+                f"---\nname: {name}\n---\n", encoding="utf-8"
+            )
             pm._plugin_skills[f"myplugin:{name}"] = {
                 "path": md, "plugin": "myplugin", "bare_name": name, "description": "",
             }
@@ -95,7 +99,7 @@ class TestPluginSkillRegistry:
 
     def test_remove_plugin_skill(self, pm, tmp_path):
         md = tmp_path / "SKILL.md"
-        md.write_text("---\nname: x\n---\n")
+        md.write_text("---\nname: x\n---\n", encoding="utf-8")
         pm._plugin_skills["p:x"] = {"path": md, "plugin": "p", "bare_name": "x", "description": ""}
 
         pm.remove_plugin_skill("p:x")
@@ -124,14 +128,16 @@ class TestPluginContextRegisterSkill:
     def test_happy_path(self, ctx, tmp_path):
         skill_md = tmp_path / "skills" / "my-skill" / "SKILL.md"
         skill_md.parent.mkdir(parents=True)
-        skill_md.write_text("---\nname: my-skill\n---\nContent.\n")
+        skill_md.write_text(
+            "---\nname: my-skill\n---\nContent.\n", encoding="utf-8"
+        )
 
         ctx.register_skill("my-skill", skill_md, "A test skill")
         assert ctx._manager.find_plugin_skill("testplugin:my-skill") == skill_md
 
     def test_rejects_colon_in_name(self, ctx, tmp_path):
         md = tmp_path / "SKILL.md"
-        md.write_text("test")
+        md.write_text("test", encoding="utf-8")
         with pytest.raises(ValueError, match="must not contain ':'"):
             ctx.register_skill("ns:foo", md)
 
@@ -163,7 +169,11 @@ class TestSkillViewQualifiedName:
         skill_dir = tmp_path / "plugins" / plugin / "skills" / name
         skill_dir.mkdir(parents=True, exist_ok=True)
         md = skill_dir / "SKILL.md"
-        md.write_text(content or f"---\nname: {name}\ndescription: {name} desc\n---\n\n{name} body.\n")
+        md.write_text(
+            content
+            or f"---\nname: {name}\ndescription: {name} desc\n---\n\n{name} body.\n",
+            encoding="utf-8",
+        )
         self.pm._plugin_skills[f"{plugin}:{name}"] = {
             "path": md, "plugin": plugin, "bare_name": name, "description": "",
         }
@@ -232,7 +242,7 @@ class TestSkillViewPluginGuards:
         d = tmp_path / "plugins" / plugin / "skills" / name
         d.mkdir(parents=True, exist_ok=True)
         md = d / "SKILL.md"
-        md.write_text(content)
+        md.write_text(content, encoding="utf-8")
         self.pm._plugin_skills[f"{plugin}:{name}"] = {
             "path": md, "plugin": plugin, "bare_name": name, "description": "",
         }
@@ -408,7 +418,10 @@ class TestBundleContextBanner:
             d = tmp_path / "plugins" / "myplugin" / "skills" / name
             d.mkdir(parents=True, exist_ok=True)
             md = d / "SKILL.md"
-            md.write_text(f"---\nname: {name}\ndescription: {name} desc\n---\n\n{name} body.\n")
+            md.write_text(
+                f"---\nname: {name}\ndescription: {name} desc\n---\n\n{name} body.\n",
+                encoding="utf-8",
+            )
             self.pm._plugin_skills[f"myplugin:{name}"] = {
                 "path": md, "plugin": "myplugin", "bare_name": name, "description": "",
             }

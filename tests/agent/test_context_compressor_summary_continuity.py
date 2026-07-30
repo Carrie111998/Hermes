@@ -184,10 +184,12 @@ def test_resume_handoff_after_default_protected_head_decays_initial_turns():
     assert "original answer before first compaction" in prompt
     assert "original follow-up before first compaction" in prompt
     assert f"[ASSISTANT]: {SUMMARY_PREFIX}" not in prompt
-    # Grounding (761a0b124e) may prepend a deterministic task-snapshot
-    # section — pin the contract, not the exact stored string.
+    # Grounding may prepend a deterministic task snapshot. Pin continuity
+    # rather than the exact stored string.
     stored_summary = compressor._previous_summary or ""
-    assert stored_summary.endswith("fresh summary")
+    assert stored_summary.count("fresh summary") == 1
+    assert "## Failed Attempts" in stored_summary
+    assert "## Next Safe Step" in stored_summary
     assert old_summary not in stored_summary
     assert all(
         "original task before first compaction" not in str(msg.get("content", ""))

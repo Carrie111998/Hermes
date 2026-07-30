@@ -91,6 +91,18 @@ class TurnResult:
 # normal completion path fires. Mirrors openclaw beta.8 fix.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
+# Since Hermes requires codex >= 0.125, lifecycle and accounting
+# notifications always carry both threadId and turnId.  Treat these events as
+# security boundaries: an unscoped/stale notification must never finish the
+# active turn, update its usage, or claim a compaction succeeded.
+_EXACT_SCOPE_METHODS = {
+    "turn/started",
+    "turn/completed",
+    "turn/diff/updated",
+    "thread/tokenUsage/updated",
+    "thread/compacted",
+}
+
 
 def _notification_scope_ids(
     note: dict,
@@ -140,25 +152,48 @@ def _notification_belongs_to_turn(
     Codex app-server can carry parent and hosted subagent threads over one
     JSON-RPC connection.  An explicitly foreign child or
     stale-turn event must not mutate the active parent's transcript or mark
-    its turn complete.  Unscoped notifications remain accepted for protocol
-    compatibility.
+    its turn complete.  Lifecycle/accounting/compaction notifications use the
+    strict codex >= 0.125 contract and must carry exact thread and turn ids.
+    Non-critical display events retain compatibility with older producers.
     """
     if not isinstance(note, dict):
         return False
 
     observed_thread_id, observed_turn_id = _notification_scope_ids(note)
+    method = str(note.get("method") or "")
+    exact_thread_and_turn_required = (
+        method in _EXACT_SCOPE_METHODS
+        or method.startswith("turn/")
+        or method.startswith("item/")
+    )
 
+    if exact_thread_and_turn_required and (
+        observed_thread_id is None or observed_turn_id is None
+    ):
+        return False
     if (
         thread_id is not None
-        and observed_thread_id is not None
-        and str(observed_thread_id) != str(thread_id)
+        and (
+            (exact_thread_and_turn_required and observed_thread_id is None)
+            or (
+                observed_thread_id is not None
+                and str(observed_thread_id) != str(thread_id)
+            )
+        )
     ):
         return False
 
     if (
         turn_id is not None
-        and observed_turn_id is not None
-        and str(observed_turn_id) != str(turn_id)
+        and (
+            (
+                exact_thread_and_turn_required and observed_turn_id is None
+            )
+            or (
+                observed_turn_id is not None
+                and str(observed_turn_id) != str(turn_id)
+            )
+        )
     ):
         return False
 
@@ -280,6 +315,12 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        resume_thread_id: Optional[str] = None,
+        on_thread_ready: Optional[Callable[[str], None]] = None,
+        lease_acquire: Optional[Callable[[], bool]] = None,
+        lease_refresh: Optional[Callable[[], bool]] = None,
+        lease_release: Optional[Callable[[], bool]] = None,
+        lease_refresh_interval: float = 60.0,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
@@ -294,6 +335,19 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._resume_thread_id = str(resume_thread_id or "").strip() or None
+        self._on_thread_ready = on_thread_ready
+        self._lease_acquire = lease_acquire
+        self._lease_refresh = lease_refresh
+        self._lease_release = lease_release
+        self._lease_refresh_interval = max(
+            float(lease_refresh_interval), 0.05
+        )
+        self._lease_acquired = False
+        self._lease_lost = threading.Event()
+        self._lease_stop = threading.Event()
+        self._lease_thread: Optional[threading.Thread] = None
+        self._lifecycle_lock = threading.Lock()
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -317,16 +371,36 @@ class CodexAppServerSession:
         thread. Returns the codex thread id. Idempotent — repeated calls
         return the same thread id."""
         if self._thread_id is not None:
+            if self._lease_lost.is_set():
+                raise CodexAppServerError(
+                    code=-32603,
+                    message="Codex turn lease was lost; refusing thread reuse",
+                )
             return self._thread_id
+        self._ensure_lease_acquired()
         if self._client is None:
-            self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+            try:
+                self._client = self._client_factory(
+                    codex_bin=self._codex_bin, codex_home=self._codex_home
+                )
+            except BaseException:
+                self.close()
+                raise
+        try:
+            capabilities = (
+                {"experimentalApi": True}
+                if self._resume_thread_id is not None
+                else None
             )
-        self._client.initialize(
-            client_name="hermes",
-            client_title="Hermes Agent",
-            client_version=_get_hermes_version(),
-        )
+            self._client.initialize(
+                client_name="hermes",
+                client_title="Hermes Agent",
+                client_version=_get_hermes_version(),
+                capabilities=capabilities,
+            )
+        except BaseException:
+            self.close()
+            raise
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
         #   1. `thread/start.permissions` is gated behind the experimentalApi
@@ -342,40 +416,157 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        if self._resume_thread_id is not None:
+            method = "thread/resume"
+            params: dict[str, Any] = {
+                "threadId": self._resume_thread_id,
+                # Hermes owns its own projected transcript and only needs the
+                # resumed thread identity/state. Codex exposes this field on
+                # the experimental app-server surface, so ensure_started()
+                # opts this resume connection into experimentalApi during the
+                # one allowed initialize handshake. This keeps long rollouts
+                # from materializing every prior turn in a response that
+                # Hermes immediately discards.
+                "excludeTurns": True,
+            }
+        else:
+            method = "thread/start"
+            params = {"cwd": self._cwd}
+        try:
+            result = self._client.request(method, params, timeout=15)
+        except BaseException:
+            self.close()
+            raise
         # Cross-fill thread.id/sessionId — different codex versions have
-        # serialized this under either key. Mirrors openclaw beta.8's
-        # tolerance fix so future codex drops/renames don't KeyError us
-        # at handshake time.
+        # serialized start responses under either key. A resume response must
+        # return the official nested thread.id, or the older top-level
+        # result.threadId compatibility field with the exact requested value.
+        # thread.sessionId is the conversation tree root and can differ after
+        # a fork, so accepting it here could attach Hermes to the wrong rollout.
         thread_obj = result.get("thread") or {}
-        thread_id = (
-            thread_obj.get("id")
-            or thread_obj.get("sessionId")
-            or result.get("sessionId")
-            or result.get("threadId")
-        )
+        if self._resume_thread_id is not None:
+            thread_id = thread_obj.get("id") or result.get("threadId")
+        else:
+            thread_id = (
+                thread_obj.get("id")
+                or thread_obj.get("sessionId")
+                or result.get("sessionId")
+                or result.get("threadId")
+            )
         if not thread_id:
+            self.close()
             raise CodexAppServerError(
                 code=-32603,
                 message=(
-                    "codex thread/start returned no thread id "
+                    f"codex {method} returned no thread id "
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
+        thread_id = str(thread_id)
+        if (
+            self._resume_thread_id is not None
+            and thread_id != self._resume_thread_id
+        ):
+            self.close()
+            raise CodexAppServerError(
+                code=-32603,
+                message=(
+                    "codex thread/resume returned a different thread id "
+                    f"(requested={self._resume_thread_id}, returned={thread_id})"
+                ),
+            )
+        if self._on_thread_ready is not None:
+            try:
+                self._on_thread_ready(thread_id)
+            except Exception as exc:
+                self.close()
+                raise CodexAppServerError(
+                    code=-32603,
+                    message=(
+                        "could not persist the Codex thread binding; "
+                        "refusing to run an unresumable turn"
+                    ),
+                ) from exc
         self._thread_id = thread_id
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            "resumed" if self._resume_thread_id is not None else "started",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,
         )
         return self._thread_id
 
-    def close(self) -> None:
-        if self._closed:
+    def _ensure_lease_acquired(self) -> None:
+        """Acquire the cross-process writer lease before spawning Codex."""
+        if self._lease_acquire is None:
             return
-        self._closed = True
+        with self._lifecycle_lock:
+            if self._lease_acquired:
+                if self._lease_lost.is_set():
+                    raise CodexAppServerError(
+                        code=-32603,
+                        message="Codex turn lease was lost",
+                    )
+                return
+            if self._closed:
+                raise CodexAppServerError(
+                    code=-32603,
+                    message="Codex app-server session is closed",
+                )
+            try:
+                acquired = bool(self._lease_acquire())
+            except Exception:
+                acquired = False
+                logger.warning(
+                    "Codex turn lease acquisition raised; failing closed",
+                    exc_info=True,
+                )
+            if not acquired:
+                raise CodexAppServerError(
+                    code=-32603,
+                    message=(
+                        "another Hermes/Codex client owns this session; "
+                        "refusing concurrent thread access"
+                    ),
+                )
+            self._lease_acquired = True
+            if self._lease_refresh is not None:
+                self._lease_thread = threading.Thread(
+                    target=self._refresh_lease_loop,
+                    name="codex-turn-lease-refresh",
+                    daemon=True,
+                )
+                self._lease_thread.start()
+
+    def _refresh_lease_loop(self) -> None:
+        while not self._lease_stop.wait(self._lease_refresh_interval):
+            try:
+                refreshed = bool(
+                    self._lease_refresh is not None
+                    and self._lease_refresh()
+                )
+            except Exception:
+                refreshed = False
+                logger.warning(
+                    "Codex turn lease refresh raised; marking lease lost",
+                    exc_info=True,
+                )
+            if not refreshed:
+                self._lease_lost.set()
+                self._interrupt_event.set()
+                return
+
+    def _lease_is_lost(self) -> bool:
+        return self._lease_acquired and self._lease_lost.is_set()
+
+    def close(self) -> None:
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            lease_acquired = self._lease_acquired
+            self._lease_acquired = False
         with self._active_turn_lock:
             self._active_turn_id = None
         if self._client is not None:
@@ -385,6 +576,57 @@ class CodexAppServerSession:
                 pass
             self._client = None
         self._thread_id = None
+        self._lease_stop.set()
+        lease_thread = self._lease_thread
+        if (
+            lease_thread is not None
+            and lease_thread is not threading.current_thread()
+        ):
+            lease_thread.join(timeout=max(self._lease_refresh_interval, 1.0))
+        self._lease_thread = None
+        if lease_acquired and self._lease_release is not None:
+            release_callback = self._lease_release
+            try:
+                released = bool(release_callback())
+                if not released:
+                    logger.warning(
+                        "Codex turn lease release failed; scheduling bounded "
+                        "background retries"
+                    )
+            except Exception:
+                released = False
+                logger.warning(
+                    "Codex turn lease release raised; scheduling bounded "
+                    "background retries",
+                    exc_info=True,
+                )
+            if not released:
+                threading.Thread(
+                    target=self._retry_lease_release,
+                    args=(release_callback,),
+                    name="codex-turn-lease-release-retry",
+                    daemon=True,
+                ).start()
+
+    @staticmethod
+    def _retry_lease_release(
+        release_callback: Callable[[], bool],
+    ) -> None:
+        """Retry transient DB release failures after the client is closed."""
+        for delay in (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0):
+            time.sleep(delay)
+            try:
+                if release_callback():
+                    return
+            except Exception:
+                logger.debug(
+                    "Codex turn lease background release retry raised",
+                    exc_info=True,
+                )
+        logger.error(
+            "Codex turn lease could not be released after bounded retries; "
+            "access remains fail-closed until process exit or manual recovery"
+        )
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -402,7 +644,7 @@ class CodexAppServerSession:
     def request_steer(self, text: str) -> bool:
         """Append user guidance to the active Codex turn via ``turn/steer``."""
         cleaned = str(text or "").strip()
-        if not cleaned:
+        if not cleaned or self._lease_is_lost():
             return False
         with self._active_turn_lock:
             turn_id = self._active_turn_id
@@ -474,6 +716,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        interrupt_grace_timeout: float = 5.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -500,6 +743,7 @@ class CodexAppServerSession:
             # Subprocess almost certainly unhealthy — retire so the next
             # turn re-spawns cleanly.
             result.should_retire = True
+            self.close()
             self._interrupt_event.clear()
             return result
         assert self._client is not None and self._thread_id is not None
@@ -510,6 +754,10 @@ class CodexAppServerSession:
         # Codex turn instead of erasing the signal.
         if self._interrupt_event.is_set():
             result.interrupted = True
+            if self._lease_is_lost():
+                result.error = "Codex turn lease was lost before turn/start"
+                result.should_retire = True
+                self.close()
             self._interrupt_event.clear()
             return result
         projector = CodexEventProjector()
@@ -557,20 +805,101 @@ class CodexAppServerSession:
             return result
 
         result.turn_id = (ts.get("turn") or {}).get("id")
+        if not result.turn_id:
+            result.error = self._format_error_with_stderr(
+                "turn/start returned no turn id"
+            )
+            result.should_retire = True
+            self.close()
+            self._interrupt_event.clear()
+            return result
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
+        interrupt_requested = False
+        interrupt_sent = False
+        interrupt_deadline: Optional[float] = None
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
 
-        while time.monotonic() < deadline and not turn_complete:
-            if self._interrupt_event.is_set():
-                self._issue_interrupt(result.turn_id)
+        def record_turn_completion(note: dict) -> None:
+            """Apply one already scope-validated terminal notification."""
+            nonlocal turn_complete
+            turn_complete = True
+            turn_obj = (note.get("params") or {}).get("turn") or {}
+            turn_status = turn_obj.get("status")
+            if turn_status == "interrupted":
                 result.interrupted = True
+            elif turn_status and turn_status != "completed":
+                err_obj = turn_obj.get("error")
+                if err_obj:
+                    err_msg = _format_responses_error(
+                        err_obj,
+                        str(turn_status),
+                    )
+                    stderr_blob = "\n".join(self._client.stderr_tail(40))
+                    hint = _classify_oauth_failure(err_msg, stderr_blob)
+                    if hint is not None:
+                        result.error = hint
+                        result.should_retire = True
+                    else:
+                        result.error = self._format_error_with_stderr(
+                            f"turn ended status={turn_status}",
+                            err_msg,
+                        )
+
+        while not turn_complete:
+            now = time.monotonic()
+            if not interrupt_requested and now >= deadline:
+                # A completed assistant message is still useful when a codex
+                # build omits turn/completed and then goes quiet.
+                if result.final_text and result.error is None:
+                    logger.warning(
+                        "codex app-server turn reached deadline after a "
+                        "completed assistant message but before "
+                        "turn/completed; accepting the assistant text as the "
+                        "terminal response"
+                    )
+                    turn_complete = True
+                    break
+                interrupt_requested = True
+                result.interrupted = True
+                result.should_retire = True
+                result.error = self._format_error_with_stderr(
+                    f"turn timed out after {turn_timeout}s"
+                )
+
+            if self._lease_is_lost():
+                result.interrupted = True
+                result.error = (
+                    "Codex turn lease refresh failed; retiring the "
+                    "app-server session"
+                )
+                result.should_retire = True
+                self.close()
+                break
+            if self._interrupt_event.is_set():
+                interrupt_requested = True
+                result.interrupted = True
+                result.should_retire = True
+                self._interrupt_event.clear()
+
+            if interrupt_requested and not interrupt_sent:
+                self._issue_interrupt(result.turn_id)
+                interrupt_sent = True
+                interrupt_deadline = (
+                    time.monotonic() + max(0.0, interrupt_grace_timeout)
+                )
+
+            if (
+                interrupt_requested
+                and interrupt_deadline is not None
+                and time.monotonic() >= interrupt_deadline
+            ):
                 break
 
             # Detect a dead subprocess between iterations. If codex exited
@@ -594,11 +923,13 @@ class CodexAppServerSession:
             # signal and codex has been silent past the quiet timeout, give
             # up on this turn instead of waiting for the outer deadline.
             if (
+                not interrupt_requested
+                and
                 last_tool_completion_at is not None
                 and (time.monotonic() - last_tool_completion_at)
                     > post_tool_quiet_timeout
             ):
-                self._issue_interrupt(result.turn_id)
+                interrupt_requested = True
                 result.interrupted = True
                 result.error = (
                     f"codex went silent for "
@@ -606,7 +937,8 @@ class CodexAppServerSession:
                     f"retiring app-server session."
                 )
                 result.should_retire = True
-                break
+                last_tool_completion_at = None
+                continue
 
             # Drain any server-initiated requests (approvals) before
             # reading notifications, so the codex side isn't blocked.
@@ -656,14 +988,25 @@ class CodexAppServerSession:
                         last_tool_completion_at = time.monotonic()
                     if proj.final_text is not None:
                         result.final_text = proj.final_text
-                        if _has_turn_aborted_marker(proj.final_text):
+                        if (
+                            not interrupt_requested
+                            and _has_turn_aborted_marker(proj.final_text)
+                        ):
                             turn_complete = True
                             result.interrupted = True
                             result.error = (
                                 result.error
                                 or "codex reported turn_aborted"
                             )
-                self._handle_server_request(sreq)
+                    if pending.get("method") == "turn/completed":
+                        record_turn_completion(pending)
+                        break
+                # Codex resolves outstanding approvals while unwinding an
+                # interrupted turn.  If the matching interrupted terminal was
+                # already drained, the locally queued request is stale and
+                # must not reopen an approval prompt after the user stopped.
+                if not turn_complete:
+                    self._handle_server_request(sreq)
                 # Activity counts as live signal — reset the post-tool
                 # quiet timer so an approval round-trip doesn't trip it.
                 last_tool_completion_at = None
@@ -724,7 +1067,10 @@ class CodexAppServerSession:
                 # `<turn_aborted>` marker in the agent message text and
                 # never sending turn/completed. Treat the marker itself
                 # as terminal so we don't burn the full deadline.
-                if _has_turn_aborted_marker(projection.final_text):
+                if (
+                    not interrupt_requested
+                    and _has_turn_aborted_marker(projection.final_text)
+                ):
                     turn_complete = True
                     result.interrupted = True
                     result.error = (
@@ -732,56 +1078,19 @@ class CodexAppServerSession:
                     )
 
             if method == "turn/completed":
-                turn_complete = True
-                turn_status = (
-                    (note.get("params") or {}).get("turn") or {}
-                ).get("status")
-                if turn_status and turn_status not in {"completed", "interrupted"}:
-                    err_obj = (
-                        (note.get("params") or {}).get("turn") or {}
-                    ).get("error")
-                    if err_obj:
-                        err_msg = _format_responses_error(err_obj, str(turn_status))
-                        # If the turn failed for an auth/refresh reason,
-                        # rewrite the error into a re-auth hint AND mark
-                        # the session for retirement.
-                        stderr_blob = "\n".join(
-                            self._client.stderr_tail(40)
-                        )
-                        hint = _classify_oauth_failure(err_msg, stderr_blob)
-                        if hint is not None:
-                            result.error = hint
-                            result.should_retire = True
-                        else:
-                            result.error = self._format_error_with_stderr(
-                                f"turn ended status={turn_status}", err_msg
-                            )
+                record_turn_completion(note)
 
-        if (
-            not turn_complete
-            and not result.interrupted
-            and result.final_text
-            and result.error is None
-        ):
-            logger.warning(
-                "codex app-server turn reached deadline after a completed "
-                "assistant message but before turn/completed; accepting "
-                "the assistant text as the terminal response"
-            )
-            turn_complete = True
-
-        if not turn_complete and not result.interrupted:
-            # Hit the deadline. Issue interrupt to stop wasted compute, and
-            # tell the caller to retire the session — a turn that never
-            # finished is a strong sign codex is wedged in a way the next
-            # turn shouldn't inherit.
-            self._issue_interrupt(result.turn_id)
+        if interrupt_requested:
             result.interrupted = True
-            if not result.error:
-                result.error = self._format_error_with_stderr(
-                    f"turn timed out after {turn_timeout}s"
-                )
             result.should_retire = True
+            if not turn_complete and not result.error:
+                result.error = self._format_error_with_stderr(
+                    "turn interrupt was not confirmed by turn/completed"
+                )
+            # Close only after the matching terminal notification was drained,
+            # or after the bounded grace period expired.  The interrupt RPC's
+            # empty response merely acknowledges the request.
+            self.close()
 
         with self._active_turn_lock:
             self._active_turn_id = None
@@ -793,6 +1102,7 @@ class CodexAppServerSession:
         *,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
+        interrupt_grace_timeout: float = 5.0,
     ) -> TurnResult:
         """Trigger Codex-native history compaction for the current thread.
 
@@ -809,11 +1119,27 @@ class CodexAppServerSession:
                 "codex app-server startup failed", exc
             )
             result.should_retire = True
+            self.close()
+            self._interrupt_event.clear()
             return result
 
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
-        self._interrupt_event.clear()
+
+        # A stop can arrive while ensure_started() is spawning, initializing,
+        # or resuming the app-server. Honor it before starting compaction;
+        # clearing it here would launch background work after the caller
+        # already asked us to stop.
+        if self._interrupt_event.is_set():
+            result.interrupted = True
+            if self._lease_is_lost():
+                result.error = (
+                    "Codex turn lease was lost before compaction started"
+                )
+                result.should_retire = True
+                self.close()
+            self._interrupt_event.clear()
+            return result
         projector = CodexEventProjector()
 
         try:
@@ -832,6 +1158,7 @@ class CodexAppServerSession:
                 result.error = self._format_error_with_stderr(
                     "thread/compact/start failed", exc
                 )
+            self._interrupt_event.clear()
             return result
         except TimeoutError as exc:
             stderr_blob = "\n".join(self._client.stderr_tail(40))
@@ -840,15 +1167,58 @@ class CodexAppServerSession:
                 "thread/compact/start timed out", exc
             )
             result.should_retire = True
+            self._interrupt_event.clear()
             return result
 
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
+        interrupt_requested = False
+        interrupt_sent = False
+        interrupt_deadline: Optional[float] = None
 
-        while time.monotonic() < deadline and not turn_complete:
-            if self._interrupt_event.is_set():
-                self._issue_interrupt(result.turn_id)
+        while not turn_complete:
+            now = time.monotonic()
+            if not interrupt_requested and now >= deadline:
+                interrupt_requested = True
                 result.interrupted = True
+                result.should_retire = True
+                result.error = self._format_error_with_stderr(
+                    f"compact turn timed out after {turn_timeout}s"
+                )
+
+            if self._lease_is_lost():
+                result.interrupted = True
+                result.error = (
+                    "Codex turn lease refresh failed during compaction; "
+                    "retiring the app-server session"
+                )
+                result.should_retire = True
+                self.close()
+                break
+            if self._interrupt_event.is_set():
+                interrupt_requested = True
+                result.interrupted = True
+                result.should_retire = True
+                self._interrupt_event.clear()
+
+            if interrupt_requested and interrupt_deadline is None:
+                interrupt_deadline = (
+                    time.monotonic() + max(0.0, interrupt_grace_timeout)
+                )
+
+            if (
+                interrupt_requested
+                and result.turn_id is not None
+                and not interrupt_sent
+            ):
+                self._issue_interrupt(result.turn_id)
+                interrupt_sent = True
+
+            if (
+                interrupt_requested
+                and interrupt_deadline is not None
+                and time.monotonic() >= interrupt_deadline
+            ):
                 break
 
             if not self._client.is_alive():
@@ -879,28 +1249,23 @@ class CodexAppServerSession:
             observed_thread_id, observed_turn_id = _notification_scope_ids(note)
             if result.turn_id is None:
                 if method == "turn/started":
-                    if (
-                        observed_thread_id is not None
-                        and str(observed_thread_id) != str(self._thread_id)
+                    if not _notification_belongs_to_turn(
+                        note,
+                        thread_id=self._thread_id,
+                        turn_id=None,
                     ):
                         logger.debug(
-                            "ignoring foreign compact turn/started: thread=%s",
+                            "ignoring unscoped/foreign compact turn/started: "
+                            "thread=%s",
                             observed_thread_id,
                         )
                         continue
-                    if observed_turn_id is None:
-                        logger.debug(
-                            "ignoring compact turn/started without a turn id"
-                        )
-                        continue
                     result.turn_id = str(observed_turn_id)
-                elif observed_turn_id is not None or method in {
-                    "item/completed",
-                    "turn/completed",
-                }:
+                else:
                     # thread/compact/start does not return a turn id. Until the
-                    # new turn/started arrives, any terminal/projectable event
-                    # is stale or cannot be safely attributed to this compaction.
+                    # matching turn/started arrives, every other event is stale
+                    # or cannot be safely attributed to this compaction. This
+                    # includes the deprecated unscoped thread/compacted event.
                     logger.debug(
                         "ignoring codex notification before compact turn start: "
                         "method=%s",
@@ -935,7 +1300,10 @@ class CodexAppServerSession:
                 result.tool_iterations += 1
             if projection.final_text is not None:
                 result.final_text = projection.final_text
-                if _has_turn_aborted_marker(projection.final_text):
+                if (
+                    not interrupt_requested
+                    and _has_turn_aborted_marker(projection.final_text)
+                ):
                     turn_complete = True
                     result.interrupted = True
                     result.error = (
@@ -967,21 +1335,29 @@ class CodexAppServerSession:
                             err_msg,
                         )
 
-        if not turn_complete and not result.interrupted:
-            self._issue_interrupt(result.turn_id)
+        if interrupt_requested:
             result.interrupted = True
-            if not result.error:
-                result.error = self._format_error_with_stderr(
-                    f"compact turn timed out after {turn_timeout}s"
-                )
             result.should_retire = True
+            if not turn_complete and not result.error:
+                result.error = self._format_error_with_stderr(
+                    "compact interrupt was not confirmed by turn/completed"
+                )
+            # `turn/interrupt` acknowledges the request; only the matching
+            # terminal notification confirms Codex has finished unwinding.
+            self.close()
 
+        self._interrupt_event.clear()
         return result
 
     # ---------- internals ----------
 
     def _issue_interrupt(self, turn_id: Optional[str]) -> None:
-        if self._client is None or self._thread_id is None or turn_id is None:
+        if (
+            self._lease_is_lost()
+            or self._client is None
+            or self._thread_id is None
+            or turn_id is None
+        ):
             return
         try:
             self._client.request(
@@ -1007,7 +1383,7 @@ class CodexAppServerSession:
                                                   permission profile in
                                                   ~/.codex/config.toml).
         """
-        if self._client is None:
+        if self._client is None or self._lease_is_lost():
             return
         method = req.get("method", "")
         rid = req.get("id")
@@ -1229,7 +1605,10 @@ def _apply_compaction_notification(result: TurnResult, note: dict) -> None:
         result.turn_id = params.get("turnId") or result.turn_id
         return
 
-    if method not in {"item/started", "item/completed"}:
+    # item/started is only intent/progress. item/completed is the
+    # authoritative execution boundary; counting the started event would turn
+    # a later failed/interrupted compaction into a false success.
+    if method != "item/completed":
         return
 
     item = params.get("item") or {}

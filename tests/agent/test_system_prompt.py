@@ -24,6 +24,7 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        _emit_status=lambda _message: None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -88,7 +89,7 @@ def _init_code_repo(path):
     import subprocess
 
     subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
-    (path / "main.py").write_text("print('hi')\n")
+    (path / "main.py").write_text("print('hi')\n", encoding="utf-8")
 
 
 class TestCodingContextBlock:

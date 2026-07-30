@@ -114,7 +114,11 @@ def test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex():
 
 def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting():
     agent = DummyAgent(
-        TurnResult(thread_id="thread-1", turn_id="compact-turn-1")
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="compact-turn-1",
+            compacted=True,
+        )
     )
     agent._codex_session = SlowCodexSession(
         agent._codex_session.result,
@@ -225,7 +229,11 @@ def test_codex_app_server_auto_without_thread_skips_builtin_compressor(
 
 def test_codex_app_server_off_mode_force_with_thread_uses_native_compaction():
     agent = DummyAgent(
-        TurnResult(thread_id="thread-1", turn_id="compact-turn-1"),
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="compact-turn-1",
+            compacted=True,
+        ),
         auto_compaction="off",
     )
     messages = [{"role": "user", "content": "hi"}]
@@ -269,6 +277,47 @@ def test_codex_app_server_compression_failure_preserves_bookkeeping():
         ("warn", "⚠ Codex app-server compaction failed: compact failed"),
         ("compacted", COMPACTION_DONE_STATUS),
     ]
+
+
+def test_codex_app_server_compaction_requires_context_compaction_event():
+    agent = DummyAgent(
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="compact-turn-1",
+            compacted=False,
+        )
+    )
+    messages = [{"role": "user", "content": "hi"}]
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+        force=True,
+    )
+
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent.context_compressor.compression_count == 0
+    assert agent.warnings == [
+        "⚠ Codex app-server compaction failed: Codex completed the compact "
+        "turn without the required contextCompaction event"
+    ]
+    assert agent.touch_calls[-1] == "context compression failed"
+
+
+def test_forced_compaction_record_does_not_manufacture_missing_boundary():
+    agent = DummyAgent(
+        TurnResult(thread_id="thread-1", turn_id="compact-turn-1")
+    )
+
+    assert _record_codex_app_server_compaction(
+        agent,
+        agent._codex_session.result,
+        force=True,
+    ) is False
+    assert agent.context_compressor.compression_count == 0
 
 
 
