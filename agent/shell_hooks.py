@@ -14,8 +14,8 @@ Design notes
   plugins are registered first (via ``discover_and_load()``) so their
   block decisions win ties over shell-hook blocks.
 * Subprocess execution tokenizes ``command`` with
-  :func:`_split_command` (``posix=False`` on Windows so backslash paths
-  survive) and runs with ``shell=False`` — no shell injection footguns.
+  :func:`_split_command` (Windows: preserve backslashes, strip grouping
+  quotes) and runs with ``shell=False`` — no shell injection footguns.
   Users that need pipes/redirection wrap their logic in a script.
 * First-use consent is gated by the allowlist under
   ``~/.hermes/shell-hooks-allowlist.json``.  Non-TTY callers must pass
@@ -101,6 +101,7 @@ emitted by each built-in hook site.
     child_role      – role string of the child agent
     child_summary   – summary of the child's work
     child_status    – exit status string (e.g. "success", "error")
+    tool_call_history – redacted tool name/input summary/byte counts/status list
     duration_ms     – wall-clock time of the child run in milliseconds
 """
 
@@ -430,13 +431,32 @@ def _parse_single_entry(
 _TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
 
 
+def _strip_grouping_quotes(token: str) -> str:
+    """Remove syntactic enclosing quotes retained by MS-mode ``shlex``.
+
+    ``shlex.split(..., posix=False)`` keeps grouping quotes as literal
+    characters in each token.  ``subprocess`` on Windows then escapes
+    those quotes during argv serialization, so a command like
+    ``python.exe "C:\\Program Files\\foo\\hook.py"`` would fail unless
+    the quotes are stripped here.
+    """
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        return token[1:-1]
+    return token
+
+
 def _split_command(command: str) -> List[str]:
     """Tokenize a hook command string for subprocess argv.
 
     POSIX-mode ``shlex`` treats backslashes as escape characters, which
     mangles unquoted Windows paths like ``C:\\Users\\foo\\hook.py``.
+    On Windows we use ``posix=False`` to preserve backslashes, then strip
+    enclosing grouping quotes so ``subprocess`` receives a clean argv.
     """
-    return shlex.split(command, posix=not IS_WINDOWS)
+    parts = shlex.split(command, posix=not IS_WINDOWS)
+    if IS_WINDOWS:
+        return [_strip_grouping_quotes(part) for part in parts]
+    return parts
 
 
 def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
@@ -474,7 +494,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             input=stdin_json,
             capture_output=True,
             timeout=spec.timeout,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             shell=False,
             **_popen_kwargs,
         )
@@ -642,7 +662,7 @@ def allowlist_path() -> Path:
 def load_allowlist() -> Dict[str, Any]:
     """Return the parsed allowlist, or an empty skeleton if absent."""
     try:
-        raw = json.loads(allowlist_path().read_text())
+        raw = json.loads(allowlist_path().read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {"approvals": []}
     if not isinstance(raw, dict):
