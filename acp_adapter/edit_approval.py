@@ -16,7 +16,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from itertools import count
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -128,28 +128,75 @@ def _proposal_for_patch_replace(arguments: dict[str, Any]) -> EditProposal:
     )
 
 
-def _extract_v4a_patch_paths(patch_body: str) -> list[str]:
+def _validate_v4a_relative_path(raw_path: str) -> str:
+    path = raw_path.strip()
+    if not path or "\x00" in path or "\n" in path or "\r" in path:
+        raise ValueError("V4A file path is missing or invalid")
+    if path.startswith("~") or Path(path).is_absolute() or PureWindowsPath(path).is_absolute():
+        raise ValueError(f"V4A file path must be relative: {path!r}")
+    if PureWindowsPath(path).drive or " -> " in path:
+        raise ValueError(f"V4A file path is ambiguous: {path!r}")
+    return path
+
+
+def extract_v4a_patch_paths(patch_body: str) -> list[str]:
+    """Return every V4A source/destination path, or reject ambiguous syntax.
+
+    This parser is shared by ACP edit approval and the worktree admission hook.
+    It intentionally validates only the operation envelope and paths; the patch
+    engine remains responsible for validating hunks and applying operations.
+    Both the Hermes ``Move File: src -> dst`` form and the Codex V4A
+    ``Update File: src`` + ``Move to: dst`` form are recognized.
+    """
+    if not isinstance(patch_body, str) or not patch_body.strip():
+        raise ValueError("patch content required")
+    lines = patch_body.splitlines()
+    nonempty = [index for index, line in enumerate(lines) if line.strip()]
+    begin_headers = {"*** Begin Patch", "***Begin Patch"}
+    end_headers = {"*** End Patch", "***End Patch"}
+    if not nonempty or lines[nonempty[0]].strip() not in begin_headers:
+        raise ValueError("V4A patch must start with an exact Begin Patch header")
+    if lines[nonempty[-1]].strip() not in end_headers:
+        raise ValueError("V4A patch must end with an exact End Patch header")
+    if sum(line.strip() in begin_headers for line in lines) != 1:
+        raise ValueError("V4A patch has an ambiguous Begin Patch header")
+    if sum(line.strip() in end_headers for line in lines) != 1:
+        raise ValueError("V4A patch has an ambiguous End Patch header")
+
     paths: list[str] = []
-    for match in re.finditer(
-        r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$',
-        patch_body,
-        re.MULTILINE,
-    ):
-        path = match.group(1).strip()
-        if path:
-            paths.append(path)
-    for match in re.finditer(
-        r'^\*\*\*\s+Move\s+File:\s*(.+?)\s*->\s*(.+)$',
-        patch_body,
-        re.MULTILINE,
-    ):
-        src = match.group(1).strip()
-        dst = match.group(2).strip()
-        if src:
-            paths.append(src)
-        if dst:
-            paths.append(dst)
+    current_kind: str | None = None
+    current_has_move_to = False
+    for index in range(nonempty[0] + 1, nonempty[-1]):
+        line = lines[index]
+        if not line.startswith("***"):
+            continue
+        simple = re.fullmatch(r"\*\*\*\s*(Update|Add|Delete)\s+File:\s*(.+)", line)
+        move_file = re.fullmatch(r"\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)", line)
+        move_to = re.fullmatch(r"\*\*\*\s*Move\s+to:\s*(.+)", line)
+        if simple:
+            current_kind = simple.group(1).lower()
+            current_has_move_to = False
+            paths.append(_validate_v4a_relative_path(simple.group(2)))
+        elif move_file:
+            current_kind = None
+            current_has_move_to = False
+            paths.append(_validate_v4a_relative_path(move_file.group(1)))
+            paths.append(_validate_v4a_relative_path(move_file.group(2)))
+        elif move_to:
+            if current_kind != "update" or current_has_move_to:
+                raise ValueError("V4A Move to header has no unique Update File source")
+            paths.append(_validate_v4a_relative_path(move_to.group(1)))
+            current_has_move_to = True
+        else:
+            raise ValueError(f"unknown or incomplete V4A header: {line!r}")
+    if not paths:
+        raise ValueError("no file paths found in V4A patch")
     return paths
+
+
+# Backward-compatible private name for callers/tests predating the shared API.
+def _extract_v4a_patch_paths(patch_body: str) -> list[str]:
+    return extract_v4a_patch_paths(patch_body)
 
 
 def _proposal_for_patch_v4a(arguments: dict[str, Any]) -> EditProposal:
@@ -157,7 +204,7 @@ def _proposal_for_patch_v4a(arguments: dict[str, Any]) -> EditProposal:
     if not isinstance(patch_body, str) or not patch_body:
         raise ValueError("patch content required")
 
-    paths = _extract_v4a_patch_paths(patch_body)
+    paths = extract_v4a_patch_paths(patch_body)
     if not paths:
         raise ValueError("no file paths found in V4A patch")
 
