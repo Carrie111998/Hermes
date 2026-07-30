@@ -376,6 +376,56 @@ class TestCheckFunction:
         assert check() is False
 
 
+    def test_registration_recreates_cached_server_after_its_task_exited(self, monkeypatch):
+        """A terminal OAuth startup failure must be recoverable on later discovery."""
+        import tools.mcp_tool as mcp_tool
+
+        dead = _make_mock_server("test_server", session=None)
+        dead._task = MagicMock()
+        dead._task.done.return_value = True
+        connected = _make_mock_server("test_server", session=object())
+        connected._registered_tool_names = ["mcp__test_server__ping"]
+        discovered = []
+
+        async def fake_discover(name, config):
+            discovered.append((name, config))
+            with mcp_tool._lock:
+                mcp_tool._servers[name] = connected
+            return list(connected._registered_tool_names)
+
+        def run_now(factory, timeout=120):
+            return asyncio.run(factory())
+
+        with mcp_tool._lock:
+            previous = mcp_tool._servers.pop("test_server", None)
+            mcp_tool._servers["test_server"] = dead
+        try:
+            monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+            monkeypatch.setattr(
+                mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
+            )
+            monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+            monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", run_now)
+            monkeypatch.setattr(
+                mcp_tool, "_discover_and_register_server", fake_discover
+            )
+
+            names = mcp_tool.register_mcp_servers(
+                {"test_server": {"url": "https://example.invalid/mcp"}}
+            )
+
+            assert discovered == [
+                ("test_server", {"url": "https://example.invalid/mcp"})
+            ]
+            assert "mcp__test_server__ping" in names
+            assert mcp_tool._servers["test_server"] is connected
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.pop("test_server", None)
+                if previous is not None:
+                    mcp_tool._servers["test_server"] = previous
+
+
     def test_recycled_stdio_server_remains_available_for_lazy_reconnect(self):
         from tools.mcp_tool import _make_check_fn, _servers
 

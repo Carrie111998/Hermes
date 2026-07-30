@@ -5917,9 +5917,26 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("No explicit MCP servers provided")
         return []
 
-    # Only attempt servers that aren't already connected and are enabled
-    # (enabled: false skips the server entirely without removing its config)
+    # A terminal startup failure (notably OAuthNonInteractiveError) leaves the
+    # server cached after its lifecycle task has exited.  Such an object cannot
+    # receive the reconnect signal below; evict it so discovery creates a new
+    # lifecycle task on the next foreground/cron attempt.
     with _lock:
+        for name in servers:
+            cached = _servers.get(name)
+            task = getattr(cached, "_task", None) if cached is not None else None
+            if (
+                cached is not None
+                and getattr(cached, "session", None) is None
+                and task is not None
+                and task.done()
+            ):
+                _servers.pop(name, None)
+                logger.info(
+                    "MCP server '%s': evicted dead cached lifecycle before rediscovery",
+                    name,
+                )
+
         new_servers = {
             k: v
             for k, v in servers.items()
