@@ -431,6 +431,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "completed_at": t.completed_at,
                     "result": t.result,
                     "current_run_id": t.current_run_id,
+                    "max_iterations": t.max_iterations,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
                 }
@@ -1171,6 +1172,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    max_iterations = args.get("max_iterations")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
     if isinstance(skills, str):
@@ -1226,6 +1228,9 @@ def _handle_create(args: dict, **kw) -> str:
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
                 ),
+                max_iterations=(
+                    int(max_iterations) if max_iterations is not None else None
+                ),
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
@@ -1245,6 +1250,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                max_iterations=new_task.max_iterations if new_task else None,
                 subscribed=subscribed,
             )
         finally:
@@ -1929,6 +1935,16 @@ KANBAN_CREATE_SCHEMA = {
                     "Per-task runtime cap. When exceeded, the "
                     "dispatcher SIGTERMs the worker and re-queues the "
                     "task with outcome='timed_out'."
+                ),
+            },
+            "max_iterations": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Per-task cap for the worker's inner LLM/tool loop. "
+                    "Overrides the assignee profile's agent.max_turns for "
+                    "this card. Prefer bounded values for concrete work; "
+                    "omit to use the profile budget."
                 ),
             },
             "initial_status": {

@@ -605,6 +605,7 @@ class CreateTaskBody(BaseModel):
     triage: bool = False
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
+    max_iterations: Optional[int] = Field(default=None, ge=1)
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
@@ -631,6 +632,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             triage=payload.triage,
             idempotency_key=payload.idempotency_key,
             max_runtime_seconds=payload.max_runtime_seconds,
+            max_iterations=payload.max_iterations,
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
