@@ -501,22 +501,21 @@ class SignalAdapter(BasePlatformAdapter):
 
             elapsed = time.time() - self._last_sse_activity
             if elapsed > HEALTH_CHECK_STALE_THRESHOLD:
-                logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
+                # Stale SSE means the receive path is dead regardless of daemon
+                # process health — reconnect first, and never let the daemon
+                # probe below refresh the activity clock (#40199).
+                logger.warning("Signal: SSE idle for %.0fs, forcing reconnect", elapsed)
+                self._force_reconnect()
                 try:
                     resp = await self.client.get(
                         f"{self.http_url}/api/v1/check", timeout=10.0
                     )
                     if resp.status_code == 200:
-                        # Daemon is alive but SSE is idle — update activity to
-                        # avoid repeated warnings (connection may just be quiet)
-                        self._last_sse_activity = time.time()
-                        logger.debug("Signal: daemon healthy, SSE idle")
+                        logger.debug("Signal: daemon reachable, reconnect triggered by stale SSE")
                     else:
-                        logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)
-                        self._force_reconnect()
+                        logger.warning("Signal: daemon health check also failed (%d)", resp.status_code)
                 except Exception as e:
-                    logger.warning("Signal: health check error: %s, forcing reconnect", e)
-                    self._force_reconnect()
+                    logger.warning("Signal: daemon health check error: %s", e)
 
     def _force_reconnect(self) -> None:
         """Force SSE reconnection by closing the current response."""
