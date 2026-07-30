@@ -467,7 +467,20 @@ export const api = {
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
   getModelInfo: () => fetchJSON<ModelInfoResponse>("/api/model/info"),
-  getModelOptions: () => fetchJSON<ModelOptionsResponse>("/api/model/options"),
+  getModelOptions: (
+    profileOrOptions?: string | { profile?: string; refresh?: boolean },
+  ) => {
+    const profile =
+      typeof profileOrOptions === "string"
+        ? profileOrOptions
+        : profileOrOptions?.profile;
+    const refresh =
+      typeof profileOrOptions === "object" && !!profileOrOptions.refresh;
+    const qs = new URLSearchParams();
+    if (profile) qs.set("profile", profile);
+    if (refresh) qs.set("refresh", "1");
+    return fetchJSON<ModelOptionsResponse>(`/api/model/options?${qs.toString()}`);
+  },
   getAuxiliaryModels: () => fetchJSON<AuxiliaryModelsResponse>("/api/model/auxiliary"),
   getMoaModels: () => fetchJSON<MoaConfigResponse>("/api/model/moa"),
   saveMoaModels: (body: MoaConfigResponse) =>
