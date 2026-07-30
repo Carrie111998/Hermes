@@ -313,3 +313,68 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
 
+
+
+class TestAuditScanSource:
+    """Audit must classify official optional skills the way install did (#73099).
+
+    ``do_audit`` passed the lockfile *identifier* straight into the trust
+    resolver. For an official optional skill that identifier is multi-segment
+    (``official/software-development/subagent-driven-development``), and
+    ``_resolve_trust_level`` matches only the bare string ``official`` — so the
+    skill was downgraded to ``community`` at audit time, turning a permitted
+    CAUTION into a misleading community-source BLOCKED.
+    """
+
+    def test_official_multi_segment_identifier_scans_as_official(self):
+        from hermes_cli.skills_hub import _scan_source_for_entry
+
+        entry = {
+            "source": "official",
+            "identifier": "official/software-development/subagent-driven-development",
+        }
+        assert _scan_source_for_entry(entry) == "official"
+
+    def test_official_scan_source_resolves_to_builtin_trust(self):
+        """End-to-end through the resolver the audit path actually calls."""
+        from hermes_cli.skills_hub import _scan_source_for_entry
+        from tools.skills_guard import _resolve_trust_level
+
+        entry = {
+            "source": "official",
+            "identifier": "official/mlops/models/segment-anything",
+        }
+        assert _resolve_trust_level(_scan_source_for_entry(entry)) == "builtin"
+
+    def test_skills_sh_identifier_is_preserved(self):
+        """skills-sh trust depends on the identifier, so it must pass through."""
+        from hermes_cli.skills_hub import _scan_source_for_entry
+        from tools.skills_guard import _resolve_trust_level
+
+        entry = {
+            "source": "skills-sh",
+            "identifier": "skills-sh/anthropics/skills/frontend-design",
+        }
+        assert _scan_source_for_entry(entry) == "skills-sh/anthropics/skills/frontend-design"
+        assert _resolve_trust_level(_scan_source_for_entry(entry)) == "trusted"
+
+    def test_identifier_named_official_does_not_grant_builtin(self):
+        """Trust comes from the recorded source, never from identifier text.
+
+        A community repo whose identifier merely starts with "official/" must
+        stay community — this is the property the original bare-string match
+        existed to protect.
+        """
+        from hermes_cli.skills_hub import _scan_source_for_entry
+        from tools.skills_guard import _resolve_trust_level
+
+        entry = {
+            "source": "community",
+            "identifier": "official/evil/backdoor",
+        }
+        assert _resolve_trust_level(_scan_source_for_entry(entry)) == "community"
+
+    def test_missing_identifier_falls_back_to_source(self):
+        from hermes_cli.skills_hub import _scan_source_for_entry
+
+        assert _scan_source_for_entry({"source": "community"}) == "community"

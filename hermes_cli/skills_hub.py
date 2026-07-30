@@ -1097,6 +1097,29 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
     c.print(f"[bold green]Updated {len(updates)} skill(s).[/]\n")
 
 
+def _scan_source_for_entry(entry: dict) -> str:
+    """Return the trust source a lockfile entry should be scanned under.
+
+    Mirrors the derivation ``do_install`` uses at install time. An official
+    optional skill is scanned as the literal ``"official"``; its lockfile
+    *identifier* is a multi-segment path such as
+    ``official/software-development/subagent-driven-development``, which
+    ``_resolve_trust_level`` does not recognize — it matches only the bare
+    string — so passing the identifier through downgraded the skill to
+    ``community`` at audit time even though install classified it ``builtin``
+    (#73099).
+
+    Trust still comes from the lockfile's recorded ``source`` field, never from
+    the identifier text, so a user-controlled repository named
+    ``official/<something>`` cannot claim builtin trust by its name alone.
+    Every other source keeps using the identifier, which is what lets
+    ``skills-sh/<owner>/<repo>/<skill>`` resolve against ``TRUSTED_REPOS``.
+    """
+    if entry.get("source") == "official":
+        return "official"
+    return entry.get("identifier") or entry.get("source", "")
+
+
 def do_audit(name: Optional[str] = None, console: Optional[Console] = None,
              deep: bool = False) -> None:
     """Re-run security scan on installed hub skills.
@@ -1134,7 +1157,7 @@ def do_audit(name: Optional[str] = None, console: Optional[Console] = None,
             c.print(f"[yellow]Warning:[/] {entry['name']} — path missing: {entry['install_path']}")
             continue
 
-        result = scan_skill(skill_path, source=entry.get("identifier", entry["source"]))
+        result = scan_skill(skill_path, source=_scan_source_for_entry(entry))
         c.print(format_scan_report(result))
 
         if deep:
