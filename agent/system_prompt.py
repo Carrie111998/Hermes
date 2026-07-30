@@ -497,6 +497,19 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
+        # Root AGENTS.md is a deliberate universal-policy source for named
+        # profiles, not cwd-local project context. Keep it in the stable tier
+        # and suppress it if an explicit root cwd already loaded the same body
+        # through the ordinary AGENTS.md contract.
+        universal_policy = _r.load_universal_policy_md(_ctx_len)
+        if universal_policy and universal_policy not in context_files_prompt:
+            stable_parts.append(
+                "# Universal Profile Policy\n\n"
+                "The following policy comes from the Hermes root AGENTS.md and "
+                "applies to named profiles. It is not project-cwd context.\n\n"
+                + universal_policy
+            )
+
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
