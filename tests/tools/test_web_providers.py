@@ -135,7 +135,7 @@ class TestWebProviderABCs:
 
 
 class TestPerCapabilityBackendSelection:
-    """_get_search_backend and _get_extract_backend read per-capability config."""
+    """_get_search_backend and _get_extract_backends read per-capability config."""
 
     def test_search_backend_overrides_generic(self, monkeypatch):
         from tools import web_tools
@@ -155,7 +155,7 @@ class TestPerCapabilityBackendSelection:
             "extract_backend": "exa",
         })
         monkeypatch.setenv("EXA_API_KEY", "test-key")
-        assert web_tools._get_extract_backend() == "exa"
+        assert web_tools._get_extract_backends() == ["exa"]
 
     def test_falls_back_to_generic_backend_when_search_backend_empty(self, monkeypatch):
         from tools import web_tools
@@ -175,7 +175,7 @@ class TestPerCapabilityBackendSelection:
             "extract_backend": "",
         })
         monkeypatch.setenv("PARALLEL_API_KEY", "test-key")
-        assert web_tools._get_extract_backend() == "parallel"
+        assert web_tools._get_extract_backends() == ["parallel"]
 
     def test_search_backend_ignored_when_not_available(self, monkeypatch):
         from tools import web_tools
@@ -198,7 +198,7 @@ class TestPerCapabilityBackendSelection:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         # No search_backend or extract_backend set — both fall through
         assert web_tools._get_search_backend() == "tavily"
-        assert web_tools._get_extract_backend() == "tavily"
+        assert web_tools._get_extract_backends() == ["tavily"]
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +412,13 @@ class TestDispatchersTriggerPluginDiscovery:
                 web_tools, "_load_web_config",
                 lambda: {"extract_backend": "firecrawl"},
             )
+            # "firecrawl" is a legacy backend name, so its availability check
+            # bypasses the registry entirely and probes real credentials
+            # (see _is_backend_available) — set one so _get_extract_backends()
+            # deterministically resolves to "firecrawl" per this test's own
+            # premise, rather than falling through to whatever backend
+            # _get_backend()'s auto-detect happens to prefer in this env.
+            monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
             # Sanity: registry IS empty before the tool call.
             assert web_search_registry.get_provider("firecrawl") is None
 

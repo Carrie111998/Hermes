@@ -869,21 +869,27 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
+            # Discover/load plugins BEFORE resolving the fallback chain —
+            # ``_get_extract_backends()`` filters entries by
+            # ``_is_backend_available()``, which for a custom (non-legacy)
+            # plugin backend delegates to the registry. Resolving the chain
+            # first would see an empty registry on a cold start (subprocess
+            # agent runs, delegate children, standalone scripts) and silently
+            # drop an otherwise-available custom fallback entry.
+            _ensure_web_plugins_loaded()
             backends = _get_extract_backends()
 
-            _ensure_web_plugins_loaded()
             from agent.web_search_registry import (
-                get_active_extract_provider,
                 get_provider as _wsp_get_provider,
                 _disabled_web_plugin_for,
             )
 
             last_error_json = None
             extracted_results = []
-            
-            for backend in backends:
+
+            for idx, backend in enumerate(backends):
                 provider = _wsp_get_provider(backend) if backend else None
-                
+
                 if provider is not None and not provider.supports_extract():
                     last_error_json = json.dumps(
                         {
@@ -898,10 +904,28 @@ async def web_extract_tool(
                         ensure_ascii=False,
                     )
                     continue
-                
-                provider = provider or get_active_extract_provider()
+
+                # An explicit chain entry must resolve exactly — never
+                # substitute the scalar active provider (which reads
+                # web.extract_backend / web.backend, not this chain entry)
+                # for an unregistered/unavailable name. Doing so could
+                # dispatch a provider the user never configured for this
+                # slot. Record an error and move on to the next entry.
                 if provider is None:
-                    disabled_key = _disabled_web_plugin_for(capability="extract")
+                    # Prefer the specific chain entry (correct for
+                    # web.extract_backends lists), but fall back to the
+                    # capability-wide lookup — which re-reads the real
+                    # web.extract_backend / web.backend scalar keys — for
+                    # legacy single-backend configs where this loop's
+                    # resolved entry can differ from the user's literal
+                    # config value (e.g. a disabled plugin has no real
+                    # credentials, so availability resolution falls through
+                    # to an unrelated auto-detected backend before ever
+                    # reaching the registry lookup).
+                    disabled_key = (
+                        _disabled_web_plugin_for(configured=backend, capability="extract")
+                        or _disabled_web_plugin_for(capability="extract")
+                    )
                     if disabled_key:
                         _vendor = disabled_key.split("/", 1)[-1]
                         last_error_json = json.dumps(
@@ -950,7 +974,7 @@ async def web_extract_tool(
                         continue
                         
                     all_failed = all(r.get("error") for r in extracted_results)
-                    if all_failed and len(backends) > 1 and backend != backends[-1]:
+                    if all_failed and len(backends) > 1 and idx != len(backends) - 1:
                         first_err = extracted_results[0].get("error", "Unknown error")
                         logger.warning(
                             "Extract via %s failed for all URLs (%s). Trying next backend.", provider.name, first_err
