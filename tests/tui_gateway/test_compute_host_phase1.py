@@ -99,6 +99,141 @@ def test_supervisor_startup_reconcile_pid_reuse_guard(tmp_path, monkeypatch):
     assert not registry.exists()
 
 
+def test_compute_host_reports_and_interrupts_process_local_subagents(tmp_path):
+    from unittest.mock import MagicMock
+
+    from tools.delegate_tool import _register_subagent, _unregister_subagent
+
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, heartbeat_secs=0)
+    agent = MagicMock()
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    _register_subagent(
+        {
+            "subagent_id": "sa-compute-local",
+            "goal": "process local child",
+            "status": "running",
+            "agent": agent,
+            "_profile_home": str(profile_home),
+        }
+    )
+    try:
+        host.handle_frame(
+            {
+                "type": "subagent.status",
+                "request_id": "status-1",
+                "profile_home": str(profile_home),
+            }
+        )
+        host.handle_frame(
+            {
+                "type": "subagent.interrupt",
+                "request_id": "interrupt-1",
+                "profile_home": str(profile_home),
+                "subagent_id": "sa-compute-local",
+            }
+        )
+    finally:
+        _unregister_subagent("sa-compute-local")
+        host.close()
+
+    frames = _json_lines(out)
+    status = next(frame for frame in frames if frame.get("request_id") == "status-1")
+    interrupted = next(frame for frame in frames if frame.get("request_id") == "interrupt-1")
+    assert status["type"] == "subagent.status.ack"
+    assert [row["subagent_id"] for row in status["active"]] == ["sa-compute-local"]
+    assert interrupted == {
+        **{key: interrupted[key] for key in ("host_ns",)},
+        "type": "subagent.interrupt.ack",
+        "request_id": "interrupt-1",
+        "interrupted": True,
+    }
+    agent.interrupt.assert_called_once_with(
+        "Interrupted via TUI (sa-compute-local)"
+    )
+
+
+def test_supervisor_subagent_query_round_trip(tmp_path, monkeypatch):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "registry.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+
+    def respond(frame):
+        supervisor._handle_host_frame(
+            {
+                "type": f"{frame['type']}.ack",
+                "request_id": frame["request_id"],
+                "active": [{"subagent_id": "sa-host-round-trip"}],
+                "interrupted": True,
+            }
+        )
+
+    monkeypatch.setattr(supervisor, "_send_frame", respond)
+
+    status = supervisor.subagent_status("/profiles/default")
+    interrupted = supervisor.interrupt_subagent(
+        "sa-host-round-trip",
+        profile_home="/profiles/default",
+    )
+
+    assert status["active"] == [{"subagent_id": "sa-host-round-trip"}]
+    assert interrupted is True
+
+
+def test_supervisor_subagent_query_timeout_is_explicit(tmp_path, monkeypatch):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "registry.json",
+        argv=[sys.executable, "-c", ""],
+        autostart=False,
+    )
+    monkeypatch.setattr(supervisor, "start", lambda: None)
+    monkeypatch.setattr(supervisor, "_send_frame", lambda _frame: None)
+
+    with pytest.raises(TimeoutError, match=r"subagent\.status timed out after 0\.01s"):
+        supervisor.subagent_status("/profiles/default", timeout=0.01)
+
+
+def test_supervisor_subagent_query_crosses_real_compute_host_process(tmp_path):
+    supervisor = HostSupervisor(
+        registry_path=tmp_path / "registry.json",
+        heartbeat_secs=0,
+        autostart=False,
+    )
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+
+    try:
+        response = supervisor.subagent_status(str(profile_home), timeout=5.0)
+        interrupted = supervisor.interrupt_subagent(
+            "sa-does-not-exist",
+            profile_home=str(profile_home),
+            timeout=5.0,
+        )
+    finally:
+        supervisor.shutdown()
+
+    assert response["type"] == "subagent.status.ack"
+    assert response["active"] == []
+    assert interrupted is False
+
+
+def test_compute_host_subagent_query_rejects_unscoped_frame():
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, heartbeat_secs=0)
+    try:
+        host.handle_frame({"type": "subagent.status", "request_id": "unscoped"})
+    finally:
+        host.close()
+
+    frame = next(item for item in _json_lines(out) if item.get("request_id") == "unscoped")
+    assert frame["type"] == "subagent.status.error"
+    assert frame["message"] == "profile_home required"
+
+
 def _make_compress_host_session(events: list) -> dict:
     class _Agent:
         model = "host-model"

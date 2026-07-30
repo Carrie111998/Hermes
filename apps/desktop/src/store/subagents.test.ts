@@ -354,6 +354,33 @@ describe('subagent store', () => {
     expect(listFor('runtime-b').map(item => item.id)).toEqual(['profile-b-agent'])
   })
 
+  it('does not reap prior rows from an incomplete backend snapshot', () => {
+    reconcileActiveSubagents(
+      {
+        active: [
+          {
+            goal: 'survives host timeout',
+            origin_ui_session_id: 'runtime-incomplete',
+            profile: 'incomplete-profile',
+            status: 'running',
+            subagent_id: 'sa-incomplete'
+          }
+        ],
+        complete: true
+      },
+      'incomplete-profile'
+    )
+
+    reconcileActiveSubagents(
+      { active: [], complete: false, errors: ['compute host did not answer'] },
+      'incomplete-profile'
+    )
+    expect(listFor('runtime-incomplete').map(item => item.id)).toEqual(['sa-incomplete'])
+
+    reconcileActiveSubagents({ active: [], complete: true }, 'incomplete-profile')
+    expect(listFor('runtime-incomplete')).toEqual([])
+  })
+
   it('promotes a queued event row without replacing its richer metadata', () => {
     const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(3_000_000)
 

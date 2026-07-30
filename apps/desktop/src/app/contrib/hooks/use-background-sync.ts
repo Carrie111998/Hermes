@@ -320,12 +320,19 @@ export function useBackgroundSync({
       inFlight = true
 
       try {
-        const response = await requestGateway<ActiveSubagentResponse>('delegation.status', {
-          profile: activeGatewayProfile
-        })
+        const response = await requestGateway<ActiveSubagentResponse>('delegation.status', {})
 
         if (!cancelled) {
-          reconcileActiveSubagents(response, activeGatewayProfile)
+          reconcileActiveSubagents(
+            {
+              ...response,
+              active: (response.active ?? []).map(row => ({
+                ...row,
+                profile: activeGatewayProfile
+              }))
+            },
+            activeGatewayProfile
+          )
         }
       } catch {
         // Older/incompatible gateways keep the existing event-driven behavior.

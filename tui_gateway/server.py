@@ -1220,12 +1220,15 @@ def _profile_scope_home(profile: str | None) -> Path | None:
     resolves to the launch home so profile-owned registries can always filter
     fail-closed rather than treating an unknown name as the launch profile.
     """
-    name = (profile or "").strip()
-    if not name:
+    if profile is None:
         return Path(_hermes_home)
     try:
         from hermes_cli import profiles as profiles_mod
 
+        if not isinstance(profile, str):
+            return None
+        name = profiles_mod.normalize_profile_name(profile)
+        profiles_mod.validate_profile_name(name)
         home = Path(profiles_mod.get_profile_dir(name))
     except Exception:
         return None
@@ -1233,6 +1236,32 @@ def _profile_scope_home(profile: str | None) -> Path | None:
     if home.resolve() == Path(_hermes_home).resolve():
         return Path(_hermes_home)
     return home if (home / "state.db").exists() or home.exists() else None
+
+
+def _requested_profile_name(params: dict) -> str | None:
+    """Validated profile selector for a session-less RPC.
+
+    Explicit params win. Otherwise the WebSocket descriptor profile scopes an
+    app-global remote connection. A dedicated per-profile backend carries no
+    descriptor profile and therefore uses its launch home.
+    """
+    raw = params.get("profile") if params.get("profile") is not None else None
+    if raw is None:
+        transport = current_transport()
+        raw = getattr(transport, "profile", None) if transport is not None else None
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("invalid profile")
+
+    from hermes_cli import profiles as profiles_mod
+
+    try:
+        name = profiles_mod.normalize_profile_name(raw)
+        profiles_mod.validate_profile_name(name)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid profile") from exc
+    return name
 
 
 def _profile_home(profile: str | None) -> Path | None:

@@ -153,6 +153,41 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     assert events == ["accept", "ready_after_0"]
 
 
+def test_ws_transport_captures_profile_query_for_sessionless_rpc(monkeypatch):
+    seen_profiles = []
+
+    class FakeWS:
+        query_params = {"profile": "meta"}
+
+        def __init__(self):
+            self.received = False
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, _line):
+            pass
+
+        async def receive_text(self):
+            if self.received:
+                raise ws_mod._WebSocketDisconnect()
+            self.received = True
+            return json.dumps({"id": "status", "method": "delegation.status", "params": {}})
+
+        async def close(self):
+            pass
+
+    def dispatch(_req, transport):
+        seen_profiles.append(transport.profile)
+        return {"id": "status", "result": {}}
+
+    monkeypatch.setattr(server, "dispatch", dispatch)
+
+    asyncio.run(ws_mod.handle_ws(FakeWS()))
+
+    assert seen_profiles == ["meta"]
+
+
 def test_ws_transport_serializes_concurrent_sends():
     active_sends = 0
     max_active_sends = 0

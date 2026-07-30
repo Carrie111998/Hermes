@@ -14317,6 +14317,209 @@ def test_delegation_status_rejects_unknown_profile_instead_of_falling_back(monke
     assert response["error"]["message"] == "profile not found"
 
 
+@pytest.mark.parametrize(
+    "bad_profile",
+    [False, 0, [], {}, "", ".", "..", "../escape", "/tmp/escape"],
+    ids=["false", "zero", "list", "dict", "empty", "dot", "dotdot", "relative", "absolute"],
+)
+def test_delegation_status_rejects_malformed_profile_selectors(bad_profile):
+    response = server.dispatch(
+        {
+            "id": "malformed-profile-status",
+            "jsonrpc": "2.0",
+            "method": "delegation.status",
+            "params": {"profile": bad_profile},
+        }
+    )
+
+    assert response["error"]["code"] == 4000
+    assert response["error"]["message"] == "invalid profile"
+
+
+@pytest.mark.parametrize("bad_profile", [False, 0, [], {}, "", ".."])
+def test_subagent_interrupt_rejects_malformed_profile_selectors(bad_profile):
+    response = server.dispatch(
+        {
+            "id": "malformed-profile-interrupt",
+            "jsonrpc": "2.0",
+            "method": "subagent.interrupt",
+            "params": {"profile": bad_profile, "subagent_id": "sa-secret"},
+        }
+    )
+
+    assert response["error"]["code"] == 4000
+    assert response["error"]["message"] == "invalid profile"
+
+
+def test_delegation_status_uses_profile_bound_to_websocket_transport(tmp_path, monkeypatch):
+    from tools.delegate_tool import _register_subagent, _unregister_subagent
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    monkeypatch.setattr(
+        server,
+        "_profile_scope_home",
+        lambda profile: profile_a if profile == "profile-a" else profile_b,
+    )
+    _register_subagent(
+        {
+            "subagent_id": "sa-transport-profile-a",
+            "goal": "profile a transport goal",
+            "status": "running",
+            "_profile_home": str(profile_a),
+        }
+    )
+    _register_subagent(
+        {
+            "subagent_id": "sa-transport-profile-b",
+            "goal": "profile b transport goal",
+            "status": "running",
+            "_profile_home": str(profile_b),
+        }
+    )
+    transport = types.SimpleNamespace(profile="profile-a")
+    token = bind_transport(transport)
+    try:
+        response = server.dispatch(
+            {
+                "id": "transport-profile-status",
+                "jsonrpc": "2.0",
+                "method": "delegation.status",
+                "params": {},
+            },
+            transport,
+        )
+    finally:
+        reset_transport(token)
+        _unregister_subagent("sa-transport-profile-a")
+        _unregister_subagent("sa-transport-profile-b")
+
+    assert [row["subagent_id"] for row in response["result"]["active"]] == [
+        "sa-transport-profile-a"
+    ]
+    assert response["result"]["active"][0]["profile"] == "profile-a"
+
+
+def test_delegation_status_merges_compute_host_registry(tmp_path, monkeypatch):
+    from tools.delegate_tool import _register_subagent, _unregister_subagent
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+
+    class FakeSupervisor:
+        def subagent_status(self, requested_home):
+            assert requested_home == str(profile_home.resolve())
+            return {
+                "type": "subagent.status.ack",
+                "active": [
+                    {
+                        "subagent_id": "sa-compute-host",
+                        "goal": "isolated child",
+                        "status": "running",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(server, "_profile_scope_home", lambda _profile: profile_home)
+    monkeypatch.setattr(
+        server,
+        "_load_dashboard_process_isolation_config",
+        lambda: {"turn_isolation": True},
+    )
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: FakeSupervisor())
+    _register_subagent(
+        {
+            "subagent_id": "sa-serving-process",
+            "goal": "inline child",
+            "status": "running",
+            "_profile_home": str(profile_home),
+        }
+    )
+    try:
+        response = server.dispatch(
+            {
+                "id": "merged-status",
+                "jsonrpc": "2.0",
+                "method": "delegation.status",
+                "params": {"profile": "default"},
+            }
+        )
+    finally:
+        _unregister_subagent("sa-serving-process")
+
+    assert response["result"]["complete"] is True
+    assert [row["subagent_id"] for row in response["result"]["active"]] == [
+        "sa-serving-process",
+        "sa-compute-host",
+    ]
+
+
+def test_delegation_status_marks_snapshot_incomplete_when_compute_host_query_fails(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+
+    class FailingSupervisor:
+        def subagent_status(self, _requested_home):
+            raise TimeoutError("compute host did not answer")
+
+    monkeypatch.setattr(server, "_profile_scope_home", lambda _profile: profile_home)
+    monkeypatch.setattr(
+        server,
+        "_load_dashboard_process_isolation_config",
+        lambda: {"turn_isolation": True},
+    )
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: FailingSupervisor())
+
+    response = server.dispatch(
+        {
+            "id": "incomplete-status",
+            "jsonrpc": "2.0",
+            "method": "delegation.status",
+            "params": {"profile": "default"},
+        }
+    )
+
+    assert response["result"]["complete"] is False
+    assert response["result"]["active"] == []
+    assert response["result"]["errors"] == ["compute host did not answer"]
+
+
+def test_subagent_interrupt_routes_to_compute_host_with_profile_scope(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+
+    class FakeSupervisor:
+        def interrupt_subagent(self, subagent_id, *, profile_home: str):
+            assert subagent_id == "sa-compute-host"
+            assert profile_home == str((tmp_path / "profile").resolve())
+            return True
+
+    monkeypatch.setattr(server, "_profile_scope_home", lambda _profile: profile_home)
+    monkeypatch.setattr(
+        server,
+        "_load_dashboard_process_isolation_config",
+        lambda: {"turn_isolation": True},
+    )
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: FakeSupervisor())
+
+    response = server.dispatch(
+        {
+            "id": "compute-host-interrupt",
+            "jsonrpc": "2.0",
+            "method": "subagent.interrupt",
+            "params": {"profile": "default", "subagent_id": "sa-compute-host"},
+        }
+    )
+
+    assert response["result"] == {
+        "found": True,
+        "subagent_id": "sa-compute-host",
+    }
+
+
 def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch):
     """#48305: switching models from the TUI must NOT destroy sibling keys under
     `model:` (model_slots, model_fallback, etc.). _persist_model_switch now uses

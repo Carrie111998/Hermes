@@ -199,6 +199,10 @@ class ComputeHost:
             self._handle_reload_mcp(frame)
         elif kind == "control":
             self._handle_control(frame)
+        elif kind == "subagent.status":
+            self._handle_subagent_status(frame)
+        elif kind == "subagent.interrupt":
+            self._handle_subagent_interrupt(frame)
         elif kind == "shutdown":
             self.emit({"type": "shutdown.ack", "request_id": frame.get("request_id")})
             # Explicit supervisor/test shutdown is a clean child-process close;
@@ -211,6 +215,61 @@ class ComputeHost:
                     "type": "error",
                     "request_id": frame.get("request_id"),
                     "message": f"unknown frame type: {kind}",
+                }
+            )
+
+    def _handle_subagent_status(self, frame: dict[str, Any]) -> None:
+        from tools.delegate_tool import list_active_subagents
+
+        request_id = frame.get("request_id")
+        try:
+            profile_home = frame.get("profile_home")
+            if not isinstance(profile_home, str) or not profile_home.strip():
+                raise ValueError("profile_home required")
+            active = list_active_subagents(
+                profile_home=profile_home
+            )
+            self.emit(
+                {
+                    "type": "subagent.status.ack",
+                    "request_id": request_id,
+                    "active": active,
+                }
+            )
+        except Exception as exc:
+            self.emit(
+                {
+                    "type": "subagent.status.error",
+                    "request_id": request_id,
+                    "message": str(exc),
+                }
+            )
+
+    def _handle_subagent_interrupt(self, frame: dict[str, Any]) -> None:
+        from tools.delegate_tool import interrupt_subagent
+
+        request_id = frame.get("request_id")
+        try:
+            profile_home = frame.get("profile_home")
+            if not isinstance(profile_home, str) or not profile_home.strip():
+                raise ValueError("profile_home required")
+            interrupted = interrupt_subagent(
+                str(frame.get("subagent_id") or ""),
+                profile_home=profile_home,
+            )
+            self.emit(
+                {
+                    "type": "subagent.interrupt.ack",
+                    "request_id": request_id,
+                    "interrupted": interrupted,
+                }
+            )
+        except Exception as exc:
+            self.emit(
+                {
+                    "type": "subagent.interrupt.error",
+                    "request_id": request_id,
+                    "message": str(exc),
                 }
             )
 

@@ -89,10 +89,12 @@ describe('useBackgroundSync subagent reconciliation', () => {
 
       if (method === 'delegation.status') {
         return {
+          complete: true,
           active: [
             {
               goal: 'visible after reconnect',
               origin_ui_session_id: 'runtime-reconnected',
+              profile: 'default',
               status: 'running',
               subagent_id: 'sa-reconnected'
             }
@@ -123,7 +125,7 @@ describe('useBackgroundSync subagent reconciliation', () => {
     )
 
     await waitFor(() => {
-      expect(requestGateway).toHaveBeenCalledWith('delegation.status', { profile: 'reconnect-test' })
+      expect(requestGateway).toHaveBeenCalledWith('delegation.status', {})
       expect($subagentsBySession.get()['runtime-reconnected']?.[0]?.id).toBe('sa-reconnected')
     })
 

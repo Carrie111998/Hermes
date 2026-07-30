@@ -50,6 +50,8 @@ const TOOL_PREVIEW_MAX = 96
 
 export interface ActiveSubagentResponse {
   active?: SubagentPayload[]
+  complete?: boolean
+  errors?: string[]
 }
 
 export const $subagentsBySession = atom<Record<string, SubagentProgress[]>>({})
@@ -281,6 +283,7 @@ export function upsertSubagent(sid: string, payload: SubagentPayload, createIfMi
 export function reconcileActiveSubagents(response: ActiveSubagentResponse, profileKey = 'default') {
   const previous = activeSnapshotRowsByProfile.get(profileKey) ?? new Map<string, string>()
   const current = new Map<string, string>()
+  const complete = response.complete !== false
 
   for (const payload of response.active ?? []) {
     const sid = str(payload.origin_ui_session_id).trim()
@@ -311,23 +314,35 @@ export function reconcileActiveSubagents(response: ActiveSubagentResponse, profi
     }
   }
 
-  for (const [id, sid] of previous) {
-    if (current.has(id)) {
-      continue
+  if (complete) {
+    for (const [id, sid] of previous) {
+      if (current.has(id)) {
+        continue
+      }
+
+      const map = $subagentsBySession.get()
+      const list = map[sid]
+
+      if (!list?.some(item => item.id === id && !TERMINAL.has(item.status))) {
+        continue
+      }
+
+      const next = list.filter(item => item.id !== id || TERMINAL.has(item.status))
+      $subagentsBySession.set({ ...map, [sid]: next })
     }
-
-    const map = $subagentsBySession.get()
-    const list = map[sid]
-
-    if (!list?.some(item => item.id === id && !TERMINAL.has(item.status))) {
-      continue
-    }
-
-    const next = list.filter(item => item.id !== id || TERMINAL.has(item.status))
-    $subagentsBySession.set({ ...map, [sid]: next })
   }
 
-  activeSnapshotRowsByProfile.set(profileKey, current)
+  if (complete) {
+    activeSnapshotRowsByProfile.set(profileKey, current)
+  } else {
+    const retained = new Map(previous)
+
+    for (const [id, sid] of current) {
+      retained.set(id, sid)
+    }
+
+    activeSnapshotRowsByProfile.set(profileKey, retained)
+  }
 }
 
 export function buildSubagentTree(items: readonly SubagentProgress[]): SubagentNode[] {

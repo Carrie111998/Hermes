@@ -89,10 +89,12 @@ class WSTransport:
         loop: asyncio.AbstractEventLoop,
         *,
         peer: str = "unknown",
+        profile: str | None = None,
     ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        self.profile = profile
         self._closed = False
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
@@ -301,7 +303,15 @@ async def handle_ws(ws: Any) -> None:
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        query_params = getattr(ws, "query_params", {}) or {}
+        raw_profile = query_params.get("profile") if hasattr(query_params, "get") else None
+        profile = raw_profile.strip() if isinstance(raw_profile, str) and raw_profile.strip() else None
+        transport = WSTransport(
+            ws,
+            asyncio.get_running_loop(),
+            peer=peer,
+            profile=profile,
+        )
 
         ready_ok = await transport.write_async(
             {

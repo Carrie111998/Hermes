@@ -2726,13 +2726,43 @@ def _(rid, params: dict) -> dict:
         _get_max_spawn_depth,
     )
 
-    requested_profile = str(params.get("profile") or "").strip()
+    try:
+        requested_profile = _requested_profile_name(params)
+    except ValueError:
+        return _err(rid, 4000, "invalid profile")
     profile_home = _profile_scope_home(requested_profile)
     if profile_home is None:
         return _err(rid, 4040, "profile not found")
-    rows = list_active_subagents(profile_home=str(profile_home))
+    local_rows = list_active_subagents(profile_home=str(profile_home))
+    rows_by_id = {
+        str(row.get("subagent_id") or ""): row
+        for row in local_rows
+        if str(row.get("subagent_id") or "")
+    }
+    complete = True
+    errors: list[str] = []
+    if _turn_isolation_enabled():
+        try:
+            host_response = _get_compute_host_supervisor().subagent_status(
+                str(profile_home.resolve())
+            )
+            if host_response.get("type") == "subagent.status.error":
+                raise RuntimeError(
+                    str(host_response.get("message") or "compute host status failed")
+                )
+            for row in host_response.get("active") or []:
+                if not isinstance(row, dict):
+                    continue
+                subagent_id = str(row.get("subagent_id") or "")
+                if subagent_id:
+                    rows_by_id.setdefault(subagent_id, row)
+        except Exception as exc:
+            complete = False
+            errors.append(str(exc))
+    rows = list(rows_by_id.values())
+    profile_key = _response_profile_name(requested_profile)
     for row in rows:
-        row["profile"] = requested_profile or "default"
+        row["profile"] = profile_key
 
     return _ok(
         rid,
@@ -2741,6 +2771,8 @@ def _(rid, params: dict) -> dict:
             "paused": is_spawn_paused(),
             "max_spawn_depth": _get_max_spawn_depth(),
             "max_concurrent_children": _get_max_concurrent_children(),
+            "complete": complete,
+            "errors": errors,
         },
     )
 
@@ -2760,10 +2792,26 @@ def _(rid, params: dict) -> dict:
     subagent_id = str(params.get("subagent_id") or "").strip()
     if not subagent_id:
         return _err(rid, 4000, "subagent_id required")
-    profile_home = _profile_scope_home(str(params.get("profile") or "").strip())
+    try:
+        requested_profile = _requested_profile_name(params)
+    except ValueError:
+        return _err(rid, 4000, "invalid profile")
+    profile_home = _profile_scope_home(requested_profile)
     if profile_home is None:
         return _err(rid, 4040, "profile not found")
     ok = interrupt_subagent(subagent_id, profile_home=str(profile_home))
+    if not ok and _turn_isolation_enabled():
+        try:
+            ok = _get_compute_host_supervisor().interrupt_subagent(
+                subagent_id,
+                profile_home=str(profile_home.resolve()),
+            )
+        except Exception as exc:
+            return _err(
+                rid,
+                5019,
+                f"compute-host subagent interrupt failed: {exc}",
+            )
     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
 
 

@@ -310,6 +310,63 @@ class HostSupervisor:
             with self._lock:
                 self._pending_controls.pop(request_id, None)
 
+    def _request_frame(self, frame: dict[str, Any], *, timeout: float) -> dict:
+        self.start()
+        request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        payload = dict(frame)
+        payload["request_id"] = request_id
+        q: queue.Queue[dict] = queue.Queue(maxsize=1)
+        with self._lock:
+            self._pending_controls[request_id] = q
+        try:
+            self._send_frame(payload)
+            try:
+                return q.get(timeout=timeout)
+            except queue.Empty as exc:
+                raise TimeoutError(
+                    f"{payload.get('type') or 'host request'} timed out after {timeout:g}s"
+                ) from exc
+        finally:
+            with self._lock:
+                self._pending_controls.pop(request_id, None)
+
+    def subagent_status(self, profile_home: str, *, timeout: float = 3.0) -> dict:
+        """Read the process-local active registry from the compute host."""
+        response = self._request_frame(
+            {
+                "type": "subagent.status",
+                "profile_home": profile_home,
+            },
+            timeout=timeout,
+        )
+        if response.get("type") != "subagent.status.ack":
+            raise RuntimeError(
+                str(response.get("message") or "compute-host status failed")
+            )
+        return response
+
+    def interrupt_subagent(
+        self,
+        subagent_id: str,
+        *,
+        profile_home: str,
+        timeout: float = 3.0,
+    ) -> bool:
+        """Interrupt one compute-host child after profile ownership checking."""
+        response = self._request_frame(
+            {
+                "type": "subagent.interrupt",
+                "profile_home": profile_home,
+                "subagent_id": subagent_id,
+            },
+            timeout=timeout,
+        )
+        if response.get("type") != "subagent.interrupt.ack":
+            raise RuntimeError(
+                str(response.get("message") or "compute-host interrupt failed")
+            )
+        return bool(response.get("interrupted"))
+
     def _spawn_locked(self, *, reason: str) -> None:
         if self._stopped_respawning:
             raise RuntimeError("compute host respawn disabled after crash loop")
@@ -430,7 +487,17 @@ class HostSupervisor:
         if ftype in {"turn.end", "turn.error"}:
             self._complete_turn(frame)
             return
-        if ftype in {"control.ack", "control.error", "interrupt.ack", "reload_mcp.ack", "shutdown.ack"}:
+        if ftype in {
+            "control.ack",
+            "control.error",
+            "interrupt.ack",
+            "reload_mcp.ack",
+            "shutdown.ack",
+            "subagent.status.ack",
+            "subagent.status.error",
+            "subagent.interrupt.ack",
+            "subagent.interrupt.error",
+        }:
             request_id = str(frame.get("request_id") or "")
             with self._lock:
                 q = self._pending_controls.get(request_id)
