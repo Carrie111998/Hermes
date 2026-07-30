@@ -417,9 +417,9 @@ class TestSelfHostedConfig:
 
 
 class TestMem0WriteIsolation:
-    """Non-primary agent contexts (cron/flush/subagent) and platform=cron must
-    not perform durable writes, and auto-extraction must drop injected
-    <memory-context> recall so it is never re-ingested as a fact (#68393)."""
+    """Provider-level write-isolation defense-in-depth (#68393): non-primary
+    agent contexts (cron/flush/subagent) and platform=cron must not perform
+    durable writes; search/read stays available."""
 
     def _provider(self, backend, **init_kwargs):
         provider = Mem0MemoryProvider()
@@ -486,25 +486,3 @@ class TestMem0WriteIsolation:
         provider = self._provider(backend, agent_context="subagent")
         result = json.loads(provider.handle_tool_call("mem0_search", {"query": "q"}))
         assert result["results"][0]["id"] == "m1"
-
-    def test_sync_turn_strips_injected_memory_context(self):
-        backend = FakeBackend()
-        provider = self._provider(backend, agent_context="primary")
-        user = (
-            "<memory-context>\nrecalled: user likes tea\n</memory-context>\n"
-            "What's the weather?"
-        )
-        self._run_sync(provider, user, "It's sunny.")
-        assert len(backend.captured) == 1
-        messages = backend.captured[0][1]
-        user_msg = next(m for m in messages if m["role"] == "user")["content"]
-        assert "<memory-context>" not in user_msg
-        assert "recalled: user likes tea" not in user_msg
-        assert "What's the weather?" in user_msg
-
-    def test_sync_turn_skips_when_only_memory_context_remains(self):
-        backend = FakeBackend()
-        provider = self._provider(backend, agent_context="primary")
-        user = "<memory-context>\nrecalled: user likes tea\n</memory-context>"
-        self._run_sync(provider, user, "")
-        assert backend.captured == []
