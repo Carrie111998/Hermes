@@ -2664,9 +2664,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Close the database connection.
 
         Drains queued token deltas first (the background writer needs the
-        connection). Writable connections then attempt a TRUNCATE WAL
-        checkpoint so exiting writer processes help shrink the WAL file.
-        Read-only connections never request a checkpoint.
+        connection), then attempts a PASSIVE WAL checkpoint so that
+        committed frames are settled without risking corruption.
         """
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
@@ -8783,7 +8782,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             try:
                 self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception as exc:
-                logger.debug("WAL checkpoint (TRUNCATE) before VACUUM failed: %s", exc)
+                logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
             self._conn.execute("VACUUM")
         return optimized
 
