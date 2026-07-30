@@ -168,3 +168,31 @@ class TestTranscribeLocalWiring:
         ]
         _, result = self._run(monkeypatch, {}, segments=segments)
         assert result["transcript"] == "real speech"
+
+    def test_thresholds_reach_model_defaults(self, monkeypatch):
+        captured, _ = self._run(monkeypatch, {})
+        assert captured["no_speech_threshold"] == 0.6
+        assert captured["log_prob_threshold"] == -1.0
+
+    def test_thresholds_reach_model_configured(self, monkeypatch):
+        stt_cfg = {
+            "local": {
+                "no_speech_prob_threshold": 0.4,
+                "logprob_threshold": -0.7,
+            }
+        }
+        captured, _ = self._run(monkeypatch, stt_cfg)
+        assert captured["no_speech_threshold"] == 0.4
+        assert captured["log_prob_threshold"] == -0.7
+
+    def test_thresholds_reach_model_invalid_fallback(self, monkeypatch):
+        stt_cfg = {
+            "local": {
+                "no_speech_prob_threshold": "invalid",
+                "logprob_threshold": None,
+            }
+        }
+        captured, _ = self._run(monkeypatch, stt_cfg)
+        assert captured["no_speech_threshold"] == 0.6
+        assert captured["log_prob_threshold"] == -1.0
+

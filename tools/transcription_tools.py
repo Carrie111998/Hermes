@@ -1526,6 +1526,10 @@ def build_local_transcribe_kwargs(stt_config: Optional[Dict[str, Any]] = None) -
         "condition_on_previous_text": False,
     }
 
+    no_speech_threshold, logprob_threshold = _confidence_thresholds(local_cfg)
+    kwargs["no_speech_threshold"] = no_speech_threshold
+    kwargs["log_prob_threshold"] = logprob_threshold
+
     vad_enabled = local_cfg.get("vad", True)
     if vad_enabled is None:
         vad_enabled = True
