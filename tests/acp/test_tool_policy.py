@@ -142,6 +142,35 @@ class TestResolveAcpEnabledToolsets:
         assert "cronjob" not in enabled
         assert "kanban" not in enabled
 
+    @pytest.mark.parametrize(
+        "platform_toolsets",
+        [
+            {"cli": []},
+            {"cli": ["terminal"], "acp": []},
+        ],
+        ids=["cli-empty", "acp-empty"],
+    )
+    def test_profile_mode_preserves_explicit_empty_platform_list(
+        self, monkeypatch, platform_toolsets
+    ):
+        config = {
+            "acp": {"tool_policy": "profile"},
+            "platform_toolsets": platform_toolsets,
+            "mcp_servers": {},
+            "agent": {},
+        }
+        monkeypatch.delenv("HASS_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._xai_credentials_present",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_plugin_toolset_keys",
+            lambda: set(),
+        )
+
+        assert resolve_acp_enabled_toolsets(config) == []
+
 
 # ---------------------------------------------------------------------------
 # session construction / restore
@@ -214,6 +243,26 @@ class TestSessionToolPolicy:
         enabled = set(captured["enabled_toolsets"])
         assert "hermes-acp" not in enabled
         assert {"terminal", "skills", "memory", "cronjob", "delegation"} <= enabled
+
+    def test_profile_mode_session_preserves_explicit_empty_toolsets(
+        self, tmp_path, monkeypatch
+    ):
+        captured = {}
+        config = {
+            "model": {"provider": "openrouter", "default": "test-model"},
+            "acp": {"tool_policy": "profile"},
+            "platform_toolsets": {"cli": []},
+            "mcp_servers": {},
+            "agent": {},
+        }
+        _patch_agent_stack(monkeypatch, config, captured)
+        db = SessionDB(tmp_path / "state.db")
+
+        state = SessionManager(db=db).create_session(cwd="/work")
+
+        assert captured["enabled_toolsets"] == []
+        assert state.agent.enabled_toolsets == []
+        assert state.agent.acp_tool_policy == "profile"
 
     def test_restored_session_uses_same_profile_policy(self, tmp_path, monkeypatch):
         """Create under profile policy, drop memory, restore — policy must re-apply."""
@@ -321,22 +370,20 @@ async def test_profile_mode_ignores_host_mcp_servers(tmp_path, monkeypatch):
         "mcp_servers": {},
         "agent": {},
     }
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
-
+    captured = {}
+    _patch_agent_stack(monkeypatch, config, captured)
     agent = HermesACPAgent()
-    agent.session_manager = SessionManager(
-        agent_factory=lambda: SimpleNamespace(
-            enabled_toolsets=["terminal", "memory"],
-            disabled_toolsets=None,
-            tools=[],
-            valid_tool_names=set(),
-            session_id="s1",
-            model="m",
-        ),
-        db=SessionDB(tmp_path / "state.db"),
-    )
+    agent.session_manager = SessionManager(db=SessionDB(tmp_path / "state.db"))
     state = agent.session_manager.create_session(cwd="/work")
+    state.agent.disabled_toolsets = None
+    state.agent.tools = []
+    state.agent.valid_tool_names = set()
     original = list(state.agent.enabled_toolsets)
+    assert state.agent.acp_tool_policy == "profile"
+
+    # Admission must stay bound to the policy that built the session even if
+    # config changes before the host supplies MCP servers.
+    config["acp"]["tool_policy"] = "hermes-acp"
 
     register_calls = []
 

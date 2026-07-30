@@ -132,7 +132,8 @@ def _expand_acp_enabled_toolsets(
 ) -> List[str]:
     """Return ACP toolsets plus explicit MCP server toolsets for this session."""
     expanded: List[str] = []
-    for name in list(toolsets or ["hermes-acp"]):
+    base_toolsets = ["hermes-acp"] if toolsets is None else toolsets
+    for name in list(base_toolsets):
         if name and name not in expanded:
             expanded.append(name)
 
@@ -199,14 +200,19 @@ def resolve_acp_base_toolsets(config: dict | None) -> List[str]:
     else:
         platform = "cli"
 
-    resolved = sorted(
+    # An explicit empty list is an intentional deny-all selection. Return
+    # before the canonical resolver's non-configurable recovery and default MCP
+    # expansion can add capabilities the operator deliberately removed.
+    if platform_toolsets.get(platform) == []:
+        return []
+
+    return sorted(
         _get_platform_tools(
             config,
             platform,
             include_default_mcp_servers=True,
         )
     )
-    return resolved or ["hermes-acp"]
 
 
 def resolve_acp_enabled_toolsets(config: dict | None) -> List[str]:
@@ -698,6 +704,7 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
+        tool_policy = resolve_acp_tool_policy(config)
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": resolve_acp_enabled_toolsets(config),
@@ -724,6 +731,11 @@ class SessionManager:
 
         _register_task_cwd(session_id, cwd)
         agent = AIAgent(**kwargs)
+        # Keep host MCP admission bound to the same config snapshot that built
+        # this agent. Re-reading config later can otherwise create a hybrid
+        # session when the file changes between construction and ACP lifecycle
+        # registration.
+        agent.acp_tool_policy = tool_policy
         # Codex app-server sessions are spawned lazily on the first turn. Stamp
         # the ACP workspace onto the agent so the Codex runtime starts from the
         # editor/session cwd instead of the Hermes daemon's process cwd.
