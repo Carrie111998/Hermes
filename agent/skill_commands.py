@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+# Guards the (map, platform-tag) pair so publication and the freshness lookup
+# always see a consistent snapshot. Scanning itself stays outside this lock.
+_publish_lock = threading.Lock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -470,11 +474,16 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
-    # Publish the finished map and the platform it was scanned for together,
-    # so ``get_skill_commands`` can never observe a new platform tag against a
-    # stale map (or vice versa).
-    _skill_commands = commands
-    _skill_commands_platform = platform
+    # Publish the finished map and the platform it was scanned for as ONE
+    # step. Two bare assignments are not atomic together: a reader landing
+    # between them sees the NEW map still carrying the OLD platform tag, and
+    # if that stale tag happens to match its own platform it accepts the map
+    # without rescanning — serving another platform's disabled-skill view,
+    # exactly the leak #14536 closed. Only the publish/lookup pair is locked;
+    # the scan above (file I/O, deferred imports) stays outside it.
+    with _publish_lock:
+        _skill_commands = commands
+        _skill_commands_platform = platform
     return commands
 
 
@@ -485,12 +494,17 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     process serving Telegram and Discord concurrently) so each platform
     sees its own ``skills.platform_disabled`` view (#14536).
     """
-    if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-    ):
-        scan_skill_commands()
-    return _skill_commands
+    current_platform = _resolve_skill_commands_platform()
+    # Read the map and its tag under the same lock that publishes them, so the
+    # freshness decision is made against a consistent pair.
+    with _publish_lock:
+        commands = _skill_commands
+        is_fresh = bool(commands) and _skill_commands_platform == current_platform
+    if is_fresh:
+        return commands
+    # Scan outside the lock — it does file I/O and deferred imports, and
+    # concurrent scans are already safe (each builds its own map).
+    return scan_skill_commands()
 
 
 def reload_skills() -> Dict[str, Any]:

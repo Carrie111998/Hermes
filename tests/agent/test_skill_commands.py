@@ -358,6 +358,45 @@ class TestScanSkillCommands:
         assert len(foreground) == skill_count
         assert foreground["/skill-0"]["name"] == "skill-0"
 
+    def test_publication_and_lookup_share_one_lock(self, tmp_path):
+        """A reader must not land between the map and platform-tag writes.
+
+        They are two separate global assignments. A reader in between sees the
+        NEW map still carrying the OLD platform tag; if that stale tag matches
+        its own platform it accepts the map without rescanning and serves
+        another platform's disabled-skill view — the leak #14536 closed.
+        Holding the publish lock must therefore block a reader outright.
+        """
+        import threading
+
+        import agent.skill_commands as skill_commands_module
+        from agent.skill_commands import get_skill_commands
+
+        _make_skill(tmp_path, "shared")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            scan_skill_commands()
+
+            done = threading.Event()
+
+            def _read():
+                with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                    get_skill_commands()
+                done.set()
+
+            with skill_commands_module._publish_lock:
+                reader = threading.Thread(target=_read, daemon=True)
+                reader.start()
+                # The reader must be unable to complete its freshness lookup
+                # while publication is in progress.
+                assert not done.wait(timeout=0.5), (
+                    "get_skill_commands read the (map, platform) pair without "
+                    "the publish lock"
+                )
+
+            assert done.wait(timeout=10), "reader did not finish after release"
+            reader.join(timeout=10)
+
     def test_scan_never_publishes_a_partially_built_map(self, tmp_path):
         """A reader during a scan sees the previous map, never a half-built one."""
         import threading
