@@ -7,18 +7,36 @@ type MessagingSessionRow = Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profil
 interface ResolveOpenMessagingCandidateIdsOptions {
   knownSessions: MessagingSessionRow[]
   messagingSessions: MessagingSessionRow[]
+  profile: string
   selectedStoredSessionId: null | string
   sessionTiles: ReadonlyArray<{ storedSessionId: string }>
 }
 
 interface ResolveOpenTranscriptSurfacesOptions {
   activeRuntimeSessionId: null | string
+  profile: string
   selectedStoredSessionId: null | string
   sessionTiles: ReadonlyArray<{ runtimeId?: null | string; storedSessionId: string }>
 }
 
 export interface OpenTranscriptSurface {
   runtimeSessionId: string
+  storedSessionId: string
+  profile: string
+}
+
+interface IsTranscriptRefreshScopeCurrentOptions {
+  activeProfile: null | string | undefined
+  capturedProfileEpoch: number
+  currentProfileEpoch: number
+  profile: null | string | undefined
+  runtimeSessionId: string
+  surfaces: OpenTranscriptSurface[]
+}
+
+interface ResolveProfileScopedStoredSessionOptions {
+  getSession: (storedSessionId: string, profile: string) => Promise<MessagingSessionRow>
+  profile: string
   storedSessionId: string
 }
 
@@ -45,10 +63,46 @@ export interface ResolvedMessagingTranscriptTarget {
 
 interface ResolveMessagingTranscriptTargetsOptions {
   getRuntimeState: (runtimeSessionId: string) => MessagingTranscriptRuntimeState | undefined
-  resolveStoredSession: (storedSessionId: string) => Promise<MessagingSessionRow | undefined>
+  resolveStoredSession: (storedSessionId: string, profile: string) => Promise<MessagingSessionRow | undefined>
   sessionRows: MessagingSessionRow[]
   surfaces: OpenTranscriptSurface[]
 }
+
+const profileKey = (profile: null | string | undefined) => profile?.trim() || 'default'
+
+export async function resolveProfileScopedStoredSession(
+  options: ResolveProfileScopedStoredSessionOptions
+): Promise<MessagingSessionRow> {
+  const profile = profileKey(options.profile)
+
+  return {
+    ...(await options.getSession(options.storedSessionId, profile)),
+    profile
+  }
+}
+
+export function isTranscriptRefreshScopeCurrent(
+  options: IsTranscriptRefreshScopeCurrentOptions
+): boolean {
+  if (options.capturedProfileEpoch !== options.currentProfileEpoch) {
+    return false
+  }
+
+  const profile = profileKey(options.profile)
+
+  if (profileKey(options.activeProfile) !== profile) {
+    return false
+  }
+
+  return options.surfaces.some(
+    surface => surface.runtimeSessionId === options.runtimeSessionId && surface.profile === profile
+  )
+}
+
+const findSessionInProfile = (sessions: MessagingSessionRow[], storedSessionId: string, profile: string) =>
+  sessions.find(
+    session => profileKey(session.profile) === profile && sessionMatchesStoredId(session, storedSessionId)
+  )
 
 interface RefreshMessagingTranscriptTargetOptions<TTranscript> {
   commit: (
@@ -70,6 +124,7 @@ export function resolveOpenTranscriptSurfaces(
 ): OpenTranscriptSurface[] {
   const surfaces: OpenTranscriptSurface[] = []
   const runtimeIds = new Set<string>()
+  const profile = profileKey(options.profile)
 
   const add = (runtimeSessionId: null | string | undefined, storedSessionId: null | string) => {
     if (!runtimeSessionId || !storedSessionId || runtimeIds.has(runtimeSessionId)) {
@@ -77,7 +132,7 @@ export function resolveOpenTranscriptSurfaces(
     }
 
     runtimeIds.add(runtimeSessionId)
-    surfaces.push({ runtimeSessionId, storedSessionId })
+    surfaces.push({ profile, runtimeSessionId, storedSessionId })
   }
 
   add(options.activeRuntimeSessionId, options.selectedStoredSessionId)
@@ -99,6 +154,7 @@ export function resolveOpenMessagingCandidateIds(
   options: ResolveOpenMessagingCandidateIdsOptions
 ): string[] {
   const openIds = [options.selectedStoredSessionId, ...options.sessionTiles.map(tile => tile.storedSessionId)]
+  const profile = profileKey(options.profile)
   const result = new Set<string>()
 
   for (const storedSessionId of openIds) {
@@ -107,8 +163,8 @@ export function resolveOpenMessagingCandidateIds(
     }
 
     const stored =
-      options.messagingSessions.find(session => sessionMatchesStoredId(session, storedSessionId)) ??
-      options.knownSessions.find(session => sessionMatchesStoredId(session, storedSessionId))
+      findSessionInProfile(options.messagingSessions, storedSessionId, profile) ??
+      findSessionInProfile(options.knownSessions, storedSessionId, profile)
 
     if (stored && isMessagingSource(stored.source)) {
       // A durable tile may still carry the lineage root after compression while
@@ -138,7 +194,18 @@ export async function resolveMessagingTranscriptTargets(
 ): Promise<ResolvedMessagingTranscriptTarget[]> {
   const grouped = new Map<string, ResolvedMessagingTranscriptTarget>()
 
+  const resolveForProfile = async (storedSessionId: string, profile: string) => {
+    try {
+      const resolved = await options.resolveStoredSession(storedSessionId, profile)
+
+      return resolved && profileKey(resolved.profile) === profile ? resolved : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   for (const surface of options.surfaces) {
+    const profile = profileKey(surface.profile)
     const runtimeState = options.getRuntimeState(surface.runtimeSessionId)
 
     if (!runtimeState || runtimeState.busy) {
@@ -147,21 +214,20 @@ export async function resolveMessagingTranscriptTargets(
 
     const liveStoredSessionId = runtimeState.storedSessionId ?? surface.storedSessionId
 
-    let stored = options.sessionRows.find(session => sessionMatchesStoredId(session, liveStoredSessionId))
+    let stored = findSessionInProfile(options.sessionRows, liveStoredSessionId, profile)
 
-    stored ??= await options.resolveStoredSession(liveStoredSessionId)
+    stored ??= await resolveForProfile(liveStoredSessionId, profile)
 
     if (!stored && liveStoredSessionId !== surface.storedSessionId) {
       stored =
-        options.sessionRows.find(session => sessionMatchesStoredId(session, surface.storedSessionId)) ??
-        (await options.resolveStoredSession(surface.storedSessionId))
+        findSessionInProfile(options.sessionRows, surface.storedSessionId, profile) ??
+        (await resolveForProfile(surface.storedSessionId, profile))
     }
 
     if (!stored || !isMessagingSource(stored.source)) {
       continue
     }
 
-    const profile = stored.profile?.trim() || 'default'
     const lineageRoot = sessionPinId(stored)
     const key = `${profile}:${lineageRoot}`
     const existing = grouped.get(key)
@@ -183,7 +249,7 @@ export async function resolveMessagingTranscriptTargets(
 
     grouped.set(key, {
       key,
-      profile: stored.profile,
+      profile,
       runtimeSessionIds: [surface.runtimeSessionId],
       session: stored,
       storedSessionId: stored.id

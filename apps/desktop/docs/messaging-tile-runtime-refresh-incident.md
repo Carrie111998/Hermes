@@ -17,7 +17,7 @@ The bug was caused by a state-scope mismatch:
 - therefore, a messaging session visible in a tile could be absent from the refresh target set;
 - the refresh callback also used the primary runtime and its global busy guard instead of resolving the target tile's runtime and busy state.
 
-The fix makes open messaging transcripts explicit: collect direct runtime bindings from both the primary chat and all open session tiles, resolve each surface's stored-session metadata and profile, skip only target runtimes whose authoritative state is busy, and update each matching renderer cache. Exact metadata fallback, lineage grouping, and post-request revalidation cover restored or compressed sessions that are not represented by the current sidebar page.
+The fix makes open messaging transcripts explicit: collect direct runtime bindings from both the primary chat and all open session tiles, resolve each surface's stored-session metadata within its owning profile, skip only target runtimes whose authoritative state is busy, and update each matching renderer cache. Exact metadata fallback, lineage grouping, profile-qualified matching, and post-request revalidation cover restored or compressed sessions that are not represented by the current sidebar page.
 
 ## User-visible symptoms
 
@@ -176,7 +176,7 @@ It deduplicates identical runtime bindings and does not infer a tile runtime thr
 
 ### 2. Resolve metadata and lineage independently
 
-`resolveMessagingTranscriptTargets()` reads each target runtime's current stored ID, checks the current session caches, and falls back to the existing exact-ID `resolveStoredSession()` path for restored, search-opened, project-opened, or older sessions outside the sidebar's recent window. It then:
+`resolveMessagingTranscriptTargets()` reads each target runtime's current stored ID, checks the current session caches within the surface's owning profile, and falls back to the profile-scoped exact-ID `getSession(id, profile)` path for restored, search-opened, project-opened, or older sessions outside the sidebar's recent window. The production adapter treats that scoped transport as authoritative and stamps the normalized requested profile on its result; alternate adapters must return metadata for the same profile before source or lineage processing. It then:
 
 - keeps only sources recognized as messaging;
 - preserves the owning profile;
@@ -187,7 +187,7 @@ It deduplicates identical runtime bindings and does not infer a tile runtime thr
 
 The wiring reads `$sessionStates` before the cache ref because reconnect hydration publishes the authoritative busy snapshot to that atom. An unrelated busy primary runtime no longer blocks an idle messaging tile, while a target runtime restored as busy is not polled.
 
-After each stored-message read, `refreshMessagingTranscriptTarget()` rechecks request generation, open-surface membership, runtime identity, and busy state. A delayed response therefore cannot overwrite a newer poll, a running turn, a closed tile, or a runtime rebound to another session.
+After each stored-message read, `refreshMessagingTranscriptTarget()` rechecks request generation, active-profile ownership, a monotonic profile epoch, open-surface membership, runtime identity, and busy state. A delayed response therefore cannot overwrite a newer poll, a running turn, a closed tile, a Profile switch (including an `A -> B -> A` round trip), or a runtime rebound to another session.
 
 ### 4. Refresh every renderer runtime without cross-suppression
 
@@ -206,10 +206,11 @@ The fix does not add another timer, websocket path, global store, or transport-s
 - `apps/desktop/src/app/contrib/hooks/refresh-messaging-transcript.test.ts`
   - covers capped-sidebar misses and exact metadata fallback;
   - covers direct runtime binding and root/tip alias grouping;
-  - covers authoritative busy state, stale-response suppression, and per-runtime signatures.
+  - covers authoritative busy state, stale-response suppression, and per-runtime signatures;
+  - covers same-ID collisions, wrong-profile exact-resolution responses, and the profile-scoped production RPC adapter.
 - `apps/desktop/src/app/contrib/wiring.tsx`
   - includes `$sessionTiles` in the background-refresh target set;
-  - reads authoritative runtime state and commits each still-valid target independently.
+  - resolves metadata through the target profile and commits each still-valid target independently.
 
 ## Regression tests
 
@@ -222,7 +223,10 @@ The focused behavior tests assert these contracts:
 5. A target published as busy is not resolved or fetched, and a runtime that becomes busy during I/O rejects the response.
 6. A delayed older response cannot overwrite a newer response.
 7. Transcript signatures are independent per renderer runtime.
-8. Existing background-sync and session-state behavior remains green.
+8. A same-ID session from another profile cannot classify or hydrate an open surface.
+9. A response started before a Profile round trip cannot commit after the original Profile becomes active again.
+10. The production exact-session adapter queries and stamps the normalized target profile.
+11. Existing background-sync and session-state behavior remains green.
 
 The verification commands are:
 
@@ -243,12 +247,12 @@ npm run build
 
 Current follow-up verification results:
 
-- focused Vitest selection: 4 files, 49 tests passed;
+- focused Vitest selection: 4 files, 54 tests passed;
 - Desktop type checking: passed;
 - targeted ESLint: passed with no warnings;
 - full Desktop lint: exit code 0, with 67 pre-existing warnings outside the changed files;
 - production build: passed, including renderer, Electron main/preload, native dependency staging, and dist assertion;
-- complete Desktop Vitest run: 3,890 passed, 22 failed, and 3 skipped. The failures match the previously reproduced unchanged Windows/MSYS baseline: 19 platform/environment cases plus one locale-dependent time label and two Billing copy assertions. No changed or newly added test file failed.
+- earlier complete Desktop Vitest baseline run: 3,890 passed, 22 failed, and 3 skipped. The failures matched the previously reproduced unchanged Windows/MSYS baseline: 19 platform/environment cases plus one locale-dependent time label and two Billing copy assertions. No changed or newly added test file failed; the profile-hardening changes above were subsequently covered by the fresh focused selection.
 
 ## Production end-to-end validation
 
@@ -272,9 +276,27 @@ Result:
 
 Before that validation, the packaged renderer artifact was checked against the tested build by SHA-256. The packaged `app.asar` renderer entry matched the build output.
 
-After that acceptance, an independent review identified additional edge cases involving the capped messaging sidebar page, root/tip alias rotation, reconnect-published busy state, and overlapping asynchronous polls. Those follow-up guards were verified with dedicated RED/GREEN regression tests, Desktop type checking, targeted and full lint, and a fresh production build. The continuously running formal Desktop instance was intentionally not reinstalled or restarted solely to repeat the already-passed primary acceptance sequence.
+After that acceptance, an independent review identified additional edge cases involving the capped messaging sidebar page, root/tip alias rotation, reconnect-published busy state, overlapping asynchronous polls, and same-ID sessions across independent profiles. Those follow-up guards were verified with dedicated RED/GREEN regression tests, Desktop type checking, targeted and full lint, and a fresh production build. The continuously running formal Desktop instance was intentionally not reinstalled or restarted solely to repeat the already-passed primary acceptance sequence.
 
 All credentials, pairing codes, user identifiers, connection details, local paths, and real session IDs are intentionally omitted or represented as `[REDACTED]`.
+
+## Related but separate incident: updater blocked by a sibling gateway process
+
+The same investigation also captured a distinct Desktop update failure. It did **not** cause the messaging transcript refresh gap and is not fixed by the renderer changes in this PR.
+
+The Desktop log records the following order:
+
+1. the updater verified `state.db` and created its emergency backup;
+2. Desktop terminated its headless backend;
+3. the `update-in-flight` gate deferred any backend restart;
+4. the venv blocker scan found one remaining process using the installation;
+5. the update aborted and identified that process as `python.exe -m hermes_cli.main gateway run` from the same managed venv.
+
+Repeated attempts reported the same sibling gateway process. This distinguishes the observed blocker from the older self-respawn failure class documented in `electron/update-gate.ts`: the Desktop backend did not respawn inside the update critical section, but the separately running messaging gateway continued to hold the managed runtime.
+
+The abort was therefore a safety response to a real install-tree owner, not evidence that the messaging database was corrupt or that the Gateway had stopped writing messages. A separate updater follow-up should coordinate the lifecycle of eligible local gateway siblings—or offer an explicit stop/update/restart flow—without terminating remote or independently managed services. The UI should also distinguish a Desktop backend from a messaging gateway when reporting blockers.
+
+This PR deliberately keeps that updater lifecycle work out of the messaging refresh fix.
 
 ## Risk assessment
 
@@ -283,6 +305,7 @@ The change is narrow:
 - it runs only while at least one known messaging transcript or unresolved open candidate exists;
 - it reuses the existing cadence and invalidation events;
 - it skips busy target runtimes;
+- it scopes cache, exact metadata, lineage grouping, and commits to the target profile;
 - it signature-gates unchanged transcripts per renderer runtime;
 - it groups root/tip aliases while preserving all visible renderer destinations;
 - errors remain non-fatal and retry on the next existing refresh opportunity.

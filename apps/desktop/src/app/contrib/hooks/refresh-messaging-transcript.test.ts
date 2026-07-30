@@ -1,14 +1,70 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+  isTranscriptRefreshScopeCurrent,
   refreshMessagingTranscriptTarget,
   resolveAuthoritativeRuntimeState,
   resolveMessagingTranscriptTargets,
   resolveOpenMessagingCandidateIds,
-  resolveOpenTranscriptSurfaces
+  resolveOpenTranscriptSurfaces,
+  resolveProfileScopedStoredSession
 } from './refresh-messaging-transcript'
 
-const session = (id: string, source: null | string = null) => ({ id, profile: 'default', source })
+const session = (id: string, source: null | string = null, profile = 'default') => ({
+  _lineage_root_id: null,
+  id,
+  profile,
+  source
+})
+
+describe('isTranscriptRefreshScopeCurrent', () => {
+  const surfaces = [
+    {
+      profile: 'default',
+      runtimeSessionId: 'runtime-a',
+      storedSessionId: 'stored-a'
+    }
+  ]
+
+  it('rejects an old response after an A -> B -> A profile round trip', () => {
+    expect(
+      isTranscriptRefreshScopeCurrent({
+        activeProfile: 'default',
+        capturedProfileEpoch: 1,
+        currentProfileEpoch: 3,
+        profile: 'default',
+        runtimeSessionId: 'runtime-a',
+        surfaces
+      })
+    ).toBe(false)
+
+    expect(
+      isTranscriptRefreshScopeCurrent({
+        activeProfile: 'default',
+        capturedProfileEpoch: 3,
+        currentProfileEpoch: 3,
+        profile: 'default',
+        runtimeSessionId: 'runtime-a',
+        surfaces
+      })
+    ).toBe(true)
+  })
+})
+
+describe('resolveProfileScopedStoredSession', () => {
+  it('queries and stamps the target profile at the production adapter boundary', async () => {
+    const getSession = vi.fn().mockResolvedValue(session('shared-id', 'qqbot', 'default'))
+
+    await expect(
+      resolveProfileScopedStoredSession({
+        getSession,
+        profile: ' work ',
+        storedSessionId: 'shared-id'
+      })
+    ).resolves.toMatchObject({ id: 'shared-id', profile: 'work', source: 'qqbot' })
+    expect(getSession).toHaveBeenCalledWith('shared-id', 'work')
+  })
+})
 
 describe('resolveAuthoritativeRuntimeState', () => {
   it('prefers reconnect-published state over a stale cache entry', () => {
@@ -20,6 +76,18 @@ describe('resolveAuthoritativeRuntimeState', () => {
 })
 
 describe('resolveOpenMessagingCandidateIds', () => {
+  it('does not let another profile session with the same id classify the active surface', () => {
+    expect(
+      resolveOpenMessagingCandidateIds({
+        knownSessions: [session('shared-id', null, 'work')],
+        messagingSessions: [session('shared-id', 'qqbot', 'default')],
+        profile: 'work',
+        selectedStoredSessionId: 'shared-id',
+        sessionTiles: []
+      })
+    ).toEqual([])
+  })
+
   it('does not keep a known local session as an unresolved messaging candidate', () => {
     const primary = session('stored-primary')
 
@@ -27,6 +95,7 @@ describe('resolveOpenMessagingCandidateIds', () => {
       resolveOpenMessagingCandidateIds({
         knownSessions: [primary],
         messagingSessions: [],
+        profile: 'default',
         selectedStoredSessionId: primary.id,
         sessionTiles: []
       })
@@ -38,6 +107,7 @@ describe('resolveOpenMessagingCandidateIds', () => {
       resolveOpenMessagingCandidateIds({
         knownSessions: [],
         messagingSessions: [],
+        profile: 'default',
         selectedStoredSessionId: null,
         sessionTiles: [{ storedSessionId: 'stored-outside-sidebar-page' }]
       })
@@ -52,6 +122,7 @@ describe('resolveOpenMessagingCandidateIds', () => {
       resolveOpenMessagingCandidateIds({
         knownSessions: [primary],
         messagingSessions: [messaging],
+        profile: 'default',
         selectedStoredSessionId: primary.id,
         sessionTiles: [{ storedSessionId: messaging.id }]
       })
@@ -65,6 +136,7 @@ describe('resolveOpenMessagingCandidateIds', () => {
       resolveOpenMessagingCandidateIds({
         knownSessions: [],
         messagingSessions: [messaging],
+        profile: 'default',
         selectedStoredSessionId: messaging.id,
         sessionTiles: [{ storedSessionId: messaging.id }]
       })
@@ -83,6 +155,7 @@ describe('resolveOpenMessagingCandidateIds', () => {
       resolveOpenMessagingCandidateIds({
         knownSessions: [],
         messagingSessions: [messaging],
+        profile: 'default',
         selectedStoredSessionId: 'stored-root',
         sessionTiles: [{ storedSessionId: 'stored-tip' }]
       })
@@ -95,6 +168,7 @@ describe('resolveOpenTranscriptSurfaces', () => {
     expect(
       resolveOpenTranscriptSurfaces({
         activeRuntimeSessionId: 'runtime-primary',
+        profile: 'work',
         selectedStoredSessionId: 'stored-primary-root',
         sessionTiles: [
           {
@@ -104,8 +178,8 @@ describe('resolveOpenTranscriptSurfaces', () => {
         ]
       })
     ).toEqual([
-      { runtimeSessionId: 'runtime-primary', storedSessionId: 'stored-primary-root' },
-      { runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-tile-root' }
+      { profile: 'work', runtimeSessionId: 'runtime-primary', storedSessionId: 'stored-primary-root' },
+      { profile: 'work', runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-tile-root' }
     ])
   })
 })
@@ -125,10 +199,10 @@ describe('resolveMessagingTranscriptTargets', () => {
       getRuntimeState: () => ({ busy: false, storedSessionId: 'stored-tip' }),
       resolveStoredSession,
       sessionRows: [],
-      surfaces: [{ runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-root' }]
+      surfaces: [{ profile: 'work', runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-root' }]
     })
 
-    expect(resolveStoredSession).toHaveBeenCalledWith('stored-tip')
+    expect(resolveStoredSession).toHaveBeenCalledWith('stored-tip', 'work')
     expect(targets).toEqual([
       {
         key: 'work:stored-root',
@@ -138,6 +212,44 @@ describe('resolveMessagingTranscriptTargets', () => {
         storedSessionId: 'stored-tip'
       }
     ])
+  })
+
+  it('selects only the row owned by the open surface profile when stored ids collide', async () => {
+    const defaultRow = session('shared-id', 'qqbot', 'default')
+    const workRow = session('shared-id', 'qqbot', 'work')
+    const resolveStoredSession = vi.fn()
+
+    const targets = await resolveMessagingTranscriptTargets({
+      getRuntimeState: () => ({ busy: false, storedSessionId: 'shared-id' }),
+      resolveStoredSession,
+      sessionRows: [defaultRow, workRow],
+      surfaces: [{ profile: 'work', runtimeSessionId: 'runtime-work', storedSessionId: 'shared-id' }]
+    })
+
+    expect(resolveStoredSession).not.toHaveBeenCalled()
+    expect(targets).toEqual([
+      {
+        key: 'work:shared-id',
+        profile: 'work',
+        runtimeSessionIds: ['runtime-work'],
+        session: workRow,
+        storedSessionId: 'shared-id'
+      }
+    ])
+  })
+
+  it('rejects exact metadata returned from another profile', async () => {
+    const resolveStoredSession = vi.fn(async () => session('shared-id', 'qqbot', 'default'))
+
+    const targets = await resolveMessagingTranscriptTargets({
+      getRuntimeState: () => ({ busy: false, storedSessionId: 'shared-id' }),
+      resolveStoredSession,
+      sessionRows: [],
+      surfaces: [{ profile: 'work', runtimeSessionId: 'runtime-work', storedSessionId: 'shared-id' }]
+    })
+
+    expect(resolveStoredSession).toHaveBeenCalledWith('shared-id', 'work')
+    expect(targets).toEqual([])
   })
 
   it('prefers the runtime-published live tip over a stale durable-root cache hit', async () => {
@@ -155,10 +267,10 @@ describe('resolveMessagingTranscriptTargets', () => {
       getRuntimeState: () => ({ busy: false, storedSessionId: 'stored-live-tip' }),
       resolveStoredSession,
       sessionRows: [stale],
-      surfaces: [{ runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-root' }]
+      surfaces: [{ profile: 'default', runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-root' }]
     })
 
-    expect(resolveStoredSession).toHaveBeenCalledWith('stored-live-tip')
+    expect(resolveStoredSession).toHaveBeenCalledWith('stored-live-tip', 'default')
     expect(targets[0]?.storedSessionId).toBe('stored-live-tip')
   })
 
@@ -174,7 +286,7 @@ describe('resolveMessagingTranscriptTargets', () => {
       getRuntimeState: () => ({ busy: false, storedSessionId: 'stored-live-tip' }),
       resolveStoredSession: vi.fn(),
       sessionRows: [live],
-      surfaces: [{ runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-intermediate-tip' }]
+      surfaces: [{ profile: 'default', runtimeSessionId: 'runtime-tile', storedSessionId: 'stored-intermediate-tip' }]
     })
 
     expect(targets[0]?.runtimeSessionIds).toEqual(['runtime-tile'])
@@ -197,8 +309,8 @@ describe('resolveMessagingTranscriptTargets', () => {
       resolveStoredSession: vi.fn(),
       sessionRows: [resolved],
       surfaces: [
-        { runtimeSessionId: 'runtime-root', storedSessionId: 'stored-root' },
-        { runtimeSessionId: 'runtime-tip', storedSessionId: 'stored-tip' }
+        { profile: 'default', runtimeSessionId: 'runtime-root', storedSessionId: 'stored-root' },
+        { profile: 'default', runtimeSessionId: 'runtime-tip', storedSessionId: 'stored-tip' }
       ]
     })
 
@@ -214,7 +326,7 @@ describe('resolveMessagingTranscriptTargets', () => {
       getRuntimeState: () => ({ busy: true, storedSessionId: 'stored-messaging' }),
       resolveStoredSession,
       sessionRows: [],
-      surfaces: [{ runtimeSessionId: 'runtime-busy', storedSessionId: 'stored-messaging' }]
+      surfaces: [{ profile: 'default', runtimeSessionId: 'runtime-busy', storedSessionId: 'stored-messaging' }]
     })
 
     expect(targets).toEqual([])

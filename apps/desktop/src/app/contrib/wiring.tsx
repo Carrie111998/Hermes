@@ -24,7 +24,7 @@ import { $newSessionTabAction } from '@/components/pane-shell/tree/store'
 import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
-import { getSessionMessages, triggerCronJob } from '@/hermes'
+import { getSession, getSessionMessages, triggerCronJob } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { latestSessionTodos } from '@/lib/todos'
@@ -96,7 +96,6 @@ import { usePreviewRouting } from '../session/hooks/use-preview-routing'
 import { usePromptActions } from '../session/hooks/use-prompt-actions'
 import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
-import { resolveStoredSession } from '../session/hooks/use-session-actions/utils'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
 import { startWorkspaceSession } from '../session/workspace-session-target'
@@ -108,11 +107,13 @@ import { UpdatesOverlay } from '../updates-overlay'
 
 import { ContribWiringContext } from './context'
 import {
+  isTranscriptRefreshScopeCurrent,
   refreshMessagingTranscriptTarget,
   resolveAuthoritativeRuntimeState,
   resolveMessagingTranscriptTargets,
   resolveOpenMessagingCandidateIds,
-  resolveOpenTranscriptSurfaces
+  resolveOpenTranscriptSurfaces,
+  resolveProfileScopedStoredSession
 } from './hooks/refresh-messaging-transcript'
 import { useBackgroundSync } from './hooks/use-background-sync'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
@@ -357,6 +358,16 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     [activeSessionIdRef, selectedStoredSessionIdRef, updateSessionState]
   )
 
+  const messagingRefreshProfileEpochRef = useRef(0)
+
+  useEffect(
+    () =>
+      $activeGatewayProfile.subscribe(() => {
+        messagingRefreshProfileEpochRef.current += 1
+      }),
+    []
+  )
+
   // Messaging sessions are written by background gateway adapters rather than
   // this renderer's stream, so reconcile every open messaging transcript from
   // storage. Tiles own independent renderer state and never select the primary
@@ -364,6 +375,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // sidebar is capped), then guard each async commit against lineage rotation,
   // reconnect busy state, tile closure/rebind, and newer overlapping polls.
   const refreshOpenMessagingTranscripts = useCallback(async () => {
+    const profile = normalizeProfileKey($activeGatewayProfile.get())
+    const profileEpoch = messagingRefreshProfileEpochRef.current
+
     const getCurrentRuntimeState = (runtimeSessionId: string) =>
       resolveAuthoritativeRuntimeState(
         runtimeSessionId,
@@ -374,13 +388,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     const getOpenSurfaces = () =>
       resolveOpenTranscriptSurfaces({
         activeRuntimeSessionId: activeSessionIdRef.current,
+        profile,
         selectedStoredSessionId: selectedStoredSessionIdRef.current,
         sessionTiles: $sessionTiles.get()
       })
 
     const targets = await resolveMessagingTranscriptTargets({
       getRuntimeState: getCurrentRuntimeState,
-      resolveStoredSession,
+      resolveStoredSession: (storedSessionId, targetProfile) =>
+        resolveProfileScopedStoredSession({ getSession, profile: targetProfile, storedSessionId }),
       sessionRows: [...$messagingSessions.get(), ...$sessions.get()],
       surfaces: getOpenSurfaces()
     })
@@ -411,7 +427,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             getCurrentRuntimeState,
             getSignature: latest => sessionMessagesSignature(latest.messages),
             isRuntimeOpen: runtimeSessionId =>
-              getOpenSurfaces().some(surface => surface.runtimeSessionId === runtimeSessionId),
+              isTranscriptRefreshScopeCurrent({
+                activeProfile: normalizeProfileKey($activeGatewayProfile.get()),
+                capturedProfileEpoch: profileEpoch,
+                currentProfileEpoch: messagingRefreshProfileEpochRef.current,
+                profile: target.profile,
+                runtimeSessionId,
+                surfaces: getOpenSurfaces()
+              }),
             loadTranscript: () => getSessionMessages(target.storedSessionId, target.profile),
             signatureByRuntimeId: messagingTranscriptSignatureByRuntimeRef.current,
             target
@@ -778,6 +801,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     resolveOpenMessagingCandidateIds({
       knownSessions: $sessions.get(),
       messagingSessions,
+      profile: normalizeProfileKey(activeGatewayProfile),
       selectedStoredSessionId,
       sessionTiles
     }).length > 0
