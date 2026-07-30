@@ -11,7 +11,7 @@ import asyncio
 import contextlib
 import os
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -1166,6 +1166,7 @@ async def test_dashboard_quiesce_waits_for_embedded_tui_turn(monkeypatch):
 
     active = True
     close_sessions = MagicMock()
+    close_ptys = AsyncMock()
     monkeypatch.setattr(
         tui_gateway.server,
         "has_active_tui_work",
@@ -1176,6 +1177,7 @@ async def test_dashboard_quiesce_waits_for_embedded_tui_turn(monkeypatch):
         "close_sessions_for_update",
         close_sessions,
     )
+    monkeypatch.setattr(ws.PTY_REGISTRY, "close_all", close_ptys)
     ws._end_dashboard_update_quiesce()
     try:
         quiesce_task = asyncio.create_task(
@@ -1186,9 +1188,27 @@ async def test_dashboard_quiesce_waits_for_embedded_tui_turn(monkeypatch):
         active = False
         await quiesce_task
         assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+        close_ptys.assert_awaited_once_with()
         close_sessions.assert_called_once_with()
     finally:
         ws._end_dashboard_update_quiesce()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_fails_closed_on_pty_shutdown(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(
+        ws.PTY_REGISTRY,
+        "close_all",
+        AsyncMock(side_effect=RuntimeError("PTY did not stop")),
+    )
+    ws._end_dashboard_update_quiesce()
+
+    with pytest.raises(RuntimeError, match="PTY did not stop"):
+        await ws._begin_dashboard_update_quiesce(timeout=0.5)
+
+    assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is False
 
 
 def test_dashboard_rejects_duplicate_live_action(monkeypatch):

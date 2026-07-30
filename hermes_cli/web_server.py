@@ -968,9 +968,14 @@ async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
             and not active_actions
             and not active_tui_work
         ):
-            from tui_gateway.server import close_sessions_for_update
+            try:
+                await PTY_REGISTRY.close_all()
+                from tui_gateway.server import close_sessions_for_update
 
-            close_sessions_for_update()
+                close_sessions_for_update()
+            except Exception:
+                _end_dashboard_update_quiesce()
+                raise
             return
         await asyncio.sleep(0.01)
 

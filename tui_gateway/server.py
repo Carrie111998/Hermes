@@ -1123,6 +1123,8 @@ def close_sessions_for_update() -> None:
         sessions = list(_sessions.values())
     _shutdown_sessions()
     current = threading.current_thread()
+    deadline = time.monotonic() + 1.0
+    pollers = []
     for session in sessions:
         poller = session.get("_notif_thread")
         if (
@@ -1130,7 +1132,19 @@ def close_sessions_for_update() -> None:
             and poller is not current
             and getattr(poller, "is_alive", lambda: False)()
         ):
-            poller.join(timeout=1.0)
+            pollers.append(poller)
+    for poller in pollers:
+        poller.join(timeout=max(deadline - time.monotonic(), 0.0))
+    still_alive = [
+        poller
+        for poller in pollers
+        if getattr(poller, "is_alive", lambda: False)()
+    ]
+    if still_alive:
+        raise RuntimeError(
+            f"{len(still_alive)} embedded-TUI notification poller(s) "
+            "did not stop before update"
+        )
 
 
 # Last-resort net for any disconnect path that slips past the WS finally. TTL is

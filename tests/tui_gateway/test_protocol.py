@@ -676,11 +676,14 @@ def test_close_sessions_for_update_releases_workers(server, monkeypatch):
             closed[self.key] += 1
 
     class _Poller:
+        alive = True
+
         def is_alive(self):
-            return True
+            return self.alive
 
         def join(self, timeout=None):
             closed["joined"] += 1
+            self.alive = False
 
     monkeypatch.setattr(server, "_get_db", lambda: None)
     server._sessions["idle"] = {
@@ -697,6 +700,21 @@ def test_close_sessions_for_update_releases_workers(server, monkeypatch):
 
     assert server._sessions == {}
     assert closed == {"agent": 1, "worker": 1, "joined": 1}
+
+
+def test_close_sessions_for_update_rejects_live_poller(server, monkeypatch):
+    class _Poller:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+    monkeypatch.setattr(server, "_shutdown_sessions", lambda: server._sessions.clear())
+    server._sessions["blocked"] = {"_notif_thread": _Poller()}
+
+    with pytest.raises(RuntimeError, match="did not stop before update"):
+        server.close_sessions_for_update()
 
 
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
