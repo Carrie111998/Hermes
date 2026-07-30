@@ -59,16 +59,66 @@ def provider_external(tmp_path, monkeypatch):
 
 class TestCircuitBreaker:
 
-    def test_opens_after_threshold_failures(self, provider):
-        """Circuit opens after _CIRCUIT_BREAKER_THRESHOLD consecutive non-retriable failures."""
-        provider._client.arecall = AsyncMock(side_effect=RuntimeError("database migration failed"))
+    def test_opens_after_threshold_connection_failures(self, provider):
+        """Only backend connection failures open the circuit."""
+        provider._client.arecall = AsyncMock(side_effect=RuntimeError("server disconnected"))
 
         for _ in range(_CIRCUIT_BREAKER_THRESHOLD):
-            with pytest.raises(RuntimeError, match="database migration failed"):
+            with pytest.raises(RuntimeError, match="server disconnected"):
                 provider._run_hindsight_operation(lambda c: c.arecall(bank_id="b", query="q"))
 
         with pytest.raises(RuntimeError, match="circuit breaker open"):
             provider._run_hindsight_operation(lambda c: c.arecall(bank_id="b", query="q"))
+
+    @pytest.mark.parametrize("message", [
+        "authentication failed", "invalid request", "unsupported operation",
+        "database migration failed",
+    ])
+    def test_non_backend_errors_do_not_open_circuit(self, provider, message):
+        provider._client.arecall = AsyncMock(side_effect=RuntimeError(message))
+
+        for _ in range(_CIRCUIT_BREAKER_THRESHOLD + 1):
+            with pytest.raises(RuntimeError, match=message):
+                provider._run_hindsight_operation(lambda c: c.arecall(bank_id="b", query="q"))
+
+        assert provider._circuit_breaker_failures == 0
+
+    def test_half_open_probe_is_single_flight(self, provider):
+        """After cooldown, one caller probes and concurrent callers fail fast."""
+        import threading
+
+        provider._circuit_breaker_failures = _CIRCUIT_BREAKER_THRESHOLD
+        provider._circuit_breaker_open_until = time.monotonic() - 1
+        started = threading.Event()
+        release = threading.Event()
+        results = []
+
+        def run_sync(_operation):
+            started.set()
+            assert release.wait(timeout=2)
+            return SimpleNamespace(results=[])
+
+        provider._run_sync = run_sync
+
+        def caller():
+            try:
+                provider._run_hindsight_operation(lambda c: "probe")
+                results.append("success")
+            except RuntimeError as exc:
+                results.append(str(exc))
+
+        first = threading.Thread(target=caller)
+        first.start()
+        assert started.wait(timeout=2)
+        second = threading.Thread(target=caller)
+        second.start()
+        second.join(timeout=2)
+        release.set()
+        first.join(timeout=2)
+
+        assert any("half-open probe in flight" in result for result in results)
+        assert results.count("success") == 1
+        assert provider._circuit_breaker_failures == 0
 
     def test_resets_after_cooldown(self, provider):
         """After cooldown, circuit allows a retry (half-open)."""
