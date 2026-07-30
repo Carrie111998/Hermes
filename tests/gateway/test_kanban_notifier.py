@@ -659,7 +659,9 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     assert tid_good in adapter.sent[0]["text"]
 
 
-def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
+def test_notifier_acknowledges_delivered_block_loop_detected_triage_ping(
+    tmp_path, monkeypatch,
+):
     """A `block_loop_detected` event must reach the subscriber as a triage ping.
 
     Regression for the silent-triage gap (PR #62712): kanban_db routes a task
@@ -677,12 +679,19 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="loops forever", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        subscription_id = kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        )
         kb._append_event(
             conn, tid, "block_loop_detected",
             {"reason": "needs credentials", "kind": "needs_input",
              "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
         )
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (tid, "block_loop_detected"),
+        ).fetchone()["id"]
     finally:
         conn.close()
 
@@ -696,13 +705,19 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     assert "TRIAGE" in text
     assert tid in text
     assert "needs credentials" in text
-    # Cursor advanced: the event is claimed and not re-delivered.
+    # The cursor advances while staging, before delivery. It cannot prove that
+    # the durable action was ACKed after the successful push.
     conn = kb.connect()
     try:
-        _, remaining = kb.unseen_events_for_sub(
-            conn, task_id=tid, platform="telegram", chat_id="chat-1",
-            kinds=["block_loop_detected"],
-        )
+        row = conn.execute(
+            "SELECT state, lease_token, lease_until "
+            "FROM kanban_notification_outbox "
+            "WHERE subscription_id = ? AND event_id = ? AND action = 'message'",
+            (subscription_id, event_id),
+        ).fetchone()
     finally:
         conn.close()
-    assert remaining == []
+    assert row is not None
+    assert (row["state"], row["lease_token"], row["lease_until"]) == (
+        "acknowledged", None, None,
+    )
