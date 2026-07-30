@@ -65,7 +65,7 @@ export const LOCALE_META: Record<Locale, { name: string }> = {
   uk: { name: "Українська" },
   af: { name: "Afrikaans" },
   ko: { name: "한국어" },
-  lo: { name: "ລາວ", flag: "🇱🇦" },
+  lo: { name: "ລາວ" },
   it: { name: "Italiano" },
   ga: { name: "Gaeilge" },
   pt: { name: "Português" },
