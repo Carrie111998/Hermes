@@ -5921,6 +5921,8 @@ class GatewayRunner:
                     if (
                         result.timers_fired
                         or result.poll_events
+                        or result.probe_errors
+                        or result.timer_errors
                         or result.sweep_processed
                     ):
                         logger.info(
