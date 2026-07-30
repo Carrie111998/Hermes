@@ -5520,12 +5520,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the same object twice.
             self.adapters.pop(adapter.platform, None)
             self.delivery_router.adapters = self.adapters
-            # A half-closed transport can wedge an adapter's native close()
-            # indefinitely. Reuse the shutdown-path timeout so this runtime
-            # fatal handler always reaches the reconnect queue.
-            await self._safe_adapter_disconnect(adapter, adapter.platform)
 
-        # Queue retryable failures for background reconnection
+        # Queue retryable failures for background reconnection.
+        # IMPORTANT: queue BEFORE disconnect() so the reconnection intent
+        # survives any cancellation that disconnect() may trigger (#74494).
+        # _safe_adapter_disconnect runs adapter.disconnect() through
+        # ensure_future in _await_adapter_cleanup_with_timeout, which creates
+        # a wrapper task.  When an adapter's disconnect() uses the "is
+        # current_task" guard to avoid self-cancellation, the wrapper task
+        # is NOT the original polling task — so the guard is defeated and
+        # the original task gets cancelled.  If that happens before the
+        # queue block, the platform is silently stranded (observed:
+        # telegram popped from adapters but never queued after network
+        # outage).  Queueing first makes the intent immune.
         if adapter.fatal_error_retryable:
             platform_config = self.config.platforms.get(adapter.platform)
             if platform_config and adapter.platform not in self._failed_platforms:
@@ -5542,6 +5549,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # exhausting its restart budget), respawn it so queued platforms
                 # are not permanently stranded (#70344).
                 self._ensure_reconnect_watcher_running()
+
+        if existing is adapter:
+            # A half-closed transport can wedge an adapter's native close()
+            # indefinitely. Reuse the shutdown-path timeout so this runtime
+            # fatal handler always reaches the reconnect queue.
+            await self._safe_adapter_disconnect(adapter, adapter.platform)
 
         if not self.adapters and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
