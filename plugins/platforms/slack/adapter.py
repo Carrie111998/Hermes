@@ -5544,6 +5544,7 @@ class SlackAdapter(BasePlatformAdapter):
         channel_name = None
         project_route_pending = False
         project_route_text = ""
+        project_session_fork = False
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -6226,6 +6227,7 @@ class SlackAdapter(BasePlatformAdapter):
                 timeout=self._slack_project_route_timeout(),
             )
             thread_ts = ts if decision.use_thread else None
+            project_session_fork = decision.use_thread
             logger.info(
                 "[Slack] project route channel=%s route=%s confidence=%.2f source=%s",
                 channel_id,
@@ -6346,6 +6348,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                "slack_project_session_fork": project_session_fork,
             },
         )
 

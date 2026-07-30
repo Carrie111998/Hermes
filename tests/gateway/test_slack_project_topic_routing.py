@@ -204,6 +204,7 @@ async def test_adapter_routes_before_session_selection(
     assert adapter.handle_message.await_count == 1
     message = adapter.handle_message.await_args.args[0]
     assert message.source.thread_id == expected_thread
+    assert message.metadata["slack_project_session_fork"] is bool(expected_thread)
 
 
 @pytest.mark.asyncio
@@ -234,6 +235,10 @@ async def test_project_turns_use_shared_or_isolated_session_keys(adapter):
     assert channel_key_1 == channel_key_2
     assert thread_key != channel_key_1
     assert sources[2].thread_id == "1700000000.000013"
+    messages = [call.args[0] for call in adapter.handle_message.await_args_list]
+    assert messages[0].metadata["slack_project_session_fork"] is False
+    assert messages[1].metadata["slack_project_session_fork"] is False
+    assert messages[2].metadata["slack_project_session_fork"] is True
 
 
 @pytest.mark.asyncio
@@ -252,6 +257,7 @@ async def test_existing_thread_bypasses_topic_router(adapter):
     classify.assert_not_called()
     message = adapter.handle_message.await_args.args[0]
     assert message.source.thread_id == "1700000000.000001"
+    assert message.metadata["slack_project_session_fork"] is False
 
 
 @pytest.mark.asyncio

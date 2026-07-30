@@ -2132,6 +2132,7 @@ class SessionStore:
         self,
         source: SessionSource,
         force_new: bool = False,
+        fork_from_session_id: Optional[str] = None,
     ) -> SessionEntry:
         """Single-flight session lookup/create per routing key.
 
@@ -2163,7 +2164,11 @@ class SessionStore:
             return slot.result
 
         try:
-            result = self._get_or_create_session_impl(source, force_new=force_new)
+            result = self._get_or_create_session_impl(
+                source,
+                force_new=force_new,
+                fork_from_session_id=fork_from_session_id,
+            )
             slot.result = result
             return result
         except BaseException as exc:
@@ -2178,6 +2183,7 @@ class SessionStore:
         self,
         source: SessionSource,
         force_new: bool = False,
+        fork_from_session_id: Optional[str] = None,
     ) -> SessionEntry:
         """Perform one session routing transition for the single-flight owner.
 
@@ -2399,6 +2405,11 @@ class SessionStore:
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
                 prev_session_id=prev_session_id,
+                metadata=(
+                    {"fork_parent_session_id": fork_from_session_id}
+                    if fork_from_session_id
+                    else {}
+                ),
             )
             with self._lock:
                 current = self._entries.get(session_key)
@@ -2423,6 +2434,12 @@ class SessionStore:
                     "chat_type": source.chat_type,
                     "thread_id": source.thread_id,
                     "profile_name": source.profile,
+                    "parent_session_id": fork_from_session_id,
+                    "model_config": (
+                        {"_branched_from": fork_from_session_id}
+                        if fork_from_session_id
+                        else None
+                    ),
                 }
 
         if _needs_save:
@@ -2451,6 +2468,11 @@ class SessionStore:
         if self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
+                if fork_from_session_id:
+                    self._copy_fork_transcript(
+                        fork_from_session_id,
+                        session_id,
+                    )
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
@@ -2461,6 +2483,25 @@ class SessionStore:
                 print(f"[gateway] Warning: Failed to create SQLite session: {e}")
 
         return entry
+
+    def _copy_fork_transcript(
+        self,
+        parent_session_id: str,
+        child_session_id: str,
+    ) -> None:
+        """Snapshot a parent's active transcript into a new child session.
+
+        The branch has its own rows for write isolation, while its explicit
+        parent link preserves lineage. ``api_content`` stays byte-identical so
+        the first child turn can reuse the provider's cached prompt prefix.
+        """
+        if not self._db or not parent_session_id or not child_session_id:
+            return
+        history = self._db.get_messages_as_conversation(parent_session_id)
+        if history:
+            # One SQLite write transaction: a failed fork can never leave a
+            # partially-copied prompt prefix in the child.
+            self._db.replace_messages(child_session_id, history)
 
     def update_session(
         self,

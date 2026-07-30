@@ -453,6 +453,100 @@ class TestLoadTranscriptDBOnly:
         assert result[1]["content"] == "db-a"
 
 
+class TestSessionStoreFork:
+    @pytest.fixture()
+    def store(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        return SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+
+    @staticmethod
+    def source(thread_id=None):
+        return SessionSource(
+            platform=Platform.SLACK,
+            scope_id="T_WORKSPACE",
+            chat_id="C_PROJECT",
+            chat_type="group",
+            user_id="U_USER",
+            thread_id=thread_id,
+        )
+
+    def test_fork_inherits_parent_then_diverges(self, store):
+        parent = store.get_or_create_session(self.source())
+        store.append_to_transcript(
+            parent.session_id,
+            {"role": "user", "content": "Plan the Japan trip"},
+        )
+        store.append_to_transcript(
+            parent.session_id,
+            {
+                "role": "assistant",
+                "content": "Day three is in Shinjuku",
+                "api_content": "  Day three is in Shinjuku  ",
+            },
+        )
+
+        child = store.get_or_create_session(
+            self.source("1700000000.000001"),
+            fork_from_session_id=parent.session_id,
+        )
+
+        assert child.session_id != parent.session_id
+        assert child.metadata["fork_parent_session_id"] == parent.session_id
+        assert store._db.get_session(child.session_id)["parent_session_id"] == parent.session_id
+        assert [m["content"] for m in store.load_transcript(child.session_id)] == [
+            "Plan the Japan trip",
+            "Day three is in Shinjuku",
+        ]
+        assert store.load_transcript(child.session_id)[1]["api_content"] == (
+            "  Day three is in Shinjuku  "
+        )
+
+        store.append_to_transcript(
+            child.session_id,
+            {"role": "user", "content": "Choose the third-night dinner"},
+        )
+        assert len(store.load_transcript(parent.session_id)) == 2
+        assert len(store.load_transcript(child.session_id)) == 3
+
+        resumed = store.get_or_create_session(
+            self.source("1700000000.000001"),
+            fork_from_session_id=parent.session_id,
+        )
+        assert resumed.session_id == child.session_id
+        assert len(store.load_transcript(child.session_id)) == 3
+
+    def test_two_threads_fork_same_snapshot_without_cross_pollution(self, store):
+        parent = store.get_or_create_session(self.source())
+        store.append_to_transcript(
+            parent.session_id,
+            {"role": "user", "content": "Shared project context"},
+        )
+        store.append_to_transcript(
+            parent.session_id,
+            {"role": "assistant", "content": "Shared project answer"},
+        )
+
+        first = store.get_or_create_session(
+            self.source("1700000000.000011"),
+            fork_from_session_id=parent.session_id,
+        )
+        second = store.get_or_create_session(
+            self.source("1700000000.000012"),
+            fork_from_session_id=parent.session_id,
+        )
+        store.append_to_transcript(
+            first.session_id,
+            {"role": "user", "content": "Dinner branch only"},
+        )
+
+        assert first.session_id != second.session_id
+        assert len(store.load_transcript(first.session_id)) == 3
+        assert len(store.load_transcript(second.session_id)) == 2
+        assert len(store.load_transcript(parent.session_id)) == 2
+
+
 class TestSessionStoreSwitchSession:
     """Regression coverage for gateway /resume session switching semantics."""
 

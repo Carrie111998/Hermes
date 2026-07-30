@@ -408,7 +408,8 @@ platforms:
       # Optional per-channel override. "channel" keeps top-level replies flat;
       # "thread" keeps thread-per-message mode; "project" keeps the project
       # mainline flat but opens high-confidence branch-worthy subtopics in a
-      # new thread/session (including bounded project subtopics or unrelated work).
+      # new thread/session. That child snapshots the channel session's committed
+      # context before the root message, then diverges independently.
       # Genuine replies inside an existing Slack thread always stay there.
       channel_reply_modes:
         C0123456789: channel
@@ -467,7 +468,7 @@ platforms:
 |-----|---------|-------------|
 | `platforms.slack.reply_to_mode` | `"first"` | Threading mode for multi-part messages: `"off"`, `"first"`, or `"all"` |
 | `platforms.slack.extra.reply_in_thread` | `true` | When `false`, channel messages get direct replies instead of threads. Messages inside existing threads still reply in-thread. |
-| `platforms.slack.extra.channel_reply_modes` | `{}` | Optional map of Slack channel IDs to `"channel"`, `"thread"`, or `"project"`. Project mode uses an auxiliary branch-classification call before session selection: project-wide discussion and broad/simple turns share the channel session, while high-confidence bounded subtopics (a specific meal, hotel, incident, decision, or deliverable) and unrelated work use the current message as a new thread root. Existing threads remain thread-scoped. |
+| `platforms.slack.extra.channel_reply_modes` | `{}` | Optional map of Slack channel IDs to `"channel"`, `"thread"`, or `"project"`. Project mode uses an auxiliary branch-classification call before session selection: project-wide discussion and broad/simple turns share the channel session, while high-confidence bounded subtopics (a specific meal, hotel, incident, decision, or deliverable) and unrelated work use the current message as a new thread root. The child session inherits a snapshot of the channel session's committed transcript and then diverges without writing thread turns back into the parent. Existing threads remain thread-scoped. |
 | `platforms.slack.extra.project_route_min_confidence` | `0.85` | Minimum classifier confidence required to move a project-mode turn into a thread. Lower-confidence results stay in the channel. |
 | `platforms.slack.extra.project_route_timeout` | `10` | Timeout in seconds for the project topic-classification call. Failures stay in the channel. Configure its provider/model under `auxiliary.topic_router`. |
 | `platforms.slack.extra.reply_broadcast` | `false` | When `true`, thread replies are also posted to the main channel. Only the first chunk is broadcast. |

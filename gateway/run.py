@@ -15513,6 +15513,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _get_or_create_inbound_session(self, event, source):
+        """Resolve an inbound lane, forking project-routed Slack threads.
+
+        The adapter supplies only a boolean marker. The trusted parent source is
+        derived here, so an inbound payload cannot name an arbitrary transcript.
+        """
+        fork_from_session_id = None
+        event_metadata = getattr(event, "metadata", None) or {}
+        if (
+            event_metadata.get("slack_project_session_fork")
+            and source.platform == Platform.SLACK
+            and source.thread_id
+        ):
+            parent_source = dataclasses.replace(source, thread_id=None)
+            parent_entry = await self.async_session_store.get_or_create_session(
+                parent_source
+            )
+            fork_from_session_id = parent_entry.session_id
+
+        return await self.async_session_store.get_or_create_session(
+            source,
+            fork_from_session_id=fork_from_session_id,
+        )
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -15542,7 +15566,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_entry = await self._get_or_create_inbound_session(event, source)
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
