@@ -523,6 +523,18 @@ def test_dispatch_runs_short_handlers_inline(server):
     assert resp == {"jsonrpc": "2.0", "id": "r1", "result": {"pong": True}}
 
 
+def test_active_tui_work_includes_running_detached_session(server):
+    server._sessions["detached-running"] = {
+        "running": True,
+        "transport": server._detached_ws_transport,
+    }
+
+    assert server.has_active_tui_work() is True
+
+    server._sessions["detached-running"]["running"] = False
+    assert server.has_active_tui_work() is False
+
+
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
 def test_completion_handlers_are_pool_routed(completion_method, server):
     """complete.path/complete.slash must run on the pool, never the reader thread.
@@ -614,5 +626,4 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-
 

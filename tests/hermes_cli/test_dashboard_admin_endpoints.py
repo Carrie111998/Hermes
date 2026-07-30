@@ -1160,6 +1160,46 @@ async def test_dashboard_quiesce_waits_for_detached_action(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dashboard_quiesce_waits_for_embedded_tui_turn(monkeypatch):
+    import tui_gateway.server
+    import hermes_cli.web_server as ws
+
+    active = True
+    monkeypatch.setattr(
+        tui_gateway.server,
+        "has_active_tui_work",
+        lambda: active,
+    )
+    ws._end_dashboard_update_quiesce()
+    try:
+        quiesce_task = asyncio.create_task(
+            ws._begin_dashboard_update_quiesce(timeout=0.5)
+        )
+        await asyncio.sleep(0.05)
+        assert quiesce_task.done() is False
+        active = False
+        await quiesce_task
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+    finally:
+        ws._end_dashboard_update_quiesce()
+
+
+def test_dashboard_rejects_duplicate_live_action(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    existing = MagicMock()
+    existing.poll.return_value = None
+    spawn = MagicMock()
+    monkeypatch.setitem(ws._ACTION_PROCS, "doctor", existing)
+    monkeypatch.setattr(ws, "_spawn_hermes_action_unlocked", spawn)
+
+    with pytest.raises(RuntimeError, match="already running"):
+        ws._spawn_hermes_action(["doctor"], "doctor")
+
+    spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_dashboard_pty_reaper_pauses_during_update(monkeypatch):
     import hermes_cli.web_server as ws
 

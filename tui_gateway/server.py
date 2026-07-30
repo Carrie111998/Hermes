@@ -148,6 +148,8 @@ _db_error: str | None = None
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+_rpc_futures_lock = threading.Lock()
+_active_rpc_futures: set[concurrent.futures.Future] = set()
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -289,6 +291,15 @@ _pool = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="tui-rpc",
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+
+
+def has_active_tui_work() -> bool:
+    """Whether an embedded TUI RPC or agent turn still owns live work."""
+    with _sessions_lock:
+        if any(session.get("running") for session in _sessions.values()):
+            return True
+    with _rpc_futures_lock:
+        return any(not future.done() for future in _active_rpc_futures)
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -1734,7 +1745,15 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             if resp is not None:
                 t.write(resp)
 
-        _pool.submit(lambda: ctx.run(run))
+        future = _pool.submit(lambda: ctx.run(run))
+        with _rpc_futures_lock:
+            _active_rpc_futures.add(future)
+
+        def _discard_rpc_future(completed: concurrent.futures.Future) -> None:
+            with _rpc_futures_lock:
+                _active_rpc_futures.discard(completed)
+
+        future.add_done_callback(_discard_rpc_future)
 
         return None
     finally:

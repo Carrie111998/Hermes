@@ -836,6 +836,11 @@ def _dashboard_action_is_running(name: str, proc: Any) -> bool:
     """Return whether one tracked detached action still owns live work."""
     if name == "hermes-update":
         return False
+    return _tracked_process_is_running(proc)
+
+
+def _tracked_process_is_running(proc: Any) -> bool:
+    """Best-effort liveness for a process registered by the dashboard."""
     poll = getattr(proc, "poll", None)
     if not callable(poll):
         # Production entries are subprocess.Popen instances. Some embedders
@@ -941,12 +946,19 @@ async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
             for name, proc in tuple(_ACTION_PROCS.items())
             if _dashboard_action_is_running(name, proc)
         ]
+        try:
+            from tui_gateway.server import has_active_tui_work
+
+            active_tui_work = has_active_tui_work()
+        except Exception:
+            active_tui_work = False
         if (
             active_http == 0
             and active_background == 0
             and not active_ws
             and not active_cron_jobs
             and not active_actions
+            and not active_tui_work
         ):
             return
         await asyncio.sleep(0.01)
@@ -3895,6 +3907,7 @@ _ACTION_LOG_FILES: Dict[str, str] = {
 # report liveness and exit code without shelling out to ``ps``.
 _ACTION_PROCS: Dict[str, subprocess.Popen] = {}
 _ACTION_COMMANDS: Dict[str, Tuple[str, ...]] = {}
+_ACTION_SPAWN_LOCK = threading.Lock()
 
 # ``name`` → completed synthetic action result for actions the server handled
 # without spawning a subprocess (for example, unsupported Docker updates).
@@ -3932,6 +3945,18 @@ def _dashboard_spawn_executable() -> str:
 
 
 def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
+    """Spawn one uniquely named detached action."""
+    with _ACTION_SPAWN_LOCK:
+        existing = _ACTION_PROCS.get(name)
+        if existing is not None and _tracked_process_is_running(existing):
+            raise RuntimeError(f"Dashboard action {name!r} is already running")
+        return _spawn_hermes_action_unlocked(subcommand, name)
+
+
+def _spawn_hermes_action_unlocked(
+    subcommand: List[str],
+    name: str,
+) -> subprocess.Popen:
     """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
 
     Uses the running interpreter's ``hermes_cli.main`` module so the action
