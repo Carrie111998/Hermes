@@ -2976,38 +2976,36 @@ def terminal_tool(
             if sudo_cache_cleared:
                 result_dict["sudo_cache_cleared"] = True
 
-            # DX (#71788): when Hermes strips provider credentials from the
-            # child env, surface which names were scrubbed so operators/models
-            # do not treat "KEY is not set" as gateway misconfiguration.
-            try:
-                from tools.env_passthrough import (
-                    format_scrubbed_provider_env_note,
-                    list_scrubbed_provider_credentials,
-                )
-                # Compare parent process env vs what LocalEnvironment would keep
-                # for a fresh local run without extra skill overrides.
-                #
-                # NOTE: this is an approximation — _make_run_env({}) recomputes
-                # the scrubbed set for a baseline run rather than reading back
-                # the exact env the child actually saw. If a skill added a
-                # passthrough/override for this run, the preview could diverge
-                # from reality. Acceptable for a DX note; the set of scrubbed
-                # provider credentials is stable across runs in practice.
-                from tools.environments.local import _make_run_env
+            # DX (#71788): surface scrubbed provider credential *names* only
+            # where we know the child env Hermes actually built.
+            # Local backends: LocalEnvironment._run_bash uses
+            # ``_make_run_env(self.env)`` — derive the note from that.
+            # Non-local backends (ssh/docker/…): the remote shell's env is
+            # not fully modeled here (ssh does not clear host env); omit the
+            # note rather than claim a remote credential was scrubbed.
+            if env_type == "local":
+                try:
+                    from tools.env_passthrough import (
+                        format_scrubbed_provider_env_note,
+                        list_scrubbed_provider_credentials,
+                    )
+                    from tools.environments.local import _make_run_env
 
-                child_preview = _make_run_env({})
-                scrubbed_names = list_scrubbed_provider_credentials(
-                    os.environ, child_preview
-                )
-                note = format_scrubbed_provider_env_note(scrubbed_names)
-                if note:
-                    result_dict["credential_scrub_note"] = note
-                    # Keep the human-readable form on output for model visibility.
-                    out = result_dict.get("output") or ""
-                    if note not in out:
-                        result_dict["output"] = (out + ("\n\n" if out else "") + note)
-            except Exception:
-                logger.debug("credential scrub note failed", exc_info=True)
+                    local_env = getattr(env, "env", None) or {}
+                    child_env = _make_run_env(local_env)
+                    scrubbed_names = list_scrubbed_provider_credentials(
+                        os.environ, child_env
+                    )
+                    note = format_scrubbed_provider_env_note(scrubbed_names)
+                    if note:
+                        result_dict["credential_scrub_note"] = note
+                        out = result_dict.get("output") or ""
+                        if note not in out:
+                            result_dict["output"] = (
+                                out + ("\n\n" if out else "") + note
+                            )
+                except Exception:
+                    logger.debug("credential scrub note failed", exc_info=True)
 
             return json.dumps(result_dict, ensure_ascii=False)
 

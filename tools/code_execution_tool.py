@@ -1094,25 +1094,13 @@ def _execute_remote(
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
 
-        # The remote script inherits only the RPC prefix above — no provider
-        # credentials from this process are shipped to the remote backend, so
-        # they are all effectively scrubbed from the child's perspective.
-        # Compute the DX note from this path's own env (an empty child env),
-        # not by reaching into execute_code's locals() across function scopes.
+        # Remote backends run via env.execute on ssh/docker/etc. We do not ship
+        # Hermes gateway provider keys as shell env on the remote command, but
+        # we also do not model the remote process environment end-to-end (SSH
+        # remote bash keeps host env). Only emit credential_scrub_note from the
+        # local execute_code path where ``_scrub_child_env`` is the actual child
+        # env. Keep _scrub_note empty here.
         _scrub_note = ""
-        try:
-            from tools.env_passthrough import (
-                format_scrubbed_provider_env_note,
-                list_scrubbed_provider_credentials,
-            )
-            _scrub_note = format_scrubbed_provider_env_note(
-                list_scrubbed_provider_credentials(os.environ, {})
-            )
-        except Exception:
-            logger.debug(
-                "Failed to compute credential scrub note (remote path)",
-                exc_info=True,
-            )
 
         # Execute the script on the remote backend
         logger.info("Executing code on %s backend (task %s)...",
