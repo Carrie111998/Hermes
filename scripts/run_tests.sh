@@ -7,7 +7,7 @@
 #     file runs in its own freshly-spawned `python -m pytest <file>`
 #     subprocess. No xdist, no shared workers, no module-level leakage
 #     between files.
-#   * TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0 (deterministic)
+#   * TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0, PYTHONUTF8=1 (deterministic)
 #   * Env vars blanked (conftest.py also does this, but this
 #     is belt-and-suspenders for anyone running pytest outside our
 #     conftest path — e.g. on a single file)
@@ -78,7 +78,7 @@ fi
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
-echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
+echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0 PYTHONUTF8=1; clean env)"
 
 cd "$REPO_ROOT"
 
@@ -98,6 +98,7 @@ CLEAN_ENV=(
   "LANG=C.UTF-8"
   "LC_ALL=C.UTF-8"
   "PYTHONHASHSEED=0"
+  "PYTHONUTF8=1"
 )
 
 # Native Windows Python ignores HOME when resolving Path.home(). Preserve only

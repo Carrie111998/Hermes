@@ -46,6 +46,26 @@ def test_canonical_runner_provides_a_resolvable_home() -> None:
     assert home.exists()
 
 
+def test_canonical_runner_forces_utf8_through_native_python_children() -> None:
+    """The clean runner must make Unicode deterministic for its process tree."""
+    assert os.environ.get("PYTHONUTF8") == "1"
+    assert sys.flags.utf8_mode == 1
+
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('\\u23f5\\u2713'); sys.stdout.flush()",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert child.returncode == 0, child.stderr.decode("utf-8", errors="replace")
+    assert child.stdout == "\u23f5\u2713".encode("utf-8")
+
+
 def _handoff_path_for(nonce: str) -> Path:
     return _HANDOFF_DIR / f"grandchild-{nonce}.json"
 
