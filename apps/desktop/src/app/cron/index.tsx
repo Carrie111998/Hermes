@@ -387,14 +387,6 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
       const updated = isPaused ? await resumeCronJob(job.id) : await pauseCronJob(job.id)
       updateCronJobs(rows => rows.map(row => (row.id === job.id ? updated : row)))
 
-      if (!isPaused) {
-        const pendingRunAt = pendingTriggersRef.current.get(job.id)
-
-        if (pendingRunAt !== undefined) {
-          clearPendingTrigger(job.id, pendingRunAt)
-        }
-      }
-
       notify({
         kind: 'success',
         title: isPaused ? c.resumed : c.paused,
@@ -786,6 +778,7 @@ function CronJobRuns({
   const loadRequestRef = useRef<null | Promise<void>>(null)
   const runIdsRef = useRef(new Set<string>())
 
+  // eslint-disable-next-line no-restricted-syntax -- request and run snapshots coordinate async loads, not atom mirrors
   useEffect(() => {
     let cancelled = false
 
@@ -805,7 +798,7 @@ function CronJobRuns({
 
               jobCompleted = latestLastRunAt !== null && latestLastRunAt !== lastRunAtBeforeTrigger
 
-              if (jobCompleted) {
+              if (jobCompleted && !cancelled) {
                 updateCronJobs(rows =>
                   rows.map(row => {
                     if (row.id !== latestJob.id || (row.last_run_at ?? null) !== lastRunAtBeforeTrigger) {

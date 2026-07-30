@@ -6,7 +6,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import type * as HermesApi from '@/hermes'
 import type { CronJob, SessionInfo } from '@/hermes'
 import { queryClient } from '@/lib/query-client'
-import { setCronFocusJobId, setCronJobs } from '@/store/cron'
+import { $cronJobs, setCronFocusJobId, setCronJobs } from '@/store/cron'
+import { notifyCronChanged, setChangeEventsAvailable } from '@/store/live-sync'
 
 const getCronJob = vi.fn()
 const getCronJobRuns = vi.fn()
@@ -114,6 +115,7 @@ beforeAll(() => {
 beforeEach(() => {
   setCronJobs([])
   setCronFocusJobId(null)
+  setChangeEventsAvailable(false)
   getCronJob.mockResolvedValue(job)
   getCronJobs.mockResolvedValue([job])
   getCronJobRuns.mockResolvedValue([])
@@ -127,6 +129,7 @@ afterEach(() => {
   queryClient.clear()
   setCronJobs([])
   setCronFocusJobId(null)
+  setChangeEventsAvailable(false)
   vi.clearAllMocks()
 })
 
@@ -168,7 +171,7 @@ describe('CronView trigger feedback', () => {
     await act(async () => nextRuns.resolve([]))
   })
 
-  it('clears queued feedback when pausing cancels the pending run', async () => {
+  it('keeps queued feedback after pause until authoritative run state settles', async () => {
     const nextRuns = deferred<SessionInfo[]>()
 
     triggerCronJob.mockResolvedValue(job)
@@ -181,10 +184,36 @@ describe('CronView trigger feedback', () => {
     await act(async () => screen.getByRole('button', { name: 'Pause' }).click())
 
     expect(pauseCronJob).toHaveBeenCalledWith(job.id)
-    expect(container.querySelector('[data-slot="cron-run-pending"]')).toBeFalsy()
-    expect((screen.getByRole('button', { name: 'Trigger now' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(container.querySelector('[data-slot="cron-run-pending"]')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Trigger now' }) as HTMLButtonElement).disabled).toBe(true)
 
-    await act(async () => nextRuns.resolve([]))
+    const observedAt = Date.now() / 1000
+
+    await act(async () => nextRuns.resolve([{ ...run, last_active: observedAt, started_at: observedAt }]))
+    await screen.findByText('Status report run')
+    await waitFor(() => expect(container.querySelector('[data-slot="cron-run-pending"]')).toBeNull())
+  })
+
+  it('reconciles pending feedback immediately when cron.changed publishes the run', async () => {
+    setChangeEventsAvailable(true)
+    triggerCronJob.mockResolvedValue(job)
+    const { container } = await renderLoadedCron()
+    const triggerButton = screen.getByRole('button', { name: 'Trigger now' })
+
+    getCronJobRuns.mockClear()
+    await act(async () => triggerButton.click())
+    await waitFor(() => expect(getCronJobRuns).toHaveBeenCalled())
+
+    const callsBeforeChange = getCronJobRuns.mock.calls.length
+    const observedAt = Date.now() / 1000
+
+    getCronJobRuns.mockResolvedValue([{ ...run, last_active: observedAt, started_at: observedAt }])
+    await act(async () => notifyCronChanged())
+
+    await waitFor(() => expect(getCronJobRuns.mock.calls.length).toBeGreaterThan(callsBeforeChange))
+    await screen.findByText('Status report run')
+    await waitFor(() => expect(container.querySelector('[data-slot="cron-run-pending"]')).toBeNull())
+    expect((triggerButton as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('does not let a canceled job probe overwrite a successful pause', async () => {
@@ -207,6 +236,28 @@ describe('CronView trigger feedback', () => {
     await act(async () => jobProbe.resolve(completedJob))
 
     expect(screen.getByRole('button', { name: 'Resume' })).toBeTruthy()
+  })
+
+  it('does not publish a completed job probe after the runs view unmounts', async () => {
+    const jobProbe = deferred<CronJob>()
+    const pendingScriptJob: CronJob = { ...scriptJob, last_run_at: '2026-07-24T12:00:00Z' }
+    const completedJob: CronJob = { ...pendingScriptJob, last_run_at: '2026-07-24T12:00:01Z' }
+
+    getCronJobs.mockResolvedValue([pendingScriptJob])
+    getCronJob.mockImplementation(() => jobProbe.promise)
+    triggerCronJob.mockResolvedValue(pendingScriptJob)
+    const view = await renderLoadedCron()
+
+    await act(async () => screen.getByRole('button', { name: 'Trigger now' }).click())
+    await waitFor(() => expect(getCronJob).toHaveBeenCalledWith(pendingScriptJob.id))
+    view.unmount()
+
+    await act(async () => {
+      jobProbe.resolve(completedJob)
+      await Promise.resolve()
+    })
+
+    expect($cronJobs.get()[0]?.last_run_at).toBe(pendingScriptJob.last_run_at)
   })
 
   it('replaces the queued run with the authoritative run and unlocks the action', async () => {
