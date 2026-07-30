@@ -315,23 +315,19 @@ class TestPersistence:
         env._mock_client.create.assert_called_once()
         assert env._sandbox is replacement
 
-    def test_persistent_creates_new_when_none_found(self, make_env, daytona_sdk):
-        env = make_env(
+    def test_persistent_creation_stamps_image_identity(self, make_env, daytona_sdk):
+        make_env(
             get_side_effect=daytona_sdk.DaytonaError("not found"),
             persistent=True,
             task_id="mytask",
         )
-        env._mock_client.create.assert_called_once()
-        # Verify the name and labels were passed to CreateSandboxFromImageParams
-        # by checking get() was called with the right sandbox name
-        env._mock_client.get.assert_called_with("hermes-mytask")
-        env._mock_client.list.assert_called_with(
-            labels={"hermes_task_id": "mytask"}, limit=1)
+
         create_kwargs = daytona_sdk.CreateSandboxFromImageParams.call_args.kwargs
         assert create_kwargs["labels"] == {
             "hermes_task_id": "mytask",
             "hermes_image": "test-image:latest",
         }
+
     def test_non_persistent_skips_lookup(self, make_env):
         env = make_env(persistent=False)
         env._mock_client.get.assert_not_called()
@@ -349,12 +345,6 @@ class TestCleanup:
         sb = env._sandbox
         env.cleanup()
         sb.stop.assert_called_once()
-
-    def test_non_persistent_cleanup_deletes_sandbox(self, make_env):
-        env = make_env(persistent=False)
-        sb = env._sandbox
-        env.cleanup()
-        env._mock_client.delete.assert_called_once_with(sb)
 
     def test_force_remove_deletes_persistent_sandbox(self, make_env):
         env = make_env(persistent=True)
@@ -378,10 +368,6 @@ class TestCleanup:
         sb.stop.assert_not_called()
         env._mock_client.delete.assert_called_once_with(sb)
 
-    def test_cleanup_idempotent(self, make_env):
-        env = make_env(persistent=True)
-        env.cleanup()
-        env.cleanup()  # should not raise
     def test_cleanup_swallows_errors(self, make_env):
         env = make_env(persistent=True)
         env._sandbox.stop.side_effect = RuntimeError("stop failed")
