@@ -1219,6 +1219,57 @@ def test_oneshot_run_agent_closes_agent_after_chat(monkeypatch):
     assert shutdown_messages == [[{"role": "user", "content": "hello"}]]
 
 
+def test_oneshot_run_agent_forwards_configured_system_prompt(monkeypatch):
+    """One-shot mode must retain the same configured instruction block as CLI."""
+    import hermes_cli.oneshot as oneshot_mod
+
+    init_kwargs = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            init_kwargs.update(kwargs)
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+            self._session_messages = []
+
+        def run_conversation(self, _prompt, **_kwargs):
+            return {"final_response": "done"}
+
+        def shutdown_memory_provider(self, messages=None):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(
+        sys.modules, "run_agent", types.SimpleNamespace(AIAgent=FakeAgent)
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {"default": "gpt-test", "provider": "openai"},
+            "agent": {"system_prompt": "Ascension contract"},
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "key",
+            "base_url": "https://example.invalid",
+            "provider": "openai",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        },
+    )
+    monkeypatch.setattr(oneshot_mod, "_create_session_db_for_oneshot", lambda: None)
+
+    assert oneshot_mod._run_agent(
+        "hello", model="gpt-test", provider="openai", use_config_toolsets=False
+    ) == ("done", {"final_response": "done"})
+    assert init_kwargs["ephemeral_system_prompt"] == "Ascension contract"
+
+
 def test_oneshot_run_agent_closes_agent_when_chat_raises(monkeypatch):
     import hermes_cli.oneshot as oneshot_mod
 

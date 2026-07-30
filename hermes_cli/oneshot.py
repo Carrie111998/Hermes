@@ -328,6 +328,17 @@ def _run_agent(
     from run_agent import AIAgent
 
     cfg = load_config()
+    agent_cfg = cfg.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    # ``hermes -z`` bypasses ``cli.py``, which normally transfers this
+    # configured instruction block into AIAgent. Keep one-shot behavior
+    # aligned with interactive CLI while preserving the explicit environment
+    # override used by embedded callers.
+    ephemeral_system_prompt = (
+        os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
+        or str(agent_cfg.get("system_prompt") or "")
+    ).strip()
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -418,6 +429,7 @@ def _run_agent(
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
+            ephemeral_system_prompt=ephemeral_system_prompt,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
             # Interactive callbacks are intentionally NOT wired beyond this
