@@ -2,6 +2,7 @@
 import json
 import os
 import time
+from typing import cast
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -469,6 +470,14 @@ class TestMattermostObserveUnmentionedChannelMessages:
         self.adapter.handle_message.assert_not_awaited()
         assert self.store.messages == []
 
+    def test_legacy_observation_env_setting_is_ignored(self):
+        legacy_key = "MATTERMOST_" + "OBSERVE_UNMENTIONED_CHANNEL_MESSAGES"
+        with patch.dict(os.environ, {legacy_key: "true"}):
+            assert (
+                self.adapter._mattermost_observe_unmentioned_channel_messages()
+                is False
+            )
+
     @pytest.mark.asyncio
     async def test_observation_requires_explicit_allowed_channel(self):
         self.adapter.config.extra.update(
@@ -503,6 +512,30 @@ class TestMattermostObserveUnmentionedChannelMessages:
         assert source.chat_id == "chan_allowed"
         assert source.thread_id == "root_123"
         assert source.user_id is None
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_mode_keeps_top_level_observation_channel_scoped(self):
+        self._enable_observation()
+        self.adapter._reply_mode = "thread"
+        self.adapter.set_authorization_check(lambda *_: True)
+
+        await self.adapter._handle_ws_event(
+            self._event(post_id="observed-top-level")
+        )
+        observed_source = self.store.sources[-1]
+
+        await self.adapter._handle_ws_event(
+            self._event(
+                "@hermes-bot what did Alice say?",
+                post_id="addressed-top-level",
+            )
+        )
+        addressed_event = cast(AsyncMock, self.adapter.handle_message).call_args.args[0]
+
+        assert observed_source.chat_id == "chan_allowed"
+        assert observed_source.thread_id is None
+        assert addressed_event.source.chat_id == "chan_allowed"
+        assert addressed_event.source.thread_id is None
 
     @pytest.mark.asyncio
     async def test_unauthorized_sender_is_not_observed(self):
@@ -835,7 +868,7 @@ class TestMattermostMediaTypes:
 
 
 @pytest.mark.asyncio
-async def test_mattermost_top_level_channel_post_is_thread_root():
+async def test_mattermost_top_level_channel_post_keeps_channel_session_scope():
     adapter = _make_adapter()
     adapter._reply_mode = "thread"
     adapter._bot_user_id = "bot_user_id"
@@ -860,7 +893,7 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     await adapter._handle_ws_event(event)
 
     msg_event = adapter.handle_message.call_args[0][0]
-    assert msg_event.source.thread_id == "top_post_123"
+    assert msg_event.source.thread_id is None
     assert msg_event.source.message_id == "top_post_123"
     assert msg_event.message_id == "top_post_123"
 

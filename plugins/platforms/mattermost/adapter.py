@@ -9,8 +9,6 @@ Environment variables:
     MATTERMOST_TOKEN            Bot token or personal-access token
     MATTERMOST_ALLOWED_USERS    Comma-separated user IDs
     MATTERMOST_HOME_CHANNEL     Channel ID for cron/notification delivery
-    MATTERMOST_OBSERVE_UNMENTIONED_CHANNEL_MESSAGES
-                                Observe authorized unmentioned posts in allowlisted channels
 """
 
 from __future__ import annotations
@@ -1530,10 +1528,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
     def _mattermost_observe_unmentioned_channel_messages(self) -> bool:
         """Whether eligible unmentioned channel posts are persisted as context."""
-        configured = self._mattermost_config_value(
-            "observe_unmentioned_channel_messages",
-            "MATTERMOST_OBSERVE_UNMENTIONED_CHANNEL_MESSAGES",
-        )
+        configured = self.config.extra.get("observe_unmentioned_channel_messages")
         return self._mattermost_bool(configured)
 
     def _mattermost_observation_enabled(
@@ -1607,10 +1602,10 @@ class MattermostAdapter(BasePlatformAdapter):
         return not is_bot
 
     def _mattermost_thread_id(self, post: Dict[str, Any], chat_type: str) -> Optional[str]:
-        thread_id = post.get("root_id") or None
-        if not thread_id and self._reply_mode == "thread" and chat_type != "dm":
-            thread_id = post.get("id") or None
-        return thread_id
+        # Session scope follows an existing Mattermost thread only. A top-level
+        # post remains channel-scoped even when replies are rendered in a new
+        # thread, so passive chatter is available to a later top-level mention.
+        return post.get("root_id") or None
 
     @staticmethod
     def _mattermost_observed_attributed_text(
@@ -1817,8 +1812,8 @@ class MattermostAdapter(BasePlatformAdapter):
                         re.escape(pattern), "", message_text, flags=re.IGNORECASE
                     ).strip()
 
-        # Thread support: replies use root_id; in thread reply mode, a top-level
-        # channel post becomes the root for the session and response.
+        # Session scope follows root_id only for actual replies. Top-level posts
+        # stay channel-scoped; reply_mode may still thread the rendered response.
         thread_id = self._mattermost_thread_id(post, chat_type)
 
         # Determine message type.

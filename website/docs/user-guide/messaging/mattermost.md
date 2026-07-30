@@ -275,12 +275,6 @@ Safety and scope:
 - Context is shared at channel scope, or at Mattermost thread-root scope for replies. Sender name and ID are retained as attribution in the observed text.
 - Passive observation records when a post has attachments but does not download those files. Addressed posts retain the existing attachment-download behavior.
 
-Environment-variable equivalent:
-
-```bash
-MATTERMOST_OBSERVE_UNMENTIONED_CHANNEL_MESSAGES=true
-```
-
 ## Native rich posts and interactive actions
 
 Mattermost can render Hermes replies as native attachment cards while preserving the original Markdown as fallback text. This is opt-in so existing installations keep their current message layout.

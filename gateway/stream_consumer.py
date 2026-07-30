@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -413,22 +414,58 @@ class GatewayStreamConsumer:
         except (TypeError, ValueError):
             return len(content) <= 4096
 
+    def _split_transformed_content(self, content: str) -> list[str]:
+        """Split transformed delivery through the platform-safe chunking rail."""
+        raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
+        len_fn: "Callable[[str], int]" = len
+        if isinstance(self.adapter, _BasePlatformAdapter):
+            try:
+                raw_limit = self.adapter.max_message_length_for_chat(self.chat_id)
+                len_fn = self.adapter.message_len_fn_for_chat(self.chat_id)
+            except Exception as exc:
+                logger.debug("per-chat transformed limit resolution failed: %s", exc)
+        try:
+            safe_limit = max(1, int(raw_limit) - 100)
+        except (TypeError, ValueError):
+            safe_limit = 3996
+        chunks = self._truncate_for_stream(content, safe_limit, len_fn)
+        if not chunks or any(len_fn(chunk) > safe_limit for chunk in chunks):
+            chunks = self._split_text_chunks(content, safe_limit, len_fn)
+        return chunks
+
+    async def _send_transformed_chunks(self, content: str) -> Optional[list[str]]:
+        """Deliver every transformed chunk, returning IDs only on full success."""
+        chunks = self._split_transformed_content(content)
+        if not chunks:
+            return []
+        if len(chunks) > 1:
+            self._is_multi_chunk = True
+        message_ids: list[str] = []
+        for chunk in chunks:
+            result = await self.adapter.send(
+                chat_id=self.chat_id,
+                content=chunk,
+                metadata=self._metadata_for_send(final=True),
+            )
+            if not getattr(result, "success", False):
+                return None
+            message_id = getattr(result, "message_id", None)
+            if message_id:
+                message_ids.append(str(message_id))
+                self._track_preview_id(message_id)
+            self._message_id = message_id or self._message_id
+            self._last_sent_text = chunk
+            self._already_sent = True
+            self._notify_new_message()
+        return message_ids
+
     async def _send_transformed_appendix(self, appendix: str) -> bool:
         """Send an append-only transform as a fresh plain continuation."""
-        result = await self.adapter.send(
-            chat_id=self.chat_id,
-            content=appendix,
-            metadata=self._metadata_for_send(final=True),
-        )
-        if not getattr(result, "success", False):
+        message_ids = await self._send_transformed_chunks(appendix)
+        if message_ids is None:
             return False
-        self._message_id = getattr(result, "message_id", None)
-        self._last_sent_text = appendix
-        self._track_preview_id(self._message_id)
-        self._already_sent = True
         self._final_response_sent = True
         self._final_content_delivered = True
-        self._notify_new_message()
         return True
 
     async def _send_transformed_replacement(self, transformed: str) -> bool:
@@ -442,19 +479,15 @@ class GatewayStreamConsumer:
         obsolete_ids = set(self._segment_preview_message_ids)
         if self._message_id and self._message_id != "__no_edit__":
             obsolete_ids.add(str(self._message_id))
-        result = await self.adapter.send(
-            chat_id=self.chat_id,
-            content=transformed,
-            metadata=self._metadata_for_send(final=True),
-        )
-        if not getattr(result, "success", False):
+        replacement_ids = await self._send_transformed_chunks(transformed)
+        if replacement_ids is None:
             return False
 
-        replacement_id = getattr(result, "message_id", None)
+        replacement_id_set = set(replacement_ids)
         delete_fn = getattr(self.adapter, "delete_message", None)
         if callable(delete_fn):
             for message_id in obsolete_ids:
-                if replacement_id and str(message_id) == str(replacement_id):
+                if str(message_id) in replacement_id_set:
                     continue
                 try:
                     await delete_fn(self.chat_id, message_id)
@@ -467,13 +500,8 @@ class GatewayStreamConsumer:
 
         self._preview_message_ids.difference_update(obsolete_ids)
         self._segment_preview_message_ids.difference_update(obsolete_ids)
-        self._message_id = replacement_id
-        self._last_sent_text = transformed
-        self._track_preview_id(replacement_id)
-        self._already_sent = True
         self._final_response_sent = True
         self._final_content_delivered = True
-        self._notify_new_message()
         return True
 
     @property

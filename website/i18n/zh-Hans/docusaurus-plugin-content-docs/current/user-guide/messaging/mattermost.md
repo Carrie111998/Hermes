@@ -275,12 +275,6 @@ mattermost:
 - 上下文按频道共享；回复消息则按 Mattermost 线程根范围共享。观察文本会保留发送者名称和 ID 作为来源标记。
 - 被动观察会记录消息包含附件，但不会下载文件；明确提及机器人的消息仍保留现有附件下载行为。
 
-等效环境变量：
-
-```bash
-MATTERMOST_OBSERVE_UNMENTIONED_CHANNEL_MESSAGES=true
-```
-
 ## 原生富消息与交互操作
 
 Mattermost 可以将 Hermes 回复渲染为原生附件卡片，同时保留原始 Markdown 作为回退文本。此功能默认关闭，因此不会改变现有安装的消息样式。

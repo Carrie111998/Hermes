@@ -1131,6 +1131,120 @@ class TestInterimCommentaryMessages:
         assert adapter.sends[0]["metadata"]["multi_chunk"] is True
 
     @pytest.mark.asyncio
+    async def test_over_limit_appendix_is_chunked_to_platform_safe_limit(self):
+        class Adapter:
+            MAX_MESSAGE_LENGTH = 600
+
+            def __init__(self):
+                self.sends = []
+
+            async def send(self, **kwargs):
+                self.sends.append(kwargs)
+                return SimpleNamespace(
+                    success=True,
+                    message_id=f"appendix-{len(self.sends)}",
+                )
+
+        head = "h" * 400
+        tail = "t" * 300
+        appendix = "a" * 1200
+        adapter = Adapter()
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        consumer._message_id = "continuation-2"
+        consumer._is_multi_chunk = True
+        consumer._finalized_overflow_prefix = head
+        consumer._streamed_source_text = head + tail
+
+        assert await consumer.edit_transformed_final(head + tail + appendix)
+        assert len(adapter.sends) == 3
+        assert all(len(call["content"]) <= 500 for call in adapter.sends)
+        assert "".join(call["content"] for call in adapter.sends) == appendix
+        assert all(call["metadata"]["multi_chunk"] is True for call in adapter.sends)
+
+    @pytest.mark.asyncio
+    async def test_over_limit_non_prefix_transform_chunks_before_cleanup(self):
+        class Adapter:
+            MAX_MESSAGE_LENGTH = 600
+
+            def __init__(self):
+                self.sends = []
+                self.deleted = []
+                self.events = []
+
+            async def send(self, **kwargs):
+                self.sends.append(kwargs)
+                message_id = f"replacement-{len(self.sends)}"
+                self.events.append(("send", message_id))
+                return SimpleNamespace(success=True, message_id=message_id)
+
+            async def delete_message(self, chat_id, message_id):
+                self.deleted.append((chat_id, message_id))
+                self.events.append(("delete", message_id))
+                return True
+
+        adapter = Adapter()
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        consumer._message_id = "continuation-2"
+        consumer._preview_message_ids = {"head-1", "continuation-2"}
+        consumer._segment_preview_message_ids = {"head-1", "continuation-2"}
+        consumer._is_multi_chunk = True
+        consumer._streamed_source_text = "old response"
+        transformed = "rewritten " + ("x" * 1300)
+
+        assert await consumer.edit_transformed_final(transformed)
+        assert len(adapter.sends) == 3
+        assert all(len(call["content"]) <= 500 for call in adapter.sends)
+        assert "".join(call["content"] for call in adapter.sends) == transformed
+        assert all(call["metadata"]["multi_chunk"] is True for call in adapter.sends)
+        first_delete = next(
+            index for index, event in enumerate(adapter.events) if event[0] == "delete"
+        )
+        assert first_delete == len(adapter.sends)
+        assert set(adapter.deleted) == {
+            ("chat_123", "head-1"),
+            ("chat_123", "continuation-2"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_failed_replacement_chunk_preserves_obsolete_stream_messages(self):
+        class Adapter:
+            MAX_MESSAGE_LENGTH = 600
+
+            def __init__(self):
+                self.sends = []
+                self.deleted = []
+
+            async def send(self, **kwargs):
+                self.sends.append(kwargs)
+                if len(self.sends) == 2:
+                    return SimpleNamespace(success=False, message_id=None)
+                return SimpleNamespace(success=True, message_id="replacement-1")
+
+            async def delete_message(self, chat_id, message_id):
+                self.deleted.append((chat_id, message_id))
+                return True
+
+        adapter = Adapter()
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        consumer._message_id = "continuation-2"
+        consumer._preview_message_ids = {"head-1", "continuation-2"}
+        consumer._segment_preview_message_ids = {"head-1", "continuation-2"}
+        consumer._is_multi_chunk = True
+        consumer._streamed_source_text = "old response"
+
+        delivered = await consumer.edit_transformed_final(
+            "rewritten " + ("x" * 1300)
+        )
+
+        assert delivered is False
+        assert len(adapter.sends) == 2
+        assert adapter.deleted == []
+        assert {"head-1", "continuation-2"}.issubset(
+            consumer._segment_preview_message_ids
+        )
+        assert consumer.final_response_sent is False
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "streamed",
         [

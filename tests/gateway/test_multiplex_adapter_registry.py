@@ -8,7 +8,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import (
+    GatewayConfig,
+    Platform,
+    PlatformConfig,
+    platform_binds_port,
+)
 from gateway.run import GatewayRunner
 
 
@@ -501,14 +506,14 @@ class TestFeishuPortBindingConditional:
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
 
-
+    def test_mattermost_binds_only_with_interaction_listener(self):
         # Feishu: webhook = port binding
-        assert _platform_binds_port("feishu", {"connection_mode": "webhook"}) is True
+        assert platform_binds_port("feishu", {"connection_mode": "webhook"}) is True
 
         # Mattermost only binds its optional interaction callback listener.
-        assert _platform_binds_port("mattermost", {}) is False
-        assert _platform_binds_port("mattermost", {"interaction_url": ""}) is False
-        assert _platform_binds_port(
+        assert platform_binds_port("mattermost", {}) is False
+        assert platform_binds_port("mattermost", {"interaction_url": ""}) is False
+        assert platform_binds_port(
             "mattermost",
             {"interaction_url": "https://hermes.example.com/mattermost/actions"},
         ) is True

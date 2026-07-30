@@ -1165,10 +1165,6 @@ class TestApprovalTimeoutIsNotConsent:
             lambda: {"mode": "manual", "timeout": seconds},
         )
 
-    def test_timeout_blocks_with_no_consent_and_timeout_hook(self, monkeypatch):
-        """The reported #24912 scenario — user never responds, agent must see
-        BLOCKED, and the post hook must distinguish timeout from deny so audit
-        plugins can alert on 'agent asked, user never replied'."""
     def test_resolve_by_approval_id_targets_exact_pending_entry(self):
         from tools import approval as mod
 
