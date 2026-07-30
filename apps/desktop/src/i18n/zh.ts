@@ -3006,6 +3006,13 @@ export const zh: Translations = {
         web_search: { done: '已搜索网页', pending: '正在搜索网页', pendingAction: '正在搜索' },
         write_file: { done: '已编辑文件', pending: '正在编辑文件', pendingAction: '正在编辑' }
       }
+    },
+    avatarEditor: {
+      title: '编辑头像',
+      description: '自定义每个参与者的名称和头像。',
+      youLabel: '你（用户）',
+      hermesLabel: 'Hermes（助手）',
+      placeholder: '输入名称'
     }
   },
 

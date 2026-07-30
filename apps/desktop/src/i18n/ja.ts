@@ -2686,6 +2686,13 @@ export const ja = defineLocale({
         web_search: { done: 'Web を検索しました', pending: 'Web を検索中', pendingAction: '検索中' },
         write_file: { done: 'ファイルを編集しました', pending: 'ファイルを編集中', pendingAction: '編集中' }
       }
+    },
+    avatarEditor: {
+      title: 'アバターを編集',
+      description: '各参加者の表示名とアバターをカスタマイズします。',
+      youLabel: 'あなた（ユーザー）',
+      hermesLabel: 'Hermes（アシスタント）',
+      placeholder: '名前を入力'
     }
   },
 

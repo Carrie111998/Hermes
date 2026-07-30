@@ -15,7 +15,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { StopFilled } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import { $avatarNames, DEFAULT_NAMES, getAvatarName } from '@/store/avatar'
+import { $avatarNames, DEFAULT_NAMES } from '@/store/avatar'
 import { notifyThreadEditOpen } from '@/store/thread-scroll'
 import { isWatchWindow } from '@/store/windows'
 
@@ -268,7 +268,7 @@ export const UserMessage: FC<{
   return (
     <MessagePrimitive.Root asChild>
       <div className="message-row message-row-user flex w-full min-w-0 items-end justify-end gap-2" data-slot="message-row">
-        <div className="flex min-w-0 max-w-[75%] flex-col items-end">
+        <div className="flex min-w-0 flex-1 flex-col items-end">
           <span className="message-name-label mb-0.5 mr-1 text-[0.6875rem] leading-4 text-(--ui-text-tertiary) select-none">
             {userName}
           </span>

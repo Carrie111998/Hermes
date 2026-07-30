@@ -2843,6 +2843,13 @@ export const en: Translations = {
         web_search: { done: 'Searched web', pending: 'Searching web', pendingAction: 'Searching' },
         write_file: { done: 'Edited file', pending: 'Editing file', pendingAction: 'Editing' }
       }
+    },
+    avatarEditor: {
+      title: 'Edit Avatars',
+      description: 'Customize participant names and avatars.',
+      youLabel: 'You (User)',
+      hermesLabel: 'Hermes (Assistant)',
+      placeholder: 'Enter name'
     }
   },
 

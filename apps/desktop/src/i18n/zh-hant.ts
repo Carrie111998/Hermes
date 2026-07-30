@@ -2576,6 +2576,13 @@ export const zhHant = defineLocale({
         web_search: { done: '已搜尋網頁', pending: '正在搜尋網頁', pendingAction: '正在搜尋' },
         write_file: { done: '已編輯檔案', pending: '正在編輯檔案', pendingAction: '正在編輯' }
       }
+    },
+    avatarEditor: {
+      title: '編輯頭像',
+      description: '自訂每個參與者的名稱和頭像。',
+      youLabel: '你（使用者）',
+      hermesLabel: 'Hermes（助手）',
+      placeholder: '輸入名稱'
     }
   },
 
