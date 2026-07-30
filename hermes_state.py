@@ -2905,29 +2905,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         entries: Dict[str, str],
         *,
         scope: str = "",
-        delete_keys: Optional[List[str]] = None,
+        delete_expected: Optional[Dict[str, str]] = None,
     ) -> None:
         """Reconcile the routing index for *scope* in one write transaction.
 
-        Upserts every ``session_key -> entry_json`` in *entries* and removes
-        the keys named in *delete_keys* (the keys the caller pruned/reset since
-        its last save).  Rows for keys the caller does not name are left
-        untouched — a whole-index save therefore no longer deletes a sibling
-        writer's concurrent insert into the same scope (#9006 concurrency
-        follow-up).  Other scopes are untouched.
+        Upserts every ``session_key -> entry_json`` in *entries*.  For each
+        ``session_key -> expected_json`` in *delete_expected* the row is
+        deleted only when its stored ``entry_json`` still equals
+        *expected_json* — a compare-and-delete guard.  A sibling writer that
+        changed that same key after the caller's snapshot no longer matches, so
+        its newer route survives and the caller's stale delete becomes a no-op
+        (#9006 concurrency follow-up).  Rows for keys the caller does not name
+        are left untouched, so a whole-index save also never deletes a sibling's
+        concurrent insert into the same scope.  Other scopes are untouched.
 
-        A key present in both *entries* and *delete_keys* is upserted (the live
-        index wins); the delete is skipped for it.  ``delete_keys=None`` (the
-        default) upserts *entries* without removing anything.
+        A key present in both *entries* and *delete_expected* is upserted (the
+        live index wins); the delete is skipped for it.  ``delete_expected=None``
+        (the default) upserts *entries* without removing anything.  Deletes and
+        upserts share one transaction so the reconcile is atomic.
         """
         now = time.time()
-        to_delete = [k for k in (delete_keys or ()) if k and k not in entries]
+        to_delete = [
+            (k, expected)
+            for k, expected in (delete_expected or {}).items()
+            if k and expected is not None and k not in entries
+        ]
 
         def _do(conn):
             if to_delete:
                 conn.executemany(
-                    "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?",
-                    [(scope, k) for k in to_delete],
+                    "DELETE FROM gateway_routing "
+                    "WHERE scope = ? AND session_key = ? AND entry_json = ?",
+                    [(scope, k, expected) for k, expected in to_delete],
                 )
             if entries:
                 conn.executemany(

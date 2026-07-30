@@ -1188,6 +1188,16 @@ class SessionStore:
         # re-upserted, so a save/prune can no longer clobber a sibling writer's
         # concurrent update to a row this store merely loaded and left alone.
         self._persisted_routing_payloads: Dict[str, str] = {}
+        # Exact raw canonical payload this store observed/owns for each key:
+        # {session_key -> entry_json byte-for-byte as stored in gateway_routing}.
+        # Seeded from the direct canonical read and legacy insert-if-absent
+        # winners, and refreshed to what was actually written after each upsert.
+        # Deletes are compare-and-delete against this value, so an owned key is
+        # removed only while the DB still holds the payload we observed; a
+        # sibling's concurrent same-key rewrite no longer matches and survives.
+        # Kept separate from the normalized change-detection signatures above:
+        # a signature is order-insensitive and is NOT a valid SQL CAS operand.
+        self._persisted_routing_raw: Dict[str, str] = {}
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
         # An unscoped pre-migration Slack key can represent at most one
@@ -1305,6 +1315,9 @@ class SessionStore:
         # still upserts them. Signatures are computed the same way as at save
         # time so an unmutated entry compares equal and is not re-upserted.
         persisted_payloads: Dict[str, str] = {}
+        # Exact raw payload observed per proven-canonical key, for compare-and-
+        # delete. Populated in lockstep with persisted_payloads.
+        persisted_raw: Dict[str, str] = {}
         canonical_read_succeeded = False
         _db = getattr(self, "_db", None)
         # An existing canonical store that failed to open at construction must
@@ -1348,6 +1361,9 @@ class SessionStore:
                         persisted_payloads[key] = self._routing_payload_signature(
                             entry.to_dict()
                         )
+                        # The exact bytes the table holds — the CAS operand a
+                        # later delete of this key must still match.
+                        persisted_raw[key] = entry_json
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning(
                             "Invalid canonical routing entry %r: %s", key, e
@@ -1451,6 +1467,10 @@ class SessionStore:
                     persisted_payloads[key] = self._routing_payload_signature(
                         candidate.to_dict()
                     )
+                    # The authoritative stored value is whatever won the
+                    # insert-if-absent race — exactly the bytes now in the
+                    # table, so it is the correct CAS operand for this key.
+                    persisted_raw[key] = authoritative_json
                 loaded_entries[key] = candidate
                 imported += 1
 
@@ -1472,6 +1492,7 @@ class SessionStore:
         # untouched. Seed before the startup prune so its save computes the
         # pruned keys as the delete set.
         self._persisted_routing_payloads = persisted_payloads
+        self._persisted_routing_raw = persisted_raw
 
         # Prune any sessions.json entries that point to sessions already ended
         # in state.db. A hard gateway crash (exit code 1) skips the graceful
@@ -1616,11 +1637,16 @@ class SessionStore:
                         # payload matches the persisted baseline is left alone,
                         # so a sibling's concurrent update to a row we merely
                         # loaded survives. Delete only owned keys that have since
-                        # disappeared (pruned/reset). Foreign rows a sibling
-                        # inserted after our load are never named or deleted, so
-                        # a save can no longer clobber a concurrent write
-                        # (#9006 concurrency follow-up).
+                        # disappeared (pruned/reset), and compare-and-delete each
+                        # such key against the exact payload we observed:
+                        # if a sibling rewrote that same key after our load it no
+                        # longer matches, so its newer route survives our stale
+                        # delete. Foreign rows a sibling inserted after our load
+                        # are never named or deleted either, so a save can no
+                        # longer clobber a concurrent write (#9006 concurrency
+                        # follow-up).
                         baseline = getattr(self, "_persisted_routing_payloads", {})
+                        raw_baseline = getattr(self, "_persisted_routing_raw", {})
                         new_signatures = {
                             k: self._routing_payload_signature(v)
                             for k, v in data.items()
@@ -1630,17 +1656,36 @@ class SessionStore:
                             for k, sig in new_signatures.items()
                             if baseline.get(k) != sig
                         }
-                        delete_keys = [k for k in baseline if k not in data]
+                        # CAS operand per delete: the raw payload we last saw the
+                        # table hold. Skip an owned key we somehow lack a raw
+                        # baseline for rather than fall back to an unconditional
+                        # delete that could clobber a sibling.
+                        delete_expected = {
+                            k: raw_baseline[k]
+                            for k in baseline
+                            if k not in data and k in raw_baseline
+                        }
                         replacer(
                             upserts,
                             scope=self._routing_scope(),
-                            delete_keys=delete_keys,
+                            delete_expected=delete_expected,
                         )
                         db_saved = True
                         # New baseline is exactly the keys the live index now
                         # holds. Unchanged owned keys keep their signature,
                         # upserted keys adopt the new one, deleted keys drop out.
                         self._persisted_routing_payloads = new_signatures
+                        # Refresh the raw CAS baseline in lockstep: upserted keys
+                        # now hold exactly the bytes we wrote; unchanged keys keep
+                        # their last observed payload; deleted keys drop out.
+                        self._persisted_routing_raw = {
+                            k: (
+                                upserts[k]
+                                if k in upserts
+                                else raw_baseline.get(k, json.dumps(data[k]))
+                            )
+                            for k in data
+                        }
                     except Exception as exc:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc

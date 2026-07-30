@@ -166,13 +166,18 @@ class TestPruneSaveConcurrencySafety:
         stale_key = "agent:main:telegram:dm:stale"
         foreign_key = "agent:main:telegram:dm:foreign"
 
+        # Build the owned entries once; the DB is seeded from exactly these
+        # bytes and the store's post-load baseline mirrors them, the way a real
+        # _ensure_loaded captures both _entries and the raw CAS operand from the
+        # same stored payload.
+        live_entry = _make_entry(live_key, "sid_live")
+        stale_entry = _make_entry(stale_key, "sid_stale")
+        live_json = json.dumps(live_entry.to_dict())
+        stale_json = json.dumps(stale_entry.to_dict())
+
         db = hermes_state.SessionDB()
-        db.save_gateway_routing_entry(
-            live_key, json.dumps(_make_entry(live_key, "sid_live").to_dict()), scope=scope
-        )
-        db.save_gateway_routing_entry(
-            stale_key, json.dumps(_make_entry(stale_key, "sid_stale").to_dict()), scope=scope
-        )
+        db.save_gateway_routing_entry(live_key, live_json, scope=scope)
+        db.save_gateway_routing_entry(stale_key, stale_json, scope=scope)
         # sid_stale reads as ended so startup pruning removes it; every other
         # session_id is absent from the sessions table (get_session -> None,
         # kept).
@@ -184,12 +189,14 @@ class TestPruneSaveConcurrencySafety:
         store = _make_store_with_db(tmp_path, db)
         # Model the post-load snapshot: the store read and now owns both rows
         # at exactly these payloads (the persistence baseline).
-        live_entry = _make_entry(live_key, "sid_live")
-        stale_entry = _make_entry(stale_key, "sid_stale")
         store._entries = {live_key: live_entry, stale_key: stale_entry}
         store._persisted_routing_payloads = {
-            live_key: json.dumps(live_entry.to_dict(), sort_keys=True),
-            stale_key: json.dumps(stale_entry.to_dict(), sort_keys=True),
+            live_key: store._routing_payload_signature(live_entry.to_dict()),
+            stale_key: store._routing_payload_signature(stale_entry.to_dict()),
+        }
+        store._persisted_routing_raw = {
+            live_key: live_json,
+            stale_key: stale_json,
         }
 
         # A sibling connection inserts a DIFFERENT row after the load snapshot.
@@ -225,17 +232,16 @@ class TestPruneSaveConcurrencySafety:
         stale_key = "agent:main:telegram:dm:stale"
         sibling_key = "agent:main:telegram:dm:sibling"
 
+        # Build the owned entries once so the DB bytes and the store's raw CAS
+        # baseline are byte-identical, the way a real load captures them.
+        stale_entry = _make_entry(stale_key, "sid_stale")
+        sibling_entry = _make_entry(sibling_key, "sid_sibling")
+        stale_json = json.dumps(stale_entry.to_dict())
+        sibling_json = json.dumps(sibling_entry.to_dict())
+
         db = hermes_state.SessionDB()
-        db.save_gateway_routing_entry(
-            stale_key,
-            json.dumps(_make_entry(stale_key, "sid_stale").to_dict()),
-            scope=scope,
-        )
-        db.save_gateway_routing_entry(
-            sibling_key,
-            json.dumps(_make_entry(sibling_key, "sid_sibling").to_dict()),
-            scope=scope,
-        )
+        db.save_gateway_routing_entry(stale_key, stale_json, scope=scope)
+        db.save_gateway_routing_entry(sibling_key, sibling_json, scope=scope)
         real_get = db.get_session
         db.get_session = lambda sid: (
             {"end_reason": "agent_close", "id": sid}
@@ -246,12 +252,14 @@ class TestPruneSaveConcurrencySafety:
         store = _make_store_with_db(tmp_path, db)
         # Model the post-load snapshot: BOTH rows were read and are owned at
         # exactly these payloads (baseline captured from the same objects).
-        stale_entry = _make_entry(stale_key, "sid_stale")
-        sibling_entry = _make_entry(sibling_key, "sid_sibling")
         store._entries = {stale_key: stale_entry, sibling_key: sibling_entry}
         store._persisted_routing_payloads = {
             stale_key: store._routing_payload_signature(stale_entry.to_dict()),
             sibling_key: store._routing_payload_signature(sibling_entry.to_dict()),
+        }
+        store._persisted_routing_raw = {
+            stale_key: stale_json,
+            sibling_key: sibling_json,
         }
 
         # A sibling connection UPDATES the loaded sibling row after our snapshot.
@@ -270,6 +278,56 @@ class TestPruneSaveConcurrencySafety:
         # The loaded sibling row was unchanged locally, so it must not have been
         # re-upserted over the sibling writer's newer value.
         assert json.loads(rows[sibling_key])["session_id"] == "sid_sibling2"
+        competitor.close()
+        db.close()
+
+    def test_prune_save_preserves_concurrent_same_key_update(
+        self, tmp_path, monkeypatch
+    ):
+        """Startup stale-prune of an owned key must CAS-guard its delete: if a
+        sibling rewrote that SAME key after our load snapshot, the
+        prune-triggered save must not erase the sibling's newer route. Our
+        in-memory copy still points at the ended session, so the key still prunes
+        locally — but the delete no longer matches what the table now holds.
+        """
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        scope = str(tmp_path.resolve())
+        stale_key = "agent:main:telegram:dm:stale"
+
+        stale_entry = _make_entry(stale_key, "sid_stale")
+        stale_json = json.dumps(stale_entry.to_dict())
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(stale_key, stale_json, scope=scope)
+        real_get = db.get_session
+        db.get_session = lambda sid: (
+            {"end_reason": "agent_close", "id": sid}
+            if sid == "sid_stale"
+            else real_get(sid)
+        )
+
+        store = _make_store_with_db(tmp_path, db)
+        store._entries = {stale_key: stale_entry}
+        store._persisted_routing_payloads = {
+            stale_key: store._routing_payload_signature(stale_entry.to_dict()),
+        }
+        store._persisted_routing_raw = {stale_key: stale_json}
+
+        # A sibling rewrites the SAME key AFTER our snapshot with a live session.
+        competitor = hermes_state.SessionDB()
+        competitor.save_gateway_routing_entry(
+            stale_key,
+            json.dumps(_make_entry(stale_key, "sid_stale_live").to_dict()),
+            scope=scope,
+        )
+
+        store._prune_stale_sessions_locked()
+
+        rows = db.load_gateway_routing_entries(scope=scope)
+        # Payload no longer ours -> stale delete is a no-op, sibling route lives.
+        assert json.loads(rows[stale_key])["session_id"] == "sid_stale_live"
         competitor.close()
         db.close()
 

@@ -1840,6 +1840,102 @@ class TestGatewayRoutingTable:
         competitor.close()
         store._db.close()
 
+    def test_sibling_same_key_update_survives_owned_removal(self, tmp_path):
+        """A sibling's concurrent update to the SAME key we own must survive when
+        we remove that key locally and save. The delete has to be CAS-guarded on
+        the payload this store observed — an unconditional key-only delete would
+        erase the sibling's newer route (#9006 concurrency follow-up)."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key = "agent:main:telegram:dm:chatA"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        assert set(store._entries) == {key}
+
+        # A sibling updates the SAME key AFTER our load; our in-memory copy of
+        # that key is now stale, and so is the payload we believe the DB holds.
+        competitor = hermes_state.SessionDB()
+        competitor.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA2")), scope=scope
+        )
+
+        # We drop the owned key locally and save. The delete must not clobber the
+        # sibling's newer value the store never observed.
+        del store._entries[key]
+        store._save()
+
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert set(rows) == {key}  # NOT deleted — payload no longer ours
+        assert json.loads(rows[key])["session_id"] == "sessionA2"
+        competitor.close()
+        store._db.close()
+
+    def test_sibling_same_key_update_survives_stale_prune(self, tmp_path):
+        """The hourly ``prune_old_entries`` path must also CAS-guard same-key
+        deletes: a sibling's newer route for a key we prune on a stale
+        ``updated_at`` survives instead of being erased."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key = "agent:main:telegram:dm:chatA"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+
+        competitor = hermes_state.SessionDB()
+        competitor.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA2")), scope=scope
+        )
+
+        # _entry_data's updated_at is far older than one day, so this key prunes.
+        removed = store.prune_old_entries(max_age_days=1)
+        assert removed == 1  # locally pruned
+
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert json.loads(rows[key])["session_id"] == "sessionA2"  # sibling wins
+        competitor.close()
+        store._db.close()
+
+    def test_unchanged_owned_key_still_deletes_on_removal(self, tmp_path):
+        """CAS-guarding must not over-preserve: an owned key whose DB payload is
+        still exactly what we observed is deleted when removed locally."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key = "agent:main:telegram:dm:chatA"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(self._entry_data(key, "sessionA")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        assert set(store._entries) == {key}
+
+        # No sibling touched the row: the DB still holds exactly our payload.
+        del store._entries[key]
+        store._save()
+
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert rows == {}
+        store._db.close()
+
     def test_canonical_key_session_key_mismatch_fails_closed(self, tmp_path):
         """A canonical row whose payload session_key disagrees with its table
         key is inconsistent and must fail the load closed, not route under a key
