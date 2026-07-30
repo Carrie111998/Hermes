@@ -129,6 +129,106 @@ def test_build_child_agent_strips_kanban_toolset_even_when_parent_is_worker(monk
     assert "kanban" in captured["disabled_toolsets"]
 
 
+def test_delegate_child_terminal_env_scrubs_parent_kanban_keys(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/tmp/parent-workspace")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock")
+    monkeypatch.setenv("HERMES_KANBAN_EXACT_OWNER", "1")
+
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import _sanitize_subprocess_env
+
+    with delegated_child_context():
+        env = _sanitize_subprocess_env({
+            "HERMES_KANBAN_TASK": "t_parent",
+            "HERMES_KANBAN_RUN_ID": "123",
+            "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
+            "HERMES_KANBAN_CLAIM_LOCK": "lock",
+            "HERMES_KANBAN_EXACT_OWNER": "1",
+            "PATH": "/usr/bin",
+        })
+
+    assert env["PATH"] == "/usr/bin"
+    assert "HERMES_KANBAN_TASK" not in env
+    assert "HERMES_KANBAN_RUN_ID" not in env
+    assert "HERMES_KANBAN_WORKSPACE" not in env
+    assert "HERMES_KANBAN_CLAIM_LOCK" not in env
+    assert "HERMES_KANBAN_EXACT_OWNER" not in env
+    assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+
+
+def test_delegate_child_foreground_terminal_env_scrubs_parent_kanban_keys(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/tmp/parent-workspace")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock")
+
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import _make_run_env
+
+    with delegated_child_context():
+        env = _make_run_env({"PATH": "/usr/bin"})
+
+    assert "HERMES_KANBAN_TASK" not in env
+    assert "HERMES_KANBAN_RUN_ID" not in env
+    assert "HERMES_KANBAN_WORKSPACE" not in env
+    assert "HERMES_KANBAN_CLAIM_LOCK" not in env
+    assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+
+
+def test_delegate_child_process_marker_scrubs_foreground_terminal_kanban_keys(monkeypatch):
+    """A delegated child subprocess has only the env marker, not the ContextVar."""
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
+    monkeypatch.setenv("HERMES_KANBAN_DB", "/tmp/parent-kanban.db")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/tmp/parent-workspace")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock")
+
+    from tools.environments.local import _make_run_env
+
+    env = _make_run_env({"PATH": "/usr/bin"})
+
+    assert "HERMES_KANBAN_TASK" not in env
+    assert "HERMES_KANBAN_RUN_ID" not in env
+    assert "HERMES_KANBAN_DB" not in env
+    assert "HERMES_KANBAN_WORKSPACE" not in env
+    assert "HERMES_KANBAN_CLAIM_LOCK" not in env
+    assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+
+
+def test_delegate_child_execute_code_env_preserves_process_marker(monkeypatch, tmp_path):
+    """execute_code has its own env scrubber; it must preserve child lineage."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from tools.code_execution_tool import _scrub_child_env
+
+    env = _scrub_child_env(
+        {
+            "HERMES_HOME": str(home),
+            "HERMES_DELEGATED_CHILD_CONTEXT": "1",
+            "HERMES_KANBAN_TASK": "t_parent",
+            "HERMES_KANBAN_RUN_ID": "123",
+            "HERMES_KANBAN_DB": str(home / "kanban.db"),
+            "HERMES_KANBAN_WORKSPACE": str(tmp_path / "parent-workspace"),
+            "PATH": "/usr/bin",
+        },
+        is_passthrough=lambda _: False,
+        is_windows=False,
+    )
+
+    assert env["HERMES_HOME"] == str(home)
+    assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+    assert env["PATH"] == "/usr/bin"
+    assert "HERMES_KANBAN_TASK" not in env
+    assert "HERMES_KANBAN_RUN_ID" not in env
+    assert "HERMES_KANBAN_DB" not in env
+    assert "HERMES_KANBAN_WORKSPACE" not in env
+
+
 def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     monkeypatch,
     tmp_path,

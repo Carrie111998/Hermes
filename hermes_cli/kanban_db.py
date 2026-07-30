@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -4696,6 +4697,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    allow_artifacts: bool = True,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4718,6 +4720,11 @@ def complete_task(
     ``completion_blocked_hallucination`` event is emitted so the rejected
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
+
+    ``allow_artifacts=False`` disables every completion artifact side effect:
+    legacy prose discovery, scratch-file persistence, attachment insertion,
+    and artifact promotion onto the completed event. Normal callers preserve
+    the legacy behavior by default; strict lifecycle callers opt out explicitly.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -4754,9 +4761,10 @@ def complete_task(
     else:
         verified_cards = []
 
-    metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
-    )
+    if allow_artifacts:
+        metadata = _merge_completion_prose_artifacts(
+            conn, task_id, metadata, summary=summary, result=result,
+        )
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4795,7 +4803,7 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
-        if isinstance(metadata, dict):
+        if allow_artifacts and isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
                 path = Path(stored_path)
@@ -4842,7 +4850,7 @@ def complete_task(
         # ``kanban_complete(artifacts=[...])`` which stashes the list in
         # ``metadata["artifacts"]`` — we promote it onto the event so
         # consumers don't have to fetch the run row to find it.
-        if isinstance(metadata, dict):
+        if allow_artifacts and isinstance(metadata, dict):
             md_artifacts = metadata.get("artifacts")
             if isinstance(md_artifacts, (list, tuple)):
                 cleaned_artifacts = [
@@ -5469,6 +5477,41 @@ def edit_completed_task_result(
     return True
 
 
+def _terminate_worker_for_block(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+    *,
+    signal_fn=None,
+) -> Optional[dict[str, Any]]:
+    """Terminate the recorded live worker before a controller block lands.
+
+    ``block_task`` clears ``worker_pid``, after which no reclaim path can ever
+    find the process again — so a block on a ``running`` card must reach the
+    worker first or it becomes a permanent, untraceable orphan. Reuses the
+    host-guarded reclaim terminator (never signals a PID recorded by another
+    host). Two exact-identity outs return ``None`` without signalling:
+
+    * the caller *is* the recorded worker (self-block via ``kanban_block``) —
+      it exits on its own, killing it here would cut its final report short;
+    * ``expected_run_id`` no longer matches — the block targets a stale run,
+      the live worker belongs to a newer one.
+    """
+    row = conn.execute(
+        "SELECT status, worker_pid, claim_lock, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] != "running" or not row["worker_pid"]:
+        return None
+    if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+        return None
+    pid = int(row["worker_pid"])
+    if pid == os.getpid():
+        return None
+    return _terminate_reclaimed_worker(pid, row["claim_lock"], signal_fn=signal_fn)
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5508,6 +5551,10 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # Reach the live worker before clearing worker_pid makes it untraceable.
+    # Outside the write transaction: SIGTERM + grace can take seconds, and the
+    # conditional UPDATEs below revalidate state exactly like reclaim does.
+    termination = _terminate_worker_for_block(conn, task_id, expected_run_id)
     # Handle dependency waits in their own transaction so the lifecycle hook
     # below runs only after COMMIT. A plugin may open a second connection to
     # inspect or mutate the terminal task; invoking it while this connection
@@ -5541,7 +5588,9 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {"reason": reason, "kind": kind}
+                | ({"termination": termination} if termination else {}),
+                run_id=run_id,
             )
             blocked_task = get_task(conn, task_id)
         _fire_kanban_lifecycle_hook(
@@ -5616,7 +5665,8 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
-                },
+                }
+                | ({"termination": termination} if termination else {}),
                 run_id=run_id,
             )
         else:
@@ -5668,7 +5718,8 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {"reason": reason, "kind": kind, "recurrences": recurrences}
+                | ({"termination": termination} if termination else {}),
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -7050,6 +7101,59 @@ def heartbeat_worker(
             run_id=run_id,
         )
     return True
+
+
+# A worker doing real tool calls refreshes its heartbeat at least every ~60s
+# (heartbeat_current_worker_from_env is rate-limited to one per minute), so a
+# few missed minutes means no observable progress — not merely a quiet spell.
+PRODUCTIVE_HEARTBEAT_MAX_AGE_SECONDS = 300
+
+
+def assess_worker_activity(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    """Qualify a task's worker beyond PID existence.
+
+    ``spawned`` (a PID was recorded) is not ``productive``: the 2026-07-30
+    Code A incident showed a live PID + ``running`` status with zero admitted
+    tool calls being narrated as an active coder. Every user-facing surface
+    (dashboard, CLI, status prompts) must qualify through this assessment:
+    ``productive`` requires the exact recorded process to be alive AND a
+    fresh heartbeat proving the agent loop is still doing observable work.
+    """
+    row = conn.execute(
+        "SELECT status, worker_pid, last_heartbeat_at FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"unknown task: {task_id}")
+    pid = row["worker_pid"]
+    spawned = bool(pid)
+    alive = spawned and _pid_alive(int(pid))
+    heartbeat_at = row["last_heartbeat_at"]
+    heartbeat_fresh = (
+        heartbeat_at is not None
+        and (int(time.time()) - int(heartbeat_at))
+        <= PRODUCTIVE_HEARTBEAT_MAX_AGE_SECONDS
+    )
+    if not spawned:
+        reason = "no worker process recorded"
+    elif not alive:
+        reason = "recorded worker process is not alive"
+    elif not heartbeat_fresh:
+        reason = "no fresh heartbeat from the worker"
+    elif row["status"] != "running":
+        reason = f"task is not running (status={row['status']})"
+    else:
+        reason = "worker alive with fresh heartbeat"
+    return {
+        "spawned": spawned,
+        "alive": alive,
+        "heartbeat_fresh": heartbeat_fresh,
+        "productive": alive and heartbeat_fresh and row["status"] == "running",
+        "reason": reason,
+    }
 
 
 def enforce_max_runtime(
@@ -8803,6 +8907,418 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_KANBAN_ISSUE_KEY_RE = re.compile(r"\b(?:HER|SCA|IMP|TL|JYI)-[1-9][0-9]*\b")
+_OWNER_REAPER_READY_TIMEOUT_SECONDS = 5.0
+
+
+def _kanban_worker_session_id(task: Task) -> str:
+    """Stable session identity shared by the worker, owner registry, and hooks."""
+    if task.current_run_id is None:
+        raise RuntimeError(f"task {task.id} has no active run id")
+    return f"kanban-{task.id}-run-{int(task.current_run_id)}"
+
+
+def _ensure_kanban_worker_session(
+    profile_home: Path, session_id: str, workspace: str,
+) -> None:
+    """Create the deterministic worker session before the resume gate opens."""
+    from hermes_state import SessionDB
+
+    session_db = SessionDB(db_path=profile_home / "state.db")
+    try:
+        session_db.create_session(
+            session_id=session_id,
+            source="cli",
+            cwd=str(Path(workspace).resolve()),
+            profile_name=profile_home.name,
+        )
+    finally:
+        session_db.close()
+
+
+def _code_owner_hook_spec(profile_home: Path) -> Optional[dict[str, str]]:
+    """Resolve the strict AI-Factory hook contract from one profile config."""
+    import shlex
+    import yaml
+
+    from hermes_cli.config import read_user_config_raw
+
+    config_path = profile_home / "config.yaml"
+    if not config_path.exists():
+        return None
+    try:
+        # Presence-sensitive raw read: the hook contract must reflect what
+        # this worker profile actually declares, never merged defaults.
+        config = read_user_config_raw(config_path)
+    except (OSError, ValueError, TypeError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"cannot read worker profile config: {exc}") from exc
+    hooks = ((config.get("hooks") or {}).get("pre_tool_call") or [])
+    matches = []
+    for entry in hooks:
+        if not isinstance(entry, dict) or entry.get("fail_closed") is not True:
+            continue
+        command = entry.get("command")
+        if not isinstance(command, str):
+            continue
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        hook_indexes = [
+            index for index, value in enumerate(argv)
+            if Path(value).name == "factory_admission_hook.py"
+        ]
+        if len(hook_indexes) != 1 or "--require-owned-git" not in argv:
+            continue
+
+        def _arg(name: str) -> str:
+            try:
+                value = argv[argv.index(name) + 1]
+            except (ValueError, IndexError) as exc:
+                raise RuntimeError(f"AI Factory hook is missing {name}") from exc
+            if not value or value.startswith("-"):
+                raise RuntimeError(f"AI Factory hook has invalid {name}")
+            return value
+
+        matches.append({
+            "registry": _arg("--registry"),
+            "agent": _arg("--agent"),
+            "profile": _arg("--profile"),
+        })
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError("worker profile has multiple AI Factory admission hooks")
+    spec = matches[0]
+    if spec["profile"] != profile_home.name:
+        raise RuntimeError("AI Factory hook profile does not match assigned profile")
+    return spec
+
+
+def _worker_issue_key(task: Task) -> str:
+    for source in (task.title or "", task.body or ""):
+        match = _KANBAN_ISSUE_KEY_RE.search(source)
+        if match:
+            return match.group(0)
+    raise RuntimeError(f"Code worker task {task.id} has no supported issue key")
+
+
+def _factory_lane_path() -> Path:
+    path = Path(__file__).resolve().parents[1] / "scripts" / "factory_lane.py"
+    if not path.is_file():
+        raise RuntimeError("AI Factory lane script is unavailable")
+    return path
+
+
+def _worker_process_start_time(pid: int) -> str:
+    """Return the exact start fingerprint used by factory_lane owner records."""
+    for _ in range(20):
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(int(pid))],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        time.sleep(0.01)
+    raise RuntimeError(f"cannot resolve worker process start time for pid {pid}")
+
+
+def _claim_worker_owner(
+    task: Task, workspace: str, profile_home: Path, pid: int,
+    process_start_time: str, session_id: str,
+) -> bool:
+    hook = _code_owner_hook_spec(profile_home)
+    if hook is None:
+        return False
+    result = subprocess.run(
+        [
+            sys.executable, str(_factory_lane_path()),
+            "--registry", hook["registry"], "admit", _worker_issue_key(task),
+            "--mode", "owner", "--hard", "--agent", hook["agent"],
+            "--profile", hook["profile"], "--session", session_id,
+            "--worktree", workspace, "--owner-pid", str(int(pid)),
+            "--owner-start-time", process_start_time,
+        ],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(details or "AI Factory owner claim failed")
+    return True
+
+
+def _release_worker_owner(
+    task: Task, workspace: str, profile_home: Path, pid: int,
+    process_start_time: str, session_id: str,
+) -> bool:
+    hook = _code_owner_hook_spec(profile_home)
+    if hook is None:
+        return False
+    result = subprocess.run(
+        [
+            sys.executable, str(_factory_lane_path()),
+            "--registry", hook["registry"], "release-owner", _worker_issue_key(task),
+            "--agent", hook["agent"], "--session", session_id,
+            "--worktree", workspace, "--owner-pid", str(int(pid)),
+            "--owner-start-time", process_start_time,
+        ],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode == 3:
+        return False
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(details or "AI Factory owner release failed")
+    return True
+
+
+def _release_worker_owner_after_failed_spawn(
+    task: Task, workspace: str, profile_home: Path, pid: int,
+    process_start_time: str, session_id: str,
+) -> bool:
+    """Retry one exact release without ever widening the owner identity."""
+    last_error: Optional[Exception] = None
+    for _ in range(2):
+        try:
+            released = _release_worker_owner(
+                task, workspace, profile_home, pid,
+                process_start_time, session_id,
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+        if released:
+            return True
+        last_error = None
+    if last_error is not None:
+        raise last_error
+    return False
+
+
+def _worker_owner_release_argv(
+    task: Task, workspace: str, profile_home: Path, pid: int,
+    process_start_time: str, session_id: str,
+) -> Optional[list[str]]:
+    hook = _code_owner_hook_spec(profile_home)
+    if hook is None:
+        return None
+    return [
+        sys.executable, str(_factory_lane_path()),
+        "--registry", hook["registry"], "release-owner", _worker_issue_key(task),
+        "--agent", hook["agent"], "--session", session_id,
+        "--worktree", workspace, "--owner-pid", str(int(pid)),
+        "--owner-start-time", process_start_time,
+    ]
+
+
+def _worker_identity_is_alive(pid: int, process_start_time: str) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, OSError):
+        return False
+    try:
+        state = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(int(pid))],
+            capture_output=True, text=True, timeout=5,
+        )
+        if state.returncode != 0 or state.stdout.strip().startswith("Z"):
+            return False
+        current_start = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(int(pid))],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return False
+    return (
+        current_start.returncode == 0
+        and current_start.stdout.strip() == process_start_time
+    )
+
+
+def _wait_for_pid_exit_and_run_release(
+    *, pid: int, process_start_time: str, release_argv: list[str],
+    poll_interval: float = 0.2, ready_fd: Optional[int] = None,
+) -> bool:
+    ack_error: Optional[OSError] = None
+    while True:
+        worker_alive = _worker_identity_is_alive(pid, process_start_time)
+        if ready_fd is not None:
+            if worker_alive:
+                try:
+                    os.write(ready_fd, b"R")
+                except OSError as exc:
+                    if exc.errno not in (errno.EBADF, errno.EPIPE):
+                        ack_error = exc
+            try:
+                os.close(ready_fd)
+            except OSError as exc:
+                if exc.errno != errno.EBADF and ack_error is None:
+                    ack_error = exc
+            ready_fd = None
+        if not worker_alive:
+            break
+        time.sleep(poll_interval)
+    result = subprocess.run(
+        release_argv, capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode == 3:
+        return False
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(details or "AI Factory owner reaper failed")
+    if ack_error is not None:
+        raise ack_error
+    return True
+
+
+def _wait_for_worker_exit_and_release(
+    *, task: Task, workspace: str, profile_home: Path, pid: int,
+    process_start_time: str, session_id: str, poll_interval: float = 0.2,
+) -> bool:
+    release_argv = _worker_owner_release_argv(
+        task, workspace, profile_home, pid, process_start_time, session_id,
+    )
+    if release_argv is None:
+        return False
+    return _wait_for_pid_exit_and_run_release(
+        pid=pid,
+        process_start_time=process_start_time,
+        release_argv=release_argv,
+        poll_interval=poll_interval,
+    )
+
+
+def _worker_owner_reaper_main(payload: str, ready_fd: int) -> int:
+    try:
+        data = json.loads(payload)
+        pid = int(data["pid"])
+        process_start_time = str(data["process_start_time"])
+        release_argv = [str(value) for value in data["release_argv"]]
+    except BaseException:
+        os.close(ready_fd)
+        raise
+    _wait_for_pid_exit_and_run_release(
+        pid=pid,
+        process_start_time=process_start_time,
+        release_argv=release_argv,
+        ready_fd=ready_fd,
+    )
+    return 0
+
+
+def _wait_for_worker_owner_reaper_ready(
+    reaper, ready_fd: int,
+    timeout: float = _OWNER_REAPER_READY_TIMEOUT_SECONDS,
+) -> None:
+    """Require a live reaper acknowledgement, closing the parent pipe on exit."""
+    deadline = time.monotonic() + timeout
+    os.set_blocking(ready_fd, False)
+    try:
+        while True:
+            try:
+                marker = os.read(ready_fd, 1)
+            except BlockingIOError:
+                marker = None
+            if marker == b"R":
+                if reaper.poll() is not None:
+                    raise RuntimeError("owner reaper exited before ready gate")
+                return
+            if marker == b"":
+                raise RuntimeError("owner reaper exited before ready acknowledgement")
+            if marker is not None:
+                raise RuntimeError("owner reaper returned an invalid ready acknowledgement")
+            if reaper.poll() is not None:
+                raise RuntimeError("owner reaper exited before ready acknowledgement")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("owner reaper did not become ready before timeout")
+            time.sleep(0.01)
+    finally:
+        os.close(ready_fd)
+
+
+def _start_worker_owner_reaper(
+    *, task: Task, workspace: str, profile_home: Path, pid: int,
+    process_start_time: str, session_id: str,
+):
+    release_argv = _worker_owner_release_argv(
+        task, workspace, profile_home, pid, process_start_time, session_id,
+    )
+    if release_argv is None:
+        return None
+    payload = json.dumps({
+        "pid": int(pid),
+        "process_start_time": process_start_time,
+        "release_argv": release_argv,
+    })
+    ready_r, ready_w = os.pipe()
+    os.set_inheritable(ready_w, True)
+    popen_kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "start_new_session": True,
+        "creationflags": subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+    }
+    if _IS_WINDOWS:
+        popen_kwargs["close_fds"] = False
+    else:
+        popen_kwargs["pass_fds"] = (ready_w,)
+    try:
+        reaper = subprocess.Popen(  # noqa: S603 -- fixed interpreter + serialized argv
+            [
+                sys.executable, "-c",
+                "from hermes_cli.kanban_db import _worker_owner_reaper_main as m; "
+                "raise SystemExit(m(__import__('sys').argv[1], int(__import__('sys').argv[2])))",
+                payload, str(ready_w),
+            ],
+            **popen_kwargs,
+        )
+    except BaseException:
+        os.close(ready_r)
+        raise
+    finally:
+        os.close(ready_w)
+    return reaper, ready_r
+
+
+def _terminate_and_wait_process(proc) -> None:
+    """Best-effort bounded stop that always reaps a process after kill."""
+    try:
+        if proc.poll() is not None:
+            return
+    except (AttributeError, OSError):
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        return
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _start_kanban_worker_process(
+    cmd: list[str], *, workspace: str, log_f, env: dict[str, str],
+):
+    return subprocess.Popen(  # noqa: S603 -- argv is supplied by the dispatcher
+        cmd,
+        cwd=workspace if os.path.isdir(workspace) else None,
+        stdin=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        env=env,
+        start_new_session=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+    )
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8848,8 +9364,10 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+    profile_home: Optional[Path] = None
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        profile_home = Path(env["HERMES_HOME"])
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
@@ -8917,6 +9435,16 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    owner_hook = (
+        _code_owner_hook_spec(profile_home)
+        if profile_home is not None
+        else None
+    )
+    worker_session_id: Optional[str] = None
+    if owner_hook is not None:
+        worker_session_id = _kanban_worker_session_id(task)
+        env["HERMES_SESSION_ID"] = worker_session_id
+        env["HERMES_KANBAN_EXACT_OWNER"] = "1"
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -8929,13 +9457,17 @@ def _default_spawn(
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
+    ]
+    if worker_session_id is not None:
+        cmd.extend(["--resume", worker_session_id, "--no-restore-cwd"])
+    cmd.extend([
         "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
-    ]
+    ])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
@@ -8979,16 +9511,38 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    if owner_hook is None:
+        try:
+            proc = _start_kanban_worker_process(
+                cmd, workspace=workspace, log_f=log_f, env=env,
+            )
+        except FileNotFoundError:
+            log_f.close()
+            raise RuntimeError(
+                "`hermes` executable not found on PATH. "
+                "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+            )
+        return proc.pid
+
+    # The wrapper waits before exec(), so the child PID and exact start-time
+    # exist while no worker code (and therefore no first tool) can run. The
+    # parent writes the random mode-0600 gate only after the owner claim wins.
+    gate_path = log_dir / (
+        f".{task.id}.{task.current_run_id}.owner-ready-{secrets.token_hex(8)}"
+    )
+    env["HERMES_KANBAN_OWNER_GATE"] = str(gate_path)
+    gate_wrapper = (
+        "import os,sys,time; "
+        "p=os.environ['HERMES_KANBAN_OWNER_GATE']; d=time.monotonic()+60; "
+        "\nwhile not os.path.exists(p):\n"
+        "  if time.monotonic()>=d: raise SystemExit(78)\n"
+        "  time.sleep(0.01)\n"
+        "os.unlink(p); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)"
+    )
+    gated_cmd = [sys.executable, "-c", gate_wrapper, *cmd]
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        proc = _start_kanban_worker_process(
+            gated_cmd, workspace=workspace, log_f=log_f, env=env,
         )
     except FileNotFoundError:
         log_f.close()
@@ -8996,6 +9550,62 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    owner_claimed = False
+    process_start_time: Optional[str] = None
+    reaper = None
+    try:
+        process_start_time = _worker_process_start_time(proc.pid)
+        if profile_home is not None:
+            owner_claimed = _claim_worker_owner(
+                task, workspace, profile_home, proc.pid,
+                process_start_time, str(worker_session_id),
+            )
+            if owner_claimed:
+                reaper_handle = _start_worker_owner_reaper(
+                    task=task,
+                    workspace=workspace,
+                    profile_home=profile_home,
+                    pid=proc.pid,
+                    process_start_time=process_start_time,
+                    session_id=str(worker_session_id),
+                )
+                if reaper_handle is None:
+                    raise RuntimeError("owner reaper did not provide a ready handle")
+                reaper, ready_fd = reaper_handle
+                _wait_for_worker_owner_reaper_ready(reaper, ready_fd)
+                _ensure_kanban_worker_session(
+                    profile_home, str(worker_session_id), workspace,
+                )
+        gate_fd = os.open(gate_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(gate_fd)
+    except Exception as spawn_error:
+        _terminate_and_wait_process(proc)
+        if reaper is not None:
+            _terminate_and_wait_process(reaper)
+        cleanup_error: Optional[Exception] = None
+        try:
+            gate_path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            cleanup_error = exc
+        if owner_claimed and profile_home is not None and process_start_time is not None:
+            try:
+                _release_worker_owner_after_failed_spawn(
+                    task, workspace, profile_home, proc.pid,
+                    process_start_time, str(worker_session_id),
+                )
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        try:
+            log_f.close()
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            raise spawn_error from cleanup_error
+        raise
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's

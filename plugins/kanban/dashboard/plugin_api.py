@@ -1412,7 +1412,9 @@ def list_active_workers(
 
     Returns ``{workers: [...], count: N, checked_at: <epoch>}``.  Each
     worker entry carries enough context for the dashboard to link back to
-    its task without a second round-trip.
+    its task without a second round-trip, plus the ``activity`` assessment
+    (``spawned``/``alive``/``heartbeat_fresh``/``productive``) so consumers
+    never present a bare PID as a working coder.
     """
     board = _resolve_board(board)
     conn = _conn(board=board)
@@ -1454,6 +1456,7 @@ def list_active_workers(
                 "claim_expires": row["claim_expires"],
                 "last_heartbeat_at": row["last_heartbeat_at"],
                 "max_runtime_seconds": row["max_runtime_seconds"],
+                "activity": kanban_db.assess_worker_activity(conn, row["task_id"]),
             }
             for row in rows
         ]

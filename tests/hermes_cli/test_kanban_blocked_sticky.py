@@ -30,6 +30,7 @@ landed via #28754 / #28781 ahead of this fix.
 from __future__ import annotations
 
 import concurrent.futures
+import subprocess
 import time
 from pathlib import Path
 
@@ -165,6 +166,48 @@ def test_dispatcher_cannot_race_retry_of_dependency_block(kanban_home: Path) -> 
         task = kb.get_task(conn, tid)
         assert task is not None
         assert task.status == "blocked"
+
+
+def test_dependency_block_completion_releases_owner_once_after_worker_exit(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocked completion closes the run; its reaper releases one exact lease."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dependency owner release")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="dependency wait",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+        ended_run = kb.get_run(conn, claimed.current_run_id)
+        assert ended_run is not None
+        assert ended_run.outcome == "blocked"
+
+    alive = iter([True, False])
+    releases = []
+    monkeypatch.setattr(
+        kb,
+        "_worker_identity_is_alive",
+        lambda _pid, _start: next(alive),
+    )
+    monkeypatch.setattr(kb.time, "sleep", lambda _interval: None)
+
+    def fake_run(argv, **kwargs):
+        releases.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(kb.subprocess, "run", fake_run)
+    assert kb._wait_for_pid_exit_and_run_release(
+        pid=456,
+        process_start_time="exact-start",
+        release_argv=["factory-lane", "release-owner", "HER-118"],
+    ) is True
+    assert len(releases) == 1
 
 
 # ---------------------------------------------------------------------------

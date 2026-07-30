@@ -89,6 +89,137 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+@pytest.fixture
+def exact_owner_worker_env(worker_env, monkeypatch, tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        run = kb.latest_run(conn, worker_env)
+    workspace = tmp_path / "exact-workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_EXACT_OWNER", "1")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", str(task.claim_lock))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", kb.get_current_board())
+    monkeypatch.setenv("HERMES_SESSION_ID", f"kanban-{worker_env}-run-{run.id}")
+    return worker_env
+
+
+@pytest.mark.parametrize(("handler_name", "args"), [
+    ("_handle_show", {}),
+    ("_handle_heartbeat", {"note": "working"}),
+    ("_handle_complete", {"summary": "done", "metadata": {"tests_run": 1}}),
+    ("_handle_block", {"reason": "needs review", "kind": "needs_input"}),
+])
+def test_exact_owner_lifecycle_handlers_accept_current_run(
+        exact_owner_worker_env, handler_name, args):
+    from tools import kanban_tools as kt
+
+    out = json.loads(getattr(kt, handler_name)(args))
+
+    assert out.get("error") is None, out
+    if handler_name == "_handle_show":
+        assert out["task"]["id"] == exact_owner_worker_env
+    else:
+        assert out["ok"] is True
+
+
+@pytest.mark.parametrize(("handler_name", "args"), [
+    ("_handle_heartbeat", {"note": "late"}),
+    ("_handle_complete", {"summary": "late"}),
+    ("_handle_block", {"reason": "late"}),
+])
+def test_exact_owner_lifecycle_mutations_reject_reclaimed_run(
+        exact_owner_worker_env, monkeypatch, handler_name, args):
+    from tools import kanban_tools as kt
+
+    stale = int(os.environ["HERMES_KANBAN_RUN_ID"]) + 1
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(stale))
+    monkeypatch.setenv(
+        "HERMES_SESSION_ID", f"kanban-{exact_owner_worker_env}-run-{stale}",
+    )
+
+    out = json.loads(getattr(kt, handler_name)(args))
+
+    assert out.get("ok") is not True
+    assert "stale or has been reclaimed" in out.get("error", "")
+
+
+@pytest.mark.parametrize(("handler_name", "base_args"), [
+    ("_handle_show", {}),
+    ("_handle_heartbeat", {"note": "working"}),
+    ("_handle_complete", {"summary": "done"}),
+    ("_handle_block", {"reason": "needs review"}),
+])
+@pytest.mark.parametrize("override", [
+    {"task_id": "same"}, {"board": "other"}, {"db_path": "/tmp/other.db"},
+    {"workspace": "/tmp/other"}, {"profile": "other"},
+    {"session_id": "other"}, {"run_id": 999}, {"claim_lock": "other"},
+])
+def test_exact_owner_lifecycle_handlers_reject_identity_and_routing_overrides(
+        exact_owner_worker_env, handler_name, base_args, override):
+    from tools import kanban_tools as kt
+
+    handler = getattr(kt, handler_name)
+    out = json.loads(handler({**base_args, **override}))
+
+    assert out.get("ok") is not True
+    assert "exact-current worker" in out.get("error", "")
+
+
+@pytest.mark.parametrize("run_id", [None, "", "invalid", "0", "-1"])
+@pytest.mark.parametrize(("handler_name", "args"), [
+    ("_handle_heartbeat", {"note": "working"}),
+    ("_handle_complete", {"summary": "done"}),
+    ("_handle_block", {"reason": "needs review"}),
+])
+def test_exact_owner_lifecycle_mutations_require_positive_run_id(
+        exact_owner_worker_env, monkeypatch, run_id, handler_name, args):
+    from tools import kanban_tools as kt
+
+    if run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
+
+    out = json.loads(getattr(kt, handler_name)(args))
+
+    assert out.get("ok") is not True
+    assert "run id" in out.get("error", "")
+
+
+@pytest.mark.parametrize("payload", [
+    {"summary": "done", "artifacts": ["/tmp/report.pdf"]},
+    {"summary": "done", "created_cards": ["t_deadbeef"]},
+    {"summary": "done", "metadata": {"artifacts": ["/tmp/report.pdf"]}},
+    {"summary": "done", "metadata": {"nested": {"_staged_artifacts": ["x"]}}},
+])
+def test_exact_owner_complete_rejects_attachment_and_card_side_effects(
+        exact_owner_worker_env, payload):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_complete(payload))
+
+    assert out.get("ok") is not True
+    assert "side effect" in out.get("error", "")
+
+
+def test_exact_owner_heartbeat_fails_when_claim_renewal_fails(
+        exact_owner_worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kb, "heartbeat_claim", lambda *args, **kwargs: False)
+
+    out = json.loads(kt._handle_heartbeat({"note": "working"}))
+
+    assert out.get("ok") is not True
+    assert "claim" in out.get("error", "")
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})

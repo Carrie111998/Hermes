@@ -146,9 +146,10 @@ def _worker_run_id(task_id: str) -> Optional[int]:
     if not raw:
         return None
     try:
-        return int(raw)
+        run_id = int(raw)
     except ValueError:
         return None
+    return run_id if run_id > 0 else None
 
 
 def _stamp_worker_session_metadata(
@@ -194,6 +195,89 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
             f"{tid}. Use kanban_comment to hand off information to other "
             f"tasks, or kanban_create to spawn follow-up work."
         )
+    return None
+
+
+_EXACT_OWNER_LIFECYCLE_KEYS = {
+    "kanban_show": frozenset(),
+    "kanban_heartbeat": frozenset({"note"}),
+    "kanban_complete": frozenset({"summary", "result", "metadata"}),
+    "kanban_block": frozenset({"reason", "kind"}),
+}
+_EXACT_OWNER_METADATA_SIDE_EFFECT_KEYS = frozenset({
+    "artifact", "artifacts", "_staged_artifacts", "attachment", "attachments",
+    "created_card", "created_cards",
+})
+
+
+def _metadata_has_exact_owner_side_effect(value) -> bool:
+    if isinstance(value, dict):
+        return any(
+            str(key).lower() in _EXACT_OWNER_METADATA_SIDE_EFFECT_KEYS
+            or _metadata_has_exact_owner_side_effect(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_metadata_has_exact_owner_side_effect(item) for item in value)
+    return False
+
+
+def _exact_owner_lifecycle_guard(tool_name: str, args: dict) -> Optional[str]:
+    """Validate the non-routable lifecycle contract for strict Code workers."""
+    if os.environ.get("HERMES_KANBAN_EXACT_OWNER") != "1":
+        return None
+    allowed = _EXACT_OWNER_LIFECYCLE_KEYS.get(tool_name)
+    if allowed is None:
+        return tool_error("exact-current worker lifecycle does not expose this Kanban tool")
+    if tool_name == "kanban_complete" and (
+        bool({"artifacts", "created_cards"} & set(args))
+        or _metadata_has_exact_owner_side_effect(args.get("metadata"))
+    ):
+        return tool_error(
+            "exact-current worker completion rejects attachment/card side effects"
+        )
+    if set(args) - allowed:
+        return tool_error(
+            "exact-current worker lifecycle rejects explicit task, identity, "
+            "board, database, workspace, profile, session, run, and claim overrides"
+        )
+
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    run_id = _worker_run_id(task_id or "")
+    if not task_id or run_id is None:
+        return tool_error("exact-current worker run id is missing, invalid, or non-positive")
+    expected_session = f"kanban-{task_id}-run-{run_id}"
+    if os.environ.get("HERMES_SESSION_ID") != expected_session:
+        return tool_error("exact-current worker deterministic session does not match task/run")
+    if not os.environ.get("HERMES_KANBAN_CLAIM_LOCK"):
+        return tool_error("exact-current worker claim identity is missing")
+    db_path = os.environ.get("HERMES_KANBAN_DB")
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE")
+    if not db_path or not os.path.isabs(db_path):
+        return tool_error("exact-current worker database identity is missing or invalid")
+    if not workspace or not os.path.isabs(workspace):
+        return tool_error("exact-current worker workspace identity is missing or invalid")
+    if not os.environ.get("HERMES_KANBAN_BOARD"):
+        return tool_error("exact-current worker board identity is missing")
+    return None
+
+
+def _exact_owner_db_task_guard(kb, conn, task_id: str) -> Optional[str]:
+    if os.environ.get("HERMES_KANBAN_EXACT_OWNER") != "1":
+        return None
+    row = conn.execute("PRAGMA database_list").fetchone()
+    actual_db = os.path.realpath(str(row[2])) if row and row[2] else ""
+    expected_db = os.path.realpath(os.environ["HERMES_KANBAN_DB"])
+    if actual_db != expected_db:
+        return tool_error("exact-current worker board/database identity changed")
+    task = kb.get_task(conn, task_id)
+    run_id = _worker_run_id(task_id)
+    if task is None or run_id is None or task.current_run_id != run_id:
+        return tool_error("exact-current worker run is stale or has been reclaimed")
+    if task.status != "running":
+        return tool_error("exact-current worker task is no longer running")
+    if task.claim_lock != os.environ.get("HERMES_KANBAN_CLAIM_LOCK"):
+        return tool_error("exact-current worker claim has changed")
     return None
 
 
@@ -401,6 +485,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events."""
+    exact_err = _exact_owner_lifecycle_guard("kanban_show", args)
+    if exact_err:
+        return exact_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -410,6 +497,9 @@ def _handle_show(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            exact_err = _exact_owner_db_task_guard(kb, conn, tid)
+            if exact_err:
+                return exact_err
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
@@ -538,6 +628,9 @@ def _handle_list(args: dict, **kw) -> str:
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
+    exact_err = _exact_owner_lifecycle_guard("kanban_complete", args)
+    if exact_err:
+        return exact_err
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
     if delegated_err:
         return delegated_err
@@ -630,6 +723,9 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            exact_err = _exact_owner_db_task_guard(kb, conn, tid)
+            if exact_err:
+                return exact_err
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -672,6 +768,9 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    allow_artifacts=(
+                        os.environ.get("HERMES_KANBAN_EXACT_OWNER") != "1"
+                    ),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -717,6 +816,9 @@ def _handle_complete(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
+    exact_err = _exact_owner_lifecycle_guard("kanban_block", args)
+    if exact_err:
+        return exact_err
     delegated_err = _reject_delegated_child_mutation("kanban_block")
     if delegated_err:
         return delegated_err
@@ -736,6 +838,10 @@ def _handle_block(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        exact_err = _exact_owner_db_task_guard(kb, conn, tid)
+        if exact_err:
+            conn.close()
+            return exact_err
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
@@ -806,6 +912,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     by ``release_stale_claims`` — which is exactly the trap that
     ``heartbeat_claim``'s docstring warns against.
     """
+    exact_err = _exact_owner_lifecycle_guard("kanban_heartbeat", args)
+    if exact_err:
+        return exact_err
     delegated_err = _reject_delegated_child_mutation("kanban_heartbeat")
     if delegated_err:
         return delegated_err
@@ -822,13 +931,19 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            exact_err = _exact_owner_db_task_guard(kb, conn, tid)
+            if exact_err:
+                return exact_err
             # Extend the claim TTL first. The dispatcher pins
             # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
             # (see _default_spawn in kanban_db.py); falling back to the
             # default _claimer_id() covers locally-driven workers that
             # never went through the dispatcher path.
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+            if not kb.heartbeat_claim(conn, tid, claimer=claim_lock):
+                return tool_error(
+                    f"could not heartbeat {tid} because its claim is no longer current"
+                )
 
             ok = kb.heartbeat_worker(
                 conn,
