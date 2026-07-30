@@ -2522,9 +2522,72 @@ def delegate_task(
         waits on each other, and returns together.
         """
         if n_tasks == 1:
-            # Single task -- run directly (no thread pool overhead)
+            # Single task -- run it on a one-slot daemon pool instead of
+            # inline.  Inline was cheaper but made /stop a lie: the parent
+            # blocked inside _run_single_child with nowhere to observe
+            # `_interrupt_requested`, so the interrupt was acknowledged in the
+            # UI while the call kept blocking until the child finished on its
+            # own.  Same poll loop, same 0.5s granularity and same fabricated
+            # "interrupted" entry as the batch path below.
+            from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
+
+            from tools.daemon_pool import DaemonThreadPoolExecutor
+
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            _single_executor = DaemonThreadPoolExecutor(max_workers=1)
+            try:
+                _single_future = _single_executor.submit(
+                    _run_single_child, _i, _t["goal"], child, parent_agent
+                )
+                _single_pending = {_single_future}
+                while True:
+                    if getattr(parent_agent, "_interrupt_requested", False) is True:
+                        if _single_future.done():
+                            # Landed in the same tick as the interrupt — the
+                            # real result wins over the fabricated entry.
+                            result = _single_future.result()
+                            break
+                        # Tell the child to stop so its thread can unwind,
+                        # then abandon it: waiting is exactly what /stop is
+                        # asking us not to do.  (Sync runs also get the signal
+                        # via the parent's _active_children fan-out, but the
+                        # async cap-fallback path detaches them, so signal here
+                        # too — same mechanism as the timeout branch.)
+                        _single_future.cancel()
+                        try:
+                            if hasattr(child, "interrupt"):
+                                child.interrupt()
+                            elif hasattr(child, "_interrupt_requested"):
+                                child._interrupt_requested = True
+                        except Exception:
+                            logger.debug(
+                                "Failed to signal interrupt to single child",
+                                exc_info=True,
+                            )
+                        result = {
+                            "task_index": _i,
+                            "status": "interrupted",
+                            "summary": None,
+                            "error": "Parent agent interrupted — child did not finish in time",
+                            "api_calls": 0,
+                            "duration_seconds": 0,
+                            "_child_role": getattr(child, "_delegate_role", None),
+                        }
+                        break
+
+                    _single_done, _single_pending = _cf_wait(
+                        _single_pending, timeout=0.5, return_when=FIRST_COMPLETED
+                    )
+                    if _single_done:
+                        # .result() re-raises whatever the child raised, so a
+                        # failing single delegation propagates exactly as it
+                        # did when the call was inline.
+                        result = _single_future.result()
+                        break
+            finally:
+                # Never wait: a wedged child would re-block the interrupt we
+                # just honoured (daemon workers can't hold the interpreter).
+                _single_executor.shutdown(wait=False)
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
