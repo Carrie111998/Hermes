@@ -127,6 +127,10 @@ def _install_modal_test_modules(
         iter_skills_files=lambda **kw: [],
         iter_cache_files=lambda **kw: [],
     )
+    lazy_ensure_calls: list[tuple[str, bool]] = []
+    sys.modules["tools.lazy_deps"] = types.SimpleNamespace(
+        ensure=lambda feature, *, prompt=True: lazy_ensure_calls.append((feature, prompt)),
+    )
 
     from_id_calls: list[str] = []
     registry_calls: list[tuple[str, list[str] | None]] = []
@@ -193,6 +197,7 @@ def _install_modal_test_modules(
         "snapshot_store": hermes_home / "modal_snapshots.json",
         "create_calls": create_calls,
         "from_id_calls": from_id_calls,
+        "lazy_ensure_calls": lazy_ensure_calls,
         "registry_calls": registry_calls,
     }
 
@@ -208,6 +213,10 @@ def test_modal_environment_migrates_legacy_snapshot_key_and_uses_snapshot_id(tmp
 
     try:
         assert state["from_id_calls"] == ["im-legacy123"]
+        assert state["lazy_ensure_calls"] == [
+            ("terminal.modal", False),
+            ("terminal.modal", False),
+        ]
         assert state["create_calls"][0]["image"] == {"kind": "snapshot", "image_id": "im-legacy123"}
         assert json.loads(snapshot_store.read_text()) == {"direct:task-legacy": "im-legacy123"}
     finally:
@@ -223,6 +232,10 @@ def test_resolve_modal_image_uses_snapshot_ids_and_registry_images(tmp_path):
 
     assert snapshot_image == {"kind": "snapshot", "image_id": "im-snapshot123"}
     assert registry_image == {"kind": "registry", "image": "python:3.11"}
+    assert state["lazy_ensure_calls"] == [
+        ("terminal.modal", False),
+        ("terminal.modal", False),
+    ]
     assert state["from_id_calls"] == ["im-snapshot123"]
     assert state["registry_calls"][0][0] == "python:3.11"
     assert "ensurepip" in state["registry_calls"][0][1][0]
