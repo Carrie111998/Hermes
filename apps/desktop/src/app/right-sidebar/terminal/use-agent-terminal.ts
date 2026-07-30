@@ -11,7 +11,6 @@ import { useTheme } from '@/themes/context'
 
 import { registerAgentTerminalWriter } from './agent-terminal-stream'
 import { makeTerminalReader, registerTerminalReader } from './buffer'
-import { resolveSurfaceColor, terminalTheme } from './selection'
 import { prepareTerminalFontFamily } from './terminal-font'
 import { useTerminalFontController } from './use-terminal-font'
 import { mirrorSelection, terminalClipboardIntent } from './clipboard'
@@ -157,7 +156,6 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
       observer?.disconnect()
       fitRef.current = null
       selectionDisposable.dispose()
-      observer.disconnect()
       term.dispose()
       termRef.current = null
       webglRef.current = null
