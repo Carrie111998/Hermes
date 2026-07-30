@@ -17,6 +17,8 @@ import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.
 import type { Theme } from '../theme.js'
 import type { Msg, Usage } from '../types.js'
 
+import { scrollbarColors } from './overlayPrimitives.js'
+
 const FACE_TICK_MS = 2500
 const HEART_COLORS = ['#ff5fa2', '#ff4d6d']
 
@@ -432,6 +434,7 @@ export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
 
 export function StatusRule({
   battery,
+  focusView,
   cwdLabel,
   cols,
   busy,
@@ -568,6 +571,11 @@ export function StatusRule({
   // so it consumes tail budget LAST and drops first on a narrow terminal.
   const showDevCredits = !!devCreditsText && fits(SEP + stringWidth(devCreditsText))
 
+  // Focus-view badge. Pinned (not tail-budgeted) on purpose: the whole point of
+  // the indicator is that the user can never be in reduced-output mode without
+  // seeing it, so it must not drop off a narrow terminal.
+  const showFocus = !!focusView
+
   const handleSessionCountClick = (event: { stopImmediatePropagation?: () => void }) => {
     event.stopImmediatePropagation?.()
     onSessionCountClick?.()
@@ -632,6 +640,12 @@ export function StatusRule({
             </Text>
           ) : null}
         </Box>
+        {showFocus ? (
+          <Box flexDirection="row" flexShrink={0}>
+            <Text color={t.color.muted}>{' │ '}</Text>
+            <Text color={t.color.warn}>◉ focus</Text>
+          </Box>
+        ) : null}
         {showBar ? (
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
@@ -753,8 +767,7 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
   const thumb = scrollable ? Math.max(1, Math.round((vp * vp) / total)) : vp
   const travel = Math.max(1, vp - thumb)
   const thumbTop = scrollable ? Math.round((pos / Math.max(1, total - vp)) * travel) : 0
-  const thumbColor = grab !== null ? t.color.primary : hover ? t.color.accent : t.color.border
-  const trackColor = hover ? t.color.border : t.color.muted
+  const { thumb: thumbColor, track: trackColor } = scrollbarColors(t, hover, grab !== null)
 
   const jump = (row: number, offset: number) => {
     if (!s || !scrollable) {
@@ -786,24 +799,21 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
       }}
       width={1}
     >
-      {!scrollable ? (
-        <Text color={trackColor} dim>
-          {' \n'.repeat(Math.max(0, vp - 1))}{' '}
-        </Text>
-      ) : (
+      {/* Nothing to scroll → draw nothing (the width={1} Box still reserves
+          the column). Drawn-blank cells composite to a black bar on
+          transparent terminals — same class as the removed opaque fills. */}
+      {!scrollable ? null : (
         <>
           {thumbTop > 0 ? (
-            <Text color={trackColor} dim={!hover}>
-              {`${'│\n'.repeat(Math.max(0, thumbTop - 1))}${thumbTop > 0 ? '│' : ''}`}
-            </Text>
+            <Text color={trackColor}>{`${'│\n'.repeat(Math.max(0, thumbTop - 1))}${thumbTop > 0 ? '│' : ''}`}</Text>
           ) : null}
           {thumb > 0 ? (
             <Text color={thumbColor}>{`${'┃\n'.repeat(Math.max(0, thumb - 1))}${thumb > 0 ? '┃' : ''}`}</Text>
           ) : null}
           {vp - thumbTop - thumb > 0 ? (
-            <Text color={trackColor} dim={!hover}>
-              {`${'│\n'.repeat(Math.max(0, vp - thumbTop - thumb - 1))}${vp - thumbTop - thumb > 0 ? '│' : ''}`}
-            </Text>
+            <Text
+              color={trackColor}
+            >{`${'│\n'.repeat(Math.max(0, vp - thumbTop - thumb - 1))}${vp - thumbTop - thumb > 0 ? '│' : ''}`}</Text>
           ) : null}
         </>
       )}
@@ -813,6 +823,8 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
 
 interface StatusRuleProps {
   battery?: BatteryInfo | null
+  // Focus view (/focus) badge — display-only reduced-output indicator.
+  focusView?: boolean
   bgCount: number
   lastTurnEndedAt?: null | number
   liveSessionCount: number

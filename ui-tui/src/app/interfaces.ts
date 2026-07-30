@@ -15,6 +15,7 @@ import type {
 } from '../gatewayTypes.js'
 import type { ParsedVoiceRecordKey } from '../lib/platform.js'
 import type { RpcResult } from '../lib/rpc.js'
+import type { ActiveWidget } from '../sdk/types.js'
 import type { Theme } from '../theme.js'
 import type {
   ApprovalReq,
@@ -87,6 +88,9 @@ export interface SelectionApi {
 
 export interface CompletionItem {
   display: string
+  /** Completion class from the gateway; `skill` is the only kind offered for
+   *  an inline `/skill` reference typed mid-message. */
+  kind?: string
   meta?: string
   text: string
 }
@@ -283,6 +287,10 @@ export interface OverlayState {
   billing: BillingOverlayState | null
   clarify: ClarifyReq | null
   confirm: ConfirmReq | null
+  /** Ambient widget apps — glanceable dock, non-blocking (never in $isBlocked). */
+  ambient: ActiveWidget[]
+  /** Modal widget app — owns input, blocks the composer. */
+  widget: ActiveWidget | null
   journey: boolean
   modelPicker: boolean | { refresh?: boolean }
   pager: null | PagerState
@@ -316,6 +324,9 @@ export interface UiState {
   compact: boolean
   detailsMode: DetailsMode
   detailsModeCommandOverride: boolean
+  // Focus view (/focus) — display-only reduced-output mode. Drives the
+  // persistent `◉ focus` status-bar badge; never affects request payloads.
+  focusView: boolean
   info: null | SessionInfo
   liveSessionCount: number
   inlineDiffs: boolean
@@ -515,7 +526,7 @@ export interface SlashHandlerContext {
   transcript: {
     page: (text: string, title?: string) => void
     panel: (title: string, sections: PanelSection[]) => void
-    send: (text: string) => void
+    send: (text: string, showUserMessage?: boolean, displayText?: string) => void
     setHistoryItems: StateSetter<Msg[]>
     sys: (text: string) => void
     trimLastExchange: (items: Msg[]) => Msg[]
