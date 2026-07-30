@@ -2409,10 +2409,16 @@ def _stdout_signals_no_work(script_output: str) -> bool:
     Shared wake-gate convention with OpenClaw ``job.precheck`` (openclaw#112371
     / hermes#68809) so the same check script can gate a cron job on either
     runtime.
+
+    The token boundary is exact: the (leading-whitespace-stripped) begin-line
+    must be exactly ``NO_WORK`` or start ``NO_WORK:`` (an optional
+    ``NO_WORK: reason`` form). Longer identifiers such as ``NO_WORKING`` or
+    ``NO_WORK_TODAY`` are NOT treated as the gate token.
     """
     if not script_output:
         return False
-    return script_output.lstrip().startswith("NO_WORK")
+    begin_line = script_output.lstrip().split("\n", 1)[0].rstrip()
+    return begin_line == "NO_WORK" or begin_line.startswith("NO_WORK:")
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -2807,6 +2813,14 @@ def run_job(
     #   - wakeAgent=false gate    → treated like empty stdout (silent), since
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
+    #   - NO_WORK begin-line gate → same as wakeAgent=false: silent run. A
+    #                               no_agent watchdog with nothing to report
+    #                               emits the shared NO_WORK token
+    #                               (openclaw#112371 / hermes#68809) instead
+    #                               of empty stdout, so it is suppressed here
+    #                               too. This intentionally means a no_agent
+    #                               job whose begin-line is the NO_WORK gate
+    #                               is NOT delivered verbatim.
     if job.get("no_agent"):
         script_path = job.get("script")
         if not script_path:
@@ -2857,11 +2871,12 @@ def run_job(
             )
             return False, doc, alert, output
 
-        # Honour the wakeAgent gate as a silent signal — `wakeAgent: false`
-        # means "nothing to report this tick", same as empty stdout.
+        # Honour the wake gate as a silent signal — either `wakeAgent: false`
+        # JSON or a leading `NO_WORK` token means "nothing to report this
+        # tick", same as empty stdout.
         if not _parse_wake_gate(output):
             logger.info(
-                "Job '%s' (no_agent): wakeAgent=false gate — silent run", job_id
+                "Job '%s' (no_agent): wake gate not set — silent run", job_id
             )
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"

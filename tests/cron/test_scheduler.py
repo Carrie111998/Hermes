@@ -1066,14 +1066,30 @@ class TestParseWakeGate:
         from cron.scheduler import _parse_wake_gate
         assert _parse_wake_gate("WORK_NEEDED: 3 dirty PRs") is True
 
+    def test_no_work_negative_prefixes_wake(self):
+        """NO_WORKING / NO_WORK_TODAY are not the gate token and wake normally."""
+        from cron.scheduler import _parse_wake_gate
+        assert _parse_wake_gate("NO_WORKING") is True
+        assert _parse_wake_gate("NO_WORK_TODAY") is True
+
 
 class TestStdoutSignalsNoWork:
     """Unit tests for the shared NO_WORK begin-line detector."""
 
-    def test_detects_no_work_prefix(self):
+    def test_detects_exact_no_work_token(self):
         from cron.scheduler import _stdout_signals_no_work
         assert _stdout_signals_no_work("NO_WORK") is True
-        assert _stdout_signals_no_work("  NO_WORK trailing") is True
+        assert _stdout_signals_no_work("  NO_WORK\n") is True
+        # Optional `NO_WORK: reason` form.
+        assert _stdout_signals_no_work("NO_WORK: inbox empty") is True
+        assert _stdout_signals_no_work("   NO_WORK: nothing to do\nextra") is True
+
+    def test_rejects_negative_prefixes(self):
+        """Longer identifiers sharing the NO_WORK prefix must NOT gate."""
+        from cron.scheduler import _stdout_signals_no_work
+        assert _stdout_signals_no_work("NO_WORKING") is False
+        assert _stdout_signals_no_work("NO_WORK_TODAY") is False
+        assert _stdout_signals_no_work("NO_WORK trailing") is False
 
     def test_empty_and_other_output(self):
         from cron.scheduler import _stdout_signals_no_work
@@ -1160,6 +1176,41 @@ class TestRunJobWakeGate:
         assert script_output in prompt_arg
         assert success is True
         assert err is None
+
+    def test_no_agent_no_work_token_is_silent_and_skips_agent(self):
+        """A no_agent job emitting NO_WORK is silent and never constructs AIAgent."""
+        from cron.scheduler import SILENT_MARKER
+        import cron.scheduler as scheduler
+
+        job = self._make_job(name="no-agent-nowork")
+        job["no_agent"] = True
+
+        with patch.object(scheduler, "_run_job_script_with_claim_heartbeat",
+                          return_value=(True, "NO_WORK: nothing to report")), \
+             patch("run_agent.AIAgent") as agent_cls:
+            success, doc, final, err = scheduler.run_job(job)
+
+        assert success is True
+        assert err is None
+        assert final == SILENT_MARKER
+        agent_cls.assert_not_called()
+
+    def test_no_agent_negative_prefix_delivered_verbatim(self):
+        """NO_WORKING is not the gate token, so a no_agent job delivers it."""
+        import cron.scheduler as scheduler
+
+        job = self._make_job(name="no-agent-noworking")
+        job["no_agent"] = True
+
+        with patch.object(scheduler, "_run_job_script_with_claim_heartbeat",
+                          return_value=(True, "NO_WORKING today")), \
+             patch("run_agent.AIAgent") as agent_cls:
+            success, doc, final, err = scheduler.run_job(job)
+
+        assert success is True
+        assert err is None
+        assert "NO_WORKING today" in final
+        agent_cls.assert_not_called()
 
 
 class TestBuildJobPromptMissingSkill:
