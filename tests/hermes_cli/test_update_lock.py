@@ -17,10 +17,13 @@ disk.
 from __future__ import annotations
 
 import os
+import sys
 import time
+import types
 
 import pytest
 
+import hermes_cli.update_lock as update_lock_module
 from hermes_cli.update_lock import (
     UPDATE_MARKER_MAX_AGE_SECONDS,
     UpdateLock,
@@ -72,6 +75,80 @@ def test_second_acquire_is_refused_while_the_first_is_live(marker):
     assert second.holder is not None
     assert second.holder.pid == os.getpid()
     assert second.acquired is False
+
+
+def test_descendant_borrows_identified_updater_ancestor_marker(marker, monkeypatch):
+    """The identified updater owns the marker through launch shims and rebuild."""
+    started_at = int(time.time())
+    updater_pid = 220
+    updater_name = "hermes-setup.exe" if os.name == "nt" else "hermes-setup"
+    updater_exe = marker.parent / updater_name
+    launcher = types.SimpleNamespace(pid=110)
+    updater = types.SimpleNamespace(
+        pid=updater_pid,
+        exe=lambda: str(updater_exe),
+        cmdline=lambda: [str(updater_exe), "--update", "--branch", "main"],
+    )
+    current = types.SimpleNamespace(parents=lambda: [launcher, updater])
+    monkeypatch.setitem(
+        sys.modules, "psutil", types.SimpleNamespace(Process=lambda: current)
+    )
+    monkeypatch.setattr(
+        update_lock_module, "_pid_alive", lambda pid: pid == updater_pid
+    )
+    marker.write_text(f"{updater_pid}\n{started_at}\n", encoding="utf-8")
+
+    lock = UpdateLock(path=marker)
+
+    assert lock.acquire() is True
+    assert lock.acquired is False, "the child borrows rather than replaces the parent lock"
+    assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == updater_pid
+
+    lock.release()
+    assert marker.exists(), "the parent owns the marker through the rebuild stage"
+
+
+def test_unrelated_ancestor_cannot_lend_update_marker(marker, monkeypatch):
+    started_at = int(time.time())
+    updater_pid = 220
+    unrelated = types.SimpleNamespace(
+        pid=updater_pid,
+        exe=lambda: str(marker.parent / "terminal.exe"),
+        cmdline=lambda: ["terminal.exe", "--update"],
+    )
+    current = types.SimpleNamespace(parents=lambda: [unrelated])
+    monkeypatch.setitem(
+        sys.modules, "psutil", types.SimpleNamespace(Process=lambda: current)
+    )
+    monkeypatch.setattr(update_lock_module, "_pid_alive", lambda _pid: True)
+    marker.write_text(f"{updater_pid}\n{started_at}\n", encoding="utf-8")
+
+    lock = UpdateLock(path=marker)
+
+    assert lock.acquire() is False
+    assert lock.holder is not None
+
+
+def test_install_mode_helper_cannot_lend_update_marker(marker, monkeypatch):
+    started_at = int(time.time())
+    updater_pid = 220
+    updater_name = "hermes-setup.exe" if os.name == "nt" else "hermes-setup"
+    install_mode = types.SimpleNamespace(
+        pid=updater_pid,
+        exe=lambda: str(marker.parent / updater_name),
+        cmdline=lambda: [str(marker.parent / updater_name)],
+    )
+    current = types.SimpleNamespace(parents=lambda: [install_mode])
+    monkeypatch.setitem(
+        sys.modules, "psutil", types.SimpleNamespace(Process=lambda: current)
+    )
+    monkeypatch.setattr(update_lock_module, "_pid_alive", lambda _pid: True)
+    marker.write_text(f"{updater_pid}\n{started_at}\n", encoding="utf-8")
+
+    lock = UpdateLock(path=marker)
+
+    assert lock.acquire() is False
+    assert lock.holder is not None
 
 
 def test_refused_lock_does_not_delete_the_live_owners_marker(marker):
