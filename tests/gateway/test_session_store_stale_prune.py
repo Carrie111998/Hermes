@@ -150,3 +150,60 @@ class TestEnsureLoadedCallsPrune:
 
         assert "dm_key" not in store._entries
 
+
+class TestPruneSaveConcurrencySafety:
+    """A prune-triggered whole-index save must not clobber a sibling writer's
+    concurrent insert into the same routing scope (#9006 concurrency follow-up).
+    """
+
+    def test_prune_save_preserves_concurrent_foreign_row(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        scope = str(tmp_path.resolve())
+
+        live_key = "agent:main:telegram:dm:live"
+        stale_key = "agent:main:telegram:dm:stale"
+        foreign_key = "agent:main:telegram:dm:foreign"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            live_key, json.dumps(_make_entry(live_key, "sid_live").to_dict()), scope=scope
+        )
+        db.save_gateway_routing_entry(
+            stale_key, json.dumps(_make_entry(stale_key, "sid_stale").to_dict()), scope=scope
+        )
+        # sid_stale reads as ended so startup pruning removes it; every other
+        # session_id is absent from the sessions table (get_session -> None,
+        # kept).
+        real_get = db.get_session
+        db.get_session = lambda sid: (
+            {"end_reason": "agent_close", "id": sid} if sid == "sid_stale" else real_get(sid)
+        )
+
+        store = _make_store_with_db(tmp_path, db)
+        # Model the post-load snapshot: the store read and now owns both rows.
+        store._entries = {
+            live_key: _make_entry(live_key, "sid_live"),
+            stale_key: _make_entry(stale_key, "sid_stale"),
+        }
+        store._persisted_routing_keys = {live_key, stale_key}
+
+        # A sibling connection inserts a DIFFERENT row after the load snapshot.
+        competitor = hermes_state.SessionDB()
+        competitor.save_gateway_routing_entry(
+            foreign_key,
+            json.dumps(_make_entry(foreign_key, "sid_foreign").to_dict()),
+            scope=scope,
+        )
+
+        # Pruning the stale key triggers the whole-index save immediately.
+        store._prune_stale_sessions_locked()
+
+        rows = db.load_gateway_routing_entries(scope=scope)
+        assert set(rows) == {live_key, foreign_key}
+        assert stale_key not in rows  # owned + removed -> deleted
+        assert json.loads(rows[foreign_key])["session_id"] == "sid_foreign"
+        competitor.close()
+        db.close()
+

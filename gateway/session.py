@@ -1178,6 +1178,13 @@ class SessionStore:
         self._save_lock = threading.Lock()
         self._routing_generation = 0
         self._persisted_routing_generation = 0
+        # Keys this store owns in the canonical routing table (seeded from the
+        # canonical read, updated on every persist). A whole-index save deletes
+        # only owned keys that have since disappeared from the in-memory index
+        # (pruned/reset sessions); rows the store never owned — e.g. a sibling
+        # writer's concurrent insert into the same scope — are left untouched
+        # so a save/prune can no longer clobber another connection's write.
+        self._persisted_routing_keys: set[str] = set()
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
         # An unscoped pre-migration Slack key can represent at most one
@@ -1204,11 +1211,35 @@ class SessionStore:
         
         # Initialize SQLite session database
         self._db = None
+        # Set when the canonical store (state.db) is present on disk but its
+        # SessionDB construction/schema/open failed. This is distinct from a
+        # genuinely absent/unavailable store: an existing-but-unopenable
+        # canonical routing index must fail closed on load rather than let the
+        # legacy sessions.json mirror silently become authoritative (#9006
+        # fail-closed follow-up). A construction failure with no state.db on
+        # disk (SQLite itself missing, pre-SQLite legacy install) keeps the
+        # historical JSONL degradation path.
+        self._canonical_store_open_failed = False
         try:
             from hermes_state import SessionDB
             self._db = SessionDB()
         except Exception as e:
-            print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
+            canonical_path = None
+            try:
+                from hermes_state import _default_db_path
+                canonical_path = _default_db_path()
+            except Exception:
+                canonical_path = None
+            if canonical_path is not None and canonical_path.exists():
+                self._canonical_store_open_failed = True
+                logger.error(
+                    "[gateway] canonical routing store %s is present but failed "
+                    "to open (%s); refusing legacy sessions.json fallback",
+                    canonical_path,
+                    e,
+                )
+            else:
+                print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
 
     def _has_active_processes_safe(self, session_key: str, *, context: str) -> bool:
         """Return whether a session has active work, failing closed on registry errors."""
@@ -1267,6 +1298,16 @@ class SessionStore:
         loaded_entries: Dict[str, SessionEntry] = dict(self._entries)
         canonical_read_succeeded = False
         _db = getattr(self, "_db", None)
+        # An existing canonical store that failed to open at construction must
+        # not degrade to the legacy sessions.json mirror — that would let stale
+        # routing override a broken-but-present canonical index. Fail closed and
+        # leave the store unloaded so a later retry (after the DB heals) can
+        # read the authoritative rows (#9006).
+        if _db is None and getattr(self, "_canonical_store_open_failed", False):
+            raise RuntimeError(
+                "canonical routing store is present but failed to open; refusing "
+                "to serve the legacy sessions.json fallback"
+            )
         if _db:
             loader = getattr(_db, "load_gateway_routing_entries", None)
             if callable(loader):
@@ -1284,7 +1325,17 @@ class SessionStore:
                             raise TypeError(
                                 "canonical routing entry must decode to an object"
                             )
-                        loaded_entries[key] = SessionEntry.from_dict(entry_data)
+                        entry = SessionEntry.from_dict(entry_data)
+                        # The table key IS the routing key; a payload whose
+                        # session_key disagrees is an inconsistent row (manual
+                        # edit, partial write, cross-key corruption). Fail closed
+                        # rather than route under a key the entry does not claim.
+                        if entry.session_key != key:
+                            raise ValueError(
+                                "canonical routing key does not match entry "
+                                f"session_key {entry.session_key!r}"
+                            )
+                        loaded_entries[key] = entry
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning(
                             "Invalid canonical routing entry %r: %s", key, e
@@ -1333,6 +1384,19 @@ class SessionStore:
                     logger.warning("Skipping invalid session entry %r: %s", key, e)
                     continue
 
+                # Never seed a canonical row under a key the entry does not
+                # claim: it would later trip the canonical key/session_key
+                # consistency check and fail the whole load closed. Skip the
+                # inconsistent legacy entry (best-effort import) instead.
+                if candidate.session_key != key:
+                    logger.warning(
+                        "Skipping legacy session entry %r: session_key %r "
+                        "disagrees with its routing key",
+                        key,
+                        candidate.session_key,
+                    )
+                    continue
+
                 if _db:
                     inserter = getattr(
                         _db, "insert_gateway_routing_entry_if_absent", None
@@ -1374,6 +1438,12 @@ class SessionStore:
 
         self._entries = loaded_entries
         self._loaded = True
+        # The canonical read observed exactly these keys; the store now owns
+        # them. A later whole-index save deletes only owned keys that vanish
+        # from the in-memory index (below, or via prune/reset) and leaves any
+        # concurrently-inserted foreign key untouched. Seed before the startup
+        # prune so its save computes the pruned keys as the delete set.
+        self._persisted_routing_keys = set(loaded_entries.keys())
 
         # Prune any sessions.json entries that point to sessions already ended
         # in state.db. A hard gateway crash (exit code 1) skips the graceful
@@ -1498,11 +1568,21 @@ class SessionStore:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
                     try:
+                        # Reconcile instead of blank-replacing the scope: upsert
+                        # the current index and delete only owned keys that have
+                        # since disappeared (pruned/reset). Foreign rows a
+                        # sibling writer inserted after our load are neither
+                        # named nor deleted, so a save can no longer clobber a
+                        # concurrent write (#9006 concurrency follow-up).
+                        owned = getattr(self, "_persisted_routing_keys", set())
+                        new_keys = set(data.keys())
                         replacer(
                             {k: json.dumps(v) for k, v in data.items()},
                             scope=self._routing_scope(),
+                            delete_keys=list(owned - new_keys),
                         )
                         db_saved = True
+                        self._persisted_routing_keys = new_keys
                     except Exception as exc:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc

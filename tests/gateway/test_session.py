@@ -1628,3 +1628,152 @@ class TestGatewayRoutingTable:
         competitor.close()
         store._db.close()
 
+    def test_construction_failure_with_present_store_fails_closed(self, tmp_path):
+        """An existing canonical store that fails to open must NOT authorize the
+        legacy sessions.json mirror — construction failure fails closed."""
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        canonical = self._entry_data(key, "canonical-session")
+        self._write_legacy_entry(tmp_path, key, "stale-legacy-session")
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key, json.dumps(canonical), scope=str(tmp_path.resolve())
+        )
+        db.close()
+        assert (tmp_path / "state.db").exists()
+
+        # SessionDB construction/schema/open now fails while state.db is present.
+        with patch(
+            "hermes_state.SessionDB",
+            side_effect=hermes_state.sqlite3.DatabaseError("schema migration failed"),
+        ):
+            store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+        assert store._db is None
+        assert store._canonical_store_open_failed is True
+
+        with pytest.raises(RuntimeError, match="present but failed to open"):
+            store._ensure_loaded()
+        assert store._loaded is False
+        # The stale legacy entry never became authoritative.
+        assert store._entries == {}
+
+    def test_construction_failure_without_store_allows_legacy_fallback(self, tmp_path):
+        """A genuinely absent canonical store keeps the historical JSONL
+        fallback — proving the fail-closed path is distinguishable from an
+        unavailable store."""
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        self._write_legacy_entry(tmp_path, key, "legacy-session")
+        assert not (tmp_path / "state.db").exists()
+
+        with patch(
+            "hermes_state.SessionDB",
+            side_effect=hermes_state.sqlite3.DatabaseError("sqlite unavailable"),
+        ):
+            store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+        assert store._db is None
+        assert store._canonical_store_open_failed is False
+
+        store._ensure_loaded()
+        assert store._entries[key].session_id == "legacy-session"
+
+    def test_concurrent_foreign_row_survives_save_but_owned_removal_deletes(
+        self, tmp_path
+    ):
+        """A sibling writer's insert/update after our load must survive the next
+        whole-index save, while an owned key removed from the index is still
+        deleted (reconcile, not blank-replace) (#9006 concurrency follow-up)."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key_a = "agent:main:telegram:dm:chatA"
+        key_b = "agent:main:telegram:dm:chatB"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key_a, json.dumps(self._entry_data(key_a, "sessionA")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        assert set(store._entries) == {key_a}
+
+        competitor = hermes_state.SessionDB()
+        # Foreign INSERT after our load snapshot.
+        competitor.save_gateway_routing_entry(
+            key_b, json.dumps(self._entry_data(key_b, "sessionB")), scope=scope
+        )
+        store._save()
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert set(rows) == {key_a, key_b}
+        assert json.loads(rows[key_b])["session_id"] == "sessionB"
+
+        # Foreign UPDATE of the same different row after our load.
+        competitor.save_gateway_routing_entry(
+            key_b, json.dumps(self._entry_data(key_b, "sessionB2")), scope=scope
+        )
+        store._save()
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert json.loads(rows[key_b])["session_id"] == "sessionB2"  # not reverted
+
+        # An OWNED key removed from the in-memory index is still deleted.
+        del store._entries[key_a]
+        store._save()
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert set(rows) == {key_b}
+        competitor.close()
+        store._db.close()
+
+    def test_canonical_key_session_key_mismatch_fails_closed(self, tmp_path):
+        """A canonical row whose payload session_key disagrees with its table
+        key is inconsistent and must fail the load closed, not route under a key
+        the entry does not claim."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        table_key = "agent:main:telegram:dm:chatX"
+        payload = self._entry_data("agent:main:telegram:dm:chatY", "sessionX")
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(table_key, json.dumps(payload), scope=scope)
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        with pytest.raises(ValueError, match="does not match entry session_key"):
+            store._ensure_loaded()
+        assert store._loaded is False
+        assert store._entries == {}
+        store._db.close()
+
+    def test_legacy_key_session_key_mismatch_is_skipped_not_seeded(self, tmp_path):
+        """An inconsistent legacy entry is skipped, so it never seeds a poison
+        canonical row that would later fail every load closed."""
+        good = "agent:main:telegram:dm:chatGood"
+        bad_key = "agent:main:telegram:dm:chatBad"
+        (tmp_path / "sessions.json").write_text(
+            json.dumps(
+                {
+                    good: self._entry_data(good, "good-session"),
+                    bad_key: self._entry_data(
+                        "agent:main:telegram:dm:other", "bad-session"
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+
+        assert store._entries[good].session_id == "good-session"
+        assert bad_key not in store._entries
+        rows = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+        assert set(rows) == {good}
+        store._db.close()
+
