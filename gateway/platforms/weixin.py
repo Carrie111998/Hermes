@@ -118,12 +118,10 @@ MESSAGE_DEDUP_TTL_SECONDS = 300
 def _is_stale_session_ret(
     ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
 ) -> bool:
-    """True when iLink returns ret=-2 / errcode=-2 with 'unknown error',
-    which is a stale-session signal (same as errcode=-14) rather than
-    a genuine rate limit."""
+    """True when iLink returns a stale-session variant of ret/errcode -2."""
     if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
         return False
-    return (errmsg or "").lower() == "unknown error"
+    return (errmsg or "").strip().lower() in {"unknown error", "prepare failed"}
 
 
 MEDIA_IMAGE = 1
@@ -330,6 +328,10 @@ class ContextTokenStore:
 
     def set(self, account_id: str, user_id: str, token: str) -> None:
         self._cache[self._key(account_id, user_id)] = token
+        self._persist(account_id)
+
+    def delete(self, account_id: str, user_id: str) -> None:
+        self._cache.pop(self._key(account_id, user_id), None)
         self._persist(account_id)
 
     def _persist(self, account_id: str) -> None:
@@ -1790,7 +1792,6 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> None:
         """Send a text chunk while holding the adapter-wide outbound text gate."""
         last_error: Optional[Exception] = None
-        retried_without_token = False
         for attempt in range(self._send_chunk_retries + 1):
             if self._rate_limit_cooldown_remaining() > 0:
                 raise self._rate_limit_error()
@@ -1815,17 +1816,18 @@ class WeixinAdapter(BasePlatformAdapter):
                             or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
                         )
                         # Session expired — strip token and retry once
-                        if is_session_expired and not retried_without_token and context_token:
-                            retried_without_token = True
-                            context_token = None
-                            self._token_store._cache.pop(
-                                self._token_store._key(self._account_id, chat_id), None
-                            )
+                        if is_session_expired and context_token:
+                            self._token_store.delete(self._account_id, chat_id)
                             logger.warning(
                                 "[%s] session expired for %s; retrying without context_token",
                                 self.name, _safe_id(chat_id),
                             )
-                            continue
+                            return await self._send_text_chunk_locked(
+                                chat_id=chat_id,
+                                chunk=chunk,
+                                context_token=None,
+                                client_id=client_id,
+                            )
                         # Rate limit (-2) — backoff and retry
                         is_rate_limited = (
                             ret == RATE_LIMIT_ERRCODE
@@ -1885,7 +1887,6 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
-        context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
 
         # Extract MEDIA: tags and bare local file paths before text delivery.
@@ -1929,6 +1930,7 @@ class WeixinAdapter(BasePlatformAdapter):
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
+                context_token = self._token_store.get(self._account_id, chat_id)
                 await self._send_text_chunk(
                     chat_id=chat_id,
                     chunk=chunk,

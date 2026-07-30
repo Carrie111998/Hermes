@@ -241,6 +241,59 @@ class TestWeixinChunkDelivery:
         assert first_try["text"] == retry["text"]
         assert first_try["client_id"] == retry["client_id"]
 
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_stale_context_token_recovers_with_zero_retry_budget(
+        self,
+        send_message_mock,
+        tmp_path,
+    ):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 0
+        adapter._token_store = weixin.ContextTokenStore(str(tmp_path))
+        adapter._token_store.set(adapter._account_id, "wxid_test123", "ctx-token")
+        send_message_mock.side_effect = [
+            {"ret": -2, "errmsg": "prepare failed"},
+            {"ret": 0},
+        ]
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        assert [
+            call.kwargs["context_token"]
+            for call in send_message_mock.await_args_list
+        ] == ["ctx-token", None]
+        assert adapter._token_store.get(adapter._account_id, "wxid_test123") is None
+
+        restored_store = weixin.ContextTokenStore(str(tmp_path))
+        restored_store.restore(adapter._account_id)
+        assert restored_store.get(adapter._account_id, "wxid_test123") is None
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_stale_context_token_is_not_reused_for_later_chunks(
+        self,
+        send_message_mock,
+        tmp_path,
+    ):
+        adapter = self._connected_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 12
+        adapter._send_chunk_delay_seconds = 0
+        adapter._token_store = weixin.ContextTokenStore(str(tmp_path))
+        adapter._token_store.set(adapter._account_id, "wxid_test123", "ctx-token")
+        send_message_mock.side_effect = [
+            {"ret": -2, "errmsg": "prepare failed"},
+            {"ret": 0},
+            {"ret": 0},
+        ]
+
+        result = asyncio.run(adapter.send("wxid_test123", "first\n\nsecond"))
+
+        assert result.success is True
+        assert [
+            call.kwargs["context_token"]
+            for call in send_message_mock.await_args_list
+        ] == ["ctx-token", None, None]
+
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_repeated_rate_limits_open_circuit_for_followup_sends(self, send_message_mock, sleep_mock):
@@ -500,6 +553,10 @@ class TestIsStaleSessionRet:
     """Regression test for #17228: distinguish stale-session ret=-2 from rate-limit ret=-2."""
 
 
+    def test_ret_minus_2_with_prepare_failed_is_stale(self):
+        assert weixin._is_stale_session_ret(-2, None, "prepare failed") is True
+
+
     def test_ret_minus_2_with_freq_limit_is_not_stale(self):
         # Genuine rate limit — must NOT be treated as stale session.
         assert weixin._is_stale_session_ret(-2, None, "freq limit") is False
@@ -509,6 +566,27 @@ class TestIsStaleSessionRet:
         # -14 is handled by the separate SESSION_EXPIRED_ERRCODE path; the
         # helper only disambiguates -2 from a genuine rate limit.
         assert weixin._is_stale_session_ret(-14, None, "session expired") is False
+
+
+class TestContextTokenStore:
+    def test_delete_removes_only_matching_peer_and_persists(self, tmp_path):
+        store = weixin.ContextTokenStore(str(tmp_path))
+        store.set("account-a", "peer-a", "stale-token")
+        store.set("account-a", "peer-b", "fresh-token")
+        store.set("account-b", "peer-a", "other-account-token")
+
+        store.delete("account-a", "peer-a")
+
+        assert store.get("account-a", "peer-a") is None
+        assert store.get("account-a", "peer-b") == "fresh-token"
+        assert store.get("account-b", "peer-a") == "other-account-token"
+
+        restored_store = weixin.ContextTokenStore(str(tmp_path))
+        restored_store.restore("account-a")
+        restored_store.restore("account-b")
+        assert restored_store.get("account-a", "peer-a") is None
+        assert restored_store.get("account-a", "peer-b") == "fresh-token"
+        assert restored_store.get("account-b", "peer-a") == "other-account-token"
 
 
 class TestWeixinContentDedup:
