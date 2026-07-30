@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -105,6 +106,7 @@ class _SidebarSkillContract:
     runtime_root_sources: tuple[str, ...]
     failure_codes: dict[str, str]
     forbid_app_server: bool
+    provider_degradation_isolated: bool
 
     @classmethod
     def load(cls, path: Path) -> "_SidebarSkillContract":
@@ -264,6 +266,9 @@ class _SidebarSkillContract:
                 raise ValueError("fixed failure mapping")
 
             no_app_server_rule = "Never use app-server thread creation as a fallback"
+            provider_isolation_rule = (
+                "must not globally block healthy queued delivery from another provider"
+            )
             required_rules = (
                 "never select placement or project identity",
                 "reconcile before creating anything",
@@ -271,6 +276,7 @@ class _SidebarSkillContract:
                 "title before commit",
                 "try fail/release once with `bridge_temporarily_unavailable`",
                 no_app_server_rule,
+                provider_isolation_rule,
             )
             if any(text.count(rule) != 1 for rule in required_rules):
                 raise ValueError("required rule")
@@ -293,6 +299,9 @@ class _SidebarSkillContract:
                 runtime_root_sources=runtime_root_sources,
                 failure_codes=failure_codes,
                 forbid_app_server=text.count(no_app_server_rule) == 1,
+                provider_degradation_isolated=(
+                    text.count(provider_isolation_rule) == 1
+                ),
             )
         except (IndexError, OSError, ValueError) as exc:
             raise ValueError(f"sidebar skill contract is invalid: {path}") from exc
@@ -378,11 +387,41 @@ class _SidebarSkillContract:
         ):
             return False
         providers = health.get("providers")
+
+        def valid_optional_number(value: object) -> bool:
+            return value is None or (
+                type(value) in (int, float) and math.isfinite(float(value))
+            )
+
+        def valid_provider(provider: object) -> bool:
+            if not isinstance(provider, dict) or not {
+                "last_success",
+                "lag_seconds",
+                "degraded_reason",
+            }.issubset(provider):
+                return False
+            degraded_reason = provider["degraded_reason"]
+            return (
+                valid_optional_number(provider["last_success"])
+                and valid_optional_number(provider["lag_seconds"])
+                and (
+                    degraded_reason is None
+                    or (
+                        type(degraded_reason) is str
+                        and re.fullmatch(
+                            r"[a-z][a-z0-9_]{0,127}",
+                            degraded_reason,
+                        )
+                        is not None
+                    )
+                )
+            )
+
         if not isinstance(providers, dict) or any(
-            not isinstance(provider, dict)
-            or "degraded_reason" not in provider
-            or provider.get("degraded_reason") is not None
-            for provider in providers.values()
+            type(provider_name) is not str
+            or not provider_name
+            or not valid_provider(provider)
+            for provider_name, provider in providers.items()
         ):
             return False
         placement = sidebar.get("placement")
@@ -2892,6 +2931,12 @@ def test_sidebar_skill_trace_requires_exact_id_on_fail_after_recovered_read() ->
         contract.validate_trace(trace)
 
 
+def test_sidebar_skill_contract_preserves_provider_isolation() -> None:
+    contract = _SidebarSkillContract.load(_SIDEBAR_SKILL_PATH)
+
+    assert contract.provider_degradation_isolated is True
+
+
 @pytest.mark.parametrize("provider", [Provider.CLAUDE, Provider.HERMES])
 def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
     tmp_path: Path,
@@ -4023,7 +4068,6 @@ def test_marker_search_candidate_read_reauthenticates_without_replacement(
     [
         "bridge_stopped",
         "watcher_degraded",
-        "provider_degraded",
         "provider_malformed",
         "placement_cwd",
         "placement_generation",
@@ -4048,10 +4092,6 @@ def test_sidebar_status_preflight_stops_before_projects_or_pending(
                 status["health"]["running"] = False
             elif invalid_status == "watcher_degraded":
                 status["health"]["watcher_state"] = "degraded"
-            elif invalid_status == "provider_degraded":
-                status["health"]["providers"]["claude"] = {
-                    "degraded_reason": "provider_refresh_failed"
-                }
             elif invalid_status == "provider_malformed":
                 status["health"]["providers"]["claude"].pop(
                     "degraded_reason",
@@ -4073,6 +4113,50 @@ def test_sidebar_status_preflight_stops_before_projects_or_pending(
             harness.contract.status_tool
         ]
         assert harness.native.create_calls == []
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("degraded_provider", "healthy_provider"),
+    [
+        (Provider.CLAUDE, Provider.HERMES),
+        (Provider.HERMES, Provider.CLAUDE),
+    ],
+)
+def test_sidebar_provider_degradation_isolated_from_healthy_queued_delivery(
+    tmp_path: Path,
+    degraded_provider: Provider,
+    healthy_provider: Provider,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / f"healthy-{healthy_provider.value}"
+        source_id = harness.seed_source(
+            healthy_provider,
+            f"healthy-{healthy_provider.value}",
+            cwd=source_cwd,
+        )
+        harness.register()
+
+        def degrade_one_provider(status: dict[str, Any]) -> dict[str, Any]:
+            status["health"]["providers"][degraded_provider.value] = {
+                "last_success": None,
+                "lag_seconds": None,
+                "degraded_reason": "scan_failed",
+            }
+            return status
+
+        harness.status_mutator = degrade_one_provider
+        with harness.client() as client:
+            delivered = harness.run_worker_once(client)
+
+        assert delivered == [
+            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        ]
+        assert harness.store.get_sidebar_job_for_source(source_id)["state"] == (
+            SidebarJobState.VISIBLE.value
+        )
     finally:
         harness.close()
 
