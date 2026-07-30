@@ -193,7 +193,6 @@ platform network disconnect as an event-loop failure.
 | `/approve` | Approve a pending dangerous command |
 | `/deny` | Reject a pending dangerous command |
 | `/sethome` | Set this chat as the home channel |
-| `/handoff <platform>` | Move the live session to another platform's home channel (see [Cross-Platform Handoff](/docs/user-guide/sessions#cross-platform-handoff)) |
 | `/compress` | Manually compress conversation context |
 | `/title [name]` | Set or show the session title |
 | `/resume [name]` | Resume a previously named session |
@@ -669,6 +668,9 @@ transfers the live conversation to that platform's home channel — same session
 transcript, tool calls included. The destination adapter opens a fresh thread where it can
 (Telegram forum topic, Discord thread, Slack thread anchor) and falls back to the home channel
 where it cannot.
+
+`/handoff` runs from the CLI only. It is not one of the chat commands above, so typing it in a
+messaging chat will not start a handoff.
 
 To come back, run `/resume <title>` from the CLI (or `hermes -r "<title>"`).
 
