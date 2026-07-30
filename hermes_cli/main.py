@@ -10662,13 +10662,6 @@ def _prepare_agent_startup(args) -> None:
 
 
 def _apply_safe_mode(args) -> None:
-    # --safe-mode: troubleshooting mode that disables ALL customizations.
-    # Inspired by Claude Code v2.1.169's --safe-mode (June 2026): run with a
-    # pristine environment to isolate whether a problem comes from the user's
-    # setup (config, rules files, plugins, MCP servers) or from Hermes itself.
-    # Implemented as a superset of --ignore-user-config + --ignore-rules plus
-    # plugin/MCP/shell-hook suppression (HERMES_SAFE_MODE is checked by
-    # hermes_cli/plugins.py, tools/mcp_tool.py, and agent/shell_hooks.py).
     if not getattr(args, "safe_mode", False):
         return
     os.environ["HERMES_SAFE_MODE"] = "1"
