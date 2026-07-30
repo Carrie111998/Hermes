@@ -1223,7 +1223,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       socketReadyState: socket?.readyState ?? null,
     });
 
-    if (!plan || !learnSeed || pendingLearnSeedRef.current === learnSeed) {
+    if (!socket || !plan || !learnSeed || pendingLearnSeedRef.current === learnSeed) {
       return;
     }
 
