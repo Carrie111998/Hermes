@@ -4,13 +4,12 @@
 
 HERMES_HOME="$HOME/.hermes"
 HERMES_AGENT="$HERMES_HOME/hermes-agent"
-TAURI_BINARY="$HERMES_AGENT/apps/desktop-tauri/src-tauri/target/release/hermes-tauri"
+TAURI_BINARY="$HERMES_AGENT/apps/desktop-tauri/src-tauri/target/debug/hermes-tauri"
 PIDFILE="/tmp/hermes-tauri.pid"
 
 log() { echo "[hermes-tauri] $*"; notify-send "Hermes Tauri" "$*" 2>/dev/null || true; }
 
 # --- integrity check - catch *** corruptions in Python backend ---
-# Uses py_compile for real syntax errors (zero false positives)
 PYTHON_CORRUPT=$(python3 -c "
 import py_compile, glob, sys
 bad = []
@@ -39,7 +38,7 @@ if [ -f /proc/driver/nvidia/version ] && command -v modinfo >/dev/null 2>&1; the
   fi
 fi
 
-# PID lock (Tauri process only, backend managed by systemd)
+# PID lock
 if [ -f "$PIDFILE" ]; then
   LOCK_PID=$(cat "$PIDFILE")
   if kill -0 "$LOCK_PID" 2>/dev/null; then
@@ -53,8 +52,6 @@ cleanup() { rm -f "$PIDFILE"; }
 trap cleanup EXIT INT TERM
 
 # --- Read shared token from systemd-managed backend ---
-log "Using shared backend (systemd hermes-serve.service)"
-
 TOKEN_FILE="$HOME/.hermes/runtime/backend-token"
 if [ -f "$TOKEN_FILE" ]; then
   SECRET=$(cat "$TOKEN_FILE")
@@ -66,9 +63,92 @@ else
   exit 1
 fi
 
-# WebKit workaround + profile
+# --- Backend liveness check ---
+# Verify backend TCP port is listening
+if ! ss -tlnp 2>/dev/null | grep -q ':44985'; then
+  log "ERROR: Backend port 44985 not listening"
+  log "Run: systemctl --user start hermes-serve"
+  systemctl --user start hermes-serve.service 2>/dev/null
+  sleep 2
+  if ! ss -tlnp 2>/dev/null | grep -q ':44985'; then
+    log "Backend still not running after restart attempt"
+    log "Run manually: systemctl --user start hermes-serve"
+    exit 1
+  fi
+  log "Backend restarted successfully"
+fi
+
+# Verify WS connectivity with actual token
+# Tests both port reachability AND token validity
+WS_CHECK=$(timeout 5 python3 -c "
+import asyncio, websockets, sys
+async def check():
+    token = '$SECRET'
+    url = f'ws://127.0.0.1:44985/api/ws?token={token}'
+    try:
+        async with websockets.connect(url, ping_interval=None, open_timeout=4) as ws:
+            msg = await asyncio.wait_for(ws.recv(), timeout=2)
+            if 'gateway.ready' in msg:
+                sys.exit(0)
+            else:
+                sys.exit(2)
+    except Exception as e:
+        print(f'WS failed: {e}')
+        sys.exit(1)
+asyncio.run(check())
+" 2>&1)
+WS_EXIT=$?
+if [ "$WS_EXIT" -ne 0 ]; then
+  log "ERROR: Backend WS check failed (exit=$WS_EXIT)"
+  echo "$WS_CHECK"
+  log "Retrying in 3s..."
+  sleep 3
+  WS_CHECK=$(timeout 5 python3 -c "
+import asyncio, websockets, sys
+async def check():
+    token = '$SECRET'
+    url = f'ws://127.0.0.1:44985/api/ws?token={token}'
+    try:
+        async with websockets.connect(url, ping_interval=None, open_timeout=4) as ws:
+            msg = await asyncio.wait_for(ws.recv(), timeout=2)
+            if 'gateway.ready' in msg:
+                sys.exit(0)
+            else:
+                sys.exit(2)
+    except Exception as e:
+        print(f'WS failed: {e}')
+        sys.exit(1)
+asyncio.run(check())
+" 2>&1)
+  WS_EXIT=$?
+  if [ "$WS_EXIT" -ne 0 ]; then
+    log "Backend WS check failed after retry -- aborting"
+    echo "$WS_CHECK"
+    exit 1
+  fi
+fi
+log "Backend WS check passed"
+
+# WebKit workaround + profile (Linux stability)
 export WEBKIT_DISABLE_COMPOSITING_MODE=1
+export WEBKIT_FORCE_COMPLEX_TEXT=1
+export GDK_BACKEND=x11
 export HERMES_PROFILE="${HERMES_PROFILE:-dimitri}"
+
+# Start dev server for dist (release binary may still use devUrl on WebKitGTK)
+DIST_DIR="$HERMES_AGENT/apps/desktop-tauri/dist"
+DEV_SERVER_PID=""
+if ! ss -tlnp 2>/dev/null | grep -q ':5173'; then
+  python3 -m http.server 5173 --directory "$DIST_DIR" &>/dev/null &
+  DEV_SERVER_PID=$!
+  disown "$DEV_SERVER_PID" 2>/dev/null
+  log "Dev server started on :5173 for dist"
+fi
 
 log "Launching Tauri..."
 "$TAURI_BINARY"
+
+# Clean up dev server on exit
+if [ -n "$DEV_SERVER_PID" ]; then
+  kill "$DEV_SERVER_PID" 2>/dev/null || true
+fi
