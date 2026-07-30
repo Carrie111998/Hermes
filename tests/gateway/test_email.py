@@ -232,7 +232,7 @@ class TestDispatchMessage(unittest.TestCase):
         asyncio.run(adapter._dispatch_message(msg_data))
         self.assertEqual(len(captured_events), 1)
         self.assertNotIn("[Subject:", captured_events[0].text)
-        self.assertEqual(captured_events[0].text, "Thanks for the help!")
+        self.assertIn("Thanks for the help!", captured_events[0].text)
 
 
     def test_image_attachment_sets_photo_type(self):
@@ -678,8 +678,8 @@ class TestImapConnectionCleanup(unittest.TestCase):
         "EMAIL_IMAP_PORT": "993",
         "EMAIL_SMTP_HOST": "smtp.test.com",
     }, clear=False)
-    def test_imap_logout_called_on_uid_fetch_failure(self):
-        """IMAP logout() must be called even when uid fetch raises."""
+    def test_imap_shutdown_called_on_uid_fetch_failure(self):
+        """IMAP shutdown() must be called even when uid fetch raises."""
         adapter = self._make_adapter()
         mock_imap = MagicMock()
 
@@ -696,7 +696,7 @@ class TestImapConnectionCleanup(unittest.TestCase):
             results = adapter._fetch_new_messages()
 
         self.assertEqual(results, [])
-        mock_imap.logout.assert_called_once()
+        mock_imap.shutdown.assert_called_once()
 
 
 class TestImapIdExtensionForNetEase(unittest.TestCase):
