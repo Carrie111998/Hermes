@@ -1780,6 +1780,7 @@ export function runSecurityAudit(): Promise<ActionResponse> {
 
 export function runBackup(): Promise<ActionResponse & { archive?: string }> {
   return window.hermesDesktop.api<ActionResponse & { archive?: string }>({
+    ...profileScoped(),
     path: '/api/ops/backup',
     method: 'POST',
     body: {}
@@ -1788,6 +1789,7 @@ export function runBackup(): Promise<ActionResponse & { archive?: string }> {
 
 export function listBackups(): Promise<BackupListResponse> {
   return window.hermesDesktop.api<BackupListResponse>({
+    ...profileScoped(),
     path: '/api/ops/backup/list'
   })
 }

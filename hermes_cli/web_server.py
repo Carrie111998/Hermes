@@ -3915,7 +3915,7 @@ async def restart_gateway(profile: Optional[str] = None):
 
 
 @app.post("/api/gateway/drain")
-async def gateway_drain(request: Request):
+async def gateway_drain(request: Request, profile: Optional[str] = None):
     """Begin or cancel an external (NAS-driven) gateway drain.
 
     Authenticated by the non-interactive token-auth seam: the
@@ -3935,6 +3935,12 @@ async def gateway_drain(request: Request):
     process owns the actual state transition (there is no HTTP control channel
     into the running gateway; the marker IS the channel, decisions.md Q-B).
 
+    ``profile`` scopes the marker to that profile's own HERMES_HOME (the
+    Desktop app's global-remote mode shares one dashboard across profiles, each
+    with its own gateway process watching its own home — see
+    ``_resolve_optional_profile_home``). None/""/"current" keeps the dashboard's
+    own home, matching every other profile-scoped endpoint here.
+
     The force-override (D6: "unless a user commands it") is NOT here — an
     immediate, drain-skipping action maps onto the existing
     ``POST /api/gateway/restart`` force path, which supersedes a drain.
@@ -3944,6 +3950,8 @@ async def gateway_drain(request: Request):
         drain_requested,
         write_drain_request,
     )
+
+    home = _resolve_optional_profile_home(profile)
 
     try:
         body = await request.json()
@@ -3957,7 +3965,7 @@ async def gateway_drain(request: Request):
     principal = getattr(principal_obj, "principal", None) or "dashboard"
 
     if action == "cancel":
-        existed = clear_drain_request()
+        existed = clear_drain_request(home=home)
         _log.info("Gateway drain CANCEL requested by %s (existed=%s)", principal, existed)
         return {"ok": True, "action": "cancel", "was_draining": existed}
 
@@ -3970,6 +3978,7 @@ async def gateway_drain(request: Request):
     payload = write_drain_request(
         principal=str(principal),
         suppress_notification=bool((body or {}).get("suppress_notification", False)),
+        home=home,
     )
     _log.info(
         "Gateway drain BEGIN requested by %s (suppress_notification=%s)",
@@ -3982,7 +3991,7 @@ async def gateway_drain(request: Request):
         "requested_at": payload["requested_at"],
         # Echo so a caller polling /api/status knows the marker is now set;
         # the gateway watcher flips gateway_state -> draining within ~1s.
-        "draining": drain_requested(),
+        "draining": drain_requested(home=home),
         "suppress_notification": payload["suppress_notification"],
     }
 
@@ -12563,18 +12572,33 @@ async def run_security_audit():
     return {"ok": True, "pid": proc.pid, "name": "security-audit"}
 
 
-def _dashboard_backup_dir() -> Path:
-    return get_hermes_home() / "backups"
+def _resolve_optional_profile_home(profile: Optional[str]) -> Path:
+    """Resolve ``profile`` to its HERMES_HOME, or the dashboard's own home.
+
+    Shared by the drain + backup endpoints below, which — unlike
+    ``/api/config``'s ``_profile_scope`` — call into helpers that already take
+    a ``home``/``-p`` argument directly, so no contextvar override is needed;
+    just the resolved directory. None/""/"current" means the dashboard's own
+    profile, matching ``_profile_scope``'s contract.
+    """
+    requested = (profile or "").strip()
+    if not requested or requested.lower() == "current":
+        return get_hermes_home()
+    return _resolve_profile_dir(requested)
 
 
-def _new_dashboard_backup_path() -> Path:
+def _dashboard_backup_dir(profile: Optional[str] = None) -> Path:
+    return _resolve_optional_profile_home(profile) / "backups"
+
+
+def _new_dashboard_backup_path(profile: Optional[str] = None) -> Path:
     stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    return _dashboard_backup_dir() / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
+    return _dashboard_backup_dir(profile) / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
 
 
-def _list_backups() -> list[dict]:
+def _list_backups(profile: Optional[str] = None) -> list[dict]:
     """List existing backup archives in the dashboard backup directory."""
-    backup_dir = _dashboard_backup_dir()
+    backup_dir = _dashboard_backup_dir(profile)
     if not backup_dir.is_dir():
         return []
     backups = []
@@ -12593,20 +12617,20 @@ def _list_backups() -> list[dict]:
 
 
 @app.get("/api/ops/backup/list")
-async def list_backups():
+async def list_backups(profile: Optional[str] = None):
     """List existing backup archives."""
-    return {"backups": _list_backups()}
+    return {"backups": _list_backups(profile)}
 
 
 @app.post("/api/ops/backup")
-async def run_backup(body: BackupRequest):
-    args = ["backup"]
+async def run_backup(body: BackupRequest, profile: Optional[str] = None):
+    args = _profile_cli_args(profile) + ["backup"]
     archive: Optional[Path] = None
     output = (body.output or "").strip()
     if output:
         args.extend(["-o", output])
     else:
-        archive = _new_dashboard_backup_path()
+        archive = _new_dashboard_backup_path(profile)
         try:
             archive.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -12627,9 +12651,9 @@ async def run_backup(body: BackupRequest):
 
 
 @app.get("/api/ops/backup/download")
-async def download_dashboard_backup(archive: str):
+async def download_dashboard_backup(archive: str, profile: Optional[str] = None):
     try:
-        backup_dir = _dashboard_backup_dir().expanduser().resolve(strict=False)
+        backup_dir = _dashboard_backup_dir(profile).expanduser().resolve(strict=False)
         target = Path(archive).expanduser().resolve(strict=True)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Backup not found")
