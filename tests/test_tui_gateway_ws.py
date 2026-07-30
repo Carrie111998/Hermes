@@ -153,6 +153,54 @@ def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
     assert events == ["accept", "ready_after_0"]
 
 
+def test_ws_plugin_command_dispatch_is_sessionless(monkeypatch):
+    """The public WebSocket path must reach only the plugin-command handler."""
+    import hermes_cli.plugins as plugins
+
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_command_handler",
+        lambda name: (lambda arg: f"{name}:{arg}"),
+    )
+    monkeypatch.setattr(plugins, "resolve_plugin_command_result", lambda result: result)
+    server._sessions.clear()
+    sent = []
+
+    class FakeWS:
+        reads = 0
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            self.reads += 1
+            if self.reads == 1:
+                return json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "plugin-command",
+                        "method": "plugin.command.dispatch",
+                        "params": {"name": "plugin-command", "arg": "fixed input"},
+                    }
+                )
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    asyncio.run(ws_mod.handle_ws(FakeWS()))
+
+    assert {
+        "jsonrpc": "2.0",
+        "id": "plugin-command",
+        "result": {"type": "plugin", "output": "plugin-command:fixed input"},
+    } in sent
+    assert server._sessions == {}
+
+
 def test_ws_transport_serializes_concurrent_sends():
     active_sends = 0
     max_active_sends = 0
@@ -226,5 +274,4 @@ def test_ws_transport_preserves_cross_batch_order():
         assert entered == ["A1", "A2", "B1", "B2"]
 
     asyncio.run(scenario())
-
 

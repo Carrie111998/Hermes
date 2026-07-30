@@ -118,6 +118,80 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_plugin_command_dispatch_is_sessionless_and_plugin_only(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    calls = []
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_command_handler",
+        lambda name: (lambda arg: calls.append((name, arg)) or "bounded output"),
+    )
+    monkeypatch.setattr(plugins, "resolve_plugin_command_result", lambda result: result)
+    server._sessions.clear()
+
+    response = server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": "plugin-command",
+            "method": "plugin.command.dispatch",
+            "params": {"name": "plugin-command", "arg": "fixed input"},
+        }
+    )
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": "plugin-command",
+        "result": {"type": "plugin", "output": "bounded output"},
+    }
+    assert calls == [("plugin-command", "fixed input")]
+    assert server._sessions == {}
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"name": "plugin-command", "arg": "fixed input", "session_id": "forbidden"},
+        {"name": "Plugin-command", "arg": "fixed input"},
+        {"name": "/plugin-command", "arg": "fixed input"},
+        {"name": "plugin-command", "arg": None},
+    ],
+)
+def test_plugin_command_dispatch_rejects_any_non_contract_parameter(params):
+    response = server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": "invalid-plugin-command",
+            "method": "plugin.command.dispatch",
+            "params": params,
+        }
+    )
+
+    assert response["error"]["code"] == -32602
+
+
+def test_plugin_command_dispatch_redacts_handler_failure(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    def failing_handler(_arg):
+        raise RuntimeError("provider-token=not-for-rpc-output")
+
+    monkeypatch.setattr(plugins, "get_plugin_command_handler", lambda _name: failing_handler)
+    monkeypatch.setattr(plugins, "resolve_plugin_command_result", lambda result: result)
+
+    response = server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": "failed-plugin-command",
+            "method": "plugin.command.dispatch",
+            "params": {"name": "plugin-command", "arg": "fixed input"},
+        }
+    )
+
+    assert response["error"] == {"code": 5000, "message": "plugin command failed"}
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):
