@@ -11,10 +11,10 @@ import { useTheme } from '@/themes/context'
 
 import { registerAgentTerminalWriter } from './agent-terminal-stream'
 import { makeTerminalReader, registerTerminalReader } from './buffer'
-import { prepareTerminalFontFamily } from './terminal-font'
-import { useTerminalFontController } from './use-terminal-font'
 import { mirrorSelection, terminalClipboardIntent } from './clipboard'
 import { isMacPlatform, resolveSurfaceColor, terminalTheme } from './selection'
+import { prepareTerminalFontFamily } from './terminal-font'
+import { useTerminalFontController } from './use-terminal-font'
 
 // Read-only terminal for an agent background process: a write-only xterm (no PTY,
 // no input) fed live by the backend output stream, keyed by process id. Shares
