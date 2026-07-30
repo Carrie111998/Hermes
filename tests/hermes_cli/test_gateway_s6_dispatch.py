@@ -132,7 +132,7 @@ def test_redirect_falls_back_to_python_heartbeat_when_sleep_missing(
 
     monkeypatch.setattr("hermes_cli.gateway.os.execvp", missing_sleep)
     monkeypatch.setattr(
-        "hermes_cli.gateway._block_forever_until_signal",
+        "hermes_cli.gateway._block_until_terminated",
         lambda: heartbeat_calls.append("entered"),
     )
     monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)

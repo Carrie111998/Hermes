@@ -2417,7 +2417,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
                 else [{"role": "user", "content": "tip prompt"}]
             )
 
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: FakeDB())
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
@@ -2727,7 +2727,7 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
         captured.setdefault("agent_session_id", session_id)
         return types.SimpleNamespace(model="test", provider="test")
 
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: db)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
@@ -2788,7 +2788,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
         captured.update(kwargs)
         return types.SimpleNamespace(model="gpt-5.4", provider="openai-codex")
 
-    monkeypatch.setattr(server, "_open_session_db", lambda _home=None: FakeDB())
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
     monkeypatch.setattr(server, "_set_session_context", lambda target: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)

@@ -6794,8 +6794,8 @@ def _maybe_redirect_run_to_s6_supervision(args) -> bool:
         os.execvp("sleep", ["sleep", "infinity"])
     except FileNotFoundError:
         print(
-            "→ `sleep` was not found; keeping the s6 CMD alive with Python "
-            "until the container is stopped.",
+            "→ `sleep` is unavailable; keeping the s6 CMD process alive "
+            "in-process until the container is stopped.",
             file=sys.stderr,
             flush=True,
         )

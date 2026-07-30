@@ -14,6 +14,8 @@ const DEFAULT_FETCH_TIMEOUT_MS = 15_000
 const DATA_URL_READ_DEFAULT_MAX_MB = 16
 const DATA_URL_READ_MIN_MAX_MB = 1
 const DATA_URL_READ_MAX_MAX_MB = 4096
+// Compatibility alias used by main-process image/data-URL caps and tests.
+const DATA_URL_READ_MAX_BYTES = DATA_URL_READ_DEFAULT_MAX_MB * 1024 * 1024
 // Remote file.attach sends one base64 JSON-RPC frame. Cap the dedicated attach
 // reader so the payload still fits uvicorn's raised ws_max_size (384 MiB)
 // after base64 + framing. Preview stays on the Settings-configurable path.
@@ -492,11 +494,13 @@ export {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
   clampDataUrlReadMaxMb,
   DATA_URL_READ_DEFAULT_MAX_MB,
+  DATA_URL_READ_MAX_BYTES,
   DATA_URL_READ_MAX_MAX_MB,
   DATA_URL_READ_MIN_MAX_MB,
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret,
+  openOrRevealExternalFilePath,
   readFileDataUrlForIpc,
   rejectUnsafePathSyntax,
   resolveDirectoryForIpc,

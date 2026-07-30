@@ -25,10 +25,6 @@ def register_cli(subparser) -> None:
         default=None,
         help="Transcript/reference text for the Hakua sample.",
     )
-    actions.add_parser(
-        "import-hakua",
-        help="Import Irodori hakua.ogg into Voicebox as a cloned profile.",
-    )
 
     synth_parser = actions.add_parser("synthesize", help="Synthesize speech via Voicebox /speak.")
     synth_parser.add_argument("--text", help="Text to synthesize.")

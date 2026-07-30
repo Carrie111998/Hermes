@@ -10598,7 +10598,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "gui", "desktop", "harness", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pets", "plugins", "portal", "profile",
         "project", "proxy",
@@ -11611,6 +11611,13 @@ def main():
     build_plugins_parser(subparsers, cmd_plugins=cmd_plugins)
 
     # =========================================================================
+    # harness command (fork: Hypura agent harness daemon control)
+    # =========================================================================
+    from hermes_cli.harness import register_harness_subparser
+
+    register_harness_subparser(subparsers)
+
+    # =========================================================================
     # Plugin CLI commands — dynamically registered by memory/general plugins.
     # Plugins provide a register_cli(subparser) function that builds their
     # own argparse tree.  No hardcoded plugin commands in main.py.
@@ -11658,7 +11665,9 @@ def main():
                 if cmd_info.get("handler_fn") is not None:
                     plugin_parser.set_defaults(func=cmd_info["handler_fn"])
         except Exception as _exc:
-            logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
+            logging.getLogger(__name__).exception(
+                "Plugin CLI discovery failed: %s", _exc
+            )
 
     # =========================================================================
     # curator command — background skill maintenance

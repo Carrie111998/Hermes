@@ -13,6 +13,7 @@ import {
   dataUrlReadMaxBytesFromMb,
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret,
+  openOrRevealExternalFilePath,
   readFileDataUrlForIpc,
   resolveDirectoryForIpc,
   resolvePublicHttpTarget,
