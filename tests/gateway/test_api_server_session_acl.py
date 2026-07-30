@@ -107,6 +107,31 @@ async def test_api_server_audit_logs_invalid_api_key(scoped_adapter, caplog):
 
 
 @pytest.mark.asyncio
+async def test_api_server_audit_suppresses_only_successful_health_probes(caplog):
+    async def health(_request):
+        return web.json_response({"ok": True})
+
+    async def unhealthy(_request):
+        return web.json_response({"ok": False}, status=503)
+
+    app = web.Application(middlewares=[request_audit_middleware])
+    app.router.add_get("/health", health)
+    app.router.add_get("/healthz", unhealthy)
+    caplog.set_level(logging.INFO, logger="gateway.api_server.audit")
+    async with TestClient(TestServer(app)) as cli:
+        healthy_response = await cli.get("/health")
+        assert healthy_response.status == 200
+        assert _audit_messages(caplog) == []
+
+        unhealthy_response = await cli.get("/healthz")
+        assert unhealthy_response.status == 503
+
+    joined = "\n".join(_audit_messages(caplog))
+    assert "'path': '/healthz'" in joined
+    assert "'status': 503" in joined
+
+
+@pytest.mark.asyncio
 async def test_api_server_audit_logs_cross_user_session_denial(scoped_adapter, caplog):
     app = _app(scoped_adapter, audit=True)
     caplog.set_level(logging.INFO, logger="gateway.api_server.audit")

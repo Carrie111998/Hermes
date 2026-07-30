@@ -20,6 +20,7 @@ from gateway.session_acl import scope_fingerprint
 
 REQUEST_ID_HEADER = "X-Hermes-Request-Id"
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
+_QUIET_PROBE_PATHS = frozenset({"/health", "/health/detailed", "/healthz", "/v1/health"})
 logger = logging.getLogger("gateway.api_server.audit")
 
 
@@ -55,6 +56,10 @@ def request_id_for(request: "web.Request") -> str:
 
 def request_id_headers(request: "web.Request") -> dict[str, str]:
     return {REQUEST_ID_HEADER: request_id_for(request)}
+
+
+def _is_quiet_probe(request: "web.Request") -> bool:
+    return _clean(getattr(request, "path", ""), max_len=500) in _QUIET_PROBE_PATHS
 
 
 def _request_fields(request: "web.Request") -> dict[str, str]:
@@ -139,13 +144,15 @@ if AIOHTTP_AVAILABLE:
     async def request_audit_middleware(request, handler):
         started_at = time.monotonic()
         ensure_request_id(request)
-        log_api_decision(
-            request,
-            action="api.request",
-            result="started",
-            started_at=started_at,
-            level=logging.INFO,
-        )
+        quiet_probe = _is_quiet_probe(request)
+        if not quiet_probe:
+            log_api_decision(
+                request,
+                action="api.request",
+                result="started",
+                started_at=started_at,
+                level=logging.INFO,
+            )
         try:
             response = await handler(request)
         except Exception:
@@ -165,14 +172,16 @@ if AIOHTTP_AVAILABLE:
                 response.headers[REQUEST_ID_HEADER] = request_id_for(request)
         except Exception:
             _ = response
-        log_api_decision(
-            request,
-            action="api.request",
-            result="completed" if getattr(response, "status", 500) < 400 else "denied",
-            status=getattr(response, "status", None),
-            started_at=started_at,
-            level=logging.INFO if getattr(response, "status", 500) < 400 else logging.WARNING,
-        )
+        response_status = getattr(response, "status", 500)
+        if not quiet_probe or response_status >= 400:
+            log_api_decision(
+                request,
+                action="api.request",
+                result="completed" if response_status < 400 else "denied",
+                status=response_status,
+                started_at=started_at,
+                level=logging.INFO if response_status < 400 else logging.WARNING,
+            )
         return response
 else:
     request_audit_middleware = None  # type: ignore[assignment]

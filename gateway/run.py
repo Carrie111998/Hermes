@@ -13284,7 +13284,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id = pending.get("message_id")
 
             if not exit_code_path.exists():
-                logger.info("Update notification deferred: update still running")
+                logger.debug("Update notification deferred: update still running")
                 cleanup = False
                 active_pending_path = pending_path
                 claimed_path.replace(pending_path)
@@ -13311,7 +13311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # update succeeded or timed out. Preserve the markers instead so
                 # a later retry (the watcher poll loop, or the next gateway
                 # startup) can deliver the result once the adapter is back.
-                logger.info(
+                logger.debug(
                     "Update notification deferred: %s adapter not connected yet",
                     platform_str,
                 )
