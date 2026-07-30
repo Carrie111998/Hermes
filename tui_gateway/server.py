@@ -150,6 +150,10 @@ _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _rpc_futures_lock = threading.Lock()
 _active_rpc_futures: set[concurrent.futures.Future] = set()
+_agent_build_quiesce_lock = threading.Lock()
+_scheduled_agent_builds: dict[str, object] = {}
+_starting_agent_builds: set[str] = set()
+_agent_builds_quiesced = False
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -295,11 +299,50 @@ atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
 
 def has_active_tui_work() -> bool:
     """Whether an embedded TUI RPC or agent turn still owns live work."""
+    with _agent_build_quiesce_lock:
+        if _starting_agent_builds:
+            return True
     with _sessions_lock:
-        if any(session.get("running") for session in _sessions.values()):
+        if any(
+            session.get("running")
+            or (
+                (ready := session.get("agent_ready")) is not None
+                and not ready.is_set()
+                and session.get("agent_build_started")
+            )
+            for session in _sessions.values()
+        ):
             return True
     with _rpc_futures_lock:
         return any(not future.done() for future in _active_rpc_futures)
+
+
+def begin_update_quiesce() -> None:
+    """Pause deferred TUI agent builds at the dashboard update boundary.
+
+    A build already past admission remains visible through
+    ``_starting_agent_builds`` and the session's ``agent_build_started`` flag,
+    so the caller can wait for it. Builds whose timers have not fired remain
+    scheduled and resume only after :func:`end_update_quiesce`.
+    """
+    global _agent_builds_quiesced
+
+    with _agent_build_quiesce_lock:
+        _agent_builds_quiesced = True
+
+
+def end_update_quiesce() -> None:
+    """Resume deferred TUI agent builds after an update exits or aborts."""
+    global _agent_builds_quiesced
+
+    with _agent_build_quiesce_lock:
+        if not _agent_builds_quiesced:
+            return
+        _agent_builds_quiesced = False
+        pending = list(_scheduled_agent_builds)
+        _scheduled_agent_builds.clear()
+    for sid in pending:
+        _schedule_agent_build(sid, delay=0.0)
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -7393,15 +7436,44 @@ def _claim_or_reuse_live(
 def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     """Pre-warm a deferred session's agent off the response path (session.create
     and cold resume both build through here; _sess() also builds on demand)."""
+    schedule_token = object()
 
     def _run():
-        session = _sessions.get(sid)
-        if session is not None:
-            _start_agent_build(sid, session)
+        with _agent_build_quiesce_lock:
+            if _scheduled_agent_builds.get(sid) is not schedule_token:
+                # The quiesce ended and re-armed this sid with a fresh timer
+                # before this older timer acquired the lock.
+                return
+            if _agent_builds_quiesced:
+                # Leave the sid scheduled. end_update_quiesce() will arm a
+                # fresh timer after the updater exits.
+                return
+            _scheduled_agent_builds.pop(sid, None)
+            _starting_agent_builds.add(sid)
+        try:
+            session = _sessions.get(sid)
+            if session is not None:
+                _start_agent_build(sid, session)
+        finally:
+            with _agent_build_quiesce_lock:
+                _starting_agent_builds.discard(sid)
+
+    with _agent_build_quiesce_lock:
+        if sid in _scheduled_agent_builds or sid in _starting_agent_builds:
+            return
+        _scheduled_agent_builds[sid] = schedule_token
+        if _agent_builds_quiesced:
+            return
 
     timer = threading.Timer(delay, _run)
     timer.daemon = True
-    timer.start()
+    try:
+        timer.start()
+    except Exception:
+        with _agent_build_quiesce_lock:
+            if _scheduled_agent_builds.get(sid) is schedule_token:
+                _scheduled_agent_builds.pop(sid, None)
+        raise
 
 
 def _session_pending_kind(sid: str) -> str:

@@ -535,6 +535,39 @@ def test_active_tui_work_includes_running_detached_session(server):
     assert server.has_active_tui_work() is False
 
 
+def test_active_tui_work_includes_live_agent_build(server):
+    ready = threading.Event()
+    server._sessions["building"] = {
+        "running": False,
+        "agent_ready": ready,
+        "agent_build_started": True,
+    }
+
+    assert server.has_active_tui_work() is True
+
+    ready.set()
+    assert server.has_active_tui_work() is False
+
+
+def test_update_quiesce_defers_scheduled_agent_build(server, monkeypatch):
+    built = threading.Event()
+    server._sessions["deferred"] = {}
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda sid, session: built.set(),
+    )
+
+    server.begin_update_quiesce()
+    try:
+        server._schedule_agent_build("deferred", delay=0.0)
+        assert built.wait(timeout=0.05) is False
+    finally:
+        server.end_update_quiesce()
+
+    assert built.wait(timeout=0.5) is True
+
+
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
 def test_completion_handlers_are_pool_routed(completion_method, server):
     """complete.path/complete.slash must run on the pool, never the reader thread.
@@ -626,4 +659,3 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-

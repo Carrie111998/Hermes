@@ -920,6 +920,14 @@ async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
         _DASHBOARD_UPDATE_QUIESCE_ACTIVE = True
         websocket_items = list(_DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS.items())
 
+    try:
+        from tui_gateway.server import begin_update_quiesce
+
+        begin_update_quiesce()
+    except Exception:
+        _end_dashboard_update_quiesce()
+        raise
+
     for _task, ws in websocket_items:
         with contextlib.suppress(Exception):
             await ws.close(code=1012, reason="Hermes update in progress")
@@ -972,7 +980,13 @@ def _end_dashboard_update_quiesce() -> None:
     global _DASHBOARD_UPDATE_QUIESCE_ACTIVE
 
     with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+        was_active = _DASHBOARD_UPDATE_QUIESCE_ACTIVE
         _DASHBOARD_UPDATE_QUIESCE_ACTIVE = False
+    if was_active:
+        with contextlib.suppress(Exception):
+            from tui_gateway.server import end_update_quiesce
+
+            end_update_quiesce()
 
 
 async def _watch_dashboard_update_quiesce(proc: subprocess.Popen) -> None:
