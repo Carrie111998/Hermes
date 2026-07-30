@@ -158,6 +158,34 @@ class TestResolveActiveContextLengthCustomProviders:
         assert captured["custom_providers"] == provs
         mock_compat.assert_called_once_with(cfg)
 
+    def test_per_model_override_short_circuits_endpoint_metadata_fetch(self):
+        import model_tools
+
+        base_url = "https://token-plan.example/apps/anthropic"
+        provs = [{
+            "name": "qianwen-tp",
+            "base_url": base_url,
+            "models": {"qwen3.8-max-preview": {"context_length": 256_000}},
+        }]
+        cfg = {
+            "model": {
+                "model": "qwen3.8-max-preview",
+                "provider": "custom:qianwen-tp",
+                "base_url": base_url,
+            },
+            "custom_providers": provs,
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value={"base_url": base_url, "api_key": "sk-x"}), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata",
+                   side_effect=AssertionError("endpoint metadata fetch attempted")) as mock_fetch:
+            ctx = model_tools._resolve_active_context_length()
+
+        assert ctx == 256_000
+        mock_fetch.assert_not_called()
+
     def test_compat_helper_failure_falls_back_to_raw_config_list(self):
         """If get_compatible_custom_providers raises, the raw
         cfg['custom_providers'] list still reaches the resolver."""
