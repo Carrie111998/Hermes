@@ -20,7 +20,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock, AsyncMock, call
 
 from gateway.platforms.base import SendResult
 
@@ -830,7 +830,10 @@ class TestWorkflowIngressTap(unittest.TestCase):
         first = EmailAdapter._stable_external_id(message)
         second = EmailAdapter._stable_external_id(dict(message))
         self.assertEqual(first, second)
-        self.assertRegex(first, r"^email-sha256:[0-9a-f]{64}$")
+        self.assertRegex(
+            first,
+            r"^<email-sha256-[0-9a-f]{64}@hermes\.local>$",
+        )
 
 
 class TestSendMethods(unittest.TestCase):
@@ -1233,6 +1236,42 @@ class TestFetchNewMessages(unittest.TestCase):
             results[0]["references"], "<root@test.com> <parent@test.com>"
         )
 
+    def test_fetch_automated_sender_is_terminally_marked_seen(self):
+        adapter = self._make_adapter()
+        raw_email = MIMEText("Automated", "plain", "utf-8")
+        raw_email["From"] = "noreply@test.com"
+        raw_email["Subject"] = "Notification"
+        raw_email["Message-ID"] = "<auto@test.com>"
+
+        mock_imap = MagicMock()
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"7"])
+            if command == "fetch":
+                return ("OK", [(b"7", raw_email.as_bytes())])
+            if command == "store":
+                return ("OK", [b""])
+            return ("NO", [])
+
+        mock_imap.uid.side_effect = uid_handler
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            first = adapter._fetch_new_messages()
+            second = adapter._fetch_new_messages()
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertIn(b"7", adapter._seen_uids)
+        fetch_calls = [
+            call for call in mock_imap.uid.call_args_list
+            if call.args[0] == "fetch"
+        ]
+        self.assertEqual(len(fetch_calls), 1)
+        self.assertIn(
+            call("store", b"7", "+FLAGS", r"(\Seen)"),
+            mock_imap.uid.call_args_list,
+        )
+
     def test_mark_message_seen_uses_uid_store(self):
         adapter = self._make_adapter()
         mock_imap = MagicMock()
@@ -1322,6 +1361,19 @@ class TestPollLoop(unittest.TestCase):
         adapter._mark_message_seen.assert_called_once_with(b"2")
         self.assertNotIn(b"1", adapter._seen_uids)
         self.assertIn(b"2", adapter._seen_uids)
+
+    def test_check_inbox_remembers_success_when_seen_store_fails(self):
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._fetch_new_messages = MagicMock(
+            return_value=[{"uid": b"9", "subject": "handled"}]
+        )
+        adapter._dispatch_message = AsyncMock()
+        adapter._mark_message_seen = MagicMock(return_value=False)
+
+        asyncio.run(adapter._check_inbox())
+
+        self.assertIn(b"9", adapter._seen_uids)
 
 
 class TestSendEmailStandalone(unittest.TestCase):

@@ -332,7 +332,7 @@ class EmailAdapter(BasePlatformAdapter):
             )
         )
         digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
-        return f"email-sha256:{digest}"
+        return f"<email-sha256-{digest}@hermes.local>"
 
     @staticmethod
     def _reference_ids(value: str) -> List[str]:
@@ -572,9 +572,16 @@ class EmailAdapter(BasePlatformAdapter):
                     self._mark_message_seen,
                     msg_data["uid"],
                 )
-                if marked_seen:
-                    self._seen_uids.add(msg_data["uid"])
-                    self._trim_seen_uids()
+                # Dispatch already completed. Remember it in-process even if
+                # the cross-restart IMAP flag update failed, or the next poll
+                # would duplicate conversational handling.
+                self._seen_uids.add(msg_data["uid"])
+                self._trim_seen_uids()
+                if not marked_seen:
+                    logger.warning(
+                        "[Email] UID %r handled but not marked seen on server",
+                        msg_data["uid"],
+                    )
             except Exception as exc:
                 logger.error(
                     "[Email] Dispatch failed for UID %r; left unseen for retry: %s",
@@ -650,6 +657,12 @@ class EmailAdapter(BasePlatformAdapter):
                     msg_headers = dict(msg.items())
                     if _is_automated_sender(sender_addr, msg_headers):
                         logger.debug("[Email] Skipping automated sender: %s", sender_addr)
+                        # This is an intentional terminal drop, not a retryable
+                        # ingress failure. Mark it seen on the current IMAP
+                        # connection and remember it in-process.
+                        imap.uid("store", uid, "+FLAGS", r"(\Seen)")
+                        self._seen_uids.add(uid)
+                        self._trim_seen_uids()
                         continue
                     body = _extract_text_body(msg)
                     attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
