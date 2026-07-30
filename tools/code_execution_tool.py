@@ -621,7 +621,7 @@ def _rpc_server_loop(
                     # sandbox-script-supplied JSON.
                     str(request.get("token") or "").encode(), rpc_token.encode()
                 ):
-                    resp = tool_error("Unauthorized RPC request")
+                    resp = json.dumps({"error": "Unauthorized RPC request"})
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -631,19 +631,23 @@ def _rpc_server_loop(
                 # Enforce the allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))
-                    resp = tool_error(
-                        f"Tool '{tool_name}' is not available in execute_code. "
-                        f"Available: {available}"
-                    )
+                    resp = json.dumps({
+                        "error": (
+                            f"Tool '{tool_name}' is not available in execute_code. "
+                            f"Available: {available}"
+                        )
+                    })
                     conn.sendall((resp + "\n").encode())
                     continue
 
                 # Enforce tool call limit
                 if tool_call_counter[0] >= max_tool_calls:
-                    resp = tool_error(
-                        f"Tool call limit reached ({max_tool_calls}). "
-                        "No more tool calls allowed in this execution."
-                    )
+                    resp = json.dumps({
+                        "error": (
+                            f"Tool call limit reached ({max_tool_calls}). "
+                            "No more tool calls allowed in this execution."
+                        )
+                    })
                     conn.sendall((resp + "\n").encode())
                     continue
 
@@ -919,16 +923,20 @@ def _rpc_poll_loop(
                 # Enforce allow-list
                 if tool_name not in allowed_tools:
                     available = ", ".join(sorted(allowed_tools))
-                    tool_result = tool_error(
-                        f"Tool '{tool_name}' is not available in execute_code. "
-                        f"Available: {available}"
-                    )
+                    tool_result = json.dumps({
+                        "error": (
+                            f"Tool '{tool_name}' is not available in execute_code. "
+                            f"Available: {available}"
+                        )
+                    })
                 # Enforce tool call limit
                 elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = tool_error(
-                        f"Tool call limit reached ({max_tool_calls}). "
-                        "No more tool calls allowed in this execution."
-                    )
+                    tool_result = json.dumps({
+                        "error": (
+                            f"Tool call limit reached ({max_tool_calls}). "
+                            "No more tool calls allowed in this execution."
+                        )
+                    })
                 else:
                     # Strip forbidden terminal parameters
                     if tool_name == "terminal" and isinstance(tool_args, dict):
@@ -1199,10 +1207,10 @@ def execute_code(
         JSON string with execution results.
     """
     if not SANDBOX_AVAILABLE:
-        return tool_error(
-            "execute_code sandbox is unavailable in this environment. "
-            "Use normal tool calls (terminal, read_file, write_file, ...) instead."
-        )
+        return json.dumps({
+            "error": "execute_code sandbox is unavailable in this environment. "
+                     "Use normal tool calls (terminal, read_file, write_file, ...) instead."
+        })
 
     if not code or not code.strip():
         return tool_error("No code provided.")

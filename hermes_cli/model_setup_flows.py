@@ -76,13 +76,6 @@ def bedrock_model_routable_from_region(model_id: str, region_name: str) -> bool:
     return matched_geo == geo
 
 
-def _existing_api_key_for_model_flow(provider_id: str, pconfig) -> tuple[str, str]:
-    """Resolve an existing wizard credential without changing its storage."""
-    from hermes_cli.auth import _resolve_api_key_provider_secret
-
-    return _resolve_api_key_provider_secret(provider_id, pconfig)
-
-
 def _prune_replaced_custom_model_config_credentials(
     base_url: str,
     *,
@@ -184,6 +177,8 @@ def _model_flow_openrouter(config, current_model=""):
         _save_model_choice,
         deactivate_provider,
     )
+    from hermes_cli.config import get_env_value
+
     # Route through _prompt_api_key so users can replace a stale/broken key
     # in-flow (K/R/C) instead of having to edit ~/.hermes/.env by hand. The
     # previous bypass-when-key-exists branch left no way to recover from a
@@ -195,16 +190,11 @@ def _model_flow_openrouter(config, current_model=""):
         auth_type="api_key",
         api_key_env_vars=("OPENROUTER_API_KEY",),
     )
-    existing_key, existing_source = _existing_api_key_for_model_flow("openrouter", pconfig)
+    existing_key = get_env_value("OPENROUTER_API_KEY") or ""
     if not existing_key:
         print("Get one at: https://openrouter.ai/keys")
         print()
-    _resolved, abort = _prompt_api_key(
-        pconfig,
-        existing_key,
-        provider_id="openrouter",
-        existing_source=existing_source,
-    )
+    _resolved, abort = _prompt_api_key(pconfig, existing_key, provider_id="openrouter")
     if abort:
         return
 
@@ -1981,16 +1971,18 @@ def _model_flow_kimi(config, current_model=""):
 
     provider_id = "kimi-coding"
     pconfig = PROVIDER_REGISTRY[provider_id]
+    key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
     base_url_env = pconfig.base_url_env_var or ""
 
     # Step 1: Check / prompt for API key
-    existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
+    existing_key = ""
+    for ev in pconfig.api_key_env_vars:
+        existing_key = get_env_value(ev) or os.getenv(ev, "")
+        if existing_key:
+            break
 
     existing_key, abort = _prompt_api_key(
-        pconfig,
-        existing_key,
-        provider_id=provider_id,
-        existing_source=existing_source,
+        pconfig, existing_key, provider_id=provider_id
     )
     if abort:
         return
@@ -2065,15 +2057,17 @@ def _model_flow_stepfun(config, current_model=""):
 
     provider_id = "stepfun"
     pconfig = PROVIDER_REGISTRY[provider_id]
+    key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
     base_url_env = pconfig.base_url_env_var or ""
 
-    existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
+    existing_key = ""
+    for ev in pconfig.api_key_env_vars:
+        existing_key = get_env_value(ev) or os.getenv(ev, "")
+        if existing_key:
+            break
 
     existing_key, abort = _prompt_api_key(
-        pconfig,
-        existing_key,
-        provider_id=provider_id,
-        existing_source=existing_source,
+        pconfig, existing_key, provider_id=provider_id
     )
     if abort:
         return
@@ -2172,28 +2166,18 @@ def _model_flow_bedrock_api_key(config, region, current_model=""):
     from hermes_cli.config import (
         load_config,
         save_config,
+        get_env_value,
         save_env_value,
     )
     from hermes_cli.models import _PROVIDER_MODELS
 
     mantle_base_url = f"https://bedrock-mantle.{region}.api.aws/v1"
 
-    # Check env var and credential pool (keys added via `hermes auth`)
-    from hermes_cli.auth import _resolve_api_key_provider_secret, ProviderConfig
-    bedrock_pconfig = ProviderConfig(
-        id="bedrock",
-        name="Bedrock",
-        auth_type="api_key",
-        api_key_env_vars=("AWS_BEARER_TOKEN_BEDROCK",),
-    )
-    existing_key, existing_source = _resolve_api_key_provider_secret(
-        "bedrock", bedrock_pconfig
-    )
+    # Prompt for API key
+    existing_key = get_env_value("AWS_BEARER_TOKEN_BEDROCK") or ""
     if existing_key:
         from hermes_cli.env_loader import format_secret_source_suffix
-        source_suffix = format_secret_source_suffix(
-            existing_source or "AWS_BEARER_TOKEN_BEDROCK"
-        )
+        source_suffix = format_secret_source_suffix("AWS_BEARER_TOKEN_BEDROCK")
         print(f"  Bedrock API Key: {existing_key[:12]}... ✓{source_suffix}")
     else:
         print(f"  Endpoint: {mantle_base_url}")
@@ -2658,13 +2642,14 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
     base_url_env = pconfig.base_url_env_var or ""
 
     # Check / prompt for API key
-    existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
+    existing_key = ""
+    for ev in pconfig.api_key_env_vars:
+        existing_key = get_env_value(ev) or os.getenv(ev, "")
+        if existing_key:
+            break
 
     existing_key, abort = _prompt_api_key(
-        pconfig,
-        existing_key,
-        provider_id=provider_id,
-        existing_source=existing_source,
+        pconfig, existing_key, provider_id=provider_id
     )
     if abort:
         return

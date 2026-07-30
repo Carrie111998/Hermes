@@ -260,10 +260,13 @@ def _load_hermes_env() -> None:
         return
 
     try:
-        # Presence-sensitive env bridge: raw read is deliberate — only keys
-        # the user actually wrote get bridged. Overlay + expansion below.
-        from hermes_cli.config import read_user_config_raw
-        raw = read_user_config_raw(config_path)
+        import yaml  # type: ignore[import-not-found]
+    except Exception:
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh) or {}
     except Exception:
         return
 

@@ -29,21 +29,11 @@ import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChat
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
-import { playWakeSound } from '@/lib/wake-sound'
 import { $billingSettingsRequest } from '@/store/billing-block'
-import { requestVoiceConversationStart } from '@/store/composer'
 import { setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
-import { $previewTarget } from '@/store/preview'
-import {
-  $activeGatewayProfile,
-  $freshSessionRequest,
-  $profileScope,
-  ensureGatewayProfile,
-  newSessionInProfile,
-  normalizeProfileKey,
-  refreshActiveProfile
-} from '@/store/profile'
+import { $filePreviewTarget, $previewTarget } from '@/store/preview'
+import { $activeGatewayProfile, $freshSessionRequest, $profileScope, refreshActiveProfile } from '@/store/profile'
 import { $startWorkSessionRequest, followActiveSessionCwd } from '@/store/projects'
 import {
   $activeSessionId,
@@ -61,10 +51,13 @@ import {
   sessionPinId,
   setAwaitingResponse,
   setBusy,
+  setCurrentModel,
+  setCurrentModelSource,
+  setCurrentProvider,
   setMessages
 } from '@/store/session'
+import { focusedSessionNeedsRoute, focusOpenSession } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
-import { armWakeWord } from '@/store/wake-word'
 import { isSecondaryWindow } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
@@ -76,14 +69,20 @@ import { useGatewayRequest } from '../gateway/hooks/use-gateway-request'
 import { useKeybinds } from '../hooks/use-keybinds'
 import { ModelPickerOverlay } from '../model-picker-overlay'
 import { ModelVisibilityOverlay } from '../model-visibility-overlay'
-import { mainChatOccupied, openSession } from '../open-session'
 import { PetGenerateOverlay } from '../pet-generate/pet-generate-overlay'
 import { FileActionDialogs } from '../right-sidebar/file-actions'
 import { RemoteFolderPicker } from '../right-sidebar/files/remote-picker'
 import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
 import { PersistentTerminal } from '../right-sidebar/terminal/persistent'
 import { closeAllTerminals } from '../right-sidebar/terminal/terminals'
-import { CRON_ROUTE, navigateToWorkspacePage, routeSessionId, SETTINGS_ROUTE, syncWorkspaceRoute } from '../routes'
+import {
+  $workspaceIsPage,
+  CRON_ROUTE,
+  routeSessionId,
+  sessionRoute,
+  SETTINGS_ROUTE,
+  syncWorkspaceIsPage
+} from '../routes'
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
 import { useBackgroundQueueDrain } from '../session/hooks/use-background-queue-drain'
@@ -98,7 +97,7 @@ import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
-import { startWorkspaceSession } from '../session/workspace-session-target'
+import { newSessionOpensTab, startWorkspaceSession } from '../session/workspace-session-target'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
 import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
 import { titlebarControlsPosition } from '../shell/titlebar'
@@ -187,12 +186,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     routedSessionIdRef.current = null
   }, [])
 
-  // Point the workspace at the route: the pane contribution re-registers
-  // headerVeto from $workspaceIsPage (so the main zone's tab bar stands down
-  // on pages), and a page route fronts the pane so it can't stay stuck behind
-  // a focused session tile.
+  // Mirror "the workspace is showing a full page" into its atom — the
+  // workspace pane contribution re-registers headerVeto from it, so the main
+  // zone's tab bar stands down on pages (and returns with the chat).
   useEffect(() => {
-    syncWorkspaceRoute(location.pathname)
+    syncWorkspaceIsPage(location.pathname)
   }, [location.pathname])
 
   const {
@@ -269,7 +267,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const { refreshHermesConfig, sttEnabled, voiceMaxRecordingSeconds } = useHermesConfig({ activeSessionIdRef })
 
-  const { applySavedMainModel, refreshCurrentModel, selectModel } = useModelControls({
+  const { refreshCurrentModel, selectModel, updateModelOptionsCache } = useModelControls({
     queryClient,
     requestGateway
   })
@@ -401,9 +399,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // follows) + the preview server restart handler, layered over the base
   // gateway event stream exactly like DesktopController.
   const { handleDesktopGatewayEvent, restartPreviewServer } = usePreviewRouting({
+    activeSessionIdRef,
     baseHandleGatewayEvent: handleGatewayEvent,
     currentCwd,
-    requestGateway
+    currentView,
+    requestGateway,
+    routedSessionId,
+    selectedStoredSessionId
   })
 
   // Composer @-mention context suggestions (files/dirs under the cwd).
@@ -493,12 +495,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // project so the new lane is visible.
   //
   // `openTab` is the sidebar "+" behavior: once a chat is loaded, stack a new
-  // tab instead of replacing it (see mainChatOccupied). The composer's
+  // tab instead of replacing it (see newSessionOpensTab). The composer's
   // "branch off into a new worktree" flow keeps the fresh-draft path — it
   // prefills the MAIN composer right after, so it has to own that surface.
   const startSessionInWorkspace = useCallback(
     (path: null | string, options?: { openTab?: boolean }) => {
-      if (options?.openTab && mainChatOccupied(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
+      if (options?.openTab && newSessionOpensTab(activeSessionIdRef.current, $selectedStoredSessionId.get())) {
         void openNewSessionTile('center', { cwd: path, listed: false })
 
         return
@@ -673,39 +675,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const handleGatewayEventWithPlugins = useCallback(
     (event: Parameters<typeof handleDesktopGatewayEvent>[0]) => {
       emitGatewayEvent(event)
-
-      if (event.type === 'wake.detected') {
-        const payload = event.payload as { profile?: null | string; start_new_session?: boolean } | undefined
-
-        // Audible confirmation that the wake registered, before voice capture
-        // starts. Gated by the shared sound-mute toggle.
-        playWakeSound()
-
-        // Multi-profile routing: a wake phrase enrolled by another profile
-        // re-homes the gateway to that profile first (live swap — same path
-        // as clicking it in the profile rail), then opens the fresh session
-        // and starts voice there.
-        const targetProfile = payload?.profile?.trim()
-        const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
-
-        if (targetProfile && normalizeProfileKey(targetProfile) !== activeProfile) {
-          if (payload?.start_new_session !== false) {
-            newSessionInProfile(targetProfile)
-          } else {
-            void ensureGatewayProfile(normalizeProfileKey(targetProfile))
-          }
-        } else if (payload?.start_new_session !== false) {
-          startFreshSessionDraft()
-        }
-
-        requestVoiceConversationStart()
-
-        return
-      }
-
       handleDesktopGatewayEvent(event)
     },
-    [handleDesktopGatewayEvent, startFreshSessionDraft]
+    [handleDesktopGatewayEvent]
   )
 
   useGatewayBoot({
@@ -725,14 +697,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     refreshHermesConfig,
     refreshSessions
   })
-
-  useEffect(() => {
-    if (gatewayState === 'open') {
-      // Status-then-arm, syncing $wakeWord so the composer toggle reflects the
-      // same listener this auto-arm claims.
-      void armWakeWord(requestGateway)
-    }
-  }, [gatewayState, requestGateway])
 
   // Only the open messaging transcript needs its own poll — local chats are
   // live over the websocket already.
@@ -761,10 +725,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // deep links, native-notification nav, preview-shortcut enablement,
   // remembered-session restore, and cross-window session-list sync.
   const previewTarget = useStore($previewTarget)
+  const filePreviewTarget = useStore($filePreviewTarget)
 
   useDesktopIntegrations({
     chatOpen,
-    hasPreview: Boolean(previewTarget),
+    hasPreview: Boolean(filePreviewTarget || previewTarget),
     locationPathname: location.pathname,
     navigate,
     refreshSessions,
@@ -861,8 +826,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onRemoveAttachment: id => void composer.removeAttachment(id),
     onRestoreToMessage: restoreToMessage,
     // Already on screen (open tile, or the main session)? Jump to its tab;
-    // otherwise load it into main. Same door every other session link uses.
-    onResumeSession: sessionId => openSession(sessionId, navigate),
+    // otherwise load it into main. From a full page (artifacts, skills, …) a
+    // `'main'` hit still has to route back: fronting the workspace tab alone
+    // leaves the page showing, so clicking the ACTIVE session was a no-op and
+    // the user had to bounce off another row to get back to the chat.
+    onResumeSession: sessionId => {
+      if (focusedSessionNeedsRoute(focusOpenSession(sessionId), $workspaceIsPage.get())) {
+        navigate(sessionRoute(sessionId))
+      }
+    },
     onRetryResume: sessionId => void resumeSession(sessionId, true),
     onSteer: steerPrompt,
     onSubmit: submitText,
@@ -999,7 +971,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         />
       )}
       <ModelPickerOverlay gateway={gateway || undefined} onSelect={selectModel} profile={activeGatewayProfile} />
-      <SessionPickerOverlay onResume={sessionId => openSession(sessionId, navigate)} />
+      <SessionPickerOverlay onResume={resumeSession} />
       <ModelVisibilityOverlay
         gateway={gateway || undefined}
         onOpenProviders={openProviderSettings}
@@ -1026,7 +998,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
               void queryClient.invalidateQueries({ queryKey: ['model-options'] })
             }}
             onMainModelChanged={(provider, model) => {
-              applySavedMainModel(provider, model)
+              setCurrentProvider(provider)
+              setCurrentModel(model)
+              setCurrentModelSource('default')
+              updateModelOptionsCache($activeSessionId.get(), provider, model, true)
               void refreshCurrentModel()
               void queryClient.invalidateQueries({ queryKey: ['model-options'] })
             }}
@@ -1040,8 +1015,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             initialSection={commandCenterInitialSection}
             onClose={closeOverlayToPreviousRoute}
             onDeleteSession={removeSession}
-            onNavigateRoute={path => navigateToWorkspacePage(navigate, path)}
-            onOpenSession={sessionId => openSession(sessionId, navigate)}
+            onNavigateRoute={path => navigate(path)}
+            onOpenSession={sessionId => navigate(sessionRoute(sessionId))}
           />
         </Suspense>
       )}
@@ -1056,7 +1031,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         <Suspense fallback={null}>
           <CronView
             onClose={closeOverlayToPreviousRoute}
-            onOpenSession={sessionId => openSession(sessionId, navigate)}
+            onOpenSession={sessionId => navigate(sessionRoute(sessionId))}
           />
         </Suspense>
       )}

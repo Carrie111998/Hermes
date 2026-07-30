@@ -2,7 +2,6 @@ import { useAuiState } from '@assistant-ui/react'
 import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import {
-  chatSurfaceRoot,
   clearSurfaceVar,
   COMPOSER_HEIGHT_VAR,
   COMPOSER_SURFACE_HEIGHT_VAR,
@@ -10,6 +9,8 @@ import {
 } from '@/app/chat/surface-vars'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
+import { $composerPoppedOut } from '@/store/composer-popout'
+import { isSecondaryWindow } from '@/store/windows'
 
 import { COMPOSER_COMPACT_PILL_PX, COMPOSER_SINGLE_LINE_MAX_PX, COMPOSER_STACK_BREAKPOINT_PX } from '../composer-utils'
 
@@ -81,11 +82,6 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
   const lastBucketedSurfaceHeightRef = useRef(0)
   const lastTightRef = useRef<boolean | null>(null)
   const lastCompactPillRef = useRef<boolean | null>(null)
-  // Mirrored into a ref so `syncComposerMetrics` stays referentially stable —
-  // it's the shared ResizeObserver's handler, and a new identity every render
-  // would re-register the observation.
-  const poppedOutRef = useRef(poppedOut)
-  poppedOutRef.current = poppedOut
 
   const syncComposerMetrics = useCallback(() => {
     const composer = composerRef.current
@@ -96,10 +92,9 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
 
     // Floating composer is out of the thread's flow — it must not reserve any
     // bottom clearance. Zero the measured vars so the thread reclaims the space.
-    // Read through a ref so the callback stays stable, and read THIS surface's
-    // own state: pop-out is per layout zone, so a float in the left split must
-    // not zero the right split's clearance.
-    if (poppedOutRef.current) {
+    // (Read globals here so the callback stays stable; mirror the popoutAllowed
+    // gate since secondary windows are forced docked.)
+    if ($composerPoppedOut.get() && !isSecondaryWindow()) {
       lastBucketedHeightRef.current = 0
       lastBucketedSurfaceHeightRef.current = 0
       setSurfaceVar(composer, COMPOSER_HEIGHT_VAR, '0px')
@@ -169,14 +164,11 @@ export function useComposerMetrics({ composerRef, composerSurfaceRef, editorRef,
   }, [poppedOut, syncComposerMetrics])
 
   useEffect(() => {
-    // Resolve the owning surface while the composer is still attached; the
-    // unmount cleanup runs after React detached the node, where closest() can
-    // no longer find [data-chat-surface].
-    const root = chatSurfaceRoot(composerRef.current)
+    const composer = composerRef.current
 
     return () => {
-      clearSurfaceVar(root, COMPOSER_HEIGHT_VAR)
-      clearSurfaceVar(root, COMPOSER_SURFACE_HEIGHT_VAR)
+      clearSurfaceVar(composer, COMPOSER_HEIGHT_VAR)
+      clearSurfaceVar(composer, COMPOSER_SURFACE_HEIGHT_VAR)
     }
   }, [composerRef])
 

@@ -12,10 +12,9 @@ Old v1 manifests (plain names without hashes) are auto-migrated.
 Update logic:
   - NEW skills (not in manifest): copied to user dir, origin hash recorded.
   - EXISTING skills (in manifest, present in user dir):
-      * If bundled still matches origin hash: no update → skip without reading
-        the user copy.
-      * If bundled changed and user copy matches origin hash: safe to update.
-      * If bundled changed and user copy differs: user customized it → SKIP.
+      * If user copy matches origin hash: user hasn't modified it → safe to
+        update from bundled if bundled changed. New origin hash recorded.
+      * If user copy differs from origin hash: user customized it → SKIP.
   - DELETED by user (in manifest, absent from user dir): respected, not re-added.
   - REMOVED from bundled (in manifest, gone from repo): cleaned from manifest.
 
@@ -411,28 +410,7 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
     }
 
 
-def _index_installed_skill_dirs_by_name() -> Dict[str, List[Path]]:
-    """Index installed skills by directory name with one active-tree scan."""
-    index: Dict[str, List[Path]] = {}
-    if not SKILLS_DIR.exists():
-        return index
-    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
-        if is_excluded_skill_path(skill_md):
-            continue
-        candidate = skill_md.parent
-        # Never reach outside the skills tree (symlinked/external dirs).
-        try:
-            candidate.resolve().relative_to(SKILLS_DIR.resolve())
-        except (OSError, ValueError):
-            continue
-        index.setdefault(candidate.name, []).append(candidate)
-    return index
-
-
-def _find_installed_skill_dir_by_name(
-    skill_dir_name: str,
-    installed_index: Optional[Dict[str, List[Path]]] = None,
-) -> Optional[Path]:
+def _find_installed_skill_dir_by_name(skill_dir_name: str) -> Optional[Path]:
     """Locate an installed skill directory by its directory name.
 
     Used only as a fallback when the repo-derived install path doesn't exist in
@@ -444,9 +422,19 @@ def _find_installed_skill_dir_by_name(
     """
     if not skill_dir_name or not SKILLS_DIR.exists():
         return None
-    if installed_index is None:
-        installed_index = _index_installed_skill_dirs_by_name()
-    matches = installed_index.get(skill_dir_name, [])
+    matches: List[Path] = []
+    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
+        if is_excluded_skill_path(skill_md):
+            continue
+        candidate = skill_md.parent
+        if candidate.name != skill_dir_name:
+            continue
+        # Never reach outside the skills tree (symlinked/external dirs).
+        try:
+            candidate.resolve().relative_to(SKILLS_DIR.resolve())
+        except (OSError, ValueError):
+            continue
+        matches.append(candidate)
     if len(matches) != 1:
         return None
     return matches[0]
@@ -479,7 +467,6 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
 
     backfilled: List[str] = []
     changed = False
-    installed_dir_index: Optional[Dict[str, List[Path]]] = None
     for skill_md in sorted(optional_dir.rglob("SKILL.md")):
         if is_excluded_skill_path(skill_md):
             continue
@@ -488,9 +475,6 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
             install_path = _safe_rel_install_path(src, optional_dir)
         except ValueError as e:
             logger.debug("Skipping optional skill with unsafe path %s: %s", src, e)
-            continue
-        lock_name = src.name
-        if lock_name in installed or install_path in existing_paths:
             continue
         dest = SKILLS_DIR / Path(*install_path.split("/"))
         if not dest.exists() or not dest.is_dir():
@@ -502,9 +486,7 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
             # silently skips them forever. Fall back to a unique
             # same-directory-name match anywhere in the tree, then still
             # require a byte-identical hash below before claiming provenance.
-            if installed_dir_index is None:
-                installed_dir_index = _index_installed_skill_dirs_by_name()
-            dest = _find_installed_skill_dir_by_name(src.name, installed_dir_index)
+            dest = _find_installed_skill_dir_by_name(src.name)
             if dest is None:
                 continue
             try:
@@ -512,9 +494,11 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
             except ValueError as e:
                 logger.debug("Skipping relocated optional skill %s: %s", dest, e)
                 continue
-        if install_path in existing_paths:
-            continue
         if _dir_hash(dest) != _dir_hash(src):
+            continue
+
+        lock_name = src.name
+        if lock_name in installed or install_path in existing_paths:
             continue
 
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -710,10 +694,9 @@ def sync_skills(quiet: bool = False) -> dict:
     # Index of skills already provided by external_dirs (skip writing them)
     external_index = _build_external_skill_index()
     shadowed_by_external: List[str] = []
-    # Rename recovery indexes are expensive on host bind mounts. Build them
-    # only if a tracked skill is actually missing from its canonical path.
-    active_index: Optional[Dict[str, List[Path]]] = None
-    hub_paths: Optional[Set[str]] = None
+    # Rename recovery indexes, built once per sync (see _recover_renamed_skill).
+    active_index = _index_active_skills()
+    hub_paths = _read_hub_install_paths()
 
     copied = []
     updated = []
@@ -759,15 +742,12 @@ def sync_skills(quiet: bool = False) -> dict:
         # "in manifest but not on disk" branch below misreads the skill as
         # user-deleted, stranding the old copy at its stale path forever.
         if not dest.exists() and skill_name in manifest:
-            if active_index is None:
-                active_index = _index_active_skills()
-                hub_paths = _read_hub_install_paths()
             _moved_from = _recover_renamed_skill(
                 skill_name,
                 manifest.get(skill_name, ""),
                 dest,
                 active_index,
-                hub_paths or set(),
+                hub_paths,
                 quiet,
             )
             if _moved_from:
@@ -836,16 +816,6 @@ def sync_skills(quiet: bool = False) -> dict:
         elif dest.exists():
             # ── Existing skill — in manifest AND on disk ──
             origin_hash = manifest.get(skill_name, "")
-
-            # If the bundled source still matches the version recorded when
-            # it was installed, there is no update to apply. Avoid recursively
-            # hashing the user's copy just to rediscover that fact; when the
-            # bundled source changes, the normal user-modification check below
-            # still protects local edits before any overwrite.
-            if origin_hash and bundled_hash == origin_hash:
-                skipped += 1
-                continue
-
             user_hash = _dir_hash(dest)
 
             if not origin_hash:

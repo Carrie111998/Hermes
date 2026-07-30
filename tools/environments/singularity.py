@@ -129,10 +129,7 @@ def _get_or_build_sif(image: str, executable: str = "apptainer") -> str:
         tmp_dir = cache_dir / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        # apptainer/singularity build: external tool, may need registry
-        # credentials from the user env — exact preservation.
-        from tools.environments.local import build_subprocess_env
-        env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
+        env = os.environ.copy()
         env["APPTAINER_TMPDIR"] = str(tmp_dir)
         env["APPTAINER_CACHEDIR"] = str(cache_dir)
 

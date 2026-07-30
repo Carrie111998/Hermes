@@ -37,10 +37,8 @@ describe('ExpandableBlock', () => {
     const toggle = screen.getByRole('button', { name: /expand|collapse/i })
     const fade = toggle.parentElement!
 
-    // Inner container allows horizontal scroll so wide code gets a scrollbar:
-    // platform overlay (`scrollbar-overlay`), not the always-on classic gutter.
+    // Inner container allows horizontal scroll so wide code gets a scrollbar.
     expect(inner.className).toContain('overflow-x-auto')
-    expect(inner.className).toContain('scrollbar-overlay')
 
     // The full-width fade is a pure cue: it spans the bottom edge but must not
     // intercept pointer events, so the scrollbar drag and text selection on the

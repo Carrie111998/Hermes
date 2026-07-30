@@ -293,7 +293,5 @@ class BrowserbaseBrowserProvider(BrowserProvider):
                     "prompt": "Browserbase project ID",
                 },
             ],
-            # Cloud-scoped hook: installs the agent-browser CLI only (no
-            # local Chromium — Browserbase hosts the browser).
-            "post_setup": "browserbase",
+            "post_setup": "agent_browser",
         }

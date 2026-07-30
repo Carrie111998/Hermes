@@ -135,9 +135,11 @@ export function ReviewPane() {
               <Codicon name="refresh" size="0.8125rem" spinning={loading} />
             </Button>
           </Tip>
-          <Button aria-label={c.close} className={ACTION_BTN} onClick={closeReview} size="icon-xs" variant="ghost">
-            <Codicon name="close" size="0.8125rem" />
-          </Button>
+          <Tip label={c.close}>
+            <Button aria-label={c.close} className={ACTION_BTN} onClick={closeReview} size="icon-xs" variant="ghost">
+              <Codicon name="close" size="0.8125rem" />
+            </Button>
+          </Tip>
         </RightSidebarSectionHeader>
       )}
 
@@ -182,15 +184,17 @@ export function ReviewPane() {
                 <Codicon name={selectedFile.staged ? 'remove' : 'add'} size="0.8rem" />
               </Button>
             </Tip>
-            <Button
-              aria-label={c.close}
-              className={ACTION_BTN}
-              onClick={clearReviewSelection}
-              size="icon-xs"
-              variant="ghost"
-            >
-              <Codicon name="close" size="0.8rem" />
-            </Button>
+            <Tip label={c.close}>
+              <Button
+                aria-label={c.close}
+                className={ACTION_BTN}
+                onClick={clearReviewSelection}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <Codicon name="close" size="0.8rem" />
+              </Button>
+            </Tip>
           </div>
           <div className="min-h-0 flex-1 overflow-auto px-1 pb-1">
             {diffLoading ? (

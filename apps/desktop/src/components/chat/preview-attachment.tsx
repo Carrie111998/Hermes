@@ -1,28 +1,33 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 
-import { useSessionView } from '@/app/chat/session-view'
 import { useI18n } from '@/i18n'
 import { MonitorPlay } from '@/lib/icons'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { previewName } from '@/lib/preview-targets'
 import { notifyError } from '@/store/notifications'
-import { $previewTabSources, closePreviewForSource, openPreview, type PreviewRecordSource } from '@/store/preview'
+import {
+  $previewTarget,
+  dismissPreviewTarget,
+  type PreviewRecordSource,
+  setCurrentSessionPreviewTarget
+} from '@/store/preview'
+import { $currentCwd } from '@/store/session'
 
 export function PreviewAttachment({ source = 'manual', target }: { source?: PreviewRecordSource; target: string }) {
   const { t } = useI18n()
-  // This link lives in one session's transcript; resolve it against THAT
-  // session's cwd, not the primary chat's.
-  const cwd = useStore(useSessionView().$cwd)
-  const openSources = useStore($previewTabSources)
+  const cwd = useStore($currentCwd)
+  const activePreview = useStore($previewTarget)
   const [opening, setOpening] = useState(false)
+  const activePreviewRef = useRef(activePreview)
   const cwdRef = useRef(cwd)
   const mountedRef = useRef(false)
   const requestTokenRef = useRef(0)
   const targetRef = useRef(target)
   const name = previewName(target)
-  const isActive = openSources.includes(target)
+  const isActive = activePreview?.source === target
 
+  activePreviewRef.current = activePreview
   cwdRef.current = cwd
   targetRef.current = target
 
@@ -48,7 +53,7 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
     }
 
     if (isActive) {
-      closePreviewForSource(target)
+      dismissPreviewTarget()
 
       return
     }
@@ -75,7 +80,13 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
         throw new Error(`Could not open preview target: ${requestTarget}`)
       }
 
-      openPreview(preview, source)
+      const currentPreview = activePreviewRef.current
+
+      if (currentPreview?.source === preview.source && currentPreview.url === preview.url) {
+        return
+      }
+
+      setCurrentSessionPreviewTarget(preview, source, requestTarget)
     } catch (error) {
       if (
         !mountedRef.current ||
