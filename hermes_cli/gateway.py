@@ -1269,7 +1269,13 @@ def _parse_launchd_gateway_jobs_from_list_output(output: str) -> list[tuple[str,
     return jobs
 
 
-def _running_launchd_gateway_jobs() -> list[tuple[str, int]]:
+class LaunchdGatewayDiscoveryError(RuntimeError):
+    """Raised when running launchd gateways cannot be enumerated."""
+
+
+def _running_launchd_gateway_jobs(
+    *, require_success: bool = False
+) -> list[tuple[str, int]]:
     """Discover running launchd-managed Hermes gateways without starting jobs."""
     try:
         result = subprocess.run(
@@ -1278,16 +1284,35 @@ def _running_launchd_gateway_jobs() -> list[tuple[str, int]]:
             text=True, encoding='utf-8', errors='replace',
             timeout=5,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except subprocess.TimeoutExpired as exc:
+        if require_success:
+            raise LaunchdGatewayDiscoveryError(
+                "launchctl list timed out"
+            ) from exc
+        return []
+    except FileNotFoundError as exc:
+        if require_success:
+            raise LaunchdGatewayDiscoveryError(
+                "launchctl executable was not found"
+            ) from exc
         return []
     if result.returncode != 0:
+        if require_success:
+            raise LaunchdGatewayDiscoveryError(
+                f"launchctl list exited with status {result.returncode}"
+            )
         return []
     return _parse_launchd_gateway_jobs_from_list_output(result.stdout or "")
 
 
-def running_launchd_gateway_labels() -> list[str]:
+def running_launchd_gateway_labels(*, require_success: bool = False) -> list[str]:
     """Return running Hermes launchd gateway labels, default and named profiles."""
-    return [label for label, _pid in _running_launchd_gateway_jobs()]
+    return [
+        label
+        for label, _pid in _running_launchd_gateway_jobs(
+            require_success=require_success
+        )
+    ]
 
 
 def _probe_launchd_service_running() -> bool:

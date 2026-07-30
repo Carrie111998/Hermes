@@ -8,10 +8,24 @@ from types import SimpleNamespace
 import pytest
 
 
-def test_macos_update_restarts_running_launchd_gateway_fleet_once(
-    tmp_path, monkeypatch, capsys
+_DEFAULT_LAUNCHD_JOBS = {
+    "ai.hermes.gateway": 101,
+    "ai.hermes.gateway-builder": 201,
+    "ai.hermes.gateway-writer": 202,
+    "ai.hermes.gateway-dormant": None,
+    "com.example.unrelated": 303,
+}
+
+
+def _run_mocked_macos_update(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    *,
+    launchd_jobs: dict[str, int | None] | None = None,
+    launchctl_list_failure: str | None = None,
+    restart_failure_label: str | None = "ai.hermes.gateway-writer",
 ):
-    """Post-update macOS refresh must cover every running Hermes launchd gateway."""
     from hermes_cli import gateway as gateway_cli
     from hermes_cli import main as hm
     import hermes_cli.config as config_cli
@@ -27,13 +41,7 @@ def test_macos_update_restarts_running_launchd_gateway_fleet_once(
     active_plist = tmp_path / "ai.hermes.gateway.plist"
     active_plist.write_text("<plist />", encoding="utf-8")
 
-    launchd_jobs = {
-        "ai.hermes.gateway": 101,
-        "ai.hermes.gateway-builder": 201,
-        "ai.hermes.gateway-writer": 202,
-        "ai.hermes.gateway-dormant": None,
-        "com.example.unrelated": 303,
-    }
+    jobs = dict(_DEFAULT_LAUNCHD_JOBS if launchd_jobs is None else launchd_jobs)
     restart_calls: list[str] = []
 
     def fake_run(cmd, **kwargs):
@@ -46,16 +54,28 @@ def test_macos_update_restarts_running_launchd_gateway_fleet_once(
         if cmd[:3] == ["git", "merge", "--ff-only"]:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if cmd[:2] == ["launchctl", "list"] and len(cmd) == 2:
+            if launchctl_list_failure == "nonzero":
+                return subprocess.CompletedProcess(
+                    cmd,
+                    1,
+                    stdout="",
+                    stderr="launchctl could not enumerate jobs\n",
+                )
+            if launchctl_list_failure == "timeout":
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 5))
+            if launchctl_list_failure == "missing":
+                raise FileNotFoundError("launchctl")
             rows = [
                 f"{pid if pid is not None else '-'}\t0\t{label}"
-                for label, pid in launchd_jobs.items()
+                for label, pid in jobs.items()
             ]
-            rows.append("202\t0\tai.hermes.gateway-writer")
+            if "ai.hermes.gateway-writer" in jobs:
+                rows.append("202\t0\tai.hermes.gateway-writer")
             return subprocess.CompletedProcess(
                 cmd, 0, stdout="\n".join(rows), stderr=""
             )
         if cmd[:2] == ["launchctl", "list"] and len(cmd) == 3:
-            pid = launchd_jobs.get(cmd[2])
+            pid = jobs.get(cmd[2])
             if pid is None:
                 return subprocess.CompletedProcess(
                     cmd, 0, stdout='"PID" = -1;\n', stderr=""
@@ -68,11 +88,11 @@ def test_macos_update_restarts_running_launchd_gateway_fleet_once(
     def fake_launchd_restart(label: str | None = None):
         restarted_label = label or gateway_cli.get_launchd_label()
         restart_calls.append(restarted_label)
-        if restarted_label == "ai.hermes.gateway-writer":
+        if restarted_label == restart_failure_label:
             raise subprocess.CalledProcessError(
                 75,
-                ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.gateway-writer"],
-                stderr="writer failed to restart",
+                ["launchctl", "kickstart", "-k", f"gui/501/{restarted_label}"],
+                stderr=f"{restarted_label} failed to restart",
             )
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -118,7 +138,11 @@ def test_macos_update_restarts_running_launchd_gateway_fleet_once(
     monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
     monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: active_plist)
     monkeypatch.setattr(gateway_cli, "launchd_restart", fake_launchd_restart)
-    monkeypatch.setattr(gateway_cli, "_get_service_pids", lambda: {101, 201, 202, 303})
+    monkeypatch.setattr(
+        gateway_cli,
+        "_get_service_pids",
+        lambda: {pid for pid in jobs.values() if pid is not None},
+    )
     monkeypatch.setattr(
         gateway_cli,
         "find_gateway_pids",
@@ -149,11 +173,25 @@ def test_macos_update_restarts_running_launchd_gateway_fleet_once(
     monkeypatch.setattr("hermes_cli.config.get_missing_config_fields", lambda: [])
     monkeypatch.setattr("hermes_cli.config.check_config_version", lambda: (1, 1))
 
-    with pytest.raises(SystemExit) as excinfo:
-        hm._cmd_update_impl(
+    def run_update():
+        return hm._cmd_update_impl(
             SimpleNamespace(yes=True, force=False, force_venv=False),
             gateway_mode=False,
         )
+
+    return run_update, restart_calls
+
+
+def test_macos_update_restarts_running_launchd_gateway_fleet_once(
+    tmp_path, monkeypatch, capsys
+):
+    """Post-update macOS refresh must cover every running Hermes launchd gateway."""
+    run_update, restart_calls = _run_mocked_macos_update(
+        tmp_path, monkeypatch, capsys
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_update()
 
     assert excinfo.value.code == 1
     assert restart_calls == [
@@ -168,3 +206,45 @@ def test_macos_update_restarts_running_launchd_gateway_fleet_once(
     out = capsys.readouterr().out
     assert "ai.hermes.gateway-writer" in out
     assert "Update incomplete" in out
+
+
+@pytest.mark.parametrize("launchctl_list_failure", ["nonzero", "timeout", "missing"])
+def test_macos_update_fails_closed_when_launchd_fleet_discovery_fails(
+    tmp_path, monkeypatch, capsys, launchctl_list_failure
+):
+    run_update, restart_calls = _run_mocked_macos_update(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        launchctl_list_failure=launchctl_list_failure,
+        restart_failure_label=None,
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_update()
+
+    assert excinfo.value.code == 1
+    assert restart_calls == []
+    out = capsys.readouterr().out
+    assert "macOS launchd gateway discovery" in out
+    assert "Update incomplete" in out
+    assert "\u2713 Update complete!" not in out
+
+
+def test_macos_update_treats_successful_empty_launchd_discovery_as_complete(
+    tmp_path, monkeypatch, capsys
+):
+    run_update, restart_calls = _run_mocked_macos_update(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        launchd_jobs={},
+        restart_failure_label=None,
+    )
+
+    run_update()
+
+    assert restart_calls == []
+    out = capsys.readouterr().out
+    assert "macOS launchd gateway discovery" not in out
+    assert "\u2713 Update complete!" in out
