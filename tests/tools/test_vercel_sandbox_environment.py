@@ -219,6 +219,7 @@ def vercel_module(vercel_sdk, monkeypatch):
     monkeypatch.setattr("tools.credential_files.get_credential_file_mounts", lambda: [])
     monkeypatch.setattr("tools.credential_files.iter_skills_files", lambda **kwargs: [])
     monkeypatch.setattr("tools.credential_files.iter_cache_files", lambda **kwargs: [])
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
 
     module = importlib.import_module("tools.environments.vercel_sandbox")
     return importlib.reload(module)
