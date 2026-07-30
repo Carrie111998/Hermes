@@ -7426,7 +7426,7 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _effective_default_config() -> Dict[str, Any]:
+def effective_default_config() -> Dict[str, Any]:
     defaults = copy.deepcopy(DEFAULT_CONFIG)
     defaults["session_bridge"]["sidebar"]["inbox_cwd"] = (
         _profile_safe_hermes_home_string()
@@ -7484,7 +7484,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
-        config = _effective_default_config()
+        config = effective_default_config()
 
         if user_sig is not None:
             try:
@@ -7794,18 +7794,6 @@ def save_config(
         )
         if merge_existing and _raw_for_paths:
             config = _merge_partial_save(_raw_for_paths, config)
-        generated_inbox_path = ("session_bridge", "sidebar", "inbox_cwd")
-        static_inbox = DEFAULT_CONFIG["session_bridge"]["sidebar"]["inbox_cwd"]
-        sidebar = config.get("session_bridge", {}).get("sidebar", {})
-        if (
-            generated_inbox_path not in (explicit_raw_paths or set())
-            and isinstance(sidebar, dict)
-            and sidebar.get("inbox_cwd") == static_inbox
-        ):
-            config = copy.deepcopy(config)
-            config["session_bridge"]["sidebar"]["inbox_cwd"] = (
-                _profile_safe_hermes_home_string()
-            )
         # ----------------------------------------------------------------
 
         current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
@@ -7837,7 +7825,7 @@ def save_config(
             normalized = _cast(Dict[str, Any], normalized)
             normalized = _strip_default_values(
                 normalized,  # type: ignore[arg-type]
-                _effective_default_config(),
+                effective_default_config(),
                 preserve_keys=effective_preserve_keys,
             )
 
@@ -8738,7 +8726,7 @@ def edit_config():
     
     # Ensure config exists
     if not config_path.exists():
-        save_config(DEFAULT_CONFIG, strip_defaults=False)
+        save_config(effective_default_config(), strip_defaults=False)
         print(f"Created {config_path}")
     
     # Find editor

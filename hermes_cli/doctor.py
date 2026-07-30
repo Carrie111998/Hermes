@@ -1030,8 +1030,8 @@ def run_doctor(args):
                     shutil.copy2(str(example_config), str(config_path))
                     check_ok(f"Created {_DHH}/config.yaml from cli-config.yaml.example")
                 else:
-                    from hermes_cli.config import DEFAULT_CONFIG, save_config
-                    save_config(DEFAULT_CONFIG)
+                    from hermes_cli.config import effective_default_config, save_config
+                    save_config(effective_default_config())
                     check_ok(f"Created {_DHH}/config.yaml from defaults")
                 fixed_count += 1
             else:

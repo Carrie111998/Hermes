@@ -372,7 +372,7 @@ def test_cached_profile_defaults_are_not_written_when_inbox_is_omitted(
 
 
 @pytest.mark.parametrize("copy_default", (False, True))
-def test_save_config_replaces_generated_static_inbox_with_current_profile(
+def test_save_config_preserves_explicit_static_inbox_across_profile_switch(
     tmp_path: Path,
     copy_default: bool,
 ) -> None:
@@ -398,7 +398,26 @@ def test_save_config_replaces_generated_static_inbox_with_current_profile(
     finally:
         reset_hermes_home_override(token_b)
 
-    assert raw["session_bridge"]["sidebar"]["inbox_cwd"] == str(profile_b)
+    assert raw["session_bridge"]["sidebar"]["inbox_cwd"] == str(profile_a)
+
+
+@pytest.mark.parametrize("session_bridge", (None, "not-a-mapping"))
+def test_save_config_preserves_non_mapping_session_bridge(
+    tmp_path: Path,
+    session_bridge: object,
+) -> None:
+    config_module = importlib.import_module("hermes_cli.config")
+    token = set_hermes_home_override(tmp_path)
+    try:
+        assert config_module.save_config({"session_bridge": session_bridge})
+        raw = config_module.read_raw_config()
+    finally:
+        reset_hermes_home_override(token)
+
+    if session_bridge is None:
+        assert "session_bridge" not in raw
+    else:
+        assert raw["session_bridge"] == session_bridge
 
 
 def test_explicit_sidebar_inbox_survives_profile_default_round_trip(tmp_path: Path) -> None:
