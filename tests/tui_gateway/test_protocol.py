@@ -1565,6 +1565,7 @@ def test_slash_exec_routes_custom_skill_bundle_away_from_worker(server):
         "type": "send",
         "message": fake_msg,
         "notice": "⚡ Loading bundle: analysis-pack (2 skills)",
+        "display": "/analysis-pack",
     }
     assert worker.calls == []
 
@@ -1991,6 +1992,7 @@ def test_command_dispatch_returns_custom_bundle_payload(server):
         "type": "send",
         "message": fake_msg,
         "notice": "⚡ Loading bundle: review-suite (3 skills)",
+        "display": "/review-suite",
     }
     build_bundle.assert_called_once_with(
         "/review-suite",
@@ -2318,3 +2320,35 @@ def test_skin_change_broadcasts_to_every_connected_client(server, monkeypatch):
         types = [f["params"]["type"] for f in transport.frames]
         assert types == ["skin.changed", "skin.changed"]
         assert transport.frames[-1]["params"]["payload"]["name"] == "synthwave"
+
+
+def test_shared_fixture_cleanup_uses_full_session_teardown(server, monkeypatch):
+    """The cross-file autouse cleanup must close every retained resource."""
+    from tests import conftest
+
+    closed = {"worker": 0, "agent": 0, "lease": 0}
+
+    class _Closable:
+        def __init__(self, key):
+            self.key = key
+
+        def close(self):
+            closed[self.key] += 1
+
+    class _Lease:
+        def release(self):
+            closed["lease"] += 1
+
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    server._sessions["leaked"] = {
+        "session_key": "leaked",
+        "agent": _Closable("agent"),
+        "slash_worker": _Closable("worker"),
+        "active_session_lease": _Lease(),
+        "history": [],
+    }
+
+    conftest._teardown_tui_server_sessions(server)
+
+    assert server._sessions == {}
+    assert closed == {"worker": 1, "agent": 1, "lease": 1}

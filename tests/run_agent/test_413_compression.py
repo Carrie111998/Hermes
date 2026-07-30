@@ -1586,8 +1586,6 @@ class TestPreflightCompression:
         assert agent.context_compressor.awaiting_real_usage_after_compression is True
         assert agent.context_compressor._ineffective_compression_count == 2
         assert agent.context_compressor._last_compression_savings_pct == 0.0
-
-
 class TestToolResultPreflightCompression:
     """Compression should trigger when tool results push context past the threshold."""
 

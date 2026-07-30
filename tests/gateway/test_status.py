@@ -670,6 +670,14 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_command_line_belongs_to_profile_normalizes_separators(self):
+        """A Windows argv renders HERMES_HOME with backslashes while the
+        profile's Path may carry forward slashes (and, on Windows, vice
+        versa).  The separator difference must not defeat the match."""
+        home = Path("c:/opt/data/profiles/coder")
+        cmdline = r"hermes_home=c:\opt\data\profiles\coder hermes gateway run --replace"
+        assert status._command_line_belongs_to_profile(cmdline, home) is True
+
 
 class TestGetProcessStartTime:
     """Start-time fingerprint backing the PID-reuse guard (#43846 / #50468).

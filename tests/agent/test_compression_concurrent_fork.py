@@ -115,10 +115,14 @@ def _wait_for_touch(touch_calls: list[str], value: str, timeout: float = 1.0) ->
         if value in touch_calls:
             return
         time.sleep(0.01)
-    pytest.fail(f"Timed out waiting for touch activity {value!r}; calls={touch_calls!r}")
+    pytest.fail(
+        f"Timed out waiting for touch activity {value!r}; calls={touch_calls!r}"
+    )
 
 
-def test_compression_activity_heartbeat_touches_agent_during_long_compress(tmp_path: Path) -> None:
+def test_compression_activity_heartbeat_touches_agent_during_long_compress(
+    tmp_path: Path,
+) -> None:
     """Long compression must refresh agent activity so gateway watchdogs do not fire."""
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "HEARTBEAT_TEST"
@@ -147,7 +151,9 @@ def test_compression_activity_heartbeat_touches_agent_during_long_compress(tmp_p
     assert db.get_compression_lock_holder(session_id) is None
 
 
-def test_compression_activity_heartbeat_stops_on_compress_exception(tmp_path: Path) -> None:
+def test_compression_activity_heartbeat_stops_on_compress_exception(
+    tmp_path: Path,
+) -> None:
     """Exception paths must stop the heartbeat and release the compression lock."""
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "HEARTBEAT_FAIL_TEST"
@@ -182,7 +188,9 @@ def test_compression_activity_heartbeat_ignores_touch_errors(tmp_path: Path) -> 
 
     agent = _build_agent_with_db(db, session_id)
     agent._compression_activity_heartbeat_interval = 0.1
-    agent._touch_activity = lambda _desc: (_ for _ in ()).throw(RuntimeError("touch boom"))
+    agent._touch_activity = lambda _desc: (_ for _ in ()).throw(
+        RuntimeError("touch boom")
+    )
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
@@ -191,7 +199,9 @@ def test_compression_activity_heartbeat_ignores_touch_errors(tmp_path: Path) -> 
     assert db.get_compression_lock_holder(session_id) is None
 
 
-def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(tmp_path: Path) -> None:
+def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(
+    tmp_path: Path,
+) -> None:
     """Strict compressor signatures still compress while heartbeat cleanup runs.
 
     Main inspects the engine signature up front (_supported_compression_kwargs)
@@ -230,7 +240,9 @@ def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(
     assert strict_calls == [120_000]
 
 
-def test_compression_activity_heartbeat_nonfinite_interval_falls_back(tmp_path: Path) -> None:
+def test_compression_activity_heartbeat_nonfinite_interval_falls_back(
+    tmp_path: Path,
+) -> None:
     """Non-finite heartbeat intervals must not reach Event.wait()."""
     from agent.conversation_compression import _CompressionActivityHeartbeat
 
@@ -247,8 +259,10 @@ def test_compression_activity_heartbeat_nonfinite_interval_falls_back(tmp_path: 
     assert heartbeat._interval_seconds == 60.0
     heartbeat.start()
     heartbeat.stop()
-    assert touch_calls == ["context compression started", "context compression completed"]
-
+    assert touch_calls == [
+        "context compression started",
+        "context compression completed",
+    ]
 
 
 def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
@@ -338,35 +352,6 @@ def test_concurrent_compression_does_not_fork_session(tmp_path: Path) -> None:
     assert db.get_compression_lock_holder(parent_sid) is None, (
         "Compression lock leaked: still held after both paths completed."
     )
-
-
-def test_durable_message_committed_before_lease_aborts_stale_snapshot(
-    tmp_path: Path,
-) -> None:
-    """A durable row absent from the caller snapshot must survive in the parent."""
-    db = SessionDB(db_path=tmp_path / "state.db")
-    parent_sid = "PRE_LEASE_DURABLE_RACE"
-    db.create_session(parent_sid, source="webui")
-    db.append_message(parent_sid, "user", "old durable")
-
-    # Frontend takes its snapshot, then another producer commits before this
-    # compressor acquires the lease.
-    stale_snapshot = [{"role": "user", "content": "old durable"}]
-    db.append_message(parent_sid, "assistant", "late committed before lease")
-    agent = _build_agent_with_db(db, parent_sid)
-
-    returned, _system_prompt = agent._compress_context(
-        stale_snapshot, "sys", approx_tokens=120_000
-    )
-
-    assert returned is stale_snapshot
-    assert agent.session_id == parent_sid
-    assert db.find_live_compression_child(parent_sid) is None
-    assert [m["content"] for m in db.get_messages_as_conversation(parent_sid)] == [
-        "old durable",
-        "late committed before lease",
-    ]
-    agent.context_compressor.compress.assert_not_called()
 
 
 def test_skipped_compression_returns_messages_unchanged(tmp_path: Path) -> None:
@@ -592,7 +577,9 @@ def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
     assert agent._flushed_db_message_session_id == child_sid
     assert agent._last_flushed_db_idx == len(recovered)
     agent.context_compressor.compress.assert_not_called()
-    lifecycle_args, lifecycle_kwargs = agent.context_compressor.on_session_start.call_args
+    lifecycle_args, lifecycle_kwargs = (
+        agent.context_compressor.on_session_start.call_args
+    )
     assert lifecycle_args == (child_sid,)
     assert lifecycle_kwargs["boundary_reason"] == "compression"
     assert lifecycle_kwargs["old_session_id"] == parent_sid
@@ -621,7 +608,9 @@ def test_delayed_contender_fails_closed_without_unique_child(tmp_path: Path) -> 
     agent.context_compressor.compress.assert_not_called()
 
 
-def test_compression_restores_user_turn_when_compressor_drops_all_users(tmp_path: Path) -> None:
+def test_compression_restores_user_turn_when_compressor_drops_all_users(
+    tmp_path: Path,
+) -> None:
     """Provider chat templates need at least one user message after compaction.
 
     A plugin or future compressor can legally return a compacted context made
@@ -655,7 +644,9 @@ def test_compression_restores_user_turn_when_compressor_drops_all_users(tmp_path
     assert user_messages == [{"role": "user", "content": "please continue from here"}]
 
 
-def test_synthetic_user_scaffolding_does_not_replace_human_anchor(tmp_path: Path) -> None:
+def test_synthetic_user_scaffolding_does_not_replace_human_anchor(
+    tmp_path: Path,
+) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "SYNTHETIC_USER_AFTER_COMPRESS"
     db.create_session(parent_sid, source="cli")
@@ -684,9 +675,7 @@ def test_synthetic_user_scaffolding_does_not_replace_human_anchor(tmp_path: Path
 
 def _no_consecutive_user_roles(messages: list) -> bool:
     roles = [m.get("role") for m in messages if isinstance(m, dict)]
-    return all(
-        not (roles[i] == roles[i + 1] == "user") for i in range(len(roles) - 1)
-    )
+    return all(not (roles[i] == roles[i + 1] == "user") for i in range(len(roles) - 1))
 
 
 def test_restored_anchor_never_creates_consecutive_user_roles() -> None:
@@ -825,7 +814,9 @@ def test_equal_copy_compression_result_does_not_rewrite_session(
     archive_and_compact.assert_not_called()
 
 
-def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypatch) -> None:
+def test_lock_refresh_keeps_owner_live_past_initial_ttl(
+    tmp_path: Path, monkeypatch
+) -> None:
     """The owning compression call must keep its lease alive while it runs."""
     import hermes_state
 
@@ -834,7 +825,9 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
 
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
+    def _short_ttl(
+        self, session_id: str, holder: str, ttl_seconds: float = 300.0
+    ) -> bool:
         return real_try_acquire(self, session_id, holder, ttl_seconds=1.0)
 
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
@@ -904,7 +897,9 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
     t_a = threading.Thread(target=run, args=(agent_a,), name="refresh_owner")
     t_a.start()
     try:
-        assert compression_started.wait(timeout=10), "compression never acquired its lock"
+        assert compression_started.wait(timeout=10), (
+            "compression never acquired its lock"
+        )
         assert db.get_compression_lock_holder(parent_sid) is not None
         assert first_refresh.wait(timeout=10), "initial lease refresh never completed"
         first_expiry = db._conn.execute(
@@ -913,7 +908,9 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
         ).fetchone()[0]
         clock[0] = first_expiry - 0.5
         allow_second_refresh.set()
-        assert second_refresh.wait(timeout=10), "recurring lease refresh never completed"
+        assert second_refresh.wait(timeout=10), (
+            "recurring lease refresh never completed"
+        )
         second_expiry = db._conn.execute(
             "SELECT expires_at FROM compression_locks WHERE session_id = ?",
             (parent_sid,),
@@ -921,9 +918,12 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
         assert second_expiry > first_expiry
         clock[0] = first_expiry + 0.5
         assert clock[0] < second_expiry
-        assert db.try_acquire_compression_lock(
-            parent_sid, "refresh_probe", ttl_seconds=3.0
-        ) is False, "live owner lease expired and was reclaimable before compression finished"
+        assert (
+            db.try_acquire_compression_lock(
+                parent_sid, "refresh_probe", ttl_seconds=3.0
+            )
+            is False
+        ), "live owner lease expired and was reclaimable before compression finished"
     finally:
         release_compression.set()
         t_a.join(timeout=10)
@@ -933,11 +933,15 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
     assert db.get_compression_lock_holder(parent_sid) is None
 
 
-def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatch) -> None:
+def test_post_compress_exception_stops_lock_refresher(
+    tmp_path: Path, monkeypatch
+) -> None:
     """A warning-path exception after compress() returns must still release the lock."""
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
+    def _short_ttl(
+        self, session_id: str, holder: str, ttl_seconds: float = 300.0
+    ) -> bool:
         return real_try_acquire(self, session_id, holder, ttl_seconds=1.0)
 
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
@@ -950,7 +954,9 @@ def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
     agent._compression_lock_ttl_seconds = 1.0
     agent._compression_lock_refresh_interval = 0.1
     agent.context_compressor._last_summary_error = "summary failed"
-    agent._emit_warning = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("warn boom"))
+    agent._emit_warning = lambda *_a, **_k: (_ for _ in ()).throw(
+        RuntimeError("warn boom")
+    )
 
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
@@ -961,11 +967,15 @@ def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
     assert db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0) is True
 
 
-def test_abort_warning_exception_stops_lock_refresher(tmp_path: Path, monkeypatch) -> None:
+def test_abort_warning_exception_stops_lock_refresher(
+    tmp_path: Path, monkeypatch
+) -> None:
     """An abort-path warning exception must still release the refreshed lock."""
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
+    def _short_ttl(
+        self, session_id: str, holder: str, ttl_seconds: float = 300.0
+    ) -> bool:
         return real_try_acquire(self, session_id, holder, ttl_seconds=1.0)
 
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
@@ -984,7 +994,9 @@ def test_abort_warning_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
         return [{"role": "user", "content": "tail"}]
 
     agent.context_compressor.compress.side_effect = _aborting_compress
-    agent._emit_warning = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("abort boom"))
+    agent._emit_warning = lambda *_a, **_k: (_ for _ in ()).throw(
+        RuntimeError("abort boom")
+    )
 
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
@@ -995,11 +1007,15 @@ def test_abort_warning_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
     assert db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0) is True
 
 
-def test_internal_typeerror_stops_lock_refresher_without_retry(tmp_path: Path, monkeypatch) -> None:
+def test_internal_typeerror_stops_lock_refresher_without_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
     """An engine TypeError must release the refreshed lock without a second call."""
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
+    def _short_ttl(
+        self, session_id: str, holder: str, ttl_seconds: float = 300.0
+    ) -> bool:
         return real_try_acquire(self, session_id, holder, ttl_seconds=1.0)
 
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
@@ -1030,7 +1046,9 @@ def test_internal_typeerror_stops_lock_refresher_without_retry(tmp_path: Path, m
     assert db.try_acquire_compression_lock(parent_sid, "probe", ttl_seconds=1.0) is True
 
 
-def test_lease_refresher_start_exception_releases_lock(tmp_path: Path, monkeypatch) -> None:
+def test_lease_refresher_start_exception_releases_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
     """A failed refresher start must not strand the lock until its TTL."""
     refreshers = []
 
@@ -1250,7 +1268,7 @@ def _make_legacy_session_db_class() -> type:
     """
     source_path = inspect.getfile(SessionDB)
     namespace = {"__name__": "hermes_state"}
-    source = '''
+    source = """
 class SessionDB:
     def __init__(self, real_db):
         self._real = real_db
@@ -1259,7 +1277,7 @@ class SessionDB:
         if name in {"_real", "__class__"}:
             return object.__getattribute__(self, name)
         return getattr(object.__getattribute__(self, "_real"), name)
-'''
+"""
     exec(compile(source, source_path, "exec"), namespace)
     return namespace["SessionDB"]
 
@@ -1313,7 +1331,9 @@ class _NonCallableLockAPI:
         return getattr(self._real, name)
 
 
-def test_missing_lock_subsystem_fails_open_not_infinite_loop(tmp_path: Path, monkeypatch) -> None:
+def test_missing_lock_subsystem_fails_open_not_infinite_loop(
+    tmp_path: Path, monkeypatch
+) -> None:
     """A truly old in-memory SessionDB class must still make progress.
 
     A module reload can update ``conversation_compression`` while the cached
@@ -1342,7 +1362,9 @@ def test_missing_lock_subsystem_fails_open_not_infinite_loop(tmp_path: Path, mon
             ),
         )
         messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
-        compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+        compressed, _sp = agent._compress_context(
+            messages, "sys", approx_tokens=120_000
+        )
     finally:
         monkeypatch.setattr(hermes_state, "SessionDB", real_session_db_type)
 
@@ -1480,7 +1502,9 @@ def test_post_acquire_error_releases_owned_lock(tmp_path: Path, monkeypatch) -> 
     agent.context_compressor.compress.assert_not_called()
 
 
-def test_review_fork_disables_compression_to_prevent_stale_parent_fork(tmp_path: Path) -> None:
+def test_review_fork_disables_compression_to_prevent_stale_parent_fork(
+    tmp_path: Path,
+) -> None:
     """The background-review fork must set ``compression_enabled = False``
     so it can never compress the parent it shares a session_id with
     (issue #38727).
@@ -1749,3 +1773,45 @@ def test_lease_refresher_stops_on_persistent_raise() -> None:
     _no_sleep(refresher)
     refresher._run()  # must not propagate
     assert db.calls == refresher._max_consecutive_failures
+
+
+def test_durable_message_committed_before_lease_is_adopted(
+    tmp_path: Path,
+) -> None:
+    """A durable row absent from the caller snapshot must still be compressed.
+
+    Previously this path aborted and returned the stale snapshot unchanged,
+    which permanently wedged busy sessions: every compress attempt saw the
+    DB ahead of the in-memory list, logged "changed before lease
+    acquisition", and never called the compressor. Adopting the durable
+    transcript keeps the late-committed turn and lets compression proceed.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "PRE_LEASE_DURABLE_RACE"
+    db.create_session(parent_sid, source="webui")
+    db.append_message(parent_sid, "user", "old durable")
+
+    # Frontend takes its snapshot, then another producer commits before this
+    # compressor acquires the lease.
+    stale_snapshot = [{"role": "user", "content": "old durable"}]
+    db.append_message(parent_sid, "assistant", "late committed before lease")
+    agent = _build_agent_with_db(db, parent_sid)
+
+    returned, _system_prompt = agent._compress_context(
+        stale_snapshot, "sys", approx_tokens=120_000
+    )
+
+    agent.context_compressor.compress.assert_called_once()
+    compressed_arg = agent.context_compressor.compress.call_args.args[0]
+    assert [m["content"] for m in compressed_arg] == [
+        "old durable",
+        "late committed before lease",
+    ]
+    # Must not echo the stale snapshot — compression proceeded on the
+    # adopted durable transcript (rotation publishes a child session).
+    assert returned is not stale_snapshot
+    assert returned[0]["content"] == "[CONTEXT COMPACTION] summary"
+    assert agent.session_id != parent_sid
+    child_id = _live_child_id(db, parent_sid)
+    assert child_id is not None
+    assert child_id == agent.session_id

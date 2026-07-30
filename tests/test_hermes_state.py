@@ -1622,8 +1622,12 @@ class TestMessageStorage:
             ],
         )
 
-        model_expected = db.get_messages_as_conversation("child", repair_alternation=True)
-        display_expected = db.get_messages_as_conversation("child", include_ancestors=True)
+        model_expected = db.get_messages_as_conversation(
+            "child", repair_alternation=True, include_row_ids=True
+        )
+        display_expected = db.get_messages_as_conversation(
+            "child", include_ancestors=True, include_row_ids=True
+        )
 
         model_history, display_history = db.get_resume_conversations("child")
 
@@ -1637,8 +1641,12 @@ class TestMessageStorage:
         db.append_message("solo", role="user", content="hi")
         db.append_message("solo", role="assistant", content="hello")
 
-        model_expected = db.get_messages_as_conversation("solo", repair_alternation=True)
-        display_expected = db.get_messages_as_conversation("solo", include_ancestors=True)
+        model_expected = db.get_messages_as_conversation(
+            "solo", repair_alternation=True, include_row_ids=True
+        )
+        display_expected = db.get_messages_as_conversation(
+            "solo", include_ancestors=True, include_row_ids=True
+        )
         model_history, display_history = db.get_resume_conversations("solo")
 
         assert model_history == model_expected
@@ -1652,8 +1660,12 @@ class TestMessageStorage:
         db.create_session("child", "tui", parent_session_id="root")
         db.append_message("child", role="user", content="next prompt")
 
-        model_expected = db.get_messages_as_conversation("child", repair_alternation=True)
-        display_expected = db.get_messages_as_conversation("child", include_ancestors=True)
+        model_expected = db.get_messages_as_conversation(
+            "child", repair_alternation=True, include_row_ids=True
+        )
+        display_expected = db.get_messages_as_conversation(
+            "child", include_ancestors=True, include_row_ids=True
+        )
         model_history, display_history = db.get_resume_conversations("child")
 
         assert model_history == model_expected
@@ -5458,39 +5470,60 @@ class TestOptimizeFts:
         # Search still works after repeated optimization.
         assert len(db.search_messages("repeat")) == 1
 
-    def test_write_path_optimizes_fts_on_cadence(self, db, monkeypatch):
-        """Writes periodically merge FTS segments so they never accumulate
-        into the tens-of-thousands that lengthen the write-lock hold and
-        starve competing writers ("database is locked")."""
-        db._OPTIMIZE_EVERY_N_WRITES = 5
-        calls = {"n": 0}
-        real_optimize = db.optimize_fts
-
-        def _counting_optimize():
-            calls["n"] += 1
-            return real_optimize()
-
-        monkeypatch.setattr(db, "optimize_fts", _counting_optimize)
-        # create_session is write #1; appends are #2.. -> #5 and #10 trigger.
+    def test_incremental_merge_bounded_commands_per_present_index(self, db):
+        """Each pass issues bounded 'merge' commands, never 'optimize'."""
         db.create_session(session_id="s1", source="cli")
-        for i in range(9):
+        db.append_message(session_id="s1", role="user", content="bounded merge")
+        statements = []
+        db._conn.set_trace_callback(statements.append)
+        try:
+            executed = db._merge_fts_incrementally(max_pages=37)
+        finally:
+            db._conn.set_trace_callback(None)
+
+        # At least one merge command per present FTS index, and never more
+        # than the per-pass command cap per index.
+        present = [t for t in db._FTS_TABLES if db._fts_table_exists(t)]
+        assert len(present) >= 2  # messages_fts + trigram on a fresh DB
+        merge_sql = [sql for sql in statements if "VALUES('merge', 37)" in sql]
+        assert len(merge_sql) == executed
+        assert len(present) <= executed <= (
+            len(present) * db._FTS_MERGE_COMMANDS_PER_PASS
+        )
+        for tbl in present:
+            n = sum(f"{tbl}({tbl}, rank)" in sql for sql in merge_sql)
+            assert 1 <= n <= db._FTS_MERGE_COMMANDS_PER_PASS
+        # The usermerge floor is applied so positive merges can make
+        # progress on levels with >= 2 segments (SQLite FTS5 §6.8).
+        assert any("VALUES('usermerge', 2)" in sql for sql in statements)
+        assert not any("'optimize'" in sql for sql in statements)
+
+    def test_write_path_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
+        """Routine writes use bounded merge and never full optimize."""
+        db._FTS_MERGE_EVERY_N_WRITES = 5
+        calls = []
+
+        def _counting_merge(*, max_pages):
+            calls.append(max_pages)
+            return 0
+
+        def _unexpected_optimize():
+            raise AssertionError("routine cadence must not call optimize")
+
+        monkeypatch.setattr(db, "_merge_fts_incrementally", _counting_merge)
+        monkeypatch.setattr(db, "optimize_fts", _unexpected_optimize)
+        db.create_session(session_id="s1", source="cli")
+        for i in range(3):
             db.append_message(session_id="s1", role="user", content=f"needle {i}")
-        assert calls["n"] == 2
-        # The auto-merge is layout-only: search is unaffected.
+        assert calls == []  # Four successful writes are below the boundary.
+        db.append_message(session_id="s1", role="user", content="needle 3")
+        assert calls == [500]  # The fifth write gets the production page budget.
+        for i in range(4, 8):
+            db.append_message(session_id="s1", role="user", content=f"needle {i}")
+        assert calls == [500]
+        db.append_message(session_id="s1", role="user", content="needle 8")
+        assert calls == [500, 500]  # The tenth write is the next boundary.
         assert len(db.search_messages("needle")) == 9
-
-    def test_write_path_optimize_failure_never_breaks_write(self, db, monkeypatch):
-        """A failing periodic optimize must not fail the surrounding write."""
-        db._OPTIMIZE_EVERY_N_WRITES = 2
-
-        def _boom():
-            raise sqlite3.OperationalError("simulated optimize failure")
-
-        monkeypatch.setattr(db, "optimize_fts", _boom)
-        db.create_session(session_id="s1", source="cli")  # write #1
-        # write #2 trips the cadence; the swallowed failure must not propagate.
-        db.append_message(session_id="s1", role="user", content="still persists")
-        assert len(db.get_messages("s1")) == 1
 
 
 class TestAutoMaintenance:
@@ -6858,6 +6891,34 @@ class TestSessionPinAndStaleArchive:
         assert result["archived"] == 1
 
 
+    def test_pinned_session_survives_the_limit_window(self, db):
+        """A pin outlives recency: paging must not evict a pinned row.
+
+        Without ``include_pinned`` the desktop's Pinned section renders empty
+        for any conversation that has aged off the sidebar page.
+        """
+        for i in range(6):
+            self._make_idle(db, f"s{i}", days_idle=6 - i)
+        db.set_session_pinned("s0", True)  # the oldest — off a 3-row page
+
+        def ids(**kw):
+            return [
+                s["id"]
+                for s in db.list_sessions_rich(
+                    limit=3, min_message_count=1, order_by_last_active=True, **kw
+                )
+            ]
+
+        page = ids()
+        assert "s0" not in page, "precondition: the pin is off the page"
+
+        with_pins = ids(include_pinned=True)
+        assert "s0" in with_pins
+        # The page itself is untouched; the pin is additive.
+        assert with_pins[:3] == page
+        assert len(with_pins) == len(page) + 1
+
+
 class TestSessionIdSearch:
     """Session id search backs Desktop's Search Sessions UX."""
 
@@ -7801,3 +7862,151 @@ class TestDisplayMetadataReadPaths:
             }],
         )
         assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
+
+
+class TestGatewayRoutingPkHeal:
+    """Legacy gateway_routing tables (session_key-only PK) get rebuilt on open.
+
+    Early builds of the #59203 routing-index migration created gateway_routing
+    with ``session_key TEXT PRIMARY KEY`` and no ``scope`` column. The column
+    reconciler ADDs ``scope`` but cannot change the PK, so on those databases
+    every routing save failed ("ON CONFLICT clause does not match any PRIMARY
+    KEY or UNIQUE constraint" / "UNIQUE constraint failed:
+    gateway_routing.session_key") and spammed warnings on each save.
+    """
+
+    LEGACY_SQL = """
+        CREATE TABLE gateway_routing (
+            session_key TEXT PRIMARY KEY,
+            entry_json TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        , "scope" TEXT DEFAULT '')
+    """
+
+    def _make_legacy_db(self, tmp_path, rows=()):
+        db_path = tmp_path / "state.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(self.LEGACY_SQL)
+        conn.executemany(
+            "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            list(rows),
+        )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def _pk_cols(self, db):
+        rows = db._conn.execute('PRAGMA table_info("gateway_routing")').fetchall()
+        cols = sorted(
+            ((r["pk"], r["name"]) for r in rows if r["pk"]),
+        )
+        return [name for _, name in cols]
+
+    def test_legacy_pk_rebuilt_to_composite(self, tmp_path):
+        db_path = self._make_legacy_db(
+            tmp_path, rows=[("/home/u/.hermes/sessions", "agent:main:telegram:dm:1", "{}", 1.0)]
+        )
+        db = SessionDB(db_path=db_path)
+        try:
+            assert self._pk_cols(db) == ["scope", "session_key"]
+            # Existing rows survive the rebuild.
+            entries = db.load_gateway_routing_entries(scope="/home/u/.hermes/sessions")
+            assert entries == {"agent:main:telegram:dm:1": "{}"}
+        finally:
+            db.close()
+
+
+
+    def test_current_shape_left_untouched(self, tmp_path, db):
+        """A DB born with the composite PK is not rebuilt (idempotence)."""
+        db.save_gateway_routing_entry("k1", "{}", scope="s")
+        assert self._pk_cols(db) == ["scope", "session_key"]
+        # Re-running the heal is a no-op.
+        cur = db._conn.cursor()
+        db._heal_gateway_routing_pk(cur)
+        assert db.load_gateway_routing_entries(scope="s") == {"k1": "{}"}
+
+class TestApplyDatabasePragmas:
+    """Config-driven WAL-sizing pragma application (database: section)."""
+
+    @staticmethod
+    def _patch_cfg(monkeypatch, cfg):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: cfg,
+        )
+
+    def test_honors_wal_autocheckpoint_from_config(self, tmp_path, monkeypatch):
+        import sqlite3
+        from hermes_state import apply_database_pragmas
+
+        conn = sqlite3.connect(str(tmp_path / "pragmas.db"))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._patch_cfg(monkeypatch, {"database": {"wal_autocheckpoint": 250}})
+            apply_database_pragmas(conn, db_label="test.db")
+            assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 250
+        finally:
+            conn.close()
+
+    def test_honors_journal_size_limit_from_config(self, tmp_path, monkeypatch):
+        import sqlite3
+        from hermes_state import apply_database_pragmas
+
+        conn = sqlite3.connect(str(tmp_path / "pragmas.db"))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._patch_cfg(
+                monkeypatch, {"database": {"journal_size_limit": 10485760}}
+            )
+            apply_database_pragmas(conn, db_label="test.db")
+            assert (
+                conn.execute("PRAGMA journal_size_limit").fetchone()[0] == 10485760
+            )
+        finally:
+            conn.close()
+
+    def test_noop_when_database_section_missing(self, tmp_path, monkeypatch):
+        import sqlite3
+        from hermes_state import apply_database_pragmas
+
+        conn = sqlite3.connect(str(tmp_path / "pragmas.db"))
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+            self._patch_cfg(monkeypatch, {})
+            apply_database_pragmas(conn, db_label="test.db")
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        finally:
+            conn.close()
+
+    def test_never_touches_journal_mode(self, tmp_path, monkeypatch):
+        """journal_mode is owned by apply_wal_with_fallback — a database:
+        journal_mode entry must NOT cause a second, unguarded mode switch."""
+        import sqlite3
+        from hermes_state import apply_database_pragmas
+
+        conn = sqlite3.connect(str(tmp_path / "pragmas.db"))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._patch_cfg(monkeypatch, {"database": {"journal_mode": "delete"}})
+            apply_database_pragmas(conn, db_label="test.db")
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        finally:
+            conn.close()
+
+    def test_ignores_non_integer_values(self, tmp_path, monkeypatch):
+        import sqlite3
+        from hermes_state import apply_database_pragmas
+
+        conn = sqlite3.connect(str(tmp_path / "pragmas.db"))
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            before = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+            self._patch_cfg(
+                monkeypatch, {"database": {"wal_autocheckpoint": "lots"}}
+            )
+            apply_database_pragmas(conn, db_label="test.db")
+            assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == before
+        finally:
+            conn.close()

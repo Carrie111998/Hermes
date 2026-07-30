@@ -234,6 +234,27 @@ class TestSessionTokenInjection:
         assert ws._SESSION_TOKEN and len(ws._SESSION_TOKEN) >= 32
 
 
+    def test_session_token_resolution_preserves_loaded_app_auth(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from starlette.testclient import TestClient
+
+        original_app = ws.app
+        original_header_name = ws._SESSION_HEADER_NAME
+        original_token = ws._SESSION_TOKEN
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-seeded-token")
+        assert ws._resolve_session_token() == "desktop-seeded-token"
+        monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+        with patch.object(ws.secrets, "token_urlsafe", return_value="generated-token"):
+            assert ws._resolve_session_token() == "generated-token"
+
+        client = TestClient(original_app)
+        client.headers[original_header_name] = original_token
+        assert client.get("/api/__session_token_probe").status_code == 404
+        assert ws.app is original_app
+        assert ws._SESSION_HEADER_NAME == original_header_name
+        assert ws._SESSION_TOKEN == original_token
+
+
 # ---------------------------------------------------------------------------
 # web_server tests (FastAPI endpoints)
 # ---------------------------------------------------------------------------
@@ -5271,6 +5292,51 @@ class TestWebServerEndpoints:
         assert data["free_tier"] is None
 
 
+    def test_post_memory_provider_setup_routes_pip_through_lazy_deps(self, monkeypatch):
+        """NS-605: dashboard pip installs must use the environment-aware
+        lazy_deps pipeline (durable-target redirect on immutable hosted
+        images), never a direct `pip install --python sys.executable`."""
+        import subprocess as _subprocess
+
+        import hermes_cli.web_server as web_server
+        from tools import lazy_deps as ld
+
+        # honcho declares pip_dependencies: [honcho-ai]; force it missing.
+        monkeypatch.setattr(web_server, "_dependency_importable", lambda dep: False)
+
+        installed = []
+
+        def fake_install_specs(specs, *, timeout=300):
+            installed.append(tuple(specs))
+            return ld.InstallSpecsResult(
+                ok=True, command="uv pip install --target /opt/data/lazy-packages honcho-ai",
+                stdout="ok", stderr="",
+            )
+
+        monkeypatch.setattr(ld, "install_specs", fake_install_specs)
+
+        # Any direct pip/uv subprocess from the memory-provider pip path is
+        # a regression; external-dep checks may still run subprocess, so only
+        # trip on pip-flavored commands.
+        real_run = _subprocess.run
+
+        def guarded_run(command, **kwargs):
+            flat = command if isinstance(command, str) else " ".join(map(str, command))
+            assert "pip install" not in flat, f"direct pip call leaked: {flat}"
+            return real_run(command, **kwargs)
+
+        monkeypatch.setattr(web_server.subprocess, "run", guarded_run)
+
+        resp = self.client.post("/api/memory/providers/honcho/setup", json={"values": {}})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        pip_rows = [row for row in data["results"] if row["kind"] == "pip"]
+        assert pip_rows and pip_rows[0]["status"] == "installed"
+        assert "--target /opt/data/lazy-packages" in pip_rows[0]["command"]
+        assert installed == [("honcho-ai",)]
+
+
 # ---------------------------------------------------------------------------
 # _build_schema_from_config tests
 # ---------------------------------------------------------------------------
@@ -5423,6 +5489,30 @@ class TestBuildSchemaFromConfig:
         cats = Counter(e["category"] for e in CONFIG_SCHEMA.values())
         for cat, count in cats.items():
             assert count >= 2, f"Category '{cat}' has only {count} field(s) — should be merged"
+
+
+    def test_timezone_field_is_searchable_select(self):
+        """timezone must ship as a searchable, clearable select of IANA ids.
+
+        Desktop renders this via SearchableSelect (Popover + cmdk); the old
+        free-text input let users type invalid timezone strings (#68970).
+        Invariants, not snapshots: valid IANA entries present, sorted, no
+        blank entry server-side (the clear item is client-side via
+        ``clearable``), and never empty even without tzdata (UTC fallback).
+        """
+        from hermes_cli.web_server import CONFIG_SCHEMA, _timezone_options
+
+        entry = CONFIG_SCHEMA["timezone"]
+        assert entry["type"] == "select"
+        assert entry.get("searchable") is True
+        assert entry.get("clearable") is True
+        options = entry["options"]
+        assert len(options) >= 1
+        assert options == sorted(options)
+        assert "" not in options
+        assert "UTC" in options
+        # Fallback path: never returns an empty list.
+        assert len(_timezone_options()) >= 1
 
 
 # ---------------------------------------------------------------------------

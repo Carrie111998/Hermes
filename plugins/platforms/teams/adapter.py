@@ -105,6 +105,12 @@ _DEFAULT_PORT = 3978
 # Bot Framework activities are JSON payloads well under 1 MiB; an explicit
 # aiohttp client_max_size keeps oversized/chunked request bodies bounded.
 _MAX_BODY_BYTES = 1_048_576
+# ``None`` → aiohttp/asyncio ``create_server`` binds one listening socket per
+# address family (IPv4 + IPv6). The old hardcoded "0.0.0.0" bound IPv4 ONLY
+# and was unreachable over IPv6-only private networks (e.g. Fly.io 6PN) —
+# same bug as the LINE adapter (NS-603) and gateway/platforms/webhook.py
+# (d542894ad). Pin a host via TEAMS_HOST or extra.host.
+_DEFAULT_HOST = None
 _WEBHOOK_PATH = "/api/messages"
 
 
@@ -705,6 +711,9 @@ class TeamsAdapter(BasePlatformAdapter):
         self._port = _coerce_port(
             extra.get("port") or os.getenv("TEAMS_PORT", str(_DEFAULT_PORT))
         )
+        # Falsy host (unset/"") collapses to the dual-stack default (None).
+        _raw_host = extra.get("host") or os.getenv("TEAMS_HOST", "") or _DEFAULT_HOST
+        self._host: Optional[str] = str(_raw_host) if _raw_host else None
         self._app: Optional["App"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._dedup = MessageDeduplicator(max_size=1000)
@@ -774,13 +783,14 @@ class TeamsAdapter(BasePlatformAdapter):
 
             self._runner = web.AppRunner(aiohttp_app)
             await self._runner.setup()
-            site = web.TCPSite(self._runner, "0.0.0.0", self._port)
+            site = web.TCPSite(self._runner, self._host, self._port)
             await site.start()
 
             self._running = True
             self._mark_connected()
             logger.info(
-                "[teams] Webhook server listening on 0.0.0.0:%d%s",
+                "[teams] Webhook server listening on %s:%d%s",
+                self._host or "* (all interfaces, IPv4+IPv6)",
                 self._port,
                 _WEBHOOK_PATH,
             )
@@ -1098,7 +1108,6 @@ class TeamsAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
         allow_session: bool = True,
-        smart_denied: bool = False,
     ) -> SendResult:
         """Send an Adaptive Card approval prompt with Allow/Deny buttons."""
         if not self._app:
@@ -1116,7 +1125,7 @@ class TeamsAdapter(BasePlatformAdapter):
             title="Allow Once", verb="hermes_approve",
             data={**btn_data_base, "hermes_action": "approve_once"}, style="positive",
         )]
-        if not smart_denied and allow_session:
+        if allow_session:
             actions.append(ExecuteAction(
                 title="Always Allow", verb="hermes_approve",
                 data={**btn_data_base, "hermes_action": "approve_always"},

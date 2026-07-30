@@ -61,6 +61,28 @@ class _CompressionThenFailureAgent:
         pass
 
 
+class _EmptyRateLimitFailureAgent(_CompressionThenFailureAgent):
+    def run_conversation(
+        self,
+        user_message,
+        conversation_history=None,
+        task_id=None,
+        **_kwargs,
+    ):
+        return {
+            "final_response": "",
+            "failed": True,
+            "completed": False,
+            "error": "429 Too Many Requests",
+            "failure_reason": "rate_limit",
+            "messages": [
+                *(conversation_history or []),
+                {"role": "user", "content": user_message},
+            ],
+            "api_calls": 3,
+        }
+
+
 class _StreamConsumer:
     final_response_sent = False
 
@@ -135,9 +157,12 @@ def _runner(session_store, profile_home):
     return runner
 
 
-def _install_compression_failure_agent(monkeypatch):
+def _install_compression_failure_agent(
+    monkeypatch,
+    agent_cls=_CompressionThenFailureAgent,
+):
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = _CompressionThenFailureAgent
+    fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
     monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "0")
@@ -242,3 +267,26 @@ def test_session_split_sync_skips_when_binding_already_moved(monkeypatch, tmp_pa
     assert session_store.save_calls == 0
     assert session_store.peer_records == []
     assert getattr(runner._sync_telegram_topic_binding, "call_count") == 0
+
+
+def test_empty_rate_limit_response_preserves_failure_metadata(
+    monkeypatch,
+    tmp_path,
+):
+    """The empty-response path must retain its structured failure reason."""
+    _install_compression_failure_agent(monkeypatch, _EmptyRateLimitFailureAgent)
+
+    session_store = _SessionStore()
+    runner = _runner(session_store, tmp_path)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    result = _run_compression_failure_turn(runner, source)
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "rate_limit"
+    assert result["completed"] is False

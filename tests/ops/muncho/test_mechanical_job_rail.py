@@ -348,10 +348,15 @@ def test_routine_push_target_is_exact_fork_and_never_upstream() -> None:
     source = (ROOT / rail.ROUTINE_RELATIVE).read_text(encoding="utf-8")
     assert 'FORK_GIT_URL = "https://github.com/lomliev/hermes-agent.git"' in source
     assert 'UPSTREAM_GIT_URL = "https://github.com/NousResearch/hermes-agent.git"' in source
-    push = source[source.index('"push",\n            FORK_GIT_URL') - 200 :]
-    assert '"push",\n            FORK_GIT_URL' in push
-    assert '"push",\n            UPSTREAM_GIT_URL' not in source
+    push = source[source.index('"push",\n                FORK_GIT_URL') - 200 :]
+    assert '"push",\n                FORK_GIT_URL' in push
+    assert '"push",\n                UPSTREAM_GIT_URL' not in source
     assert '"pr",\n                    "create",\n                    "--repo",\n                    FORK_REPO' in source
+    assert (
+        '"--head",\n                    branch,\n'
+        '                    "--draft",'
+        in source
+    )
 
 
 def test_existing_pr_without_separate_merge_gate_is_inert_and_receipted(
@@ -367,54 +372,85 @@ def test_existing_pr_without_separate_merge_gate_is_inert_and_receipted(
     monkeypatch.setattr(
         routine, "BLOCKER_DEDUPE_STATE", state / "blocker-dedupe.json"
     )
+    monkeypatch.setattr(routine, "AUTO_STATE", state / "candidate.json")
     monkeypatch.setenv(routine.EXECUTE_ENV, "1")
-    monkeypatch.delenv(routine.AUTO_MERGE_DEPLOY_ENV, raising=False)
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="9" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-candidate-branch",
+        head_sha="3" * 40,
+        base_sha="1" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-14T12:00:00Z",
+    )
+    manifest = routine.publish_candidate_manifest(prepared, pr_number=101)
+    candidate = {
+        "number": 101,
+        "url": "https://github.com/lomliev/hermes-agent/pull/101",
+        "state": "OPEN",
+        "headRefName": "exact-candidate-branch",
+        "headRefOid": "3" * 40,
+        "baseRefName": "main",
+    }
     monkeypatch.setattr(
         routine,
         "build_plan",
         lambda _args: {
             "created_at_utc": "2026-07-14T12:00:00Z",
-            "fresh_refs": {"behind_by": 31},
-            "open_sync_prs": [
-                {
-                    "number": 101,
-                    "url": "https://github.com/lomliev/hermes-agent/pull/101",
-                }
-            ],
+            "status": "candidate_pr_exists_review_required_no_action",
+            "blocked": False,
+            "blockers": [],
+            "fresh_refs": {
+                "fork_main_ref": "1" * 40,
+                "upstream_main_ref": "5" * 40,
+                "merge_base": "4" * 40,
+                "behind_by": 31,
+            },
+            "open_fork_prs": [candidate],
+            "candidate_manifest": manifest,
+            "candidate_pr": candidate,
         },
     )
-    monkeypatch.setattr(
-        routine,
-        "cleanup_stale_sync_prs",
-        lambda _prs, _fresh: {"closed": [], "kept": []},
-    )
-    monkeypatch.setattr(routine, "cleanup_old_auto_sync_worktrees", lambda: [])
-    monkeypatch.setattr(
-        routine,
-        "auto_merge_sync_pr_and_start_deploy",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("merge/deploy gate must remain inert")
-        ),
-    )
-
     assert routine.execute(argparse.Namespace(execute=True)) == 0
     receipt = json.loads((state / "auto-sync-pr-latest.json").read_text())
-    assert receipt["status"] == "open_sync_pr_exists_review_required_no_action"
+    assert receipt["status"] == (
+        "candidate_pr_exists_review_required_tail_pending_no_action"
+    )
     assert receipt["pr_number"] == 101
+    assert receipt["candidate_ref_frozen"] is True
+    assert receipt["later_upstream_is_tail_drift"] is True
+    assert receipt["tail_drift_rebinds_candidate"] is False
     assert not (state / "deploy_queue").exists()
 
 
-def test_routine_redacts_exact_and_token_shaped_github_credentials(
+def test_routine_redacts_only_exact_registered_github_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     routine = _load_sync_routine()
     secret = "github_pat_" + "a" * 40
+    unregistered_lookalike = "ghp_" + "b" * 40
     monkeypatch.setenv("GH_TOKEN", secret)
-    value = f"first={secret} second=ghp_{'b' * 40}"
-    redacted = routine.redact_command_output(value)
-    assert secret not in redacted
-    assert "ghp_" not in redacted
-    assert redacted.count("[REDACTED]") == 2
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    value = f"first={secret} second={unregistered_lookalike}"
+
+    assert (
+        routine.redact_command_output(value)
+        == f"first=[REDACTED] second={unregistered_lookalike}"
+    )
+
+
+def test_routine_preserves_unregistered_secret_lookalikes_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routine = _load_sync_routine()
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    value = f"github_pat_{'a' * 40}\nghp_{'b' * 40}\nGhO_{'c' * 40}"
+
+    assert routine.redact_command_output(value) == value
 
 
 def test_module_compiles_under_isolated_stdlib() -> None:

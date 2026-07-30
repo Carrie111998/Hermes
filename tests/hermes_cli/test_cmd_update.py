@@ -324,10 +324,11 @@ class TestCmdUpdateBranchFallback:
         assert "origin/main" in rev_list_cmds[0]
         assert "origin/fix/stoicneko" not in rev_list_cmds[0]
 
-        # pull should use main, not fix/stoicneko
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        # The fetched tracking ref is merged without a second network fetch.
+        merge_cmds = [c for c in commands if "merge --ff-only" in c]
+        assert len(merge_cmds) == 1
+        assert "origin/main" in merge_cmds[0]
+        assert "origin/fix/stoicneko" not in merge_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -346,9 +347,9 @@ class TestCmdUpdateBranchFallback:
         assert len(rev_list_cmds) == 1
         assert "origin/main" in rev_list_cmds[0]
 
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        merge_cmds = [c for c in commands if "merge --ff-only" in c]
+        assert len(merge_cmds) == 1
+        assert "origin/main" in merge_cmds[0]
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -415,7 +416,9 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Restart required to finish the managed Python runtime repair" in captured.out
         assert "long-lived processes still use the previous runtime" in captured.out
-        assert str(backup) in captured.out
+        # A successful cutover needs only a process restart; the internal
+        # backup path is recovery detail and is not exposed in the success UX.
+        assert str(backup) not in captured.out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -790,9 +793,12 @@ class TestCmdUpdateBranchFlag:
         assert any("origin/bb/gui" in c for c in rev_list_cmds), rev_list_cmds
         assert not any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
-        # pull must target bb/gui
-        pull_cmds = [c for c in commands if "pull" in c and "ff-only" in c]
-        assert any("bb/gui" in c and "main" not in c.split() for c in pull_cmds), pull_cmds
+        # The already-fetched tracking ref must target bb/gui.
+        merge_cmds = [c for c in commands if "merge --ff-only" in c]
+        assert any(
+            "origin/bb/gui" in c and "origin/main" not in c
+            for c in merge_cmds
+        ), merge_cmds
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")

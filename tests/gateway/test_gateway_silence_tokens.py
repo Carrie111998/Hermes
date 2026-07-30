@@ -12,6 +12,13 @@ from gateway.platforms.base import MessageEvent, ProcessingOutcome
 from gateway.session import SessionEntry, SessionSource
 from gateway.response_filters import should_suppress_delivery
 
+from gateway.platforms.base import MessageEvent
+
+from gateway.response_filters import (
+    is_intentional_silence_agent_result,
+    is_intentional_silence_response,
+)
+
 
 @pytest.fixture(autouse=True)
 def _reset_gateway_listener_authority():
@@ -337,3 +344,14 @@ async def test_swallowed_agent_exception_is_logical_failure(monkeypatch, tmp_pat
     assert "unexpected error" in response
     assert "private failure detail" not in response
     assert event.logical_processing_outcome is ProcessingOutcome.FAILURE
+
+
+def test_exact_silence_tokens_are_intentional_silence():
+    for token in ("[SILENT]", " SILENT ", "NO_REPLY", "no reply"):
+        assert is_intentional_silence_response(token)
+
+
+def test_blank_and_prose_mentions_are_not_silence():
+    assert not is_intentional_silence_response("")
+    assert not is_intentional_silence_response("Use NO_REPLY when no answer is needed.")
+    assert not is_intentional_silence_response("The reply was [SILENT], intentionally.")

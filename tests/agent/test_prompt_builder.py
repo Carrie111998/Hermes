@@ -83,6 +83,7 @@ class TestContextContentSovereignty:
 
         assert load_soul_md() == content
 
+
 # =========================================================================
 # Content truncation
 # =========================================================================
@@ -131,6 +132,7 @@ class TestTruncateContent:
             return {"context_file_max_chars": 120}
 
         monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", fake_load_config)
         content = "HEAD" + "x" * 160 + "TAIL"
 
         result = _truncate_content(content, "config.md")
@@ -157,6 +159,7 @@ class TestTruncateContent:
             return {"context_file_max_chars": 120}
 
         monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", fake_load_config)
 
         _truncate_content("x" * 180, "warning.md")
 
@@ -174,6 +177,7 @@ class TestTruncateContent:
             return {"context_file_max_chars": 120}
 
         monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", fake_load_config)
 
         # Generate a warning in a fresh child context, then assert it did NOT
         # leak into the parent context's accumulator.
@@ -216,7 +220,10 @@ class TestDynamicContextFileCap:
 
     def test_dynamic_respects_ceiling(self):
         # An enormous window is clamped to the ceiling.
-        assert _dynamic_context_file_max_chars(100_000_000) == _CONTEXT_FILE_DYNAMIC_CEILING
+        assert (
+            _dynamic_context_file_max_chars(100_000_000)
+            == _CONTEXT_FILE_DYNAMIC_CEILING
+        )
 
     def test_none_context_length_falls_back_to_flat_default(self):
         assert _dynamic_context_file_max_chars(None) == CONTEXT_FILE_MAX_CHARS
@@ -233,6 +240,10 @@ class TestDynamicContextFileCap:
             "hermes_cli.config.load_config",
             lambda: {"context_file_max_chars": 1_000},
         )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"context_file_max_chars": 1_000},
+        )
         assert _get_context_file_max_chars(200_000) == 1_000
 
     def test_large_window_avoids_truncation_of_midsize_doc(self):
@@ -247,7 +258,9 @@ class TestDynamicContextFileCap:
     def test_marker_points_to_read_path(self):
         content = "h" * 50_000
         result = _truncate_content(
-            content, "AGENTS.md", context_length=8_000,
+            content,
+            "AGENTS.md",
+            context_length=8_000,
             read_path="/proj/AGENTS.md",
         )
         assert "read_file" in result
@@ -295,7 +308,9 @@ class TestParseSkillFile:
         assert frontmatter == {}
         assert desc == ""
 
-    def test_logs_parse_failures_and_returns_defaults(self, tmp_path, monkeypatch, caplog):
+    def test_logs_parse_failures_and_returns_defaults(
+        self, tmp_path, monkeypatch, caplog
+    ):
         skill_file = tmp_path / "SKILL.md"
         skill_file.write_text("---\nname: broken\n---\n")
 
@@ -364,6 +379,7 @@ class TestBuildSkillsSystemPrompt:
     def _clear_skills_cache(self):
         """Ensure the in-process skills prompt cache doesn't leak between tests."""
         from agent.prompt_builder import clear_skills_system_prompt_cache
+
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -532,9 +548,7 @@ class TestBuildSkillsSystemPrompt:
         first = build_skills_system_prompt()
         assert "cached-skill" in first
 
-        (tmp_path / "config.yaml").write_text(
-            "skills:\n  disabled: [cached-skill]\n"
-        )
+        (tmp_path / "config.yaml").write_text("skills:\n  disabled: [cached-skill]\n")
 
         second = build_skills_system_prompt()
         assert "cached-skill" not in second
@@ -598,7 +612,9 @@ class TestBuildSkillsSystemPrompt:
 
 class TestBuildNousSubscriptionPrompt:
     def test_includes_active_subscription_features(self, monkeypatch):
-        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True
+        )
         monkeypatch.setattr(
             "hermes_cli.nous_subscription.get_nous_subscription_features",
             lambda config=None: NousSubscriptionFeatures(
@@ -606,13 +622,83 @@ class TestBuildNousSubscriptionPrompt:
                 nous_auth_present=True,
                 provider_is_nous=True,
                 features={
-                    "web": NousFeatureState("web", "Web tools", True, True, True, True, False, True, "firecrawl"),
-                    "image_gen": NousFeatureState("image_gen", "Image generation", True, True, True, True, False, True, "Nous Subscription"),
-                    "video_gen": NousFeatureState("video_gen", "Video generation", False, False, False, False, False, False, ""),
-                    "tts": NousFeatureState("tts", "OpenAI TTS", True, True, True, True, False, True, "OpenAI TTS"),
-                    "stt": NousFeatureState("stt", "Speech-to-text", True, True, True, True, False, True, "OpenAI Whisper"),
-                    "browser": NousFeatureState("browser", "Browser automation", True, True, True, True, False, True, "Browser Use"),
-                    "modal": NousFeatureState("modal", "Modal execution", False, True, False, False, False, True, "local"),
+                    "web": NousFeatureState(
+                        "web",
+                        "Web tools",
+                        True,
+                        True,
+                        True,
+                        True,
+                        False,
+                        True,
+                        "firecrawl",
+                    ),
+                    "image_gen": NousFeatureState(
+                        "image_gen",
+                        "Image generation",
+                        True,
+                        True,
+                        True,
+                        True,
+                        False,
+                        True,
+                        "Nous Subscription",
+                    ),
+                    "video_gen": NousFeatureState(
+                        "video_gen",
+                        "Video generation",
+                        False,
+                        False,
+                        False,
+                        False,
+                        False,
+                        False,
+                        "",
+                    ),
+                    "tts": NousFeatureState(
+                        "tts",
+                        "OpenAI TTS",
+                        True,
+                        True,
+                        True,
+                        True,
+                        False,
+                        True,
+                        "OpenAI TTS",
+                    ),
+                    "stt": NousFeatureState(
+                        "stt",
+                        "Speech-to-text",
+                        True,
+                        True,
+                        True,
+                        True,
+                        False,
+                        True,
+                        "OpenAI Whisper",
+                    ),
+                    "browser": NousFeatureState(
+                        "browser",
+                        "Browser automation",
+                        True,
+                        True,
+                        True,
+                        True,
+                        False,
+                        True,
+                        "Browser Use",
+                    ),
+                    "modal": NousFeatureState(
+                        "modal",
+                        "Modal execution",
+                        False,
+                        True,
+                        False,
+                        False,
+                        False,
+                        True,
+                        "local",
+                    ),
                 },
             ),
         )
@@ -621,10 +707,17 @@ class TestBuildNousSubscriptionPrompt:
 
         assert "Browser Use" in prompt
         assert "Modal execution is optional" in prompt
-        assert "do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys" in prompt
+        assert (
+            "do not ask the user for Firecrawl, FAL, OpenAI TTS, OpenAI Whisper, or Browser-Use API keys"
+            in prompt
+        )
 
-    def test_non_subscriber_prompt_includes_relevant_upgrade_guidance(self, monkeypatch):
-        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True)
+    def test_non_subscriber_prompt_includes_relevant_upgrade_guidance(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: True
+        )
         monkeypatch.setattr(
             "hermes_cli.nous_subscription.get_nous_subscription_features",
             lambda config=None: NousSubscriptionFeatures(
@@ -632,13 +725,67 @@ class TestBuildNousSubscriptionPrompt:
                 nous_auth_present=False,
                 provider_is_nous=False,
                 features={
-                    "web": NousFeatureState("web", "Web tools", True, False, False, False, False, True, ""),
-                    "image_gen": NousFeatureState("image_gen", "Image generation", True, False, False, False, False, True, ""),
-                    "video_gen": NousFeatureState("video_gen", "Video generation", False, False, False, False, False, False, ""),
-                    "tts": NousFeatureState("tts", "OpenAI TTS", True, False, False, False, False, True, ""),
-                    "stt": NousFeatureState("stt", "Speech-to-text", True, False, False, False, False, True, ""),
-                    "browser": NousFeatureState("browser", "Browser automation", True, False, False, False, False, True, ""),
-                    "modal": NousFeatureState("modal", "Modal execution", False, False, False, False, False, True, ""),
+                    "web": NousFeatureState(
+                        "web", "Web tools", True, False, False, False, False, True, ""
+                    ),
+                    "image_gen": NousFeatureState(
+                        "image_gen",
+                        "Image generation",
+                        True,
+                        False,
+                        False,
+                        False,
+                        False,
+                        True,
+                        "",
+                    ),
+                    "video_gen": NousFeatureState(
+                        "video_gen",
+                        "Video generation",
+                        False,
+                        False,
+                        False,
+                        False,
+                        False,
+                        False,
+                        "",
+                    ),
+                    "tts": NousFeatureState(
+                        "tts", "OpenAI TTS", True, False, False, False, False, True, ""
+                    ),
+                    "stt": NousFeatureState(
+                        "stt",
+                        "Speech-to-text",
+                        True,
+                        False,
+                        False,
+                        False,
+                        False,
+                        True,
+                        "",
+                    ),
+                    "browser": NousFeatureState(
+                        "browser",
+                        "Browser automation",
+                        True,
+                        False,
+                        False,
+                        False,
+                        False,
+                        True,
+                        "",
+                    ),
+                    "modal": NousFeatureState(
+                        "modal",
+                        "Modal execution",
+                        False,
+                        False,
+                        False,
+                        False,
+                        False,
+                        True,
+                        "",
+                    ),
                 },
             ),
         )
@@ -649,7 +796,9 @@ class TestBuildNousSubscriptionPrompt:
         assert "Do not mention subscription unless" in prompt
 
     def test_feature_flag_off_returns_empty_prompt(self, monkeypatch):
-        monkeypatch.setattr("tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: False)
+        monkeypatch.setattr(
+            "tools.tool_backend_helpers.managed_nous_tools_enabled", lambda: False
+        )
 
         prompt = build_nous_subscription_prompt({"web_search"})
 
@@ -702,7 +851,9 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
         assert "Never give up" in result
 
-    def test_loads_agents_md_in_install_tree_fallback_for_cli(self, monkeypatch, tmp_path):
+    def test_loads_agents_md_in_install_tree_fallback_for_cli(
+        self, monkeypatch, tmp_path
+    ):
         # CLI/TUI surfaces launch from the user's shell cwd, so an in-tree
         # fallback there is deliberate — allow_install_tree_fallback=True
         # (system_prompt.py passes it for platform cli/tui) keeps discovery on.
@@ -725,8 +876,12 @@ class TestBuildContextFilesPrompt:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
         hermes_home = tmp_path / "hermes_home"
         hermes_home.mkdir()
-        (hermes_home / "SOUL.md").write_text("Be concise and friendly.", encoding="utf-8")
-        (tmp_path / "SOUL.md").write_text("cwd soul should be ignored", encoding="utf-8")
+        (hermes_home / "SOUL.md").write_text(
+            "Be concise and friendly.", encoding="utf-8"
+        )
+        (tmp_path / "SOUL.md").write_text(
+            "cwd soul should be ignored", encoding="utf-8"
+        )
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Be concise and friendly." in result
         assert "cwd soul should be ignored" not in result
@@ -735,7 +890,9 @@ class TestBuildContextFilesPrompt:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
         hermes_home = tmp_path / "hermes_home"
         hermes_home.mkdir()
-        (hermes_home / "SOUL.md").write_text("Be concise and friendly.", encoding="utf-8")
+        (hermes_home / "SOUL.md").write_text(
+            "Be concise and friendly.", encoding="utf-8"
+        )
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Be concise and friendly." in result
         assert "If SOUL.md is present" not in result
@@ -1129,6 +1286,7 @@ class TestPromptBuilderConstants:
         # Bot API 10.1 guidance; it is injected conditionally in
         # system_prompt.py when rich_messages: true.
         from agent.prompt_builder import TELEGRAM_RICH_MESSAGES_HINT
+
         rich_lowered = TELEGRAM_RICH_MESSAGES_HINT.lower()
         assert "rich markdown" in rich_lowered
         assert "table" in rich_lowered
@@ -1176,6 +1334,7 @@ class TestPromptBuilderConstants:
 # Environment hints
 # =========================================================================
 
+
 class TestEnvironmentHints:
     def test_wsl_hint_constant_mentions_mnt(self):
         assert "/mnt/c/" in WSL_ENVIRONMENT_HINT
@@ -1183,6 +1342,7 @@ class TestEnvironmentHints:
 
     def test_build_environment_hints_on_wsl(self, monkeypatch):
         import agent.prompt_builder as _pb
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: True)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         _pb._clear_backend_probe_cache()
@@ -1195,6 +1355,7 @@ class TestEnvironmentHints:
     def test_build_environment_hints_on_linux_local(self, monkeypatch):
         import agent.prompt_builder as _pb
         import sys, platform
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(platform, "system", lambda: "Linux")
@@ -1215,6 +1376,7 @@ class TestEnvironmentHints:
     def test_build_environment_hints_on_windows_local(self, monkeypatch):
         import agent.prompt_builder as _pb
         import sys
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
@@ -1232,6 +1394,7 @@ class TestEnvironmentHints:
     def test_build_environment_hints_on_macos_local(self, monkeypatch):
         import agent.prompt_builder as _pb
         import sys
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
@@ -1243,10 +1406,13 @@ class TestEnvironmentHints:
         assert "PowerShell" not in result
         assert "hostname" not in result
 
-    def test_build_environment_hints_suppresses_host_on_docker_backend(self, monkeypatch):
+    def test_build_environment_hints_suppresses_host_on_docker_backend(
+        self, monkeypatch
+    ):
         """Docker/remote backends must hide host info — the agent can only touch the backend."""
         import agent.prompt_builder as _pb
         import sys
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.setenv("TERMINAL_ENV", "docker")
@@ -1263,10 +1429,13 @@ class TestEnvironmentHints:
         assert "Terminal backend: docker" in result
         assert "inside" in result.lower()
 
-    def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(self, monkeypatch, tmp_path):
+    def test_build_environment_hints_uses_terminal_cwd_over_launch_dir(
+        self, monkeypatch, tmp_path
+    ):
         """THE BUG: gateway/cron set TERMINAL_CWD but the prompt emitted os.getcwd()
         (the daemon launch dir). Regression for #24882/#24969/#27383/#29265."""
         import agent.prompt_builder as _pb
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         configured = tmp_path / "workspace"
@@ -1274,11 +1443,16 @@ class TestEnvironmentHints:
         monkeypatch.setenv("TERMINAL_CWD", str(configured))
         monkeypatch.chdir(tmp_path)
         _pb._clear_backend_probe_cache()
-        assert f"Current working directory: {configured}" in _pb.build_environment_hints()
+        assert (
+            f"Current working directory: {configured}" in _pb.build_environment_hints()
+        )
 
-    def test_build_environment_hints_falls_back_to_launch_dir(self, monkeypatch, tmp_path):
+    def test_build_environment_hints_falls_back_to_launch_dir(
+        self, monkeypatch, tmp_path
+    ):
         """The #19242 local-CLI contract: no TERMINAL_CWD → the launch dir."""
         import agent.prompt_builder as _pb
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
@@ -1289,6 +1463,7 @@ class TestEnvironmentHints:
     def test_build_environment_hints_uses_live_probe_when_available(self, monkeypatch):
         """When the probe succeeds, its output must appear in the hint block."""
         import agent.prompt_builder as _pb
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.setenv("TERMINAL_ENV", "modal")
         fake_probe_output = "  OS: Linux 6.8.0\n  User: root\n  Home: /root\n  Working directory: /workspace"
@@ -1331,6 +1506,7 @@ class TestEnvironmentHints:
         # Patch the REAL factory in tools.terminal_tool — the probe imports it
         # locally, so the import itself must succeed (the bug was here).
         import tools.terminal_tool as _tt
+
         monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
 
         line = _pb._probe_remote_backend("docker")
@@ -1342,6 +1518,7 @@ class TestEnvironmentHints:
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""
         import agent.prompt_builder as _pb
+
         for backend in ("docker", "singularity", "modal", "daytona", "ssh"):
             assert backend in _pb._REMOTE_TERMINAL_BACKENDS, (
                 f"{backend!r} must be in _REMOTE_TERMINAL_BACKENDS so its host "
@@ -1351,9 +1528,12 @@ class TestEnvironmentHints:
     def test_environment_hint_from_env_var_is_appended(self, monkeypatch):
         """HERMES_ENVIRONMENT_HINT lets an embedder describe the runtime env."""
         import agent.prompt_builder as _pb
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
-        monkeypatch.setenv("HERMES_ENVIRONMENT_HINT", "Running inside an OpenShell sandbox.")
+        monkeypatch.setenv(
+            "HERMES_ENVIRONMENT_HINT", "Running inside an OpenShell sandbox."
+        )
         _pb._clear_backend_probe_cache()
         result = _pb.build_environment_hints()
         assert "Running inside an OpenShell sandbox." in result
@@ -1363,11 +1543,16 @@ class TestEnvironmentHints:
     def test_environment_hint_env_var_overrides_config(self, monkeypatch):
         """Env var wins over config.yaml agent.environment_hint."""
         import agent.prompt_builder as _pb
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.setenv("HERMES_ENVIRONMENT_HINT", "ENV-WINS")
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
+            lambda: {"agent": {"environment_hint": "CONFIG-VALUE"}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
             lambda: {"agent": {"environment_hint": "CONFIG-VALUE"}},
         )
         _pb._clear_backend_probe_cache()
@@ -1378,11 +1563,16 @@ class TestEnvironmentHints:
     def test_environment_hint_falls_back_to_config(self, monkeypatch):
         """With no env var, the config.yaml value is used."""
         import agent.prompt_builder as _pb
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.delenv("HERMES_ENVIRONMENT_HINT", raising=False)
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
+            lambda: {"agent": {"environment_hint": "CONFIG-VALUE"}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
             lambda: {"agent": {"environment_hint": "CONFIG-VALUE"}},
         )
         _pb._clear_backend_probe_cache()
@@ -1392,10 +1582,14 @@ class TestEnvironmentHints:
     def test_environment_hint_empty_by_default(self, monkeypatch):
         """No hint configured anywhere → no embedder text, host block intact."""
         import agent.prompt_builder as _pb
+
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
         monkeypatch.delenv("HERMES_ENVIRONMENT_HINT", raising=False)
         monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"agent": {}})
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly", lambda: {"agent": {}}
+        )
         _pb._clear_backend_probe_cache()
         result = _pb.build_environment_hints()
         assert "Host:" in result
@@ -1405,55 +1599,96 @@ class TestEnvironmentHints:
 # Conditional skill activation
 # =========================================================================
 
+
 class TestSkillShouldShow:
     def test_no_filter_info_always_shows(self):
         assert _skill_should_show({}, None, None) is True
 
     def test_empty_conditions_always_shows(self):
-        assert _skill_should_show(
-            {"fallback_for_toolsets": [], "requires_toolsets": [],
-             "fallback_for_tools": [], "requires_tools": []},
-            {"web_search"}, {"web"}
-        ) is True
+        assert (
+            _skill_should_show(
+                {
+                    "fallback_for_toolsets": [],
+                    "requires_toolsets": [],
+                    "fallback_for_tools": [],
+                    "requires_tools": [],
+                },
+                {"web_search"},
+                {"web"},
+            )
+            is True
+        )
 
     def test_fallback_hidden_when_toolset_available(self):
-        conditions = {"fallback_for_toolsets": ["web"], "requires_toolsets": [],
-                      "fallback_for_tools": [], "requires_tools": []}
+        conditions = {
+            "fallback_for_toolsets": ["web"],
+            "requires_toolsets": [],
+            "fallback_for_tools": [],
+            "requires_tools": [],
+        }
         assert _skill_should_show(conditions, set(), {"web"}) is False
 
     def test_fallback_shown_when_toolset_unavailable(self):
-        conditions = {"fallback_for_toolsets": ["web"], "requires_toolsets": [],
-                      "fallback_for_tools": [], "requires_tools": []}
+        conditions = {
+            "fallback_for_toolsets": ["web"],
+            "requires_toolsets": [],
+            "fallback_for_tools": [],
+            "requires_tools": [],
+        }
         assert _skill_should_show(conditions, set(), set()) is True
 
     def test_requires_shown_when_toolset_available(self):
-        conditions = {"fallback_for_toolsets": [], "requires_toolsets": ["terminal"],
-                      "fallback_for_tools": [], "requires_tools": []}
+        conditions = {
+            "fallback_for_toolsets": [],
+            "requires_toolsets": ["terminal"],
+            "fallback_for_tools": [],
+            "requires_tools": [],
+        }
         assert _skill_should_show(conditions, set(), {"terminal"}) is True
 
     def test_requires_hidden_when_toolset_missing(self):
-        conditions = {"fallback_for_toolsets": [], "requires_toolsets": ["terminal"],
-                      "fallback_for_tools": [], "requires_tools": []}
+        conditions = {
+            "fallback_for_toolsets": [],
+            "requires_toolsets": ["terminal"],
+            "fallback_for_tools": [],
+            "requires_tools": [],
+        }
         assert _skill_should_show(conditions, set(), set()) is False
 
     def test_fallback_for_tools_hidden_when_tool_available(self):
-        conditions = {"fallback_for_toolsets": [], "requires_toolsets": [],
-                      "fallback_for_tools": ["web_search"], "requires_tools": []}
+        conditions = {
+            "fallback_for_toolsets": [],
+            "requires_toolsets": [],
+            "fallback_for_tools": ["web_search"],
+            "requires_tools": [],
+        }
         assert _skill_should_show(conditions, {"web_search"}, set()) is False
 
     def test_fallback_for_tools_shown_when_tool_missing(self):
-        conditions = {"fallback_for_toolsets": [], "requires_toolsets": [],
-                      "fallback_for_tools": ["web_search"], "requires_tools": []}
+        conditions = {
+            "fallback_for_toolsets": [],
+            "requires_toolsets": [],
+            "fallback_for_tools": ["web_search"],
+            "requires_tools": [],
+        }
         assert _skill_should_show(conditions, set(), set()) is True
 
     def test_requires_tools_hidden_when_tool_missing(self):
-        conditions = {"fallback_for_toolsets": [], "requires_toolsets": [],
-                      "fallback_for_tools": [], "requires_tools": ["terminal"]}
+        conditions = {
+            "fallback_for_toolsets": [],
+            "requires_toolsets": [],
+            "fallback_for_tools": [],
+            "requires_tools": ["terminal"],
+        }
         assert _skill_should_show(conditions, set(), set()) is False
 
     def test_requires_tools_shown_when_tool_available(self):
-        conditions = {"fallback_for_toolsets": [], "requires_toolsets": [],
-                      "fallback_for_tools": [], "requires_tools": ["terminal"]}
+        conditions = {
+            "fallback_for_toolsets": [],
+            "requires_toolsets": [],
+            "fallback_for_tools": [],
+            "requires_tools": ["terminal"],
+        }
         assert _skill_should_show(conditions, {"terminal"}, set()) is True
 
 
@@ -1461,6 +1696,7 @@ class TestBuildSkillsSystemPromptConditional:
     @pytest.fixture(autouse=True)
     def _clear_skills_cache(self):
         from agent.prompt_builder import clear_skills_system_prompt_cache
+
         clear_skills_system_prompt_cache(clear_snapshot=True)
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)

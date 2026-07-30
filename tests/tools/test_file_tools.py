@@ -840,6 +840,15 @@ class TestSilentFileMisplacementE2E:
         import tools.terminal_tool as tt
         import tools.file_tools as ft
 
+        # This regression exercises cwd durability.  On macOS the pytest
+        # directory resolves below /private/var, which is independently
+        # protected by the production sensitive-path gate.
+        monkeypatch.setattr(
+            ft,
+            "_check_sensitive_path",
+            lambda _path, _task_id="default": None,
+        )
+
         project = tmp_path / "project"
         config_default = tmp_path / "config_default"
         project.mkdir()

@@ -318,3 +318,116 @@ class TestReportAndHash:
         file_path = tmp_path / "single.txt"
         file_path.write_text("content")
         assert content_hash(file_path).startswith("sha256:")
+
+
+class TestCheckStructure:
+    def test_structural_limits(self, tmp_path):
+        for i in range(MAX_FILE_COUNT + 5):
+            (tmp_path / f"file_{i}.txt").write_text("x")
+        (tmp_path / "big.txt").write_text("x" * ((MAX_SINGLE_FILE_KB + 1) * 1024))
+        (tmp_path / "malware.exe").write_bytes(b"\x00" * 100)
+
+        ids = {fi.pattern_id for fi in _check_structure(tmp_path)}
+        assert {"too_many_files", "oversized_file", "binary_file"} <= ids
+
+    def test_symlink_escape(self, tmp_path):
+        target = tmp_path / "outside"
+        target.mkdir()
+        link = tmp_path / "skill" / "escape"
+        (tmp_path / "skill").mkdir()
+        link.symlink_to(target)
+        findings = _check_structure(tmp_path / "skill")
+        assert any(fi.pattern_id == "symlink_escape" for fi in findings)
+
+    @pytest.mark.skipif(
+        not _can_symlink(), reason="Symlinks need elevated privileges"
+    )
+    def test_symlink_prefix_confusion_blocked(self, tmp_path):
+        """A symlink resolving to a sibling dir with a shared prefix must be caught.
+
+        Regression: startswith('axolotl') matches 'axolotl-backdoor'.
+        is_relative_to() correctly rejects this.
+        """
+        skills = tmp_path / "skills"
+        skill_dir = skills / "axolotl"
+        sibling_dir = skills / "axolotl-backdoor"
+        skill_dir.mkdir(parents=True)
+        sibling_dir.mkdir(parents=True)
+
+        malicious = sibling_dir / "malicious.py"
+        malicious.write_text("evil code")
+
+        link = skill_dir / "helper.py"
+        link.symlink_to(malicious)
+
+        findings = _check_structure(skill_dir)
+        assert any(fi.pattern_id == "symlink_escape" for fi in findings)
+
+    @pytest.mark.skipif(
+        not _can_symlink(), reason="Symlinks need elevated privileges"
+    )
+    def test_symlink_within_skill_dir_allowed(self, tmp_path):
+        """A symlink that stays within the skill directory is fine."""
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        real_file = skill_dir / "real.py"
+        real_file.write_text("print('ok')")
+        link = skill_dir / "alias.py"
+        link.symlink_to(real_file)
+
+        findings = _check_structure(skill_dir)
+        assert not any(fi.pattern_id == "symlink_escape" for fi in findings)
+
+    def test_clean_structure(self, tmp_path):
+        (tmp_path / "SKILL.md").write_text("# Skill\n")
+        (tmp_path / "main.py").write_text("print(1)\n")
+        findings = _check_structure(tmp_path)
+        assert findings == []
+
+class TestContentHash:
+    def test_hash_deterministic_for_dir_and_file(self, tmp_path):
+        (tmp_path / "a.txt").write_text("hello")
+        (tmp_path / "b.txt").write_text("world")
+        h1 = content_hash(tmp_path)
+        assert h1.startswith("sha256:")
+        assert h1 == content_hash(tmp_path)
+        assert content_hash(tmp_path / "a.txt").startswith("sha256:")
+
+    def test_hash_changes_with_content(self, tmp_path):
+        f = tmp_path / "file.txt"
+        f.write_text("version1")
+        h1 = content_hash(tmp_path)
+        f.write_text("version2")
+        h2 = content_hash(tmp_path)
+        assert h1 != h2
+
+class TestSkillIgnore:
+    def test_patterns_and_defaults(self, tmp_path):
+        ig = _load_skill_ignore(tmp_path)  # no ignore file -> nothing ignored
+        assert ig("docs/plans/x.md") is False
+        # The ignore files themselves are always excluded.
+        assert ig(".skillignore") is True
+        assert ig(".clawhubignore") is True
+
+        (tmp_path / ".skillignore").write_text(
+            "# comment\n\n  \ndocs/\nrelease-notes.md\n*.jsonl\nSKILL.md\n"
+        )
+        ig = _load_skill_ignore(tmp_path)
+        assert ig("docs/plans/x.md") is True  # directory pattern -> whole subtree
+        assert ig("release-notes.md") is True
+        assert ig("fixtures/data.jsonl") is True  # glob
+        assert ig("scripts/run.py") is False
+        assert ig("SKILL.md") is False  # never ignorable
+
+
+    def test_ignored_files_not_counted_in_structure(self, tmp_path):
+        skill_dir = tmp_path / "skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("# Skill\n")
+        (skill_dir / ".skillignore").write_text("junk/\n")
+        junk = skill_dir / "junk"
+        junk.mkdir()
+        for i in range(MAX_FILE_COUNT + 10):
+            (junk / f"f{i}.txt").write_text("x")
+        result = scan_skill(skill_dir, source="community")
+        assert not any(fi.pattern_id == "too_many_files" for fi in result.findings)

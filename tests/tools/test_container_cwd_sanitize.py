@@ -60,10 +60,17 @@ class TestIsUnusableContainerCwd:
         assert "/home/" in tt._HOST_CWD_PREFIXES
         assert "/Users/" in tt._HOST_CWD_PREFIXES
 
-    def test_container_backends_set(self):
-        assert tt._CONTAINER_BACKENDS == frozenset(
-            {"docker", "singularity", "modal", "daytona", "isolated_worker"}
-        )
+    def test_known_container_backends_are_covered(self):
+        # Assert the behaviorally relevant minimum without freezing the whole
+        # registry and turning every new backend into a test failure.
+        assert {
+            "docker",
+            "singularity",
+            "modal",
+            "daytona",
+            "isolated_worker",
+            "vercel_sandbox",
+        }.issubset(tt._CONTAINER_BACKENDS)
 
 
 class TestOverrideCwdSanitizedAtCallSite:

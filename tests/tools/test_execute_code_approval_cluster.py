@@ -8,7 +8,7 @@ Covers the canonical fix for issues #4146, #27303, #30882, #33057:
   2. Both execute_code RPC threads are wrapped with that helper (source guard).
   3. tools.approval.check_execute_code_guard — the entry-point guard decision
      matrix (isolated backends, yolo/off, cron-deny, headless-local,
-     gateway approve/deny/timeout/missing-notify, retired smart-to-manual migration).
+     gateway approve/deny/timeout/missing-notify).
   4. tools.code_execution_tool._scrub_child_env — broad HERMES_ prefix dropped,
      operational allowlist kept, DSN/WEBHOOK blocked, passthrough precedence.
 """
@@ -23,6 +23,7 @@ import pytest
 
 from tools import approval as A
 from tools.thread_context import propagate_context_to_thread
+import json
 
 
 # ---------------------------------------------------------------------------
@@ -262,13 +263,6 @@ def test_guard_gateway_missing_notify_is_pending(gw_session):
     res = A.check_execute_code_guard("import os", "local")
     assert res["approved"] is False
     assert res["status"] == "pending_approval"
-
-
-def test_retired_smart_mode_falls_through_to_owner_approval(gw_session, monkeypatch):
-    monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
-    _register_resolver(gw_session, "once")
-    res = A.check_execute_code_guard("import os", "local")
-    assert res["approved"] is True
 
 
 def test_guard_session_yolo_bypasses(gw_session):

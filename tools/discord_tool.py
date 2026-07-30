@@ -35,7 +35,7 @@ import urllib.parse
 import urllib.request
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from tools.registry import registry
+from tools.registry import registry, tool_error
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -301,7 +301,6 @@ _capability_bg_lock = threading.Lock()
 
 
 def _capability_disk_cache_path() -> "Path":
-    from pathlib import Path
 
     from hermes_constants import get_hermes_home
 
@@ -1406,14 +1405,14 @@ def _run_discord_action(
     """Shared handler logic for both discord tools."""
     token = _get_bot_token()
     if not token:
-        return json.dumps({"error": "DISCORD_BOT_TOKEN not configured."})
+        return tool_error("DISCORD_BOT_TOKEN not configured.")
 
     action_fn = valid_actions.get(action)
     if not action_fn:
-        return json.dumps({
-            "error": f"Unknown action: {action}",
-            "available_actions": list(valid_actions.keys()),
-        })
+        return tool_error(
+            f"Unknown action: {action}",
+            available_actions=list(valid_actions.keys()),
+        )
 
     writer_policy_required = _writer_policy_required()
     if writer_policy_required and action in _WRITER_POLICY_FORBIDDEN_ENUMERATIONS:
@@ -1443,12 +1442,10 @@ def _run_discord_action(
     # actions through).
     allowlist = _load_allowed_actions_config()
     if allowlist is not None and action not in allowlist:
-        return json.dumps({
-            "error": (
-                f"Action '{action}' is disabled by config (discord.server_actions). "
-                f"Allowed: {', '.join(allowlist) if allowlist else '<none>'}"
-            ),
-        })
+        return tool_error(
+            f"Action '{action}' is disabled by config (discord.server_actions). "
+            f"Allowed: {', '.join(allowlist) if allowlist else '<none>'}"
+        )
 
     local_vars = {
         "guild_id": guild_id,
@@ -1465,9 +1462,9 @@ def _run_discord_action(
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
     if missing:
-        return json.dumps({
-            "error": f"Missing required parameters for '{action}': {', '.join(missing)}",
-        })
+        return tool_error(
+            f"Missing required parameters for '{action}': {', '.join(missing)}"
+        )
 
     if action == "create_thread":
         try:
@@ -1516,11 +1513,11 @@ def _run_discord_action(
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)
         if e.status == 403:
-            return json.dumps({"error": _enrich_403(action, e.body)})
-        return json.dumps({"error": str(e)})
+            return tool_error(_enrich_403(action, e.body))
+        return tool_error(str(e))
     except Exception as e:
         logger.exception("Unexpected error in %s action '%s'", tool_label, action)
-        return json.dumps({"error": f"Unexpected error: {e}"})
+        return tool_error(f"Unexpected error: {e}")
 
 
 def discord_core(action: str, **kwargs) -> str:

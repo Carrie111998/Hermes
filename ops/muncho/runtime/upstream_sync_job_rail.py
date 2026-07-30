@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -79,6 +78,9 @@ DISCORD_CHANNEL_ID = "1504852355588423801"
 RUN_TIMEOUT_SECONDS = 45 * 60
 MAX_CAPTURE_BYTES = 8 * 1024 * 1024
 MAX_PUBLIC_REPORTS = 80
+EXIT_PASS = 0
+EXIT_PARTIAL = 2
+EXIT_BLOCKED = 3
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_]{20,4096}$")
@@ -208,9 +210,17 @@ def validate_digest(value: object, label: str) -> str:
 
 
 def release_root(revision: str) -> Path:
-    if _SHA40.fullmatch(revision) is None:
+    if not isinstance(revision, str) or _SHA40.fullmatch(revision) is None:
         raise DualSyncRailError("dual_sync_revision_invalid")
     return RELEASES_ROOT / f"hermes-agent-{revision[:12]}"
+
+
+def exact_revision_marker(revision: str) -> bytes:
+    """Return the one canonical on-disk framing for a release revision."""
+
+    if not isinstance(revision, str) or _SHA40.fullmatch(revision) is None:
+        raise DualSyncRailError("dual_sync_revision_invalid")
+    return revision.encode("ascii", errors="strict") + b"\n"
 
 
 def source_paths(release: Path) -> dict[str, Path]:
@@ -637,7 +647,7 @@ def build_package(revision: str, sender_revision: str) -> RailPackage:
     if resolved != release:
         raise DualSyncRailError("dual_sync_release_not_final_address")
     marker = read_regular(release / SOURCE_MARKER_RELATIVE, maximum=128)
-    if marker.decode("ascii", errors="strict").strip() != revision:
+    if marker != exact_revision_marker(revision):
         raise DualSyncRailError("dual_sync_release_marker_mismatch")
     interpreter = release / ".venv/bin/python"
     if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
@@ -654,7 +664,7 @@ def build_package(revision: str, sender_revision: str) -> RailPackage:
         sender_release / SOURCE_MARKER_RELATIVE,
         maximum=128,
     )
-    if sender_marker.decode("ascii", errors="strict").strip() != sender_revision:
+    if sender_marker != exact_revision_marker(sender_revision):
         raise DualSyncRailError("dual_sync_sender_release_marker_mismatch")
     sender_python = sender_release / ".venv/bin/python"
     if not sender_python.is_file() or not os.access(sender_python, os.X_OK):
@@ -756,10 +766,8 @@ def validate_manifest(
         or manifest.get("sender_revision") != sender_revision
         or manifest.get("sender_release_root")
         != str(release_root(sender_revision))
-        or _SHA256.fullmatch(
-            str(manifest.get("sender_interpreter_sha256") or "")
-        )
-        is None
+        or not isinstance(manifest.get("sender_interpreter_sha256"), str)
+        or _SHA256.fullmatch(manifest["sender_interpreter_sha256"]) is None
         or manifest.get("github_credential_value_recorded") is not False
         or manifest.get("sync_service_model_or_provider_dependency") is not False
         or manifest.get("sync_service_discord_dependency") is not False
@@ -853,7 +861,7 @@ def credential() -> str:
     if not directory or not os.path.isabs(directory):
         raise DualSyncRailError("dual_sync_credentials_directory_invalid")
     raw = read_regular(Path(directory) / CREDENTIAL_NAME, maximum=4096)
-    value = raw.decode("ascii", errors="strict").strip()
+    value = raw.decode("ascii", errors="strict")
     if _TOKEN.fullmatch(value) is None:
         raise DualSyncRailError("dual_sync_github_credential_invalid")
     return value
@@ -864,7 +872,7 @@ def attest_release(args: argparse.Namespace) -> tuple[Path, Mapping[str, Path]]:
     if release.resolve(strict=True) != release:
         raise DualSyncRailError("dual_sync_release_not_final_address")
     marker = read_regular(release / SOURCE_MARKER_RELATIVE, maximum=128)
-    if marker.decode("ascii", errors="strict").strip() != args.revision:
+    if marker != exact_revision_marker(args.revision):
         raise DualSyncRailError("dual_sync_release_marker_mismatch")
     paths = source_paths(release)
     expected = {
@@ -911,28 +919,10 @@ def load_json(path: Path) -> Mapping[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def cleanup_managed_worktrees(root: Path, *, prefix: str) -> dict[str, int]:
-    """Remove only rail-owned worktrees so one job cannot starve the next."""
+def no_worktree_cleanup_receipt() -> dict[str, int]:
+    """Record that the rail performs no name-inferred destructive cleanup."""
 
-    result = {"removed": 0, "failed": 0}
-    try:
-        children = list(root.iterdir())
-    except OSError:
-        return {**result, "failed": 1}
-    for child in children:
-        if (
-            not child.name.startswith(prefix)
-            or child.is_symlink()
-            or not child.is_dir()
-        ):
-            continue
-        try:
-            shutil.rmtree(child)
-        except OSError:
-            result["failed"] += 1
-        else:
-            result["removed"] += 1
-    return result
+    return {"removed": 0, "failed": 0}
 
 
 def run_child(
@@ -942,6 +932,10 @@ def run_child(
     environment: Mapping[str, str],
     report_path: Path,
 ) -> ChildResult:
+    # The child report is a run result, not a cache. Remove only this exact
+    # rail-owned path before launch so a crash cannot replay a prior run's
+    # apparently valid status.
+    report_path.unlink(missing_ok=True)
     with tempfile.TemporaryFile(dir=RUNTIME_ROOT) as stdout, tempfile.TemporaryFile(
         dir=RUNTIME_ROOT
     ) as stderr:
@@ -976,13 +970,15 @@ def run_child(
 
 
 def safe_code(value: object, fallback: str = "unknown") -> str:
-    text = str(value or "")
-    return text if _SAFE_CODE.fullmatch(text) else fallback
+    if not isinstance(value, str):
+        return fallback
+    return value if _SAFE_CODE.fullmatch(value) else fallback
 
 
 def safe_sha(value: object) -> str | None:
-    text = str(value or "")
-    return text if _SHA40.fullmatch(text) else None
+    if not isinstance(value, str):
+        return None
+    return value if _SHA40.fullmatch(value) else None
 
 
 def safe_count(value: object) -> int | None:
@@ -992,18 +988,27 @@ def safe_count(value: object) -> int | None:
 
 
 def safe_pr(value: object) -> str | None:
-    text = str(value or "")
-    return text if _PR_URL.fullmatch(text) else None
+    if not isinstance(value, str):
+        return None
+    return value if _PR_URL.fullmatch(value) else None
 
 
 def muncho_component(result: ChildResult) -> dict[str, Any]:
     report = result.report or {}
     outcome = safe_code(report.get("status"), "missing_report")
+    blocked = report.get("blocked")
     if result.timed_out:
         status, blocker = "BLOCKED", "timeout"
     elif not report:
         status, blocker = "BLOCKED", "missing_report"
-    elif outcome.startswith("blocked_"):
+    elif type(blocked) is not bool:
+        status, blocker = "BLOCKED", "invalid_blocked_field"
+    elif (
+        (blocked is True and result.returncode != 2)
+        or (blocked is False and result.returncode != 0)
+    ):
+        status, blocker = "BLOCKED", "child_exit_status_mismatch"
+    elif blocked is True:
         status, blocker = "BLOCKED", outcome
     elif outcome == "no_drift_no_action":
         status, blocker = "PASS", None
@@ -1026,11 +1031,32 @@ def muncho_component(result: ChildResult) -> dict[str, Any]:
 
 def skyai_component(result: ChildResult) -> dict[str, Any]:
     report = result.report or {}
-    status = str(report.get("status") or "BLOCKED").upper()
-    if status not in {"PASS", "PARTIAL", "BLOCKED"}:
-        status = "BLOCKED"
+    exact_status = report.get("status")
+    status_valid = (
+        isinstance(exact_status, str)
+        and exact_status in {"PASS", "PARTIAL", "BLOCKED"}
+    )
+    status = exact_status if status_valid else "BLOCKED"
+    blocker_value = report.get("blocker")
+    blocker = (
+        safe_code(blocker_value, "invalid_blocker")
+        if blocker_value is not None
+        else None
+    )
     if result.timed_out:
-        status = "BLOCKED"
+        status, blocker = "BLOCKED", "timeout"
+    elif not report:
+        status, blocker = "BLOCKED", "missing_report"
+    elif not status_valid:
+        status, blocker = "BLOCKED", "invalid_status"
+    elif (
+        (exact_status == "PASS" and result.returncode != 0)
+        or (
+            exact_status in {"PARTIAL", "BLOCKED"}
+            and result.returncode != 2
+        )
+    ):
+        status, blocker = "BLOCKED", "child_exit_status_mismatch"
     return {
         "status": status,
         "outcome": safe_code(report.get("outcome"), "missing_report"),
@@ -1040,20 +1066,22 @@ def skyai_component(result: ChildResult) -> dict[str, Any]:
         "ahead": safe_count(report.get("head_ahead")),
         "behind": safe_count(report.get("head_behind")),
         "pr_url": safe_pr(report.get("pr_url")),
-        "blocker": (
-            "timeout"
-            if result.timed_out
-            else safe_code(report.get("blocker"), "")
-            if report.get("blocker")
-            else None
-        ),
+        "blocker": blocker,
     }
 
 
 def aggregate_status(components: Sequence[Mapping[str, Any]]) -> str:
     priority = {"PASS": 0, "PARTIAL": 1, "BLOCKED": 2}
+    statuses = [
+        value if value in priority else "BLOCKED"
+        for item in components
+        for value in (item.get("status"),)
+        if isinstance(value, str)
+    ]
+    if len(statuses) != len(components):
+        return "BLOCKED"
     return max(
-        (str(item.get("status") or "BLOCKED") for item in components),
+        statuses,
         key=priority.__getitem__,
     )
 
@@ -1195,10 +1223,7 @@ def run_all(args: argparse.Namespace) -> int:
             environment=muncho_env,
             report_path=muncho_state / "auto-sync-pr-latest.json",
         )
-        inter_job_cleanup = cleanup_managed_worktrees(
-            STATE_ROOT / "muncho-worktrees",
-            prefix="codex-upstream-sync-auto-",
-        )
+        inter_job_cleanup = no_worktree_cleanup_receipt()
         skyai_result = run_child(
             job_id=SKYAI_JOB_ID,
             routine=paths["skyai_routine"],
@@ -1265,14 +1290,11 @@ def run_all(args: argparse.Namespace) -> int:
             "secret_material_recorded": False,
         }
         write_private_receipt(receipt)
-        return (
-            1
-            if any(
-                result.timed_out or result.report is None
-                for result in (muncho_result, skyai_result)
-            )
-            else 0
-        )
+        return {
+            "PASS": EXIT_PASS,
+            "PARTIAL": EXIT_PARTIAL,
+            "BLOCKED": EXIT_BLOCKED,
+        }[public["status"]]
     finally:
         os.close(descriptor)
 

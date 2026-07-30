@@ -119,11 +119,23 @@ else
   # reported "0 tests passed" (which reads green at a glance even though the
   # exit code is 1). Skip such a venv and keep probing instead.
   VENV=""
+  VENV_PYTHON=""
   SKIPPED_VENVS=""
   for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
     if [ -f "$candidate/bin/activate" ]; then
       if "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
         VENV="$candidate"
+        VENV_PYTHON="$candidate/bin/python"
+        break
+      fi
+      SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
+    fi
+    # Native Windows venv layout: python.exe and activate live under
+    # Scripts/, and there is no bin/.
+    if [ -f "$candidate/Scripts/activate" ]; then
+      if "$candidate/Scripts/python.exe" -c 'import pytest' 2>/dev/null; then
+        VENV="$candidate"
+        VENV_PYTHON="$candidate/Scripts/python.exe"
         break
       fi
       SKIPPED_VENVS="$SKIPPED_VENVS $candidate"
@@ -137,7 +149,7 @@ else
   fi
 
   if [ -n "$VENV" ]; then
-    PYTHON="$VENV/bin/python"
+    PYTHON="$VENV_PYTHON"
   elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
       && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
     # Guard with an import check: HERMES_PYTHON may point at the RELEASE
@@ -191,6 +203,15 @@ if [ ! -d "$RUNNER_TMPDIR" ] || [ ! -w "$RUNNER_TMPDIR" ]; then
 fi
 RUNNER_TMPDIR="$(cd "$RUNNER_TMPDIR" && pwd -P)"
 
+# Native Windows CPython resolves user, platform, socket, and temporary paths
+# through these location variables. They carry paths rather than credentials.
+WIN_ENV=()
+for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT TEMP TMP; do
+  if [ -n "${!_win_var:-}" ]; then
+    WIN_ENV+=("$_win_var=${!_win_var}")
+  fi
+done
+
 
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
@@ -212,12 +233,15 @@ echo "▶ launching test runner"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${WIN_ENV[@]+"${WIN_ENV[@]}"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  PYTHONUTF8=1 \
   TMPDIR="$RUNNER_TMPDIR" \
   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
+  ${HERMES_E2E_BROWSER:+HERMES_E2E_BROWSER="$HERMES_E2E_BROWSER"} \
   ${MUNCHO_OWNER_GATE_ISOLATED_TEST_RUNTIME:+MUNCHO_OWNER_GATE_ISOLATED_TEST_RUNTIME="$MUNCHO_OWNER_GATE_ISOLATED_TEST_RUNTIME"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \

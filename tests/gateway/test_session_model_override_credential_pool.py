@@ -158,3 +158,46 @@ def test_credential_pool_for_provider_delegates(monkeypatch):
         lambda p: {"credential_pool": sentinel, "provider": p},
     )
     assert _credential_pool_for_provider("custom:hyper") is sentinel
+
+def test_fast_session_override_includes_credential_pool(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {
+        "sess-1": {
+            "model": "kimi-k2.7",
+            "provider": "custom:hyper",
+            "api_key": "sk-test",
+            "base_url": "https://hyper.charm.land/v1",
+            "api_mode": "chat_completions",
+        },
+    }
+    fake_pool = object()
+    resolved = {}
+
+    monkeypatch.setattr(
+        "gateway.run._resolve_gateway_model",
+        lambda _uc=None: "default-model",
+    )
+
+    def _resolve_override(provider, *, target_model=None):
+        resolved.update(provider=provider, target_model=target_model)
+        return {
+            "provider": provider,
+            "api_key": "sk-live",
+            "base_url": "https://hyper.charm.land/v1",
+            "api_mode": "chat_completions",
+            "credential_pool": fake_pool,
+        }
+
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        _resolve_override,
+    )
+
+    model, runtime = runner._resolve_session_agent_runtime(session_key="sess-1")
+
+    assert model == "kimi-k2.7"
+    assert runtime["credential_pool"] is fake_pool
+    assert resolved == {
+        "provider": "custom:hyper",
+        "target_model": "kimi-k2.7",
+    }

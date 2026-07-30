@@ -217,8 +217,16 @@ def test_background_and_main_agent_paths_refresh_only_outside_sealed_canary():
         keyword.value
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "AIAgent"
+        and (
+            (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "AIAgent"
+            )
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "AIAgent"
+            )
+        )
         for keyword in node.keywords
         if keyword.arg == "fallback_model"
     ]
@@ -241,7 +249,14 @@ def test_background_and_main_agent_paths_refresh_only_outside_sealed_canary():
     guarded_refreshes = [
         value
         for value in fallback_values
-        if isinstance(value, ast.Name) and value.id in guarded_names
+        if (
+            isinstance(value, ast.Name)
+            and value.id in guarded_names
+        )
+        or (
+            isinstance(value, ast.Attribute)
+            and value.attr in guarded_names
+        )
     ]
     assert guarded_names == {"fallback_model", "turn_fallback_model"}
     assert len(guarded_refreshes) == 2

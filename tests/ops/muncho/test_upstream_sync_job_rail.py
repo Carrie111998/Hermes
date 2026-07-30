@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -130,6 +131,7 @@ def test_package_has_exact_two_jobs_and_split_credentials(
         in report_service
     )
 
+    assert "OnActiveSec=30m" in sync_timer
     assert "OnUnitActiveSec=3h" in sync_timer
     assert "OnCalendar=" not in sync_timer
     assert "OnCalendar=*-*-* 08:00:00 Europe/Sofia" in report_timer
@@ -159,6 +161,63 @@ def test_package_staging_is_byte_exact_and_inert(
         rail.verify_package(package, output_root=staged)
 
 
+def test_release_markers_are_exact_framed_revision_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = _release(tmp_path, monkeypatch)
+    marker = release / rail.SOURCE_MARKER_RELATIVE
+    monkeypatch.setattr(rail, "validate_credential_metadata", lambda: None)
+    monkeypatch.setattr(rail, "host_binary_fact", lambda _path: "4" * 64)
+
+    assert marker.read_bytes() == REVISION.encode("ascii") + b"\n"
+    marker.write_bytes(b" " + REVISION.encode("ascii") + b"\n")
+    with pytest.raises(rail.DualSyncRailError, match="release_marker_mismatch"):
+        rail.build_package(REVISION, REVISION)
+
+    marker.write_bytes(REVISION.encode("ascii") + b"\n\n")
+    with pytest.raises(rail.DualSyncRailError, match="release_marker_mismatch"):
+        rail.build_package(REVISION, REVISION)
+
+
+def test_manifest_sender_interpreter_digest_rejects_type_lookalike(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, package = _package(tmp_path, monkeypatch)
+    manifest = json.loads(package.manifest_bytes)
+    manifest["sender_interpreter_sha256"] = int("4" * 64)
+
+    with pytest.raises(rail.DualSyncRailError, match="manifest_invalid"):
+        rail.validate_manifest(
+            manifest,
+            revision=REVISION,
+            sender_revision=REVISION,
+        )
+
+
+def test_github_credential_preserves_exact_bytes_and_rejects_whitespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials = tmp_path / "credentials"
+    credentials.mkdir()
+    credential = credentials / rail.CREDENTIAL_NAME
+    token = "github_pat_" + "x" * 32
+    monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
+
+    credential.write_text(token, encoding="ascii")
+    assert rail.credential() == token
+
+    credential.write_text(token + "\n", encoding="ascii")
+    with pytest.raises(rail.DualSyncRailError, match="credential_invalid"):
+        rail.credential()
+
+    credential.write_text(f" {token}", encoding="ascii")
+    with pytest.raises(rail.DualSyncRailError, match="credential_invalid"):
+        rail.credential()
+
+
 def test_package_hashes_final_sender_interpreter_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -182,29 +241,26 @@ def test_package_hashes_final_sender_interpreter_target(
     ).hexdigest()
 
 
-def test_cleanup_managed_worktrees_removes_only_owned_directories(
+def test_rail_preserves_every_worktree_name_without_exact_inventory(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "worktrees"
-    managed = root / "codex-upstream-sync-auto-20260725-0100"
+    lookalike = root / "codex-upstream-sync-auto-20260725-0100"
     unrelated = root / "operator-investigation"
     outside = tmp_path / "outside"
-    managed.mkdir(parents=True)
+    lookalike.mkdir(parents=True)
     unrelated.mkdir()
     outside.mkdir()
-    (managed / "tracked.txt").write_text("managed", encoding="utf-8")
+    (lookalike / "tracked.txt").write_text("lookalike", encoding="utf-8")
     (root / "codex-upstream-sync-auto-symlink").symlink_to(
         outside,
         target_is_directory=True,
     )
 
-    result = rail.cleanup_managed_worktrees(
-        root,
-        prefix="codex-upstream-sync-auto-",
-    )
+    result = rail.no_worktree_cleanup_receipt()
 
-    assert result == {"removed": 1, "failed": 0}
-    assert not managed.exists()
+    assert result == {"removed": 0, "failed": 0}
+    assert lookalike.is_dir()
     assert unrelated.is_dir()
     assert outside.is_dir()
     assert (root / "codex-upstream-sync-auto-symlink").is_symlink()
@@ -242,6 +298,7 @@ def test_run_all_executes_both_jobs_and_publishes_only_sanitized_fields(
         if job_id == rail.MUNCHO_JOB_ID:
             report = {
                 "status": "blocked_merge_conflicts",
+                "blocked": True,
                 "fresh_refs": {
                     "fork_main_ref": "a" * 40,
                     "upstream_main_ref": "b" * 40,
@@ -271,7 +328,7 @@ def test_run_all_executes_both_jobs_and_publishes_only_sanitized_fields(
     monkeypatch.setattr(rail, "run_child", fake_child)
     args = argparse.Namespace(revision=REVISION)
 
-    assert rail.run_all(args) == 0
+    assert rail.run_all(args) == rail.EXIT_BLOCKED
     assert [job for job, _env in calls] == list(rail.JOB_IDS)
     assert all(env["GH_TOKEN"].startswith("github_pat_") for _job, env in calls)
     assert all("DISCORD_BOT_TOKEN" not in env for _job, env in calls)
@@ -291,6 +348,149 @@ def test_run_all_executes_both_jobs_and_publishes_only_sanitized_fields(
     assert receipt["secret_material_recorded"] is False
     assert receipt["inter_job_cleanup"] == {"removed": 0, "failed": 0}
     assert all(item["content_recorded"] is False for item in receipt["children"])
+
+
+def test_run_child_cannot_replay_a_stale_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = tmp_path / "state" / "latest.json"
+    report.parent.mkdir()
+    report.write_text(
+        json.dumps({"status": "PASS", "outcome": "stale"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rail, "RUNTIME_ROOT", tmp_path)
+    monkeypatch.setattr(
+        rail.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+        ),
+    )
+
+    result = rail.run_child(
+        job_id=rail.MUNCHO_JOB_ID,
+        routine=tmp_path / "routine.py",
+        environment={},
+        report_path=report,
+    )
+
+    assert result.returncode == 1
+    assert result.report is None
+    assert not report.exists()
+
+
+def test_muncho_component_requires_exact_blocked_boolean():
+    base = dict(
+        job_id=rail.MUNCHO_JOB_ID,
+        returncode=0,
+        timed_out=False,
+        stdout_bytes=0,
+        stdout_sha256="1" * 64,
+        stderr_bytes=0,
+        stderr_sha256="2" * 64,
+    )
+    lookalike = rail.ChildResult(
+        **base,
+        report={"status": "blocked_merge_conflicts", "blocked": False},
+    )
+    invalid = rail.ChildResult(
+        **base,
+        report={"status": "no_drift_no_action", "blocked": "false"},
+    )
+    exact = rail.ChildResult(
+        **{**base, "returncode": 2},
+        report={"status": "candidate_identity_mismatch", "blocked": True},
+    )
+
+    assert rail.muncho_component(lookalike)["status"] == "PARTIAL"
+    assert rail.muncho_component(lookalike)["blocker"] is None
+    assert rail.muncho_component(invalid)["status"] == "BLOCKED"
+    assert (
+        rail.muncho_component(invalid)["blocker"]
+        == "invalid_blocked_field"
+    )
+    assert rail.muncho_component(exact)["status"] == "BLOCKED"
+    assert (
+        rail.muncho_component(exact)["blocker"]
+        == "candidate_identity_mismatch"
+    )
+
+
+def test_muncho_component_rejects_report_exit_mismatch():
+    result = rail.ChildResult(
+        job_id=rail.MUNCHO_JOB_ID,
+        returncode=0,
+        timed_out=False,
+        stdout_bytes=0,
+        stdout_sha256="1" * 64,
+        stderr_bytes=0,
+        stderr_sha256="2" * 64,
+        report={"status": "blocked_merge_conflicts", "blocked": True},
+    )
+
+    component = rail.muncho_component(result)
+
+    assert component["status"] == "BLOCKED"
+    assert component["blocker"] == "child_exit_status_mismatch"
+
+
+def test_skyai_component_requires_exact_status_enum_without_coercion():
+    base = dict(
+        job_id=rail.SKYAI_JOB_ID,
+        returncode=0,
+        timed_out=False,
+        stdout_bytes=0,
+        stdout_sha256="1" * 64,
+        stderr_bytes=0,
+        stderr_sha256="2" * 64,
+    )
+    exact = rail.ChildResult(
+        **base,
+        report={"status": "PASS", "outcome": "up_to_date"},
+    )
+    case_lookalike = rail.ChildResult(
+        **base,
+        report={"status": "pass", "outcome": "up_to_date"},
+    )
+    non_string = rail.ChildResult(
+        **base,
+        report={"status": 1, "outcome": "up_to_date"},
+    )
+
+    assert rail.skyai_component(exact)["status"] == "PASS"
+    assert rail.skyai_component(case_lookalike)["status"] == "BLOCKED"
+    assert rail.skyai_component(case_lookalike)["blocker"] == "invalid_status"
+    assert rail.skyai_component(non_string)["status"] == "BLOCKED"
+    assert rail.skyai_component(non_string)["blocker"] == "invalid_status"
+
+
+def test_skyai_component_rejects_report_exit_mismatch():
+    result = rail.ChildResult(
+        job_id=rail.SKYAI_JOB_ID,
+        returncode=0,
+        timed_out=False,
+        stdout_bytes=0,
+        stdout_sha256="1" * 64,
+        stderr_bytes=0,
+        stderr_sha256="2" * 64,
+        report={"status": "PARTIAL", "outcome": "candidate_ci_pending"},
+    )
+
+    component = rail.skyai_component(result)
+
+    assert component["status"] == "BLOCKED"
+    assert component["blocker"] == "child_exit_status_mismatch"
+
+
+def test_safe_protocol_fields_reject_non_string_lookalikes():
+    assert rail.safe_code(123, "fallback") == "fallback"
+    assert rail.safe_sha(1) is None
+    assert rail.safe_pr(
+        Path("https://github.com/lomliev/hermes-agent/pull/178")
+    ) is None
 
 
 def test_module_compiles_in_isolated_stdlib() -> None:

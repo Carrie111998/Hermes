@@ -5,6 +5,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 
 MODULE_PATH = (
     Path(__file__).parents[3]
@@ -23,20 +25,18 @@ CURRENT = "2" * 40
 HEAD = "3" * 40
 
 
-def test_superseded_automation_snapshot_is_stale():
-    assert hardening.classify_stale_sync_pr(
-        automation_owned=True,
+def test_newer_upstream_keeps_exact_review_candidate_stable():
+    assert hardening.classify_stale_candidate(
         head_already_in_fork_main=False,
         upstream_snapshot_sha=OLD,
         upstream_snapshot_in_fork_merge_base=False,
         current_upstream_sha=CURRENT,
         current_upstream_contains_snapshot=True,
-    ) == "upstream_snapshot_superseded"
+    ) is None
 
 
-def test_superseded_snapshot_requires_ancestry_proof():
-    assert hardening.classify_stale_sync_pr(
-        automation_owned=True,
+def test_unrelated_upstream_also_keeps_exact_review_candidate_stable():
+    assert hardening.classify_stale_candidate(
         head_already_in_fork_main=False,
         upstream_snapshot_sha=OLD,
         upstream_snapshot_in_fork_merge_base=False,
@@ -45,20 +45,8 @@ def test_superseded_snapshot_requires_ancestry_proof():
     ) is None
 
 
-def test_non_automation_pr_is_never_auto_closed():
-    assert hardening.classify_stale_sync_pr(
-        automation_owned=False,
-        head_already_in_fork_main=True,
-        upstream_snapshot_sha=OLD,
-        upstream_snapshot_in_fork_merge_base=True,
-        current_upstream_sha=CURRENT,
-        current_upstream_contains_snapshot=True,
-    ) is None
-
-
 def test_existing_stale_reasons_keep_precedence():
-    assert hardening.classify_stale_sync_pr(
-        automation_owned=True,
+    assert hardening.classify_stale_candidate(
         head_already_in_fork_main=True,
         upstream_snapshot_sha=OLD,
         upstream_snapshot_in_fork_merge_base=True,
@@ -67,9 +55,220 @@ def test_existing_stale_reasons_keep_precedence():
     ) == "head_already_in_fork_main"
 
 
+def _prepared_manifest() -> dict[str, object]:
+    return hardening.build_prepared_candidate_manifest(
+        candidate_id="9" * 64,
+        fork_repository="lomliev/hermes-agent",
+        upstream_repository="NousResearch/hermes-agent",
+        base_ref="main",
+        upstream_ref="main",
+        branch="opaque exact branch",
+        head_sha=HEAD,
+        base_sha=OLD,
+        upstream_sha=CURRENT,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+
+
+def test_candidate_manifest_two_phase_is_exact_digest_bound(tmp_path):
+    path = tmp_path / "private" / "candidate.json"
+    prepared = _prepared_manifest()
+    hardening.write_candidate_manifest(path, prepared)
+
+    assert hardening.load_candidate_manifest(path) == prepared
+    assert prepared["phase"] == "prepared"
+    assert prepared["pr_number"] is None
+
+    published = hardening.publish_candidate_manifest(prepared, pr_number=481)
+    hardening.write_candidate_manifest(path, published)
+
+    assert hardening.load_candidate_manifest(path) == published
+    assert published["phase"] == "published"
+    assert published["pr_number"] == 481
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_candidate_manifest_rejects_tampering_and_phase_repair(tmp_path):
+    path = tmp_path / "candidate.json"
+    manifest = hardening.publish_candidate_manifest(
+        _prepared_manifest(), pr_number=481
+    )
+
+    tampered = dict(manifest)
+    tampered["branch"] = f"{manifest['branch']} "
+    with pytest.raises(
+        hardening.CandidateManifestError,
+        match="candidate_manifest_digest_mismatch",
+    ):
+        hardening.write_candidate_manifest(path, tampered)
+
+    repaired = dict(manifest)
+    repaired["phase"] = "prepared"
+    with pytest.raises(
+        hardening.CandidateManifestError,
+        match="prepared_pr_number_must_be_null",
+    ):
+        hardening.validate_candidate_manifest(repaired)
+
+
+def test_private_state_parent_symlink_or_broad_mode_fails_closed(tmp_path):
+    broad = tmp_path / "broad"
+    broad.mkdir(mode=0o755)
+    broad.chmod(0o755)
+    with pytest.raises(RuntimeError, match="invalid private state directory"):
+        hardening.write_candidate_manifest(
+            broad / "candidate.json",
+            _prepared_manifest(),
+        )
+    assert broad.stat().st_mode & 0o777 == 0o755
+
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="invalid private state directory"):
+        hardening.write_candidate_manifest(
+            linked / "candidate.json",
+            _prepared_manifest(),
+        )
+
+
+def test_private_pointer_and_lock_require_exact_owner_and_mode(
+    tmp_path,
+    monkeypatch,
+):
+    pointer = tmp_path / "private" / "candidate.json"
+    hardening.write_candidate_manifest(pointer, _prepared_manifest())
+    pointer.chmod(0o644)
+    with pytest.raises(
+        hardening.CandidateManifestError,
+        match="candidate_manifest_file_invalid",
+    ):
+        hardening.load_candidate_manifest(pointer)
+
+    pointer.chmod(0o600)
+    monkeypatch.setattr(hardening.os, "geteuid", lambda: pointer.stat().st_uid + 1)
+    with pytest.raises(
+        hardening.CandidateManifestError,
+        match="candidate_manifest_file_invalid",
+    ):
+        hardening.load_candidate_manifest(pointer)
+
+    monkeypatch.undo()
+    lock = pointer.with_name(f".{pointer.name}.lock")
+    lock.write_text("", encoding="utf-8")
+    lock.chmod(0o644)
+    with pytest.raises(RuntimeError, match="invalid blocker state lock"):
+        with hardening.candidate_manifest_lock(pointer):
+            raise AssertionError("invalid lock was accepted")
+    assert lock.stat().st_mode & 0o777 == 0o644
+
+
+def test_prepared_manifest_is_persistent_fail_closed_state(tmp_path):
+    path = tmp_path / "candidate.json"
+    hardening.write_candidate_manifest(path, _prepared_manifest())
+    hardening.clear_candidate_manifest(path)
+    assert not path.exists()
+
+
+def test_candidate_ledger_recovers_missing_pointer_across_both_phases(tmp_path):
+    pointer = tmp_path / "private" / "candidate.json"
+    prepared = _prepared_manifest()
+    hardening.append_candidate_manifest(pointer, prepared)
+    pointer.unlink()
+
+    assert hardening.recover_candidate_manifest(pointer) == prepared
+
+    published = hardening.publish_candidate_manifest(prepared, pr_number=481)
+    hardening.append_candidate_manifest(pointer, published)
+    pointer.unlink()
+
+    assert hardening.recover_candidate_manifest(pointer) == published
+    ledger = hardening.candidate_ledger_path(pointer)
+    assert ledger.stat().st_mode & 0o777 == 0o700
+    assert all(path.stat().st_mode & 0o777 == 0o600 for path in ledger.iterdir())
+
+
+def test_candidate_ledger_advances_exact_prepared_pointer_after_publish_crash(
+    tmp_path,
+):
+    pointer = tmp_path / "private" / "candidate.json"
+    prepared = _prepared_manifest()
+    published = hardening.publish_candidate_manifest(prepared, pr_number=481)
+    hardening.append_candidate_manifest(pointer, prepared)
+    hardening.append_candidate_manifest(pointer, published)
+    # Recreate the exact crash state: published ledger event is durable, but
+    # replacement of the mutable pointer did not happen.
+    hardening.write_candidate_manifest(pointer, prepared)
+
+    assert hardening.recover_candidate_manifest(pointer) == published
+    assert hardening.load_candidate_manifest(pointer) == published
+
+
+def test_candidate_ledger_terminal_receipt_retires_exact_published_state(
+    tmp_path,
+):
+    pointer = tmp_path / "private" / "candidate.json"
+    prepared = _prepared_manifest()
+    published = hardening.publish_candidate_manifest(prepared, pr_number=481)
+    hardening.append_candidate_manifest(pointer, prepared)
+    hardening.append_candidate_manifest(pointer, published)
+
+    receipt = hardening.append_candidate_terminal_receipt(
+        pointer,
+        published,
+        observed_base_sha="4" * 40,
+        created_at_utc="2026-07-30T12:00:00Z",
+    )
+
+    assert receipt["terminal_state"] == "MERGED"
+    assert not pointer.exists()
+    assert hardening.recover_candidate_manifest(pointer) is None
+
+
+def test_candidate_ledger_tamper_and_ambiguous_active_state_fail_closed(tmp_path):
+    pointer = tmp_path / "private" / "candidate.json"
+    first = _prepared_manifest()
+    hardening.append_candidate_manifest(pointer, first)
+    ledger = hardening.candidate_ledger_path(pointer)
+    entry = next(ledger.iterdir())
+    tampered = json.loads(entry.read_text(encoding="utf-8"))
+    tampered["head_sha"] = "8" * 40
+    entry.write_text(json.dumps(tampered), encoding="utf-8")
+    entry.chmod(0o600)
+    with pytest.raises(
+        hardening.CandidateManifestError,
+        match="digest_mismatch",
+    ):
+        hardening.recover_candidate_manifest(pointer)
+
+    entry.unlink()
+    hardening.clear_candidate_manifest(pointer)
+    second = hardening.build_prepared_candidate_manifest(
+        candidate_id="7" * 64,
+        fork_repository="lomliev/hermes-agent",
+        upstream_repository="NousResearch/hermes-agent",
+        base_ref="main",
+        upstream_ref="main",
+        branch="second exact branch",
+        head_sha="6" * 40,
+        base_sha=OLD,
+        upstream_sha=CURRENT,
+        created_at_utc="2026-07-30T10:00:00Z",
+    )
+    hardening.append_candidate_manifest(pointer, first)
+    hardening.append_candidate_manifest(pointer, second)
+    with pytest.raises(
+        hardening.CandidateManifestError,
+        match="multiple_active",
+    ):
+        hardening.recover_candidate_manifest(pointer)
+
+
 def test_blocker_fingerprint_is_order_independent():
     first = hardening.blocker_fingerprint(
-        status="blocked_auto_merge_deploy_gate",
+        status="blocked_candidate_identity_state",
         pr_number=91,
         head_sha=HEAD,
         blockers=["checks_failed", "merge_state_UNSTABLE"],
@@ -79,16 +278,28 @@ def test_blocker_fingerprint_is_order_independent():
         ],
     )
     second = hardening.blocker_fingerprint(
-        status="blocked_auto_merge_deploy_gate",
+        status="blocked_candidate_identity_state",
         pr_number=91,
         head_sha=HEAD,
         blockers=["merge_state_UNSTABLE", "checks_failed"],
         failed_checks=[
-            {"name": "required", "conclusion": "FAILURE"},
-            {"name": "slice 5", "conclusion": "FAILURE"},
+            {"name": "required", "conclusion": "failure"},
+            {"name": "slice 5", "conclusion": "failure"},
         ],
     )
     assert first == second
+
+    case_lookalike = hardening.blocker_fingerprint(
+        status="blocked_candidate_identity_state",
+        pr_number=91,
+        head_sha=HEAD,
+        blockers=["checks_failed", "merge_state_UNSTABLE"],
+        failed_checks=[
+            {"name": "slice 5", "conclusion": "FAILURE"},
+            {"name": "required", "conclusion": "FAILURE"},
+        ],
+    )
+    assert case_lookalike != first
 
 
 def test_unchanged_blocker_is_suppressed_until_repeat_window(tmp_path):

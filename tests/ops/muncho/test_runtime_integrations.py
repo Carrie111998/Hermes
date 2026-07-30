@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import subprocess
@@ -32,45 +33,797 @@ def _load_routine():
         sys.path.remove(str(RUNTIME))
 
 
-def test_runtime_stale_detection_checks_current_upstream_ancestry(monkeypatch):
+def _fork_repository_identity(routine):
+    return {
+        "isCrossRepository": False,
+        "headRepository": {"nameWithOwner": routine.FORK_REPO},
+        "headRepositoryOwner": {"login": routine.FORK_OWNER},
+    }
+
+
+def test_runtime_keeps_open_candidate_stable_when_upstream_advances(monkeypatch):
     routine = _load_routine()
     snapshot = "1" * 40
     current = "2" * 40
     fork = "3" * 40
     head = "4" * 40
     pr = {
+        **_fork_repository_identity(routine),
         "headRefName": "codex/upstream-sync-auto-20260711-1200",
         "headRefOid": head,
-        "body": f"Automated fork-only upstream sync PR\nUpstream main: `{snapshot}`",
+        "baseRefName": "main",
+        "number": 91,
+        "state": "OPEN",
     }
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="9" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch=pr["headRefName"],
+        head_sha=head,
+        base_sha="6" * 40,
+        upstream_sha=snapshot,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    manifest = routine.publish_candidate_manifest(prepared, pr_number=91)
     fresh = {
         "fork_main_ref": fork,
         "merge_base": "5" * 40,
         "upstream_main_ref": current,
     }
 
-    monkeypatch.setattr(routine, "is_auto_owned_sync_pr", lambda _: True)
-
     def contains(repo, base, candidate):
         return repo == routine.UPSTREAM_REPO and base == snapshot and candidate == current
 
     monkeypatch.setattr(routine, "compare_shows_head_contains_base", contains)
-    assert routine.stale_sync_reason(pr, fresh) == "upstream_snapshot_superseded"
+    assert routine.stale_candidate_reason(manifest, pr, fresh) is None
+
+
+def test_pr_title_body_and_prefix_lookalikes_never_gain_candidate_identity():
+    routine = _load_routine()
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="8" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-state-branch",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    manifest = routine.publish_candidate_manifest(prepared, pr_number=91)
+    lookalike = {
+        "number": 92,
+        "headRefName": "codex/upstream-sync-auto-exact-state-branch",
+        "headRefOid": "4" * 40,
+        "baseRefName": "main",
+        "title": "chore: sync fork with upstream main",
+        "body": "Automated fork-only upstream sync PR",
+    }
+
+    mismatches = routine.candidate_pr_mismatches(lookalike, manifest)
+    assert "candidate_pr_number_mismatch" in mismatches
+    assert "candidate_pr_headRefName_mismatch" in mismatches
+
+
+def test_exact_published_manifest_matches_without_reading_display_text():
+    routine = _load_routine()
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="7" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-state-branch",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    manifest = routine.publish_candidate_manifest(prepared, pr_number=91)
+    observed = {
+        **_fork_repository_identity(routine),
+        "number": 91,
+        "headRefName": "exact-state-branch",
+        "headRefOid": "4" * 40,
+        "baseRefName": "main",
+        "title": "unrelated display title",
+        "body": "unrelated display body",
+    }
+
+    assert routine.candidate_pr_mismatches(observed, manifest) == []
+
+
+def test_cross_repository_same_branch_and_head_never_matches_manifest():
+    routine = _load_routine()
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="6" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-state-branch",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    manifest = routine.publish_candidate_manifest(prepared, pr_number=91)
+    lookalike = {
+        "number": 91,
+        "headRefName": "exact-state-branch",
+        "headRefOid": "4" * 40,
+        "baseRefName": routine.FORK_BRANCH,
+        "isCrossRepository": True,
+        "headRepository": {"nameWithOwner": "attacker/hermes-agent"},
+        "headRepositoryOwner": {"login": "attacker"},
+    }
+
+    mismatches = routine.candidate_pr_mismatches(lookalike, manifest)
+
+    assert "candidate_pr_cross_repository_mismatch" in mismatches
+    assert "candidate_pr_head_repository_mismatch" in mismatches
+    assert "candidate_pr_head_owner_mismatch" in mismatches
+
+
+def test_manifest_base_and_upstream_shas_require_exact_head_ancestry(
+    monkeypatch,
+):
+    routine = _load_routine()
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="5" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-state-branch",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    manifest = routine.publish_candidate_manifest(prepared, pr_number=91)
+    observed: list[tuple[str, str, str]] = []
+
+    def contains(repo, base, head):
+        observed.append((repo, base, head))
+        return base == "3" * 40
+
+    monkeypatch.setattr(routine, "compare_shows_head_contains_base", contains)
+
+    assert routine.candidate_commit_mismatches(manifest) == [
+        "candidate_head_missing_exact_upstream_sha"
+    ]
+    assert observed == [
+        (routine.FORK_REPO, "3" * 40, "4" * 40),
+        (routine.FORK_REPO, "2" * 40, "4" * 40),
+    ]
+
+
+def test_later_candidate_lookup_uses_only_exact_stored_pr_number(monkeypatch):
+    routine = _load_routine()
+    observed: list[list[str]] = []
+
+    def fake_gh_json(args):
+        observed.append(args)
+        return {"number": 481}
+
+    monkeypatch.setattr(routine, "gh_json", fake_gh_json)
+    assert routine.pr_view(481) == {"number": 481}
+    assert observed == [
+        [
+            "pr",
+            "view",
+            "481",
+            "--repo",
+            routine.FORK_REPO,
+            "--json",
+            (
+                "number,url,state,isDraft,headRefName,headRefOid,baseRefName,"
+                "mergeable,mergeStateStatus,statusCheckRollup,labels,"
+                "isCrossRepository,headRepository,headRepositoryOwner"
+            ),
+        ]
+    ]
+
+
+def test_prepared_state_is_recovered_only_from_exact_private_ledger(
+    tmp_path, monkeypatch
+):
+    routine = _load_routine()
+    state = tmp_path / "candidate.json"
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="6" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-prepared-branch",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    monkeypatch.setattr(routine, "AUTO_STATE", state)
+    routine.append_candidate_manifest(state, prepared)
+
+    def forbidden_lookup(*_args, **_kwargs):
+        raise AssertionError("prepared state must not infer an orphan PR")
+
+    monkeypatch.setattr(routine, "pr_view", forbidden_lookup)
+    manifest, candidate, blockers = routine._candidate_state_for_plan([])
+
+    assert manifest == prepared
+    assert candidate is None
+    assert blockers == []
+
+
+def test_exact_candidate_query_uses_plain_branch_and_structured_repo_identity(
+    monkeypatch,
+):
+    routine = _load_routine()
+    observed: list[list[str]] = []
+
+    def fake_gh_json(args):
+        observed.append(args)
+        return []
+
+    monkeypatch.setattr(routine, "gh_json", fake_gh_json)
+
+    assert (
+        routine.list_exact_branch_candidate_prs(
+            "exact-prepared-branch",
+            "4" * 40,
+        )
+        == []
+    )
+    command = observed[0]
+    assert command[command.index("--head") + 1] == "exact-prepared-branch"
+    assert "lomliev:exact-prepared-branch" not in command
+    fields = command[command.index("--json") + 1]
+    assert "isCrossRepository" in fields
+    assert "headRepository" in fields
+    assert "headRepositoryOwner" in fields
+
+
+def test_prepared_state_recovers_existing_exact_pr_without_push(
+    tmp_path, monkeypatch
+):
+    routine = _load_routine()
+    state = tmp_path / "candidate.json"
+    monkeypatch.setattr(routine, "AUTO_STATE", state)
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="5" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-prepared-branch",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    routine.append_candidate_manifest(state, prepared)
+    candidate = {
+        **_fork_repository_identity(routine),
+        "number": 91,
+        "url": "https://github.com/lomliev/hermes-agent/pull/91",
+        "state": "OPEN",
+        "headRefName": prepared["branch"],
+        "headRefOid": prepared["head_sha"],
+        "baseRefName": routine.FORK_BRANCH,
+    }
+    monkeypatch.setattr(
+        routine,
+        "list_exact_branch_candidate_prs",
+        lambda *_args: [candidate],
+    )
+    monkeypatch.setattr(
+        routine,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("existing exact PR attempted a push")
+        ),
+    )
+    monkeypatch.setattr(routine, "_execute_locked", lambda _args: 0)
+    report = {
+        "fresh_refs": {"behind_by": 1, "ahead_by": 0},
+    }
+
+    assert (
+        routine._recover_prepared_candidate(
+            argparse.Namespace(execute=True),
+            report,
+            prepared,
+        )
+        == 0
+    )
+    recovered = routine.recover_candidate_manifest(state)
+    assert recovered is not None
+    assert recovered["phase"] == "published"
+    assert recovered["pr_number"] == 91
+
+
+def test_prepared_state_retries_exact_push_and_pr_once_after_crash(
+    tmp_path, monkeypatch
+):
+    routine = _load_routine()
+    state = tmp_path / "candidate.json"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.setattr(routine, "AUTO_STATE", state)
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="4" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-prepared-branch",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    routine.append_candidate_manifest(state, prepared)
+    candidate = {
+        **_fork_repository_identity(routine),
+        "number": 91,
+        "url": "https://github.com/lomliev/hermes-agent/pull/91",
+        "state": "OPEN",
+        "headRefName": prepared["branch"],
+        "headRefOid": prepared["head_sha"],
+        "baseRefName": routine.FORK_BRANCH,
+    }
+    monkeypatch.setattr(
+        routine,
+        "list_exact_branch_candidate_prs",
+        lambda *_args: [],
+    )
+    monkeypatch.setattr(
+        routine,
+        "_validate_prepared_worktree",
+        lambda _manifest: worktree,
+    )
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(cmd, **_kwargs):
+        commands.append(tuple(cmd))
+        return routine.CmdResult(list(cmd), 0, "", "")
+
+    monkeypatch.setattr(routine, "run", fake_run)
+    monkeypatch.setattr(
+        routine,
+        "create_candidate_pr",
+        lambda **_kwargs: (
+            candidate,
+            routine.CmdResult([], 0, candidate["url"], ""),
+        ),
+    )
+    monkeypatch.setattr(routine, "_execute_locked", lambda _args: 0)
+
+    assert (
+        routine._recover_prepared_candidate(
+            argparse.Namespace(execute=True),
+            {"fresh_refs": {"behind_by": 1, "ahead_by": 0}},
+            prepared,
+        )
+        == 0
+    )
+    pushes = [command for command in commands if "push" in command]
+    assert len(pushes) == 1
+    recovered = routine.recover_candidate_manifest(state)
+    assert recovered is not None and recovered["phase"] == "published"
+
+
+def test_candidate_routine_has_no_merge_or_deploy_execution_surface():
+    source = (
+        RUNTIME / "fork_upstream_auto_sync_pr_routine.py"
+    ).read_text(encoding="utf-8")
+    assert '"pr",\n            "merge"' not in source
+    assert "queue_auto_deploy_request" not in source
+    assert "AUTO_MERGE_DEPLOY" not in source
+    assert "known_conflict_auto_resolver" not in source
+    prepared = source.index(
+        "append_candidate_manifest(AUTO_STATE, prepared_manifest)"
+    )
+    push = source.index('"push",', prepared)
+    create = source.index('"create",', push)
+    published = source.index("append_candidate_manifest(AUTO_STATE, manifest)", create)
+    assert prepared < push < create < published
+
+
+def test_open_candidate_flow_performs_no_external_mutation(
+    tmp_path, monkeypatch
+):
+    routine = _load_routine()
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="9" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-open-candidate",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    manifest = routine.publish_candidate_manifest(prepared, pr_number=91)
+    candidate = {
+        **_fork_repository_identity(routine),
+        "number": 91,
+        "url": "https://github.com/lomliev/hermes-agent/pull/91",
+        "state": "OPEN",
+        "headRefName": "exact-open-candidate",
+        "headRefOid": "4" * 40,
+        "baseRefName": "main",
+    }
+    monkeypatch.setattr(
+        routine,
+        "build_plan",
+        lambda _args: {
+            "created_at_utc": "2026-07-30T12:00:00Z",
+            "status": "candidate_pr_exists_review_required_no_action",
+            "blocked": False,
+            "blockers": [],
+            "fresh_refs": {
+                "fork_main_ref": "3" * 40,
+                "upstream_main_ref": "5" * 40,
+                "merge_base": "6" * 40,
+                "ahead_by": 0,
+                "behind_by": 1,
+            },
+            "candidate_manifest": manifest,
+            "candidate_pr": candidate,
+            "proposed_branch": "unused",
+        },
+    )
+    external_commands: list[tuple[str, ...]] = []
+
+    def forbidden_run(cmd, **_kwargs):
+        external_commands.append(tuple(cmd))
+        raise AssertionError("open candidate flow attempted an external command")
+
+    reports: list[dict] = []
+    monkeypatch.setattr(routine, "run", forbidden_run)
+    monkeypatch.setattr(
+        routine,
+        "clear_blocker_delivery_state",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        routine,
+        "write_report",
+        lambda report: reports.append(dict(report)),
+    )
+    monkeypatch.setattr(routine, "AUTO_STATE", tmp_path / "candidate.json")
+
+    assert routine._execute_locked(argparse.Namespace(execute=True)) == 0
+    assert external_commands == []
+    assert reports[-1]["candidate_ref_frozen"] is True
+    assert reports[-1]["later_upstream_is_tail_drift"] is True
+    assert reports[-1]["tail_drift_rebinds_candidate"] is False
+
+
+def test_closed_candidate_fails_closed_without_reopen_or_evidence_cleanup(
+    tmp_path, monkeypatch
+):
+    routine = _load_routine()
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="8" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-closed-candidate",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    manifest = routine.publish_candidate_manifest(prepared, pr_number=91)
+    candidate = {
+        **_fork_repository_identity(routine),
+        "number": 91,
+        "url": "https://github.com/lomliev/hermes-agent/pull/91",
+        "state": "CLOSED",
+        "headRefName": "exact-closed-candidate",
+        "headRefOid": "4" * 40,
+        "baseRefName": "main",
+    }
+    monkeypatch.setattr(routine, "load_monitor", lambda: {})
+    monkeypatch.setattr(
+        routine,
+        "compare_refs",
+        lambda: {
+            "fork_main_ref": "3" * 40,
+            "upstream_main_ref": "5" * 40,
+            "merge_base": "6" * 40,
+            "ahead_by": 0,
+            "behind_by": 1,
+            "compare_status": "behind",
+            "compare_url": None,
+        },
+    )
+    monkeypatch.setattr(routine, "list_open_fork_prs", lambda: [])
+    monkeypatch.setattr(
+        routine,
+        "_candidate_state_for_plan",
+        lambda _prs: (manifest, candidate, []),
+    )
+    external_commands: list[tuple[str, ...]] = []
+
+    def forbidden_run(cmd, **_kwargs):
+        external_commands.append(tuple(cmd))
+        raise AssertionError("closed candidate attempted an external command")
+
+    def forbidden_cleanup(*_args, **_kwargs):
+        raise AssertionError("closed candidate evidence was removed")
+
+    reports: list[dict] = []
+    monkeypatch.setattr(routine, "run", forbidden_run)
+    monkeypatch.setattr(
+        routine,
+        "cleanup_exact_candidate_worktree",
+        forbidden_cleanup,
+    )
+    monkeypatch.setattr(
+        routine,
+        "append_candidate_terminal_receipt",
+        forbidden_cleanup,
+    )
+    monkeypatch.setattr(
+        routine,
+        "apply_blocker_notification_dedupe",
+        lambda _report, _pr: False,
+    )
+    monkeypatch.setattr(
+        routine,
+        "write_report",
+        lambda report: reports.append(dict(report)),
+    )
+    monkeypatch.setattr(routine, "AUTO_STATE", tmp_path / "candidate.json")
+
+    assert routine._execute_locked(argparse.Namespace(execute=True)) == 2
+    assert external_commands == []
+    assert reports[-1]["status"] == (
+        "blocked_candidate_closed_requires_operator_reconciliation"
+    )
+    assert reports[-1]["blockers"] == [
+        "candidate_closed_requires_operator_reconciliation"
+    ]
+
+
+def test_merged_candidate_reconciles_exact_state_then_continues(
+    tmp_path, monkeypatch
+):
+    routine = _load_routine()
+    prepared = routine.build_prepared_candidate_manifest(
+        candidate_id="7" * 64,
+        fork_repository=routine.FORK_REPO,
+        upstream_repository=routine.UPSTREAM_REPO,
+        base_ref=routine.FORK_BRANCH,
+        upstream_ref=routine.UPSTREAM_BRANCH,
+        branch="exact-merged-candidate",
+        head_sha="4" * 40,
+        base_sha="3" * 40,
+        upstream_sha="2" * 40,
+        created_at_utc="2026-07-30T09:00:00Z",
+    )
+    manifest = routine.publish_candidate_manifest(prepared, pr_number=91)
+    candidate = {
+        **_fork_repository_identity(routine),
+        "number": 91,
+        "state": "MERGED",
+        "headRefName": manifest["branch"],
+        "headRefOid": manifest["head_sha"],
+        "baseRefName": routine.FORK_BRANCH,
+    }
+    plans = iter(
+        [
+            {
+                "created_at_utc": "2026-07-30T12:00:00Z",
+                "status": "candidate_merged_requires_reconciliation",
+                "blocked": False,
+                "blockers": [],
+                "fresh_refs": {
+                    "behind_by": 1,
+                    "fork_main_ref": "5" * 40,
+                },
+                "candidate_manifest": manifest,
+                "candidate_pr": candidate,
+                "proposed_branch": "unused",
+            },
+            {
+                "created_at_utc": "2026-07-30T12:01:00Z",
+                "status": "no_drift_no_action",
+                "blocked": False,
+                "blockers": [],
+                "fresh_refs": {"behind_by": 0},
+                "candidate_manifest": None,
+                "candidate_pr": None,
+                "proposed_branch": "unused",
+            },
+        ]
+    )
+    monkeypatch.setattr(routine, "build_plan", lambda _args: next(plans))
+    reconciled: list[str] = []
+    monkeypatch.setattr(
+        routine,
+        "cleanup_exact_candidate_worktree",
+        lambda exact: reconciled.append(f"worktree:{exact['pr_number']}") or True,
+    )
+    monkeypatch.setattr(
+        routine,
+        "compare_shows_head_contains_base",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        routine,
+        "append_candidate_terminal_receipt",
+        lambda *_args, **_kwargs: (
+            reconciled.append("terminal")
+            or {"receipt_sha256": "a" * 64}
+        ),
+    )
+    monkeypatch.setattr(
+        routine,
+        "clear_blocker_delivery_state",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(routine, "write_report", lambda _report: None)
+    monkeypatch.setattr(routine, "AUTO_STATE", tmp_path / "candidate.json")
+    monkeypatch.setattr(
+        routine,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("merged reconciliation attempted an external command")
+        ),
+    )
+
+    assert routine._execute_locked(argparse.Namespace(execute=True)) == 0
+    assert reconciled == ["terminal", "worktree:91"]
+
+
+def test_candidate_create_flow_mutates_only_fork_draft_candidate(
+    tmp_path, monkeypatch
+):
+    routine = _load_routine()
+    fork_sha = "1" * 40
+    upstream_sha = "2" * 40
+    head_sha = "3" * 40
+    created_at = "2026-07-30T12:00:00Z"
+    branch = routine.branch_name(created_at)
+    worktree_root = tmp_path / "worktrees"
+    monkeypatch.setattr(routine, "WORKTREE_ROOT", worktree_root)
+    monkeypatch.setattr(routine, "AUTO_STATE", tmp_path / "state" / "candidate.json")
+    monkeypatch.setattr(
+        routine,
+        "BLOCKER_DEDUPE_STATE",
+        tmp_path / "state" / "dedupe.json",
+    )
+    monkeypatch.setattr(routine, "disk_free_bytes", lambda _path: 6 * 1024**3)
+    monkeypatch.setattr(routine, "changed_python_files", lambda *_args: [])
+    monkeypatch.setattr(
+        routine,
+        "clear_blocker_delivery_state",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(routine, "write_report", lambda _report: None)
+    monkeypatch.setattr(routine, "now_utc", lambda: created_at)
+    monkeypatch.setattr(routine, "load_monitor", lambda: {})
+    monkeypatch.setattr(
+        routine,
+        "compare_refs",
+        lambda: {
+            "fork_main_ref": fork_sha,
+            "upstream_main_ref": upstream_sha,
+            "merge_base": "4" * 40,
+            "ahead_by": 0,
+            "behind_by": 1,
+            "compare_status": "behind",
+            "compare_url": None,
+        },
+    )
+    unrelated_pr = {
+        "number": 77,
+        "url": "https://github.com/lomliev/hermes-agent/pull/77",
+        "state": "OPEN",
+        "headRefName": "codex/upstream-sync-auto-lookalike",
+        "headRefOid": "9" * 40,
+        "baseRefName": routine.FORK_BRANCH,
+        "title": "Automated fork-only upstream sync PR",
+        "body": "Upstream main lookalike display text",
+    }
+    monkeypatch.setattr(
+        routine,
+        "list_open_fork_prs",
+        lambda: [unrelated_pr],
+    )
+    monkeypatch.setattr(
+        routine,
+        "discover_created_candidate_pr",
+        lambda exact_branch, exact_head: {
+            **_fork_repository_identity(routine),
+            "number": 91,
+            "url": "https://github.com/lomliev/hermes-agent/pull/91",
+            "state": "OPEN",
+            "headRefName": exact_branch,
+            "headRefOid": exact_head,
+            "baseRefName": routine.FORK_BRANCH,
+        },
+    )
+
+    commands: list[tuple[str, ...]] = []
+
+    def fake_run(cmd, *, cwd=None, check=True, timeout=None):
+        del cwd, check, timeout
+        command = tuple(cmd)
+        commands.append(command)
+        if command[:2] == ("git", "clone"):
+            Path(command[-1]).mkdir(parents=True)
+        stdout = ""
+        if command[:2] == ("git", "rev-parse"):
+            stdout = {
+                "origin/main": fork_sha,
+                "upstream/main": upstream_sha,
+                "HEAD": head_sha,
+            }[command[-1]] + "\n"
+        elif command[:3] == ("git", "diff", "--name-only"):
+            stdout = ""
+        elif command[:3] == (str(routine.GH), "pr", "create"):
+            stdout = "https://github.com/lomliev/hermes-agent/pull/91\n"
+        return routine.CmdResult(list(command), 0, stdout, "")
+
+    monkeypatch.setattr(routine, "run", fake_run)
+
+    assert routine._execute_locked(argparse.Namespace(execute=True)) == 0
+
+    pushes = [
+        command
+        for command in commands
+        if command[0] == "git" and "push" in command
+    ]
+    creates = [
+        command
+        for command in commands
+        if command[:3] == (str(routine.GH), "pr", "create")
+    ]
+    assert len(pushes) == 1
+    assert routine.FORK_GIT_URL in pushes[0]
+    assert routine.UPSTREAM_GIT_URL not in pushes[0]
+    assert len(creates) == 1
+    assert creates[0][creates[0].index("--repo") + 1] == routine.FORK_REPO
+    assert "--draft" in creates[0]
+    assert not any(
+        command[:3]
+        in {
+            (str(routine.GH), "pr", "merge"),
+            (str(routine.GH), "pr", "close"),
+        }
+        for command in commands
+    )
+    assert not any(
+        token in {"deploy", "restart", "systemctl"}
+        for command in commands
+        for token in command
+    )
 
 
 def test_runtime_dedupe_suppresses_unchanged_blocker(tmp_path, monkeypatch):
     routine = _load_routine()
     monkeypatch.setattr(routine, "BLOCKER_DEDUPE_STATE", tmp_path / "dedupe.json")
     report = {
-        "status": "blocked_auto_merge_deploy_gate",
-        "auto_merge_deploy": {
-            "blockers": ["checks_failed", "merge_state_UNSTABLE"],
-            "checks": {
-                "failure_like_checks": [
-                    {"name": "Python tests / slice 5", "conclusion": "FAILURE"}
-                ]
-            },
-        },
+        "status": "blocked_candidate_identity_state",
+        "blockers": [
+            "candidate_manifest_digest_mismatch",
+            "candidate_pr_headRefOid_mismatch",
+        ],
     }
     pr = {"number": 91, "headRefOid": "6" * 40}
 

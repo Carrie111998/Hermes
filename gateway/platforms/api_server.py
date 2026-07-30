@@ -79,12 +79,6 @@ _api_request_authority: ContextVar[Optional["APIRequestScope"]] = ContextVar(
     default=None,
 )
 
-def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
-    if smart_denied:
-        return ["once", "deny"]
-    return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
-
-
 async def _await_if_needed(value: Any) -> Any:
     """Await production coroutines while preserving synchronous test seams."""
     if inspect.isawaitable(value):
@@ -2110,20 +2104,6 @@ def _notify_cron_provider_jobs_changed() -> None:
     except Exception:
         pass
 
-# Defense-in-depth: mirror the agent-facing cronjob tool, which scans the
-# user-supplied prompt for exfiltration/injection payloads at create/update
-# time (tools/cronjob_tools.py).  The REST cron endpoints are authenticated
-# (every handler runs _check_auth, and connect() refuses to start without
-# API_SERVER_KEY), so this is not the trust boundary — it's parity with the
-# tool path so a malicious prompt is rejected the same way regardless of
-# which surface created the job.  Imported defensively: a missing scanner
-# must not disable the cron REST API.
-try:
-    from tools.cronjob_tools import _scan_cron_prompt as _scan_cron_prompt
-except Exception:  # pragma: no cover - scanner is optional hardening
-    _scan_cron_prompt = None
-
-
 class _ProviderAuthResolutionError(RuntimeError):
     """Raised only when gateway.run._resolve_runtime_agent_kwargs() fails
     to resolve provider credentials.
@@ -3417,17 +3397,22 @@ class APIServerAdapter(BasePlatformAdapter):
         1. Explicit override (config extra or API_SERVER_MODEL_NAME env var)
         2. Active profile name (so each profile advertises a distinct model)
         3. Fallback: "hermes-agent"
+
+        Delegates the tiered fallthrough to
+        :func:`hermes_cli.model_switch.resolve_effective_model` (the shared
+        override > mid-tier > default precedence owner).
         """
-        if explicit and explicit.strip():
-            return explicit.strip()
+        from hermes_cli.model_switch import resolve_effective_model
+
+        profile_name = ""
         try:
             from hermes_cli.profiles import get_active_profile_name
             profile = get_active_profile_name()
             if profile and profile not in {"default", "custom"}:
-                return profile
+                profile_name = profile
         except Exception:
             pass
-        return "hermes-agent"
+        return resolve_effective_model(explicit, profile_name, "hermes-agent")
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -3529,6 +3514,30 @@ class APIServerAdapter(BasePlatformAdapter):
             return API_APPROVAL_PASSKEY_AUTHORITY_SCHEMA
         return API_APPROVAL_AUTHORITY_SCHEMA
 
+    def _expected_api_key(self) -> str:
+        """Return the API key authorized for the URL-selected profile."""
+        profile = _api_request_profile.get()
+        if not profile or profile == "default":
+            return self._api_key
+
+        try:
+            from agent.secret_scope import get_secret
+            from hermes_cli.auth import has_usable_secret
+
+            key = get_secret("API_SERVER_KEY", "") or ""
+            if not has_usable_secret(key, min_length=16):
+                return ""
+            return key
+        except Exception as exc:
+            # Fail closed if the profile scope or strength guard cannot resolve
+            # the credential. Do not log the key or exception text.
+            logger.warning(
+                "Failed to resolve a usable profile-scoped API_SERVER_KEY for %r: %s",
+                profile,
+                type(exc).__name__,
+            )
+            return ""
+
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
         Validate Bearer token from Authorization header.
@@ -3537,7 +3546,32 @@ class APIServerAdapter(BasePlatformAdapter):
         connect() refuses to start the API server without API_SERVER_KEY, so
         the no-key branch only exists for tests or unsupported manual wiring.
         """
-        if not self._api_auth_configured():
+        profile = _api_request_profile.get()
+        is_named_profile = bool(profile and profile != "default")
+        expected_key = self._expected_api_key()
+        if is_named_profile and not expected_key:
+            # Preserve the historical no-key test/manual-wiring behavior only
+            # for the default listener. Named profiles must fail closed rather
+            # than inherit the listener owner's key.
+            if not is_named_profile:
+                return None
+            logger.warning(
+                "API server rejected request for profile %r: no profile-scoped "
+                "API_SERVER_KEY is configured; %s",
+                profile,
+                self._request_audit_log_suffix(request),
+            )
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Invalid gateway API key (API_SERVER_KEY)",
+                        "type": "gateway_auth_error",
+                        "code": "gateway_auth_failed",
+                    }
+                },
+                status=401,
+            )
+        if not is_named_profile and not self._api_auth_configured():
             return None
 
         auth_header = request.headers.get("Authorization", "")
@@ -3549,11 +3583,13 @@ class APIServerAdapter(BasePlatformAdapter):
             # otherwise crash this handler (500) instead of returning a clean
             # 401. Encoding both sides keeps the timing-safe comparison and
             # matches web_server.py's dashboard-token check.
-            legacy_valid = bool(self._api_key) and hmac.compare_digest(
+            legacy_valid = bool(expected_key) and hmac.compare_digest(
                 token.encode(),
-                self._api_key.encode(),
+                expected_key.encode(),
             )
             verifier_valid = (
+                not is_named_profile
+                and
                 self._api_bearer_verifier is not None
                 and api_bearer_matches(self._api_bearer_verifier, token)
             )
@@ -5194,8 +5230,13 @@ class APIServerAdapter(BasePlatformAdapter):
             # platform/test extension seams that replace this hook with a
             # one-argument callable remain compatible.
             session_override = self._session_model_override_for(session_key)
+        # Model-string precedence delegates to the shared owner
+        # hermes_cli.model_switch.resolve_effective_model (session /model
+        # override > session-persisted model > global) — the rule 7dd00bb47d
+        # had to re-fix here after it diverged from gateway/run.py.
+        from hermes_cli.model_switch import resolve_effective_model
         if session_override:
-            override_model = _clean_request_string(session_override.get("model")) or model
+            override_model = resolve_effective_model(session_override, None, model)
             session_provider = _clean_request_string(session_override.get("provider"))
             current_provider = _clean_request_string(runtime_kwargs.get("provider"))
             provider_runtime = _resolve_provider_runtime(
@@ -5225,7 +5266,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if provider_runtime:
                 _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
-            model = session_row_model
+            model = resolve_effective_model(None, session_row_model, model)
             if request_model or request_provider:
                 logger.debug(
                     "api_server request selection skipped: session-persisted model wins for %s",
@@ -7557,21 +7598,18 @@ class APIServerAdapter(BasePlatformAdapter):
             headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=headers)
         await response.prepare(request)
-        last_write = time.monotonic()
         try:
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
                 except asyncio.TimeoutError:
                     await response.write(b": keepalive\n\n")
-                    last_write = time.monotonic()
                     continue
                 if item is None:
                     break
                 name, payload = item
                 data = json.dumps(payload, ensure_ascii=False)
                 await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
-                last_write = time.monotonic()
         except (asyncio.CancelledError, ConnectionResetError):
             agent = agent_ref[0]
             if agent is not None:

@@ -231,8 +231,6 @@ class TestAtomicSnapshotWrite:
         boot = captured.get("cmd", "")
         assert "umask 077" in boot
         assert boot.index("umask 077") < boot.index("export -p")
-
-
 class TestAtomicSnapshotConcurrencyBehavioral:
     """Behavioral regression for #38249 — actually EXECUTES the generated
     snapshot write/read concurrently and asserts the file never tears.

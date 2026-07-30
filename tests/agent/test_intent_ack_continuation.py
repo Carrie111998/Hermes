@@ -1,4 +1,5 @@
 """Model-sovereignty contract: no keyword-based intent continuation."""
+
 import agent.agent_runtime_helpers as helpers
 
 
