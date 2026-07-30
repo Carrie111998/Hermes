@@ -2372,6 +2372,8 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
+                                source=agent._session_source_for_persistence(),
+                                model_config=agent._session_init_model_config,
                             )
                         except Exception as e:
                             # Log token persistence failures so they're

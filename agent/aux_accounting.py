@@ -32,7 +32,8 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# (session_db, session_id) for the active agent turn, or None outside one.
+# (session_db, session_id, source, model_config) for the active agent turn,
+# or None outside one.
 _accounting: ContextVar[Optional[tuple]] = ContextVar(
     "aux_accounting_context", default=None
 )
@@ -43,7 +44,13 @@ _accounting: ContextVar[Optional[tuple]] = ContextVar(
 _EXCLUDED_TASKS = frozenset({"moa_reference", "moa_aggregator"})
 
 
-def set_accounting_context(session_db: Any, session_id: Optional[str]):
+def set_accounting_context(
+    session_db: Any,
+    session_id: Optional[str],
+    *,
+    source: Optional[str] = None,
+    model_config: Optional[dict[str, Any]] = None,
+):
     """Publish the active session's accounting handles for aux usage recording.
 
     Called by the agent loop at turn entry. Returns the ContextVar token so
@@ -52,7 +59,7 @@ def set_accounting_context(session_db: Any, session_id: Optional[str]):
     """
     if session_db is None or not session_id:
         return _accounting.set(None)
-    return _accounting.set((session_db, session_id))
+    return _accounting.set((session_db, session_id, source, model_config))
 
 
 def reset_accounting_context(token) -> None:
@@ -64,7 +71,7 @@ def reset_accounting_context(token) -> None:
 
 
 def get_accounting_context() -> Optional[tuple]:
-    """Return ``(session_db, session_id)`` for the active turn, or ``None``."""
+    """Return the active turn's DB, ID, source, and model config, or ``None``."""
     return _accounting.get()
 
 
@@ -95,7 +102,7 @@ def record_aux_usage(
         ctx = _accounting.get()
         if ctx is None:
             return
-        session_db, session_id = ctx
+        session_db, session_id, source, model_config = ctx
         raw_usage = getattr(response, "usage", None)
         if raw_usage is None:
             return
@@ -133,6 +140,8 @@ def record_aux_usage(
             cache_write_tokens=usage.cache_write_tokens,
             reasoning_tokens=usage.reasoning_tokens,
             estimated_cost_usd=estimated_cost,
+            source=source,
+            model_config=model_config,
         )
     except Exception:
         logger.debug("Aux usage recording failed (non-fatal)", exc_info=True)

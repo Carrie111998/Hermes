@@ -81,6 +81,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                     billing_base_url=agent.base_url,
                     billing_mode="subscription_included",
                     api_call_count=1,
+                    source=agent._session_source_for_persistence(),
+                    model_config=agent._session_init_model_config,
                 )
             except Exception as exc:
                 logger.debug(
@@ -171,6 +173,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 if cost_result.status == "included" else None,
                 model=agent.model,
                 api_call_count=1,
+                source=agent._session_source_for_persistence(),
+                model_config=agent._session_init_model_config,
             )
         except Exception as exc:
             logger.debug(

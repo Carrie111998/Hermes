@@ -1,7 +1,10 @@
 """Tests for agent.title_generator — auto-generated session titles."""
 
-import pytest
+import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 from agent.title_generator import (
@@ -248,6 +251,49 @@ class TestAutoTitleSession:
             auto_title_session(db, "sess-1", "hi", "hello")
             db.set_auto_title_if_empty.assert_called_once_with("sess-1", "New Title")
 
+    def test_aux_fallback_preserves_structural_provenance(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        model_config = {"_delegate_from": "parent-cron"}
+
+        def generate_and_record_usage(*_args, **_kwargs):
+            from agent.aux_accounting import record_aux_usage
+
+            response = SimpleNamespace(
+                model="aux-title-model",
+                usage=SimpleNamespace(
+                    prompt_tokens=12,
+                    completion_tokens=3,
+                    total_tokens=15,
+                ),
+            )
+            record_aux_usage(
+                response,
+                "title_generation",
+                provider="test-provider",
+            )
+            return "Generated Title"
+
+        with patch(
+            "agent.title_generator.generate_title",
+            side_effect=generate_and_record_usage,
+        ):
+            auto_title_session(
+                db,
+                "sess-aux-only",
+                "hi",
+                "hello",
+                source="subagent",
+                model_config=model_config,
+            )
+
+        row = db._conn.execute(
+            "SELECT source, model_config FROM sessions WHERE id = ?",
+            ("sess-aux-only",),
+        ).fetchone()
+        assert row is not None
+        assert row["source"] == "subagent"
+        assert json.loads(row["model_config"]) == model_config
+
     def test_does_not_overwrite_title_set_immediately_before_conditional_write(
         self, tmp_path
     ):
@@ -378,7 +424,16 @@ class TestMaybeAutoTitle:
             import threading
             called = threading.Event()
             mock_auto.side_effect = lambda *a, **k: called.set()
-            maybe_auto_title(db, "sess-1", "hello", "hi there", history)
+            model_config = {"_delegate_from": "parent-cron"}
+            maybe_auto_title(
+                db,
+                "sess-1",
+                "hello",
+                "hi there",
+                history,
+                source="subagent",
+                model_config=model_config,
+            )
             # Event-based wait: sleep-sync flaked when the daemon thread
             # wasn't scheduled within the fixed nap on a loaded runner.
             assert called.wait(timeout=10), "auto_title thread never ran"
@@ -391,6 +446,8 @@ class TestMaybeAutoTitle:
                 main_runtime=None,
                 title_callback=None,
                 runtime_validator=None,
+                source="subagent",
+                model_config=model_config,
             )
 
     def test_skips_when_title_generation_disabled(self):

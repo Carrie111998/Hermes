@@ -3432,10 +3432,10 @@ class SessionDB:
         ``create_session`` then carries the real ``model`` / ``model_config`` /
         ``system_prompt``. A plain ``INSERT OR IGNORE`` silently dropped that
         enrichment, leaving gateway sessions with NULL model/billing metadata.
-        The ``ON CONFLICT`` upsert backfills those fields via ``COALESCE`` —
-        only filling columns that are still NULL, never overwriting values an
-        earlier writer already set (so a later bare call with source="unknown"
-        can't clobber a real source/model).
+        The ``ON CONFLICT`` upsert backfills nullable metadata via ``COALESCE``.
+        Source is first-writer-wins except for the explicit accounting
+        placeholder ``unknown``, which yields to a later non-empty canonical
+        source. A later bare ``unknown`` write can never clobber a real source.
 
         ``chat_id``/``thread_id`` record the messaging origin (the chat/room and
         thread the session was started in) so that gateway ``/resume`` can prove
@@ -3443,6 +3443,9 @@ class SessionDB:
         switching to it (IDOR scoping — without them the ``sessions`` table has
         no chat/thread to compare).
         """
+        normalized_source = source.strip()
+        if not normalized_source or normalized_source.casefold() == "unknown":
+            normalized_source = "unknown"
         conn.execute(
             """INSERT INTO sessions (
                id, source, user_id, session_key, chat_id, chat_type, thread_id,
@@ -3450,6 +3453,12 @@ class SessionDB:
             )
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET
+                   source = CASE
+                       WHEN sessions.source = 'unknown'
+                            AND excluded.source != 'unknown'
+                       THEN excluded.source
+                       ELSE sessions.source
+                   END,
                    model = COALESCE(sessions.model, excluded.model),
                    model_config = COALESCE(sessions.model_config, excluded.model_config),
                    system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
@@ -3462,7 +3471,7 @@ class SessionDB:
                    profile_name = COALESCE(sessions.profile_name, excluded.profile_name)""",
             (
                 session_id,
-                source,
+                normalized_source,
                 user_id,
                 session_key,
                 chat_id,
@@ -4419,6 +4428,8 @@ class SessionDB:
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        source: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -4432,8 +4443,13 @@ class SessionDB:
         # Ensure the session row exists so the UPDATE doesn't silently affect
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
         # initial create_session() may have failed due to SQLite locking.
-        # INSERT OR IGNORE is cheap and idempotent.
-        self._insert_session_row(session_id, "unknown", model=model)
+        # The source-aware upsert is cheap and idempotent.
+        self._insert_session_row(
+            session_id,
+            source or "unknown",
+            model=model,
+            model_config=model_config,
+        )
         if absolute:
             sql = """UPDATE sessions SET
                    input_tokens = ?,
@@ -4678,7 +4694,7 @@ class SessionDB:
         model: Optional[str] = None,
         **kwargs,
     ) -> str:
-        """Ensure a session row exists (INSERT OR IGNORE). Accepts optional kwargs."""
+        """Ensure a session row exists via an enriching upsert."""
         self._insert_session_row(session_id, source, model=model, **kwargs)
         return session_id
 
@@ -4696,6 +4712,8 @@ class SessionDB:
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
+        source: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
 
@@ -4715,9 +4733,13 @@ class SessionDB:
         if not session_id or not task:
             return
         # FK on session_model_usage.session_id → sessions.id: ensure the row
-        # exists (same INSERT OR IGNORE guard update_token_counts uses — the
+        # exists (same enriching upsert guard update_token_counts uses — the
         # initial create_session() can fail under concurrent SQLite locking).
-        self._insert_session_row(session_id, "unknown")
+        self._insert_session_row(
+            session_id,
+            source or "unknown",
+            model_config=model_config,
+        )
 
         def _do(conn):
             self._record_model_usage(

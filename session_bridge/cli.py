@@ -83,6 +83,7 @@ from .models import (
     Provider,
     SidebarHydrationState,
     SidebarJobState,
+    canonical_session_id,
     encode_bridge_marker,
 )
 from .claude_skill import install_claude_skill
@@ -2668,7 +2669,9 @@ class ProductionBackend:
                 config=self.config,
                 store=store,
                 inventory=lambda after: self._claude_visibility_inventory(
-                    after, marker_secret=marker_secret
+                    after,
+                    marker_secret=marker_secret,
+                    state_db_only=True,
                 ),
                 continuous_inventory=lambda after: self._claude_visibility_inventory(
                     after,
@@ -2696,6 +2699,19 @@ class ProductionBackend:
     ) -> Sequence[SidebarSource]:
         store = self._require_store()
         sources = list(store.list_claude_visibility_hermes_sources(after, None))
+        indexed_codex = store.list_claude_visibility_codex_sources(after, None)
+        indexed_by_native_id: dict[str, SidebarSource] = {}
+        for source in indexed_codex:
+            native_id = source.projection.native_id
+            if (
+                source.projection.provider is not Provider.CODEX
+                or source.source_session_id
+                != canonical_session_id(Provider.CODEX, native_id)
+                or native_id in indexed_by_native_id
+            ):
+                raise ValueError("conflicting indexed Codex visibility source")
+            indexed_by_native_id[native_id] = source
+        known_visibility_source_ids = store.list_claude_visibility_source_ids()
         if self._codex_client is None:
             codex_command = resolve_cli_executable("codex")
             if len(codex_command) != 1:
@@ -2713,6 +2729,8 @@ class ProductionBackend:
         page = codex.list_claude_visibility_sources(
             after=after,
             state_db_only=state_db_only,
+            indexed_sources=indexed_by_native_id,
+            known_visibility_source_ids=known_visibility_source_ids,
         )
         existing = {
             (item.projection.provider, item.source_session_id) for item in sources

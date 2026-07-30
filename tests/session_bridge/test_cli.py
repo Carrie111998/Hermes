@@ -3994,6 +3994,98 @@ def test_claude_visibility_runtime_passes_only_preflight_theme_to_registrar(
     assert events == ["resolve_executable", ("preflight", ("claude",))]
 
 
+def test_claude_visibility_inventory_reuses_indexed_codex_and_fast_state_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = BridgeConfig()
+    backend = ProductionBackend(config)
+    indexed_projection = SessionProjection(
+        provider=Provider.CODEX,
+        native_id="indexed-codex",
+        title="Indexed Codex",
+        cwd="C:/work/indexed",
+        started_at=100.0,
+        last_active=200.0,
+        messages=(
+            ProjectedMessage(
+                native_event_id="indexed-user",
+                ordinal=0,
+                role="user",
+                content="Reuse indexed projection",
+                timestamp=110.0,
+            ),
+        ),
+        origin_kind=OriginKind.NATIVE,
+    )
+    indexed = cli_module.SidebarSource(
+        source_session_id="codex:indexed-codex",
+        projection=indexed_projection,
+        git_root=None,
+        git_head=None,
+        worktree_id=None,
+        automation_only=False,
+        subagent_only=False,
+    )
+
+    class Store:
+        def list_claude_visibility_hermes_sources(
+            self, after: float, limit: int | None
+        ) -> tuple[()]:
+            assert after == 150.0
+            assert limit is None
+            return ()
+
+        def list_claude_visibility_codex_sources(
+            self, after: float, limit: int | None
+        ) -> tuple[cli_module.SidebarSource, ...]:
+            assert after == 150.0
+            assert limit is None
+            return (indexed,)
+
+        def list_claude_visibility_source_ids(self) -> frozenset[str]:
+            return frozenset({"codex:indexed-codex"})
+
+    captured: dict[str, object] = {}
+
+    class Adapter:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def list_claude_visibility_sources(
+            self,
+            *,
+            after: float,
+            state_db_only: bool,
+            indexed_sources: Mapping[str, cli_module.SidebarSource],
+            known_visibility_source_ids: frozenset[str],
+        ) -> tuple[cli_module.SidebarSource, ...]:
+            captured.update({
+                "after": after,
+                "state_db_only": state_db_only,
+                "indexed_sources": indexed_sources,
+                "known_visibility_source_ids": known_visibility_source_ids,
+            })
+            return (indexed,)
+
+    backend._codex_client = object()
+    monkeypatch.setattr(backend, "_require_store", lambda: Store())
+    monkeypatch.setattr("session_bridge.cli.CodexSourceAdapter", Adapter)
+
+    sources = backend._claude_visibility_inventory(
+        150.0,
+        marker_secret=b"m" * 32,
+        state_db_only=True,
+    )
+
+    assert sources == (indexed,)
+    assert captured == {
+        "after": 150.0,
+        "state_db_only": True,
+        "indexed_sources": {"indexed-codex": indexed},
+        "known_visibility_source_ids": frozenset({"codex:indexed-codex"}),
+    }
+
+
 def test_characterization_preflight_blocks_before_store_or_registrar(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

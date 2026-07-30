@@ -5,6 +5,7 @@ their token usage into session_model_usage with a ``task`` dimension via
 the ambient accounting context (agent/aux_accounting.py), making aux model
 spend visible in analytics.
 """
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -206,6 +207,28 @@ class TestAmbientAccountingContext:
         assert rows[0]["model"] == "aux-m"
         assert rows[0]["input_tokens"] == 100
         assert rows[0]["output_tokens"] == 20
+
+    def test_aux_only_placeholder_preserves_structural_source(self, db):
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+
+        token = set_accounting_context(
+            db,
+            "child",
+            source="subagent",
+            model_config={"_delegate_from": "parent"},
+        )
+        try:
+            record_aux_usage(_mk_response(model="aux-m"), "vision")
+        finally:
+            reset_accounting_context(token)
+
+        session = db.get_session("child")
+        assert session["source"] == "subagent"
+        assert json.loads(session["model_config"]) == {"_delegate_from": "parent"}
 
     def test_noop_outside_context(self, db):
         from agent.aux_accounting import record_aux_usage

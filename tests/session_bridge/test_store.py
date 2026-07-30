@@ -6987,6 +6987,91 @@ def test_claude_visibility_hermes_inventory_uses_exact_recorded_worktree_identit
     assert by_id["hermes-non-git"].worktree_id is None
 
 
+def test_claude_visibility_codex_inventory_reuses_full_indexed_projections(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+    native = _projection(
+        _message(
+            "native-user",
+            "Build the indexed Codex inventory",
+            role="user",
+            timestamp=101.0,
+        ),
+        _message(
+            "native-assistant",
+            "Assistant content must not be materialized",
+            role="assistant",
+            timestamp=102.0,
+        ),
+        provider=Provider.CODEX,
+        native_id="indexed-native",
+        last_active=120.0,
+        cursor="native-cursor",
+        native_hash="native-hash",
+        git_branch="feature/native",
+    )
+    placeholder = _projection(
+        _message(
+            "placeholder-user",
+            "Authenticated bridge placeholder",
+            role="user",
+            timestamp=111.0,
+        ),
+        provider=Provider.CODEX,
+        native_id="indexed-placeholder",
+        last_active=130.0,
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id="bridge:indexed-placeholder",
+    )
+    claude = _projection(
+        _message("claude-user", "Claude must not pollute Codex inventory"),
+        provider=Provider.CLAUDE,
+        native_id="native-claude",
+        last_active=140.0,
+    )
+    for projection in (native, placeholder, claude):
+        store.upsert_projection(projection)
+
+    sources = store.list_claude_visibility_codex_sources(after=100.0, limit=None)
+
+    assert [source.source_session_id for source in sources] == [
+        "codex:indexed-placeholder",
+        "codex:indexed-native",
+    ]
+    by_id = {source.projection.native_id: source for source in sources}
+    assert tuple(by_id["indexed-native"].projection.messages) == (
+        ProjectedMessage(
+            native_event_id="native-user",
+            ordinal=0,
+            role="user",
+            content="Build the indexed Codex inventory",
+            timestamp=101.0,
+        ),
+    )
+    assert by_id["indexed-native"].projection.native_cursor == "native-cursor"
+    assert by_id["indexed-native"].projection.native_hash == "native-hash"
+    assert by_id["indexed-native"].projection.git_branch == "feature/native"
+    assert (
+        by_id["indexed-placeholder"].projection.origin_kind
+        is OriginKind.BRIDGE_PLACEHOLDER
+    )
+    assert (
+        by_id["indexed-placeholder"].projection.origin_bridge_id
+        == "bridge:indexed-placeholder"
+    )
+
+
+def test_claude_visibility_source_ids_cover_existing_jobs(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+    assert store.list_claude_visibility_source_ids() == frozenset()
+    candidate, identity = _claude_visibility_identity("known-source")
+
+    _enqueue_claude_visibility_job(store, candidate, identity)
+
+    assert store.list_claude_visibility_source_ids() == frozenset({
+        candidate.source_session_id
+    })
+
+
 def _sidebar_candidate(
     db: SessionDB,
     *,

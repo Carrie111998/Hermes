@@ -216,6 +216,8 @@ def auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    source: Optional[str] = None,
+    model_config: Optional[dict] = None,
 ) -> None:
     """Generate and set a session title if one doesn't already exist.
 
@@ -245,6 +247,8 @@ def auto_title_session(
             main_runtime=main_runtime,
             title_callback=title_callback,
             runtime_validator=runtime_validator,
+            source=source,
+            model_config=model_config,
         )
     except Exception as e:
         # WARNING (not debug) so operators see it in agent.log; the message
@@ -271,6 +275,8 @@ def _auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    source: Optional[str] = None,
+    model_config: Optional[dict] = None,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
     if not session_db or not session_id:
@@ -301,7 +307,12 @@ def _auto_title_session(
     set_conversation_context(conversation_id)
     # Same for the accounting context, so the title call's token usage is
     # recorded against this session (task='title_generation', #23270).
-    set_accounting_context(session_db, session_id)
+    set_accounting_context(
+        session_db,
+        session_id,
+        source=source,
+        model_config=model_config,
+    )
 
     title = generate_title(
         user_message,
@@ -337,6 +348,8 @@ def maybe_auto_title(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    source: Optional[str] = None,
+    model_config: Optional[dict] = None,
 ) -> None:
     """Fire-and-forget title generation after the first exchange.
 
@@ -361,15 +374,21 @@ def maybe_auto_title(
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return
 
+    thread_kwargs = {
+        "failure_callback": failure_callback,
+        "main_runtime": main_runtime,
+        "title_callback": title_callback,
+        "runtime_validator": runtime_validator,
+    }
+    if source is not None:
+        thread_kwargs["source"] = source
+    if model_config is not None:
+        thread_kwargs["model_config"] = model_config
+
     thread = threading.Thread(
         target=auto_title_session,
         args=(session_db, session_id, user_message, assistant_response),
-        kwargs={
-            "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
-            "title_callback": title_callback,
-            "runtime_validator": runtime_validator,
-        },
+        kwargs=thread_kwargs,
         daemon=True,
         name="auto-title",
     )
