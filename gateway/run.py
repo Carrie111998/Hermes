@@ -1492,17 +1492,23 @@ def _collect_auto_append_media_tags(
 
 
 def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
-    """Collect every media path already delivered in prior assistant/tool output.
+    """Collect every media path already delivered in prior assistant output.
 
     Used to dedup auto-appended and model-emitted MEDIA tags so the same file
-    is not re-sent on later turns. Covers three delivery shapes:
-      * ``MEDIA:<path>`` text tags in tool results,
+    is not re-sent on later turns. Covers two delivery shapes:
       * ``MEDIA:<path>`` text tags in assistant messages (model-generated tags),
       * ``image_generate`` JSON-payload paths (``host_image`` / ``image`` /
         ``agent_visible_image``), which carry no MEDIA: tag.
 
+    Tool/function results are deliberately skipped: they contain MEDIA paths
+    from tool OUTPUT that have not been delivered yet, and including them
+    causes false-positive dedup that silently drops the current turn's media
+    (#74928). image_generate JSON payloads in tool results are still collected
+    since they represent actually-delivered content.
+
     Missing the JSON-payload shape caused #46627; missing the assistant-message
     shape caused repeated delivery when the model echoed a previous MEDIA tag.
+    Including tool-result MEDIA tags caused #74928 (TTS/voice never delivered).
     """
     paths: set = set()
     tool_name_by_call_id: Dict[str, str] = {}
@@ -1536,10 +1542,13 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
             continue
         if role not in {"tool", "function"}:
             continue
-        content = str(msg.get("content", "") or "")
-        if "MEDIA:" in content:
-            _add_text_media_paths(content)
-            continue
+        # Skip MEDIA: text tags in tool/function results — they contain paths
+        # from tool OUTPUT that haven't been delivered yet.  Including them
+        # in the dedup set causes false-positive suppression: the current
+        # turn's assistant MEDIA tag is silently dropped because the tool
+        # result already mentioned the path (#74928).
+        # (image_generate JSON payloads are still collected below since they
+        # represent actually-delivered content, not MEDIA: tags.)
         cid = str(msg.get("tool_call_id") or msg.get("call_id") or "")
         if tool_name_by_call_id.get(cid) == "image_generate":
             try:
