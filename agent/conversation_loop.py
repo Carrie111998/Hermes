@@ -23,6 +23,7 @@ import random
 import re
 import ssl
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -1081,7 +1082,7 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def run_conversation(
+def _run_conversation_unleased(
     agent,
     user_message: Any,
     system_message: str = None,
@@ -7031,4 +7032,72 @@ def run_conversation(
 
 
 
-__all__ = ["run_conversation"]
+def run_conversation(
+    agent,
+    user_message: Any,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    task_id: str = None,
+    stream_callback: Optional[callable] = None,
+    persist_user_message: Optional[Any] = None,
+    persist_user_timestamp: Optional[float] = None,
+    persist_user_display_kind: Optional[str] = None,
+    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    moa_config: Optional[dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one conversation inside the host-owned outer-turn lease.
+
+    The large conversation body remains independently testable as
+    ``_run_conversation_unleased``.  This wrapper is deliberately the only
+    public conversation entrypoint: it constructs the runtime identity before
+    any prompt, persistence, or tool setup and keeps the lease alive through
+    the final response.
+    """
+    from agent.turn_gate import (
+        TurnGateRequest,
+        acquire_outer_turn,
+        build_runtime_identity,
+        guard_output_callback,
+        enforce_output_allowed,
+    )
+
+    session_id = str(getattr(agent, "session_id", "") or "session")
+    turn_id = f"{session_id}:{task_id or 'task'}:{uuid.uuid4().hex[:8]}"
+    identity = build_runtime_identity(
+        surface="conversation",
+        session_scope=session_id,
+        turn_id=turn_id,
+    )
+    request = TurnGateRequest(
+        entrypoint="conversation",
+        purpose="business",
+        task_id=task_id,
+        identity=identity,
+    )
+    guarded_callback = guard_output_callback(stream_callback)
+    with acquire_outer_turn(request):
+        result = _run_conversation_unleased(
+            agent,
+            user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            stream_callback=guarded_callback,
+            persist_user_message=persist_user_message,
+            persist_user_timestamp=persist_user_timestamp,
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+            moa_config=moa_config,
+        )
+        # Final assembly is an output boundary even when no streaming callback
+        # was installed (for example, a CLI or a test double).
+        enforce_output_allowed()
+        return result
+
+
+# Preserve source-introspection compatibility for diagnostics and existing
+# regression tests while keeping the host-owned outer wrapper public.
+run_conversation.__wrapped__ = _run_conversation_unleased  # type: ignore[attr-defined]
+
+
+__all__ = ["run_conversation", "_run_conversation_unleased"]

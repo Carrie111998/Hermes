@@ -32,6 +32,8 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.tool_guardrails import ToolGuardrailDecision
+from agent.turn_gate import tool_block_message
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -51,6 +53,11 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+def _host_gate_block_message(function_name: str) -> str | None:
+    """Return a host-enforced block reason before hooks or middleware run."""
+    return tool_block_message(function_name)
 
 
 def _ensure_file_checkpoint(
@@ -366,6 +373,27 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    host_gate_block = _host_gate_block_message(function_name)
+    if host_gate_block is not None:
+        trace = list(middleware_trace or [])
+        result = json.dumps(
+            {"error": host_gate_block, "error_type": "turn_gate_block"},
+            ensure_ascii=False,
+        )
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=function_name,
+            function_args=dict(function_args),
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+            status="blocked",
+            error_type="turn_gate_block",
+            error_message=host_gate_block,
+            middleware_trace=trace,
+        )
+        return _ManagedToolResult(result, dict(function_args), trace, True)
+
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,

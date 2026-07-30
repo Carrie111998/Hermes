@@ -40,6 +40,7 @@ import sys
 import signal
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -18475,18 +18476,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         resolve from that profile's secret scope. Mirrors the pattern in
         ``_run_agent``.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+        from agent.turn_gate import (
+            TurnGateRequest,
+            acquire_outer_turn,
+            build_runtime_identity,
+        )
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+        turn_id = f"{task_id}:{uuid.uuid4().hex[:8]}"
+        identity = build_runtime_identity(
+            surface="gateway-background",
+            session_scope=task_id,
+            turn_id=turn_id,
+        )
+        request = TurnGateRequest(
+            entrypoint="gateway-background",
+            purpose="business",
+            task_id=task_id,
+            identity=identity,
+        )
+        with acquire_outer_turn(request):
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return await self._run_background_task_inner(
+                    prompt, source, task_id, event_message_id, media_urls, media_types,
+                )
+
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await self._run_background_task_inner(
+                    prompt, source, task_id, event_message_id, media_urls, media_types,
+                )
 
     async def _run_background_task_inner(
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        event_message_id: Optional[str] = None,
+        media_urls: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None,
+    ) -> None:
+        """Compatibility seam that remains below the host-owned lease."""
+        return await self._run_background_task_unleased(
+            prompt, source, task_id, event_message_id, media_urls, media_types,
+        )
+
+    async def _run_background_task_unleased(
         self,
         prompt: str,
         source: "SessionSource",
@@ -23003,6 +23037,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=message_type,
             )
 
+    async def _run_agent_inner(
+        self,
+        message: str,
+        context_prompt: str,
+        history: List[Dict[str, Any]],
+        source: SessionSource,
+        session_id: str,
+        session_key: str = None,
+        run_generation: Optional[int] = None,
+        _interrupt_depth: int = 0,
+        event_message_id: Optional[str] = None,
+        channel_prompt: Optional[str] = None,
+        moa_config: Optional[dict] = None,
+        persist_user_message: Optional[Any] = None,
+        persist_user_timestamp: Optional[float] = None,
+        message_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Acquire the host lease before entering the real gateway turn."""
+        from agent.turn_gate import (
+            TurnGateRequest,
+            acquire_outer_turn,
+            build_runtime_identity,
+            enforce_output_allowed,
+        )
+
+        turn_id = f"{session_id}:{uuid.uuid4().hex[:8]}"
+        identity = build_runtime_identity(
+            surface="gateway",
+            session_scope=session_id,
+            turn_id=turn_id,
+        )
+        request = TurnGateRequest(
+            entrypoint="gateway",
+            purpose="business",
+            task_id=session_id,
+            identity=identity,
+        )
+        with acquire_outer_turn(request):
+            result = await self._run_agent_inner_unleased(
+                message, context_prompt, history, source, session_id,
+                session_key=session_key, run_generation=run_generation,
+                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                channel_prompt=channel_prompt, moa_config=moa_config,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                message_type=message_type,
+            )
+            enforce_output_allowed()
+            return result
+
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
 
@@ -23107,7 +23191,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return get_hermes_home()
 
-    async def _run_agent_inner(
+    async def _run_agent_inner_unleased(
         self,
         message: str,
         context_prompt: str,

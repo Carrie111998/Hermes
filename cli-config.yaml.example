@@ -799,6 +799,18 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Optional host-enforced outer-turn gate. A plugin must register a provider
+  # under the same manifest key/name as `required_provider`. When configured,
+  # malformed settings or a missing provider fail closed before the turn body.
+  # See docs/turn-gate/README.md for the provider contract.
+  # turn_gate:
+  #   required_provider: example-gate
+  #   runtime_identity:
+  #     machine_id: workstation-01
+  #   allowed_child_environment:
+  #     - EXAMPLE_TURN_LEASE_ID
+  #     - EXAMPLE_COORDINATOR_SOCKET
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

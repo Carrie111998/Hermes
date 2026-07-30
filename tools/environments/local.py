@@ -449,6 +449,17 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+def _inject_turn_gate_env(env: dict[str, str]) -> None:
+    """Apply the generic host-owned child-environment contribution contract."""
+    try:
+        from agent.turn_gate import inject_turn_gate_child_environment
+    except ImportError:
+        return
+    sanitized = inject_turn_gate_child_environment(env)
+    env.clear()
+    env.update(sanitized)
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -485,6 +496,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _inject_turn_gate_env(sanitized)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -629,6 +641,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+    _inject_turn_gate_env(env)
 
     # Non-terminal subprocess helpers (browser, lazy-deps, TUI/ACP hosts, etc.)
     # also need the delegate_task child lineage marker.  Otherwise a child
@@ -699,6 +712,7 @@ def build_subprocess_env(
         apply_subprocess_home_env(env)
     if extra:
         env.update(extra)
+    _inject_turn_gate_env(env)
     return env
 
 
@@ -1255,6 +1269,7 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    _inject_turn_gate_env(run_env)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)

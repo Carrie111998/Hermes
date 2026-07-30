@@ -32,6 +32,7 @@ from typing import Any, Optional, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
+from agent.turn_gate import create_detached_task
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
@@ -3163,7 +3164,7 @@ class GatewaySlashCommandsMixin:
         media_types = list(event.media_types) if event.media_types else []
 
         # Fire-and-forget the background task
-        _task = asyncio.create_task(
+        _task = create_detached_task(
             self._run_background_task(
                 prompt,
                 source,

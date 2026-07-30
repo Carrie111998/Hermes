@@ -683,6 +683,18 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        try:
+            from agent.turn_gate import tool_block_message
+            block_message = tool_block_message(name)
+        except Exception:
+            block_message = None
+        if block_message is not None:
+            return tool_error(
+                block_message,
+                error_type="turn_gate_block",
+                tool=name,
+            )
+
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")

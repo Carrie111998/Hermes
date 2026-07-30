@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.metadata
 import importlib.util
 import inspect
@@ -1174,6 +1175,24 @@ class PluginContext:
             display_name,
         )
 
+    def register_turn_gate_provider(self, provider: Any) -> None:
+        """Register this plugin as a host-enforced outer-turn gate provider."""
+        from agent.turn_gate import register_turn_gate_provider
+
+        provider_id = self.manifest.key or self.manifest.name
+        register_turn_gate_provider(
+            provider_id,
+            provider,
+            owner_id=provider_id,
+            replace=True,
+        )
+        self._manager._turn_gate_provider_ids.add(provider_id)
+        logger.debug(
+            "Plugin %s registered mandatory turn gate provider: %s",
+            self.manifest.name,
+            provider_id,
+        )
+
     def register_hook(self, hook_name: str, callback: Callable) -> None:
         """Register a lifecycle hook callback.
 
@@ -1273,6 +1292,22 @@ class PluginManager:
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
+        self._turn_gate_provider_ids: Set[str] = set()
+        # Set to the failing plugin's error text when a plugin that touched the
+        # mandatory turn-gate registry raised during its own load. _load_plugin
+        # swallows that exception (so other plugins still load) and rolls back
+        # its own gate registration, but a force reload must NOT commit a round
+        # in which the mandatory gate silently failed to (re)register after the
+        # up-front teardown already removed the previously-live provider. Reset
+        # per discovery round; consulted only by the force path.
+        self._gate_provider_load_error: Optional[str] = None
+        # Ephemeral transaction context for failures that happen before a
+        # same-ID plugin can call register(). Cleared whenever the round exits.
+        self._force_reload_prior_gate_provider_ids: frozenset[str] = frozenset()
+        # Any plugin import/load/register failure aborts a force round. Non-force
+        # discovery keeps the historical best-effort, per-plugin error behavior.
+        self._force_reload_error: Optional[str] = None
+        self._force_reload_active: bool = False
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
@@ -1304,11 +1339,34 @@ class PluginManager:
         """
         if self._discovered and not force:
             return
-        if env_var_enabled("HERMES_SAFE_MODE"):
-            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
-            self._discovered = True
-            return
+        # force=True is transactional: the teardown below unregisters the live
+        # turn-gate providers and wipes discovery state up front, but a plugin's
+        # register() can register a same-id replacement and then fail mid-round.
+        # Snapshot the exact prior providers and discovery state BEFORE any
+        # teardown so any BaseException from the round restores them precisely
+        # (a per-plugin _load_plugin snapshot cannot — the old objects are
+        # already gone by the time it runs). A successful clean (including
+        # SAFE_MODE) commits.
+        _gate_registry_snapshot = None
+        _discovery_snapshot = None
+        _host_registry_snapshot = None
+        self._force_reload_prior_gate_provider_ids = (
+            frozenset(self._turn_gate_provider_ids) if force else frozenset()
+        )
         if force:
+            from agent.turn_gate import (
+                snapshot_turn_gate_providers,
+                unregister_turn_gate_providers_by_owner,
+            )
+
+            _gate_registry_snapshot = snapshot_turn_gate_providers()
+            _discovery_snapshot = self._snapshot_discovery_state()
+            _host_registry_snapshot = self._snapshot_force_reload_host_state()
+            self._force_reload_active = True
+
+            for provider_id in tuple(self._turn_gate_provider_ids):
+                unregister_turn_gate_providers_by_owner(provider_id)
+            self._turn_gate_provider_ids.clear()
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
@@ -1320,6 +1378,17 @@ class PluginManager:
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
+        # Fresh per round: _load_plugin records here when a gate-registering
+        # plugin fails its own load. The force path treats such a failure as a
+        # failed round even though _load_plugin itself swallowed the exception.
+        self._gate_provider_load_error = None
+        self._force_reload_error = None
+        if env_var_enabled("HERMES_SAFE_MODE"):
+            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+            self._discovered = True
+            self._force_reload_prior_gate_provider_ids = frozenset()
+            self._force_reload_active = False
+            return
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
         # raises so a failed scan is NOT cached as "discovered with an empty
@@ -1329,9 +1398,224 @@ class PluginManager:
         self._discovered = True
         try:
             self._discover_and_load_inner()
+            if force and self._gate_provider_load_error is not None:
+                # A plugin registered a turn-gate provider (same-id replacement
+                # of a torn-down live provider, or a fresh one) and then raised.
+                # _load_plugin swallowed that and only recorded loaded.error, so
+                # _discover_and_load_inner returned "successfully" — but the
+                # mandatory gate is now missing the provider the up-front
+                # teardown removed. Fail the round closed so the except below
+                # restores the exact previous provider object and manager state.
+                from agent.turn_gate import TurnGateBlocked
+
+                raise TurnGateBlocked(
+                    "force reload failed to re-establish a mandatory turn gate "
+                    f"provider and rolled back: {self._gate_provider_load_error}"
+                )
+            if force and self._force_reload_error is not None:
+                raise RuntimeError(
+                    "force plugin discovery failed and rolled back: "
+                    f"{self._force_reload_error}"
+                )
         except BaseException:
-            self._discovered = False
+            try:
+                if force:
+                    # Roll the whole round back to the exact pre-teardown state:
+                    # provider objects, tracking, and every cleared discovery map.
+                    from agent.turn_gate import restore_turn_gate_providers
+
+                    restore_turn_gate_providers(_gate_registry_snapshot)
+                    assert _host_registry_snapshot is not None
+                    self._restore_force_reload_host_state(_host_registry_snapshot)
+                    self._restore_discovery_state(_discovery_snapshot)
+                else:
+                    self._discovered = False
+            finally:
+                self._force_reload_prior_gate_provider_ids = frozenset()
+                self._force_reload_active = False
             raise
+        self._force_reload_prior_gate_provider_ids = frozenset()
+        self._force_reload_active = False
+
+    def _snapshot_discovery_state(self) -> dict:
+        """Capture the manager discovery state that a force-reload tears down.
+
+        Shallow per-container copies are enough to restore the exact prior
+        objects: the force teardown ``clear()``s each container in place, so the
+        round populates fresh containers/lists and never mutates the snapshot's.
+        """
+        return {
+            "plugins": dict(self._plugins),
+            "hooks": {name: list(cbs) for name, cbs in self._hooks.items()},
+            "middleware": {
+                kind: list(cbs) for kind, cbs in self._middleware.items()
+            },
+            "plugin_tool_names": set(self._plugin_tool_names),
+            "plugin_platform_names": set(self._plugin_platform_names),
+            "turn_gate_provider_ids": set(self._turn_gate_provider_ids),
+            "gate_provider_load_error": self._gate_provider_load_error,
+            "force_reload_error": self._force_reload_error,
+            "cli_commands": dict(self._cli_commands),
+            "plugin_commands": dict(self._plugin_commands),
+            "plugin_skills": dict(self._plugin_skills),
+            "aux_tasks": dict(self._aux_tasks),
+            "slack_action_handlers": list(self._slack_action_handlers),
+            "context_engine": self._context_engine,
+            "discovered": self._discovered,
+        }
+
+    def _restore_discovery_state(self, snapshot: dict) -> None:
+        """Restore state captured by :meth:`_snapshot_discovery_state`, in place."""
+        self._plugins.clear()
+        self._plugins.update(snapshot["plugins"])
+        self._hooks.clear()
+        self._hooks.update(snapshot["hooks"])
+        self._middleware.clear()
+        self._middleware.update(snapshot["middleware"])
+        self._plugin_tool_names.clear()
+        self._plugin_tool_names.update(snapshot["plugin_tool_names"])
+        self._plugin_platform_names.clear()
+        self._plugin_platform_names.update(snapshot["plugin_platform_names"])
+        self._turn_gate_provider_ids.clear()
+        self._turn_gate_provider_ids.update(snapshot["turn_gate_provider_ids"])
+        self._gate_provider_load_error = snapshot["gate_provider_load_error"]
+        self._force_reload_error = snapshot["force_reload_error"]
+        self._cli_commands.clear()
+        self._cli_commands.update(snapshot["cli_commands"])
+        self._plugin_commands.clear()
+        self._plugin_commands.update(snapshot["plugin_commands"])
+        self._plugin_skills.clear()
+        self._plugin_skills.update(snapshot["plugin_skills"])
+        self._aux_tasks.clear()
+        self._aux_tasks.update(snapshot["aux_tasks"])
+        self._slack_action_handlers[:] = snapshot["slack_action_handlers"]
+        self._context_engine = snapshot["context_engine"]
+        self._discovered = snapshot["discovered"]
+
+    @staticmethod
+    def _snapshot_force_reload_host_state() -> dict:
+        """Snapshot every host registry exposed through ``PluginContext``.
+
+        A force round may replace providers or register tools/platforms before a
+        later plugin fails. The manager-local snapshot cannot undo those global
+        writes, so capture their exact object mappings and the plugin namespace
+        modules as one transaction boundary.
+        """
+        browser_registry = importlib.import_module("agent.browser_registry")
+        dashboard_auth_registry = importlib.import_module(
+            "hermes_cli.dashboard_auth.registry"
+        )
+        image_gen_registry = importlib.import_module("agent.image_gen_registry")
+        transcription_registry = importlib.import_module(
+            "agent.transcription_registry"
+        )
+        tts_registry = importlib.import_module("agent.tts_registry")
+        video_gen_registry = importlib.import_module("agent.video_gen_registry")
+        web_search_registry = importlib.import_module("agent.web_search_registry")
+        secret_source_registry = importlib.import_module(
+            "agent.secret_sources.registry"
+        )
+        platform_registry = importlib.import_module(
+            "gateway.platform_registry"
+        ).platform_registry
+        tool_registry = importlib.import_module("tools.registry").registry
+
+        provider_registries = []
+        for registry_module in (
+            browser_registry,
+            dashboard_auth_registry,
+            image_gen_registry,
+            transcription_registry,
+            tts_registry,
+            video_gen_registry,
+            web_search_registry,
+        ):
+            lock = getattr(registry_module, "_lock")
+            providers = getattr(registry_module, "_providers")
+            with lock:
+                provider_registries.append((registry_module, dict(providers)))
+
+        tool_lock = getattr(tool_registry, "_lock")
+        with tool_lock:
+            tool_state = {
+                "tools": dict(getattr(tool_registry, "_tools")),
+                "plugin_override_policy": dict(
+                    getattr(tool_registry, "_plugin_override_policy")
+                ),
+                "toolset_checks": dict(getattr(tool_registry, "_toolset_checks")),
+                "toolset_aliases": dict(getattr(tool_registry, "_toolset_aliases")),
+                "generation": getattr(tool_registry, "_generation"),
+            }
+
+        return {
+            "tool_registry": tool_registry,
+            "tool_state": tool_state,
+            "platform_registry": platform_registry,
+            "platform_entries": dict(getattr(platform_registry, "_entries")),
+            "platform_deferred": dict(getattr(platform_registry, "_deferred")),
+            "provider_registries": provider_registries,
+            "secret_source_registry": secret_source_registry,
+            "secret_sources": dict(getattr(secret_source_registry, "_SOURCES")),
+            "secret_builtins_loaded": getattr(
+                secret_source_registry, "_BUILTINS_LOADED"
+            ),
+            "plugin_modules": {
+                name: module
+                for name, module in sys.modules.items()
+                if name == _NS_PARENT or name.startswith(f"{_NS_PARENT}.")
+            },
+        }
+
+    @staticmethod
+    def _restore_force_reload_host_state(snapshot: dict) -> None:
+        """Restore the host registries captured for a failed force round."""
+        tool_registry = snapshot["tool_registry"]
+        tool_state = snapshot["tool_state"]
+        tool_lock = getattr(tool_registry, "_lock")
+        with tool_lock:
+            for attr, key in (
+                ("_tools", "tools"),
+                ("_plugin_override_policy", "plugin_override_policy"),
+                ("_toolset_checks", "toolset_checks"),
+                ("_toolset_aliases", "toolset_aliases"),
+            ):
+                target = getattr(tool_registry, attr)
+                target.clear()
+                target.update(tool_state[key])
+            setattr(tool_registry, "_generation", tool_state["generation"])
+
+        platform_registry = snapshot["platform_registry"]
+        entries = getattr(platform_registry, "_entries")
+        entries.clear()
+        entries.update(snapshot["platform_entries"])
+        deferred = getattr(platform_registry, "_deferred")
+        deferred.clear()
+        deferred.update(snapshot["platform_deferred"])
+
+        for registry_module, providers_before in snapshot["provider_registries"]:
+            lock = getattr(registry_module, "_lock")
+            providers = getattr(registry_module, "_providers")
+            with lock:
+                providers.clear()
+                providers.update(providers_before)
+
+        secret_source_registry = snapshot["secret_source_registry"]
+        sources = getattr(secret_source_registry, "_SOURCES")
+        sources.clear()
+        sources.update(snapshot["secret_sources"])
+        setattr(
+            secret_source_registry,
+            "_BUILTINS_LOADED",
+            snapshot["secret_builtins_loaded"],
+        )
+
+        modules_before = snapshot["plugin_modules"]
+        for name in tuple(sys.modules):
+            if (
+                name == _NS_PARENT or name.startswith(f"{_NS_PARENT}.")
+            ) and name not in modules_before:
+                sys.modules.pop(name, None)
+        sys.modules.update(modules_before)
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -1773,7 +2057,11 @@ class PluginManager:
         )
 
         from tools.registry import registry as _registry
+        from agent.turn_gate import snapshot_turn_gate_providers
+
         _plugin_id = manifest.key or manifest.name
+        _gate_ids_before = set(self._turn_gate_provider_ids)
+        _gate_registry_before = snapshot_turn_gate_providers()
         _slug = _plugin_id.replace("/", "__").replace("-", "_")
         _registry.register_plugin_override_policy(
             f"{_NS_PARENT}.{_slug}",
@@ -1791,6 +2079,11 @@ class PluginManager:
             register_fn = getattr(module, "register", None)
             if register_fn is None:
                 loaded.error = "no register() function"
+                if (
+                    self._force_reload_active
+                    and self._force_reload_error is None
+                ):
+                    self._force_reload_error = f"{_plugin_id}: {loaded.error}"
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
             else:
                 ctx = PluginContext(manifest, self)
@@ -1840,7 +2133,41 @@ class PluginManager:
                     ),
                 )
 
+            if (
+                _plugin_id in self._force_reload_prior_gate_provider_ids
+                and _plugin_id not in self._turn_gate_provider_ids
+            ):
+                self._gate_provider_load_error = (
+                    f"{_plugin_id}: previously-live turn gate provider was not re-registered"
+                )
+
         except Exception as exc:
+            from agent.turn_gate import restore_turn_gate_providers
+
+            # Detect BEFORE rollback whether this plugin's register() touched
+            # the mandatory turn-gate registry (registered/replaced a provider)
+            # before it raised. If so, record it so a force reload can judge the
+            # whole round failed — swallowing here would otherwise silently drop
+            # a gate provider the force teardown already removed up front.
+            _gate_registry_after = snapshot_turn_gate_providers()
+            _gate_touched = (
+                set(_gate_registry_after) != set(_gate_registry_before)
+                or any(
+                    _gate_registry_after.get(provider_id) is not provider
+                    for provider_id, provider in _gate_registry_before.items()
+                )
+                or set(self._turn_gate_provider_ids) != _gate_ids_before
+            )
+            restore_turn_gate_providers(_gate_registry_before)
+            self._turn_gate_provider_ids.clear()
+            self._turn_gate_provider_ids.update(_gate_ids_before)
+            if (
+                _gate_touched
+                or _plugin_id in self._force_reload_prior_gate_provider_ids
+            ):
+                self._gate_provider_load_error = f"{_plugin_id}: {exc}"
+            if self._force_reload_active and self._force_reload_error is None:
+                self._force_reload_error = f"{_plugin_id}: {exc}"
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
@@ -2057,12 +2384,25 @@ def get_plugin_manager() -> PluginManager:
 
 
 def discover_plugins(force: bool = False) -> None:
-    """Discover and load all plugins.
+    """Discover plugins and bind any mandatory host turn gate from config.yaml."""
+    manager = get_plugin_manager()
+    try:
+        manager.discover_and_load(force=force)
+    finally:
+        try:
+            from agent.turn_gate import configure_turn_gate_from_config
+            from hermes_cli.config import load_config
 
-    Default behavior is idempotent. Pass ``force=True`` to rescan plugin
-    manifests and reload state in the current process.
-    """
-    get_plugin_manager().discover_and_load(force=force)
+            configure_turn_gate_from_config(load_config() or {})
+        except Exception as exc:
+            try:
+                from agent.turn_gate import mark_turn_gate_configuration_error
+
+                mark_turn_gate_configuration_error(str(exc))
+            except Exception:
+                pass
+            logger.error("mandatory turn gate configuration failed", exc_info=True)
+            raise
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
@@ -2351,9 +2691,8 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
 
     Pass ``force=True`` to rescan in the current process.
     """
-    manager = get_plugin_manager()
-    manager.discover_and_load(force=force)
-    return manager
+    discover_plugins(force=force)
+    return get_plugin_manager()
 
 
 def get_plugin_context_engine():

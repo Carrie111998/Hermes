@@ -62,13 +62,14 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from dataclasses import dataclass, field
 
 from html import escape as _html_escape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 try:
     from mautrix.types import (
@@ -136,6 +137,12 @@ from gateway.platforms.base import (
     _ssrf_redirect_guard,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
+from agent.turn_gate import (
+    TurnGateRequest,
+    acquire_outer_turn,
+    build_runtime_identity,
+    create_detached_task,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3486,6 +3493,27 @@ class MatrixAdapter(BasePlatformAdapter):
         """Remove a reaction by redacting its event."""
         return await self.redact_message(room_id, reaction_event_id, reason)
 
+    async def _run_deferred_platform_side_effect(
+        self,
+        entrypoint: str,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Run detached Matrix output under a fresh host-owned outer turn."""
+        turn_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        identity = build_runtime_identity(
+            surface=entrypoint,
+            session_scope=session_id,
+            turn_id=turn_id,
+        )
+        request = TurnGateRequest(
+            entrypoint=entrypoint,
+            purpose="business",
+            identity=identity,
+        )
+        with acquire_outer_turn(request):
+            return await operation()
+
     def _schedule_reaction_redaction(
         self,
         room_id: str,
@@ -3498,20 +3526,27 @@ class MatrixAdapter(BasePlatformAdapter):
             try:
                 if self._reaction_redaction_delay_seconds:
                     await asyncio.sleep(self._reaction_redaction_delay_seconds)
-                if not await self._redact_reaction(room_id, reaction_event_id, reason):
+                if not await self._run_deferred_platform_side_effect(
+                    "matrix-reaction-redaction",
+                    lambda: self._redact_reaction(
+                        room_id, reaction_event_id, reason
+                    ),
+                ):
                     logger.debug(
                         "Matrix: failed to redact reaction %s", reaction_event_id
                     )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug(
+                logger.warning(
                     "Matrix: delayed reaction redaction failed for %s: %s",
                     reaction_event_id,
                     exc,
                 )
 
-        task = asyncio.create_task(_redact_later())
+        # A Task copies the current ContextVars. Schedule from an empty Context
+        # so a delayed output cannot inherit the caller's soon-to-expire lease.
+        task = create_detached_task(_redact_later())
         self._reaction_redaction_tasks.add(task)
         task.add_done_callback(self._reaction_redaction_tasks.discard)
 
@@ -3886,11 +3921,16 @@ class MatrixAdapter(BasePlatformAdapter):
 
         async def _send() -> None:
             try:
-                await self.send_read_receipt(room_id, event_id)
+                await self._run_deferred_platform_side_effect(
+                    "matrix-read-receipt",
+                    lambda: self.send_read_receipt(room_id, event_id),
+                )
             except Exception as exc:  # pragma: no cover — defensive
-                logger.debug("Matrix: background read receipt failed: %s", exc)
+                logger.warning("Matrix: background read receipt failed: %s", exc)
 
-        asyncio.ensure_future(_send())
+        # Read receipts are detached from message parsing. Never inherit an
+        # outer-turn lease from a future caller that happens to schedule one.
+        create_detached_task(_send())
 
     async def send_read_receipt(self, room_id: str, event_id: str) -> bool:
         """Send a read receipt (m.read) for an event."""

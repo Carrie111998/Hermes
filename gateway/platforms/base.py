@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import functools
 import inspect
 import ipaddress
 import logging
@@ -23,6 +24,14 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from agent.turn_gate import (
+    TurnGateRequest,
+    acquire_outer_turn,
+    build_runtime_identity,
+    create_detached_task,
+    current_turn_gate_request,
+    enforce_output_allowed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2634,6 +2643,136 @@ class BasePlatformAdapter(ABC):
     - Handling media
     """
 
+    _GATE_GUARDED_OUTPUT_METHODS = frozenset(
+        {
+            "send",
+            "send_animation",
+            "send_approval_request",
+            "send_audio",
+            "send_biz_request",
+            "send_c2c_message",
+            "send_c2c_msg_body",
+            "send_clarify",
+            "send_direct",
+            "send_dm",
+            "send_document",
+            "send_draft",
+            "send_exec_approval",
+            "send_file",
+            "send_group_message",
+            "send_group_msg_body",
+            "send_heartbeat_once",
+            "send_image",
+            "send_image_file",
+            "send_media",
+            "send_multiple_images",
+            "send_private_notice",
+            "send_reaction",
+            "send_slash_confirm",
+            "send_sticker",
+            "send_text",
+            "send_text_chunk",
+            "send_typing",
+            "send_update_prompt",
+            "send_video",
+            "send_voice",
+            "send_weixin_direct",
+            "send_with_keyboard",
+            "send_yuanbao_direct",
+            "edit_message",
+            "update_message",
+            "delete",
+            "delete_message",
+            "add_reaction",
+            "remove_reaction",
+            "stop_typing",
+            "mark_read",
+            "react",
+            "reply",
+            "on_processing_start",
+            "on_processing_complete",
+            # Thread/topic/room lifecycle, membership, presence, read receipts,
+            # and redaction perform real platform mutations but do NOT match the
+            # send/edit/update/delete/react prefixes. Enumerated explicitly (by
+            # name, auditable) so the host gate wraps every subclass override of
+            # them before the side effect — rather than widening a prefix that
+            # could also catch pure-query helpers.
+            "create_handoff_thread",
+            "create_room",
+            "invite_user",
+            "rename_thread",
+            "rename_dm_topic",
+            "send_read_receipt",
+            "redact_message",
+            "set_presence",
+        }
+    )
+    _GATE_GUARDED_OUTPUT_PREFIXES = (
+        "send",
+        "edit",
+        "update",
+        "delete",
+        "add_reaction",
+        "remove_reaction",
+        "set_reaction",
+        "reaction",
+        "react",
+        "reply",
+        "start_typing",
+        "stop_typing",
+        "set_typing",
+        "mark_read",
+        "mark_message_read",
+    )
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Gate every platform-visible subclass override at the host boundary.
+
+        Call sites are intentionally not the security boundary: background,
+        fallback, streaming, and legacy paths may call adapter methods directly.
+        Wrapping subclass implementations here keeps the checkpoint immediately
+        adjacent to the actual platform operation.
+        """
+        super().__init_subclass__(**kwargs)
+        for method_name, implementation in tuple(cls.__dict__.items()):
+            if not (
+                method_name in cls._GATE_GUARDED_OUTPUT_METHODS
+                or method_name.startswith(cls._GATE_GUARDED_OUTPUT_PREFIXES)
+            ):
+                continue
+            if getattr(implementation, "_hermes_output_gate_wrapped", False):
+                continue
+            if not callable(implementation):
+                continue
+
+            if inspect.iscoroutinefunction(implementation):
+                @functools.wraps(implementation)
+                async def guarded_async_output_method(
+                    self,
+                    *args: Any,
+                    __implementation=implementation,
+                    **method_kwargs: Any,
+                ):
+                    enforce_output_allowed()
+                    return await __implementation(self, *args, **method_kwargs)
+
+                guarded_output_method = guarded_async_output_method
+            else:
+                @functools.wraps(implementation)
+                def guarded_sync_output_method(
+                    self,
+                    *args: Any,
+                    __implementation=implementation,
+                    **method_kwargs: Any,
+                ):
+                    enforce_output_allowed()
+                    return __implementation(self, *args, **method_kwargs)
+
+                guarded_output_method = guarded_sync_output_method
+
+            setattr(guarded_output_method, "_hermes_output_gate_wrapped", True)
+            setattr(cls, method_name, guarded_output_method)
+
     # Whether this platform renders triple-backtick fenced code blocks (i.e.
     # ``format_message`` translates/preserves markdown fences into a real code
     # block).  Capability flag for markdown-aware presentation choices.
@@ -3620,7 +3759,28 @@ class BasePlatformAdapter(ABC):
         async def _run_delete() -> None:
             try:
                 await asyncio.sleep(max(1, int(ttl_seconds)))
-                await self.delete_message(chat_id=chat_id, message_id=message_id)
+                # This runs AFTER the originating outer turn released its lease.
+                # The task was created with an empty ContextVar context (below)
+                # precisely so it does NOT inherit that dead lease. Take a fresh,
+                # independent host-owned outer turn dedicated to the cleanup so
+                # the gate-wrapped delete_message sees a live authorization.
+                # Identity/task ids are random opaque UUIDs — never the
+                # chat_id/message_id being deleted.
+                turn_id = str(uuid.uuid4())
+                session_id = str(uuid.uuid4())
+                identity = build_runtime_identity(
+                    surface="gateway-ephemeral-delete",
+                    session_scope=session_id,
+                    turn_id=turn_id,
+                )
+                request = TurnGateRequest(
+                    entrypoint="gateway-ephemeral-delete",
+                    purpose="business",
+                    task_id=session_id,
+                    identity=identity,
+                )
+                with acquire_outer_turn(request):
+                    await self.delete_message(chat_id=chat_id, message_id=message_id)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -3631,7 +3791,10 @@ class BasePlatformAdapter(ABC):
 
         coro = _run_delete()
         try:
-            asyncio.create_task(coro)
+            # Schedule the task from a fresh, empty ContextVar context so it can
+            # never inherit the scheduling turn's about-to-be-released gate
+            # lease (asyncio copies the context active at create_task time).
+            create_detached_task(coro)
         except RuntimeError:
             # No running loop (e.g. unit tests that never reach the async
             # path).  Close the coroutine cleanly so Python doesn't warn
@@ -5038,6 +5201,8 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
+        if content:
+            enforce_output_allowed()
         result = await self.send(
             chat_id=chat_id,
             content=content,
@@ -5072,6 +5237,8 @@ class BasePlatformAdapter(ABC):
                     self.name, attempt, max_retries, delay, error_str,
                 )
                 await asyncio.sleep(delay)
+                if content:
+                    enforce_output_allowed()
                 result = await self.send(
                     chat_id=chat_id,
                     content=content,
@@ -5094,6 +5261,7 @@ class BasePlatformAdapter(ABC):
                     "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
+                    enforce_output_allowed()
                     await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
@@ -5101,6 +5269,7 @@ class BasePlatformAdapter(ABC):
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
+        enforce_output_allowed()
         fallback_result = await self.send(
             chat_id=chat_id,
             content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
@@ -5371,7 +5540,9 @@ class BasePlatformAdapter(ABC):
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
 
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        task = create_detached_task(
+            self._process_message_background(event, session_key)
+        )
         self._session_tasks[session_key] = task
         try:
             self._background_tasks.add(task)
@@ -5760,6 +5931,40 @@ class BasePlatformAdapter(ABC):
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
+        """Hold the outer-turn lease through final platform delivery."""
+        # The delegated body keeps the established auto-TTS contract:
+        # ``play_tts`` runs inside a try/finally, and the finally block calls
+        # ``os.remove`` for every generated temporary audio path.
+        inherited = current_turn_gate_request()
+        purpose = inherited.purpose if inherited is not None else "business"
+        session_instances = getattr(self, "_turn_gate_session_instances", None)
+        if session_instances is None:
+            session_instances = {}
+            setattr(self, "_turn_gate_session_instances", session_instances)
+        session_scope = session_instances.get(session_key)
+        if session_scope is None:
+            session_scope = str(uuid.uuid4())
+            session_instances[session_key] = session_scope
+        turn_id = (
+            inherited.identity.turn_id
+            if inherited is not None and inherited.identity is not None
+            else f"{session_scope}:{uuid.uuid4().hex}"
+        )
+        identity = build_runtime_identity(
+            surface=getattr(self, "name", None) or "gateway",
+            session_scope=session_scope,
+            turn_id=turn_id,
+        )
+        request = TurnGateRequest(
+            entrypoint="gateway-delivery",
+            purpose=purpose,
+            task_id=session_scope,
+            identity=identity,
+        )
+        with acquire_outer_turn(request):
+            return await self._process_message_background_unleased(event, session_key)
+
+    async def _process_message_background_unleased(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
@@ -6302,7 +6507,7 @@ class BasePlatformAdapter(ABC):
                 # exhaust at ~2000 frames and SIGSEGV the process.
                 # Mirror the late-arrival drain pattern below: hand off
                 # to a new task and return so this frame can unwind.
-                drain_task = asyncio.create_task(
+                drain_task = create_detached_task(
                     self._process_message_background(pending_event, session_key)
                 )
                 # Hand ownership of the session to the drain task so
@@ -6427,7 +6632,7 @@ class BasePlatformAdapter(ABC):
                     _active = self._active_sessions.get(session_key)
                     if _active is not None:
                         _active.clear()
-                    drain_task = asyncio.create_task(
+                    drain_task = create_detached_task(
                         self._process_message_background(late_pending, session_key)
                     )
                     # Hand ownership of the session to the drain task so stale-lock
