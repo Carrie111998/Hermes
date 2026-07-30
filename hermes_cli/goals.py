@@ -282,6 +282,16 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 )
 
 
+# System prompt for goal decomposition — breaks a goal into sub-tasks
+# with dependency edges for parallel DAG dispatch.
+_DECOMPOSE_SYSTEM_PROMPT = (
+    "Break this goal into 3-8 ordered sub-tasks. "
+    "Output ONLY a JSON object with a 'sub_tasks' array. "
+    "Each task: {\"description\": \"...\", \"depends_on\": []}. "
+    "List IDs of tasks that must complete first in depends_on. "
+    "Tasks with no dependencies can run in parallel."
+)
+
 # ──────────────────────────────────────────────────────────────────────
 # Completion contract
 # ──────────────────────────────────────────────────────────────────────
@@ -640,6 +650,16 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         if load_goal(new_session_id) is not None:
             return False
         save_goal(new_session_id, state)
+        # Also migrate enhanced scratchpad if present
+        try:
+            if _HAS_ENHANCED_JUDGE:
+                db = _get_session_db()
+                if db is not None:
+                    raw = db.get_meta(f"scratchpad:{old_session_id}")
+                    if raw:
+                        db.set_meta(f"scratchpad:{new_session_id}", raw)
+        except Exception:
+            pass
         # Archive the parent's row so it isn't double-counted as active.
         clear_goal(old_session_id)
         logger.debug(
@@ -1057,29 +1077,14 @@ def decompose_goal(goal: str, *, timeout: float = 30.0) -> "List[SubTask]":
     if len(goal.split()) < 5:
         return []
     try:
-        from agent.auxiliary_client import get_text_auxiliary_client
+        from agent.auxiliary_client import call_llm
     except Exception:
         return []
     try:
-        client, model = get_text_auxiliary_client("goal_decompose")
-    except Exception:
-        return []
-    if client is None or not model:
-        return []
-    try:
-        resp = client.chat.completions.create(
-            model=model,
+        resp = call_llm(
+            task="goal_judge",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Break this goal into 3-8 ordered sub-tasks. "
-                        "Output ONLY a JSON object with a 'sub_tasks' array. "
-                        'Each task: {"description": "...", "depends_on": []}. '
-                        "List IDs of tasks that must complete first in depends_on. "
-                        "Tasks with no dependencies can run in parallel."
-                    ),
-                },
+                {"role": "system", "content": _DECOMPOSE_SYSTEM_PROMPT},
                 {"role": "user", "content": goal},
             ],
             temperature=0, max_tokens=500, timeout=timeout,
@@ -1269,6 +1274,42 @@ class GoalManager:
         if _HAS_ENHANCED_JUDGE:
             self._scratchpad = GoalScratchpad.empty(goal_id=session_id)
 
+    def _scratchpad_meta_key(self) -> str:
+        return f"scratchpad:{self.session_id}"
+
+    def _save_scratchpad(self) -> None:
+        if self._scratchpad is None or not _HAS_ENHANCED_JUDGE:
+            return
+        try:
+            db = _get_session_db()
+            if db is not None:
+                db.set_meta(self._scratchpad_meta_key(), self._scratchpad.to_json())
+        except Exception:
+            pass
+
+    def _load_scratchpad_from_db(self, session_id: str) -> Optional["GoalScratchpad"]:
+        if not _HAS_ENHANCED_JUDGE:
+            return None
+        try:
+            db = _get_session_db()
+            if db is None:
+                return None
+            raw = db.get_meta(f"scratchpad:{session_id}")
+            if raw:
+                return GoalScratchpad.from_json(raw)
+        except Exception:
+            pass
+        return None
+
+    def _delete_scratchpad(self, session_id: Optional[str] = None) -> None:
+        sid = session_id or self.session_id
+        try:
+            db = _get_session_db()
+            if db is not None:
+                db.set_meta(f"scratchpad:{sid}", "")
+        except Exception:
+            pass
+
     # --- introspection ------------------------------------------------
 
     @property
@@ -1328,6 +1369,8 @@ class GoalManager:
         )
         self._state = state
         save_goal(self.session_id, state)
+        self._scratchpad = GoalScratchpad.empty(goal_id=self.session_id) if _HAS_ENHANCED_JUDGE else None
+        self._save_scratchpad()
         return state
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
