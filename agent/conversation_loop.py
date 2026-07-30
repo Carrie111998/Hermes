@@ -1255,6 +1255,14 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    # Task-boundary checkpoint reset: clears the per-directory dedup once at
+    # the start of this user task so a fresh baseline can be captured. In
+    # scope="task" the per-iteration new_turn() below is a no-op, so this is
+    # the sole reset — the first file mutation snapshots the pre-task state and
+    # every later turn reuses it (issue #68877). In scope="turn" this is
+    # redundant with the per-iteration clear and harmless.
+    agent._checkpoint_mgr.new_task()
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
@@ -1265,8 +1273,16 @@ def run_conversation(
                     f"User correction during the turn: {_redirect_text}"
                 )
             agent._persist_session(messages, conversation_history)
+            # A redirect is a real user message appended to the live turn, so
+            # it is a task boundary too: re-arm the baseline here or a
+            # scope="task" run would keep rolling back to the state before the
+            # *original* instruction, discarding work the user just steered
+            # and asked to keep. Matches the documented "a new user message
+            # re-arms a fresh baseline" contract (#68877).
+            agent._checkpoint_mgr.new_task()
 
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
+        # (no-op under scope="task"; see CheckpointManager.new_turn).
         agent._checkpoint_mgr.new_turn()
 
         # Check for interrupt request (e.g., user sent new message)
