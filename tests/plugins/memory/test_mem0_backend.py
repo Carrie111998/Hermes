@@ -603,6 +603,229 @@ class TestOSSBackendRecreateQdrantIntegration:
         assert vc.size == 384
 
 
+qdrant_models = pytest.importorskip("qdrant_client.models")
+
+
+class _RealMem0StyleVectorStore:
+    """Vector store over a REAL QdrantClient, reproducing mem0's create_col.
+
+    Mirrors ``mem0.vector_stores.qdrant.Qdrant``: the dense slot plus a ``bm25``
+    sparse slot with the IDF modifier, and ``_has_bm25_slot`` — the flag mem0's
+    insert path consults to decide whether to write the sparse vector.
+    """
+
+    def __init__(self, client, collection_name="mem0", on_disk=False):
+        self.client = client
+        self.collection_name = collection_name
+        self.on_disk = on_disk
+        self.is_local = True  # embedded Qdrant: no payload indexes, as in mem0
+        self._has_bm25_slot = False
+
+    def create_col(self, vector_size, on_disk, distance=None):
+        from qdrant_client.models import (
+            Distance,
+            Modifier,
+            SparseVectorParams,
+            VectorParams,
+        )
+
+        if self.client.collection_exists(self.collection_name):
+            return
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config=VectorParams(
+                size=vector_size, distance=distance or Distance.COSINE, on_disk=on_disk
+            ),
+            sparse_vectors_config={"bm25": SparseVectorParams(modifier=Modifier.IDF)},
+        )
+        self._has_bm25_slot = True
+
+
+class _RealStoreFailingCreateCol(_RealMem0StyleVectorStore):
+    """Same real client, but ``create_col`` fails — forces the fallback path."""
+
+    def create_col(self, vector_size, on_disk, distance=None):
+        raise RuntimeError("create_col failed: simulated backend error")
+
+
+def _sparse_config(client, collection_name="mem0"):
+    return client.get_collection(collection_name).config.params.sparse_vectors
+
+
+def _dense_dims(client, collection_name="mem0"):
+    vectors = client.get_collection(collection_name).config.params.vectors
+    if isinstance(vectors, dict):
+        first = next(iter(vectors.values()), None)
+        return first.size if first else None
+    return getattr(vectors, "size", None)
+
+
+def _upsert_hybrid(client, collection_name, dims, point_id=1):
+    """Write a point the way mem0 does when the bm25 slot exists.
+
+    Raises if the collection has no ``bm25`` sparse slot — which is exactly how
+    a degraded (dense-only) collection surfaces: it rejects writes.
+    """
+    from qdrant_client.models import PointStruct, SparseVector
+
+    client.upsert(
+        collection_name=collection_name,
+        points=[
+            PointStruct(
+                id=point_id,
+                vector={
+                    "": [0.1] * dims,
+                    "bm25": SparseVector(indices=[7, 42], values=[0.5, 0.9]),
+                },
+                payload={"user_id": "u1", "data": "likes tea"},
+            )
+        ],
+    )
+
+
+class TestQdrantRecreateRealContract:
+    """Real-Qdrant tests: the recreate must preserve the full Mem0 contract.
+
+    These use an actual in-memory ``QdrantClient`` (not a fake), so the
+    assertions are against Qdrant's real collection config and its real
+    accept/reject behaviour on writes.
+    """
+
+    def _backend(self, vs):
+        backend = OSSBackend.__new__(OSSBackend)
+        backend._memory = type("M", (), {
+            "vector_store": vs,
+            "collection_name": vs.collection_name,
+        })()
+        return backend
+
+    def _client(self):
+        from qdrant_client import QdrantClient
+        return QdrantClient(location=":memory:")
+
+    def _seed(self, vs, dims):
+        """Create the pre-existing (wrong-dims) collection the way mem0 would."""
+        vs.create_col(dims, vs.on_disk)
+        assert vs._has_bm25_slot
+        assert "bm25" in _sparse_config(vs.client)
+
+    # --- primary path: create_col rebuilds the collection ------------------
+
+    def test_primary_path_preserves_bm25_and_dims(self):
+        client = self._client()
+        vs = _RealMem0StyleVectorStore(client)
+        self._seed(vs, 128)
+
+        self._backend(vs)._recreate_qdrant_if_dims_changed(384)
+
+        assert client.collection_exists("mem0"), "collection must exist after recreate"
+        assert _dense_dims(client) == 384
+        sparse = _sparse_config(client)
+        assert sparse and "bm25" in sparse, "bm25 sparse slot must survive recreate"
+        assert sparse["bm25"].modifier == qdrant_models.Modifier.IDF
+
+    def test_primary_path_collection_accepts_hybrid_write_and_search(self):
+        client = self._client()
+        vs = _RealMem0StyleVectorStore(client)
+        self._seed(vs, 128)
+
+        self._backend(vs)._recreate_qdrant_if_dims_changed(384)
+
+        _upsert_hybrid(client, "mem0", 384)
+        hits = client.query_points(
+            collection_name="mem0", query=[0.1] * 384, limit=5
+        ).points
+        assert len(hits) == 1
+        assert hits[0].payload["data"] == "likes tea"
+
+    # --- fallback path: create_col raises, we rebuild by hand --------------
+
+    def test_fallback_preserves_bm25_sparse_config(self):
+        """The regression under review: the fallback must NOT create a
+        dense-only collection, which would later reject mem0's writes."""
+        client = self._client()
+        seed = _RealMem0StyleVectorStore(client)
+        self._seed(seed, 128)
+
+        vs = _RealStoreFailingCreateCol(client)
+        vs._has_bm25_slot = True  # what mem0 believes after its own create_col
+        self._backend(vs)._recreate_qdrant_if_dims_changed(384)
+
+        assert client.collection_exists("mem0"), "fallback must recreate the collection"
+        assert _dense_dims(client) == 384
+        sparse = _sparse_config(client)
+        assert sparse and "bm25" in sparse, (
+            "fallback dropped the bm25 sparse slot — collection is degraded"
+        )
+        assert sparse["bm25"].modifier == qdrant_models.Modifier.IDF
+        assert vs._has_bm25_slot is True, (
+            "vector store's bm25 flag must stay true so insert() keeps working"
+        )
+
+    def test_fallback_collection_accepts_hybrid_write_and_search(self):
+        """Operate on the collection after the fallback recreate."""
+        client = self._client()
+        self._seed(_RealMem0StyleVectorStore(client), 128)
+
+        vs = _RealStoreFailingCreateCol(client)
+        self._backend(vs)._recreate_qdrant_if_dims_changed(384)
+
+        _upsert_hybrid(client, "mem0", 384)
+        hits = client.query_points(
+            collection_name="mem0", query=[0.1] * 384, limit=5
+        ).points
+        assert len(hits) == 1
+        assert hits[0].payload["user_id"] == "u1"
+
+    def test_dense_only_collection_would_reject_hybrid_write(self):
+        """Pins down *why* the fallback must keep the sparse slot: a dense-only
+        collection rejects the very write mem0's insert path performs."""
+        from qdrant_client.models import Distance, VectorParams
+
+        client = self._client()
+        client.create_collection(
+            collection_name="dense_only",
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+        )
+        with pytest.raises(Exception):
+            _upsert_hybrid(client, "dense_only", 384)
+
+    # --- no-op paths, against the real client ------------------------------
+
+    def test_matching_dims_leaves_collection_untouched(self):
+        client = self._client()
+        vs = _RealMem0StyleVectorStore(client)
+        self._seed(vs, 384)
+        _upsert_hybrid(client, "mem0", 384)
+
+        self._backend(vs)._recreate_qdrant_if_dims_changed(384)
+
+        assert client.count("mem0").count == 1, (
+            "matching dims must not drop existing points"
+        )
+        assert "bm25" in _sparse_config(client)
+
+    def test_missing_create_col_leaves_collection_intact(self):
+        """Without create_col we cannot honour the contract, so we must not
+        delete — the real collection and its data stay put."""
+        client = self._client()
+        seed = _RealMem0StyleVectorStore(client)
+        self._seed(seed, 128)
+        _upsert_hybrid(client, "mem0", 128)
+
+        class _NoCreateCol:
+            def __init__(self, c):
+                self.client = c
+                self.collection_name = "mem0"
+                self.on_disk = False
+
+        self._backend(_NoCreateCol(client))._recreate_qdrant_if_dims_changed(384)
+
+        assert client.collection_exists("mem0")
+        assert _dense_dims(client) == 128, "collection must be left as-is"
+        assert client.count("mem0").count == 1
+
+
 class TestOSSBackendConstructorNoExtraClient:
     """Constructor-level: verify __init__ does NOT create a separate QdrantClient."""
 

@@ -218,16 +218,23 @@ class OSSBackend(Mem0Backend):
     def _recreate_qdrant_if_dims_changed(self, expected_dims: int) -> None:
         """Recreate the Qdrant collection when its stored embedding dims differ.
 
-        Runs after ``Memory.from_config`` and uses the Memory's own
-        ``vector_store`` client, rather than opening a second QdrantClient
-        against the same local path (which deadlocks on Windows file locks).
+        The problem this replaces: the recreate used to run *before*
+        ``Memory.from_config``, from a standalone ``QdrantClient`` opened
+        against the same local path.  Two clients on one embedded Qdrant
+        directory deadlock on Windows file locks.  So this runs after
+        ``Memory.from_config`` and reuses the Memory's own ``vector_store``
+        client — no second client is ever opened.
 
         ``Memory.from_config`` already created the collection (or left an
         existing one untouched, since ``create_col`` skips when it exists). If
         that existing collection has the wrong dims we delete it and rebuild it
-        *only through the vector store's ``create_col``*, which restores BM25
-        sparse vectors and filter indexes.  A bare ``create_collection`` would
-        drop them, so we never delete unless we know we can properly rebuild.
+        through the vector store's ``create_col``, which restores the dense
+        vectors, the ``bm25`` sparse slot and the payload filter indexes.  We
+        never delete unless we know we can rebuild that full contract: if
+        ``create_col`` is missing we skip entirely, and if it raises the
+        fallback reproduces the same contract by hand (a dense-only collection
+        would later reject writes, since mem0's insert path targets the
+        ``bm25`` slot).
         """
         import logging
         log = logging.getLogger(__name__)
@@ -275,26 +282,60 @@ class OSSBackend(Mem0Backend):
             except Exception:
                 log.warning(
                     "create_col for %r failed after dim mismatch (dims %d -> %d), "
-                    "attempting fallback with basic collection",
+                    "attempting fallback rebuild of the full collection contract",
                     collection_name, current_dims, expected_dims,
                 )
 
-            # Fallback: bare client.create_collection without BM25 / sparse
-            # vectors.  Not as rich as create_col, but strictly better than
-            # leaving the collection deleted.
+            # Fallback: rebuild the collection directly, reproducing the full
+            # Mem0 Qdrant contract rather than a bare dense-only collection.
+            # A dense-only collection would have no ``bm25`` sparse slot, and
+            # mem0's insert path writes to that slot whenever the vector store
+            # believes it exists — so a degraded collection later *rejects
+            # writes*.  Mirror create_col exactly: dense VectorParams (cosine,
+            # on_disk), the ``bm25`` sparse slot with the IDF modifier, and the
+            # payload filter indexes.
             try:
                 from qdrant_client.models import (
                     Distance,
+                    Modifier,
+                    SparseVectorParams,
                     VectorParams,
                 )
 
                 client.create_collection(
                     collection_name=collection_name,
                     vectors_config=VectorParams(
-                        size=expected_dims, distance=Distance.COSINE
+                        size=expected_dims, distance=Distance.COSINE, on_disk=on_disk
                     ),
+                    sparse_vectors_config={
+                        "bm25": SparseVectorParams(modifier=Modifier.IDF),
+                    },
                 )
-                log.info("Fallback basic collection %r created with dims %d", collection_name, expected_dims)
+                # Keep the vector store's own view of the bm25 slot coherent:
+                # create_col sets this, and insert() consults it.
+                if hasattr(vs, "_has_bm25_slot"):
+                    vs._has_bm25_slot = True
+                # Payload indexes, as in Qdrant._create_filter_indexes.  Local
+                # (embedded/on-disk) Qdrant does not support them, and mem0
+                # skips them there, so do the same and stay best-effort.
+                if not getattr(vs, "is_local", False):
+                    for field in ("user_id", "agent_id", "run_id", "actor_id"):
+                        try:
+                            client.create_payload_index(
+                                collection_name=collection_name,
+                                field_name=field,
+                                field_schema="keyword",
+                            )
+                        except Exception:
+                            log.debug(
+                                "Payload index for %r on %r not created",
+                                field, collection_name,
+                            )
+                log.info(
+                    "Fallback collection %r created with dims %d "
+                    "(bm25 sparse slot + filter indexes)",
+                    collection_name, expected_dims,
+                )
             except Exception:
                 log.exception(
                     "Fallback creation also failed for collection %r — "
