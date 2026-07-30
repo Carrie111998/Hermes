@@ -7470,6 +7470,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        config["session_bridge"]["sidebar"]["inbox_cwd"] = str(get_hermes_home())
 
         if user_sig is not None:
             try:

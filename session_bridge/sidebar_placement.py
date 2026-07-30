@@ -54,7 +54,7 @@ def _resolve_canonical_inbox(configured_inbox_cwd: str, hermes_home: Path | str)
             raise SidebarPlacementError("inbox_unavailable")
         inbox = configured_path.resolve(strict=True)
         home = Path(hermes_home).resolve(strict=True)
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError, TypeError, ValueError):
         raise SidebarPlacementError("inbox_unavailable") from None
     if (
         not inbox.is_dir()

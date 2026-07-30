@@ -13,9 +13,10 @@ import pytest
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-_DEFAULT_CONFIG_HOME = Path(
-    tempfile.mkdtemp(prefix="session-bridge-config-")
-).resolve()
+_DEFAULT_CONFIG_DIRECTORY = tempfile.TemporaryDirectory(
+    prefix="session-bridge-config-"
+)
+_DEFAULT_CONFIG_HOME = Path(_DEFAULT_CONFIG_DIRECTORY.name).resolve()
 _default_config_home_token = set_hermes_home_override(_DEFAULT_CONFIG_HOME)
 try:
     DEFAULT_CONFIG = importlib.import_module("hermes_cli.config").DEFAULT_CONFIG
@@ -243,6 +244,70 @@ def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
     assert config.sidebar == SidebarConfig()
     assert config.sidebar.enabled is False
     assert config.sidebar.continuous is False
+
+
+def test_load_config_refreshes_sidebar_inbox_default_for_current_profile(
+    tmp_path: Path,
+) -> None:
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    config_module = importlib.import_module("hermes_cli.config")
+
+    profile_a_token = set_hermes_home_override(profile_a)
+    try:
+        config_module = importlib.reload(config_module)
+    finally:
+        reset_hermes_home_override(profile_a_token)
+
+    profile_b_token = set_hermes_home_override(profile_b)
+    try:
+        loaded = config_module.load_config()
+    finally:
+        reset_hermes_home_override(profile_b_token)
+        default_token = set_hermes_home_override(_DEFAULT_CONFIG_HOME)
+        try:
+            importlib.reload(config_module)
+        finally:
+            reset_hermes_home_override(default_token)
+
+    assert loaded["session_bridge"]["sidebar"]["inbox_cwd"] == str(profile_b)
+
+
+def test_load_config_preserves_explicit_sidebar_inbox_cwd_after_profile_switch(
+    tmp_path: Path,
+) -> None:
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    configured_inbox = tmp_path / "configured-inbox"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    (profile_b / "config.yaml").write_text(
+        "session_bridge:\n  sidebar:\n    inbox_cwd: "
+        f"{configured_inbox}\n",
+        encoding="utf-8",
+    )
+    config_module = importlib.import_module("hermes_cli.config")
+
+    profile_a_token = set_hermes_home_override(profile_a)
+    try:
+        config_module = importlib.reload(config_module)
+    finally:
+        reset_hermes_home_override(profile_a_token)
+
+    profile_b_token = set_hermes_home_override(profile_b)
+    try:
+        loaded = config_module.load_config()
+    finally:
+        reset_hermes_home_override(profile_b_token)
+        default_token = set_hermes_home_override(_DEFAULT_CONFIG_HOME)
+        try:
+            importlib.reload(config_module)
+        finally:
+            reset_hermes_home_override(default_token)
+
+    assert loaded["session_bridge"]["sidebar"]["inbox_cwd"] == str(configured_inbox)
 
 
 def test_sidebar_config_loads_only_from_config_yaml(

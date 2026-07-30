@@ -64,6 +64,20 @@ def test_resolve_sidebar_placement_deduplicates_identical_roots(tmp_path: Path) 
     assert placement.runtime_workspace_roots == (str(inbox.resolve()),)
 
 
+def test_resolve_sidebar_placement_rejects_invalid_hermes_home_type(
+    tmp_path: Path,
+) -> None:
+    inbox = tmp_path / ".hermes"
+    source = tmp_path / "source"
+    inbox.mkdir()
+    source.mkdir()
+
+    with pytest.raises(SidebarPlacementError, match="^inbox_unavailable$"):
+        resolve_sidebar_placement(
+            str(inbox), None, 1, str(source)  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize(
     "configured_inbox",
     (
