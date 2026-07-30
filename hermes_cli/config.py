@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
+from hermes_cli.dotted_path import split_dotted_key
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -981,36 +982,12 @@ def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     return missing
 
 
-def _split_dotted_key(dotted_key: str) -> list:
-    """Split a dotted config path into segments, honouring double-quoted spans.
-
-    A double-quoted span is taken literally, so a key segment that legitimately
-    contains a dot can be addressed.  Every real model id contains one
-    (``gpt-5.6-sol``, ``claude-sonnet-4.5``), which is what otherwise makes
-    ``platforms.api_server.extra.model_routes.<model-id>`` unreachable::
-
-        platforms.api_server.extra.model_routes."gpt-5.6-sol".model
-        -> ['platforms', 'api_server', 'extra', 'model_routes',
-            'gpt-5.6-sol', 'model']
-
-    Input without quotes tokenizes byte-for-byte identically to
-    ``dotted_key.split(".")``, so this is fully backward compatible.
-    """
-    parts: list = []
-    buf: list = []
-    in_quotes = False
-    for ch in dotted_key:
-        if ch == '"':
-            in_quotes = not in_quotes
-        elif ch == "." and not in_quotes:
-            parts.append("".join(buf))
-            buf = []
-        else:
-            buf.append(ch)
-    if in_quotes:
-        raise ValueError(f"unterminated quote in config key {dotted_key!r}")
-    parts.append("".join(buf))
-    return parts
+# The canonical dotted-path representation lives in ``hermes_cli.dotted_path``
+# so ``managed_scope`` can share it: ``config`` imports ``managed_scope``, never
+# the reverse, so the helper cannot live here without inverting that dependency.
+# ``_split_dotted_key`` stays as the in-module name — every call site below, and
+# the CLI's malformed-key guards, already use it.
+_split_dotted_key = split_dotted_key
 
 
 def _set_nested(config, dotted_key: str, value):
@@ -2488,10 +2465,20 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     ``save_config`` to drop managed-scope leaves before persisting, so a bulk
     write never writes a user value that would lose to the managed layer on the
     next load. Only keys actually present in ``cfg`` are reported as stripped.
+
+    Keys arrive in the canonical representation (``managed_config_keys()``), so
+    they are tokenized with ``split_dotted_key`` — a raw ``.split(".")`` here
+    would walk into ``model_routes`` → ``gpt-5`` → ``6-sol"`` and silently strip
+    nothing, letting a user bulk-write persist a value the managed overlay then
+    overrides. A malformed key can only come from a caller that built it by
+    hand; skip it rather than aborting the whole save.
     """
     stripped: set = set()
     for dotted in dotted_keys:
-        parts = dotted.split(".")
+        try:
+            parts = split_dotted_key(dotted)
+        except ValueError:
+            continue
         node = cfg
         for p in parts[:-1]:
             if not isinstance(node, dict) or p not in node:
