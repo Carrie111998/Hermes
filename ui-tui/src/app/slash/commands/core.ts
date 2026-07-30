@@ -128,7 +128,7 @@ export const coreCommands: SlashCommand[] = [
     aliases: ['exit'],
     help: 'exit hermes',
     name: 'quit',
-    run: (_arg, ctx) => {
+    run: (arg, ctx) => {
       // In the hosted dashboard chat there is no in-page restart path after
       // the PTY child exits, so quitting bricks the tab until a refresh. The
       // keyboard idle-exit (Ctrl+C / Ctrl+D) and SIGINT handling already refuse
@@ -142,7 +142,25 @@ export const coreCommands: SlashCommand[] = [
         return
       }
 
-      ctx.session.die()
+      // /quit --delete: remove this session's transcripts + SQLite history
+      // before exiting, mirroring the CLI's /exit --delete (cli.py:9588).
+      const flag = arg.trim().toLowerCase()
+
+      if (flag && flag !== '--delete' && flag !== '-d') {
+        ctx.transcript.sys('usage: /quit [--delete]')
+
+        return
+      }
+
+      if (flag && ctx.sid) {
+        // Ask the gateway to delete the session while it's still alive,
+        // then exit regardless of the outcome (best-effort, like the CLI).
+        ctx.gateway
+          .rpc('session.exit', { delete: true, session_id: ctx.sid })
+          .finally(() => ctx.session.die())
+      } else {
+        ctx.session.die()
+      }
     }
   },
 

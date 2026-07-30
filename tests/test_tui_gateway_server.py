@@ -10496,6 +10496,147 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# session.exit — TUI /quit --delete (mirrors CLI /exit --delete, #27101)
+# --------------------------------------------------------------------------
+
+
+def test_session_exit_requires_session_id(monkeypatch):
+    """Empty / missing session_id is a 4006 client error (no DB call)."""
+    called: list[tuple] = []
+
+    class _DB:
+        def delete_session(self, *a, **kw):
+            called.append((a, kw))
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.exit", "params": {"delete": True}}
+    )
+    assert "error" in resp
+    assert resp["error"]["code"] == 4006
+    assert called == []
+
+
+def test_session_exit_noop_without_delete_flag(monkeypatch):
+    """Without ``delete: true`` the RPC is a no-op (no DB call)."""
+    called: list[tuple] = []
+
+    class _DB:
+        def delete_session(self, *a, **kw):
+            called.append((a, kw))
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.exit", "params": {"session_id": "abc"}}
+    )
+    assert "result" in resp
+    assert resp["result"] == {"deleted": None}
+    assert called == []
+
+
+def test_session_exit_returns_db_unavailable_when_no_db(monkeypatch):
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_db_error", "locked")
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.exit", "params": {"session_id": "abc", "delete": True}}
+    )
+
+    assert "error" in resp
+    assert resp["error"]["code"] == 5036
+    assert "state.db unavailable" in resp["error"]["message"]
+
+
+def test_session_exit_allows_active_session(monkeypatch):
+    """Unlike session.delete, session.exit MUST allow deleting the active
+    session — the caller is about to terminate the process."""
+    called: list[str] = []
+
+    class _DB:
+        def delete_session(self, sid, sessions_dir=None):
+            called.append(sid)
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setitem(server._sessions, "live", {"session_key": "key-live"})
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.exit",
+                "params": {"session_id": "key-live", "delete": True},
+            }
+        )
+    finally:
+        server._sessions.pop("live", None)
+
+    assert "result" in resp, resp
+    assert resp["result"] == {"deleted": "key-live"}
+    assert called == ["key-live"]
+
+
+def test_session_exit_returns_4007_when_missing(monkeypatch):
+    class _DB:
+        def delete_session(self, sid, sessions_dir=None):
+            return False
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.exit", "params": {"session_id": "ghost", "delete": True}}
+    )
+
+    assert "error" in resp
+    assert resp["error"]["code"] == 4007
+
+
+def test_session_exit_propagates_db_exception(monkeypatch):
+    class _DB:
+        def delete_session(self, sid, sessions_dir=None):
+            raise RuntimeError("disk full")
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.exit", "params": {"session_id": "x", "delete": True}}
+    )
+
+    assert "error" in resp
+    assert resp["error"]["code"] == 5036
+    assert "disk full" in resp["error"]["message"]
+
+
+def test_session_exit_success_returns_deleted_id(monkeypatch):
+    """Happy path — DB delete succeeds, response carries the deleted id
+    and the on-disk sessions dir is forwarded so transcript files get
+    cleaned up alongside the row."""
+    captured: dict = {}
+
+    class _DB:
+        def delete_session(self, sid, sessions_dir=None):
+            captured["sid"] = sid
+            captured["sessions_dir"] = sessions_dir
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.exit", "params": {"session_id": "old-1", "delete": True}}
+    )
+
+    assert "result" in resp, resp
+    assert resp["result"] == {"deleted": "old-1"}
+    assert captured["sid"] == "old-1"
+    assert captured["sessions_dir"] is not None
+    assert str(captured["sessions_dir"]).endswith("sessions")
+
+
+
+# --------------------------------------------------------------------------
 # session.* profile scoping (app-global remote mode) — #62503
 # --------------------------------------------------------------------------
 

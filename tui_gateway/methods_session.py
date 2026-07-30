@@ -835,6 +835,42 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"deleted": target})
 
 
+@method("session.exit")
+def _(rid, params: dict) -> dict:
+    """Graceful exit with optional session deletion (TUI ``/quit --delete``).
+
+    Mirrors the CLI's ``/exit --delete`` shutdown path (cli.py:17317):
+    deletes the session's SQLite rows and on-disk transcript files.  The
+    active-session guard in ``session.delete`` is intentionally bypassed
+    here because the caller is about to terminate the process — no further
+    writes will land after this RPC returns.
+
+    Called by the TUI frontend *before* ``ctx.session.die()`` so the
+    deletion completes while the gateway is still alive.
+    """
+    target = params.get("session_id", "")
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    if not params.get("delete"):
+        return _ok(rid, {"deleted": None})
+    profile = (params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+    with _profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5036)
+        if profile_home is not None:
+            sessions_dir = Path(profile_home) / "sessions"
+        else:
+            sessions_dir = get_hermes_home() / "sessions"
+        try:
+            deleted = db.delete_session(target, sessions_dir=sessions_dir)
+        except Exception as e:
+            return _err(rid, 5036, f"delete failed: {e}")
+        if not deleted:
+            return _err(rid, 4007, "session not found")
+        return _ok(rid, {"deleted": target})
+
+
 @method("session.title")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
