@@ -32,7 +32,9 @@ Curator 由空闲检查触发，而非 cron 守护进程。在 CLI 会话启动�
 一次运行分为两个阶段：
 
 1. **自动状态转换**（确定性，无 LLM）。未使用时间超过 `stale_after_days`（30 天）的技能变为 `stale`；未使用时间超过 `archive_after_days`（90 天）的技能被移至 `~/.hermes/skills/.archive/`。
-2. **LLM 合并审查**（单次辅助模型 pass，`max_iterations=8`）——**默认关闭**。当 `curator.consolidate: true` 时，派生的 agent 会审查 agent 创建的技能，并逐个决定是保留、修补（通过 `skill_manage`）、合并到类别级 umbrella，还是通过终端工具归档。捆绑内置技能只有在 `curator.prune_builtins: true` 时才会出现，并且只作为可归档候选。
+   - 已固定的技能，以及被任何 cron 任务引用的技能（包括已暂停或禁用的任务）都会被完全跳过。合并 umbrella 时，Curator 也会同步重写 cron 中的技能引用。
+   - 从未使用过的技能（`use_count == 0`）至少享有 `stale_after_days` 的宽限期；零次使用只是缺少证据，并不表示技能可以立即丢弃。
+2. **LLM 合并审查**（单次辅助模型 pass，使用较高的迭代上限；一次完整审查通常需要 50–100 次 API 调用）——**默认关闭**。当 `curator.consolidate: true` 时，派生的 agent 会审查 agent 创建的技能，可通过 `skill_view` 读取任意候选，并逐个决定是保留、修补（通过 `skill_manage`）、合并到类别级 umbrella，还是通过终端工具归档。捆绑内置技能只有在 `curator.prune_builtins: true` 时才会出现，并且只作为可归档候选。合并会把技能视为完整包：若技能包含 `references/`、`templates/`、`scripts/`、`assets/` 或指向这些路径的相对链接，Curator 必须保留独立技能、迁移所需支持文件并重写路径，或原样归档整个包，不能只把 `SKILL.md` 扁平化到另一个技能的 `references/` 中。
 
 :::info 合并审查是 opt-in
 默认情况下，curator 只执行**修剪**：确定性的空闲检测会标记 stale 并归档长期未使用的技能。带观点的 LLM **合并** pass（umbrella 构建、合并重叠技能）默认关闭，因为它每次运行都会消耗辅助模型 token，并且会对技能库做更广泛的结构性修改。可通过 `curator.consolidate: true` 打开，或用 `hermes curator run --consolidate` 针对单次运行开启。
@@ -103,10 +105,13 @@ hermes curator pause          # stop runs until resumed
 hermes curator resume
 hermes curator pin <skill>    # never auto-transition this skill
 hermes curator unpin <skill>
+hermes curator adopt <skill>    # 将未托管技能交给 curator
+hermes curator adopt --all-unmanaged   # 接管所有未托管技能
+hermes curator list-unmanaged   # 列出没有来源标记的技能
 hermes curator restore <skill>  # move an archived skill back to active
 hermes curator list-archived    # list skills currently in ~/.hermes/skills/.archive/
 hermes curator archive <skill>  # manually archive a single skill now
-hermes curator prune [--days N] # 批量归档空闲 >= N 天的 agent-created 技能；启用时也可能包含捆绑内置技能
+hermes curator prune [--days N] # 批量归档空闲 >= N 天的 curator-managed 技能（默认 90 天）
 ```
 
 ## 备份与回滚
@@ -144,7 +149,7 @@ Curator 主要管理在 `~/.hermes/skills/.usage.json` 中显式标记为
 **agent-created** 的技能。技能对应的 `.usage.json` 条目具有
 `"created_by": "agent"` 或 `"agent_created": true` 时，才有这个标记。
 
-有一个仅限归档的例外：列在 `~/.hermes/skills/.bundled_manifest` 中的捆绑内置技能，在 `curator.prune_builtins: true`（默认值）时也会成为候选。它们遵循同样的空闲归档窗口，但永远不会被修补、合并或删除。
+有一个仅限归档的例外：列在 `~/.hermes/skills/.bundled_manifest` 中的捆绑内置技能，在 `curator.prune_builtins: true`（默认值）时也会成为候选。它们遵循同样的空闲归档窗口，但永远不会被修补、合并、固定或删除。
 
 列在 `~/.hermes/skills/.hub/lock.json` 中的 hub 安装技能永远不会被 curator 触碰，不受 `curator.prune_builtins` 影响。
 
@@ -155,7 +160,27 @@ Curator 主要管理在 `~/.hermes/skills/.usage.json` 中显式标记为
 :::warning 你手写的技能不会被 curator 管理
 如果你手动创建了 `SKILL.md`，或让 Hermes 指向外部技能目录，该技能在 `.usage.json` 中会是 `created_by: null`（或没有该字段）。Curator 不会触碰它。前台 agent 应你请求创建的技能同样如此。
 
-**要查看 curator 实际管理哪些技能**，运行 `hermes curator status`。如果输出 `no agent-created skills`，则当前没有 agent-created 技能，也没有可修剪的捆绑内置技能在范围内——LLM 审查 pass 会被跳过，报告会显示 `Model: (not resolved) via (not resolved)` 和 `Duration: 0s`。
+**要查看 curator 实际管理哪些技能**，运行 `hermes curator status`。如果 curator-managed 数量为 0，则当前没有 agent-created 技能，也没有可修剪的捆绑内置技能在范围内——LLM 审查 pass 会被跳过，报告会显示 `Model: (not resolved) via (not resolved)` 和 `Duration: 0s`。
+:::
+
+### 接管未托管技能
+
+`hermes curator status` 会同时报告 curator-managed 与 **unmanaged** 数量。未托管技能没有来源标记，通常分为两类：一类创建于 `created_by` 字段引入之前，作者信息已经无法从记录恢复；另一类由前台 `skill_manage(create)` 按用户要求创建，按设计归用户管理。
+
+这些技能具备被维护的条件，但在你明确声明前不会进入自动生命周期。可用以下命令把它们交给 Curator：
+
+```bash
+hermes curator list-unmanaged                    # 按原因列出未托管技能
+hermes curator adopt <name> [<name> ...]         # 接管指定技能
+hermes curator adopt --all-unmanaged --dry-run   # 预览全部接管对象
+hermes curator adopt --all-unmanaged             # 接管全部对象（会请求确认）
+hermes curator adopt --all-unmanaged --yes       # 跳过确认
+```
+
+接管会写入与后台审查 fork 相同的 `created_by: agent` 标记，但不会重置空闲计时；长期未使用的技能可能在下一次运行中立即进入 `stale` 或 `archived`。这也会允许后台审查自主改进该技能。前台、用户指示的编辑始终不受影响。
+
+:::note `created_by` 是策略标志，不是作者声明
+该字段在运行时表示“是否允许自主维护触碰此技能”，并不能可靠说明谁编写了文件。`hermes curator adopt` 改变的是维护策略，而不是历史作者信息。接管必须由用户明确执行；Curator 不会根据使用或修补次数自动猜测来源。
 :::
 
 Agent-created 技能遵循完整生命周期：
@@ -183,6 +208,8 @@ hermes curator unpin <skill>
 ```
 
 该标志以 `"pinned": true` 的形式存储在 `~/.hermes/skills/.usage.json` 中技能对应的条目上，因此跨会话持久有效。
+
+任何 cron 任务的 `skills:` 列表中引用的技能也会获得相同的**自动状态转换**保护，即使任务已暂停或禁用；只要引用仍存在，Curator 就不会将其标记为 stale 或归档。如果还需要阻止 `skill_manage delete`，请显式固定该技能。
 
 只有非捆绑、非 hub、非外部的技能名才能被固定——若你尝试固定捆绑或 hub 安装的技能，`hermes curator pin` 会拒绝并给出说明。Hub 安装的技能永远不受 curator 变更。捆绑内置技能仅在 `curator.prune_builtins: true`（默认值）时会被触碰，并且即使如此也只会在 `archive_after_days` 未使用后被归档——不会被修补、合并、固定或删除。设置 `curator.prune_builtins: false` 可完全豁免捆绑技能。
 
@@ -231,6 +258,10 @@ Curator 在 `~/.hermes/skills/.usage.json` 维护一个附属文件，每个技�
 ```
 
 `REPORT.md` 是快速查看某次运行所做操作的方式——哪些技能发生了状态转换、LLM 审查者说了什么、修补了哪些技能。无需 grep `agent.log` 即可完成审计。
+
+:::note 没有候选时，报告会显示 `(not resolved)`
+当 Curator 没有任何 curator-managed 技能可供审查时，LLM 审查 pass 会被完全跳过。报告头会显示 `Model: (not resolved) via (not resolved)` 与 `Duration: 0s`；这不表示配置错误或模型解析失败，只表示没有候选，因此没有调用模型。自动状态转换阶段仍会正常执行并报告计数。
+:::
 
 ### 摘要中的重命名映射
 

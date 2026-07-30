@@ -6,7 +6,7 @@ description: "Background maintenance for agent-created skills — usage tracking
 
 # Curator
 
-The curator is a background maintenance pass primarily for **agent-created skills**. It tracks usage, moves long-unused skills through `active → stale → archived` states, and periodically spawns a short auxiliary-model review that proposes consolidations or patches drift.
+The curator is a background maintenance pass for **agent-created skills**. It tracks how often each skill is viewed, used, and patched, moves long-unused skills through `active → stale → archived` states, and periodically spawns a short auxiliary-model review that proposes consolidations or patches drift.
 
 It exists so that skills created via the [self-improvement loop](/user-guide/features/skills#agent-managed-skills-skill_manage-tool) don't pile up forever. Every time the agent solves a novel problem and saves a skill, that skill lands in `~/.hermes/skills/`. Without maintenance, you end up with dozens of narrow near-duplicates that pollute the catalog and waste tokens.
 
@@ -32,7 +32,9 @@ If you want to see what the curator *would* do before it runs for real, run `her
 A run has two phases:
 
 1. **Automatic transitions** (deterministic, no LLM). Skills unused for `stale_after_days` (30) become `stale`; skills unused for `archive_after_days` (90) are moved to `~/.hermes/skills/.archive/`. This is the always-on pruning behavior — it runs whenever the curator is enabled, with no aux-model cost.
-2. **LLM consolidation** (single aux-model pass, `max_iterations=8`) — **OFF by default**. When `curator.consolidate: true`, the forked agent surveys the agent-created skills and decides per-skill whether to keep, patch (via `skill_manage`), consolidate overlapping ones into class-level umbrellas, or archive via the terminal tool. Bundled built-ins are visible only when `curator.prune_builtins: true`, and then only as archive candidates. Consolidation treats a skill as a full package: if a skill has `references/`, `templates/`, `scripts/`, `assets/`, or relative links to those paths, the curator must either keep it standalone, re-home the needed support files and rewrite paths, or archive the entire package unchanged — not flatten only `SKILL.md` into another skill's `references/` file.
+   - **Pinned skills** and **skills referenced by any cron job** (including paused/disabled jobs) are skipped entirely — treated like pin for auto-transitions so a slow or paused schedule cannot archive a skill out from under a job. Consolidation also rewrites cron skill references when it merges umbrellas.
+   - **Never-used skills** (`use_count == 0`) get a grace floor: they are not archived until they are at least `stale_after_days` old. Zero uses is absence of evidence, not proof the skill is disposable.
+2. **LLM consolidation** (single aux-model pass with a high iteration ceiling — a full curation sweep typically takes 50–100 API calls) — **OFF by default**. When `curator.consolidate: true`, the forked agent surveys the agent-created skills, can read any of them with `skill_view`, and decides per-skill whether to keep, patch (via `skill_manage`), consolidate overlapping ones into class-level umbrellas, or archive via the terminal tool. Bundled built-ins are visible only when `curator.prune_builtins: true`, and then only as archive candidates. Consolidation treats a skill as a full package: if a skill has `references/`, `templates/`, `scripts/`, `assets/`, or relative links to those paths, the curator must either keep it standalone, re-home the needed support files and rewrite paths, or archive the entire package unchanged — not flatten only `SKILL.md` into another skill's `references/` file.
 
 :::info Consolidation is opt-in
 By default the curator only **prunes** — the deterministic inactivity pass marks skills stale and archives long-unused ones. The opinionated LLM **consolidation** pass (umbrella-building, merging overlapping skills) is off by default because it costs aux-model tokens on every run and makes broad structural changes to your library. Turn it on with `curator.consolidate: true`, or run it once on demand with `hermes curator run --consolidate`.
@@ -103,10 +105,13 @@ hermes curator pause          # stop runs until resumed
 hermes curator resume
 hermes curator pin <skill>    # never auto-transition this skill
 hermes curator unpin <skill>
+hermes curator adopt <skill>    # hand an unmanaged skill to the curator
+hermes curator adopt --all-unmanaged   # hand over every unmanaged skill
+hermes curator list-unmanaged   # itemize skills with no provenance marker
 hermes curator restore <skill>  # move an archived skill back to active
 hermes curator list-archived    # list skills currently in ~/.hermes/skills/.archive/
 hermes curator archive <skill>  # manually archive a single skill now
-hermes curator prune [--days N] # bulk-archive agent-created skills idle >= N days; may include bundled built-ins when enabled
+hermes curator prune [--days N] # bulk-archive curator-managed skills idle >= N days (default 90)
 ```
 
 ## Backups and rollback
@@ -147,7 +152,7 @@ entry has `"created_by": "agent"` or `"agent_created": true`.
 There is one archive-only exception: bundled built-in skills listed in
 `~/.hermes/skills/.bundled_manifest` are also candidates when
 `curator.prune_builtins: true` (the default). They follow the same inactivity
-window for archival, but are never patched, consolidated, or deleted.
+window for archival, but are never patched, consolidated, pinned, or deleted.
 
 Hub-installed skills listed in `~/.hermes/skills/.hub/lock.json` are never
 touched by the curator, regardless of `curator.prune_builtins`.
@@ -169,10 +174,77 @@ directory, that skill will have a `.usage.json` entry with `created_by: null`
 skills the foreground agent created at your request.
 
 **To see which skills the curator actually manages**, run `hermes curator status`.
-If it prints `no agent-created skills`, no agent-created skills or
-prune-eligible bundled built-ins are currently in scope — the LLM review pass is
-skipped and the report will show
+If the curator-managed count is 0, no agent-created skills or prune-eligible
+bundled built-ins are currently in scope — the LLM review pass is skipped and
+the report will show
 `Model: (not resolved) via (not resolved)` with `Duration: 0s`.
+:::
+
+### Adopting unmanaged skills
+
+`hermes curator status` reports an **unmanaged** count alongside the managed
+one:
+
+```
+curator-managed skills: 43 total  (agent-created=43  bundled=0)
+  active     41
+  stale       2
+  archived    0
+
+unmanaged (no provenance marker): 112 total
+  pre-dates marker    34
+  foreground-created  78
+  never auto-staled or archived — `hermes curator adopt <name>` hands one over
+```
+
+Those 112 are curation-*eligible* but permanently invisible to the lifecycle,
+for one of two reasons:
+
+- **pre-dates marker** — the record was written before `created_by` existed, so
+  it carries no provenance signal at all. Authorship is genuinely unknowable
+  from the record.
+- **foreground-created** — a foreground `skill_manage(create)` left the marker
+  unset by design, since skills you ask for belong to you.
+
+A large library can therefore look fully curated while most of it is
+untouchable. `adopt` closes that gap by **declaration**:
+
+```bash
+hermes curator list-unmanaged                    # itemize them, with reasons
+hermes curator adopt <name> [<name> ...]         # hand specific skills over
+hermes curator adopt --all-unmanaged --dry-run   # preview the full list
+hermes curator adopt --all-unmanaged             # hand over everything (prompts)
+hermes curator adopt --all-unmanaged --yes       # skip the prompt
+```
+
+Adoption writes the same `created_by: agent` marker the background review fork
+writes. It does **not** reset the inactivity clock — an adopted skill keeps its
+existing `last_activity_at`, so handing over a library you already stopped
+using does not buy it a fresh 90-day window. Expect adopted long-idle skills to
+go `stale` (or `archived`) on the next pass; that is the point.
+
+Adoption is also what unblocks autonomous *improvement*. The background review
+fork refuses to patch a skill that isn't curator-managed, so if it notices one
+of your skills is outdated it will say so and recommend adoption rather than
+edit it. Foreground (user-directed) edits are never affected — you and the
+agent can always edit your own skills on request.
+
+:::note `created_by` is a policy flag, not a provenance claim
+The stored field is named `created_by`, but it is consumed as "may autonomous
+curation touch this?" — not "who wrote this file". Those are different
+questions, and for records predating the marker the authorship answer is simply
+unrecoverable. The name is kept because it is already on disk in every
+`.usage.json`; read it as policy. `hermes curator adopt` changes the policy, and
+says nothing about who authored the file.
+:::
+
+:::note Provenance is declared, never inferred
+Adoption is deliberately manual. Telemetry cannot establish authorship: a skill
+with thousands of patches proves the agent **maintains** it, not that the agent
+**wrote** it — Hermes edits user-authored skills on your behalf constantly. An
+automatic "looks agent-made, adopt it" heuristic would eventually archive
+something you hand-wrote. `adopt` refuses bundled, hub-installed, external, and
+protected built-in skills, which have an owner other than you.
 :::
 
 Agent-created skills follow the full lifecycle:
@@ -204,6 +276,8 @@ hermes curator unpin <skill>
 ```
 
 The flag is stored as `"pinned": true` on the skill's entry in `~/.hermes/skills/.usage.json`, so it survives across sessions.
+
+Skills named in any cron job's `skills:` list are protected the same way for **auto-transitions** (the curator never stales/archives them while the reference remains), even when the job is paused or disabled. Prefer an explicit pin when you also want `skill_manage delete` blocked.
 
 Only non-bundled, non-hub, non-external skill names can be pinned — `hermes curator pin` refuses on bundled and hub-installed skills with an explanatory message if you try. Hub-installed skills are never subject to curator mutation. Bundled built-in skills are only touched when `curator.prune_builtins: true` (the default), and even then only archived after `archive_after_days` of non-use — never patched, consolidated, pinned, or deleted. Set `curator.prune_builtins: false` to exempt bundled skills entirely.
 
@@ -254,9 +328,8 @@ Every curator run writes a timestamped directory under `~/.hermes/logs/curator/`
 `REPORT.md` is a quick way to see what a given run did — which skills transitioned, what the LLM reviewer said, which skills it patched. Good for auditing without having to grep `agent.log`.
 
 :::note No candidates? Report shows `(not resolved)`
-When the curator has **no agent-created skills** (and no prune-eligible bundled
-built-ins) to review, the LLM review pass
-is skipped entirely. The report header will show
+When the curator has **no curator-managed skills** to review, the LLM review
+pass is skipped entirely. The report header will show
 `Model: (not resolved) via (not resolved)` with `Duration: 0s` — this does **not**
 indicate a configuration error or model resolution failure. It simply means there
 were no candidates, so no model was ever invoked. The auto-transition phase still
