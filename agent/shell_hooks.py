@@ -100,7 +100,6 @@ emitted by each built-in hook site.
     child_role      – role string of the child agent
     child_summary   – summary of the child's work
     child_status    – exit status string (e.g. "success", "error")
-    tool_call_history – redacted tool name/input summary/byte counts/status list
     duration_ms     – wall-clock time of the child run in milliseconds
 """
 
@@ -139,14 +138,17 @@ DEFAULT_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 300
 ALLOWLIST_FILENAME = "shell-hooks-allowlist.json"
 _DEFAULT_BLOCK_MESSAGE = "Blocked by shell hook."
+_DEFAULT_FAIL_CLOSED_MESSAGE = (
+    "Blocked because a required shell hook did not explicitly allow the tool call."
+)
 
-# (event, matcher, command) triples that have been wired to the plugin
+# (event, matcher, command, fail_closed) tuples wired to the plugin
 # manager in the current process.  Matcher is part of the key because
 # the same script can legitimately register for different matchers under
 # the same event (e.g. one entry per tool the user wants to gate).
 # Second registration attempts for the exact same triple become no-ops
 # so the CLI and gateway can both call register_from_config() safely.
-_registered: Set[Tuple[str, Optional[str], str]] = set()
+_registered: Set[Tuple[str, Optional[str], str, bool]] = set()
 _registered_lock = threading.Lock()
 
 # Intra-process lock for allowlist read-modify-write on platforms that
@@ -166,6 +168,7 @@ class ShellHookSpec:
     command: str
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
+    fail_closed: bool = False
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -252,7 +255,7 @@ def register_from_config(
     # input().  Mutation re-takes the lock with a defensive idempotence
     # re-check in case two callers ever race through the prompt.
     for spec in specs:
-        key = (spec.event, spec.matcher, spec.command)
+        key = (spec.event, spec.matcher, spec.command, spec.fail_closed)
         with _registered_lock:
             if key in _registered:
                 continue
@@ -415,11 +418,33 @@ def _parse_single_entry(
         )
         timeout = MAX_TIMEOUT_SECONDS
 
+    if "fail_open" in raw:
+        qualifier = "contradictory" if "fail_closed" in raw else "unsupported"
+        logger.warning(
+            "hooks.%s[%d] has %s fail_open/fail_closed directives; refusing hook entry",
+            event, index, qualifier,
+        )
+        return None
+    if "fail_closed" in raw and not isinstance(raw["fail_closed"], bool):
+        logger.warning(
+            "hooks.%s[%d].fail_closed must be a strict bool (got %r); refusing hook entry",
+            event, index, raw["fail_closed"],
+        )
+        return None
+    fail_closed = raw.get("fail_closed", False)
+    if fail_closed and event != "pre_tool_call":
+        logger.warning(
+            "hooks.%s[%d].fail_closed is only supported for pre_tool_call; ignoring",
+            event, index,
+        )
+        fail_closed = False
+
     return ShellHookSpec(
         event=event,
         command=command.strip(),
         matcher=matcher,
         timeout=timeout,
+        fail_closed=fail_closed,
     )
 
 
@@ -465,7 +490,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             input=stdin_json,
             capture_output=True,
             timeout=spec.timeout,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
             shell=False,
             **_popen_kwargs,
         )
@@ -493,6 +518,9 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
 def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]]]:
     """Build the closure that ``invoke_hook()`` will call per firing."""
 
+    def required_hook_block() -> Dict[str, Any]:
+        return {"action": "block", "message": _DEFAULT_FAIL_CLOSED_MESSAGE}
+
     def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
         # Matcher gate — only meaningful for tool-scoped events.
         if spec.event in {"pre_tool_call", "post_tool_call"}:
@@ -506,13 +534,13 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
                 "shell hook failed (event=%s command=%s): %s",
                 spec.event, spec.command, r["error"],
             )
-            return None
+            return required_hook_block() if spec.fail_closed else None
         if r["timed_out"]:
             logger.warning(
                 "shell hook timed out after %.2fs (event=%s command=%s)",
                 r["elapsed_seconds"], spec.event, spec.command,
             )
-            return None
+            return required_hook_block() if spec.fail_closed else None
 
         stderr = r["stderr"].strip()
         if stderr:
@@ -520,18 +548,37 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
                 "shell hook stderr (event=%s command=%s): %s",
                 spec.event, spec.command, stderr[:400],
             )
-        # Non-zero exits: log but still parse stdout so scripts that
-        # signal failure via exit code can also return a block directive.
+        # Non-zero exits may still carry an explicit block directive. Required
+        # hooks otherwise need a successful, explicit allow response.
         if r["returncode"] != 0:
             logger.warning(
                 "shell hook exited %d (event=%s command=%s); stderr=%s",
                 r["returncode"], spec.event, spec.command, stderr[:400],
             )
-        return _parse_response(spec.event, r["stdout"])
+        parsed = _parse_response(spec.event, r["stdout"])
+        if not spec.fail_closed:
+            return parsed
+        if parsed is not None:
+            return parsed
+        if r["returncode"] == 0 and _is_explicit_allow_response(r["stdout"]):
+            return None
+        return required_hook_block()
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
     return _callback
+
+
+def _is_explicit_allow_response(stdout: str) -> bool:
+    """Accept only one JSON object carrying an explicit allow directive."""
+    try:
+        data = json.loads((stdout or "").strip())
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return (
+        isinstance(data, dict)
+        and (data.get("action") or data.get("decision")) == "allow"
+    )
 
 
 def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
@@ -633,7 +680,7 @@ def allowlist_path() -> Path:
 def load_allowlist() -> Dict[str, Any]:
     """Return the parsed allowlist, or an empty skeleton if absent."""
     try:
-        raw = json.loads(allowlist_path().read_text(encoding="utf-8"))
+        raw = json.loads(allowlist_path().read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {"approvals": []}
     if not isinstance(raw, dict):
