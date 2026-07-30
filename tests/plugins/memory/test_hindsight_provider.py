@@ -1811,6 +1811,62 @@ class TestDaemonHealthProbe:
         assert p.check_daemon_health() is True
         assert seen_urls == ["http://127.0.0.1:9177/health"]
 
+    def test_resolves_dynamic_port_when_api_url_not_configured(self, tmp_path, monkeypatch):
+        """local_embedded has no fixed port -- without an explicit api_url
+        override, the real per-profile port (allocated by hindsight_embed,
+        e.g. via its .env override or a hash of the profile name) must be
+        resolved rather than assumed to be _DEFAULT_LOCAL_URL. Previously a
+        daemon on any port but the unnamed-default one was reported
+        unavailable."""
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({"mode": "local_embedded", "profile": "acct-1"}))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        class _FakeManager:
+            def get_url(self, profile):
+                assert profile == "acct-1"
+                return "http://127.0.0.1:54321"
+
+        fake_module = SimpleNamespace(DaemonEmbedManager=_FakeManager)
+        monkeypatch.setitem(sys.modules, "hindsight_embed", SimpleNamespace())
+        monkeypatch.setitem(sys.modules, "hindsight_embed.daemon_embed_manager", fake_module)
+
+        seen_urls = []
+
+        def _capture(req, timeout=None):
+            seen_urls.append(req.full_url)
+            return self._FakeResponse(json.dumps({"status": "healthy"}).encode())
+
+        monkeypatch.setattr("urllib.request.urlopen", _capture)
+
+        p = HindsightMemoryProvider()
+        assert p.check_daemon_health() is True
+        assert seen_urls == ["http://127.0.0.1:54321/health"]
+
+    def test_falls_back_to_default_port_when_discovery_unavailable(self, tmp_path, monkeypatch):
+        """When hindsight_embed itself can't be imported (the same gap
+        is_available() hits per #70089), fall back to the old default
+        rather than raising."""
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({"mode": "local_embedded"}))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setitem(sys.modules, "hindsight_embed", None)
+        monkeypatch.setitem(sys.modules, "hindsight_embed.daemon_embed_manager", None)
+
+        seen_urls = []
+
+        def _capture(req, timeout=None):
+            seen_urls.append(req.full_url)
+            return self._FakeResponse(json.dumps({"status": "healthy"}).encode())
+
+        monkeypatch.setattr("urllib.request.urlopen", _capture)
+
+        p = HindsightMemoryProvider()
+        assert p.check_daemon_health() is True
+        assert seen_urls == ["http://localhost:8888/health"]
+
 
 class TestSharedEventLoopLifecycle:
     """Regression tests for #11923 — Hindsight leaking aiohttp ClientSession /

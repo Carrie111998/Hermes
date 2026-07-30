@@ -759,7 +759,22 @@ class HindsightMemoryProvider(MemoryProvider):
                 mode = "local_embedded"
             if mode not in {"local_embedded", "local_external"}:
                 return False
-            api_url = cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", _DEFAULT_LOCAL_URL)
+            api_url = cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", "")
+            if not api_url and mode == "local_embedded":
+                # local_embedded has no fixed port -- it's per-profile
+                # (overridable in ~/.hindsight/profiles/<profile>.env, else
+                # hash-allocated from the profile name). _DEFAULT_LOCAL_URL
+                # only happens to be right for the unnamed default profile,
+                # which is why a daemon on any other port was reported as
+                # unavailable. Resolve the real port the same way the daemon
+                # itself does instead of guessing.
+                try:
+                    from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+                    api_url = DaemonEmbedManager().get_url(cfg.get("profile", "hermes"))
+                except Exception:
+                    api_url = _DEFAULT_LOCAL_URL
+            elif not api_url:
+                api_url = _DEFAULT_LOCAL_URL
             if not api_url:
                 return False
             import urllib.request
