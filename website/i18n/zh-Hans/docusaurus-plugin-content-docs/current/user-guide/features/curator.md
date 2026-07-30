@@ -101,7 +101,7 @@ hermes curator restore <skill>  # move an archived skill back to active
 
 ## 备份与回滚
 
-默认情况下，每次真正的 curator pass 之前，Hermes 会将 `<HERMES_HOME>/skills/` 快照为 `<HERMES_HOME>/skill-snapshots/<utc-iso>/skills.tar.gz`（默认配置文件的 `<HERMES_HOME>` 是 `~/.hermes`）。命名 profile 使用自己的 home，例如 `<HERMES_HOME>/profiles/worker_alpha/skill-snapshots/<utc-iso>/skills.tar.gz`。如果某次 pass 归档或合并了你不希望被触碰的内容，可以用一条命令撤销整次运行：
+默认情况下，每次真正的 curator pass 之前，Hermes 会将 `<HERMES_HOME>/skills/` 快照为 `~/.hermes/skill-snapshots/<utc-iso>/skills.tar.gz`。这里的 `<HERMES_HOME>` 指当前激活 profile 的 home：对于名为 `worker_alpha` 的 profile，具体路径是 `~/.hermes/profiles/worker_alpha/skill-snapshots/<utc-iso>/skills.tar.gz`；等价地，如果 `HERMES_HOME` 已经设为该 profile 的 home，路径就是 `<HERMES_HOME>/skill-snapshots/<utc-iso>/skills.tar.gz`。如果某次 pass 归档或合并了你不希望被触碰的内容，可以用一条命令撤销整次运行：
 
 ```bash
 hermes curator rollback        # restore newest snapshot (with confirmation)
@@ -113,7 +113,7 @@ hermes curator rollback --list # see all snapshots with reason + size
 
 你也可以随时通过 `hermes curator backup --reason "before-refactor"` 手动创建快照。`--reason` 字符串会写入快照的 `manifest.json`，并在 `--list` 中显示。
 
-新 `<HERMES_HOME>/skill-snapshots/` 根目录中的快照会被裁剪至 `curator.backup.keep`（默认 5 个）以控制磁盘占用。旧版 `<HERMES_HOME>/skills/.curator_backups/` 中的快照保持只读且仍可发现、用于回滚；不会被裁剪：
+新 `<HERMES_HOME>/skill-snapshots/` 根目录中的快照会被裁剪至 `curator.backup.keep`（默认 5 个）以控制磁盘占用。旧版 `<HERMES_HOME>/skills/.curator_backups/` 中的快照保持只读且仍可发现、用于回滚；不会被裁剪。对于默认 profile，该旧路径是 `~/.hermes/skills/.curator_backups/`；对于 `worker_alpha`，则是 `~/.hermes/profiles/worker_alpha/skills/.curator_backups/`：
 
 ```yaml
 curator:
