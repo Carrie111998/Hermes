@@ -17,7 +17,7 @@ import pytest
 
 from gateway import run as gateway_run
 from gateway import session_ipc
-from gateway.config import PlatformConfig
+from gateway.config import GatewayConfig, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -229,6 +229,51 @@ async def test_idle_exact_route_uses_real_adapter_protected_acceptance_path():
     assert is_gateway_session_ipc_task(accepted_event)
     assert accepted_event.is_command() is False
     assert accepted_event.metadata["gateway_session_id"] == SESSION_ID
+
+
+@pytest.mark.asyncio
+async def test_idle_exact_route_heals_stale_adapter_guard_before_acceptance():
+    runner, _ = _runner(_entry())
+    adapter = _TestAdapter(
+        PlatformConfig(enabled=True, token="test"),
+        Platform.TELEGRAM,
+    )
+    runner._adapter_for_source = lambda source: adapter
+    adapter._start_session_processing = Mock(return_value=True)
+
+    async def _done():
+        return None
+
+    stale_task = asyncio.create_task(_done())
+    await stale_task
+    adapter._active_sessions[SESSION_KEY] = asyncio.Event()
+    adapter._session_tasks[SESSION_KEY] = stale_task
+
+    proof = await _inject(runner, "Do not strand this task")
+
+    assert proof["disposition"] == "queued"
+    adapter._start_session_processing.assert_called_once()
+    assert SESSION_KEY not in adapter._session_tasks
+
+
+@pytest.mark.asyncio
+async def test_multiplexer_accepts_exact_route_for_served_named_profile():
+    runner, adapter = _runner(_entry(profile="jasper"))
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner._active_profile_name = lambda: "default"
+    runner._profile_adapters = {"jasper": {Platform.TELEGRAM: adapter}}
+
+    proof = await _inject(runner, "Route through the default multiplexer")
+
+    assert proof["profile"] == "jasper"
+    assert proof["disposition"] == "queued"
+    adapter.accept_internal_task.assert_called_once()
+
+
+def test_gateway_runner_constructs_one_busy_queue_lock():
+    runner = GatewayRunner(GatewayConfig())
+
+    assert runner._busy_queue_guard() is runner._busy_queue_lock
 
 
 @pytest.mark.asyncio
@@ -619,6 +664,43 @@ async def test_socket_rejects_cross_profile_and_malformed_json(tmp_path):
         assert calls == []
     finally:
         await server.stop()
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets unavailable")
+@pytest.mark.asyncio
+async def test_multiplexer_socket_dispatches_served_named_profile(tmp_path):
+    handler = AsyncMock(
+        return_value={
+            "ok": True,
+            "profile": "jasper",
+            "session_key": SESSION_KEY,
+            "session_id": SESSION_ID,
+            "disposition": "queued",
+        }
+    )
+    server = GatewaySessionIPCServer(
+        handler,
+        profile="default",
+        served_profiles={"default", "jasper"},
+        hermes_home=tmp_path,
+    )
+    await server.start()
+    try:
+        response = await asyncio.to_thread(
+            inject_gateway_session,
+            profile="jasper",
+            session_key=SESSION_KEY,
+            expected_session_id=SESSION_ID,
+            idempotency_key="multiplex-server-1",
+            message="Route through one socket",
+            hermes_home=tmp_path,
+        )
+    finally:
+        await server.stop()
+
+    assert response["ok"] is True
+    assert response["profile"] == "jasper"
+    handler.assert_awaited_once()
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets unavailable")
@@ -1085,3 +1167,49 @@ def test_gateway_inject_cli_parser_requires_exact_session_and_message():
     assert args.expected_session_id == SESSION_ID
     assert args.idempotency_key == "work-8491-message-1"
     assert args.message == "Do the task"
+
+
+def test_named_profile_inject_uses_default_multiplexer_socket(tmp_path, capsys):
+    active_socket = tmp_path / "named" / "run" / "gateway-session.sock"
+    default_home = tmp_path / "default"
+    default_socket = default_home / "run" / "gateway-session.sock"
+    default_socket.parent.mkdir(parents=True)
+    default_socket.touch()
+    inject_mock = Mock(
+        return_value={
+            "ok": True,
+            "profile": "jasper",
+            "session_key": SESSION_KEY,
+            "session_id": SESSION_ID,
+            "disposition": "queued",
+        }
+    )
+
+    def socket_path(home=None):
+        return default_socket if home == default_home else active_socket
+
+    with (
+        patch("hermes_cli.profiles.get_active_profile_name", return_value="jasper"),
+        patch("hermes_constants.get_default_hermes_root", return_value=default_home),
+        patch("gateway.session_ipc.gateway_session_socket_path", side_effect=socket_path),
+        patch("gateway.session_ipc.inject_gateway_session", inject_mock),
+    ):
+        _gateway_command_inner(
+            SimpleNamespace(
+                gateway_command="inject",
+                session_key=SESSION_KEY,
+                expected_session_id=SESSION_ID,
+                idempotency_key="multiplex-task-1",
+                message="Route this exactly",
+            )
+        )
+
+    inject_mock.assert_called_once_with(
+        profile="jasper",
+        session_key=SESSION_KEY,
+        expected_session_id=SESSION_ID,
+        idempotency_key="multiplex-task-1",
+        message="Route this exactly",
+        hermes_home=default_home,
+    )
+    assert json.loads(capsys.readouterr().out)["ok"] is True

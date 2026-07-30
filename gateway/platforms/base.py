@@ -5423,6 +5423,10 @@ class BasePlatformAdapter(ABC):
         if metadata.get("gateway_session_key") != session_key:
             return False
 
+        # Match ordinary inbound dispatch: a completed owner task can leave a
+        # stale active-session guard behind.  Heal it before choosing the busy
+        # queue, otherwise accepted IPC work has no live task to drain it.
+        self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
             runner = getattr(self, "gateway_runner", None)
             enqueue_internal = getattr(runner, "_enqueue_internal_fifo_event", None)

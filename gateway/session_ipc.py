@@ -155,9 +155,13 @@ class GatewaySessionIPCServer:
         *,
         profile: str,
         hermes_home: Path | str | None = None,
+        served_profiles: set[str] | frozenset[str] | None = None,
     ) -> None:
         self._handler = handler
         self.profile = str(profile or "default")
+        self.served_profiles = frozenset(
+            {self.profile, *(str(item) for item in (served_profiles or ()))}
+        )
         self.socket_path = gateway_session_socket_path(hermes_home)
         self._server: asyncio.AbstractServer | None = None
         self._bound_identity: tuple[int, int] | None = None
@@ -480,10 +484,10 @@ class GatewaySessionIPCServer:
             expected_session_id = request.get("expected_session_id")
             idempotency_key = request.get("idempotency_key")
             message = request.get("message")
-            if profile != self.profile:
+            if profile not in self.served_profiles:
                 raise SessionIPCRequestError(
                     "profile_mismatch",
-                    f"Socket serves profile {self.profile!r}, not {profile!r}",
+                    f"Socket does not serve profile {profile!r}",
                 )
             if not isinstance(session_key, str) or not session_key.strip():
                 raise SessionIPCRequestError("invalid_request", "session_key is required")

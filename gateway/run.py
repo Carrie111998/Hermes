@@ -5670,6 +5670,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # inject``.  It is created only after adapters are ready and closed at
         # the start of shutdown so no new internal work can enter a drain.
         self._session_ipc_server = None
+        # Serializes the shared adapter head slot and runner overflow queue.
+        # Construct once so concurrent first-use admissions cannot install
+        # different locks and both pass the queue-depth cap.
+        self._busy_queue_lock = threading.RLock()
         self._executor_lock = threading.Lock()
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
@@ -10968,9 +10972,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.session_ipc import GatewaySessionIPCServer
 
+            ipc_profiles = {self._active_profile_name()}
+            if getattr(self.config, "multiplex_profiles", False):
+                ipc_profiles.update(self._profile_adapters.keys())
             self._session_ipc_server = GatewaySessionIPCServer(
                 self._inject_exact_session,
                 profile=self._active_profile_name(),
+                served_profiles=ipc_profiles,
             )
             await self._session_ipc_server.start()
             logger.info(
@@ -11825,10 +11833,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         active_profile = self._active_profile_name()
-        if profile != active_profile:
+        served_profiles = {active_profile}
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            served_profiles.update(getattr(self, "_profile_adapters", {}).keys())
+        if profile not in served_profiles:
             raise SessionIPCRequestError(
                 "profile_mismatch",
-                f"Gateway serves profile {active_profile!r}, not {profile!r}",
+                f"Gateway does not serve profile {profile!r}",
             )
         if not message.strip():
             raise SessionIPCRequestError("invalid_request", "message is required")

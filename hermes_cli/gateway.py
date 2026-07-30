@@ -6782,10 +6782,22 @@ def _gateway_command_inner(args):
         return
 
     if subcmd == "inject":
-        from gateway.session_ipc import SessionIPCRequestError, inject_gateway_session
+        from gateway.session_ipc import (
+            SessionIPCRequestError,
+            gateway_session_socket_path,
+            inject_gateway_session,
+        )
+        from hermes_constants import get_default_hermes_root
         from hermes_cli.profiles import get_active_profile_name
 
         profile = get_active_profile_name() or "default"
+        ipc_home = None
+        if profile != "default" and not gateway_session_socket_path().exists():
+            # A default-profile multiplexer owns the only IPC socket while
+            # retaining the named profile in the request for exact routing.
+            default_home = get_default_hermes_root()
+            if gateway_session_socket_path(default_home).exists():
+                ipc_home = default_home
         try:
             response = inject_gateway_session(
                 profile=profile,
@@ -6793,6 +6805,7 @@ def _gateway_command_inner(args):
                 expected_session_id=args.expected_session_id,
                 idempotency_key=args.idempotency_key,
                 message=args.message,
+                hermes_home=ipc_home,
             )
         except SessionIPCRequestError as exc:
             response = exc.to_response()
