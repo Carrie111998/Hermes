@@ -751,11 +751,13 @@
   }
 }
 
-/* Vital-sign breath for a `good` StatusDot — a soft opacity pulse that reads
-   as "online / healthy" on the gateway-menu status rows without the chorus of
-   outward ping rings that stacking 2-3 dots would produce. Slower than
-   quest-glow (a warning demands attention; "ok" is allowed to be calmer) and
-   scoped to opacity only, so it never disturbs layout geometry.
+/* Finite vital-sign breath for a `good` StatusDot — a soft opacity pulse that
+   reads as "online / healthy" on gateway-menu status rows without retaining a
+   permanent compositor animation for each connected platform. Two cycles are
+   enough to establish the state after mount; the static primary dot remains
+   the durable healthy signal. Slower than quest-glow (a warning demands
+   attention; "ok" is allowed to be calmer) and scoped to opacity only, so it
+   never disturbs layout geometry.
 
    Reduced-motion contract: the blanket override at the top of this file
    (animation-duration: 0.01ms !important) neutralizes the pulse for users who
@@ -776,7 +778,7 @@
 }
 
 .status-dot-breath {
-  animation: status-dot-breath 2.2s ease-in-out infinite;
+  animation: status-dot-breath 2.2s ease-in-out;
 }
 
 /* Command-palette deep-link: briefly flash the targeted settings row. */
