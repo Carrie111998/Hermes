@@ -3367,6 +3367,21 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
+        # Resolve model.key_env / model.api_key_env into model.api_key so all
+        # downstream consumers (agent_init, credential_pool, gateway) see the
+        # resolved value without each needing independent key_env support.
+        # Mirrors the fallback_providers path in chat_completion_helpers.py.
+        _model_section = expanded.get("model")
+        if isinstance(_model_section, dict):
+            _existing_key = str(_model_section.get("api_key") or "").strip()
+            if not _existing_key:
+                _key_env_name = str(
+                    _model_section.get("key_env") or _model_section.get("api_key_env") or ""
+                ).strip()
+                if _key_env_name:
+                    _resolved = os.getenv(_key_env_name, "").strip()
+                    if _resolved:
+                        _model_section["api_key"] = _resolved
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
         # against the process environment, never against user-config-defined refs.

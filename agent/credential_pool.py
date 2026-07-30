@@ -2715,6 +2715,16 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
                 if isinstance(v, str) and v.strip():
                     model_api_key = v.strip()
                     break
+            # Resolve key_env / api_key_env when no inline api_key is present.
+            # Mirrors the fallback_providers path in chat_completion_helpers.py
+            # and the Desktop UI writer in web_server.py which writes
+            # model.key_env but was never consumed here.
+            if not model_api_key:
+                _key_env = str(
+                    model_cfg.get("key_env") or model_cfg.get("api_key_env") or ""
+                ).strip()
+                if _key_env:
+                    model_api_key = os.getenv(_key_env, "").strip()
             if model_provider == "custom" and model_base_url and model_api_key:
                 # Check if this model's base_url matches our custom provider
                 matched_key = get_custom_provider_pool_key(model_base_url)
