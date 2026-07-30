@@ -138,6 +138,40 @@ def read_live_update(*, path: Path | None = None) -> UpdateHolder | None:
     return UpdateHolder(pid=pid, age_seconds=age)
 
 
+def _holder_is_packaged_updater_ancestor(
+    holder: UpdateHolder, *, marker_path: Path
+) -> bool:
+    """True only for the packaged updater's live ancestor-owned marker.
+
+    Windows venv/distlib shims can put one or more launcher processes between
+    ``Hermes-Setup`` and the Python process running ``hermes update``, so the
+    owner need not be our direct parent. Ancestry alone is insufficient,
+    though: an unrelated ancestor or an install-mode helper must never bypass
+    mutual exclusion. Require the marker owner to be the stable updater executable
+    beside the marker and to be running the internal ``--update`` mode. Fail
+    closed when process identity or arguments cannot be inspected.
+    """
+    updater_name = "hermes-setup.exe" if os.name == "nt" else "hermes-setup"
+    expected_exe = marker_path.parent / updater_name
+    try:
+        import psutil
+
+        owner = next(
+            (parent for parent in psutil.Process().parents() if parent.pid == holder.pid),
+            None,
+        )
+        if owner is None:
+            return False
+        actual_norm = os.path.normcase(str(Path(owner.exe()).resolve()))
+        expected_norm = os.path.normcase(str(expected_exe.resolve()))
+        identity_matches = actual_norm == expected_norm
+        update_mode = "--update" in owner.cmdline()[1:]
+        return identity_matches and update_mode
+    except Exception as exc:
+        logger.debug("Could not verify packaged updater ancestry: %s", exc)
+        return False
+
+
 def describe_holder(holder: UpdateHolder) -> str:
     """One-line, user-facing explanation of who holds the update lock."""
     minutes, seconds = divmod(int(max(holder.age_seconds, 0)), 60)
@@ -155,11 +189,14 @@ def describe_holder(holder: UpdateHolder) -> str:
 class UpdateLock:
     """Context manager owning the shared update marker for this process.
 
-    ``acquired`` is False when another live update already holds it — callers
-    decide whether that's a hard refusal (CLI/dashboard) or a wait. Releasing
-    only removes the marker when *we* still own it, so a marker rewritten by a
-    handoff partner (the Tauri updater overwrites it with its own pid) is never
-    deleted out from under its new owner.
+    ``acquired`` is True only when this process wrote and owns the marker. A
+    descendant of the live marker owner may borrow that ancestor-owned lock
+    (the Tauri updater → launcher shim → ``hermes update`` handoff); borrowing
+    returns True from :meth:`acquire` but leaves ``acquired`` False so the child
+    never removes the parent's marker before the rebuild stage. Every other
+    live owner is refused. Releasing only removes the marker when *we* still own
+    it, so a marker rewritten by a handoff partner is never deleted out from
+    under its new owner.
     """
 
     def __init__(self, *, path: Path | None = None) -> None:
@@ -171,6 +208,15 @@ class UpdateLock:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken."""
         existing = read_live_update(path=self.path)
         if existing is not None:
+            if _holder_is_packaged_updater_ancestor(existing, marker_path=self.path):
+                # The packaged updater owns the cross-process marker while a
+                # descendant ``hermes update`` process mutates the checkout.
+                # Borrow without rewriting it: the ancestor must keep the
+                # Electron launch gate closed through the later rebuild stage.
+                logger.debug(
+                    "Borrowing update marker owned by ancestor pid %s", existing.pid
+                )
+                return True
             self.holder = existing
             return False
         try:

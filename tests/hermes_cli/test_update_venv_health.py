@@ -60,6 +60,70 @@ def _proc(pid: int, exe: str, name: str, cmdline: list[str] | None = None, cwd: 
     return proc
 
 
+@patch.object(cli_main, "_is_windows", return_value=True)
+def test_detect_venv_python_only_loads_expensive_details_for_python_candidates(_winp, tmp_path):
+    """Windows process snapshots must stay bounded on process-heavy desktops."""
+
+    class FakeProcess:
+        def __init__(self, *, pid, name, exe, cmdline, cwd=""):
+            self.all_info = {
+                "pid": pid,
+                "name": name,
+                "exe": exe,
+                "cmdline": cmdline,
+                "cwd": cwd,
+            }
+            self.info = {}
+            self.detail_calls = 0
+
+        def as_dict(self, attrs):
+            self.detail_calls += 1
+            return {attr: self.all_info.get(attr) for attr in attrs}
+
+    venv_py = str(tmp_path / "venv" / "Scripts" / "python.exe")
+    unrelated = FakeProcess(
+        pid=101,
+        name="chrome.exe",
+        exe="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        cmdline=["chrome.exe"],
+    )
+    candidate = FakeProcess(
+        pid=102,
+        name="python.exe",
+        exe=venv_py,
+        cmdline=[venv_py, "-m", "hermes_cli.main", "serve"],
+    )
+    venv_tool = FakeProcess(
+        pid=103,
+        name="custom-tool.exe",
+        exe=str(tmp_path / "venv" / "Scripts" / "custom-tool.exe"),
+        cmdline=["custom-tool.exe"],
+    )
+    requested_attrs = []
+
+    def process_iter(attrs):
+        requested_attrs.append(attrs)
+        for proc in (unrelated, candidate, venv_tool):
+            proc.info = {attr: proc.all_info.get(attr) for attr in attrs}
+        return iter((unrelated, candidate, venv_tool))
+
+    me = MagicMock()
+    me.parents.return_value = []
+    fake_psutil = types.SimpleNamespace(
+        process_iter=process_iter,
+        Process=lambda *a, **k: me,
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.dict(
+        sys.modules, {"psutil": fake_psutil}
+    ):
+        matches = cli_main._detect_venv_python_processes()
+
+    assert requested_attrs == [["pid", "name", "exe"]]
+    assert unrelated.detail_calls == 0
+    assert candidate.detail_calls == 1
+    assert venv_tool.detail_calls == 1
+    assert [match[0] for match in matches] == [102, 103]
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
