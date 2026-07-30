@@ -150,10 +150,12 @@ _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _rpc_futures_lock = threading.Lock()
 _active_rpc_futures: set[concurrent.futures.Future] = set()
-_agent_build_quiesce_lock = threading.Lock()
+_update_quiesce_lock = threading.Lock()
 _scheduled_agent_builds: dict[str, object] = {}
 _starting_agent_builds: set[str] = set()
-_agent_builds_quiesced = False
+_scheduled_auto_continues: dict[str, tuple[object, Any]] = {}
+_starting_auto_continues: set[str] = set()
+_tui_update_quiesced = False
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
@@ -299,8 +301,8 @@ atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
 
 def has_active_tui_work() -> bool:
     """Whether an embedded TUI RPC or agent turn still owns live work."""
-    with _agent_build_quiesce_lock:
-        if _starting_agent_builds:
+    with _update_quiesce_lock:
+        if _starting_agent_builds or _starting_auto_continues:
             return True
     with _sessions_lock:
         if any(
@@ -325,24 +327,31 @@ def begin_update_quiesce() -> None:
     so the caller can wait for it. Builds whose timers have not fired remain
     scheduled and resume only after :func:`end_update_quiesce`.
     """
-    global _agent_builds_quiesced
+    global _tui_update_quiesced
 
-    with _agent_build_quiesce_lock:
-        _agent_builds_quiesced = True
+    with _update_quiesce_lock:
+        _tui_update_quiesced = True
 
 
 def end_update_quiesce() -> None:
     """Resume deferred TUI agent builds after an update exits or aborts."""
-    global _agent_builds_quiesced
+    global _tui_update_quiesced
 
-    with _agent_build_quiesce_lock:
-        if not _agent_builds_quiesced:
+    with _update_quiesce_lock:
+        if not _tui_update_quiesced:
             return
-        _agent_builds_quiesced = False
-        pending = list(_scheduled_agent_builds)
+        _tui_update_quiesced = False
+        pending_builds = list(_scheduled_agent_builds)
+        pending_continues = [
+            (sid, target)
+            for sid, (_token, target) in _scheduled_auto_continues.items()
+        ]
         _scheduled_agent_builds.clear()
-    for sid in pending:
+        _scheduled_auto_continues.clear()
+    for sid in pending_builds:
         _schedule_agent_build(sid, delay=0.0)
+    for sid, target in pending_continues:
+        _schedule_auto_continue_kickoff(sid, target)
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -7078,7 +7087,7 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             with session["history_lock"]:
                 session["running"] = False
 
-    threading.Thread(target=kickoff, daemon=True).start()
+    _schedule_auto_continue_kickoff(sid, kickoff)
     logger.info(
         "auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago)",
         session_key,
@@ -7439,12 +7448,12 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     schedule_token = object()
 
     def _run():
-        with _agent_build_quiesce_lock:
+        with _update_quiesce_lock:
             if _scheduled_agent_builds.get(sid) is not schedule_token:
                 # The quiesce ended and re-armed this sid with a fresh timer
                 # before this older timer acquired the lock.
                 return
-            if _agent_builds_quiesced:
+            if _tui_update_quiesced:
                 # Leave the sid scheduled. end_update_quiesce() will arm a
                 # fresh timer after the updater exits.
                 return
@@ -7455,14 +7464,14 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
             if session is not None:
                 _start_agent_build(sid, session)
         finally:
-            with _agent_build_quiesce_lock:
+            with _update_quiesce_lock:
                 _starting_agent_builds.discard(sid)
 
-    with _agent_build_quiesce_lock:
+    with _update_quiesce_lock:
         if sid in _scheduled_agent_builds or sid in _starting_agent_builds:
             return
         _scheduled_agent_builds[sid] = schedule_token
-        if _agent_builds_quiesced:
+        if _tui_update_quiesced:
             return
 
     timer = threading.Timer(delay, _run)
@@ -7470,9 +7479,55 @@ def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
     try:
         timer.start()
     except Exception:
-        with _agent_build_quiesce_lock:
+        with _update_quiesce_lock:
             if _scheduled_agent_builds.get(sid) is schedule_token:
                 _scheduled_agent_builds.pop(sid, None)
+        raise
+
+
+def _schedule_auto_continue_kickoff(sid: str, target) -> None:
+    """Start one crash-recovery kickoff unless update quiesce defers it.
+
+    The kickoff directly starts or waits for an agent build and can then launch
+    a synthesized turn. Track the entire handoff so an update cannot attest
+    idle between the resume RPC returning and either the build or turn becoming
+    visible through the ordinary session flags.
+    """
+    schedule_token = object()
+
+    def _run() -> None:
+        with _update_quiesce_lock:
+            pending = _scheduled_auto_continues.get(sid)
+            if pending is None or pending[0] is not schedule_token:
+                return
+            if _tui_update_quiesced:
+                return
+            _scheduled_auto_continues.pop(sid, None)
+            _starting_auto_continues.add(sid)
+        try:
+            target()
+        finally:
+            with _update_quiesce_lock:
+                _starting_auto_continues.discard(sid)
+
+    with _update_quiesce_lock:
+        if sid in _scheduled_auto_continues or sid in _starting_auto_continues:
+            return
+        _scheduled_auto_continues[sid] = (schedule_token, target)
+        if _tui_update_quiesced:
+            return
+
+    worker = threading.Thread(
+        target=_run,
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        with _update_quiesce_lock:
+            pending = _scheduled_auto_continues.get(sid)
+            if pending is not None and pending[0] is schedule_token:
+                _scheduled_auto_continues.pop(sid, None)
         raise
 
 

@@ -568,6 +568,38 @@ def test_update_quiesce_defers_scheduled_agent_build(server, monkeypatch):
     assert built.wait(timeout=0.5) is True
 
 
+def test_update_quiesce_defers_auto_continue_kickoff(server):
+    kicked_off = threading.Event()
+
+    server.begin_update_quiesce()
+    try:
+        server._schedule_auto_continue_kickoff("deferred", kicked_off.set)
+        assert kicked_off.wait(timeout=0.05) is False
+    finally:
+        server.end_update_quiesce()
+
+    assert kicked_off.wait(timeout=0.5) is True
+
+
+def test_active_tui_work_includes_auto_continue_handoff(server):
+    started = threading.Event()
+    release = threading.Event()
+
+    def kickoff():
+        started.set()
+        release.wait(timeout=0.5)
+
+    server._schedule_auto_continue_kickoff("starting", kickoff)
+    assert started.wait(timeout=0.5) is True
+    assert server.has_active_tui_work() is True
+
+    release.set()
+    deadline = time.monotonic() + 0.5
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.has_active_tui_work() is False
+
+
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
 def test_completion_handlers_are_pool_routed(completion_method, server):
     """complete.path/complete.slash must run on the pool, never the reader thread.
