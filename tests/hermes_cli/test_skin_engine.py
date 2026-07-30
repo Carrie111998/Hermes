@@ -555,3 +555,93 @@ class TestAutoSkinSelector:
             "/skin auto must reach set_active_skin(), not be rejected as an "
             "unknown skin name"
         )
+
+    def test_real_startup_path_display_skin_auto_with_hermes_light_resolves_daylight(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression (review of #68610): a full, real cli.py module
+        (re)import with display.skin: auto configured and HERMES_LIGHT=1
+        set must end up on the "daylight" skin -- not silently fall back
+        to "default" via resolve_auto_skin()'s own except-swallow.
+
+        This is the exact path the prior tests in this class don't cover:
+        they either mock resolve_auto_skin() directly, or check that
+        cli._detect_light_mode exists as an attribute on the ALREADY-fully-
+        imported module (post test-collection). Neither exercises cli.py's
+        own top-level execution ORDER: init_skin_from_config() used to run
+        (indirectly, via set_active_skin("auto") -> resolve_auto_skin() ->
+        `from cli import _detect_light_mode`) BEFORE cli.py had reached the
+        line defining that function, which failed with the classic
+        partially-initialized-module ImportError, got silently swallowed,
+        and left the active skin on "default" even with HERMES_LIGHT=1 set.
+        importlib.reload() re-executes cli.py's module-scope code exactly
+        as a fresh process import would, so this is the faithful
+        reproduction of the real startup sequence.
+        """
+        import sys as _sys
+        import types as _types
+        import importlib
+        import textwrap
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_LIGHT", "1")
+        monkeypatch.delenv("HERMES_TUI_LIGHT", raising=False)
+        monkeypatch.delenv("HERMES_TUI_THEME", raising=False)
+        monkeypatch.delenv("HERMES_TUI_BACKGROUND", raising=False)
+        monkeypatch.delenv("COLORFGBG", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            textwrap.dedent(
+                """
+                display:
+                  skin: auto
+                """
+            ).lstrip()
+        )
+        # No user-installed auto.yaml, so the virtual selector resolves.
+        skins_dir = tmp_path / "skins"
+        skins_dir.mkdir(exist_ok=True)
+
+        try:
+            import cli as _cli_mod  # noqa: F401 -- import for its side effect / availability check
+        except Exception:
+            for _mod in ("prompt_toolkit", "dotenv"):
+                if _mod not in _sys.modules:
+                    stub = _types.ModuleType(_mod)
+                    if _mod == "dotenv":
+                        stub.load_dotenv = lambda *a, **k: None
+                    monkeypatch.setitem(_sys.modules, _mod, stub)
+            try:
+                import cli as _cli_mod  # noqa: F401
+            except Exception:
+                import pytest as _pytest
+                _pytest.skip("cli module could not be imported in this sandbox")
+
+        # importlib.reload() re-executes cli.py's top-level statements, but
+        # reuses the SAME module object in place -- its namespace still has
+        # every attribute from the PRIOR full execution (including
+        # _detect_light_mode) while the reload is running, so the circular
+        # `from cli import _detect_light_mode` inside resolve_auto_skin()
+        # would succeed immediately regardless of where the init call sits
+        # in this file. That does NOT reproduce the real bug: a fresh
+        # process's first import starts with an EMPTY module namespace, so
+        # the circular import only succeeds once execution has actually
+        # reached the `def _detect_light_mode` line. Deleting cli (and its
+        # own submodule cache entries it may have created) from
+        # sys.modules before re-importing forces Python to treat this as a
+        # genuinely first-time import, faithfully reproducing the ordering
+        # bug this test guards against.
+        for _mod_name in list(_sys.modules):
+            if _mod_name == "cli" or _mod_name.startswith("cli."):
+                del _sys.modules[_mod_name]
+
+        import cli as _cli_mod
+
+        from hermes_cli.skin_engine import get_active_skin_name
+
+        assert get_active_skin_name() == "daylight", (
+            "display.skin: auto with HERMES_LIGHT=1 must resolve to "
+            "'daylight' via the real cli.py startup sequence -- if this is "
+            "'default', init_skin_from_config() ran before "
+            "cli._detect_light_mode was defined, and the resulting "
+            "ImportError was silently swallowed"
+        )
