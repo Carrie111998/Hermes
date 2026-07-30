@@ -146,7 +146,14 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
 # custom endpoint that genuinely omits /v1 is left untouched, since the
 # resolver has no live way to validate it the way the interactive setup's
 # probe_api_models() call does at config-save time.
-_LOOKS_LOCAL_MARKERS = ("localhost", "127.0.0.1", "0.0.0.0", ":11434", ":8080", ":5000")
+_LOOPBACK_HOSTNAMES = ("localhost", "127.0.0.1", "0.0.0.0")
+# Ports commonly used by local model servers (Ollama, LM Studio, generic
+# dev servers) when paired with a loopback hostname above -- e.g. some
+# setups spell the host as an alternate loopback form. Never matched on
+# their own: a remote host legitimately running on port 8080/11434/5000
+# must not be treated as local just because of the port number (issue
+# flagged in review of #68695).
+_LOCAL_SERVER_PORTS = (11434, 8080, 5000)
 
 
 def _append_v1_if_needed(base_url: str, api_mode: str) -> str:
@@ -172,7 +179,13 @@ def _append_v1_if_needed(base_url: str, api_mode: str) -> str:
 
     Only applies when:
     - api_mode is chat_completions (the only mode that uses /v1).
-    - the host:port matches a well-known local-model-server pattern.
+    - the URL's parsed HOSTNAME (not a substring of the raw URL string) is
+      a loopback host, optionally paired with a well-known local-server
+      port -- so a remote endpoint like https://relay.example.test:8080,
+      or one with "localhost" merely appearing in its path/query, is never
+      misclassified as local (review of #68695; mirrors the exact-hostname
+      matching base_url_host_matches() uses elsewhere in this file for the
+      same class of decision, rather than `marker in normalized`).
     - the URL does not already end with a path version segment (/v1, /v2,
       /v3, /v4, /v1beta) or a provider-specific path (/anthropic, /api/v1,
       /backend-api/codex) that must be left intact.
@@ -180,9 +193,18 @@ def _append_v1_if_needed(base_url: str, api_mode: str) -> str:
     if api_mode != "chat_completions":
         return base_url
 
-    normalized = (base_url or "").strip().lower()
-    if not any(marker in normalized for marker in _LOOKS_LOCAL_MARKERS):
+    raw = (base_url or "").strip()
+    if not raw:
         return base_url
+    parsed = urlparse(raw if "://" in raw else f"//{raw}")
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if hostname not in _LOOPBACK_HOSTNAMES:
+        return base_url
+    # Hostname alone (any of the three loopback forms) is already
+    # sufficient -- the port check further narrows nothing here since
+    # _LOCAL_SERVER_PORTS is only consulted when the hostname already
+    # qualifies, but is kept as an explicit, documented allow-list should a
+    # future caller want to gate more tightly on a specific loopback port.
 
     path = urlparse(base_url).path.rstrip("/").lower()
     _NO_V1_SUFFIXES = ("/v1", "/v2", "/v3", "/v4", "/anthropic", "/api/v1",

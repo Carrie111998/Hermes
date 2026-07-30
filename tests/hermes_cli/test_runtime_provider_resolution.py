@@ -3561,3 +3561,75 @@ class TestAppendV1AtResolverBoundary:
         resolved = rp.resolve_runtime_provider()
 
         assert resolved["base_url"] == "http://localhost:11434/v1", resolved
+
+    def test_remote_url_with_local_looking_port_not_rewritten(self, monkeypatch):
+        """Regression (review of #68695): the prior substring-search
+        implementation (`marker in normalized`) matched ':8080' anywhere in
+        the URL string, so a genuinely remote endpoint that happens to run
+        on a common local-dev port was incorrectly rewritten. Must now
+        parse the URL and check the exact hostname component."""
+        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
+        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+
+        resolved = rp.resolve_runtime_provider(
+            requested="custom", explicit_base_url="https://relay.example.test:8080",
+        )
+
+        assert resolved["base_url"] == "https://relay.example.test:8080", (
+            "A remote endpoint must not be rewritten just because it runs "
+            "on a port number that's also a common local-dev port"
+        )
+
+    def test_remote_url_with_localhost_in_path_not_rewritten(self, monkeypatch):
+        """Same regression, the other exact repro from review: 'localhost'
+        appearing in the URL's PATH (not its hostname) must not trigger
+        the local-server rewrite."""
+        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
+        monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+
+        resolved = rp.resolve_runtime_provider(
+            requested="custom",
+            explicit_base_url="https://relay.example.test/path/localhost",
+        )
+
+        assert resolved["base_url"] == "https://relay.example.test/path/localhost", (
+            "'localhost' appearing in the URL path (not the hostname) must "
+            "not trigger the local-server rewrite"
+        )
+
+
+class TestAppendV1IfNeededHostnameParsing:
+    """Direct unit tests for _append_v1_if_needed()'s hostname parsing,
+    covering the exact false-positive cases identified in review of #68695
+    plus the genuine local-server cases that must still work."""
+
+    def test_remote_host_with_local_dev_port_unchanged(self):
+        result = rp._append_v1_if_needed(
+            "https://relay.example.test:8080", "chat_completions"
+        )
+        assert result == "https://relay.example.test:8080"
+
+    def test_remote_host_with_localhost_in_path_unchanged(self):
+        result = rp._append_v1_if_needed(
+            "https://relay.example.test/path/localhost", "chat_completions"
+        )
+        assert result == "https://relay.example.test/path/localhost"
+
+    def test_remote_host_with_localhost_in_query_unchanged(self):
+        result = rp._append_v1_if_needed(
+            "https://relay.example.test/api?redirect=localhost", "chat_completions"
+        )
+        assert result == "https://relay.example.test/api?redirect=localhost"
+
+    def test_genuine_localhost_still_gets_v1(self):
+        result = rp._append_v1_if_needed("http://localhost:11434", "chat_completions")
+        assert result == "http://localhost:11434/v1"
+
+    def test_genuine_loopback_ip_still_gets_v1(self):
+        result = rp._append_v1_if_needed("http://127.0.0.1:8080", "chat_completions")
+        assert result == "http://127.0.0.1:8080/v1"
+
+    def test_genuine_wildcard_bind_still_gets_v1(self):
+        result = rp._append_v1_if_needed("http://0.0.0.0:5000", "chat_completions")
+        assert result == "http://0.0.0.0:5000/v1"
+
