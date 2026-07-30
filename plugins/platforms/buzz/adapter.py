@@ -76,6 +76,9 @@ _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
 
+# Relay rejection when --reply-to names an event it does not have.
+_PARENT_NOT_FOUND_RE = re.compile(r"parent event \S+ not found", re.I)
+
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
 _WS_AUTH_TIMEOUT = 20.0
@@ -589,6 +592,19 @@ class BuzzAdapter(BasePlatformAdapter):
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
+        if code != 0 and reply_target and _PARENT_NOT_FOUND_RE.search(err or ""):
+            # The reply target does not exist on this relay. ``metadata["thread_id"]``
+            # is populated by generic gateway machinery — this adapter never sets
+            # thread metadata on inbound — so it can carry an id the relay has
+            # never seen. Threading is a presentation detail; losing the message
+            # over it is not, and the caller's plain-text fallback re-sends with
+            # the same reply target and fails identically. Retry flat once.
+            logger.warning(
+                "Buzz: reply target %s not found on relay; resending unthreaded",
+                str(reply_target)[:12],
+            )
+            args = [a for a in args if a not in ("--reply-to", str(reply_target))]
+            code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
                 success=False,

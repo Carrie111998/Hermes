@@ -421,6 +421,45 @@ class TestBuzzAdapterSend:
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
 
+    @pytest.mark.asyncio
+    async def test_send_retries_unthreaded_when_parent_missing(self):
+        """A reply target this relay does not have must not lose the message."""
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script(
+            "messages", "send", "", code=4,
+            stderr='{"error":"other","message":"error: parent event abc123 not found"}',
+        )
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt203", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "hello", reply_to="abc123")
+        assert result.success is True
+        assert result.message_id == "evt203"
+
+        assert len(cli.calls) == 2
+        first_args, _ = cli.calls[0]
+        retry_args, retry_stdin = cli.calls[1]
+        assert first_args[first_args.index("--reply-to") + 1] == "abc123"
+        assert "--reply-to" not in retry_args
+        assert "abc123" not in retry_args
+        assert retry_stdin == "hello"
+
+    @pytest.mark.asyncio
+    async def test_send_does_not_retry_on_unrelated_error(self):
+        """Only the missing-parent case is retried; everything else still fails."""
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script(
+            "messages", "send", "", code=1,
+            stderr='{"error":"user_error","message":"something else entirely"}',
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "hello", reply_to="abc123")
+        assert result.success is False
+        assert len(cli.calls) == 1
+
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 
