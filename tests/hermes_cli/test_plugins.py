@@ -543,7 +543,6 @@ class TestThreadToolWhitelist:
 class TestPluginContext:
     """Tests for the PluginContext facade."""
 
-
     def test_register_tool_forwards_run_start_event(self):
         from hermes_cli.plugins import PluginContext, PluginManifest
         from tools.registry import registry
@@ -610,9 +609,6 @@ class TestPluginContext:
             assert "test_plugin_positional_override" in manager._plugin_tool_names
         finally:
             registry.deregister("test_plugin_positional_override")
-
-
-
 
     def test_register_tool_override_blocked_without_operator_opt_in(self, tmp_path, monkeypatch):
         """override=True must be rejected when the operator hasn't opted in.

@@ -95,7 +95,6 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["b1", "r3"]
 
-
     def test_never_parallel_tool_is_a_barrier(self):
         calls = [
             _tc("web_search", call_id="r1"),
@@ -115,8 +114,6 @@ class TestPlanToolBatchSegments:
         segments = _plan_tool_batch_segments(calls)
         assert _kinds(segments) == ["sequential", "parallel"]
         assert _flatten_ids(segments) == ["intent", "search-1", "search-2"]
-
-
 
     def test_overlapping_paths_split_across_segments(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
