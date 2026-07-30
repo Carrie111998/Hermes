@@ -6164,7 +6164,9 @@ class GatewayRunner:
                 _phase_elapsed(),
             )
 
-            await self._stop_pa_credentials_watcher()
+            # Use the class implementation so minimal GatewayRunner stand-ins
+            # that exercise shutdown still receive the optional watcher cleanup.
+            await GatewayRunner._stop_pa_credentials_watcher(self)
 
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
