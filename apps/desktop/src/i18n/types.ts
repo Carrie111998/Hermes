@@ -195,6 +195,7 @@ export interface Translations {
       noSpeechDetected: string
       playbackFailed: string
       recordingFailed: string
+      sayStopToEnd: (phrase: string) => string
       transcriptionFailed: string
       transcriptionUnavailable: string
       tryRecordingAgain: string
@@ -445,6 +446,9 @@ export interface Translations {
       builtinOnly: string
       notSet: string
       commaSeparated: string
+      searchPlaceholder: string
+      noResults: string
+      systemDefault: string
       loading: string
       emptyTitle: string
       emptyDesc: string
@@ -783,6 +787,9 @@ export interface Translations {
       ready: string
       needsSignIn: string
       needsSetup: string
+      activeBackend: string
+      activeBackendHint: string
+      useBackend: string
       nousIncluded: string
       nousAuthNeededTitle: string
       nousAuthNeededMessage: (provider: string) => string
@@ -1197,6 +1204,23 @@ export interface Translations {
     failedUpdate: (name: string) => string
     failedSave: (name: string) => string
     failedClear: (key: string) => string
+    pendingRequests: (count: number) => string
+    pendingAria: (count: number) => string
+    approvedUsers: (count: number) => string
+    approve: string
+    approving: string
+    revoke: string
+    revoking: string
+    revokeAria: (name: string) => string
+    revokeTitle: string
+    revokeDesc: (name: string) => string
+    approvedUser: (name: string) => string
+    approvedHint: string
+    revokedUser: (name: string) => string
+    failedApprove: (name: string) => string
+    failedRevoke: (name: string) => string
+    pairingLockedOut: string
+    waitingSince: (minutes: number) => string
     fieldCopy: Record<string, { label?: string; help?: string; placeholder?: string }>
     platformIntro: Record<string, string>
   }
@@ -1644,6 +1668,9 @@ export interface Translations {
     voiceDictation: string
     speakReplies: string
     stopSpeakingReplies: string
+    wakeWordListening: (phrase: string) => string
+    wakeWordOff: (phrase: string) => string
+    wakeWordPausedVoice: (phrase: string) => string
     lookupLoading: string
     lookupNoMatches: string
     lookupTry: string
@@ -2344,6 +2371,8 @@ export interface Translations {
       statusError: string
       statusRecovered: string
       statusDone: string
+      /** Over-budget / rejected memory write title — not "Saved to memory". */
+      memoryWriteNoted: string
       actions: {
         read: string
         reading: string
