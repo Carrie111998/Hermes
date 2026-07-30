@@ -1951,7 +1951,7 @@ def _tui_external_local_workspaces(tui_dir: Path) -> list[tuple[Path, Path]]:
 
 def _iter_tui_workspace_inputs(relative: Path, workspace: Path):
     """Yield copied workspace files, rejecting symlinks before they can escape."""
-    for path in workspace.rglob("*"):
+    for path in sorted(workspace.rglob("*"), key=lambda candidate: candidate.as_posix()):
         workspace_relative = path.relative_to(workspace)
         if any(part in {"node_modules", "dist"} for part in workspace_relative.parts):
             continue
@@ -1971,13 +1971,12 @@ def _tui_bundle_stamp(root: Path) -> str:
     """Content stamp for the self-contained TUI bundle cache."""
     h = hashlib.sha256()
     ws_root = _workspace_root(root)
-    for path in sorted(_iter_tui_build_inputs(root), key=lambda p: p.as_posix()):
+    for rel, path in _iter_tui_workspace_inputs(Path("ui-tui"), root):
         try:
-            rel = path.relative_to(root).as_posix()
             data = path.read_bytes()
         except OSError:
             continue
-        h.update(rel.encode("utf-8", "surrogateescape"))
+        h.update(rel.as_posix().encode("utf-8", "surrogateescape"))
         h.update(b"\0")
         h.update(data)
         h.update(b"\0")
@@ -2113,7 +2112,12 @@ def _ensure_tui_cached_bundle(
                 tui_dir,
                 tmp_build / "ui-tui",
                 ignore=shutil.ignore_patterns("node_modules", "dist"),
+                symlinks=True,
             )
+            for _input in _iter_tui_workspace_inputs(
+                Path("ui-tui"), tmp_build / "ui-tui"
+            ):
+                pass
             for relative, workspace in _tui_external_local_workspaces(tui_dir):
                 destination = tmp_build / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)

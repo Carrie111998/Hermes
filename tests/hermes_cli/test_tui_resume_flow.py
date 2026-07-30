@@ -502,6 +502,27 @@ def test_tui_bundle_stamp_rejects_symlinks_in_external_workspace(main_mod, tmp_p
         main_mod._tui_bundle_stamp(tui_dir)
 
 
+def test_tui_bundle_stamp_rejects_symlinks_in_primary_workspace(main_mod, tmp_path):
+    repo = tmp_path / "repo"
+    tui_dir = repo / "ui-tui"
+    outside = tmp_path / "outside"
+    (tui_dir / "src").mkdir(parents=True)
+    outside.mkdir()
+    (repo / "package.json").write_text(
+        '{"private":true,"workspaces":["ui-tui"]}', encoding="utf-8"
+    )
+    (repo / "package-lock.json").write_text(
+        '{"name":"hermes-agent","lockfileVersion":3,"packages":{}}',
+        encoding="utf-8",
+    )
+    (tui_dir / "package.json").write_text('{"name":"hermes-tui"}', encoding="utf-8")
+    (outside / "secret.ts").write_text("export const secret = true\n", encoding="utf-8")
+    (tui_dir / "src" / "escape").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        main_mod._tui_bundle_stamp(tui_dir)
+
+
 def test_tui_cache_advisory_lock_serializes_builders(main_mod, tmp_path):
     lock_path = tmp_path / "tui-bundle.lock"
     first = main_mod._try_acquire_tui_cache_lock(lock_path)
