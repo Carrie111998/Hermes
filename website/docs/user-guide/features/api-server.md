@@ -386,6 +386,28 @@ redaction before leaving the process. Per-tool child events
 are high-volume UI noise; use the per-child live transcript files for
 play-by-play.
 
+When the run uses a mixture-of-agents preset, the stream also carries the MoA
+fan-out so a council run is not silent while the references work.
+`moa.reference` fires once per reference model, before the aggregator acts, and
+carries `label` (the reference model slot), `text` (that reference's output —
+a reference that failed still emits a frame), and `index` / `count` (its
+1-based position in the fan-out, out of the references attempted).
+`moa.aggregating` fires once afterwards with `aggregator` (the aggregator model
+slot) and `ref_count`, the same attempted-reference total. Both carry the usual
+`event`, `run_id` and `timestamp` fields. When a MoA privacy mode is
+configured, reference text is redacted at the point of emission, so these
+streams see exactly what the CLI and TUI see.
+Per-reference progress ticks (`moa.progress`, `moa.phase`) are intentionally
+**not** forwarded, for the same reason per-tool child events are not.
+
+```
+event: moa.reference
+data: {"event": "moa.reference", "run_id": "run_abc123", "timestamp": 1717171717.5, "label": "openrouter:anthropic/claude-opus-4.8", "text": "Answer A.", "index": 1, "count": 3}
+
+event: moa.aggregating
+data: {"event": "moa.aggregating", "run_id": "run_abc123", "timestamp": 1717171718.1, "aggregator": "nous:hermes-4-405b", "ref_count": 3}
+```
+
 Unconsumed event buffers expire after five minutes so a detached client cannot
 grow memory indefinitely. This expires transport state only: a run that is
 still executing remains visible to status polling, approval, stop control, and
@@ -453,7 +475,24 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `GET` | `/api/sessions/{id}/messages` | Message history for a session |
 | `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
-| `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, `run.completed` events |
+| `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, `moa.reference`, `moa.aggregating`, `run.completed` events |
+
+On a mixture-of-agents run this stream carries the same fan-out events the
+`/v1/runs` stream does, so an external UI shows the council working instead of a
+silent pause. `moa.reference` fires once per reference model attempted, with
+`label`, `text`, `index` and `count`; `moa.aggregating` fires once afterwards
+with `aggregator` and `ref_count`. Both also carry the `message_id` of the
+assistant message being streamed, plus the `session_id`, `run_id`, `seq` and `ts` fields
+every event on this stream carries — so a client can attribute the fan-out to
+the turn that produced it.
+
+```
+event: moa.reference
+data: {"message_id": "msg_9f2c8ab1e4", "label": "openrouter:anthropic/claude-opus-4.8", "text": "Answer A.", "index": 1, "count": 3, "session_id": "space-session", "run_id": "run_abc123", "seq": 3, "ts": 1717171717.5}
+
+event: moa.aggregating
+data: {"message_id": "msg_9f2c8ab1e4", "aggregator": "nous:hermes-4-405b", "ref_count": 3, "session_id": "space-session", "run_id": "run_abc123", "seq": 6, "ts": 1717171718.1}
+```
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
 
