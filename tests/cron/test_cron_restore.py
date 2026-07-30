@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,12 +40,13 @@ def read_rows() -> list[dict]:
 def test_subprocess_restore_roundtrip_and_missing_error_is_redacted(temp_home):
     snapshot = create_snapshot()
     job_id = snapshot["id"]
+    before = read_rows()
     assert cli("cron", "edit", job_id, "--name", "mutated", "--json").returncode == 0
     restored = cli("cron", "restore", job_id, "--snapshot-stdin", "--json",
                    input_text=json.dumps(snapshot))
     assert restored.returncode == 0, restored.stdout
     assert json.loads(restored.stdout) == snapshot
-    assert read_rows() == [snapshot]
+    assert read_rows() == before
     missing = cli("cron", "restore", "missing", "--snapshot-stdin", "--json",
                   input_text=json.dumps(snapshot))
     assert missing.returncode != 0
@@ -105,3 +107,89 @@ def test_one_shot_and_cron_snapshots_are_versioned_and_restoreable(temp_home, sc
                    input_text=json.dumps(snapshot))
     assert restored.returncode == 0, restored.stdout
     assert json.loads(restored.stdout) == snapshot
+
+
+def test_direct_restore_rejects_non_json_graphs_before_mutation(temp_home):
+    from cron.jobs import restore_job
+
+    snapshot = create_snapshot()
+    job_id = snapshot["id"]
+    before = read_rows()
+    cases = [
+        ({**snapshot, "record": {**snapshot["record"], "skills": ("x",)}},
+         "CRON_RESTORE_NON_SERIALIZABLE"),
+        ({**snapshot, "record": {**snapshot["record"], "origin": {"value": float("nan")}}},
+         "CRON_RESTORE_NON_SERIALIZABLE"),
+        ({**snapshot, "record": {**snapshot["record"], "origin": {"value": 2**10000}}},
+         "CRON_RESTORE_BOUNDS_EXCEEDED"),
+    ]
+    cycle = {}
+    cycle["self"] = cycle
+    cases.append(({**snapshot, "record": {**snapshot["record"], "origin": cycle}},
+                  "CRON_RESTORE_CYCLE"))
+
+    for invalid_snapshot, code in cases:
+        with pytest.raises(ValueError, match=code):
+            restore_job(job_id, invalid_snapshot)
+        assert read_rows() == before
+
+
+def test_direct_restore_rejects_canonical_utf8_payload_over_64k_before_mutation(temp_home):
+    from cron.jobs import restore_job
+
+    snapshot = create_snapshot()
+    before = read_rows()
+    record = dict(snapshot["record"])
+    record["origin"] = {f"k{i}": "x" * 14_000 for i in range(5)}
+    with pytest.raises(ValueError, match="CRON_RESTORE_BOUNDS_EXCEEDED"):
+        restore_job(snapshot["id"], {**snapshot, "record": record})
+    assert read_rows() == before
+
+
+def test_cli_restore_maps_only_explicit_restore_codes(monkeypatch, capsys):
+    from hermes_cli import cron as cron_cli
+
+    class Stdin:
+        buffer = type("Buffer", (), {"read": lambda self, limit: b"{}"})()
+
+    monkeypatch.setattr(sys, "stdin", Stdin())
+    monkeypatch.setattr("cron.jobs.restore_job", lambda *_args: (_ for _ in ()).throw(
+        ValueError("CRON_RESTORE_INVENTED_SECRET")
+    ))
+    rc = cron_cli.cron_restore(SimpleNamespace(
+        job_id="job-1", snapshot_stdin=True, json=False,
+    ))
+    assert rc == 1
+    output = capsys.readouterr().out
+    assert "CRON_RESTORE_INVALID_SNAPSHOT" in output
+    assert "INVENTED_SECRET" not in output
+
+
+def test_cli_restore_notifies_provider_once_only_after_success(temp_home, monkeypatch, capsys):
+    from hermes_cli import cron as cron_cli
+
+    snapshot = create_snapshot()
+    calls = []
+    monkeypatch.setattr("cron.scheduler._notify_provider_jobs_changed",
+                        lambda: calls.append("notified"))
+    monkeypatch.setattr(sys, "stdin", type("Stdin", (), {
+        "buffer": type("Buffer", (), {
+            "read": lambda self, limit: json.dumps(snapshot).encode("utf-8")
+        })()
+    })())
+    assert cron_cli.cron_restore(SimpleNamespace(
+        job_id=snapshot["id"], snapshot_stdin=True, json=True,
+    )) == 0
+    capsys.readouterr()
+    assert calls == ["notified"]
+
+    monkeypatch.setattr(sys, "stdin", type("Stdin", (), {
+        "buffer": type("Buffer", (), {
+            "read": lambda self, limit: json.dumps(snapshot).encode("utf-8")
+        })()
+    })())
+    assert cron_cli.cron_restore(SimpleNamespace(
+        job_id="missing", snapshot_stdin=True, json=False,
+    )) == 1
+    capsys.readouterr()
+    assert calls == ["notified"]

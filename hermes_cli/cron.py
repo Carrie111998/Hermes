@@ -25,6 +25,25 @@ from cron.lifecycle_guard import (  # noqa: F401  (re-exported for terminal_tool
     contains_gateway_lifecycle_command as _contains_gateway_lifecycle_command,
 )
 
+_CRON_RESTORE_ERROR_CODES = frozenset({
+    "CRON_RESTORE_INVALID_ID", "CRON_RESTORE_INVALID_SNAPSHOT",
+    "CRON_RESTORE_INVALID_UTF8", "CRON_RESTORE_INVALID_JSON",
+    "CRON_RESTORE_BOUNDS_EXCEEDED", "CRON_RESTORE_CYCLE",
+    "CRON_RESTORE_NON_SERIALIZABLE", "CRON_RESTORE_INVALID_KEY",
+    "CRON_RESTORE_INVALID_RECORD", "CRON_RESTORE_UNKNOWN_FIELD",
+    "CRON_RESTORE_UNKNOWN_RECORD_FIELD", "CRON_RESTORE_INVALID_PRESENCE",
+    "CRON_RESTORE_ID_MISMATCH", "CRON_RESTORE_RECORD_MISMATCH",
+    "CRON_RESTORE_SCHEDULE_MISMATCH", "CRON_RESTORE_REPEAT_MISMATCH",
+    "CRON_RESTORE_RUN_AT_MISMATCH", "CRON_RESTORE_DELIVERY_MISMATCH",
+    "CRON_RESTORE_INVALID_NAME", "CRON_RESTORE_INVALID_ENABLED",
+    "CRON_RESTORE_INVALID_STATE", "CRON_RESTORE_INVALID_SCHEDULE",
+    "CRON_RESTORE_INVALID_REPEAT", "CRON_RESTORE_INVALID_SKILLS",
+    "CRON_RESTORE_INVALID_TEXT_FIELD", "CRON_RESTORE_INVALID_NO_AGENT",
+    "CRON_RESTORE_INVALID_DELIVERY", "CRON_RESTORE_INVALID_METADATA",
+    "CRON_RESTORE_INVALID_NEXT_RUN", "CRON_RESTORE_SCRIPT_REQUIRED",
+    "CRON_RESTORE_AGENT_INPUT_REQUIRED", "CRON_RESTORE_JOB_NOT_FOUND",
+})
+
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
     if skills is None:
@@ -96,8 +115,8 @@ def _warn_if_gateway_not_running() -> None:
     print(color("     Check status:  hermes cron status", Colors.DIM))
 
 
-def _canonical_job(job: dict) -> dict:
-    """Return a lossless, versioned persisted-job shape."""
+def _canonical_job(job: dict, *, include_snapshot: bool = False) -> dict:
+    """Return the stable CLI projection, optionally with restore data."""
     from cron.jobs import PERSISTED_JOB_FIELDS
 
     # list_jobs() adds latest_execution as a derived display field.  Never put
@@ -132,14 +151,11 @@ def _canonical_job(job: dict) -> dict:
             platform, recipient = parts[0], parts[1]
             thread = parts[2] if len(parts) == 3 else None
     result = {
-        "schema_version": 2,
-        "record": record,
-        "presence": sorted(record),
         "id": record.get("id"), "name": record.get("name"),
         "enabled": record.get("enabled", True),
         "state": record.get("state", "scheduled"),
         "schedule": record.get("schedule_display") or (schedule or {}).get("display"),
-        "schedule_state": json.loads(json.dumps(schedule, ensure_ascii=False)),
+
         "run_at": (schedule or {}).get("run_at"), "next_run_at": record.get("next_run_at"),
         "repeat": repeat_mapping.get("times"), "delivery": deliver, "deliver": deliver,
         "platform": platform, "recipient": recipient, "thread": thread,
@@ -148,12 +164,12 @@ def _canonical_job(job: dict) -> dict:
         "prompt": record.get("prompt"), "model": record.get("model"),
         "provider": record.get("provider"), "workdir": record.get("workdir"),
     }
-    result["repeat_state"] = json.loads(json.dumps(record.get("repeat"), ensure_ascii=False))
-    # Keep all supported persisted metadata visible at the canonical surface;
-    # ``presence`` is the authoritative distinction between absent and null.
-    for field in sorted(PERSISTED_JOB_FIELDS):
-        result.setdefault(field, json.loads(json.dumps(record[field], ensure_ascii=False))
-                           if field in record else None)
+    if include_snapshot:
+        result["schema_version"] = 2
+        result["record"] = record
+        result["presence"] = sorted(record)
+        result["schedule_state"] = json.loads(json.dumps(schedule, ensure_ascii=False))
+        result["repeat_state"] = json.loads(json.dumps(record.get("repeat"), ensure_ascii=False))
     return result
 
 
@@ -163,7 +179,7 @@ def cron_show(job_id: str, *, json_mode: bool = False) -> int:
     if job is None:
         print(color("Job not found", Colors.RED))
         return 1
-    canonical = _canonical_job(job)
+    canonical = _canonical_job(job, include_snapshot=True)
     if json_mode:
         print(json.dumps(canonical, ensure_ascii=False, sort_keys=True))
     else:
@@ -442,7 +458,7 @@ def cron_create(args):
         if not job:
             print("Failed to create job: canonical readback missing", file=sys.stderr)
             return 1
-        print(json.dumps(_canonical_job(job), ensure_ascii=False, sort_keys=True))
+        print(json.dumps(_canonical_job(job, include_snapshot=True), ensure_ascii=False, sort_keys=True))
         return 0
     print(color(f"Created job: {result['job_id']}", Colors.GREEN))
     print(f"  Name: {result['name']}")
@@ -517,7 +533,7 @@ def cron_edit(args):
         if not updated_job:
             print("Failed to update job: canonical readback missing", file=sys.stderr)
             return 1
-        print(json.dumps(_canonical_job(updated_job), ensure_ascii=False, sort_keys=True))
+        print(json.dumps(_canonical_job(updated_job, include_snapshot=True), ensure_ascii=False, sort_keys=True))
         return 0
 
     updated = result["job"]
@@ -576,7 +592,7 @@ def cron_restore(args):
         return 1
     except (ValueError, TypeError) as exc:
         code = str(exc)
-        if not code.startswith("CRON_RESTORE_"):
+        if code not in _CRON_RESTORE_ERROR_CODES:
             code = "CRON_RESTORE_INVALID_SNAPSHOT"
         print(color(f"Failed to restore job: {code}", Colors.RED))
         return 1
@@ -589,7 +605,7 @@ def cron_restore(args):
     except Exception:
         pass
     if getattr(args, "json", False):
-        print(json.dumps(_canonical_job(restored), ensure_ascii=False, sort_keys=True))
+        print(json.dumps(_canonical_job(restored, include_snapshot=True), ensure_ascii=False, sort_keys=True))
     else:
         print(color(f"Restored job: {args.job_id}", Colors.GREEN))
     return 0

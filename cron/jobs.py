@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -1643,42 +1644,71 @@ def restore_job(job_id: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any
         invalid("CRON_RESTORE_INVALID_SNAPSHOT")
 
     # Validate the object graph before deepcopy. Direct callers can supply
-    # cycles or non-JSON objects even though the CLI accepts JSON only.
-    seen: set[int] = set()
-    def bounded(value: Any, depth: int = 0, nodes: list[int] | None = None) -> None:
-        if nodes is None:
-            nodes = [0]
-        if depth > 12 or nodes[0] >= 1000:
+    # cycles or non-JSON objects even though the CLI accepts JSON only. Keep
+    # this iterative so malicious nesting cannot consume the Python stack.
+    active: set[int] = set()
+    stack: list[tuple[str, Any, int]] = [("enter", snapshot, 0)]
+    node_count = 0
+    while stack:
+        action, value, depth = stack.pop()
+        if action == "exit":
+            active.remove(id(value))
+            continue
+        if depth > 12:
             invalid("CRON_RESTORE_BOUNDS_EXCEEDED")
-        nodes[0] += 1
-        if isinstance(value, (dict, list, tuple, set)):
+        node_count += 1
+        if node_count > 1000:
+            invalid("CRON_RESTORE_BOUNDS_EXCEEDED")
+        if isinstance(value, dict):
             marker = id(value)
-            if marker in seen:
+            if marker in active:
                 invalid("CRON_RESTORE_CYCLE")
-            seen.add(marker)
-            try:
-                if isinstance(value, dict):
-                    if len(value) > 256:
-                        invalid("CRON_RESTORE_BOUNDS_EXCEEDED")
-                    for key, item in value.items():
-                        if not isinstance(key, str) or len(key) > 256:
-                            invalid("CRON_RESTORE_INVALID_KEY")
-                        bounded(item, depth + 1, nodes)
-                else:
-                    if len(value) > 256:
-                        invalid("CRON_RESTORE_BOUNDS_EXCEEDED")
-                    for item in value:
-                        bounded(item, depth + 1, nodes)
-            finally:
-                seen.remove(marker)
+            if len(value) > 256:
+                invalid("CRON_RESTORE_BOUNDS_EXCEEDED")
+            active.add(marker)
+            stack.append(("exit", value, depth))
+            for key, item in reversed(list(value.items())):
+                if not isinstance(key, str):
+                    invalid("CRON_RESTORE_INVALID_KEY")
+                if len(key) > 256:
+                    invalid("CRON_RESTORE_INVALID_KEY")
+                stack.append(("enter", item, depth + 1))
+        elif isinstance(value, list):
+            marker = id(value)
+            if marker in active:
+                invalid("CRON_RESTORE_CYCLE")
+            if len(value) > 256:
+                invalid("CRON_RESTORE_BOUNDS_EXCEEDED")
+            active.add(marker)
+            stack.append(("exit", value, depth))
+            for item in reversed(value):
+                stack.append(("enter", item, depth + 1))
+        elif isinstance(value, (tuple, set)):
+            invalid("CRON_RESTORE_NON_SERIALIZABLE")
         elif isinstance(value, str):
             if len(value) > 16384:
                 invalid("CRON_RESTORE_BOUNDS_EXCEEDED")
-        elif value is None or isinstance(value, (bool, int, float)):
-            return
+        elif isinstance(value, bool) or value is None:
+            continue
+        elif isinstance(value, int):
+            if abs(value) > 2**63 - 1:
+                invalid("CRON_RESTORE_BOUNDS_EXCEEDED")
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                invalid("CRON_RESTORE_NON_SERIALIZABLE")
         else:
             invalid("CRON_RESTORE_NON_SERIALIZABLE")
-    bounded(snapshot)
+
+    canonical_json = b""
+    try:
+        canonical_json = json.dumps(
+            snapshot, ensure_ascii=False, allow_nan=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        invalid("CRON_RESTORE_NON_SERIALIZABLE")
+    if len(canonical_json) > 64 * 1024:
+        invalid("CRON_RESTORE_BOUNDS_EXCEEDED")
 
     versioned = snapshot.get("schema_version") == 2
     if versioned:
@@ -1835,11 +1865,6 @@ def restore_job(job_id: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any
                 if current.get("id") == job_id:
                     jobs[index] = copy.deepcopy(snapshot)
                     save_jobs(jobs)
-                    try:
-                        from cron.scheduler import _notify_provider_jobs_changed
-                        _notify_provider_jobs_changed()
-                    except Exception:
-                        pass
                     return copy.deepcopy(snapshot)
         return None
     restored = {
