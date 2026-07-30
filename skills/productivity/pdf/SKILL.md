@@ -22,9 +22,7 @@ Use this skill whenever the user wants to do anything with PDF files: reading or
 
 ## Prerequisites
 
-On Hermes's Windows venv, `pypdf`, `pdfplumber`, `pdfminer.six`, and `pymupdf` are **already installed** — do not reinstall. `pdftotext`/`qpdf` (poppler/qpdf) are on PATH. Only install `reportlab` (for creation) or OCR extras (`pytesseract`, `pdf2image`, `tesseract-ocr`) if a task needs them.
-
-Other platforms: `pip install pypdf pdfplumber reportlab`; `apt install -y poppler-utils qpdf` (Linux) or `brew install poppler qpdf` (macOS).
+Install the libraries this skill uses (they are not part of a stock Hermes install): `pip install pypdf pdfplumber reportlab` — add `pymupdf` for the `ocr-and-documents` path. On Windows, install into the Hermes venv (`venv\Scripts\python.exe -m pip install ...`), not a system Python. CLI tools: `apt install -y poppler-utils qpdf` (Linux) or `brew install poppler qpdf` (macOS) provide `pdftotext`/`qpdf`. OCR extras: `pip install pytesseract pdf2image` + `tesseract-ocr`.
 
 ## Windows paths — critical
 
@@ -34,7 +32,7 @@ Hermes's shell reports paths in MSYS form (`/c/Users/...`). Native tools (`pdfto
 winpath=$(cygpath -w "/c/Users/David/Downloads/file.pdf")   # -> C:\Users\David\Downloads\file.pdf
 ```
 
-In Python use a native path (`r"C:\Users\..."` or `"C:/Users/..."`), never `/c/...`. If a path still won't open, fall back to the bytes from `read_file`: `pdfplumber.open(io.BytesIO(data))` / `pypdf.PdfReader(io.BytesIO(data))`.
+In Python use a native path (`r"C:\Users\..."` or `"C:/Users/..."`), never `/c/...`. If a native tool still can't open the path (spaces or non-ASCII), copy the file to a simple temp path first and open that.
 
 > Script paths below are relative to this skill's directory. Form filling has its own workflow — read [forms.md](forms.md) and follow it. Advanced library usage (pypdfium2, pdf-lib) and troubleshooting: [reference.md](reference.md).
 
@@ -106,7 +104,7 @@ story = [Paragraph("Report Title", styles["Title"]), Spacer(1, 12),
 doc.build(story)
 ```
 
-**Subscripts/superscripts:** never use Unicode sub/superscript characters (₀₁₂, ⁰¹²) — the built-in fonts lack the glyphs and render solid black boxes. Use `<sub>`/`<super>` markup inside `Paragraph` objects: `Paragraph("H<sub>2</sub>O", styles['Normal'])`. For canvas-drawn text, adjust font size and position manually.
+**Subscripts/superscripts:** nnever use Unicode sub/superscript characters (₀₁₂, ⁰¹²) — the built-in fonts lack the glyphs and render solid black boxes. Use `<sub>`/`<super>` markup inside `Paragraph` objects: `Paragraph("H<sub>2</sub>O", styles['Normal'])`. For canvas-drawn text, adjust font size and position manually.
 
 ### Command-line tools
 
