@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 
 from agent.run_usage_ledger import UsageLedger, run_id_for_session
 from hermes_cli import kanban_db
@@ -392,35 +393,121 @@ def test_persistent_writer_failure_fails_closed_and_persists_diagnostic(tmp_path
     assert any(detail == "persistent_writer_failure" for _, detail in diagnostics)
 
 
-def test_diagnostic_capacity_exhaustion_sets_global_fail_closed_sentinel(tmp_path):
-    ledger = UsageLedger(tmp_path / "state.db")
-    ledger._diagnostic_limit = 2
-    for run_id in ("run-1", "run-2", "run-3"):
-        ledger.start_run(run_id=run_id, process_id=run_id)
-        ledger._record_drop(run_id, "queue_saturated")
-
-    assert not ledger.finalize_run(run_id="run-1", outcome="completed")
-    assert not ledger.finalize_run(run_id="run-3", outcome="completed")
-    with sqlite3.connect(tmp_path / "state.db") as connection:
-        diagnostics = connection.execute(
-            "SELECT diagnostic_type, detail FROM usage_diagnostics"
-        ).fetchall()
-    assert any(kind == "usage_incomplete_global" for kind, _ in diagnostics)
-
-
 def test_failed_operation_buffer_overflow_sets_global_fail_closed_sentinel(tmp_path):
-    ledger = UsageLedger(tmp_path / "state.db", queue_size=1)
+    ledger = UsageLedger(tmp_path / "state.db", queue_size=2)
     ledger.start_run(run_id="buffer", process_id="p")
-    with ledger._queue_cond:
-        ledger._failed_operations.append((lambda: None, (), {}))
-    ledger._mark_global_incomplete("failed_buffer_full")
-    ledger._record_drop("buffer", "failed_buffer_full")
+
+    def always_fail(**_kwargs):
+        raise sqlite3.OperationalError("injected persistence failure")
+
+    ledger._record_event = always_fail
+    for event_id in ("api-1", "api-2"):
+        assert ledger.queue_model_usage(
+            run_id="buffer", event_id=event_id, session_id="s", turn_id=event_id,
+            model="m", provider="p", input_tokens=1,
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with ledger._queue_cond:
+                if len(ledger._failed_operations) >= int(event_id[-1]):
+                    break
+            time.sleep(0.005)
+        else:
+            raise AssertionError("writer did not retain failed operation")
+
+    # The caller-facing queue API remains nonblocking even after the bounded
+    # failed-operation buffer is full. The writer observes the third failure
+    # and records the global fail-closed state automatically.
+    started = time.monotonic()
+    assert ledger.queue_model_usage(
+        run_id="buffer", event_id="api-3", session_id="s", turn_id="api-3",
+        model="m", provider="p", input_tokens=1,
+    )
+    assert time.monotonic() - started < 0.5
+    assert ledger.flush()
 
     assert not ledger.finalize_run(run_id="buffer", outcome="completed")
     with sqlite3.connect(tmp_path / "state.db") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM usage_diagnostics WHERE diagnostic_type='usage_incomplete_global'"
-        ).fetchone()[0] == 1
+        diagnostics = connection.execute(
+            "SELECT run_id, diagnostic_type, detail FROM usage_diagnostics"
+        ).fetchall()
+        receipt = connection.execute(
+            "SELECT ended_at FROM usage_runs WHERE run_id='buffer'"
+        ).fetchone()
+        projection_table = connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='task_run_usage'"
+        ).fetchone()[0]
+    assert any(
+        kind == "usage_incomplete_global" and detail == "failed_buffer_full"
+        for _, kind, detail in diagnostics
+    )
+    assert any(run_id == "buffer" and detail == "failed_buffer_full" for run_id, _, detail in diagnostics)
+    assert receipt == (None,)
+    assert projection_table == 0
+    with ledger._queue_cond:
+        assert len(ledger._queue) <= 2
+        assert len(ledger._failed_operations) <= 2
+        assert len(ledger._dropped) <= 256
+        assert len(ledger._incomplete_runs) <= 256
+        assert len(ledger._global_diagnostics) <= 256
+
+
+def test_diagnostic_capacity_exhaustion_is_automatic_and_global(tmp_path):
+    ledger = UsageLedger(tmp_path / "state.db", queue_size=1)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_writer(**_kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        raise sqlite3.OperationalError("injected persistence failure")
+
+    ledger._record_event = blocked_writer
+    ledger.start_run(run_id="blocker", process_id="p")
+    assert ledger.queue_model_usage(
+        run_id="blocker", event_id="blocker-event", session_id="s", turn_id="t",
+        model="m", provider="p", input_tokens=1,
+    )
+    assert entered.wait(timeout=2)
+
+    dropped = []
+    for index in range(300):
+        run_id = f"dropped-{index}"
+        ledger.start_run(run_id=run_id, process_id=run_id)
+        accepted = ledger.queue_model_usage(
+            run_id=run_id, event_id=f"event-{index}", session_id=run_id, turn_id=f"turn-{index}",
+            model="m", provider="p", input_tokens=1,
+        )
+        if not accepted:
+            dropped.append(run_id)
+    assert len(dropped) > 256
+    release.set()
+    assert ledger.flush()
+
+    with ledger._queue_cond:
+        assert len(ledger._queue) <= 1
+        assert len(ledger._failed_operations) <= 1
+        assert len(ledger._dropped) <= 256
+        assert len(ledger._incomplete_runs) <= 256
+        assert len(ledger._global_diagnostics) <= 256
+
+    affected = dropped[256]
+    assert not ledger.finalize_run(run_id=affected, outcome="completed")
+    assert not ledger.finalize_run(run_id="dropped-after-cap", outcome="completed")
+    with sqlite3.connect(tmp_path / "state.db") as connection:
+        diagnostics = connection.execute(
+            "SELECT run_id, diagnostic_type, detail FROM usage_diagnostics"
+        ).fetchall()
+        ended = connection.execute(
+            "SELECT run_id, ended_at FROM usage_runs WHERE run_id IN (?, ?) ORDER BY run_id",
+            (affected, "dropped-after-cap"),
+        ).fetchall()
+    assert any(
+        run_id is None and kind == "usage_incomplete_global" and detail == "diagnostic_capacity_exhausted"
+        for run_id, kind, detail in diagnostics
+    )
+    assert len([row for row in diagnostics if row[1] == "dropped_event"]) >= 256
+    assert all(row[1] is None for row in ended)
 
 
 def test_model_breakdown_is_deterministic_and_marks_mixed_runs(tmp_path):

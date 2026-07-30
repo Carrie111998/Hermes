@@ -52,7 +52,10 @@ def _observe_run_usage(hook_name: str, event: dict[str, Any]) -> None:
             "provider": provider,
         }
         if hook_name == "on_session_start":
-            ledger.queue_start_run(**common)
+            # The start marker is the crash-survival anchor.  It must be
+            # durable before the first provider request, otherwise SIGKILL can
+            # erase the only evidence that a direct run existed.
+            ledger.start_run(**common)
         elif hook_name == "post_api_request":
             api_request_id = str(event.get("api_request_id") or "")
             if not api_request_id:
