@@ -19,13 +19,43 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from hermes_state import SessionDB
+
+
+# Exposure window for the concurrency stress test.
+#
+# The race is probabilistic, so the test has to keep the writer and the
+# handoff watchers overlapping long enough for it to surface. Measured on
+# pre-fix code: 6/6 runs scrambled, between 0.76s and 3.67s, at write counts
+# ranging from 35 to 248 — so elapsed exposure, not write count, is what
+# determines whether the race appears. The window is set at ~2x the slowest
+# observed failure. A failing run exits the moment it scrambles; only a
+# passing run spends the full window.
+_EXPOSURE_S = 8.0
+# Independently, a run that achieved no writes proves nothing, so require a
+# floor of real work before trusting a pass.
+_MIN_PROGRESS_WRITES = 10
 
 
 def _new_db(path: Path) -> SessionDB:
     db = SessionDB(db_path=path)
     db.create_session("session", source="test", model="test-model")
     return db
+
+
+def _enable_wal(db: SessionDB) -> None:
+    """Put *db* on the WAL read path, or skip the test if unavailable.
+
+    _read_ctx() only hands out the per-thread read-only connection when
+    _wal_active is true; without this the WAL branch silently goes uncovered.
+    """
+    journal_mode = db._conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    assert journal_mode.lower() == "wal", (
+        f"expected WAL journal mode for this test, got {journal_mode!r}"
+    )
+    db._wal_active = True
 
 
 def test_compression_lock_read_waits_for_writer_lock(tmp_path: Path) -> None:
@@ -165,10 +195,22 @@ def test_handoff_reads_do_not_scramble_writer_error_state(tmp_path: Path) -> Non
 
     Fails within seconds while the handoff reads are unlocked; passes once
     they go through _read_ctx() (per-thread RO connection or writer lock).
+
+    WAL-path coverage: _read_ctx() uses the per-thread read-only connection
+    only when _wal_active is True. This test explicitly enables WAL so the
+    intended production path is exercised, not just the writer-lock fallback.
     """
     db = _new_db(tmp_path / "state.db")
+    # Enable WAL so _read_ctx() takes the per-thread read-only connection
+    # path instead of the writer-lock fallback (production behavior).
+    # Asserted, not assumed: if a future SQLite build or Hermes' WAL guard
+    # refuses WAL, this test would silently revert to covering only the
+    # fallback branch — the exact gap this coverage exists to close.
+    _enable_wal(db)
     stop = threading.Event()
     scrambled: list[BaseException] = []
+    scramble_seen = threading.Event()
+    progress = {"writes": 0}
 
     def contention() -> None:
         # Mirrors SessionStore/CLI/cron writers: an independent connection
@@ -199,13 +241,17 @@ def test_handoff_reads_do_not_scramble_writer_error_state(tmp_path: Path) -> Non
             db.get_handoff_state("session")
 
     def writer() -> None:
+        success = 0
         while not stop.is_set():
             try:
                 db.append_message("session", "user", content="x")
+                success += 1
+                progress["writes"] = success
             except sqlite3.Error as exc:
                 msg = str(exc).lower()
                 if "locked" not in msg and "busy" not in msg:
                     scrambled.append(exc)
+                    scramble_seen.set()
                     stop.set()
                     return
 
@@ -215,12 +261,80 @@ def test_handoff_reads_do_not_scramble_writer_error_state(tmp_path: Path) -> Non
                 for _ in range(3)]
     for t in threads:
         t.start()
-    stop.wait(timeout=20.0)
+    # A regression trips this immediately, so a failing run costs a fraction
+    # of a second; only a healthy run spends the full exposure window.
+    scramble_seen.wait(timeout=_EXPOSURE_S)
     stop.set()
     for t in threads:
         t.join(timeout=10)
     db.close()
+    # Order matters: a scramble aborts the writer, which also suppresses its
+    # write count. Report the real defect first, or a genuine regression gets
+    # misdiagnosed as "the writer made no progress".
     assert not scrambled, (
         "writer exception scrambled by unlocked shared-connection read: "
         f"{type(scrambled[0]).__name__}: {scrambled[0]}"
     )
+    # Guard against a vacuous pass: without real writes the watchers never
+    # raced anything, so a clean result would mean nothing.
+    assert progress["writes"] >= _MIN_PROGRESS_WRITES, (
+        f"writer completed only {progress['writes']} appends in "
+        f"{_EXPOSURE_S}s (expected >= {_MIN_PROGRESS_WRITES}) — contention or "
+        "handoff reads may be blocking unexpectedly"
+    )
+
+
+def test_handoff_reads_use_read_ctx_on_wal_path(tmp_path: Path) -> None:
+    """Both handoff reads must resolve through _read_ctx() under WAL.
+
+    The stress test above proves the race is gone; this pins *how*. Under
+    WAL, _read_ctx() yields a per-thread read-only connection, so neither
+    handoff read may touch the shared writer connection — that is precisely
+    what allowed a reader's sqlite3_step() to overwrite the writer's error
+    state. Asserting on behavior (which connection served the read, and that
+    the rows are still correct) rather than on source text keeps this honest
+    if the internals are refactored.
+    """
+    db = _new_db(tmp_path / "state.db")
+    try:
+        _enable_wal(db)
+        assert db.request_handoff("session", "telegram") is True
+
+        used: list[sqlite3.Connection] = []
+        real_get_read_conn = db._get_read_conn
+
+        def spy_get_read_conn():
+            conn = real_get_read_conn()
+            used.append(conn)
+            return conn
+
+        db._get_read_conn = spy_get_read_conn
+
+        state = db.get_handoff_state("session")
+        pending = db.list_pending_handoffs()
+
+        # Both helpers went through the read path...
+        assert len(used) == 2, (
+            f"expected both handoff reads to consult _read_ctx(), saw {len(used)}"
+        )
+        # ...and got a real per-thread read-only connection, not the shared
+        # writer connection whose error state the race corrupted.
+        assert all(conn is not None for conn in used), (
+            "WAL read path returned no connection; _read_ctx() fell back to "
+            "the shared writer connection"
+        )
+        assert all(conn is not db._conn for conn in used), (
+            "handoff read was served by the shared writer connection"
+        )
+
+        # Routing is only worth anything if the data is still right.
+        assert state is not None and state["state"] == "pending"
+        assert state["platform"] == "telegram"
+        assert [row["id"] for row in pending] == ["session"]
+
+        # And the read-only connection genuinely cannot write, which is what
+        # makes it safe to use off the writer lock.
+        with pytest.raises(sqlite3.OperationalError):
+            used[0].execute("UPDATE sessions SET model = 'nope' WHERE id = 'session'")
+    finally:
+        db.close()
