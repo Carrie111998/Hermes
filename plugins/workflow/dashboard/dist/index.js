@@ -308,21 +308,25 @@
   function StageNode(props) {
     var Handle = flow.Handle;
     var Position = flow.Position || {};
+    var vertical = !!props.data.vertical;
     return h("div", { className: "hermes-workflow-node" },
-      Handle ? h(Handle, { type: "target", position: Position.Left || "left", isConnectable: false }) : null,
+      Handle ? h(Handle, { type: "target", position: vertical ? (Position.Top || "top") : (Position.Left || "left"), isConnectable: false }) : null,
       h("div", { className: "hermes-workflow-node-label" }, props.data.label),
       h("div", { className: "hermes-workflow-node-count" }, String(props.data.count) + " active"),
-      Handle ? h(Handle, { type: "source", position: Position.Right || "right", isConnectable: false }) : null);
+      Handle ? h(Handle, { type: "source", position: vertical ? (Position.Bottom || "bottom") : (Position.Right || "right"), isConnectable: false }) : null);
   }
 
   function GraphView(props) {
     var model = templateRenderModel(props.board, props.template, props.allInstances);
+    var vertical = typeof window !== "undefined" && window.innerWidth <= 600;
     var nodes = model.stages.map(function (stage) {
       return {
         id: stage._key,
         type: "workflowStage",
-        position: { x: stage._index * 250, y: 100 + (stage._index % 2) * 45 },
-        data: { label: stage._label, count: model.counts[stage._key] || 0 },
+        position: vertical
+          ? { x: 70, y: stage._index * 135 }
+          : { x: stage._index * 250, y: 100 + (stage._index % 2) * 45 },
+        data: { label: stage._label, count: model.counts[stage._key] || 0, vertical: vertical },
         draggable: false,
         selectable: false,
       };
