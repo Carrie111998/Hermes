@@ -1345,7 +1345,16 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = agent._drain_pending_steer()
+        _drain_with_provenance = getattr(
+            agent, "_drain_pending_steer_with_provenance", None
+        )
+        if callable(_drain_with_provenance):
+            _pre_api_steer, _pre_api_steer_is_gateway_session_ipc = (
+                _drain_with_provenance()
+            )
+        else:
+            _pre_api_steer = agent._drain_pending_steer()
+            _pre_api_steer_is_gateway_session_ipc = False
         if _pre_api_steer:
             _injected = False
             for _si in range(len(messages) - 1, -1, -1):
@@ -1373,16 +1382,33 @@ def run_conversation(
             if not _injected:
                 # No tool message to inject into — put it back so
                 # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
+                _restore_pending_steer = getattr(
+                    agent, "_restore_pending_steer", None
+                )
+                if callable(_restore_pending_steer):
+                    _restore_pending_steer(
+                        _pre_api_steer,
+                        is_gateway_session_ipc=(
+                            _pre_api_steer_is_gateway_session_ipc
+                        ),
+                    )
                 else:
-                    existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+                    _lock = getattr(agent, "_pending_steer_lock", None)
+                    if _lock is not None:
+                        with _lock:
+                            if agent._pending_steer:
+                                agent._pending_steer = (
+                                    agent._pending_steer + "\n" + _pre_api_steer
+                                )
+                            else:
+                                agent._pending_steer = _pre_api_steer
+                    else:
+                        existing = getattr(agent, "_pending_steer", None)
+                        agent._pending_steer = (
+                            (existing + "\n" + _pre_api_steer)
+                            if existing
+                            else _pre_api_steer
+                        )
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages

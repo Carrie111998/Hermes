@@ -2682,6 +2682,22 @@ def _pending_slash_is_command_leak(
         return False
 
 
+def _event_for_leftover_gateway_session_ipc_steer(
+    result: dict[str, Any],
+    source: SessionSource,
+) -> MessageEvent | None:
+    """Rebuild the protected event for a trusted steer handed to a new turn."""
+    text = str(result.get("pending_steer") or "").strip()
+    if not text or not result.get("pending_steer_is_gateway_session_ipc"):
+        return None
+    return _new_gateway_session_ipc_event(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+    )
+
+
 _INTERRUPT_REASON_STOP = "Stop requested"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
@@ -11917,7 +11933,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     with mutation_gate:
                         ensure_not_cancelled()
-                        if running_agent.steer(event.text):
+                        if running_agent.steer(
+                            event.text,
+                            _gateway_session_ipc=True,
+                        ):
                             committed.set()
                             disposition = "steered"
                         else:
@@ -24609,6 +24628,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _leftover_steer = result.get("pending_steer")
                 if _leftover_steer:
                     pending = _leftover_steer
+                    pending_event = _event_for_leftover_gateway_session_ipc_steer(
+                        result,
+                        source,
+                    )
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",

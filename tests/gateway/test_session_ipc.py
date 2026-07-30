@@ -202,7 +202,10 @@ async def test_active_exact_route_steers_without_platform_send_or_queue():
 
     assert proof["disposition"] == "steered"
     assert proof["session_id"] == SESSION_ID
-    agent.steer.assert_called_once_with("Use the corrected constraint.")
+    agent.steer.assert_called_once_with(
+        "Use the corrected constraint.",
+        _gateway_session_ipc=True,
+    )
     adapter.accept_internal_task.assert_not_called()
     assert adapter._pending_messages == {}
 
@@ -241,6 +244,10 @@ async def test_active_route_steer_fallback_uses_bounded_fifo_queue():
     assert [call.args for call in agent.steer.call_args_list] == [
         ("First queued task.",),
         ("Second queued task.",),
+    ]
+    assert [call.kwargs for call in agent.steer.call_args_list] == [
+        {"_gateway_session_ipc": True},
+        {"_gateway_session_ipc": True},
     ]
     adapter.accept_internal_task.assert_not_called()
     assert adapter._pending_messages[SESSION_KEY].text == "First queued task."
@@ -370,6 +377,22 @@ def test_trusted_slash_task_survives_drain_as_inert_text_while_user_slash_is_blo
         drained_user.text, drained_user
     ) is True
     assert drained_user.is_command() is True
+
+
+def test_leftover_gateway_ipc_steer_rebuilds_protected_event():
+    event = gateway_run._event_for_leftover_gateway_session_ipc_steer(
+        {
+            "pending_steer": "/restart trusted task",
+            "pending_steer_is_gateway_session_ipc": True,
+        },
+        _source(),
+    )
+
+    assert event is not None
+    assert event.text == "/restart trusted task"
+    assert is_gateway_session_ipc_task(event)
+    assert event.is_command() is False
+    assert gateway_run._pending_slash_is_command_leak(event.text, event) is False
 
 
 @pytest.mark.asyncio
@@ -687,6 +710,45 @@ async def test_client_timeout_retry_with_same_key_delivers_once(tmp_path):
 
     assert proof["disposition"] == "queued"
     assert calls == 1
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets unavailable")
+@pytest.mark.asyncio
+async def test_uncommitted_failure_releases_idempotency_key_for_retry(tmp_path):
+    calls = 0
+
+    async def handler(**request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return SessionIPCRequestError(
+                "queue_full",
+                "Pending queue is full",
+            ).to_response()
+        return {
+            "ok": True,
+            "profile": request["profile"],
+            "session_key": request["session_key"],
+            "session_id": request["expected_session_id"],
+            "disposition": "queued",
+        }
+
+    server = GatewaySessionIPCServer(handler, profile="jasper", hermes_home=tmp_path)
+    await server.start()
+    key = "retry-after-uncommitted-failure"
+    payload = _request_payload(idempotency_key=key)
+    try:
+        first = await asyncio.to_thread(_raw_request, server.socket_path, payload)
+        await asyncio.sleep(0)
+        second = await asyncio.to_thread(_raw_request, server.socket_path, payload)
+    finally:
+        await server.stop()
+
+    assert first["ok"] is False
+    assert first["error"]["code"] == "queue_full"
+    assert second["ok"] is True
+    assert second["disposition"] == "queued"
+    assert calls == 2
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets unavailable")

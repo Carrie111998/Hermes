@@ -380,6 +380,14 @@ class GatewaySessionIPCServer:
             except Exception:
                 self._idempotency_fingerprints.pop(idempotency_key, None)
                 return
+            # A failed handler result did not accept a task.  Release both the
+            # result and fingerprint so a caller can retry the same operation
+            # with the same required idempotency key after a transient failure
+            # (for example queue_full, acceptance_failed, or request_timeout).
+            # Successful results remain cached and exactly-once.
+            if result.get("ok") is not True:
+                self._idempotency_fingerprints.pop(idempotency_key, None)
+                return
             self._idempotency_results[idempotency_key] = result
             self._idempotency_results.move_to_end(idempotency_key)
 

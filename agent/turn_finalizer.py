@@ -615,14 +615,26 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _close_steer_admission = getattr(agent, "_close_steer_admission", None)
-    if callable(_close_steer_admission):
-        _leftover_steer = _close_steer_admission()
+    _close_with_provenance = getattr(
+        agent, "_close_steer_admission_with_provenance", None
+    )
+    if callable(_close_with_provenance):
+        (
+            _leftover_steer,
+            _leftover_steer_is_gateway_session_ipc,
+        ) = _close_with_provenance()
     else:
-        # Compatibility for lightweight test/runtime stubs.
-        _leftover_steer = agent._drain_pending_steer()
+        _close_steer_admission = getattr(agent, "_close_steer_admission", None)
+        if callable(_close_steer_admission):
+            _leftover_steer = _close_steer_admission()
+        else:
+            # Compatibility for lightweight test/runtime stubs.
+            _leftover_steer = agent._drain_pending_steer()
+        _leftover_steer_is_gateway_session_ipc = False
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
+        if _leftover_steer_is_gateway_session_ipc:
+            result["pending_steer_is_gateway_session_ipc"] = True
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt

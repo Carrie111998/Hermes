@@ -3088,9 +3088,10 @@ class AIAgent:
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
+                self._pending_steer_is_gateway_session_ipc = False
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, _gateway_session_ipc: bool = False) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3120,6 +3121,8 @@ class AIAgent:
                 return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            if not existing:
+                self._pending_steer_is_gateway_session_ipc = bool(_gateway_session_ipc)
             return True
         with _lock:
             if not getattr(self, "_steer_accepting", True):
@@ -3128,6 +3131,7 @@ class AIAgent:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+                self._pending_steer_is_gateway_session_ipc = bool(_gateway_session_ipc)
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3248,15 +3252,53 @@ class AIAgent:
         Safe to call from the agent execution thread after appending tool
         results. Returns None when no steer is pending.
         """
+        text, _is_gateway_session_ipc = self._drain_pending_steer_with_provenance()
+        return text
+
+    def _drain_pending_steer_with_provenance(self) -> tuple[Optional[str], bool]:
+        """Return and clear pending steer text together with trust provenance."""
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
+            is_gateway_session_ipc = bool(
+                getattr(self, "_pending_steer_is_gateway_session_ipc", False)
+            )
             self._pending_steer = None
-            return text
+            self._pending_steer_is_gateway_session_ipc = False
+            return text, is_gateway_session_ipc
         with _lock:
             text = self._pending_steer
+            is_gateway_session_ipc = bool(
+                getattr(self, "_pending_steer_is_gateway_session_ipc", False)
+            )
             self._pending_steer = None
-        return text
+            self._pending_steer_is_gateway_session_ipc = False
+        return text, is_gateway_session_ipc
+
+    def _restore_pending_steer(
+        self,
+        text: str,
+        *,
+        is_gateway_session_ipc: bool = False,
+    ) -> None:
+        """Put a temporarily drained steer back without losing provenance."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            existing = getattr(self, "_pending_steer", None)
+            self._pending_steer = (existing + "\n" + text) if existing else text
+            if not existing:
+                self._pending_steer_is_gateway_session_ipc = bool(
+                    is_gateway_session_ipc
+                )
+            return
+        with _lock:
+            if self._pending_steer:
+                self._pending_steer = self._pending_steer + "\n" + text
+            else:
+                self._pending_steer = text
+                self._pending_steer_is_gateway_session_ipc = bool(
+                    is_gateway_session_ipc
+                )
 
     def _open_steer_admission(self) -> None:
         """Allow steer() calls for the current conversation turn."""
@@ -3274,17 +3316,32 @@ class AIAgent:
         concurrent surface cannot report a steer as accepted unless it was
         included in the returned text.
         """
+        text, _is_gateway_session_ipc = (
+            self._close_steer_admission_with_provenance()
+        )
+        return text
+
+    def _close_steer_admission_with_provenance(self) -> tuple[Optional[str], bool]:
+        """Atomically close steer admission and return text plus provenance."""
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             self._steer_accepting = False
             text = getattr(self, "_pending_steer", None)
+            is_gateway_session_ipc = bool(
+                getattr(self, "_pending_steer_is_gateway_session_ipc", False)
+            )
             self._pending_steer = None
-            return text
+            self._pending_steer_is_gateway_session_ipc = False
+            return text, is_gateway_session_ipc
         with _lock:
             self._steer_accepting = False
             text = self._pending_steer
+            is_gateway_session_ipc = bool(
+                getattr(self, "_pending_steer_is_gateway_session_ipc", False)
+            )
             self._pending_steer = None
-        return text
+            self._pending_steer_is_gateway_session_ipc = False
+        return text, is_gateway_session_ipc
 
     def _record_file_mutation_result(
         self,

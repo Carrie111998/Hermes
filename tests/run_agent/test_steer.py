@@ -23,6 +23,7 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._pending_steer_is_gateway_session_ipc = False
     agent._steer_accepting = True
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
@@ -79,6 +80,20 @@ class TestSteerDrain:
 
         assert agent.steer("new turn") is True
         assert agent._drain_pending_steer() == "new turn"
+
+    def test_close_preserves_gateway_session_ipc_provenance(self):
+        agent = _bare_agent()
+        assert agent.steer(
+            "/restart trusted task",
+            _gateway_session_ipc=True,
+        ) is True
+
+        text, trusted = agent._close_steer_admission_with_provenance()
+
+        assert text == "/restart trusted task"
+        assert trusted is True
+        assert agent._pending_steer is None
+        assert agent._pending_steer_is_gateway_session_ipc is False
 
 
 
