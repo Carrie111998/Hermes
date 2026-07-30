@@ -40,6 +40,7 @@ import {
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
+  scopeGatewayWsUrlForProfile,
   tokenPreview
 } from './connection-config'
 
@@ -378,6 +379,32 @@ test('buildGatewayWsUrlWithTicket uses ?ticket= not ?token=', () => {
 
 test('buildGatewayWsUrlWithTicket url-encodes the ticket', () => {
   assert.equal(buildGatewayWsUrlWithTicket('https://host', 'a+b/c'), 'wss://host/api/ws?ticket=a%2Bb%2Fc')
+})
+
+test('scopeGatewayWsUrlForProfile binds token and OAuth sockets on an app-global remote route', () => {
+  const opts = { globalRemote: true, primaryProfile: 'default', profileRemoteOverride: false }
+
+  assert.equal(
+    scopeGatewayWsUrlForProfile('wss://gateway.example.com/api/ws?token=secret', 'coder', opts),
+    'wss://gateway.example.com/api/ws?token=secret&profile=coder'
+  )
+  assert.equal(
+    scopeGatewayWsUrlForProfile('wss://gateway.example.com/api/ws?ticket=one-use', 'coder', opts),
+    'wss://gateway.example.com/api/ws?ticket=one-use&profile=coder'
+  )
+})
+
+test('scopeGatewayWsUrlForProfile does not forward a Desktop alias to its dedicated backend', () => {
+  const wsUrl = 'wss://coder.example.com/api/ws?token=secret'
+
+  assert.equal(
+    scopeGatewayWsUrlForProfile(wsUrl, 'coder', {
+      globalRemote: true,
+      primaryProfile: 'default',
+      profileRemoteOverride: true
+    }),
+    wsUrl
+  )
 })
 
 // --- authModeFromStatus ---

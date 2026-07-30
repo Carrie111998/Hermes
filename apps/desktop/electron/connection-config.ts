@@ -404,6 +404,23 @@ function resolveProfileBackendRoute(profile, opts: ProfileRouteOptions = {}): Pr
   return { backend: 'pool', descriptorProfile: null, scopePath: false }
 }
 
+/** Scope a WebSocket only when it shares the app-global backend. Dedicated
+ * remote/local profile backends are already launch-scoped; forwarding their
+ * Desktop alias would either 404 or select the wrong home. */
+function scopeGatewayWsUrlForProfile(wsUrl, profile, opts: ProfileRouteOptions = {}) {
+  const descriptorProfile = resolveProfileBackendRoute(profile, opts).descriptorProfile
+
+  if (!descriptorProfile) {
+    return wsUrl
+  }
+
+  const parsed = new URL(wsUrl)
+
+  parsed.searchParams.set('profile', descriptorProfile)
+
+  return parsed.toString()
+}
+
 /**
  * Add renderer-side `request.profile` to a REST path when the route says the
  * serving backend is not already scoped to that profile.
@@ -562,5 +579,6 @@ export {
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
+  scopeGatewayWsUrlForProfile,
   tokenPreview
 }

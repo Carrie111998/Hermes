@@ -73,6 +73,7 @@ import {
   resolveProfileBackendRoute,
   resolveTestWsUrl,
   savedProfileSsh,
+  scopeGatewayWsUrlForProfile,
   tokenPreview
 } from './connection-config'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
@@ -6354,15 +6355,16 @@ async function freshGatewayWsUrl(profile) {
   // the wrong profile's DB. A null/empty profile resolves to the primary, so
   // legacy callers and single-profile users are unchanged.
   const connection = await ensureBackend(profile)
+  const scopeUrl = wsUrl => scopeGatewayWsUrlForProfile(wsUrl, profile, profileRouteOptions(profile))
 
   if (connection.authMode === 'oauth') {
     const ticket = await mintGatewayWsTicket(connection.baseUrl)
 
-    return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
+    return scopeUrl(buildGatewayWsUrlWithTicket(connection.baseUrl, ticket))
   }
 
   // Local/token: the cached wsUrl already carries the (long-lived) token.
-  return connection.wsUrl
+  return scopeUrl(connection.wsUrl)
 }
 
 // --- Hermes Cloud discovery + silent per-agent sign-in (cloud-auto-discovery
@@ -7923,7 +7925,13 @@ async function ensureBackend(profile) {
 
     // A shared backend still owes the caller its profile scope, so renderer-side
     // WebSocket, filesystem, and cache routing target the selected profile.
-    return route.descriptorProfile ? { ...connection, profile: route.descriptorProfile } : connection
+    return route.descriptorProfile
+      ? {
+          ...connection,
+          profile: route.descriptorProfile,
+          wsUrl: scopeGatewayWsUrlForProfile(connection.wsUrl, key, profileRouteOptions(key))
+        }
+      : connection
   }
 
   const existing = backendPool.get(key)

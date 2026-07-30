@@ -14403,6 +14403,77 @@ def test_delegation_status_uses_profile_bound_to_websocket_transport(tmp_path, m
     assert response["result"]["active"][0]["profile"] == "profile-a"
 
 
+def test_delegation_status_rejects_explicit_override_of_websocket_profile(
+    tmp_path, monkeypatch
+):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    monkeypatch.setattr(
+        server,
+        "_profile_scope_home",
+        lambda profile: profile_a if profile == "profile-a" else profile_b,
+    )
+    transport = types.SimpleNamespace(profile="profile-a")
+
+    response = server.dispatch(
+        {
+            "id": "transport-profile-override",
+            "jsonrpc": "2.0",
+            "method": "delegation.status",
+            "params": {"profile": "profile-b"},
+        },
+        transport,
+    )
+
+    assert response["error"] == {
+        "code": 4030,
+        "message": "profile scope forbidden",
+    }
+
+
+def test_sessionless_websocket_cannot_escape_dedicated_launch_profile(
+    tmp_path, monkeypatch
+):
+    foreign_home = tmp_path / "profiles" / "foreign"
+    foreign_home.mkdir(parents=True)
+    monkeypatch.setattr(
+        server,
+        "_profile_scope_home",
+        lambda profile: Path(server._hermes_home) if profile is None else foreign_home,
+    )
+    transport = types.SimpleNamespace(profile=None)
+
+    status = server.dispatch(
+        {
+            "id": "dedicated-profile-status-escape",
+            "jsonrpc": "2.0",
+            "method": "delegation.status",
+            "params": {"profile": "foreign"},
+        },
+        transport,
+    )
+    interrupt = server.dispatch(
+        {
+            "id": "dedicated-profile-interrupt-escape",
+            "jsonrpc": "2.0",
+            "method": "subagent.interrupt",
+            "params": {"profile": "foreign", "subagent_id": "sa-private"},
+        },
+        transport,
+    )
+
+    assert status["error"] == {
+        "code": 4030,
+        "message": "profile scope forbidden",
+    }
+    assert interrupt["error"] == {
+        "code": 4030,
+        "message": "profile scope forbidden",
+    }
+
+
 def test_delegation_status_merges_compute_host_registry(tmp_path, monkeypatch):
     from tools.delegate_tool import _register_subagent, _unregister_subagent
 

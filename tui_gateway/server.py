@@ -1239,29 +1239,52 @@ def _profile_scope_home(profile: str | None) -> Path | None:
 
 
 def _requested_profile_name(params: dict) -> str | None:
-    """Validated profile selector for a session-less RPC.
+    """Validate and authorize a profile selector for a session-less RPC.
 
-    Explicit params win. Otherwise the WebSocket descriptor profile scopes an
-    app-global remote connection. A dedicated per-profile backend carries no
-    descriptor profile and therefore uses its launch home.
+    A WebSocket profile is an ownership boundary, not merely a default. An
+    explicit selector may repeat that scope but may not override it. A socket
+    with no descriptor profile is bound to the backend's launch home (the
+    dedicated-backend case). The local stdio transport retains explicit profile
+    selection because it is the trusted app-global control path.
     """
-    raw = params.get("profile") if params.get("profile") is not None else None
-    if raw is None:
-        transport = current_transport()
-        raw = getattr(transport, "profile", None) if transport is not None else None
-    if raw is None:
-        return None
-    if not isinstance(raw, str):
-        raise ValueError("invalid profile")
-
     from hermes_cli import profiles as profiles_mod
 
-    try:
-        name = profiles_mod.normalize_profile_name(raw)
-        profiles_mod.validate_profile_name(name)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid profile") from exc
-    return name
+    def normalized(raw) -> str | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, str):
+            raise ValueError("invalid profile")
+        try:
+            name = profiles_mod.normalize_profile_name(raw)
+            profiles_mod.validate_profile_name(name)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid profile") from exc
+        return name
+
+    explicit_name = normalized(params.get("profile"))
+    transport = current_transport()
+
+    # WSTransport deliberately carries a `profile` attribute (possibly None).
+    # Other transports, including the trusted stdio control path, do not.
+    if transport is None or not hasattr(transport, "profile"):
+        return explicit_name
+
+    transport_name = normalized(getattr(transport, "profile", None))
+    if transport_name is not None:
+        if explicit_name is not None and explicit_name != transport_name:
+            raise PermissionError("profile scope forbidden")
+        return transport_name
+
+    if explicit_name is None:
+        return None
+
+    requested_home = _profile_scope_home(explicit_name)
+    if requested_home is None:
+        # Preserve the handler's existing 404 distinction for unknown names.
+        return explicit_name
+    if requested_home.resolve() != Path(_hermes_home).resolve():
+        raise PermissionError("profile scope forbidden")
+    return explicit_name
 
 
 def _profile_home(profile: str | None) -> Path | None:

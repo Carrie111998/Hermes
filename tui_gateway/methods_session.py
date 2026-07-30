@@ -2728,6 +2728,8 @@ def _(rid, params: dict) -> dict:
 
     try:
         requested_profile = _requested_profile_name(params)
+    except PermissionError:
+        return _err(rid, 4030, "profile scope forbidden")
     except ValueError:
         return _err(rid, 4000, "invalid profile")
     profile_home = _profile_scope_home(requested_profile)
@@ -2794,6 +2796,8 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4000, "subagent_id required")
     try:
         requested_profile = _requested_profile_name(params)
+    except PermissionError:
+        return _err(rid, 4030, "profile scope forbidden")
     except ValueError:
         return _err(rid, 4000, "invalid profile")
     profile_home = _profile_scope_home(requested_profile)
