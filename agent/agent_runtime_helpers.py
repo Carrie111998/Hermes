@@ -296,8 +296,33 @@ def sanitize_tool_call_arguments(
                 continue
 
             try:
-                json.loads(arguments)
+                parsed_args = json.loads(arguments)
             except json.JSONDecodeError:
+                parsed_args = None
+
+            # The model may emit arguments as a JSON array (e.g.
+            # [{"mode": "replace"}]) instead of an object. Strict
+            # OpenAI-compatible endpoints reject this with HTTP 400
+            # InvalidParameter. See #58057.
+            if parsed_args is not None and not isinstance(parsed_args, dict):
+                if (isinstance(parsed_args, list) and len(parsed_args) == 1
+                        and isinstance(parsed_args[0], dict)):
+                    # Single-element list of dicts: the model meant to
+                    # emit an object. Unwrap it.
+                    function["arguments"] = json.dumps(parsed_args[0], separators=(",", ":"))
+                    log.warning(
+                        "tool_call arguments were a single-element list of dicts; "
+                        "unwrapped to object (session=%s, message_index=%s, function=%s)",
+                        session_id or "-",
+                        message_index,
+                        function.get("name", "?"),
+                    )
+                    continue
+                # Otherwise treat as corruption: replace with {} and
+                # prepend the marker.
+                parsed_args = None
+
+            if parsed_args is None:
                 tool_call_id = tool_call.get("id")
                 function_name = function.get("name", "?")
                 preview = arguments[:80]
