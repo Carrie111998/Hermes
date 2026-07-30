@@ -255,20 +255,18 @@ def test_mpim_unmentioned_does_not_react():
 
 
 def test_reaction_guard_pinned_to_production_expression():
-    """Regression teeth for the reaction guard.
+    """Default reaction scope must retain the MPIM spam guard.
 
-    ``_reaction_guard`` mirrors the production expression at the
-    ``_should_react = (is_one_to_one_dm or is_mentioned) ...`` site in
-    ``adapter.py``. This test pins that source line so a revert of the fix
-    (back to ``is_dm or is_mentioned``, which reacts to unmentioned MPIMs)
-    fails here instead of silently passing a self-referential lambda.
+    ``processed`` deliberately expands ACKs only when configured. The default
+    ``addressed`` branch must continue to key off 1:1 IMs or explicit mentions,
+    never the broader ``is_dm`` value that also includes MPIMs.
     """
-    src = inspect.getsource(SlackAdapter._handle_slack_message)
-    assert "(is_one_to_one_dm or is_mentioned)" in src, (
-        "reaction guard no longer keys off is_one_to_one_dm — an unmentioned "
-        "MPIM would react again (regression of the group-DM fix)"
+    src = inspect.getsource(SlackAdapter._should_ack_processed_message)
+    assert "return is_one_to_one_dm or is_mentioned" in src, (
+        "default reaction scope no longer keys off is_one_to_one_dm — an "
+        "unmentioned MPIM would react again"
     )
-    assert "(is_dm or is_mentioned)" not in src, (
+    assert "return is_dm or is_mentioned" not in src, (
         "reaction guard reverted to is_dm — MPIMs would react when unmentioned"
     )
 
