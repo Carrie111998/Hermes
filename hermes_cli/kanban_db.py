@@ -3411,7 +3411,14 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
+                "last_failure_error = NULL, "
+                "status = CASE "
+                "WHEN status = 'blocked' AND block_kind = 'capability' "
+                "THEN 'ready' ELSE status END, "
+                "block_kind = CASE "
+                "WHEN status = 'blocked' AND block_kind = 'capability' "
+                "THEN NULL ELSE block_kind END "
+                "WHERE id = ?",
                 (profile, task_id),
             )
         else:
@@ -4208,7 +4215,19 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            preflight_event = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? "
+                "AND kind IN ('pre_dispatch_validation_failed', 'unblocked') "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            preflight_blocked = bool(
+                preflight_event
+                and preflight_event["kind"] == "pre_dispatch_validation_failed"
+            )
+            if cur_status == "blocked" and (
+                _has_sticky_block(conn, task_id) or preflight_blocked
+            ):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
@@ -6954,12 +6973,14 @@ class DispatchResult:
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
-    """Ready task ids skipped because their assignee names a control-plane
-    lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
-    profile. Expected steady-state on multi-lane setups; NOT an
-    operator-actionable failure. Tracked separately so health telemetry
-    can distinguish "real stuck" (nothing spawned but spawnable work
-    available) from "correctly idle" (nothing spawnable in the queue)."""
+    """Ready/review task ids skipped because their assignee is not an
+    installed Hermes profile. Each real (non-dry-run) skip also emits a
+    deduplicated ``dispatch_nonspawnable_assignee`` event so the failure is
+    durable and machine-readable instead of silently leaving work queued."""
+    pre_dispatch_failed: list[tuple[str, str]] = field(default_factory=list)
+    """Task ids rejected by the pre-claim capability gate, paired with the
+    stable failure code. A rejected task is blocked before a run is created
+    and is not retried until an operator changes the task or node state."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -8528,6 +8549,119 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
+    def record_nonspawnable(task_id: str, assignee: str, task_status: str) -> None:
+        """Persist one actionable event for a missing-profile assignment.
+
+        Dispatcher ticks are frequent, so identical unresolved failures are
+        deduplicated. Reassignment (or a later transition back into the same
+        bad assignment) changes the task's event stream and permits a fresh
+        signal without producing one event per tick.
+        """
+        if dry_run:
+            return
+        error = (
+            f"Assignee profile {assignee!r} does not exist; create that Hermes "
+            "profile or reassign the task to an installed profile."
+        )
+        # Ignore unrelated comments/diagnostic events when deduplicating, but
+        # let an explicit reassignment reset the signal so assigning back to
+        # the same missing name is reported again.
+        latest = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "AND kind IN ('dispatch_nonspawnable_assignee', 'assigned') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest is not None and latest["kind"] == "dispatch_nonspawnable_assignee":
+            try:
+                prior = json.loads(latest["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                prior = {}
+            if (
+                prior.get("assignee") == assignee
+                and prior.get("task_status") == task_status
+                and prior.get("error_code") == "missing_assignee_profile"
+            ):
+                return
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "dispatch_nonspawnable_assignee",
+                {
+                    "outcome": "dispatch_failed",
+                    "error_code": "missing_assignee_profile",
+                    "error": error,
+                    "assignee": assignee,
+                    "task_status": task_status,
+                    "action": "create_profile_or_reassign",
+                },
+            )
+
+    def reject_pre_dispatch(task: Task, failure: Any) -> None:
+        """Block one invalid candidate before claim and emit one durable event."""
+        result.pre_dispatch_failed.append((task.id, failure.code))
+        if dry_run:
+            return
+        with write_txn(conn):
+            latest = conn.execute(
+                "SELECT kind, payload FROM task_events WHERE task_id = ? "
+                "AND kind IN ('pre_dispatch_validation_failed', 'assigned', 'unblocked') "
+                "ORDER BY id DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            if latest is not None and latest["kind"] == "pre_dispatch_validation_failed":
+                try:
+                    prior = json.loads(latest["payload"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    prior = {}
+                if prior.get("error_code") == failure.code:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                        "last_failure_error = ? WHERE id = ? AND status IN ('ready', 'review')",
+                        (failure.message[:500], task.id),
+                    )
+                    return
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "last_failure_error = ? WHERE id = ? AND status IN ('ready', 'review')",
+                (failure.message[:500], task.id),
+            )
+            payload = {
+                "outcome": "dispatch_rejected",
+                "error_code": failure.code,
+                "error": failure.message,
+                "action": failure.action,
+                "assignee": task.assignee,
+                "task_status": task.status,
+            }
+            if failure.requirement:
+                payload["requirement"] = failure.requirement
+            _append_event(
+                conn,
+                task.id,
+                "pre_dispatch_validation_failed",
+                payload,
+            )
+
+    def validate_pre_dispatch(task: Task) -> bool:
+        from hermes_cli.kanban_preflight import validate_dispatch_candidate
+
+        board_slug = board if board else get_current_board()
+        failure = validate_dispatch_candidate(
+            task,
+            runtime_argv=_resolve_hermes_argv(),
+            board_default_workdir=(
+                read_board_metadata(board_slug).get("default_workdir") or None
+            ),
+            scratch_root=workspaces_root(board=board),
+        )
+        if failure is None:
+            return True
+        reject_pre_dispatch(task, failure)
+        return False
+
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
@@ -8646,7 +8780,7 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
+        # Fail loudly for ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
         # control-plane lane (e.g. an interactive Claude Code terminal
@@ -8661,13 +8795,26 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            candidate = get_task(conn, row["id"])
+            if candidate is not None:
+                from hermes_cli.kanban_preflight import PreDispatchFailure
+
+                reject_pre_dispatch(
+                    candidate,
+                    PreDispatchFailure(
+                        code="missing_assignee_profile",
+                        message=(
+                            f"Assignee profile {row_assignee!r} does not exist; "
+                            "create that Hermes profile or reassign the task."
+                        ),
+                        action="create_profile_or_reassign",
+                        requirement=row_assignee,
+                    ),
+                )
+            continue
+        candidate = get_task(conn, row["id"])
+        if candidate is None or not validate_pre_dispatch(candidate):
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -8817,6 +8964,25 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            candidate = get_task(conn, row["id"])
+            if candidate is not None:
+                from hermes_cli.kanban_preflight import PreDispatchFailure
+
+                reject_pre_dispatch(
+                    candidate,
+                    PreDispatchFailure(
+                        code="missing_assignee_profile",
+                        message=(
+                            f"Assignee profile {row['assignee']!r} does not exist; "
+                            "create that Hermes profile or reassign the task."
+                        ),
+                        action="create_profile_or_reassign",
+                        requirement=row["assignee"],
+                    ),
+                )
+            continue
+        candidate = get_task(conn, row["id"])
+        if candidate is None or not validate_pre_dispatch(candidate):
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
@@ -10257,6 +10423,66 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
         }
         for name in names
     ]
+
+
+def nonspawnable_assignee_health(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Return actionable health for queued tasks with missing profiles.
+
+    Only ``ready`` and ``review`` tasks are dispatch candidates. Historical,
+    completed, blocked, and archived assignments do not degrade current board
+    health. If profile discovery itself is unavailable, report ``unknown``
+    rather than manufacturing a clean bill of health.
+    """
+    rows = conn.execute(
+        "SELECT id, title, assignee, status FROM tasks "
+        "WHERE status IN ('ready', 'review') AND claim_lock IS NULL "
+        "AND assignee IS NOT NULL AND assignee != '' "
+        "ORDER BY priority DESC, created_at ASC, id ASC"
+    ).fetchall()
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception as exc:
+        return {
+            "status": "unknown",
+            "count": 0,
+            "tasks": [],
+            "error_code": "profile_discovery_unavailable",
+            "error": str(exc),
+        }
+
+    existence: dict[str, bool] = {}
+    affected: list[dict[str, Any]] = []
+    for row in rows:
+        assignee = row["assignee"]
+        if assignee not in existence:
+            try:
+                existence[assignee] = bool(profile_exists(assignee))
+            except Exception as exc:
+                return {
+                    "status": "unknown",
+                    "count": 0,
+                    "tasks": [],
+                    "error_code": "profile_discovery_unavailable",
+                    "error": str(exc),
+                }
+        if existence[assignee]:
+            continue
+        affected.append(
+            {
+                "task_id": row["id"],
+                "title": row["title"],
+                "assignee": assignee,
+                "task_status": row["status"],
+                "error_code": "missing_assignee_profile",
+                "action": "create_profile_or_reassign",
+            }
+        )
+
+    return {
+        "status": "degraded" if affected else "ok",
+        "count": len(affected),
+        "tasks": affected,
+    }
 
 
 # ---------------------------------------------------------------------------
