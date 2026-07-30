@@ -116,7 +116,7 @@ hermes curator prune [--days N] # bulk-archive agent-created skills idle >= N da
 
 ## Backups and rollback
 
-By default, before every real curator pass Hermes takes a tar.gz snapshot of `<HERMES_HOME>/skills/` at `~/.hermes/skill-snapshots/<utc-iso>/skills.tar.gz`. Here `<HERMES_HOME>` means the active profile home: for a named profile such as `worker_alpha`, the concrete path is `~/.hermes/profiles/worker_alpha/skill-snapshots/<utc-iso>/skills.tar.gz`, equivalently `<HERMES_HOME>/skill-snapshots/<utc-iso>/skills.tar.gz` when `HERMES_HOME` is already set to that profile home. If a pass archives or consolidates something you didn't want touched, you can undo the whole run with one command:
+By default, before every real curator pass Hermes takes a tar.gz snapshot of `<HERMES_HOME>/skills/` at `<HERMES_HOME>/skill-snapshots/<utc-iso>/skills.tar.gz`. Here `<HERMES_HOME>` means the active profile home: for a named profile such as `worker_alpha`, the concrete path is `~/.hermes/profiles/worker_alpha/skill-snapshots/<utc-iso>/skills.tar.gz`. If a pass archives or consolidates something you didn't want touched, you can undo the whole run with one command:
 
 ```bash
 hermes curator rollback        # restore newest snapshot (with confirmation)

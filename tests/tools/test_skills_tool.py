@@ -989,3 +989,37 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
+
+    def test_explicit_external_root_under_support_dir_keeps_flat_skill_scoped(self, tmp_path):
+        """A configured root nested in another skill's references is independent."""
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+        _make_skill(local_dir, "umbrella")
+        external_dir = local_dir / "umbrella" / "references" / "external-root"
+        external_dir.mkdir(parents=True)
+
+        flat_skill = external_dir / "flat-skill.md"
+        flat_skill.write_text(
+            "---\nname: flat-skill\ndescription: Valid flat skill.\n---\n\nFlat body.\n",
+            encoding="utf-8",
+        )
+        listed_skill = _make_skill(external_dir, "listed-skill")
+        support_skill = listed_skill / "references" / "flat-skill.md"
+        support_skill.parent.mkdir(parents=True)
+        support_skill.write_text("---\nname: support-ghost\n---\n", encoding="utf-8")
+        snapshot_skill = external_dir / "ghost-pre-edit-snapshot-t_abcdef12" / "SKILL.md"
+        snapshot_skill.parent.mkdir()
+        snapshot_skill.write_text("---\nname: snapshot-ghost\n---\n", encoding="utf-8")
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            viewed = json.loads(skill_view("flat-skill"))
+            listed = json.loads(skills_list())
+
+        assert viewed["success"] is True
+        assert viewed["name"] == "flat-skill"
+        names = {skill["name"] for skill in listed["skills"]}
+        assert listed["success"] is True
+        assert "listed-skill" in names
+        assert "support-ghost" not in names
+        assert "snapshot-ghost" not in names

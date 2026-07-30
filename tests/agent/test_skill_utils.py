@@ -1,6 +1,9 @@
 """Tests for agent/skill_utils.py."""
 
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
+
+import pytest
 
 from agent.skill_utils import (
     extract_skill_config_vars,
@@ -164,6 +167,76 @@ def test_pre_edit_snapshot_name_requires_canonical_task_id(tmp_path):
     legitimate.write_text("---\nname: photo\n---\n", encoding="utf-8")
 
     assert is_excluded_skill_path(legitimate) is False
+
+
+@pytest.mark.parametrize(
+    ("task_suffix", "excluded"),
+    [
+        ("abcdef1", False),
+        ("abcdef12", True),
+        ("abcdef123", False),
+        ("ABCDEF12", False),
+        ("abcdef1g", False),
+    ],
+)
+def test_pre_edit_snapshot_task_suffix_is_exactly_lowercase_eight_hex(
+    tmp_path, task_suffix, excluded
+):
+    """Only canonical generated task IDs hide directories and legacy .md files."""
+    directory = tmp_path / f"ghost-pre-edit-snapshot-t_{task_suffix}"
+    directory.mkdir()
+    directory_skill = directory / "SKILL.md"
+    directory_skill.write_text("---\nname: directory\n---\n", encoding="utf-8")
+    legacy_skill = tmp_path / f"ghost-pre-edit-snapshot-t_{task_suffix}.md"
+    legacy_skill.write_text("---\nname: legacy\n---\n", encoding="utf-8")
+
+    assert is_excluded_skill_path(directory_skill) is excluded
+    assert is_excluded_skill_path(legacy_skill, root=tmp_path) is excluded
+
+
+def test_outside_explicit_root_does_not_inherit_ancestor_exclusions(tmp_path):
+    """Outside-root paths are not classified using unrelated parent segments."""
+    root = tmp_path / "configured-root"
+    root.mkdir()
+
+    outside_site_packages = tmp_path / "site-packages" / "live" / "SKILL.md"
+    outside_site_packages.parent.mkdir(parents=True)
+    outside_site_packages.write_text("---\nname: live\n---\n", encoding="utf-8")
+
+    outside_support = tmp_path / "ancestor-skill" / "references" / "live" / "SKILL.md"
+    outside_support.parent.mkdir(parents=True)
+    (outside_support.parents[2] / "SKILL.md").write_text(
+        "---\nname: ancestor\n---\n", encoding="utf-8"
+    )
+    outside_support.write_text("---\nname: live\n---\n", encoding="utf-8")
+
+    outside_snapshot = tmp_path / "ghost-pre-edit-snapshot-t_abcdef12" / "SKILL.md"
+    outside_snapshot.parent.mkdir()
+    outside_snapshot.write_text("---\nname: ghost\n---\n", encoding="utf-8")
+
+    relative_site_packages = Path("..") / "site-packages" / "live" / "SKILL.md"
+    assert is_excluded_skill_path(outside_site_packages, root=root) is False
+    assert is_skill_support_path(outside_site_packages, root=root) is False
+    assert is_excluded_skill_path(outside_support, root=root) is False
+    assert is_skill_support_path(outside_support, root=root) is False
+    assert is_excluded_skill_path(outside_snapshot, root=root) is False
+    assert is_skill_support_path(outside_snapshot, root=root) is False
+    assert is_excluded_skill_path(relative_site_packages, root=root) is False
+    assert is_skill_support_path(relative_site_packages, root=root) is False
+
+
+def test_windows_lexical_paths_classify_root_and_drive_boundaries():
+    """Windows path behavior is deterministic even when tests run on Linux."""
+    root = PureWindowsPath("C:/configured-root")
+    inside = PureWindowsPath("C:/configured-root/live/SKILL.md")
+    different_drive = PureWindowsPath("D:/site-packages/live/SKILL.md")
+    same_drive_outside = PureWindowsPath("C:/ghost-pre-edit-snapshot-t_abcdef12/SKILL.md")
+    relative_escape = PureWindowsPath("..", "site-packages", "live", "SKILL.md")
+
+    assert is_excluded_skill_path(inside, root=root) is False
+    assert is_excluded_skill_path(different_drive, root=root) is False
+    assert is_excluded_skill_path(same_drive_outside, root=root) is False
+    assert is_excluded_skill_path(relative_escape, root=root) is False
 
 
 def test_exclusions_are_relative_to_discovery_root(tmp_path):

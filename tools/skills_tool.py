@@ -1124,7 +1124,7 @@ def skill_view(
             # at the top of the dir).
             direct_path = search_dir / name
             if (
-                not _is_skill_support_path(direct_path)
+                not _is_skill_support_path(direct_path, root=search_dir)
                 and not _is_excluded_skill_path(direct_path / "SKILL.md", root=search_dir)
                 and direct_path.is_dir()
                 and (direct_path / "SKILL.md").exists()
@@ -1135,7 +1135,9 @@ def skill_view(
                 and not _is_excluded_skill_path(
                     direct_path.with_suffix(".md"), root=search_dir
                 )
-                and not _is_skill_support_path(direct_path.with_suffix(".md"))
+                and not _is_skill_support_path(
+                    direct_path.with_suffix(".md"), root=search_dir
+                )
             ):
                 _record(None, direct_path.with_suffix(".md"))
 
@@ -1145,7 +1147,7 @@ def skill_view(
             if local_category_name:
                 categorized_path = search_dir / local_category_name
                 if (
-                    not _is_skill_support_path(categorized_path)
+                    not _is_skill_support_path(categorized_path, root=search_dir)
                     and not _is_excluded_skill_path(
                         categorized_path / "SKILL.md", root=search_dir
                     )
@@ -1158,7 +1160,9 @@ def skill_view(
                     and not _is_excluded_skill_path(
                         categorized_path.with_suffix(".md"), root=search_dir
                     )
-                    and not _is_skill_support_path(categorized_path.with_suffix(".md"))
+                    and not _is_skill_support_path(
+                        categorized_path.with_suffix(".md"), root=search_dir
+                    )
                 ):
                     _record(None, categorized_path.with_suffix(".md"))
 
@@ -1187,7 +1191,7 @@ def skill_view(
                 if (
                     found_md.name != "SKILL.md"
                     and not _is_excluded_skill_path(found_md, root=search_dir)
-                    and not _is_skill_support_path(found_md)
+                    and not _is_skill_support_path(found_md, root=search_dir)
                 ):
                     _record(None, found_md)
 

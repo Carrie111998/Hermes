@@ -101,7 +101,7 @@ hermes curator restore <skill>  # move an archived skill back to active
 
 ## 备份与回滚
 
-默认情况下，每次真正的 curator pass 之前，Hermes 会将 `<HERMES_HOME>/skills/` 快照为 `~/.hermes/skill-snapshots/<utc-iso>/skills.tar.gz`。这里的 `<HERMES_HOME>` 指当前激活 profile 的 home：对于名为 `worker_alpha` 的 profile，具体路径是 `~/.hermes/profiles/worker_alpha/skill-snapshots/<utc-iso>/skills.tar.gz`；等价地，如果 `HERMES_HOME` 已经设为该 profile 的 home，路径就是 `<HERMES_HOME>/skill-snapshots/<utc-iso>/skills.tar.gz`。如果某次 pass 归档或合并了你不希望被触碰的内容，可以用一条命令撤销整次运行：
+默认情况下，每次真正的 curator pass 之前，Hermes 会将 `<HERMES_HOME>/skills/` 快照为 `<HERMES_HOME>/skill-snapshots/<utc-iso>/skills.tar.gz`。这里的 `<HERMES_HOME>` 指当前激活 profile 的 home：对于名为 `worker_alpha` 的 profile，具体路径是 `~/.hermes/profiles/worker_alpha/skill-snapshots/<utc-iso>/skills.tar.gz`。如果某次 pass 归档或合并了你不希望被触碰的内容，可以用一条命令撤销整次运行：
 
 ```bash
 hermes curator rollback        # restore newest snapshot (with confirmation)
