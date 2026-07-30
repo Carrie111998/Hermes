@@ -171,6 +171,13 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
+        # Queue.get() removes an event before a consumer has decided whether to
+        # claim, drop, or requeue it.  The TUI poller and an active conversation
+        # loop can otherwise race in that temporary-empty window, making a ready
+        # result_delivery=inject event miss its same-turn boundary.  Consumers
+        # that route/claim completion events hold this lock only for the bounded
+        # dequeue -> decision handoff, never while an agent/model turn runs.
+        self.completion_routing_lock = threading.RLock()
         # Rehydrate durable delegation completions only at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
         try:

@@ -670,6 +670,7 @@ def test_pending_claim_heartbeat_renews_until_ack(monkeypatch):
 
 def test_run_conversation_inject_transport_normalize_and_ack(monkeypatch, tmp_path):
     agent = _make_loop_agent(tmp_path)
+    cached_system_prompt = deepcopy(getattr(agent, "_cached_system_prompt"))
     requests = []
     responses = [
         _loop_response(
@@ -706,6 +707,8 @@ def test_run_conversation_inject_transport_normalize_and_ack(monkeypatch, tmp_pa
     delegation_id = published["delegation_id"]
     assert result["completed"] is True
     assert len(requests) == 2
+    assert requests[1][: len(requests[0])] == requests[0]
+    assert getattr(agent, "_cached_system_prompt") == cached_system_prompt
     assert "LIVE_LOOP_INJECT" in str(requests[1])
     assert _event_state(delegation_id, "task:0") == ("delivered", 1)
     assert not agent._pending_delegation_inject_claims

@@ -301,55 +301,60 @@ def drain_ready_injects(agent: Any, messages: list[dict[str, Any]], turn_id: str
     from tools.process_registry import _format_async_delegation, process_registry
 
     completion_queue = process_registry.completion_queue
-    try:
-        scan_count = completion_queue.qsize()
-    except Exception:
-        return 0
-
     accepted: list[tuple[dict[str, Any], str, str, str]] = []
-    for _ in range(max(0, scan_count)):
+    # Atomic with TUI dequeue -> route/requeue/claim.  Without this guard the
+    # TUI poller can temporarily hold a ready event outside the queue while this
+    # bounded snapshot reports zero, nondeterministically degrading inject to a
+    # later synthetic turn.
+    with process_registry.completion_routing_lock:
         try:
-            event = completion_queue.get_nowait()
-        except queue.Empty:
-            break
+            scan_count = completion_queue.qsize()
         except Exception:
-            break
+            return 0
 
-        delivery = str(event.get("result_delivery") or "after_turn").strip().lower()
-        event_turn_id = str(event.get("parent_turn_id") or "")
-        if (
-            event.get("type") != "async_delegation"
-            or delivery != "inject"
-            or event_turn_id != str(turn_id)
-        ):
-            completion_queue.put(event)
-            continue
+        for _ in range(max(0, scan_count)):
+            try:
+                event = completion_queue.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
 
-        # Formatting is local preparation, not a delivery attempt.  Do it before
-        # the durable claim so a broken spill/formatter cannot exhaust the
-        # bounded delivery-attempt budget without ever showing the result.
-        try:
-            text = _format_async_delegation(event)
-        except Exception:
-            logger.debug("Failed to format inject delegation event", exc_info=True)
-            completion_queue.put(event)
-            continue
-        if not text:
-            completion_queue.put(event)
-            continue
+            delivery = str(event.get("result_delivery") or "after_turn").strip().lower()
+            event_turn_id = str(event.get("parent_turn_id") or "")
+            if (
+                event.get("type") != "async_delegation"
+                or delivery != "inject"
+                or event_turn_id != str(turn_id)
+            ):
+                completion_queue.put(event)
+                continue
 
-        claim_id = claim_event_delivery(event, f"conversation-loop:{os.getpid()}")
-        if claim_id is None:
-            # A competing CLI/gateway process already owns this durable event,
-            # or it was delivered from a duplicate restored queue entry.
-            continue
-        event_id = _event_identity(event)
-        if _durable_event_is_in_history(messages, event_id):
-            # A previous process persisted the synthetic message before it
-            # crashed.  The active transcript is now the durable handoff.
-            complete_event_delivery(event, claim_id)
-            continue
-        accepted.append((event, claim_id, text, event_id))
+            # Formatting is local preparation, not a delivery attempt.  Do it before
+            # the durable claim so a broken spill/formatter cannot exhaust the
+            # bounded delivery-attempt budget without ever showing the result.
+            try:
+                text = _format_async_delegation(event)
+            except Exception:
+                logger.debug("Failed to format inject delegation event", exc_info=True)
+                completion_queue.put(event)
+                continue
+            if not text:
+                completion_queue.put(event)
+                continue
+
+            claim_id = claim_event_delivery(event, f"conversation-loop:{os.getpid()}")
+            if claim_id is None:
+                # A competing CLI/gateway process already owns this durable event,
+                # or it was delivered from a duplicate restored queue entry.
+                continue
+            event_id = _event_identity(event)
+            if _durable_event_is_in_history(messages, event_id):
+                # A previous process persisted the synthetic message before it
+                # crashed.  The active transcript is now the durable handoff.
+                complete_event_delivery(event, claim_id)
+                continue
+            accepted.append((event, claim_id, text, event_id))
 
     if not accepted:
         return 0
