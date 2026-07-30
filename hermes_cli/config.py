@@ -4854,6 +4854,36 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
+
+    # ── Dict-overwrite guard (#74995) ────────────────────────────────
+    # If the target already exists as a dict in the user config, setting
+    # it to a scalar silently destroys every sub-key.  Refuse with a
+    # helpful message, unless --force is used for scripted workflows.
+    _existing = _get_nested(user_config, key)
+    if isinstance(_existing, dict) and not force:
+        sub_keys = list(_existing.keys())
+        print(
+            f"Cannot set '{key}' to a scalar value: '{key}' is a "
+            f"configuration section with {len(sub_keys)} sub-key(s).",
+            file=sys.stderr,
+        )
+        if sub_keys:
+            sub_list = ", ".join(sub_keys[:10])
+            print(f"  Sub-keys: {sub_list}", file=sys.stderr)
+            if len(sub_keys) > 10:
+                print(f"  ... and {len(sub_keys) - 10} more", file=sys.stderr)
+        print(
+            "  Use dotted paths to set individual keys:",
+            file=sys.stderr,
+        )
+        print(f"    hermes config set {key}.<sub-key> <value>", file=sys.stderr)
+        print(
+            "  Or use --force to replace the entire section:",
+            file=sys.stderr,
+        )
+        print(f"    hermes config set --force {key} {value!r}", file=sys.stderr)
+        sys.exit(1)
+
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
