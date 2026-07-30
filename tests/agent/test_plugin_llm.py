@@ -456,6 +456,61 @@ class TestPluginLlmFacade:
         assert api_key == "tok-codex-work"
         assert base_url == "https://chatgpt.com/backend-api/codex"
 
+    def test_resolve_profile_credentials_preserves_custom_pool_key(
+        self, monkeypatch
+    ):
+        """Named custom providers must keep the custom:<name> pool key."""
+        entry = SimpleNamespace(
+            runtime_api_key="sk-custom-work",
+            runtime_base_url="https://example.test/v1",
+            access_token="sk-custom-work",
+            base_url="https://example.test/v1",
+        )
+        seen: dict = {}
+
+        def fake_load_pool(provider):
+            seen["provider"] = provider
+            return SimpleNamespace(
+                resolve_target=lambda _t: (1, entry, None),
+            )
+
+        monkeypatch.setattr("agent.credential_pool.load_pool", fake_load_pool)
+        provider, api_key, base_url = _resolve_profile_credentials(
+            "custom:together", "work"
+        )
+        assert seen["provider"] == "custom:together"
+        assert provider == "custom:together"
+        assert api_key == "sk-custom-work"
+        assert base_url == "https://example.test/v1"
+
+    def test_resolve_profile_credentials_preserves_active_custom_pool_key(
+        self, monkeypatch
+    ):
+        entry = SimpleNamespace(
+            runtime_api_key="sk-active-custom",
+            runtime_base_url=None,
+            access_token="sk-active-custom",
+            base_url=None,
+        )
+        seen: dict = {}
+
+        def fake_load_pool(provider):
+            seen["provider"] = provider
+            return SimpleNamespace(
+                resolve_target=lambda _t: (1, entry, None),
+            )
+
+        monkeypatch.setattr("agent.credential_pool.load_pool", fake_load_pool)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_requested_provider",
+            lambda _requested=None: "custom:together",
+        )
+        provider, api_key, base_url = _resolve_profile_credentials(None, "work")
+        assert seen["provider"] == "custom:together"
+        assert provider == "custom:together"
+        assert api_key == "sk-active-custom"
+        assert base_url is None
+
     def test_complete_structured_returns_parsed_json(self):
         def fake_caller(**_kwargs):
             return "openai", "gpt-4o", _fake_response(

@@ -345,10 +345,15 @@ def _pool_provider_for_profile(provider_override: Optional[str]) -> str:
     from agent.auxiliary_client import _normalize_aux_provider
 
     def _canonical(name: str) -> str:
+        raw = (name or "").strip().lower()
+        # Pool keys keep the custom: prefix; _normalize_aux_provider strips
+        # it for HTTP routing and must not be used for load_pool().
+        if raw.startswith("custom:") and len(raw) > len("custom:"):
+            return raw
         normalized = _normalize_aux_provider(name)
         if normalized and normalized not in {"", "auto"}:
             return normalized
-        return (name or "").strip().lower()
+        return raw
 
     explicit = (provider_override or "").strip().lower()
     if explicit and explicit != "auto":
