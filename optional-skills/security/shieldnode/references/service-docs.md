@@ -1,6 +1,6 @@
 # Per-service reference docs and key storage
 
-After a service is configured, write a markdown reference at `skills/shieldnode/services/<service-slug>.md` (lowercase kebab: `openai`, `airtable`, `stripe`). It becomes the single source of truth for that service in the project, so future agents read it instead of re-fetching the docs.
+After a service is configured, write a markdown reference for it. **SKILL.md gives the one path to write to**, so it is stated in a single place and never drifts; the file name is the service slug in lowercase kebab (`openai`, `airtable`, `stripe`). It becomes the single source of truth for that service, so future agents read it instead of re-fetching the docs.
 
 ## Template
 

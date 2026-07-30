@@ -9,7 +9,7 @@ import requests
 PROXY = "https://proxy.shieldnode.app"
 KEY = "shieldnode_..."  # virtual key, load from $SHIELDNODE_<SERVICE>_KEY
 
-def call_with_approval(path, *, method="GET", json=None, agent="Claude",
+def call_with_approval(path, *, method="GET", json=None, agent="Hermes",
                        minutes=15, max_wait_s=300, poll_s=30):
     """
     Call the proxy. If the key is disabled and the user has the mobile app,
@@ -57,10 +57,20 @@ def call_with_approval(path, *, method="GET", json=None, agent="Claude",
         r.raise_for_status()
 
 
-data = call_with_approval("/chat/completions",
-                          method="POST",
-                          json={"model": "gpt-4o", "messages": [...]},
-                          agent="Claude", minutes=30).json()
+# A consequential action on a classic API, which is what this flow is for:
+# the user gets a push, approves once, and the send goes through.
+data = call_with_approval(
+    "/emails",
+    method="POST",
+    json={
+        "from": "reports@example.com",
+        "to": ["owner@example.com"],
+        "subject": "Weekly report",
+        "html": "<p>Numbers attached.</p>",
+    },
+    agent="Hermes",
+    minutes=5,
+).json()
 ```
 
 ## Why each part matters

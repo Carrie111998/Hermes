@@ -1,8 +1,8 @@
 ---
 name: shieldnode
-description: Call APIs through a proxy that holds the real keys, with push approval on your phone.
+description: Call APIs without the real keys, approved by phone push.
 version: 1.0.0
-author: RP0-undefined
+author: Ray Pendragon (RP0-undefined)
 license: MIT
 platforms: [macos, linux, windows]
 metadata:
@@ -11,17 +11,15 @@ metadata:
     category: security
 ---
 
-# ShieldNode
+# ShieldNode Skill
 
-ShieldNode keeps the user's real API keys in an encrypted vault and gives this agent a **virtual key** instead. You call the proxy, it injects the real credential, the upstream API answers. The real key never reaches you, so a leaked virtual key is worthless on its own.
+Call a user's third-party APIs through the ShieldNode proxy, which holds their real credentials and hands the agent a **virtual key** instead, so the real key never enters the conversation. When a key is disabled, the call returns a structured `403` and the user approves it by push for a bounded window. It does not store or read the user's data, does not manage non-HTTP credentials, and cannot revoke keys: revocation happens in the ShieldNode app.
 
 ```
 Hermes --X-Api-Key: shieldnode_...--> proxy.shieldnode.app/{path} --real key--> api.upstream.com/{path}
 ```
 
-The user can leave a key **disabled** by default. Your call then triggers a push notification on their phone, they approve it for a bounded window, and the call goes through.
-
-**The key format is the signal.** Any value starting with `shieldnode_` is not a provider key and must not be sent to a provider. It goes in the `X-Api-Key` header against `proxy.shieldnode.app`, and this skill applies. The user pasting one into the chat is all the setup you need to get started.
+**The key format is the signal.** Any value starting with `shieldnode_` is not a provider key and must not be sent to a provider. It goes in the `X-Api-Key` header against `proxy.shieldnode.app`, and this skill applies. The user pasting one into the chat is all the setup needed to get started.
 
 ## When to Use
 
@@ -79,7 +77,7 @@ curl -sS -H "X-Api-Key: $SHIELDNODE_KEY" \
 
 That gives you the upstream, the configured `base_url` (which fixes your path convention) and whether the next call goes straight through (`active: true`) or triggers an approval push. `alias` is the label the user put on the key, usually the name of the agent it was issued to. Name a key by its **service** when you talk about it, and use `alias` only to disambiguate when several keys exist on the same service. Never quote any part of the key value. whoami never returns credentials, is never forwarded upstream, and fires no push.
 
-**Then write the service doc, without being asked.** If there is no `services/<slug>.md` for the service whoami just named, create one from the template in `references/service-docs.md`. No command and no question to the user: whoami already gave you the service, the base URL and the auth shape. Later sessions read that file instead of deriving it again.
+**Then write the service doc, without being asked.** The one location, used everywhere in this skill, is `~/.hermes/shieldnode/services/<slug>.md`, named with the service slug in lowercase kebab. If no file exists there for the service whoami just named, create one from the template in `references/service-docs.md`. No command and no question to the user: whoami already gave you the service, the base URL and the auth shape. Later sessions read that file instead of deriving it again, and it sits outside `~/.hermes/skills/` so reinstalling this skill never deletes it.
 
 Then call the API, always identifying yourself:
 
@@ -159,7 +157,7 @@ curl -sS -X POST "https://proxy.shieldnode.app/_shieldnode/config-request" \
           "agent_name":"Hermes","reason":"creating invoices for the user"}'
 ```
 
-Fill `base_url` and `detected_auth_method` from what you know about the API, or from its docs. Poll `/_shieldnode/config-request/<request_id>` until `approved`, then ask the user for a virtual key on the new service and **write its `services/<slug>.md` at that point** (`references/service-docs.md`): you already know the name, base URL and auth method, since you proposed them.
+Fill `base_url` and `detected_auth_method` from what you know about the API, or from its docs. Poll `/_shieldnode/config-request/<request_id>` until `approved`, then ask the user for a virtual key on the new service and **write its `~/.hermes/shieldnode/services/<slug>.md` at that point** (`references/service-docs.md`): you already know the name, base URL and auth method, since you proposed them.
 
 **Never put the user's upstream API key in this request.** You propose the non-secret shape only.
 
