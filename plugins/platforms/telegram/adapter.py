@@ -3060,7 +3060,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     raise RuntimeError("Telegram application was torn down during conflict reconnect")
                 await self._start_polling_once(
                     app,
-                    drop_pending_updates=False,
+                    drop_pending_updates=True,
                     error_callback=self._polling_error_callback_ref,
                 )
                 logger.info(

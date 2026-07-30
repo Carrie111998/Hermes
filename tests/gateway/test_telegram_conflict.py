@@ -85,7 +85,7 @@ async def test_polling_conflict_retries_before_fatal(monkeypatch):
     captured = {}
 
     async def fake_start_polling(**kwargs):
-        captured["error_callback"] = kwargs["error_callback"]
+        captured.update(kwargs)
         # Cold connect requires real getUpdates readiness (#67498) — simulate
         # the first successful poll for the generation this call started, but
         # only on the initial connect: the conflict-retry generation must NOT
@@ -131,6 +131,9 @@ async def test_polling_conflict_retries_before_fatal(monkeypatch):
     await adapter._polling_error_task
 
     assert adapter.has_fatal_error is False, "First conflict should not be fatal"
+    assert captured["drop_pending_updates"] is True, (
+        "Conflict recovery must ask Telegram to terminate stale getUpdates sessions"
+    )
     assert adapter._polling_conflict_count == 1, (
         "Count must remain until the retried generation makes getUpdates progress"
     )
