@@ -1014,6 +1014,7 @@ class MattermostAdapter(BasePlatformAdapter):
         # authorization/trust semantics differ from a two-party DM.
         if (
             channel_type_raw == "D"
+            and msg_type != MessageType.COMMAND
             and post.get("root_id")
             and thread_id
             and post_id

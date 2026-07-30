@@ -132,26 +132,14 @@ class TestMattermostDMThreadContext:
     @pytest.mark.asyncio
     async def test_first_dm_thread_slash_command_keeps_command_type(self):
         self.adapter._has_active_dm_thread_session = MagicMock(return_value=False)
-        self.adapter._api_get = AsyncMock(return_value={
-            "posts": {
-                "root_a": {
-                    "user_id": "user_a",
-                    "message": "prior request",
-                    "create_at": 1,
-                },
-                "reply_a": {
-                    "user_id": "user_a",
-                    "message": "/status",
-                    "create_at": 2,
-                },
-            },
-        })
+        self.adapter._api_get = AsyncMock()
 
         await self.adapter._handle_ws_event(self._event(message="/status"))
 
         message = self.adapter.handle_message.call_args.args[0]
         assert message.message_type == MessageType.COMMAND
-        assert message.text.endswith("/status")
+        assert message.text == "/status"
+        self.adapter._api_get.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_persisted_thread_session_skips_rehydration_after_restart(self):
