@@ -910,7 +910,10 @@ def run_doctor(args):
                     provider_ids_to_accept.add(catalog_provider)
 
             if provider and provider != "auto":
-                if catalog_provider is None or (
+                if (
+                    catalog_provider is None
+                    and provider not in known_providers
+                ) or (
                     known_providers
                     and not (provider_ids_to_accept & valid_provider_ids)
                 ):
