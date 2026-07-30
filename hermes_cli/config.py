@@ -1101,6 +1101,13 @@ def _ensure_hermes_home_managed(home: Path):
 # Config loading/saving
 # =============================================================================
 
+def _profile_safe_hermes_home_string() -> str:
+    try:
+        return str(get_hermes_home())
+    except RuntimeError:
+        return str((Path.cwd() / ".hermes").resolve())
+
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -3316,7 +3323,7 @@ DEFAULT_CONFIG = {
 
     "session_bridge": {
         "sidebar": {
-            "inbox_cwd": str(get_hermes_home()),
+            "inbox_cwd": _profile_safe_hermes_home_string(),
             "placement_generation": 1,
             "enabled": False,
             "continuous": False,
@@ -7419,6 +7426,14 @@ def apply_terminal_config_to_env(
     return target
 
 
+def _effective_default_config() -> Dict[str, Any]:
+    defaults = copy.deepcopy(DEFAULT_CONFIG)
+    defaults["session_bridge"]["sidebar"]["inbox_cwd"] = (
+        _profile_safe_hermes_home_string()
+    )
+    return defaults
+
+
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_hermes_home()
@@ -7469,8 +7484,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
-        config = copy.deepcopy(DEFAULT_CONFIG)
-        config["session_bridge"]["sidebar"]["inbox_cwd"] = str(get_hermes_home())
+        config = _effective_default_config()
 
         if user_sig is not None:
             try:
@@ -7811,7 +7825,7 @@ def save_config(
             normalized = _cast(Dict[str, Any], normalized)
             normalized = _strip_default_values(
                 normalized,  # type: ignore[arg-type]
-                DEFAULT_CONFIG,
+                _effective_default_config(),
                 preserve_keys=effective_preserve_keys,
             )
 
