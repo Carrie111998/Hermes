@@ -500,6 +500,39 @@ async def test_failed_turn_requeues_mixed_steers_with_independent_trust():
     assert followup is existing
 
 
+def test_recursion_cap_preserves_deferred_head_behind_recovered_steer():
+    runner, adapter = _runner(_entry())
+    deferred = MessageEvent(
+        text="already deferred",
+        message_type=MessageType.TEXT,
+        source=_source(),
+    )
+    tail = MessageEvent(
+        text="later tail",
+        message_type=MessageType.TEXT,
+        source=_source(),
+    )
+    recovered = _new_gateway_session_ipc_event(
+        text="/restart trusted recovery",
+        message_type=MessageType.TEXT,
+        source=_source(),
+        internal=True,
+    )
+    adapter._pending_messages[SESSION_KEY] = deferred
+    runner._queued_events[SESSION_KEY] = [tail]
+
+    queued = runner._queue_pending_at_recursion_cap(
+        SESSION_KEY,
+        _source(),
+        recovered,
+        recovered.text,
+    )
+
+    assert queued is True
+    assert adapter._pending_messages[SESSION_KEY] is recovered
+    assert runner._queued_events[SESSION_KEY] == [deferred, tail]
+
+
 @pytest.mark.asyncio
 async def test_busy_steer_queues_nonempty_text_when_admission_closed():
     runner, adapter = _runner(_entry())

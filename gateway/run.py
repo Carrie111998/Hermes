@@ -8669,6 +8669,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ).conversation.queued_events = ordered[1:]
         return True
 
+    def _queue_pending_at_recursion_cap(
+        self,
+        session_key: str,
+        source: SessionSource,
+        pending_event: MessageEvent | None,
+        pending_text: str | None,
+    ) -> bool:
+        """Queue the current head without replacing already deferred work."""
+        adapter = self._adapter_for_source(source)
+        event = pending_event
+        if event is None and pending_text:
+            event = MessageEvent(
+                text=pending_text,
+                message_type=MessageType.TEXT,
+                source=source,
+            )
+        return bool(
+            event is not None
+            and self._prepend_pending_events(
+                session_key,
+                [event],
+                adapter,
+            )
+        )
+
     async def _requeue_failed_turn_steer(
         self,
         session_key: str,
@@ -24996,15 +25021,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "queueing message instead of recursing.",
                         _interrupt_depth, session_key,
                     )
-                    adapter = self._adapter_for_source(source)
-                    if adapter and pending_event:
-                        self._merge_pending_event(
-                            adapter,
-                            session_key,
-                            pending_event,
-                        )
-                    elif adapter and hasattr(adapter, 'queue_message'):
-                        adapter.queue_message(session_key, pending)
+                    self._queue_pending_at_recursion_cap(
+                        session_key,
+                        source,
+                        pending_event,
+                        pending,
+                    )
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
