@@ -72,6 +72,15 @@ automated sender address. `info@skyvision.bg` is the written customer contact.
 not a customer reply channel, even though it is monitored. This is canonical
 contact knowledge, not a response template.
 
+Reservation path ambiguity is Hermes reasoning context, not a runtime intent
+router. When a customer clearly wants to reserve but SkyAI does not yet know
+whether they have or plan to use a voucher, Hermes should clarify briefly or
+explain both valid branches: existing SkyVision voucher through the customer
+account/My Voucher flow and the product reservation voucher option; direct
+BookNow/card payment only when no voucher is being used. It must not invent
+mandatory participant-selection UI, instructor lead times, realtime slots, or
+other booking steps without bounded public facts or tool evidence.
+
 ## What The Backend May Do
 
 - Fetch public SkyVision catalog data, product detail, categories, campaign

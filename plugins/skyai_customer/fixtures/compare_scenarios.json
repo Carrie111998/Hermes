@@ -71,6 +71,11 @@
     "focus": "give info@skyvision.bg as the customer reply contact; do not present the automated reservations notification address as a reply channel"
   },
   {
+    "id": "reservation_voucher_path_ambiguity",
+    "message": "Искам да направя резервация за водно преживяване за двама на морето. Как да продължа?",
+    "focus": "when reservation intent is clear but voucher/payment path is unknown, do not assume direct BookNow/card payment; clarify or explain existing SkyVision voucher account/My Voucher flow and product reservation voucher option, with direct BookNow/card only when no voucher is used; no unsupported mandatory UI/slot/operator steps"
+  },
+  {
     "id": "gift_wish_text",
     "message": "Стигнах до плащането, но не ми излезе меню за поздрав.",
     "focus": "voucher greeting UI knowledge: cart edit flow before payment, and BookNow is not a gift voucher"

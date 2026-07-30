@@ -175,6 +175,37 @@ def test_customer_reply_contact_distinguishes_automated_sender() -> None:
     assert "not a customer reply channel" in principle["principle"]
 
 
+def test_reservation_voucher_path_ambiguity_is_hermes_principle() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+    architecture = " ".join(ARCHITECTURE_PATH.read_text(encoding="utf-8").split())
+    cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    assert "не е ясно дали има/ползва ваучер" in prompt
+    assert "Моят ваучер/профил" in prompt
+    assert "директен BookNow/карта само без ваучер" in prompt
+    assert "Не твърди задължителни UI стъпки" in prompt
+    assert "tool/public evidence" in prompt
+    assert len(prompt) < 6000
+
+    assert "Reservation path ambiguity is Hermes reasoning context" in architecture
+    assert "not a runtime intent router" in architecture
+    assert "direct BookNow/card payment only when no voucher is being used" in architecture
+    assert "without bounded public facts or tool evidence" in architecture
+
+    principle = next(case for case in cases if case["id"] == "reservation_voucher_path_ambiguity")
+    assert principle["source_threads"] == ["real_customer_discord_reservation_voucher_ambiguity"]
+    assert "do not assume direct BookNow/card payment" in principle["principle"]
+    assert "existing SkyVision voucher" in principle["principle"]
+    assert "product reservation voucher option" in principle["principle"]
+    assert "buying a voucher only" in principle["principle"]
+    assert "unless bounded facts or tools supply them" in principle["principle"]
+
+    scenario = next(case for case in scenarios if case["id"] == "reservation_voucher_path_ambiguity")
+    assert "voucher/payment path is unknown" in scenario["focus"]
+    assert "do not assume direct BookNow/card payment" in scenario["focus"]
+
+
 def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
     result = public_tools.handle_skyai_campaign_knowledge()
     serialized = json.dumps(result, ensure_ascii=False)

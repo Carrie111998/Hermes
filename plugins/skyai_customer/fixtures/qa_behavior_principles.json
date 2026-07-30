@@ -120,6 +120,12 @@
     "scoring": ["contact_accuracy", "support_accuracy", "next_step_clarity"]
   },
   {
+    "id": "reservation_voucher_path_ambiguity",
+    "source_threads": ["real_customer_discord_reservation_voucher_ambiguity"],
+    "principle": "When reservation intent is clear but voucher ownership or payment path is not established, do not assume direct BookNow/card payment. Ask one concise clarification or explain both valid paths: existing SkyVision voucher through the customer account/My Voucher flow and the product reservation voucher option; direct BookNow/card applies only when no voucher is being used. Mention buying a voucher only when the customer is shopping for a gift. Do not assert participant-selection UI, instructor contact timing, realtime slot availability, or other mandatory booking steps unless bounded facts or tools supply them.",
+    "scoring": ["reservation_path_reasoning", "voucher_context", "payment_accuracy", "evidence_uncertainty", "concise_human_bulgarian"]
+  },
+  {
     "id": "no_keyword_backend_patches",
     "source_threads": ["architecture"],
     "principle": "Do not fix these issues with keyword guards or one-off backend branches. Use prompt principles, facts, and evaluation scoring.",
