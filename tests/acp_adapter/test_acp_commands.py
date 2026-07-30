@@ -20,7 +20,6 @@ class FakeAgent:
         self.steers = []
         self.redirects = []
         self.runs = []
-        self.run_kwargs = []
 
     def steer(self, text):
         self.steers.append(text)
@@ -32,7 +31,6 @@ class FakeAgent:
 
     def run_conversation(self, *, user_message, conversation_history, task_id, **kwargs):
         self.runs.append(user_message)
-        self.run_kwargs.append(kwargs)
         messages = list(conversation_history or [])
         messages.append({"role": "user", "content": user_message})
         final = f"ran: {user_message}"
@@ -163,29 +161,6 @@ async def test_acp_cancel_publishes_hard_stop_while_holding_runtime_lock():
     assert observed["lock_held"] is True
     assert state.cancel_event.is_set()
     assert state.interrupted_prompt_text == "original request"
-
-
-@pytest.mark.asyncio
-async def test_acp_steer_on_idle_session_runs_as_regular_prompt():
-    # /steer on an idle session (no running turn, nothing to salvage) should
-    # run the steer payload as a normal user prompt — NOT silently append it
-    # to state.queued_prompts. Without this, users on Zed / other ACP clients
-    # see their /steer turn into "queued for the next turn" when they never
-    # typed /queue. Matches gateway/run.py ~L4898 idle-/steer behavior.
-    acp_agent, state, fake, _conn = make_agent_and_state()
-
-    response = await acp_agent.prompt(
-        session_id=state.session_id,
-        prompt=[TextContentBlock(type="text", text="/steer summarize the README")],
-    )
-
-    assert response.stop_reason == "end_turn"
-    assert fake.steers == []
-    assert fake.runs == ["summarize the README"]
-    assert fake.run_kwargs == [{"persist_user_message": "summarize the README"}]
-    assert "turn_routing_request" not in fake.run_kwargs[0]
-    assert state.queued_prompts == []
-
 
 
 

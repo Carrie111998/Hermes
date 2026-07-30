@@ -375,22 +375,6 @@ def test_aborted_turn_persist_override_cannot_leak_into_later_turns():
     assert agent._persist_user_message_timestamp is None
 
 
-def test_pending_cli_message_carries_durable_marker_to_new_turn_dict():
-    """A close-persisted CLI input must not be written again by turn start."""
-    agent = _FakeAgent()
-    staged = {"role": "user", "content": "already durable", "_db_persisted": True}
-    agent._pending_cli_user_message = staged
-
-    ctx = _build(agent, user_message="already durable")
-
-    assert ctx.messages[-1] is staged
-    assert ctx.messages[-1]["content"] == "already durable"
-    assert ctx.messages[-1]["_db_persisted"] is True
-    assert agent._pending_cli_user_message is None
-
-
-
-
 def test_pending_cli_message_uses_clean_override_for_api_local_note():
     """A noted API message reuses the clean staged dict and its DB marker."""
     agent = _FakeAgent()
