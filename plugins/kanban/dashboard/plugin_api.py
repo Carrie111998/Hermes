@@ -836,6 +836,36 @@ class UpdateTaskBody(BaseModel):
     clear_model_override: bool = False
 
 
+class FrozenHeadReviewBody(BaseModel):
+    head_sha: str
+    worktree_path: str
+    evidence: dict[str, Any]
+    actor: Optional[str] = "dashboard"
+
+
+@router.post("/tasks/{task_id}/submit-review")
+def submit_review(task_id: str, payload: FrozenHeadReviewBody, board: Optional[str] = Query(None)):
+    """Submit a completed exact frozen implementation head without claiming it."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        try:
+            kanban_db.submit_task_for_review(
+                conn,
+                task_id,
+                head_sha=payload.head_sha,
+                worktree_path=payload.worktree_path,
+                evidence=payload.evidence,
+                actor=payload.actor or "dashboard",
+            )
+        except kanban_db.FrozenHeadReviewError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        task = kanban_db.get_task(conn, task_id)
+        return {"task": _task_dict(task) if task else None}
+    finally:
+        conn.close()
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)

@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, NoReturn, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -4684,6 +4684,123 @@ class HallucinatedCardsError(ValueError):
 
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
+
+
+class FrozenHeadReviewError(ValueError):
+    """Raised when an exact frozen implementation head cannot enter review."""
+
+
+def submit_task_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    head_sha: str,
+    worktree_path: str,
+    evidence: Optional[dict[str, Any]],
+    actor: str = "operator",
+) -> bool:
+    """Move a completed, immutable implementation head into ``review``.
+
+    This is deliberately separate from the worker ``running`` and legacy
+    ``blocked`` review handoffs.  The caller must provide a duplicated,
+    explicit evidence record; the database then verifies the record against
+    the live git worktree and the completed implementation run before making
+    the transition.  Every rejection is recorded, but no task state is
+    changed on rejection.
+    """
+    def reject(reason: str) -> NoReturn:
+        with write_txn(conn):
+            _append_event(conn, task_id, "review_submission_rejected", {
+                "route": "frozen_head",
+                "reason": reason,
+                "head_sha": head_sha,
+                "worktree_path": worktree_path,
+                "actor": actor,
+            })
+        raise FrozenHeadReviewError(reason)
+
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
+        reject("head_sha must be a full 40-character commit id")
+    if not isinstance(worktree_path, str) or not worktree_path.strip():
+        reject("worktree_path is required")
+    if not isinstance(evidence, dict):
+        reject("explicit evidence object is required")
+    evidence = dict(evidence)
+    if evidence.get("head_sha") != head_sha:
+        reject("evidence head_sha must exactly match head_sha")
+    if evidence.get("worktree_path") != worktree_path:
+        reject("evidence worktree_path must exactly match worktree_path")
+    if evidence.get("clean") is not True:
+        reject("evidence clean must be true")
+    if evidence.get("implementation_complete") is not True:
+        reject("evidence implementation_complete must be true")
+
+    path = Path(worktree_path).expanduser()
+    if not path.is_dir():
+        reject("worktree_path is not a directory")
+    try:
+        verified_head = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        reject(f"unable to verify git worktree: {exc}")
+    if verified_head.lower() != head_sha.lower():
+        reject("worktree HEAD does not match exact head_sha")
+    if dirty:
+        reject("worktree is dirty")
+
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        reject(f"task {task_id} not found")
+    if row["status"] != "done":
+        reject(f"task must be done; current status is {row['status']!r}")
+    if row["current_run_id"] is not None or row["claim_lock"] is not None or row["worker_pid"] is not None:
+        reject("task has a live claim or current writer")
+
+    run = conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'completed' AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if run is None:
+        reject("completed implementation evidence is absent")
+    try:
+        run_metadata = json.loads(run["metadata"] or "null")
+    except (TypeError, json.JSONDecodeError):
+        run_metadata = None
+    if not isinstance(run_metadata, dict):
+        reject("completed implementation evidence metadata is malformed")
+    if not run_metadata.get("changed_files") or "tests_run" not in run_metadata:
+        reject("completed implementation evidence requires changed_files and tests_run")
+
+    try:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'review' WHERE id = ? AND status = 'done' "
+                "AND current_run_id IS NULL AND claim_lock IS NULL AND worker_pid IS NULL",
+                (task_id,),
+            )
+            if cur.rowcount != 1:
+                raise FrozenHeadReviewError("task state changed while submitting frozen head")
+            _append_event(conn, task_id, "review_submitted_frozen_head", {
+                "route": "frozen_head",
+                "actor": actor,
+                "head_sha": head_sha,
+                "worktree_path": str(path.resolve()),
+                "evidence": evidence,
+                "implementation_run_id": int(run["id"]),
+            }, run_id=int(run["id"]))
+    except FrozenHeadReviewError as exc:
+        reject(str(exc))
+    return True
 
 
 def complete_task(
