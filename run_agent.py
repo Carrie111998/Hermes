@@ -367,6 +367,57 @@ def _safe_session_filename_component(session_id: str) -> str:
     return f"{sanitized}_{digest}"
 
 
+def _apply_run_terminal_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the exact terminal truth for one agent invocation.
+
+    Conversation sessions intentionally remain open across user messages. The
+    per-run receipt is the terminal boundary: every returned invocation is
+    ``done``, ``blocked``, or ``failed`` and separately reports whether a
+    visible final was generated. Platform delivery proof is added later by the
+    gateway and must never be inferred from generation alone.
+    """
+
+    reason = str(
+        result.get("turn_exit_reason")
+        or result.get("failure_reason")
+        or ""
+    ).strip()
+    final_response = result.get("final_response")
+    final_generated = bool(
+        isinstance(final_response, str)
+        and final_response.strip()
+        and final_response.strip() != "(empty)"
+    )
+    reason_lower = reason.lower()
+    if (
+        result.get("guardrail") is not None
+        or "guardrail" in reason_lower
+        or (
+            "approval" in reason_lower
+            and ("denied" in reason_lower or "rejected" in reason_lower)
+        )
+    ):
+        terminal_state = "blocked"
+    elif (
+        result.get("failed") is True
+        or result.get("interrupted") is True
+        or result.get("completed") is False
+        or not final_generated
+    ):
+        terminal_state = "failed"
+    else:
+        terminal_state = "done"
+
+    result["run_terminal_state"] = terminal_state
+    result["run_ended_at"] = time.time()
+    result["run_end_reason"] = (
+        reason
+        or ("completed" if terminal_state == "done" else terminal_state)
+    )
+    result["final_generated"] = final_generated
+    return result
+
+
 class _StreamErrorEvent(Exception):
     """Synthesized provider error surfaced from a Responses ``error`` SSE frame.
 
@@ -2150,6 +2201,7 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                platform_message_id = msg.get("platform_message_id")
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
@@ -2163,6 +2215,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    platform_message_id=platform_message_id,
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
                     display_kind=(
@@ -7018,6 +7071,7 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
@@ -7037,6 +7091,7 @@ class AIAgent:
             finish_task_run,
             start_task_run,
         )
+        from agent.request_phase import push_turn_policy, reset_turn_policy
         from agent.subagent_lifecycle import bind_subagent_parent
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
@@ -7058,10 +7113,18 @@ class AIAgent:
         relay_turn = None
         token = None
         acct_token = None
+        phase_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
         try:
+            phase_token = push_turn_policy(
+                persist_user_message
+                if persist_user_message is not None
+                else user_message,
+                cwd=getattr(self, "session_cwd", None),
+                prior_context=conversation_history,
+            )
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
                 session_id=task_context["session_id"],
@@ -7109,14 +7172,22 @@ class AIAgent:
                     stream_callback,
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
+                    persist_user_platform_message_id=(
+                        persist_user_platform_message_id
+                    ),
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                 )
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "Agent run returned without a structured terminal result."
+                )
+            result = _apply_run_terminal_receipt(result)
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
-            elif terminal.get("failed") is True:
+            elif terminal.get("run_terminal_state") in {"blocked", "failed"}:
                 relay_outcome = "failed"
             else:
                 relay_outcome = "success"
@@ -7159,6 +7230,8 @@ class AIAgent:
                 finally:
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
+                    if phase_token is not None:
+                        reset_turn_policy(phase_token)
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
                     if token is not None:

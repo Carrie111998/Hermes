@@ -33,8 +33,9 @@ ambiguous sends):
 Poison rows cannot spin: attempts are capped, stale rows expire, and both
 transition to ``abandoned`` (kept briefly for inspection, then pruned).
 
-Everything here is best-effort by design: ledger failures must never block
-or delay an actual send. Callers wrap every call in try/except.
+The generated and attempting checkpoints are a precondition for a turn-final
+platform effect. Callers fail closed before send when either checkpoint cannot
+be persisted; an untracked final is not an acceptable recovery strategy.
 """
 
 from __future__ import annotations
@@ -223,14 +224,36 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def delivery_result_is_unknown(result: Any) -> bool:
+    """Return true when a final-send effect may exist without an ACK.
+
+    Unknown outcomes are never evidence of failure and therefore must remain
+    in ``attempting``. Recovery can then make any later retry visible instead
+    of silently producing a duplicate.
+    """
+
+    if result is None:
+        return True
+    error_kind = str(getattr(result, "error_kind", "") or "").strip().lower()
+    if error_kind == "unknown":
+        return True
+    error = str(getattr(result, "error", None) or result).lower()
+    name = result.__class__.__name__.lower()
+    return "timeout" in error or "timed out" in error or "timeout" in name
+
+
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
                WHERE obligation_id=?""",
             (state, time.time(), error[:500] if error else None, obligation_id),
         )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                "delivery obligation state update matched no durable row"
+            )
 
 
 def sweep_recoverable(

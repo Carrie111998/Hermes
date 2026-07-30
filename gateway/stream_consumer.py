@@ -54,6 +54,14 @@ _COMMENTARY = object()
 _FLUSH = object()
 
 
+class _FinalDeliveryOutcomeUnknown(RuntimeError):
+    """A prior final send may have landed; never retry it silently."""
+
+
+class _FinalDeliveryLedgerUnavailable(RuntimeError):
+    """A turn-final send is blocked until its durable checkpoints exist."""
+
+
 def escape_code_fences_for_display(text: str) -> str:
     """Escape triple-backtick markers so text can be safely wrapped
     inside an outer ``` code block without breaking the fence.
@@ -199,6 +207,10 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        delivery_session_key: Optional[str] = None,
+        delivery_message_ref: Optional[str] = None,
+        delivery_platform: Optional[str] = None,
+        delivery_thread_id: Optional[str] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -302,6 +314,45 @@ class GatewayStreamConsumer:
         self._draft_failures = 0
         self._before_finalize_notified = False
 
+        # Durable final-delivery proof.  Streaming normally sends the final
+        # assistant reply from this consumer and causes the outer gateway
+        # producer to return ``None``.  Carry the turn identity here so that
+        # path uses the same pending -> attempting -> delivered/failed ledger
+        # contract as the non-streaming producer.
+        self._delivery_session_key = (
+            delivery_session_key.strip()
+            if isinstance(delivery_session_key, str)
+            and delivery_session_key.strip()
+            else None
+        )
+        self._delivery_message_ref = (
+            delivery_message_ref
+            if isinstance(delivery_message_ref, str)
+            and delivery_message_ref
+            and delivery_message_ref.strip() == delivery_message_ref
+            else None
+        )
+        platform_value = delivery_platform
+        if platform_value is None:
+            platform_value = getattr(adapter, "platform", None)
+        platform_value = getattr(platform_value, "value", platform_value)
+        self._delivery_platform = (
+            str(platform_value).strip() if platform_value is not None else ""
+        )
+        if delivery_thread_id is None and isinstance(self.metadata, dict):
+            delivery_thread_id = (
+                self.metadata.get("thread_id")
+                or self.metadata.get("direct_messages_topic_id")
+            )
+        self._delivery_thread_id = (
+            str(delivery_thread_id) if delivery_thread_id is not None else None
+        )
+        self._delivery_obligation_id: Optional[str] = None
+        self._delivery_obligation_content = ""
+        self._delivery_ledger_state = ""
+        self._final_delivery_outcome_unknown = False
+        self._final_delivery_ledger_error = ""
+
     def _metadata_for_send(
         self,
         *,
@@ -349,6 +400,18 @@ class GatewayStreamConsumer:
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
 
+    @property
+    def final_delivery_outcome_unknown(self) -> bool:
+        """True when a final send started but platform ACK is unknown."""
+
+        return self._final_delivery_outcome_unknown
+
+    @property
+    def final_delivery_ledger_error(self) -> str:
+        """Exact reason a turn-final send was blocked before platform I/O."""
+
+        return self._final_delivery_ledger_error
+
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
         if self._before_finalize_notified:
@@ -362,6 +425,230 @@ class GatewayStreamConsumer:
                 await result
         except Exception:
             pass
+
+    def _prepare_final_delivery_obligation(self, content: str) -> bool:
+        """Durably record one exact turn-final response before its first send.
+
+        Overflow and fallback paths can use several platform calls for one
+        answer.  The first call records the complete answer, and every later
+        call advances that same obligation rather than creating per-chunk rows.
+        """
+
+        if self._delivery_obligation_id is not None:
+            return True
+        if not (
+            self._delivery_session_key
+            and self._delivery_message_ref
+            and self._delivery_platform
+            and isinstance(content, str)
+            and content.strip()
+        ):
+            return True
+        try:
+            from gateway.delivery_ledger import (
+                compute_obligation_id,
+                ledger_enabled,
+                record_obligation,
+            )
+
+            if not ledger_enabled():
+                return True
+            obligation_id = compute_obligation_id(
+                self._delivery_session_key,
+                self._delivery_message_ref,
+                content,
+            )
+            record_obligation(
+                obligation_id=obligation_id,
+                session_key=self._delivery_session_key,
+                platform=self._delivery_platform,
+                chat_id=str(self.chat_id),
+                thread_id=self._delivery_thread_id,
+                content=content,
+            )
+        except Exception:
+            self._final_delivery_ledger_error = (
+                "Final delivery was blocked before send because Hermes could "
+                "not durably record the generated response."
+            )
+            logger.error(
+                "stream final delivery ledger record failed; blocking send",
+                exc_info=True,
+            )
+            return False
+        self._delivery_obligation_id = obligation_id
+        self._delivery_obligation_content = content
+        self._delivery_ledger_state = "pending"
+        self._final_delivery_ledger_error = ""
+        return True
+
+    def _mark_final_delivery_attempting(self) -> bool:
+        """Checkpoint immediately before a turn-final platform await."""
+
+        if self._delivery_obligation_id is None:
+            return True
+        if self._delivery_ledger_state == "delivered":
+            return True
+        try:
+            from gateway.delivery_ledger import mark_attempting
+
+            mark_attempting(self._delivery_obligation_id)
+            self._delivery_ledger_state = "attempting"
+            self._final_delivery_ledger_error = ""
+            return True
+        except Exception:
+            self._final_delivery_ledger_error = (
+                "Final delivery was blocked before send because Hermes could "
+                "not durably mark the delivery attempt."
+            )
+            logger.error(
+                "stream final delivery ledger attempting update failed; "
+                "blocking send",
+                exc_info=True,
+            )
+            return False
+
+    def _note_final_delivery_result(self, result: Any) -> None:
+        """Record a definitive rejection, preserving ambiguous attempts."""
+
+        if (
+            self._delivery_obligation_id is None
+            or self._delivery_ledger_state == "delivered"
+            or getattr(result, "success", False)
+        ):
+            return
+        if self._final_delivery_result_is_ambiguous(result):
+            self._preserve_unknown_final_delivery()
+            return
+        try:
+            from gateway.delivery_ledger import mark_failed
+
+            mark_failed(
+                self._delivery_obligation_id,
+                str(getattr(result, "error", "") or ""),
+            )
+            self._delivery_ledger_state = "failed"
+        except Exception:
+            logger.debug(
+                "stream final delivery ledger failure update failed",
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _final_delivery_result_is_ambiguous(result: Any) -> bool:
+        """Treat timeout and explicitly unknown results as ambiguous."""
+
+        from gateway.delivery_ledger import delivery_result_is_unknown
+
+        return delivery_result_is_unknown(result)
+
+    def _preserve_unknown_final_delivery(self) -> None:
+        """Suppress unmarked retries while the durable row stays attempting."""
+
+        self._final_delivery_outcome_unknown = True
+        # This is only a duplicate-suppression signal.  Do not reuse
+        # ``final_content_delivered`` here: a timeout means the platform may
+        # have accepted the request, not that delivery was confirmed.  The
+        # outer gateway suppresses a silent retry via the explicit unknown
+        # flag while the ledger remains ``attempting`` for visible recovery.
+        self._already_sent = True
+
+    def _confirm_final_delivery(self) -> None:
+        """Mark the complete final response delivered after exact success."""
+
+        if (
+            self._delivery_obligation_id is None
+            or self._delivery_ledger_state == "delivered"
+        ):
+            return
+        try:
+            from gateway.delivery_ledger import mark_delivered
+
+            mark_delivered(self._delivery_obligation_id)
+            self._delivery_ledger_state = "delivered"
+        except Exception:
+            logger.debug(
+                "stream final delivery ledger delivered update failed",
+                exc_info=True,
+            )
+
+    async def _await_platform_delivery(
+        self,
+        operation: Callable[[], Any],
+        *,
+        turn_final: bool,
+        final_content: str,
+    ) -> Any:
+        """Await one platform effect under the final-delivery ledger contract."""
+
+        if not turn_final:
+            return await operation()
+        if not self._prepare_final_delivery_obligation(final_content):
+            raise _FinalDeliveryLedgerUnavailable(
+                self._final_delivery_ledger_error
+            )
+        if self._final_delivery_outcome_unknown:
+            raise _FinalDeliveryOutcomeUnknown(
+                "prior final delivery outcome is unknown; refusing a silent retry"
+            )
+        if not self._mark_final_delivery_attempting():
+            raise _FinalDeliveryLedgerUnavailable(
+                self._final_delivery_ledger_error
+            )
+        try:
+            result = await operation()
+        except BaseException:
+            # The platform may have accepted an interrupted/timed-out request.
+            # Keep the durable row in ``attempting`` for honest recovery.
+            if self._delivery_obligation_id is not None:
+                self._preserve_unknown_final_delivery()
+            raise
+        self._note_final_delivery_result(result)
+        return result
+
+    async def replace_final_with_delivery_proof(
+        self,
+        *,
+        message_id: str,
+        content: str,
+    ) -> Any:
+        """Replace a streamed final under a receipt for the exact new content.
+
+        Output-transform hooks can change the final text after the original
+        streamed answer was delivered. That transformed answer is a distinct
+        delivery obligation: reusing the original content hash would make the
+        receipt claim proof for text it never covered.
+        """
+
+        if self._final_delivery_outcome_unknown:
+            raise _FinalDeliveryOutcomeUnknown(
+                "prior final delivery outcome is unknown; refusing a "
+                "transformed edit that could create an unmarked duplicate"
+            )
+
+        if content != self._delivery_obligation_content:
+            self._delivery_obligation_id = None
+            self._delivery_obligation_content = ""
+            self._delivery_ledger_state = ""
+            self._final_delivery_ledger_error = ""
+            self._final_response_sent = False
+            self._final_content_delivered = False
+
+        result = await self._await_platform_delivery(
+            lambda: self._edit_message(
+                message_id=message_id,
+                content=content,
+                finalize=True,
+            ),
+            turn_final=True,
+            final_content=content,
+        )
+        if getattr(result, "success", False):
+            self._last_sent_text = content
+            self._final_response_sent = True
+            self._final_content_delivered = True
+            self._confirm_final_delivery()
+        return result
 
     async def _edit_message(
         self,
@@ -763,6 +1050,11 @@ class GatewayStreamConsumer:
                     ):
                         await self._suppress_silence_marker()
                         return
+                    self._prepare_final_delivery_obligation(
+                        ensure_closed_code_fences(
+                            self._clean_for_display(self._accumulated)
+                        )
+                    )
 
                 # Decide whether to flush an edit
                 now = time.monotonic()
@@ -873,6 +1165,7 @@ class GatewayStreamConsumer:
                             self._final_response_sent = chunks_delivered and tail_delivered
                             if self._final_response_sent:
                                 self._final_content_delivered = True
+                                self._confirm_final_delivery()
                             return
                         if got_segment_break:
                             self._message_id = None
@@ -964,6 +1257,7 @@ class GatewayStreamConsumer:
                             # edit here would duplicate the message / re-delete,
                             # so just record delivery and stop.
                             self._final_content_delivered = True
+                            self._confirm_final_delivery()
                         elif (
                             current_update_visible
                             and (
@@ -983,6 +1277,7 @@ class GatewayStreamConsumer:
                             # on screen.
                             self._final_response_sent = True
                             self._final_content_delivered = True
+                            self._confirm_final_delivery()
                         elif self._message_id:
                             # Either the mid-stream edit didn't run (no
                             # visible update this tick) OR the adapter needs
@@ -992,6 +1287,7 @@ class GatewayStreamConsumer:
                             )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
+                                self._confirm_final_delivery()
                             elif self._fallback_final_send:
                                 # The final edit attempt itself may be the one
                                 # that exhausts flood-control strikes and
@@ -1002,9 +1298,13 @@ class GatewayStreamConsumer:
                                 # not duplicate the visible prefix.
                                 await self._send_fallback_final(self._accumulated)
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(
+                                self._accumulated,
+                                finalize=True,
+                            )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
+                                self._confirm_final_delivery()
                     return
 
                 if commentary_text is not None:
@@ -1063,7 +1363,11 @@ class GatewayStreamConsumer:
             # is_turn_final=False keeps _try_fresh_final from setting
             # _final_response_sent itself; this handler owns the flags.
             _best_effort_ok = False
-            if self._accumulated and self._message_id:
+            if (
+                not self._final_delivery_outcome_unknown
+                and self._accumulated
+                and self._message_id
+            ):
                 try:
                     _best_effort_ok = bool(
                         await self._send_or_edit(
@@ -1141,11 +1445,18 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
-            result = await self.adapter.send(
-                chat_id=self.chat_id,
-                content=text,
-                reply_to=reply_to_id,
-                metadata=self._metadata_for_send(final=final, expect_edits=True),
+            result = await self._await_platform_delivery(
+                lambda: self.adapter.send(
+                    chat_id=self.chat_id,
+                    content=text,
+                    reply_to=reply_to_id,
+                    metadata=self._metadata_for_send(
+                        final=final,
+                        expect_edits=True,
+                    ),
+                ),
+                turn_final=final,
+                final_content=self._delivery_obligation_content or text,
             )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
@@ -1308,10 +1619,15 @@ class GatewayStreamConsumer:
                     and self._last_sent_text.endswith(self.cfg.cursor)
                 ):
                     clean_text = self._last_sent_text[:-len(self.cfg.cursor)]
+                    message_id = self._message_id
                     try:
-                        result = await self._edit_message(
-                            message_id=self._message_id,
-                            content=clean_text,
+                        result = await self._await_platform_delivery(
+                            lambda: self._edit_message(
+                                message_id=message_id,
+                                content=clean_text,
+                            ),
+                            turn_final=True,
+                            final_content=final_text,
                         )
                         if result.success:
                             self._last_sent_text = clean_text
@@ -1320,6 +1636,7 @@ class GatewayStreamConsumer:
                 self._already_sent = True
                 self._final_response_sent = True
                 self._final_content_delivered = True
+                self._confirm_final_delivery()
                 return
 
         raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
@@ -1348,10 +1665,14 @@ class GatewayStreamConsumer:
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=chunk,
-                    metadata=self._metadata_for_send(final=True),
+                result = await self._await_platform_delivery(
+                    lambda: self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=chunk,
+                        metadata=self._metadata_for_send(final=True),
+                    ),
+                    turn_final=True,
+                    final_content=final_text,
                 )
                 if result.success:
                     break
@@ -1422,6 +1743,7 @@ class GatewayStreamConsumer:
         self._already_sent = True
         self._final_response_sent = True
         self._final_content_delivered = True
+        self._confirm_final_delivery()
         self._last_sent_text = chunks[-1]
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
@@ -1443,10 +1765,14 @@ class GatewayStreamConsumer:
         result = None
         for attempt in range(2):
             try:
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=final_text,
-                    metadata=self._metadata_for_send(final=True),
+                result = await self._await_platform_delivery(
+                    lambda: self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=final_text,
+                        metadata=self._metadata_for_send(final=True),
+                    ),
+                    turn_final=True,
+                    final_content=final_text,
                 )
             except Exception as exc:
                 logger.debug("Empty fallback final send failed: %s", exc)
@@ -1492,6 +1818,7 @@ class GatewayStreamConsumer:
         self._already_sent = True
         self._final_response_sent = True
         self._final_content_delivered = True
+        self._confirm_final_delivery()
         self._last_sent_text = final_text
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
@@ -1818,10 +2145,14 @@ class GatewayStreamConsumer:
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
         try:
-            result = await self.adapter.send(
-                chat_id=self.chat_id,
-                content=text,
-                metadata=self._metadata_for_send(final=True),
+            result = await self._await_platform_delivery(
+                lambda: self.adapter.send(
+                    chat_id=self.chat_id,
+                    content=text,
+                    metadata=self._metadata_for_send(final=True),
+                ),
+                turn_final=is_turn_final,
+                final_content=text,
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -1864,6 +2195,7 @@ class GatewayStreamConsumer:
         self._last_sent_text = text
         if is_turn_final:
             self._final_response_sent = True
+            self._confirm_final_delivery()
         return True
 
     async def _suppress_silence_marker(self) -> None:
@@ -1988,6 +2320,7 @@ class GatewayStreamConsumer:
         self._last_edit_overflowed = False
         try:
             if self._message_id is not None:
+                message_id = self._message_id
                 if self._edit_supported:
                     # Skip if text is identical to what we last sent.
                     # Exception: adapters that require an explicit finalize
@@ -2054,10 +2387,14 @@ class GatewayStreamConsumer:
                     ):
                         return True
                     # Edit existing message
-                    result = await self._edit_message(
-                        message_id=self._message_id,
-                        content=text,
-                        finalize=finalize,
+                    result = await self._await_platform_delivery(
+                        lambda: self._edit_message(
+                            message_id=message_id,
+                            content=text,
+                            finalize=finalize,
+                        ),
+                        turn_final=finalize and is_turn_final,
+                        final_content=text,
                     )
                     if result.success:
                         self._already_sent = True
@@ -2088,6 +2425,8 @@ class GatewayStreamConsumer:
                             self._notify_new_message()
                         else:
                             self._last_sent_text = text
+                        if finalize and is_turn_final:
+                            self._confirm_final_delivery()
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
                         return True
@@ -2205,14 +2544,18 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    reply_to=self._initial_reply_to_id,
-                    metadata=self._metadata_for_send(
-                        final=finalize,
-                        expect_edits=True,
+                result = await self._await_platform_delivery(
+                    lambda: self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=text,
+                        reply_to=self._initial_reply_to_id,
+                        metadata=self._metadata_for_send(
+                            final=finalize,
+                            expect_edits=True,
+                        ),
                     ),
+                    turn_final=finalize and is_turn_final,
+                    final_content=text,
                 )
                 if result.success:
                     if result.message_id:
@@ -2240,6 +2583,8 @@ class GatewayStreamConsumer:
                     # gets closed off — the next tool fires into a new
                     # bubble below, preserving chronological order.
                     self._notify_new_message()
+                    if finalize and is_turn_final:
+                        self._confirm_final_delivery()
                     return True
                 else:
                     # Initial send failed — disable streaming for this session

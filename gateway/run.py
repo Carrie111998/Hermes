@@ -79,6 +79,198 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+
+def _required_inbound_platform_message_id(event: Any) -> Optional[str]:
+    """Return Telegram's exact inbound message ID or fail closed.
+
+    Internal synthetic events are not owner instructions and therefore carry
+    no platform provenance obligation. For authenticated inbound Telegram
+    events, only the event field is accepted: reply anchors, update IDs, source
+    metadata, and generated IDs are intentionally not substitutes.
+    """
+    if bool(getattr(event, "internal", False)):
+        return None
+
+    source = getattr(event, "source", None)
+    platform = getattr(source, "platform", None)
+    platform_name = getattr(platform, "value", platform)
+    if str(platform_name or "").lower() != "telegram":
+        return None
+
+    message_id = getattr(event, "message_id", None)
+    if (
+        not isinstance(message_id, str)
+        or not message_id
+        or message_id.strip() != message_id
+    ):
+        raise RuntimeError(
+            "Telegram turn blocked because its original message ID is unavailable."
+        )
+    return message_id
+
+
+def _delivery_message_ref(
+    platform_message_id: Optional[str],
+    reply_anchor: Optional[str],
+    *,
+    session_id: Optional[str],
+    run_generation: Optional[int],
+) -> str:
+    """Return a stable per-run ledger key without inventing provenance.
+
+    Real inbound message IDs remain the first choice. Internal continuations
+    deliberately have no platform provenance, so they use the durable session
+    identity plus its monotonic run generation. This keeps delivery proof
+    complete without feeding a synthetic message ID back to platform reply
+    routing.
+    """
+
+    for candidate in (platform_message_id, reply_anchor):
+        if isinstance(candidate, str) and candidate.strip() == candidate and candidate:
+            return candidate
+    stable_session = str(session_id or "unknown-session")
+    stable_generation = int(run_generation or 0)
+    return f"internal:{stable_session}:{stable_generation}"
+
+
+def _delivery_result_is_unknown(result: Any) -> bool:
+    """Return True when a send may have reached the platform without an ACK."""
+
+    from gateway.delivery_ledger import delivery_result_is_unknown
+
+    return delivery_result_is_unknown(result)
+
+
+def _apply_stream_final_delivery_status(
+    response: dict[str, Any],
+    *,
+    has_final: bool,
+    transformed: bool,
+    outcome_unknown: bool,
+    delivery_confirmed: bool,
+    ledger_error: str = "",
+) -> Optional[str]:
+    """Record stream delivery truth while preserving duplicate suppression.
+
+    An ambiguous platform timeout must suppress an automatic resend, but it is
+    not evidence that the final reached the user.  Keep that state distinct
+    from confirmed delivery in the task result so generated, unknown, and
+    delivered outcomes cannot collapse into the same receipt.
+    """
+
+    if not has_final:
+        return None
+    if ledger_error:
+        response["final_delivery_status"] = "failed"
+        response["final_delivery_error"] = ledger_error
+        return "failed"
+    if outcome_unknown:
+        response["already_sent"] = True
+        response["final_delivery_status"] = "unknown"
+        return "unknown"
+    if not transformed and delivery_confirmed:
+        response["already_sent"] = True
+        response["final_delivery_status"] = "delivered"
+        return "delivered"
+    return None
+
+
+async def _send_final_with_delivery_proof(
+    *,
+    adapter: Any,
+    chat_id: str,
+    content: str,
+    metadata: Optional[dict],
+    session_key: str,
+    message_ref: str,
+    platform: Any,
+    thread_id: Optional[str],
+) -> Any:
+    """Send one generated final under the durable delivery-ledger contract."""
+
+    obligation_id = None
+    ledger_error = ""
+    ledger_error_detail = ""
+    try:
+        from gateway.delivery_ledger import (
+            compute_obligation_id,
+            ledger_enabled,
+            mark_attempting,
+            record_obligation,
+        )
+
+        if ledger_enabled():
+            platform_value = getattr(platform, "value", platform)
+            obligation_id = compute_obligation_id(
+                session_key,
+                message_ref,
+                content,
+            )
+            record_obligation(
+                obligation_id=obligation_id,
+                session_key=session_key,
+                platform=str(platform_value),
+                chat_id=str(chat_id),
+                thread_id=str(thread_id) if thread_id is not None else None,
+                content=content,
+            )
+            mark_attempting(obligation_id)
+    except Exception as exc:
+        ledger_error = (
+            "Final delivery was blocked before send because Hermes could not "
+            "persist its generated/attempting delivery receipt."
+        )
+        ledger_error_detail = type(exc).__name__
+        logging.getLogger(__name__).error(
+            "queued final delivery ledger checkpoint failed; blocking send",
+            exc_info=True,
+        )
+        obligation_id = None
+    if ledger_error:
+        from gateway.platforms.base import SendResult
+
+        return SendResult(
+            success=False,
+            error=f"{ledger_error} ({ledger_error_detail})",
+            error_kind="transient",
+            retryable=True,
+        )
+
+    try:
+        # One platform attempt only. Base adapter retries are useful for
+        # clearly rejected transient errors, but a timeout can mean the
+        # platform accepted the message without returning an ACK. Retrying
+        # that outcome here would create an unmarked duplicate.
+        result = await adapter.send(
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata,
+        )
+    except BaseException:
+        # The platform may have accepted the request before the await failed.
+        # Leave the row attempting so recovery is visibly marked.
+        raise
+
+    if obligation_id is not None:
+        try:
+            from gateway.delivery_ledger import mark_delivered, mark_failed
+
+            if getattr(result, "success", False):
+                mark_delivered(obligation_id)
+            elif not _delivery_result_is_unknown(result):
+                mark_failed(
+                    obligation_id,
+                    str(getattr(result, "error", "") or "send rejected"),
+                )
+            # Unknown outcomes deliberately remain attempting.
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "queued final delivery ledger update failed",
+                exc_info=True,
+            )
+    return result
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -864,6 +1056,58 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _bounded_progress_interval(value: float) -> Optional[float]:
+    """Return the enabled heartbeat cadence, capped at the operator SLA."""
+
+    return min(float(value), 90.0) if value > 0 else None
+
+
+async def _deliver_progress_receipt_after_interval(
+    *,
+    interval: float,
+    adapter: Any,
+    chat_id: str,
+    should_emit: Callable[[], bool],
+    build_content: Callable[[], str],
+    metadata: Optional[dict],
+    message_id: Optional[str] = None,
+) -> tuple[bool, Any, Optional[str]]:
+    """Wait one cadence and deliver one visible long-run receipt.
+
+    The return tuple is ``(run_still_active, send_result, message_id)``. A
+    supported platform edits the prior heartbeat in place; otherwise this
+    sends one new receipt. Keeping the sleep and effect in one testable seam
+    proves the configured 90-second policy reaches a real adapter call.
+    """
+
+    await asyncio.sleep(interval)
+    if not should_emit():
+        return False, None, message_id
+
+    content = build_content()
+    result = None
+    if message_id:
+        try:
+            result = await adapter.edit_message(
+                chat_id,
+                message_id,
+                content,
+            )
+        except Exception as exc:
+            logger.debug("Heartbeat edit failed: %s", exc)
+            result = None
+    if not (result and getattr(result, "success", False)):
+        result = await adapter.send(
+            chat_id,
+            content,
+            metadata=metadata,
+        )
+    next_message_id = message_id
+    if getattr(result, "success", False) and getattr(result, "message_id", None):
+        next_message_id = str(result.message_id)
+    return True, result, next_message_id
 
 
 def _is_fresh_gateway_interruption(
@@ -4192,6 +4436,19 @@ class TurnRunner:
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
+                        delivery_session_key=ctx.session_key,
+                        delivery_message_ref=_delivery_message_ref(
+                            ctx.persist_user_platform_message_id,
+                            ctx.event_message_id,
+                            session_id=ctx.session_id,
+                            run_generation=ctx.run_generation,
+                        ),
+                        delivery_platform=getattr(
+                            ctx.source.platform,
+                            "value",
+                            ctx.source.platform,
+                        ),
+                        delivery_thread_id=ctx.source.thread_id,
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -5082,6 +5339,10 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.persist_user_platform_message_id is not None:
+                _conversation_kwargs["persist_user_platform_message_id"] = (
+                    ctx.persist_user_platform_message_id
+                )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -7473,6 +7734,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         best-effort status re-write. In-flight turns are NOT interrupted (the
         whole point is to let them finish); only NEW turns are refused.
         """
+        from agent.request_phase import suspend_local_mutations
+
+        suspend_local_mutations("gateway external drain")
         if self._external_drain_active:
             return
         self._external_drain_active = True
@@ -7504,6 +7768,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "to running (shutdown takes precedence)."
             )
             return
+        from agent.request_phase import resume_local_mutations
+
+        resume_local_mutations()
         logger.info(
             "External drain RELEASED (.drain_request.json removed) — "
             "re-accepting new turns; gateway_state -> running."
@@ -11911,6 +12178,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         service_restart: bool = False,
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
+        from agent.request_phase import suspend_local_mutations
+
+        # Freeze only local source/skill effects. Business/provider calls that
+        # are already in flight may still finish during the bounded drain.
+        suspend_local_mutations("gateway shutdown/drain")
         # getattr-guard: shutdown-path tests build bare runners via
         # object.__new__ that lack the liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
@@ -15498,6 +15770,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        persist_user_platform_message_id = (
+            _required_inbound_platform_message_id(event)
+        )
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -16667,6 +16942,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_platform_message_id=(
+                    persist_user_platform_message_id
+                ),
                 message_type=event.message_type,
             )
 
@@ -17970,6 +18248,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    # Goal continuation is generated by Hermes after an
+                    # authenticated turn; it has no new Telegram message ID
+                    # and must use the explicit internal-event path.
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -22697,6 +22979,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        persist_user_platform_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -22813,6 +23096,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        delivery_session_key=session_key,
+                        delivery_message_ref=_delivery_message_ref(
+                            persist_user_platform_message_id,
+                            event_message_id,
+                            session_id=session_id,
+                            run_generation=run_generation,
+                        ),
+                        delivery_platform=getattr(
+                            source.platform,
+                            "value",
+                            source.platform,
+                        ),
+                        delivery_thread_id=source.thread_id,
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -22976,6 +23272,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -22995,6 +23292,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_platform_message_id=(
+                    persist_user_platform_message_id
+                ),
                 message_type=message_type,
             )
 
@@ -23007,6 +23307,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_platform_message_id=(
+                    persist_user_platform_message_id
+                ),
                 message_type=message_type,
             )
 
@@ -23129,6 +23432,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -23145,6 +23449,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if persist_user_platform_message_id is not None:
+                if (
+                    not isinstance(persist_user_platform_message_id, str)
+                    or not persist_user_platform_message_id
+                    or persist_user_platform_message_id.strip()
+                    != persist_user_platform_message_id
+                ):
+                    raise RuntimeError(
+                        "Required inbound platform provenance is not one exact message ID."
+                    )
+                if self._session_db is None:
+                    raise RuntimeError(
+                        "Required inbound platform provenance could not be persisted."
+                    )
+                persisted_content = (
+                    persist_user_message
+                    if persist_user_message is not None
+                    else message
+                )
+                try:
+                    already_persisted = await self._session_db.has_platform_message_id(
+                        session_id,
+                        persist_user_platform_message_id,
+                    )
+                    if not already_persisted:
+                        await self._session_db.append_message(
+                            session_id=session_id,
+                            role="user",
+                            content=persisted_content,
+                            platform_message_id=persist_user_platform_message_id,
+                            timestamp=persist_user_timestamp,
+                        )
+                    provenance_persisted = (
+                        await self._session_db.has_platform_message_id(
+                            session_id,
+                            persist_user_platform_message_id,
+                        )
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Required inbound platform provenance could not be persisted."
+                    ) from exc
+                if not provenance_persisted:
+                    raise RuntimeError(
+                        "Required inbound platform provenance could not be read back."
+                    )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -23154,6 +23504,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                persist_user_platform_message_id=(
+                    persist_user_platform_message_id
+                ),
             )
 
         from run_agent import AIAgent
@@ -23414,6 +23767,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            persist_user_platform_message_id=(
+                persist_user_platform_message_id
+            ),
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -23782,10 +24138,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Periodic "still working" notifications for long-running tasks.
         # Fires every N seconds so the user knows the agent hasn't died.
         # Config: agent.gateway_notify_interval in config.yaml, or
-        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
+        # HERMES_AGENT_NOTIFY_INTERVAL env var. Default 90s.
         # 0 = disable notifications.
-        _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 90)
+        # A configured slower cadence must not recreate the silent-run failure
+        # this heartbeat closes. Preserve 0 as the explicit off switch, but
+        # cap every enabled interval at the 90-second operator receipt SLA.
+        _NOTIFY_INTERVAL = _bounded_progress_interval(_NOTIFY_INTERVAL_RAW)
         _long_running_mode = _display_surface_mode(
             "long_running_notifications",
             default=True,
@@ -23807,22 +24166,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # interval. Falls back to send-new when edit fails or isn't
             # supported by the adapter.
             _heartbeat_msg_id: Optional[str] = None
-            while True:
-                await asyncio.sleep(_NOTIFY_INTERVAL)
-                # Stop heartbeating once this run no longer owns the session
-                # slot or the executor has finished — otherwise a stale
-                # "running: delegate_task" bubble can outlive the run that
-                # spawned it (#12029). _executor_task is a closure var bound
-                # just after this task is scheduled; tolerate the brief window
-                # before then (the first wake is _NOTIFY_INTERVAL away anyway).
+
+            def _run_still_active() -> bool:
+                # _executor_task is bound just after the notifier is
+                # scheduled. The first callback is one full interval later.
                 try:
                     _exec_ref = _executor_task
                 except NameError:
                     _exec_ref = None
-                if not self._should_emit_long_running_notification(
-                    session_key, agent_holder[0], _exec_ref
-                ):
-                    break
+                return self._should_emit_long_running_notification(
+                    session_key,
+                    agent_holder[0],
+                    _exec_ref,
+                )
+
+            def _heartbeat_content() -> str:
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
                 # Include agent activity context if available. Default
                 # heartbeat is terse: elapsed + current tool. Verbose
@@ -23846,42 +24204,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _parts.append(
                                 f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
                             )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
+                        _action = _a.get("current_tool") or _a.get(
+                            "last_activity_desc"
+                        )
                         if _action:
                             _parts.append(str(_action))
                         if _parts:
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = (
+                return (
                     _generic_status_phrase("status")
                     if _long_running_mode == "generic"
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
+
+            while True:
                 try:
-                    _notify_res = None
-                    if _heartbeat_msg_id:
-                        try:
-                            _notify_res = await _notify_adapter.edit_message(
-                                source.chat_id,
-                                _heartbeat_msg_id,
-                                _heartbeat_text,
-                            )
-                        except Exception as _ee:
-                            logger.debug("Heartbeat edit failed: %s", _ee)
-                            _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
-                        _notify_res = await _notify_adapter.send(
-                            source.chat_id,
-                            _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
-                        )
-                        if getattr(_notify_res, "success", False) and getattr(
-                            _notify_res, "message_id", None
-                        ):
-                            _heartbeat_msg_id = str(_notify_res.message_id)
-                            if _cleanup_progress:
-                                _cleanup_msg_ids.append(_heartbeat_msg_id)
+                    _prior_heartbeat_id = _heartbeat_msg_id
+                    (
+                        _still_active,
+                        _notify_res,
+                        _heartbeat_msg_id,
+                    ) = await _deliver_progress_receipt_after_interval(
+                        interval=_NOTIFY_INTERVAL,
+                        adapter=_notify_adapter,
+                        chat_id=source.chat_id,
+                        should_emit=_run_still_active,
+                        build_content=_heartbeat_content,
+                        metadata=_non_conversational_metadata(
+                            _status_thread_metadata,
+                            platform=source.platform,
+                        ),
+                        message_id=_heartbeat_msg_id,
+                    )
+                    if not _still_active:
+                        break
+                    if (
+                        _cleanup_progress
+                        and _heartbeat_msg_id
+                        and _heartbeat_msg_id != _prior_heartbeat_id
+                        and getattr(_notify_res, "success", False)
+                    ):
+                        _cleanup_msg_ids.append(_heartbeat_msg_id)
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -24337,9 +24702,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         _intentional_silence = False
+                    _stream_outcome_unknown = bool(
+                        _sc
+                        and getattr(
+                            _sc,
+                            "final_delivery_outcome_unknown",
+                            False,
+                        )
+                    )
                     if _intentional_silence:
                         logger.info(
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
+                            session_key or "?",
+                        )
+                    elif _stream_outcome_unknown:
+                        logger.warning(
+                            "Queued follow-up for session %s: prior final "
+                            "delivery outcome is unknown; preserving its "
+                            "attempting receipt and refusing a silent resend.",
                             session_key or "?",
                         )
                     elif first_response and not _already_streamed:
@@ -24348,11 +24728,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
+                            _first_send_result = await _send_final_with_delivery_proof(
+                                adapter=adapter,
+                                chat_id=source.chat_id,
+                                content=first_response,
                                 metadata=_status_thread_metadata,
+                                session_key=session_key or "",
+                                message_ref=_delivery_message_ref(
+                                    persist_user_platform_message_id,
+                                    event_message_id,
+                                    session_id=session_id,
+                                    run_generation=run_generation,
+                                ),
+                                platform=source.platform,
+                                thread_id=source.thread_id,
                             )
+                            if not getattr(_first_send_result, "success", False):
+                                logger.warning(
+                                    "First response before queued message was "
+                                    "not confirmed delivered: %s",
+                                    getattr(
+                                        _first_send_result,
+                                        "error",
+                                        "send returned success=False",
+                                    ),
+                                )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
@@ -24393,6 +24793,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_source = source
                 next_message = pending
                 next_message_id = None
+                next_platform_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
                 # #60671 — carry the pending event's message_type into the
@@ -24429,6 +24830,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if next_message is None:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
+                    next_platform_message_id = (
+                        _required_inbound_platform_message_id(pending_event)
+                    )
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
 
@@ -24485,6 +24889,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    persist_user_platform_message_id=(
+                        next_platform_message_id
+                    ),
                     message_type=next_message_type,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
@@ -24583,6 +24990,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _content_delivered = bool(
                 _sc and getattr(_sc, "final_content_delivered", False)
             )
+            _delivery_outcome_unknown = bool(
+                _sc
+                and getattr(
+                    _sc,
+                    "final_delivery_outcome_unknown",
+                    False,
+                )
+            )
+            _delivery_ledger_error = str(
+                getattr(_sc, "final_delivery_ledger_error", "") or ""
+            )
             # Plugin hooks (e.g. transform_llm_output) may have appended content
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
@@ -24598,7 +25016,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _final,
                 previewed=_previewed,
             )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            _stream_delivery_status = _apply_stream_final_delivery_status(
+                response,
+                has_final=not _is_empty_sentinel,
+                transformed=_transformed,
+                outcome_unknown=_delivery_outcome_unknown,
+                delivery_confirmed=(_streamed or _content_delivered),
+                ledger_error=_delivery_ledger_error,
+            )
+            if _stream_delivery_status == "failed":
+                logger.error(
+                    "Stream final delivery blocked for session %s: %s",
+                    session_key or "?",
+                    _delivery_ledger_error,
+                )
+            elif _stream_delivery_status == "unknown":
+                logger.warning(
+                    "Suppressing normal final resend for session %s: final "
+                    "delivery outcome is unknown; durable receipt remains "
+                    "attempting and delivery is not reported as confirmed.",
+                    session_key or "?",
+                )
+            elif _stream_delivery_status == "delivered":
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -24606,28 +25045,81 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _previewed,
                     _content_delivered,
                 )
-                response["already_sent"] = True
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
+                    _transformed_edit_result = None
                     try:
-                        await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=_sc_msg_id,
-                            content=response["final_response"],
-                            finalize=True,
-                        )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
+                        _transformed_edit_result = (
+                            await _sc.replace_final_with_delivery_proof(
+                                message_id=_sc_msg_id,
+                                content=response["final_response"],
+                            )
                         )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
                             session_key or "?", _edit_err,
+                        )
+                    _transformed_delivery_status = (
+                        _apply_stream_final_delivery_status(
+                            response,
+                            has_final=True,
+                            transformed=False,
+                            outcome_unknown=bool(
+                                getattr(
+                                    _sc,
+                                    "final_delivery_outcome_unknown",
+                                    False,
+                                )
+                            ),
+                            delivery_confirmed=bool(
+                                _transformed_edit_result
+                                and getattr(
+                                    _transformed_edit_result,
+                                    "success",
+                                    False,
+                                )
+                            ),
+                            ledger_error=str(
+                                getattr(
+                                    _sc,
+                                    "final_delivery_ledger_error",
+                                    "",
+                                )
+                                or ""
+                            ),
+                        )
+                    )
+                    if _transformed_delivery_status == "delivered":
+                        logger.info(
+                            "Edited streamed message %s for session %s to "
+                            "include plugin-transformed content with exact "
+                            "delivery proof.",
+                            _sc_msg_id,
+                            session_key or "?",
+                        )
+                    elif _transformed_delivery_status == "unknown":
+                        logger.warning(
+                            "Transformed final edit outcome is unknown for "
+                            "session %s; refusing an unmarked resend.",
+                            session_key or "?",
+                        )
+                    elif _transformed_delivery_status == "failed":
+                        logger.error(
+                            "Transformed final edit was blocked before send "
+                            "for session %s: %s",
+                            session_key or "?",
+                            response.get("final_delivery_error", ""),
+                        )
+                    else:
+                        logger.warning(
+                            "Transformed final edit was definitively rejected "
+                            "for session %s; leaving normal final delivery "
+                            "eligible.",
+                            session_key or "?",
                         )
 
         # Schedule deletion of tracked temporary progress bubbles after the
@@ -24991,6 +25483,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    from agent.request_phase import resume_local_mutations
+
+    resume_local_mutations()
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale
@@ -25223,6 +25718,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Set up signal handlers
     def shutdown_signal_handler(received_signal=None):
         nonlocal _signal_initiated_shutdown
+        from agent.request_phase import suspend_local_mutations
+
+        suspend_local_mutations("gateway shutdown signal")
         # Planned --replace takeover check: when a sibling gateway is
         # taking over via --replace, it wrote a marker naming this PID
         # before sending SIGTERM. If present, treat the signal as a

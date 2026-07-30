@@ -35,6 +35,15 @@ class _FakeGuardrails:
         self.reset_called = True
 
 
+class _FakeSessionDB:
+    def __init__(self):
+        self.platform_message_ids = set()
+
+    def has_platform_message_id(self, session_id, platform_message_id):
+        del session_id
+        return platform_message_id in self.platform_message_ids
+
+
 class _FakeAgent:
     """Minimal stand-in covering only what the prologue touches."""
 
@@ -91,6 +100,7 @@ class _FakeAgent:
         self._session_messages = []
         self._pending_cli_user_message = None
         self._session_persist_lock = threading.RLock()
+        self._session_db = _FakeSessionDB()
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
@@ -132,8 +142,14 @@ class _FakeAgent:
     def _safe_print(self, *_a, **_k):
         pass
 
-    def _persist_session(self, *_a, **_k):
+    def _persist_session(self, messages, *_a, **_k):
         self._persist_calls += 1
+        self._session_db.platform_message_ids.update(
+            message["platform_message_id"]
+            for message in messages
+            if isinstance(message, dict)
+            and isinstance(message.get("platform_message_id"), str)
+        )
 
 
 def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
@@ -206,6 +222,52 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_platform_message_id_is_persisted_and_read_back_before_return():
+    agent = _FakeAgent()
+
+    ctx = _build(
+        agent,
+        persist_user_platform_message_id="42197",
+    )
+
+    assert ctx.messages[-1] == {
+        "role": "user",
+        "content": "hello",
+        "platform_message_id": "42197",
+    }
+    assert agent._persist_calls == 1
+    assert agent._session_db.has_platform_message_id("sess-1", "42197")
+
+
+def test_required_platform_provenance_fails_closed_without_readback():
+    agent = _FakeAgent()
+    agent._session_db.has_platform_message_id = lambda *_a, **_k: False
+
+    with pytest.raises(
+        RuntimeError,
+        match="Required inbound platform provenance could not be read back",
+    ):
+        _build(
+            agent,
+            persist_user_platform_message_id="42197",
+        )
+
+
+@pytest.mark.parametrize("message_id", ["", " 42197", "42197 "])
+def test_required_platform_provenance_rejects_non_exact_ids_before_setup(
+    message_id,
+):
+    agent = _FakeAgent()
+
+    with pytest.raises(ValueError, match="one exact non-empty string"):
+        _build(
+            agent,
+            persist_user_platform_message_id=message_id,
+        )
+
+    assert agent._persist_calls == 0
 
 
 def test_turn_start_replaces_stale_parent_history_with_compression_child():

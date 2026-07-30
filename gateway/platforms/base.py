@@ -5049,12 +5049,14 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
-        is_network = result.retryable or self._is_retryable_error(error_str)
+        from gateway.delivery_ledger import delivery_result_is_unknown
 
-        # Timeout errors are not safe to retry (message may have been
-        # delivered) and not formatting errors — return the failure as-is.
-        if not is_network and self._is_timeout_error(error_str):
+        # A timeout or explicitly unclassified effect may already have reached
+        # the platform. Never retry it inside the same producer run.
+        if delivery_result_is_unknown(result):
             return result
+
+        is_network = result.retryable or self._is_retryable_error(error_str)
 
         if is_network:
             # Retry with exponential backoff for transient errors.
@@ -5082,6 +5084,8 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
+                if delivery_result_is_unknown(result):
+                    return result
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
                 if not (result.retryable or self._is_retryable_error(error_str)):
@@ -6026,11 +6030,13 @@ class BasePlatformAdapter(ABC):
                     # response BEFORE the send attempt so a gateway crash
                     # between finalize and platform ACK can redeliver it on
                     # the next boot instead of silently losing the turn's
-                    # output (#58818). Best-effort at every step — ledger
-                    # trouble must never block or delay the actual send.
+                    # output (#58818). Generated + attempting checkpoints are
+                    # a precondition for the effect; an untracked final would
+                    # recreate the silent-loss window this ledger closes.
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
+                    _delivery_ledger_error = ""
                     if not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
@@ -6060,30 +6066,50 @@ class BasePlatformAdapter(ABC):
                                     content=text_content,
                                 )
                                 mark_attempting(_obligation_id)
-                        except Exception:
-                            logger.debug("delivery ledger record failed", exc_info=True)
+                        except Exception as exc:
+                            _delivery_ledger_error = (
+                                "Final delivery was blocked before send because "
+                                "Hermes could not persist its generated/"
+                                "attempting delivery receipt "
+                                f"({type(exc).__name__})."
+                            )
+                            logger.error(
+                                "delivery ledger checkpoint failed; blocking "
+                                "turn-final send",
+                                exc_info=True,
+                            )
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    if _delivery_ledger_error:
+                        result = SendResult(
+                            success=False,
+                            error=_delivery_ledger_error,
+                            error_kind="transient",
+                            retryable=True,
+                        )
+                    else:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
+                                delivery_result_is_unknown,
                                 mark_delivered,
                                 mark_failed,
                             )
 
                             if getattr(result, "success", False):
                                 mark_delivered(_obligation_id)
-                            else:
+                            elif not delivery_result_is_unknown(result):
                                 mark_failed(
                                     _obligation_id,
                                     str(getattr(result, "error", "") or ""),
                                 )
+                            # Unknown outcomes deliberately remain attempting.
                         except Exception:
                             logger.debug(
                                 "delivery ledger update failed", exc_info=True

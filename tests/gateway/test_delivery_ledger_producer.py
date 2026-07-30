@@ -3,8 +3,8 @@ obligations around the final send (gateway/platforms/base.py).
 
 Contract: obligation recorded (pending→attempting) BEFORE the send await,
 delivered/failed by SendResult afterward; slash commands, ephemeral
-replies, and empty responses are never recorded; ledger failures never
-block the send.
+replies, and empty responses are never recorded. A normal turn-final send
+fails closed if its generated/attempting checkpoints cannot be persisted.
 """
 
 import asyncio
@@ -96,6 +96,64 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "failed"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            SendResult(
+                success=False,
+                error="platform request timed out",
+                retryable=True,
+            ),
+            SendResult(
+                success=False,
+                error="provider returned no classified result",
+                error_kind="unknown",
+                retryable=True,
+            ),
+        ],
+    )
+    async def test_actual_final_producer_never_retries_unknown_outcome(
+        self,
+        outcome,
+    ):
+        adapter = _Adapter()
+        adapter.send = AsyncMock(return_value=outcome)
+
+        await _run(adapter, _event())
+
+        adapter.send.assert_awaited_once()
+        rows = _rows()
+        assert len(rows) == 1
+        assert rows[0][1] == "attempting"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("checkpoint", "expected_state"),
+        [
+            ("record_obligation", None),
+            ("mark_attempting", "pending"),
+        ],
+    )
+    async def test_ledger_checkpoint_failure_blocks_platform_send(
+        self,
+        monkeypatch,
+        checkpoint,
+        expected_state,
+    ):
+        adapter = _Adapter()
+
+        def fail_checkpoint(*_args, **_kwargs):
+            raise OSError("state.db unavailable")
+
+        monkeypatch.setattr(dl, checkpoint, fail_checkpoint)
+
+        await _run(adapter, _event())
+
+        assert adapter.sent == []
+        rows = _rows()
+        assert (rows[0][1] if rows else None) == expected_state
+
 
     @pytest.mark.asyncio
     async def test_crash_between_attempting_and_ack_is_recoverable(self):
@@ -116,9 +174,7 @@ class TestProducerHook:
 
         rows = _rows()
         assert len(rows) == 1
-        # Row is stuck in 'attempting' (or failed if retry wrapper caught it):
-        # either way it is non-delivered and recoverable.
-        assert rows[0][1] in ("attempting", "failed")
+        assert rows[0][1] == "attempting"
         with dl._connect() as conn:
             conn.execute(
                 "UPDATE delivery_obligations SET owner_pid=999999999, owner_started_at=1"

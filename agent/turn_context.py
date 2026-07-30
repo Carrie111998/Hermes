@@ -335,6 +335,7 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
+    persist_user_platform_message_id: Optional[str] = None,
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
@@ -353,6 +354,16 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    if persist_user_platform_message_id is not None and (
+        not isinstance(persist_user_platform_message_id, str)
+        or not persist_user_platform_message_id
+        or persist_user_platform_message_id.strip()
+        != persist_user_platform_message_id
+    ):
+        raise ValueError(
+            "persist_user_platform_message_id must be one exact non-empty string."
+        )
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -556,6 +567,8 @@ def build_turn_context(
         user_msg["display_kind"] = persist_user_display_kind
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
+    if persist_user_platform_message_id is not None:
+        user_msg["platform_message_id"] = persist_user_platform_message_id
 
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
@@ -1233,12 +1246,35 @@ def build_turn_context(
         else:
             with persist_lock:
                 _ensure_and_persist()
-    except Exception:
+    except Exception as exc:
+        if persist_user_platform_message_id is not None:
+            raise RuntimeError(
+                "Required inbound platform provenance could not be persisted."
+            ) from exc
         logger.warning(
             "Early turn-start session persistence failed for session=%s",
             agent.session_id or "none",
             exc_info=True,
         )
+    else:
+        if persist_user_platform_message_id is not None:
+            session_db = getattr(agent, "_session_db", None)
+            try:
+                provenance_persisted = bool(
+                    session_db is not None
+                    and session_db.has_platform_message_id(
+                        agent.session_id,
+                        persist_user_platform_message_id,
+                    )
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Required inbound platform provenance could not be read back."
+                ) from exc
+            if not provenance_persisted:
+                raise RuntimeError(
+                    "Required inbound platform provenance could not be read back."
+                )
     finally:
         # Keep an unmarked staged input available to a later close retry if the
         # normal persistence attempt failed. Once the marker is present, the

@@ -2551,6 +2551,137 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+        assert result["run_terminal_state"] == "done"
+        assert result["run_end_reason"] == "text_response(finish_reason=stop)"
+        assert result["final_generated"] is True
+        assert isinstance(result["run_ended_at"], float)
+
+    @pytest.mark.parametrize(
+        ("inner_result", "expected_state", "expected_relay_outcome"),
+        [
+            (
+                {
+                    "final_response": "Done with proof.",
+                    "completed": True,
+                    "failed": False,
+                    "interrupted": False,
+                    "turn_exit_reason": "text_response(finish_reason=stop)",
+                },
+                "done",
+                "success",
+            ),
+            (
+                {
+                    "final_response": "One exact approval is required.",
+                    "completed": False,
+                    "failed": False,
+                    "interrupted": False,
+                    "turn_exit_reason": "guardrail_halt",
+                    "guardrail": {"reason": "protected_effect"},
+                },
+                "blocked",
+                "failed",
+            ),
+            (
+                {
+                    "final_response": "The run failed explicitly.",
+                    "completed": False,
+                    "failed": True,
+                    "interrupted": False,
+                    "turn_exit_reason": "system_aborted",
+                },
+                "failed",
+                "failed",
+            ),
+        ],
+    )
+    def test_each_returned_run_gets_one_terminal_receipt(
+        self,
+        agent,
+        inner_result,
+        expected_state,
+        expected_relay_outcome,
+    ):
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = object()
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run"
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ) as finish_task_run,
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value=dict(inner_result),
+            ),
+        ):
+            result = agent.run_conversation("hello", task_id="terminal-task")
+
+        assert result["run_terminal_state"] == expected_state
+        assert result["run_end_reason"] == inner_result["turn_exit_reason"]
+        assert result["final_generated"] is True
+        assert isinstance(result["run_ended_at"], float)
+        finish_task_run.assert_called_once()
+        assert finish_task_run.call_args.kwargs["result"] is result
+        coordinator.end_turn.assert_called_once_with(
+            relay_turn,
+            outcome=expected_relay_outcome,
+        )
+        coordinator.release_conversation.assert_called_once_with(relay_lease)
+
+    def test_exception_path_closes_run_as_explicit_failure(self, agent):
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = object()
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+        run_error = RuntimeError("producer failed")
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run"
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ) as finish_task_run,
+            patch(
+                "agent.conversation_loop.run_conversation",
+                side_effect=run_error,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="producer failed"):
+                agent.run_conversation("hello", task_id="terminal-error")
+
+        finish_task_run.assert_called_once()
+        assert finish_task_run.call_args.kwargs["error"] is run_error
+        coordinator.end_turn.assert_called_once_with(
+            relay_turn,
+            outcome="failed",
+        )
+        coordinator.release_conversation.assert_called_once_with(relay_lease)
 
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)

@@ -38,9 +38,15 @@ async def test_retry_returns_response_not_none(gateway):
         text="/retry",
         message_type=MessageType.TEXT,
         source=MagicMock(),
+        message_id="telegram-retry-417",
+        platform_update_id=812,
     )
     result = await gateway._handle_retry_command(event)
     assert result is not None, "/retry must not return None"
     assert result == expected_response
+    retry_event = gateway._handle_message.await_args.args[0]
+    assert retry_event.message_id == "telegram-retry-417"
+    assert retry_event.platform_update_id == 812
+    assert retry_event.internal is False
 
 
