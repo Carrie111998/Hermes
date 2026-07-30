@@ -1,5 +1,6 @@
 """Tests for gateway session management."""
 import json
+import sqlite3
 import pytest
 from dataclasses import replace
 from datetime import datetime
@@ -545,6 +546,39 @@ class TestSessionStoreFork:
         assert len(store.load_transcript(first.session_id)) == 3
         assert len(store.load_transcript(second.session_id)) == 2
         assert len(store.load_transcript(parent.session_id)) == 2
+
+    def test_atomic_db_fork_rolls_back_child_row_when_copy_fails(self, store):
+        parent = store.get_or_create_session(self.source())
+        store.append_to_transcript(
+            parent.session_id,
+            {"role": "user", "content": "context"},
+        )
+        child_id = "forced_fork_failure"
+        with store._db._lock:
+            store._db._conn.execute(
+                f"""CREATE TRIGGER fail_child_copy
+                    BEFORE INSERT ON messages
+                    WHEN NEW.session_id = '{child_id}'
+                    BEGIN SELECT RAISE(ABORT, 'forced copy failure'); END"""
+            )
+            store._db._conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store._db.fork_session_with_transcript(
+                child_id,
+                "slack",
+                parent_session_id=parent.session_id,
+                session_key="child-key",
+                chat_id="C_PROJECT",
+                chat_type="group",
+                thread_id="1700000000.000099",
+            )
+
+        assert store._db.get_session(child_id) is None
+        assert [
+            message["content"]
+            for message in store._db.get_messages_as_conversation(parent.session_id)
+        ] == ["context"]
 
 
 class TestSessionStoreSwitchSession:

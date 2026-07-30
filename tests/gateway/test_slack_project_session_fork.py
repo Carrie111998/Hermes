@@ -1,7 +1,7 @@
 """End-to-end routing contracts for Slack project session forks."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -32,7 +32,7 @@ async def test_marked_project_thread_forks_from_derived_channel_session():
     source = _source()
 
     result = await GatewayRunner._get_or_create_inbound_session(
-        runner, event, source
+        runner, event, source, "child-key", 7
     )
 
     assert result is child_entry
@@ -66,11 +66,34 @@ async def test_unmarked_or_non_slack_lanes_never_fork(event, source):
     runner = SimpleNamespace(async_session_store=store)
 
     result = await GatewayRunner._get_or_create_inbound_session(
-        runner, event, source
+        runner, event, source, "child-key", 7
     )
 
     assert result is child_entry
-    store.get_or_create_session.assert_awaited_once_with(
-        source,
-        fork_from_session_id=None,
+    store.get_or_create_session.assert_awaited_once_with(source)
+
+
+@pytest.mark.asyncio
+async def test_project_fork_holds_parent_turn_lease_until_snapshot_finishes():
+    store = SimpleNamespace(get_or_create_session=AsyncMock())
+    parent_entry = SimpleNamespace(session_id="parent-session")
+    child_entry = SimpleNamespace(session_id="child-session")
+    store.get_or_create_session.side_effect = [parent_entry, child_entry]
+    token = object()
+    leases = SimpleNamespace(
+        acquire=AsyncMock(return_value=token),
+        release=MagicMock(),
     )
+    runner = SimpleNamespace(async_session_store=store, _turn_leases=leases)
+    event = SimpleNamespace(metadata={"slack_project_session_fork": True})
+
+    result = await GatewayRunner._get_or_create_inbound_session(
+        runner, event, _source(), "child-key", 7
+    )
+
+    assert result is child_entry
+    leases.acquire.assert_awaited_once()
+    acquire = leases.acquire.await_args
+    assert acquire.args[0] == "parent-session"
+    assert acquire.kwargs["generation"] == 7
+    leases.release.assert_called_once_with(token)

@@ -2242,6 +2242,8 @@ class SessionStore:
 
         db_end_session_id = None
         db_create_kwargs = None
+        db_fork_precreated = False
+        db_fork_session_id = None
         existing_session_id = None
         force_new_observed_entry = None
 
@@ -2411,6 +2413,43 @@ class SessionStore:
                     else {}
                 ),
             )
+            candidate_db_create_kwargs = {
+                "session_id": session_id,
+                "source": source.platform.value,
+                "user_id": source.user_id,
+                "session_key": session_key,
+                "chat_id": source.chat_id,
+                "chat_type": source.chat_type,
+                "thread_id": source.thread_id,
+                "profile_name": source.profile,
+                "parent_session_id": fork_from_session_id,
+                "model_config": (
+                    {"_branched_from": fork_from_session_id}
+                    if fork_from_session_id
+                    else None
+                ),
+            }
+            # Fork durability precedes route publication: child row + active
+            # transcript are one SQLite transaction, so a crash cannot leave a
+            # published mapping to a partially-copied child.
+            if self._db and fork_from_session_id:
+                try:
+                    self._db.fork_session_with_transcript(
+                        **candidate_db_create_kwargs
+                    )
+                    db_fork_precreated = True
+                    db_fork_session_id = session_id
+                except Exception as exc:
+                    logger.warning(
+                        "Session fork failed for %s from %s; falling back to an "
+                        "empty isolated child: %s",
+                        session_id,
+                        fork_from_session_id,
+                        exc,
+                    )
+                    candidate.metadata.pop("fork_parent_session_id", None)
+                    candidate_db_create_kwargs["parent_session_id"] = None
+                    candidate_db_create_kwargs["model_config"] = None
             with self._lock:
                 current = self._entries.get(session_key)
                 may_publish = current is None or (
@@ -2424,23 +2463,8 @@ class SessionStore:
             assert published is not None
             entry = published
             _needs_save = True
-            if entry is candidate:
-                db_create_kwargs = {
-                    "session_id": session_id,
-                    "source": source.platform.value,
-                    "user_id": source.user_id,
-                    "session_key": session_key,
-                    "chat_id": source.chat_id,
-                    "chat_type": source.chat_type,
-                    "thread_id": source.thread_id,
-                    "profile_name": source.profile,
-                    "parent_session_id": fork_from_session_id,
-                    "model_config": (
-                        {"_branched_from": fork_from_session_id}
-                        if fork_from_session_id
-                        else None
-                    ),
-                }
+            if entry is candidate and not db_fork_precreated:
+                db_create_kwargs = candidate_db_create_kwargs
 
         if _needs_save:
             self._save_entries()
@@ -2465,14 +2489,19 @@ class SessionStore:
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
 
-        if self._db and db_create_kwargs:
+        if self._db and db_fork_precreated and db_fork_session_id:
+            try:
+                self._record_gateway_session_peer(
+                    db_fork_session_id,
+                    session_key,
+                    source,
+                    display_name=entry.display_name,
+                )
+            except Exception as e:
+                logger.debug("Session DB peer record failed: %s", e)
+        elif self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
-                if fork_from_session_id:
-                    self._copy_fork_transcript(
-                        fork_from_session_id,
-                        session_id,
-                    )
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
@@ -2483,25 +2512,6 @@ class SessionStore:
                 print(f"[gateway] Warning: Failed to create SQLite session: {e}")
 
         return entry
-
-    def _copy_fork_transcript(
-        self,
-        parent_session_id: str,
-        child_session_id: str,
-    ) -> None:
-        """Snapshot a parent's active transcript into a new child session.
-
-        The branch has its own rows for write isolation, while its explicit
-        parent link preserves lineage. ``api_content`` stays byte-identical so
-        the first child turn can reuse the provider's cached prompt prefix.
-        """
-        if not self._db or not parent_session_id or not child_session_id:
-            return
-        history = self._db.get_messages_as_conversation(parent_session_id)
-        if history:
-            # One SQLite write transaction: a failed fork can never leave a
-            # partially-copied prompt prefix in the child.
-            self._db.replace_messages(child_session_id, history)
 
     def update_session(
         self,
