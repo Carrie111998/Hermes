@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import textwrap
 import threading
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -169,3 +171,83 @@ def test_tui_pre_route_hook_switch_session_logged(mock_sync_thread, mock_get_tui
 
     # Message processing should continue normally with the same agent/session
     agent.run_conversation.assert_called_once()
+
+
+# ── Integration test: real HOOK.yaml + handler.py discovery ────────────────
+
+def test_real_hook_yaml_discovery_and_invocation(tmp_path):
+    """Integration test: _get_tui_hook_registry discovers hooks from a real
+    temp HERMES_HOME and emit_collect actually invokes the handler.
+
+    This test exercises the full discovery pipeline (HOOK.yaml parsing,
+    handler.py dynamic loading, event registration) without mocking the
+    registry — verifying the code path that was broken by the module-level
+    HOOKS_DIR singleton (blocker #1).
+    """
+    # Build a minimal HERMES_HOME with one hook for message:pre_route
+    hooks_root = tmp_path / "hooks"
+    hook_dir = hooks_root / "test-pre-route"
+    hook_dir.mkdir(parents=True)
+
+    # Write HOOK.yaml
+    (hook_dir / "HOOK.yaml").write_text(
+        textwrap.dedent("""\
+            name: test-pre-route
+            description: Integration test hook for message:pre_route
+            events:
+              - message:pre_route
+        """),
+        encoding="utf-8",
+    )
+
+    # Write handler.py — sets a sentinel in a shared list so the test can
+    # confirm the handler was actually called.
+    invocations: list = []
+    handler_source = textwrap.dedent("""\
+        _invocations = []
+
+        def handle(event_type, context):
+            _invocations.append({"event": event_type, "message": context.get("message")})
+            return {"decision": "allow"}
+    """)
+    (hook_dir / "handler.py").write_text(handler_source, encoding="utf-8")
+
+    # Ask for a registry pointed at our temp HERMES_HOME — bypasses the
+    # module-level HOOKS_DIR singleton.
+    from gateway.hooks import HookRegistry
+    registry = HookRegistry(hooks_dir=hooks_root)
+    registry.discover_and_load()
+
+    # Confirm discovery found the hook
+    loaded_names = [h["name"] for h in registry.loaded_hooks]
+    assert "test-pre-route" in loaded_names, (
+        f"Hook not discovered. Loaded: {loaded_names}"
+    )
+
+    # emit_collect should invoke the handler and return its non-None result
+    results = asyncio.run(
+        registry.emit_collect(
+            "message:pre_route",
+            {"message": "integration-test-payload", "platform": "desktop"},
+        )
+    )
+
+    assert results == [{"decision": "allow"}], (
+        f"emit_collect returned unexpected results: {results}"
+    )
+
+    # Also confirm that _get_tui_hook_registry accepts the explicit hermes_home
+    # kwarg and returns a registry that can discover from the same temp dir.
+    # (Clears the cache entry first so the test is independent of call order.)
+    hermes_home_str = str(tmp_path)
+    server._tui_hook_registries.pop(str(tmp_path.resolve()), None)
+    tui_registry = server._get_tui_hook_registry(hermes_home=hermes_home_str)
+    tui_results = asyncio.run(
+        tui_registry.emit_collect(
+            "message:pre_route",
+            {"message": "via-tui-registry", "platform": "desktop"},
+        )
+    )
+    assert tui_results == [{"decision": "allow"}], (
+        f"TUI registry emit_collect returned unexpected results: {tui_results}"
+    )

@@ -82,6 +82,7 @@ async def handle(event_type: str, context: dict):
 | `agent:start` | Agent begins processing a message | `platform`, `user_id`, `chat_id`, `thread_id` (forum-topic / thread root id; empty when not in a thread), `chat_type` (`"dm"` \| `"group"` \| `"forum"`; empty if unknown), `session_id`, `message` (truncated to 500 chars) |
 | `agent:step` | Each iteration of the tool-calling loop | `platform`, `user_id`, `session_id`, `iteration`, `tool_names` |
 | `agent:end` | Agent finishes processing | same keys as `agent:start`, plus `response` (truncated to 500 chars) |
+| `message:pre_route` | Fires before a message is dispatched to the agent — after the internal-event guard and before auth/pairing. **Surfaces:** gateway (Telegram, Discord, Slack, WhatsApp, Teams) and **desktop/TUI**. Handlers can return a `{"decision": "switch_session", "session_id": "..."}` dict; on gateway this redirects the message to the named session. On desktop/TUI the decision is logged but not yet acted on (pending #64178). | `platform`, `user_id`, `chat_id`, `thread_id`, `chat_type`, `session_id`, `session_key`, `message` |
 | `reaction:added` | An emoji reaction was added to a message the bot can see (Slack adapter currently). Requires the `reactions:read` scope + the `reaction_added` bot event subscription; the bot must be a member of the channel. | `platform`, `reaction`, `user_id`, `item_user_id`, `item_type`, `channel_id`, `message_ts`, `team_id`, `event_ts`, `raw_event` |
 | `reaction:removed` | An emoji reaction was removed from a message the bot can see. Requires the `reaction_removed` bot event subscription. | same shape as `reaction:added` |
 | `command:*` | Any slash command executed | `platform`, `user_id`, `command`, `args` |
@@ -354,7 +355,9 @@ An earlier version of Hermes shipped this as a built-in hook and silently spawne
 5. Errors in any handler are caught and logged — a broken hook never crashes the agent
 
 :::info
-Gateway hooks only fire in the **gateway** (Telegram, Discord, Slack, WhatsApp, Teams). The CLI does not load gateway hooks. For hooks that work everywhere, use [plugin hooks](#plugin-hooks).
+Gateway hooks fire in the **gateway** (Telegram, Discord, Slack, WhatsApp, Teams). The CLI does not load gateway hooks. For hooks that work everywhere, use [plugin hooks](#plugin-hooks).
+
+**Exception:** `message:pre_route` also fires in the **desktop/TUI** path (the Ink TUI and dashboard embedded chat). `switch_session` decisions from TUI handlers are logged but not yet acted on pending #64178.
 :::
 
 ## Plugin Hooks

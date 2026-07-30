@@ -19,7 +19,7 @@ from datetime import datetime
 from gateway.hooks import HookRegistry
 from hermes_cli.config import get_hermes_home
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 from agent.secret_scope import (
     build_profile_secret_scope,
@@ -153,19 +153,37 @@ _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
 
-_tui_hook_registry: Optional[HookRegistry] = None
+# Per-profile-home cache: keyed by resolved HERMES_HOME path string so that
+# TUI sessions running under a non-default profile discover hooks from that
+# profile's hooks/ dir, not the module-import-time default.
+_tui_hook_registries: Dict[str, HookRegistry] = {}
 _tui_hooks_lock = threading.Lock()
 
 
-def _get_tui_hook_registry() -> HookRegistry:
-    global _tui_hook_registry
-    if _tui_hook_registry is None:
+def _get_tui_hook_registry(hermes_home: Optional[str] = None) -> HookRegistry:
+    """Return the HookRegistry for *hermes_home* (or the active home if None).
+
+    Registries are cached by resolved home path so repeated calls within a
+    profile are cheap (single dict lookup) while each profile gets its own
+    registry that points at ``<profile_home>/hooks/``.
+
+    Args:
+        hermes_home: Absolute path to the profile home whose hooks to use.
+            ``None`` resolves the current active home via
+            :func:`~hermes_constants.get_hermes_home` at call-time, which
+            respects the context-local override set by
+            :func:`~hermes_constants.set_hermes_home_override`.
+    """
+    from pathlib import Path as _Path
+    resolved = str(_Path(hermes_home).resolve()) if hermes_home else str(get_hermes_home().resolve())
+    if resolved not in _tui_hook_registries:
         with _tui_hooks_lock:
-            if _tui_hook_registry is None:
-                registry = HookRegistry()
+            if resolved not in _tui_hook_registries:
+                hooks_dir = _Path(resolved) / "hooks"
+                registry = HookRegistry(hooks_dir=hooks_dir)
                 registry.discover_and_load()
-                _tui_hook_registry = registry
-    return _tui_hook_registry
+                _tui_hook_registries[resolved] = registry
+    return _tui_hook_registries[resolved]
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
