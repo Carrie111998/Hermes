@@ -54,8 +54,7 @@ test('does not inspect or replace CAs outside Windows', () => {
   assert.deepEqual(result, {
     applied: false,
     systemCertificateCount: 0,
-    totalCertificateCount: 0,
-    reason: 'not-applicable'
+    totalCertificateCount: 0
   })
 })
 
@@ -79,11 +78,11 @@ test('returns not-applicable on linux without inspecting or replacing CAs', () =
   // `platform !== 'win32'` early-return against a future refactor that
   // hoists the default/system read above the gate.
   assert.equal(reads, 0)
-  assert.equal(result.applied, false)
-  assert.equal(result.systemCertificateCount, 0)
-  assert.equal(result.totalCertificateCount, 0)
-  assert.equal(result.reason, 'not-applicable')
-  assert.equal(result.error, undefined)
+  assert.deepEqual(result, {
+    applied: false,
+    systemCertificateCount: 0,
+    totalCertificateCount: 0
+  })
 })
 
 test('leaves the existing defaults untouched when Windows has no system CAs', () => {
@@ -95,8 +94,7 @@ test('leaves the existing defaults untouched when Windows has no system CAs', ()
   assert.deepEqual(result, {
     applied: false,
     systemCertificateCount: 0,
-    totalCertificateCount: 1,
-    reason: 'empty-store'
+    totalCertificateCount: 1
   })
 })
 
@@ -120,7 +118,6 @@ test('fails open when the runtime cannot load the Windows certificate store', ()
     applied: false,
     systemCertificateCount: 0,
     totalCertificateCount: 0,
-    reason: 'tls-error',
     error: 'certificate store unavailable'
   })
 })
