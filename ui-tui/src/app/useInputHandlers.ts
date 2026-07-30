@@ -529,6 +529,13 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return clearSelection()
     }
 
+    // Esc waves off the ghost suggestion until the next agent turn. Sits
+    // below queue-edit/selection (explicit contexts win) and consumes the
+    // key only when a ghost is actually showing.
+    if (key.escape && cState.ghost && cActions.dismissGhost()) {
+      return
+    }
+
     if (key.upArrow && !cState.inputBuf.length) {
       const inputSel = getInputSelection()
       const cursor = inputSel && inputSel.start === inputSel.end ? inputSel.start : null
@@ -668,6 +675,19 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
           actions.sys('failed to toggle yolo')
         }
       })
+    }
+
+    // Plain Tab in an empty composer accepts the ghost suggestion (parity
+    // with the slash/path completion Tab below; ghost only exists when the
+    // composer is empty, so the two branches never compete).
+    if (key.tab && !key.shift && !cState.input && cState.ghost) {
+      const accepted = cActions.acceptGhost()
+
+      if (accepted) {
+        cActions.setInput(accepted)
+      }
+
+      return
     }
 
     if (key.tab && cState.completions.length) {

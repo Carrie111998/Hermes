@@ -991,6 +991,9 @@ DEFAULT_CONFIG = {
         # behavior of showing tool-call summaries inline.
         "resume_skip_tool_only": True,
         "busy_input_mode": "interrupt",  # interrupt | queue | steer
+        # Desktop/TUI ghost-text reply suggestions after an agent turn.
+        # Deterministic only; served by complete.suggest.
+        "composer_suggestions": True,
         # When busy_input_mode="steer", suppress only the visible
         # "Steered into current run" confirmation bubble by setting this false.
         # The mid-turn steering itself still happens.
