@@ -371,6 +371,8 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("record_session") is False:
+        print("  Record:  no session (session recording disabled)")
     print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()
     return 0
@@ -440,6 +442,8 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if updated.get("record_session") is False:
+        print("  Record:  no session (session recording disabled)")
     return 0
 
 
