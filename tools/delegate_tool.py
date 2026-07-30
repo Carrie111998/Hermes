@@ -4,7 +4,8 @@ Delegate Tool -- Subagent Architecture
 
 Spawns child AIAgent instances with isolated context, inherited toolsets,
 and their own terminal sessions. Supports single-task and batch (parallel)
-modes. Top-level model calls run in the background; orchestrator children
+modes. Top-level model calls run in the background when ``wait`` is omitted or
+false; ``wait=true`` returns the ordered aggregate inline. Orchestrator children
 wait for their own workers so they can synthesize the results.
 
 Each child gets:
@@ -3207,11 +3208,11 @@ def delegate_task(
             _sync_result = _execute_and_aggregate()
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
-                    "background=true is not available in this session — it cannot "
-                    "receive a detached subagent result after the turn ends (a "
+                    "Detached/background delivery is unavailable in this session — "
+                    "it cannot receive a subagent result after the turn ends (a "
                     "one-shot runner such as `hermes -z`, a cron job, a Kanban "
                     "worker, or a stateless HTTP endpoint). The subagent(s) ran "
-                    "SYNCHRONOUSLY and the result is included above."
+                    "SYNCHRONOUSLY and the aggregate result is included above."
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 

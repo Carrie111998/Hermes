@@ -163,5 +163,8 @@ def test_apiserver_session_without_id_stays_synchronous(monkeypatch):
     )
     parsed = json.loads(out)
     assert parsed.get("status") != "dispatched", parsed
-    assert "SYNCHRONOUSLY" in parsed.get("note", "")
+    note = parsed.get("note", "")
+    assert "Detached/background delivery is unavailable" in note
+    assert "SYNCHRONOUSLY" in note
+    assert "background=true" not in note
     assert process_registry.completion_queue.empty()

@@ -1,8 +1,9 @@
-"""The CLI spells out auto-resume when a delegate_task goes to the background.
+"""The CLI spells out auto-resume for detached top-level delegate_task calls.
 
-A top-level ``delegate_task`` returns a handle immediately and runs the subagent
-in the background; the result re-enters the conversation as a fresh turn when it
-finishes. ``_on_tool_complete`` prints a one-line, no-spinner reassurance at
+When model-facing ``wait`` is omitted or false, a supported session returns a
+background handle immediately and the result re-enters the conversation as a
+fresh turn. ``wait=true`` stays inline and does not take this notice path.
+``_on_tool_complete`` prints a one-line, no-spinner reassurance at detached
 dispatch so the idle prompt doesn't read as "nothing happened".
 """
 
