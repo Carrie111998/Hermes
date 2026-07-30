@@ -180,6 +180,20 @@ def _now() -> str:
     )
 
 
+def _effective_uid() -> int:
+    """Return the POSIX effective uid, or a non-root sentinel elsewhere."""
+
+    getter = getattr(os, "geteuid", None)
+    return int(getter()) if callable(getter) else -1
+
+
+def _effective_gid() -> int:
+    """Return the POSIX effective gid, or a non-root sentinel elsewhere."""
+
+    getter = getattr(os, "getegid", None)
+    return int(getter()) if callable(getter) else -1
+
+
 def _canonical(value: Any) -> bytes:
     try:
         raw = json.dumps(
@@ -1931,7 +1945,7 @@ def _atomic_write(
     )
     try:
         os.fchmod(descriptor, mode)
-        if os.geteuid() == 0:
+        if _effective_uid() == 0:
             os.fchown(descriptor, uid, gid)
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(raw)
@@ -2055,8 +2069,8 @@ def _publish_evidence(
         path,
         raw,
         mode=0o600,
-        uid=0 if root_owned else os.geteuid(),
-        gid=0 if root_owned else os.getegid(),
+        uid=0 if root_owned else _effective_uid(),
+        gid=0 if root_owned else _effective_gid(),
     )
     observed, _metadata = _read_regular(
         path,
@@ -2204,7 +2218,7 @@ def activate(
     activation_lock_factory: Callable[[], Any] | None = None,
     candidate_state_paths: Sequence[Path] | None = None,
 ) -> dict[str, Any]:
-    if require_root and os.geteuid() != 0:
+    if require_root and _effective_uid() != 0:
         raise UpstreamSyncRailCutoverError(
             "upstream_sync_activation_root_required"
         )
@@ -2585,7 +2599,7 @@ def rollback_inert(
 ) -> dict[str, Any]:
     """Remove only newly installed inert bytes before activation is proven."""
 
-    if require_root and os.geteuid() != 0:
+    if require_root and _effective_uid() != 0:
         raise UpstreamSyncRailCutoverError(
             "upstream_sync_activation_root_required"
         )

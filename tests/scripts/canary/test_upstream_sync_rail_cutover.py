@@ -33,6 +33,16 @@ FORK_AFTER = "e" * 40
 AUTHORIZATION_NOW = 2_000_000_000
 
 
+def test_effective_identity_helpers_are_safe_without_posix_getters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(cutover.os, "geteuid", raising=False)
+    monkeypatch.delattr(cutover.os, "getegid", raising=False)
+
+    assert cutover._effective_uid() == -1
+    assert cutover._effective_gid() == -1
+
+
 def _write(path: Path, raw: bytes, *, mode: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
