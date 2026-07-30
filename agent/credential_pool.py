@@ -1055,12 +1055,21 @@ class CredentialPool:
                     "openai-codex": "openai-codex",
                     "xai-oauth": "xai-oauth",
                 }.get(self.provider)
-                write_through_to_root = bool(_wt_provider_id) and not (
-                    isinstance(auth_store.get("providers"), dict)
-                    and isinstance(
-                        auth_store["providers"].get(_wt_provider_id), dict
-                    )
+                # Check whether the profile has its own providers.<id> block
+                # that was NOT created by a previous write-through.  A
+                # write-through-created block carries a sentinel so that
+                # subsequent calls still propagate rotated tokens to root.
+                _profile_has_own_block = False
+                _wt_profile_block = (
+                    auth_store.get("providers", {}).get(_wt_provider_id)
+                    if isinstance(auth_store.get("providers"), dict)
+                    else None
                 )
+                if isinstance(_wt_profile_block, dict) and not _wt_profile_block.get(
+                    "_synced_from_root"
+                ):
+                    _profile_has_own_block = True
+                write_through_to_root = bool(_wt_provider_id) and not _profile_has_own_block
                 if self.provider == "nous":
                     state = _load_provider_state(auth_store, "nous")
                     if state is None:
@@ -1114,6 +1123,13 @@ class CredentialPool:
 
                 else:
                     return
+
+                # Tag the profile's provider block so subsequent calls
+                # know it was created by write-through, not by the user.
+                if write_through_to_root and _wt_provider_id:
+                    _pb = auth_store.get("providers", {}).get(_wt_provider_id)
+                    if isinstance(_pb, dict):
+                        _pb["_synced_from_root"] = True
 
                 _save_auth_store(auth_store)
                 if write_through_to_root and _wt_provider_id:

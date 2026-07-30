@@ -233,3 +233,68 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
     # The invariant: the single-use token POST ran inside the auth-store lock.
     assert lock_held["during_post"] is True
 
+
+
+def test_write_through_to_root_survives_successive_refreshes(
+    profile_and_root,
+):
+    """Write-through must fire on every refresh, not just the first.
+
+    Regression test for #74339: the first call creates ``providers.<id>``
+    in the profile auth store (via ``_store_provider_state``), which made
+    the subsequent call's ``write_through_to_root`` check see the block
+    and skip the write-through.  Rotated single-use refresh tokens would
+    then never reach root, causing ``refresh_token_reused`` for every
+    other profile reading the stale root grant.
+    """
+    profile_path, root_path = profile_and_root
+    # Root has the initial grant; profile has no own block.
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "root-AT-v1",
+                        "refresh_token": "root-RT-v1",
+                    }
+                }
+            },
+        },
+    )
+    _write_store(profile_path, {"version": 1})
+
+    def _make_pool(access_token, refresh_token):
+        entry = _entry(
+            "openai-codex",
+            id="codex-1",
+            access_token=access_token,
+            refresh_token=refresh_token,
+        )
+        pool = CredentialPool("openai-codex", [entry])
+        return pool, entry
+
+    # --- First refresh: profile has no providers block ---
+    pool, entry = _make_pool("AT-v1", "RT-v1")
+    entry.access_token = "AT-v2"
+    entry.refresh_token = "RT-v2"
+    pool._sync_device_code_entry_to_auth_store(entry)
+
+    root_store = _read_store(root_path)
+    assert (
+        root_store["providers"]["openai-codex"]["tokens"]["access_token"] == "AT-v2"
+    ), "first refresh must write rotated tokens to root"
+
+    # --- Second refresh: profile NOW has providers.openai-codex ---
+    entry.access_token = "AT-v3"
+    entry.refresh_token = "RT-v3"
+    pool._sync_device_code_entry_to_auth_store(entry)
+
+    root_store = _read_store(root_path)
+    assert (
+        root_store["providers"]["openai-codex"]["tokens"]["access_token"] == "AT-v3"
+    ), "second refresh must still write through to root (#74339 regression)"
+    assert (
+        root_store["providers"]["openai-codex"]["tokens"]["refresh_token"] == "RT-v3"
+    ), "refresh token must propagate to root on every rotation"
