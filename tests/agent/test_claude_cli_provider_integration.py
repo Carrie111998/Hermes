@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 os.environ.setdefault("LOCALAPPDATA", os.environ.get("TEMP", r"C:\Windows\Temp"))
@@ -10,7 +11,11 @@ import pytest
 
 from agent.agent_init import init_agent
 from agent.auxiliary_client import resolve_provider_client
-from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+from agent.chat_completion_helpers import (
+    _dispatch_nonstreaming_api_request,
+    interruptible_api_call,
+    should_use_direct_api_call,
+)
 from agent.claude_cli_client import ClaudeCLIClient
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -121,3 +126,73 @@ async def test_auxiliary_router_supports_async_claude_calls(tmp_path, monkeypatc
     )
 
     assert response.choices[0].message.content == "ok"
+
+
+def test_claude_cli_cron_keeps_interrupt_worker():
+    agent = type(
+        "Agent",
+        (),
+        {
+            "platform": "cron",
+            "api_mode": "chat_completions",
+            "provider": "claude-cli",
+        },
+    )()
+
+    assert should_use_direct_api_call(agent) is False
+
+
+def test_interruptible_call_aborts_active_claude_process():
+    stopped = threading.Event()
+
+    class Runner:
+        def close(self):
+            stopped.set()
+
+    class Completions:
+        @staticmethod
+        def create(**_kwargs):
+            stopped.wait(timeout=3)
+            raise RuntimeError("process stopped")
+
+    client = type(
+        "Client",
+        (),
+        {
+            "runner": Runner(),
+            "chat": type("Chat", (), {"completions": Completions()})(),
+        },
+    )()
+    agent = type(
+        "Agent",
+        (),
+        {
+            "platform": "cli",
+            "api_mode": "chat_completions",
+            "provider": "claude-cli",
+            "model": "opus",
+            "base_url": "claude-cli://local",
+            "client": client,
+            "_interrupt_requested": True,
+            "_codex_stream_last_event_ts": None,
+            "_codex_stream_last_progress_ts": None,
+            "_compute_non_stream_stale_timeout": staticmethod(lambda _kwargs: 60),
+            "_touch_activity": staticmethod(lambda _message: None),
+            "_emit_wait_notice": staticmethod(lambda _message: None),
+            "_buffer_status": staticmethod(lambda _message: None),
+            "_abort_request_openai_client": staticmethod(
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("Claude process is not an OpenAI client")
+                )
+            ),
+            "_close_request_openai_client": staticmethod(lambda *_args, **_kwargs: None),
+        },
+    )()
+
+    with pytest.raises(InterruptedError):
+        interruptible_api_call(
+            agent,
+            {"model": "opus", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert stopped.wait(timeout=1) is True

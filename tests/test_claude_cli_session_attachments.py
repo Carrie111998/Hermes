@@ -15,6 +15,8 @@ ATTACHMENT = {
     "model_reported": "claude-opus-5",
     "tool_catalog_fingerprint": "sha256:tools",
     "system_prompt_fingerprint": "sha256:system",
+    "message_count": 2,
+    "history_fingerprint": "sha256:history",
     "last_success_at": 123.0,
 }
 

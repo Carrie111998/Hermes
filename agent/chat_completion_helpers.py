@@ -440,7 +440,7 @@ def should_use_direct_api_call(agent) -> bool:
     return (
         getattr(agent, "platform", None) == "cron"
         and getattr(agent, "api_mode", None) == "chat_completions"
-        and getattr(agent, "provider", None) != "moa"
+        and getattr(agent, "provider", None) not in {"moa", "claude-cli"}
     )
 
 
@@ -582,7 +582,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
         if request_client is None:
             return
         kind = request_client_kind.get("value", "openai")
-        if kind == "anthropic_messages":
+        if kind == "claude-cli":
+            # The shared facade stays open across turns. A stranger-thread
+            # abort terminates only its active owned process tree; the worker's
+            # normal completion merely unregisters the facade.
+            if stranger_thread:
+                request_client.runner.close()
+        elif kind == "anthropic_messages":
             if stranger_thread:
                 agent._abort_request_anthropic_client(request_client, reason=reason)
             else:
@@ -599,6 +605,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # builds it via this callback (openai- or anthropic-kind) so the
             # interrupt / stale-call detectors can force-close the worker's
             # connection without touching the shared client (#67142).
+            if getattr(agent, "provider", None) == "claude-cli":
+                _set_request_client(agent.client, kind="claude-cli")
             result["response"] = _dispatch_nonstreaming_api_request(
                 agent,
                 api_kwargs,

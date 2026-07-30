@@ -152,7 +152,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -863,6 +863,8 @@ CREATE TABLE IF NOT EXISTS provider_session_attachments (
     model_reported TEXT NOT NULL DEFAULT '',
     tool_catalog_fingerprint TEXT NOT NULL,
     system_prompt_fingerprint TEXT NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    history_fingerprint TEXT NOT NULL DEFAULT '',
     last_success_at REAL NOT NULL,
     PRIMARY KEY (hermes_session_id, provider)
 );
@@ -2035,6 +2037,8 @@ class SessionDB:
         model_reported: str,
         tool_catalog_fingerprint: str,
         system_prompt_fingerprint: str,
+        message_count: int,
+        history_fingerprint: str,
         last_success_at: float,
     ) -> None:
         """Persist one provider-native session attachment for a Hermes session."""
@@ -2045,14 +2049,16 @@ class SessionDB:
                        hermes_session_id, provider, provider_session_id,
                        model_requested, model_reported,
                        tool_catalog_fingerprint, system_prompt_fingerprint,
-                       last_success_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       message_count, history_fingerprint, last_success_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(hermes_session_id, provider) DO UPDATE SET
                        provider_session_id = excluded.provider_session_id,
                        model_requested = excluded.model_requested,
                        model_reported = excluded.model_reported,
                        tool_catalog_fingerprint = excluded.tool_catalog_fingerprint,
                        system_prompt_fingerprint = excluded.system_prompt_fingerprint,
+                       message_count = excluded.message_count,
+                       history_fingerprint = excluded.history_fingerprint,
                        last_success_at = excluded.last_success_at""",
                 (
                     hermes_session_id,
@@ -2062,6 +2068,8 @@ class SessionDB:
                     model_reported,
                     tool_catalog_fingerprint,
                     system_prompt_fingerprint,
+                    int(message_count),
+                    history_fingerprint,
                     float(last_success_at),
                 ),
             )
@@ -2080,7 +2088,7 @@ class SessionDB:
                 """SELECT hermes_session_id, provider, provider_session_id,
                           model_requested, model_reported,
                           tool_catalog_fingerprint, system_prompt_fingerprint,
-                          last_success_at
+                          message_count, history_fingerprint, last_success_at
                    FROM provider_session_attachments
                    WHERE hermes_session_id = ? AND provider = ?""",
                 (hermes_session_id, provider),

@@ -66,6 +66,10 @@ def _tool_fingerprint(tools: Iterable[Mapping[str, Any]]) -> str:
     return _fingerprint(list(tools or []))
 
 
+def _history_fingerprint(messages: Iterable[Mapping[str, Any]]) -> str:
+    return _fingerprint(list(messages or []))
+
+
 def _semantic_delta(messages: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     if not messages:
         return []
@@ -146,6 +150,7 @@ class ClaudeCLIClient:
         model_reported: str,
         tool_fingerprint: str,
         system_fingerprint: str,
+        messages: list[Mapping[str, Any]],
     ) -> None:
         if self.session_db is None:
             return
@@ -159,6 +164,8 @@ class ClaudeCLIClient:
             model_reported=model_reported,
             tool_catalog_fingerprint=tool_fingerprint,
             system_prompt_fingerprint=system_fingerprint,
+            message_count=len(messages),
+            history_fingerprint=_history_fingerprint(messages),
             last_success_at=time.time(),
         )
 
@@ -169,7 +176,10 @@ class ClaudeCLIClient:
         model: str,
         tool_fingerprint: str,
         system_fingerprint: str,
+        messages: list[Mapping[str, Any]],
     ) -> bool:
+        message_count = int((attachment or {}).get("message_count") or 0)
+        history_fingerprint = (attachment or {}).get("history_fingerprint") or ""
         return bool(
             attachment
             and attachment.get("provider") == "claude-cli"
@@ -177,6 +187,10 @@ class ClaudeCLIClient:
             and attachment.get("model_requested") == model
             and attachment.get("tool_catalog_fingerprint") == tool_fingerprint
             and attachment.get("system_prompt_fingerprint") == system_fingerprint
+            and message_count > 0
+            and message_count <= len(messages)
+            and history_fingerprint
+            == _history_fingerprint(messages[:message_count])
         )
 
     def _run_fresh(
@@ -217,6 +231,7 @@ class ClaudeCLIClient:
             model=requested_model,
             tool_fingerprint=tool_fp,
             system_fingerprint=system_fp,
+            messages=message_list,
         ):
             try:
                 result = self.runner.complete(
@@ -249,6 +264,7 @@ class ClaudeCLIClient:
             model_reported=result.model_reported or "",
             tool_fingerprint=tool_fp,
             system_fingerprint=system_fp,
+            messages=message_list,
         )
         return to_chat_completion(
             decision,

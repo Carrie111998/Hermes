@@ -126,6 +126,29 @@ def test_changed_tool_fingerprint_starts_fresh_session(tmp_path, monkeypatch):
     assert json.loads(calls[1]["prompt"])["frame"] == "bootstrap"
 
 
+def test_rewritten_or_compressed_history_starts_fresh_session(
+    tmp_path, monkeypatch
+):
+    client, _, log_path = make_client(tmp_path, monkeypatch)
+    client.chat.completions.create(
+        model="opus", messages=FIRST_MESSAGES, tools=TOOLS
+    )
+
+    client.chat.completions.create(
+        model="opus",
+        messages=[
+            {"role": "system", "content": "Hermes system"},
+            {"role": "user", "content": "compressed replacement"},
+        ],
+        tools=TOOLS,
+    )
+
+    calls = read_log(log_path)
+    assert "--session-id" in calls[1]["argv"]
+    assert "--resume" not in calls[1]["argv"]
+    assert json.loads(calls[1]["prompt"])["frame"] == "bootstrap"
+
+
 def test_stale_resume_retries_once_with_fresh_bootstrap(tmp_path, monkeypatch):
     client, db, log_path = make_client(tmp_path, monkeypatch)
     client.chat.completions.create(
