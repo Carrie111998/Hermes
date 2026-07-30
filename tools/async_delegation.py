@@ -405,7 +405,9 @@ def _build_batch_child_event(
         ),
         "dispatched_at": record.get("dispatched_at"),
         "completed_at": completed_at,
-        "result_delivery": "inject",
+        "result_delivery": str(
+            record.get("result_delivery") or "after_turn"
+        ).strip().lower(),
     }
 
 
@@ -431,15 +433,22 @@ def publish_batch_child_completion(
     task_index: int,
     result: Dict[str, Any],
 ) -> bool:
-    """Durably enqueue one ready child from an ``inject`` batch.
+    """Durably enqueue one ready child from an asynchronous batch.
 
-    The parent batch remains the execution/stall unit.  This function only
+    The parent batch remains the execution/stall unit. This function only
     creates an independently claimable delivery event, keyed by task index.
-    Repeated publication is idempotent and never resets a delivered claim.
+    ``result_delivery`` changes which consumer may claim it, not when the child
+    row becomes durable. Repeated publication is idempotent and never resets a
+    delivered claim.
     """
     with _records_lock:
         record = dict(_records.get(delegation_id) or {})
-    if str(record.get("result_delivery") or "after_turn").lower() != "inject":
+    if not record or not bool(record.get("is_batch")):
+        return False
+    if str(record.get("result_delivery") or "after_turn").lower() not in {
+        "inject",
+        "after_turn",
+    }:
         return False
 
     event = _build_batch_child_event(record, task_index, result)
@@ -452,6 +461,94 @@ def publish_batch_child_completion(
 
     process_registry.completion_queue.put(event)
     return True
+
+
+def _event_delivery_keys(event: Dict[str, Any]) -> list[str]:
+    raw_keys = event.get("delivery_event_keys")
+    if isinstance(raw_keys, (list, tuple)):
+        return list(dict.fromkeys(str(key) for key in raw_keys if key))
+    key = str(event.get("delivery_event_key") or "")
+    return [key] if key else []
+
+
+def coalesce_ready_after_turn_events(
+    events: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Combine ready child rows from each after-turn batch at one boundary.
+
+    SQLite and the shared queue retain one durable row per child. This helper
+    creates only a transient delivery envelope so every child remains
+    independently recoverable while one consumer can claim/ack the currently
+    ready set atomically. Envelopes are deliberately re-coalescible: a busy
+    consumer may requeue one while more siblings finish before its next boundary.
+    """
+
+    output: List[Dict[str, Any]] = []
+    groups: Dict[str, Dict[str, Any]] = {}
+    seen_keys: Dict[str, set[str]] = {}
+    for event in events:
+        delivery = str(event.get("result_delivery") or "after_turn").strip().lower()
+        event_keys = _event_delivery_keys(event)
+        delegation_id = str(event.get("delegation_id") or "")
+        coalescible = (
+            event.get("type") == "async_delegation"
+            and delivery == "after_turn"
+            and bool(event.get("is_batch"))
+            and bool(event_keys)
+            and all(key.startswith("task:") for key in event_keys)
+            and bool(delegation_id)
+        )
+        if not coalescible:
+            output.append(event)
+            continue
+
+        grouped = groups.get(delegation_id)
+        if grouped is None:
+            grouped = dict(event)
+            grouped.pop("delivery_event_key", None)
+            grouped["delivery_event_keys"] = []
+            grouped["task_indices"] = []
+            grouped["results"] = []
+            grouped["live_transcripts"] = []
+            grouped["coalesced_after_turn"] = True
+            groups[delegation_id] = grouped
+            seen_keys[delegation_id] = set()
+            output.append(grouped)
+
+        new_keys = [
+            key for key in event_keys if key not in seen_keys[delegation_id]
+        ]
+        if not new_keys:
+            continue
+        seen_keys[delegation_id].update(new_keys)
+        grouped["delivery_event_keys"].extend(new_keys)
+        new_key_set = set(new_keys)
+        for result in event.get("results") or []:
+            if not isinstance(result, dict):
+                continue
+            task_index = int(result.get("task_index", 0))
+            if f"task:{task_index}" not in new_key_set:
+                continue
+            grouped["task_indices"].append(task_index)
+            grouped["results"].append(result)
+        grouped["live_transcripts"].extend(
+            path for path in (event.get("live_transcripts") or []) if path
+        )
+        grouped["completed_at"] = max(
+            float(grouped.get("completed_at") or 0),
+            float(event.get("completed_at") or 0),
+        )
+
+    for grouped in groups.values():
+        grouped["delivery_event_keys"].sort(
+            key=lambda key: int(key.split(":", 1)[1])
+        )
+        grouped["task_indices"] = sorted(set(grouped["task_indices"]))
+        grouped["results"].sort(key=lambda result: int(result.get("task_index", 0)))
+        grouped["live_transcripts"] = list(
+            dict.fromkeys(grouped["live_transcripts"])
+        ) or None
+    return output
 
 
 def _build_batch_terminal_event(
@@ -489,7 +586,9 @@ def _build_batch_terminal_event(
         "error": combined.get("error"),
         "dispatched_at": event_record.get("dispatched_at"),
         "completed_at": now,
-        "result_delivery": "inject",
+        "result_delivery": str(
+            event_record.get("result_delivery") or "after_turn"
+        ).strip().lower(),
     }
     for key in (
         "stalled_after_quiet_seconds",
@@ -505,7 +604,7 @@ def _build_batch_terminal_event(
 def _publish_batch_terminal_event(
     event_record: Dict[str, Any], combined: Dict[str, Any], status: str
 ) -> bool:
-    """Deliver a parent-level inject failure not represented by child events."""
+    """Deliver a batch-level failure not represented by child events."""
     event = _build_batch_terminal_event(event_record, combined, status)
     if event is None:
         return False
@@ -520,7 +619,7 @@ def _publish_batch_terminal_event(
     return True
 
 
-def _persist_inject_batch_finalization(
+def _persist_batch_child_finalization(
     event_record: Dict[str, Any],
     parent_event: Dict[str, Any],
     combined: Dict[str, Any],
@@ -562,8 +661,9 @@ def _persist_inject_batch_finalization(
 
     from tools.process_registry import process_registry
 
-    for queued_event in newly_inserted:
-        process_registry.completion_queue.put(queued_event)
+    with process_registry.completion_routing_lock:
+        for queued_event in newly_inserted:
+            process_registry.completion_queue.put(queued_event)
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -604,16 +704,20 @@ def recover_abandoned_delegations() -> int:
             restored_delivery = str(
                 result_delivery or task.get("result_delivery") or "after_turn"
             ).lower()
-            if bool(task.get("is_batch")) and restored_delivery == "inject":
-                # Inject batches deliver child-scoped rows, never an aggregate.
-                # A crash after one or more child inserts must preserve that wire
-                # shape instead of manufacturing a contradictory parent unknown.
+            child_rows = []
+            if bool(task.get("is_batch")):
                 child_rows = conn.execute(
                     """SELECT event_key, event_json FROM async_delegation_events
                        WHERE delegation_id=? AND event_key LIKE 'task:%'
                        ORDER BY event_key""",
                     (delegation_id,),
                 ).fetchall()
+            if bool(task.get("is_batch")) and (
+                restored_delivery == "inject" or bool(child_rows)
+            ):
+                # Child-scoped batches never recover through a contradictory
+                # aggregate. A crash after one or more child inserts must
+                # preserve the already-delivered/pending task identities.
                 goals = list(task.get("goals") or [])
                 expected_child_keys = [f"task:{index}" for index in range(len(goals))]
                 child_results_by_key: dict[str, Dict[str, Any]] = {}
@@ -659,6 +763,7 @@ def recover_abandoned_delegations() -> int:
                     "role": task.get("role"),
                     "model": task.get("model"),
                     "dispatched_at": dispatched_at,
+                    "result_delivery": restored_delivery,
                 }
                 if not complete_children:
                     terminal_event = _build_batch_terminal_event(
@@ -675,7 +780,7 @@ def recover_abandoned_delegations() -> int:
                     "results": child_results,
                     "error": recovery_error,
                     "completed_at": now,
-                    "result_delivery": "inject",
+                    "result_delivery": restored_delivery,
                 }
                 _update_completion_row(
                     conn,
@@ -794,6 +899,40 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+class _DeliveryGroupConflict(RuntimeError):
+    """Rollback a multi-child settlement when any row lost ownership."""
+
+
+def _claim_child_event_group(
+    delegation_id: str, event_keys: List[str], claim_id: str
+) -> bool:
+    now = time.time()
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            for event_key in event_keys:
+                cur = conn.execute(
+                    """UPDATE async_delegation_events
+                       SET delivery_claim=?, delivery_claimed_at=?,
+                           delivery_attempts=delivery_attempts+1, updated_at=?
+                       WHERE delegation_id=? AND event_key=?
+                         AND delivery_state='pending'
+                         AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+                    (
+                        claim_id,
+                        now,
+                        now,
+                        delegation_id,
+                        event_key,
+                        now - _DELIVERY_CLAIM_LEASE_SECONDS,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise _DeliveryGroupConflict(event_key)
+    except _DeliveryGroupConflict:
+        return False
+    return True
+
+
 def _claim_child_event(delegation_id: str, event_key: str, claim_id: str) -> bool:
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
@@ -824,9 +963,13 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     if not delegation_id:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
-    event_key = str(evt.get("delivery_event_key") or "")
-    if event_key:
-        claimed = _claim_child_event(delegation_id, event_key, claim_id)
+    event_keys = _event_delivery_keys(evt)
+    if "delivery_event_keys" in evt:
+        claimed = bool(event_keys) and _claim_child_event_group(
+            delegation_id, event_keys, claim_id
+        )
+    elif event_keys:
+        claimed = _claim_child_event(delegation_id, event_keys[0], claim_id)
     else:
         claimed = claim_completion_delivery(delegation_id, claim_id)
     return claim_id if claimed else None
@@ -840,8 +983,27 @@ def renew_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
     delegation_id = str(evt.get("delegation_id") or "")
     if not delegation_id:
         return False
-    event_key = str(evt.get("delivery_event_key") or "")
+    event_keys = _event_delivery_keys(evt)
     now = time.time()
+    if "delivery_event_keys" in evt:
+        if not event_keys:
+            return False
+        try:
+            with _DB_LOCK, _transaction() as conn:
+                for event_key in event_keys:
+                    cur = conn.execute(
+                        """UPDATE async_delegation_events
+                           SET delivery_claimed_at=?, updated_at=?
+                           WHERE delegation_id=? AND event_key=?
+                             AND delivery_state='pending' AND delivery_claim=?""",
+                        (now, now, delegation_id, event_key, claim_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise _DeliveryGroupConflict(event_key)
+        except _DeliveryGroupConflict:
+            return False
+        return True
+    event_key = event_keys[0] if event_keys else ""
     with _DB_LOCK, _transaction() as conn:
         if event_key:
             cur = conn.execute(
@@ -870,8 +1032,22 @@ def get_event_delivery_state(evt: Dict[str, Any]) -> Optional[str]:
     delegation_id = str(evt.get("delegation_id") or "")
     if not delegation_id:
         return None
-    event_key = str(evt.get("delivery_event_key") or "")
+    event_keys = _event_delivery_keys(evt)
     with _DB_LOCK, _transaction() as conn:
+        if "delivery_event_keys" in evt:
+            if not event_keys:
+                return None
+            placeholders = ",".join("?" for _ in event_keys)
+            rows = conn.execute(
+                f"""SELECT delivery_state FROM async_delegation_events
+                    WHERE delegation_id=? AND event_key IN ({placeholders})""",
+                (delegation_id, *event_keys),
+            ).fetchall()
+            if len(rows) != len(event_keys):
+                return None
+            states = {str(row[0]) for row in rows}
+            return states.pop() if len(states) == 1 else "mixed"
+        event_key = event_keys[0] if event_keys else ""
         if event_key:
             row = conn.execute(
                 """SELECT delivery_state FROM async_delegation_events
@@ -999,13 +1175,98 @@ def _release_child_event(delegation_id: str, event_key: str, claim_id: str) -> b
         return cur.rowcount == 1
 
 
+def _complete_child_event_group(
+    delegation_id: str,
+    event_keys: List[str],
+    claim_id: str,
+    state: str = "delivered",
+) -> bool:
+    now = time.time()
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            for event_key in event_keys:
+                cur = conn.execute(
+                    """UPDATE async_delegation_events
+                       SET delivery_state=?, delivered_at=?, updated_at=?,
+                           delivery_claim=NULL, delivery_claimed_at=NULL
+                       WHERE delegation_id=? AND event_key=?
+                         AND delivery_state='pending' AND delivery_claim=?""",
+                    (state, now, now, delegation_id, event_key, claim_id),
+                )
+                if cur.rowcount != 1:
+                    raise _DeliveryGroupConflict(event_key)
+    except _DeliveryGroupConflict:
+        return False
+    return True
+
+
+def _release_child_event_group(
+    delegation_id: str, event_keys: List[str], claim_id: str
+) -> tuple[bool, List[str]]:
+    now = time.time()
+    pending_keys: List[str] = []
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            for event_key in event_keys:
+                capped = conn.execute(
+                    """UPDATE async_delegation_events
+                       SET delivery_state='dropped', delivery_claim=NULL,
+                           delivery_claimed_at=NULL, updated_at=?
+                       WHERE delegation_id=? AND event_key=?
+                         AND delivery_state='pending' AND delivery_claim=?
+                         AND delivery_attempts>=?""",
+                    (
+                        now,
+                        delegation_id,
+                        event_key,
+                        claim_id,
+                        _MAX_DELIVERY_ATTEMPTS,
+                    ),
+                )
+                if capped.rowcount == 1:
+                    continue
+                released = conn.execute(
+                    """UPDATE async_delegation_events
+                       SET delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                       WHERE delegation_id=? AND event_key=?
+                         AND delivery_state='pending' AND delivery_claim=?""",
+                    (now, delegation_id, event_key, claim_id),
+                )
+                if released.rowcount != 1:
+                    raise _DeliveryGroupConflict(event_key)
+                pending_keys.append(event_key)
+    except _DeliveryGroupConflict:
+        return False, event_keys
+    return True, pending_keys
+
+
+def _retain_group_event_keys(evt: Dict[str, Any], event_keys: List[str]) -> None:
+    """Keep only rows that remain pending after a grouped release."""
+
+    keep = set(event_keys)
+    evt["delivery_event_keys"] = list(event_keys)
+    evt["results"] = [
+        result
+        for result in (evt.get("results") or [])
+        if isinstance(result, dict)
+        and f"task:{int(result.get('task_index', 0))}" in keep
+    ]
+    evt["task_indices"] = sorted(
+        int(result.get("task_index", 0)) for result in evt["results"]
+    )
+
+
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
     if not claim_id or evt.get("type") != "async_delegation":
         return False
     delegation_id = str(evt.get("delegation_id") or "")
-    event_key = str(evt.get("delivery_event_key") or "")
-    if event_key:
-        completed = _complete_child_event(delegation_id, event_key, claim_id)
+    event_keys = _event_delivery_keys(evt)
+    if "delivery_event_keys" in evt:
+        completed = bool(event_keys) and _complete_child_event_group(
+            delegation_id, event_keys, claim_id
+        )
+    elif event_keys:
+        completed = _complete_child_event(delegation_id, event_keys[0], claim_id)
     else:
         completed = complete_completion_delivery(delegation_id, claim_id)
     return completed or get_event_delivery_state(evt) == "delivered"
@@ -1015,9 +1276,18 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
     if not claim_id or evt.get("type") != "async_delegation":
         return False
     delegation_id = str(evt.get("delegation_id") or "")
-    event_key = str(evt.get("delivery_event_key") or "")
-    if event_key:
-        return _release_child_event(delegation_id, event_key, claim_id)
+    event_keys = _event_delivery_keys(evt)
+    if "delivery_event_keys" in evt:
+        if not event_keys:
+            return False
+        released, pending_keys = _release_child_event_group(
+            delegation_id, event_keys, claim_id
+        )
+        if released:
+            _retain_group_event_keys(evt, pending_keys)
+        return released
+    if event_keys:
+        return _release_child_event(delegation_id, event_keys[0], claim_id)
     return release_completion_delivery(delegation_id, claim_id)
 
 
@@ -1025,9 +1295,14 @@ def drop_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     if not claim_id or evt.get("type") != "async_delegation":
         return
     delegation_id = str(evt.get("delegation_id") or "")
-    event_key = str(evt.get("delivery_event_key") or "")
-    if event_key:
-        _complete_child_event(delegation_id, event_key, claim_id, state="dropped")
+    event_keys = _event_delivery_keys(evt)
+    if "delivery_event_keys" in evt:
+        if event_keys:
+            _complete_child_event_group(
+                delegation_id, event_keys, claim_id, state="dropped"
+            )
+    elif event_keys:
+        _complete_child_event(delegation_id, event_keys[0], claim_id, state="dropped")
     else:
         drop_completion_delivery(delegation_id, claim_id)
 
@@ -1455,10 +1730,11 @@ def dispatch_async_delegation_batch(
     parallelism is bounded separately by ``max_concurrent_children``), so a
     single ``delegate_task`` fan-out never exhausts the async pool by itself.
 
-    ``after_turn`` publishes one consolidated completion after every child is
-    done. ``inject`` uses the same batch execution unit but each child publishes
-    an independently durable event as it becomes ready; finalization only
-    persists the aggregate result/status for observability and recovery.
+    Both delivery modes publish each child into an independently durable row as
+    it becomes ready. ``inject`` may claim rows at same-turn safe boundaries;
+    ``after_turn`` coalesces every ready row at the next available turn boundary.
+    Finalization only persists aggregate status for observability/recovery and
+    idempotently fills any child row missed by its completion callback.
 
     Returns ``{"status": "dispatched", "delegation_id": ...}`` on success or
     ``{"status": "rejected", "error": ...}`` when the async pool is at
@@ -1565,7 +1841,7 @@ def dispatch_async_delegation_batch(
 def _finalize_batch(
     delegation_id: str, combined: Dict[str, Any], status: str
 ) -> None:
-    """Mark a batch record complete and push ONE combined completion event."""
+    """Mark a batch complete and persist any missing child delivery events."""
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
@@ -1578,17 +1854,7 @@ def _finalize_batch(
 def _push_batch_completion_event(
     event_record: Dict[str, Any], combined: Dict[str, Any], status: str
 ) -> None:
-    """Push a combined async-delegation batch completion event."""
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            event_record.get("delegation_id"), exc,
-        )
-        return
-
+    """Finalize one child-scoped async-delegation batch."""
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
     evt = {
@@ -1631,24 +1897,13 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    if str(event_record.get("result_delivery") or "after_turn").lower() == "inject":
-        # Child callbacks publish incrementally for same-turn visibility. The
-        # finalizer idempotently inserts any missed child and commits the parent
-        # terminal row in one SQLite transaction; only newly inserted events are
-        # queued after that transaction commits.
-        _persist_inject_batch_finalization(
-            event_record, evt, combined, status
-        )
-        return
-    _persist_completion(evt, combined)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
-            event_record.get("delegation_id"), exc,
-        )
+    # Child callbacks publish incrementally in both delivery modes. The
+    # finalizer idempotently inserts any missed child and commits the parent
+    # terminal row in one SQLite transaction; only newly inserted events are
+    # queued after that transaction commits. Consumers decide whether ready
+    # children belong in the current turn (inject) or the next turn
+    # (after_turn).
+    _persist_batch_child_finalization(event_record, evt, combined, status)
 
 
 def _ensure_stale_monitor() -> None:

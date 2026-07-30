@@ -2816,8 +2816,8 @@ def delegate_task(
 
     # Background delegation applies to both single tasks and batches. A top-level
     # call is one async execution/stall unit. result_delivery determines whether
-    # ready children surface independently at safe boundaries or the completed
-    # batch follows the legacy consolidated synthetic-turn path.
+    # ready children surface independently at same-turn safe boundaries or are
+    # coalesced with every ready sibling at the next available turn boundary.
     background = is_truthy_value(background, default=False) if background is not None else False
 
     # result_delivery controls how child results reach the parent:
@@ -2990,8 +2990,8 @@ def delegate_task(
         children.append((i, t, child))
 
     def _publish_ready_result(entry: Dict[str, Any]) -> None:
-        """Publish one inject child without waiting for its batch siblings."""
-        if not background or _delivery != "inject":
+        """Publish one ready child without waiting for its batch siblings."""
+        if not background:
             return
         task_index = int(entry.get("task_index", 0))
         payload = dict(entry)
@@ -3005,7 +3005,7 @@ def delegate_task(
             # _push_batch_completion_event republishes all children
             # idempotently as a durable safety net.
             logger.exception(
-                "Failed to publish ready inject child %s/%s",
+                "Failed to publish ready child %s/%s",
                 live_deleg_id,
                 task_index,
             )
@@ -3015,10 +3015,9 @@ def delegate_task(
         fire subagent_stop hooks + cost rollup, and return the combined result
         dict. Used by BOTH the synchronous path and the background runner. In
         the background case this whole function runs on the daemon executor, so
-        the parent turn isn't blocked — but the batch still JOINS on itself
-        here (all children must finish) before producing ONE consolidated
-        results block. That is the contract: fan-out runs in the background,
-        waits on each other, and returns together.
+        the parent turn isn't blocked. Each child is published independently as
+        it becomes ready; this final aggregate is bookkeeping plus an idempotent
+        safety net for any child callback that failed before persistence.
         """
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
@@ -3194,8 +3193,9 @@ def delegate_task(
 
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
     # _execute_and_aggregate owns child execution and still returns one ordered
-    # aggregate. In inject mode its completion callback also publishes each
-    # child immediately; in after_turn mode only the aggregate is delivered.
+    # bookkeeping aggregate. Its completion callback publishes each child
+    # immediately in both delivery modes; consumers choose current-turn inject
+    # versus next-turn ready-set coalescing.
     if background:
         from tools.async_delegation import dispatch_async_delegation_batch
         from tools.approval import get_current_session_key
@@ -3372,8 +3372,9 @@ def delegate_task(
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
             # Delivery mode: 'inject' (synthetic at safe boundaries) or
-            # 'after_turn' (legacy completion_queue path). Default 'after_turn'
-            # preserves backward compatibility with old task_json entries.
+            # 'after_turn' (ready children coalesced at the next available turn
+            # boundary). Default 'after_turn' preserves compatibility with old
+            # task_json entries.
             result_delivery=_delivery,
             parent_turn_id=_parent_turn_id,
         )
@@ -3400,9 +3401,10 @@ def delegate_task(
                     "continue."
                     if n == 1 else
                     f"{n} subagents are running in parallel in the background. You "
-                    f"and the user can keep working; their consolidated results "
-                    f"re-enter as a single message once ALL finish. Do not wait "
-                    f"or poll — just continue."
+                    f"and the user can keep working; every result ready at the next "
+                    f"turn boundary re-enters in one grouped message without waiting "
+                    f"for slower siblings. Later results arrive in later grouped "
+                    f"messages. Do not wait or poll — just continue."
                 )
             payload = {
                 "status": "dispatched",
@@ -3763,8 +3765,9 @@ def _build_top_level_description() -> str:
         "each ready child is appended only after complete tool results and before "
         "the next model request, including one final reconciliation boundary. "
         "Choose result_delivery='after_turn' (the default) for independent work: "
-        "single results and consolidated batches arrive as separate synthetic "
-        "turns after the foreground turn. Neither mode waits for running children. "
+        "at each available turn boundary, every currently ready batch child is "
+        "grouped into one synthetic turn; slower siblings arrive in later grouped "
+        "turns. Neither mode waits for running children. "
         "Do NOT wait or poll; continue after dispatching.\n\n"
         "LIVE TRANSCRIPTS: the dispatch response includes 'live_transcripts' — "
         "one append-only human-readable log file per task (under "
@@ -3957,9 +3960,9 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "DEPRECATED / IGNORED. Top-level single and batch "
                     "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
-                    "consolidated batch result re-enters the conversation when "
-                    "the work finishes; just continue working in the meantime. "
+                    "not need to (and cannot) opt in or out. Ready results re-enter "
+                    "the conversation according to result_delivery; just continue "
+                    "working in the meantime. "
                     "Setting this has no effect; the parameter remains only for "
                     "backward compatibility."
                 ),
@@ -3978,8 +3981,10 @@ DELEGATE_TASK_SCHEMA = {
                     "the bounded reconciliation window become separate late-result "
                     "turns. "
                     "'after_turn' (default): use for independent background work; "
-                    "the result arrives in a separate synthetic turn after the "
-                    "foreground turn. Running children are never waited on."
+                    "at each available turn boundary, all currently ready children "
+                    "are grouped into one synthetic turn, while slower siblings "
+                    "arrive in later grouped turns. Running children are never "
+                    "waited on."
                 ),
             },
         },

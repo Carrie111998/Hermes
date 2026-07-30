@@ -414,7 +414,7 @@ def test_inject_batch_publishes_first_child_without_waiting_for_sibling():
     assert all(event.get("delivery_event_key") for event in restored)
 
 
-def test_after_turn_remains_default_and_emits_only_combined_batch_event():
+def test_after_turn_remains_default_and_coalesces_all_ready_children():
     gate = threading.Event()
 
     def runner():
@@ -430,11 +430,154 @@ def test_after_turn_remains_default_and_emits_only_combined_batch_event():
     )
     assert process_registry.completion_queue.empty()
     gate.set()
-    event = process_registry.completion_queue.get(timeout=3)
+    deadline = time.time() + 3
+    while process_registry.completion_queue.qsize() < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    drained = process_registry.drain_notifications(
+        owns_event=lambda _event: True,
+        skip_poll_observed=False,
+    )
+    assert len(drained) == 1
+    event, text = drained[0]
     assert event["delegation_id"] == dispatched["delegation_id"]
     assert event["result_delivery"] == "after_turn"
-    assert "delivery_event_key" not in event
+    assert event["delivery_event_keys"] == ["task:0", "task:1"]
     assert [r["summary"] for r in event["results"]] == ["A", "B"]
+    assert "RESULTS READY" in text
+    claim = ad.claim_event_delivery(event, "test-after-turn-default")
+    assert claim
+    assert ad.complete_event_delivery(event, claim)
+
+
+def test_batch_finalization_enqueues_ready_set_under_routing_lock(monkeypatch):
+    delegation_id = _record(goals=("A", "B"), delivery="after_turn")
+    with ad._records_lock:
+        record = dict(ad._records[delegation_id])
+    children = [_child(0, "A"), _child(1, "B")]
+
+    class TrackingLock:
+        def __init__(self):
+            self.inner = threading.RLock()
+            self.depth = 0
+
+        def __enter__(self):
+            self.inner.acquire()
+            self.depth += 1
+            return self
+
+        def __exit__(self, *_exc):
+            self.depth -= 1
+            self.inner.release()
+
+    tracking_lock = TrackingLock()
+
+    class GuardedQueue(__import__("queue").Queue):
+        def put(self, item, *args, **kwargs):
+            assert tracking_lock.depth > 0
+            return super().put(item, *args, **kwargs)
+
+    guarded_queue = GuardedQueue()
+    monkeypatch.setattr(process_registry, "completion_routing_lock", tracking_lock)
+    monkeypatch.setattr(process_registry, "completion_queue", guarded_queue)
+    combined = {"results": children, "total_duration_seconds": 1.0}
+    parent_event = {
+        **record,
+        "type": "async_delegation",
+        "status": "completed",
+        "is_batch": True,
+        "results": children,
+        "completed_at": time.time(),
+    }
+
+    ad._persist_batch_child_finalization(
+        record, parent_event, combined, "completed"
+    )
+
+    queued = [guarded_queue.get_nowait(), guarded_queue.get_nowait()]
+    assert [event["delivery_event_key"] for event in queued] == ["task:0", "task:1"]
+
+
+def test_after_turn_coalesced_claim_is_atomic_across_ready_children():
+    delegation_id = _record(goals=("A", "B"), delivery="after_turn")
+    assert ad.publish_batch_child_completion(delegation_id, 0, _child(0, "A"))
+    assert ad.publish_batch_child_completion(delegation_id, 1, _child(1, "B"))
+    children = [
+        process_registry.completion_queue.get_nowait(),
+        process_registry.completion_queue.get_nowait(),
+    ]
+    grouped = ad.coalesce_ready_after_turn_events(children)[0]
+
+    competing_claim = ad.claim_event_delivery(children[1], "competing-consumer")
+    assert competing_claim
+    assert ad.claim_event_delivery(grouped, "group-consumer") is None
+    # task:0's attempted group claim rolled back with the task:1 conflict.
+    assert _event_state(delegation_id, "task:0") == ("pending", 0)
+    assert _event_state(delegation_id, "task:1") == ("pending", 1)
+
+    assert ad.release_event_delivery(children[1], competing_claim)
+    group_claim = ad.claim_event_delivery(grouped, "group-consumer")
+    assert group_claim
+    assert ad.complete_event_delivery(grouped, group_claim)
+    assert _event_state(delegation_id, "task:0") == ("delivered", 1)
+    assert _event_state(delegation_id, "task:1") == ("delivered", 2)
+
+
+def test_group_release_prunes_attempt_capped_child_without_blocking_sibling():
+    delegation_id = _record(goals=("fresh", "near-cap"), delivery="after_turn")
+    for index, summary in enumerate(("fresh", "near-cap")):
+        assert ad.publish_batch_child_completion(
+            delegation_id, index, _child(index, summary)
+        )
+    children = [
+        process_registry.completion_queue.get_nowait(),
+        process_registry.completion_queue.get_nowait(),
+    ]
+    near_cap = children[1]
+    for _ in range(ad._MAX_DELIVERY_ATTEMPTS - 1):
+        claim = ad.claim_event_delivery(near_cap, "failing-consumer")
+        assert claim
+        assert ad.release_event_delivery(near_cap, claim)
+
+    grouped = ad.coalesce_ready_after_turn_events(children)[0]
+    group_claim = ad.claim_event_delivery(grouped, "group-consumer")
+    assert group_claim
+    assert ad.release_event_delivery(grouped, group_claim)
+
+    assert grouped["delivery_event_keys"] == ["task:0"]
+    assert [result["summary"] for result in grouped["results"]] == ["fresh"]
+    assert _event_state(delegation_id, "task:0") == ("pending", 1)
+    assert _event_state(delegation_id, "task:1") == (
+        "dropped",
+        ad._MAX_DELIVERY_ATTEMPTS,
+    )
+    retry_claim = ad.claim_event_delivery(grouped, "retry-consumer")
+    assert retry_claim
+    assert ad.complete_event_delivery(grouped, retry_claim)
+    assert _event_state(delegation_id, "task:0") == ("delivered", 2)
+
+
+def test_requeued_after_turn_envelope_absorbs_newly_ready_sibling():
+    delegation_id = _record(goals=("A", "B", "C"), delivery="after_turn")
+    for index, summary in enumerate(("A", "B", "C")):
+        assert ad.publish_batch_child_completion(
+            delegation_id, index, _child(index, summary)
+        )
+    children = [
+        process_registry.completion_queue.get_nowait(),
+        process_registry.completion_queue.get_nowait(),
+        process_registry.completion_queue.get_nowait(),
+    ]
+    requeued_envelope = ad.coalesce_ready_after_turn_events(children[:2])[0]
+    process_registry.completion_queue.put(children[2])
+
+    merged = process_registry.collect_ready_after_turn_siblings(requeued_envelope)
+
+    assert merged["delivery_event_keys"] == ["task:0", "task:1", "task:2"]
+    assert [result["summary"] for result in merged["results"]] == ["A", "B", "C"]
+    assert process_registry.completion_queue.empty()
+    claim = ad.claim_event_delivery(merged, "requeued-group-consumer")
+    assert claim
+    assert ad.complete_event_delivery(merged, claim)
 
 
 def test_inject_batch_finalization_rolls_back_children_if_parent_update_fails(
@@ -456,7 +599,7 @@ def test_inject_batch_finalization_rolls_back_children_if_parent_update_fails(
 
     monkeypatch.setattr(ad, "_update_completion_row", crash_before_parent_update)
     with pytest.raises(RuntimeError, match="simulated crash"):
-        ad._persist_inject_batch_finalization(
+        ad._persist_batch_child_finalization(
             event_record, parent_event, combined, "completed"
         )
 
@@ -464,8 +607,9 @@ def test_inject_batch_finalization_rolls_back_children_if_parent_update_fails(
     assert _parent_state(delegation_id) == ("running", "pending")
 
 
-def test_recovery_with_complete_inject_children_suppresses_parent_aggregate():
-    delegation_id = _record(goals=("A", "B"))
+@pytest.mark.parametrize("delivery", ["inject", "after_turn"])
+def test_recovery_with_complete_children_suppresses_parent_aggregate(delivery):
+    delegation_id = _record(goals=("A", "B"), delivery=delivery)
     assert ad.publish_batch_child_completion(delegation_id, 0, _child(0, "A"))
     assert ad.publish_batch_child_completion(delegation_id, 1, _child(1, "B"))
     while not process_registry.completion_queue.empty():
@@ -489,8 +633,9 @@ def test_recovery_with_complete_inject_children_suppresses_parent_aggregate():
     }
 
 
-def test_recovery_with_partial_inject_children_emits_only_terminal_gap_event():
-    delegation_id = _record(goals=("A", "B"))
+@pytest.mark.parametrize("delivery", ["inject", "after_turn"])
+def test_recovery_with_partial_children_emits_only_terminal_gap_event(delivery):
+    delegation_id = _record(goals=("A", "B"), delivery=delivery)
     assert ad.publish_batch_child_completion(delegation_id, 0, _child(0, "A"))
     process_registry.completion_queue.get_nowait()
     with ad._DB_LOCK, ad._transaction() as conn:
@@ -511,12 +656,17 @@ def test_recovery_with_partial_inject_children_emits_only_terminal_gap_event():
         "task:0",
         "terminal",
     }
-    terminal = next(event for event in events if event["delivery_event_key"] == "terminal")
+    terminal = next(
+        event for event in events if event["delivery_event_key"] == "terminal"
+    )
+    assert terminal["status"] == "unknown"
+    assert terminal["result_delivery"] == delivery
     assert "1/2 batch child results" in terminal["error"]
 
 
-def test_recovery_requires_exact_expected_batch_child_keys():
-    delegation_id = _record(goals=("A", "B"))
+@pytest.mark.parametrize("delivery", ["inject", "after_turn"])
+def test_recovery_requires_exact_expected_batch_child_keys(delivery):
+    delegation_id = _record(goals=("A", "B"), delivery=delivery)
     assert ad.publish_batch_child_completion(delegation_id, 0, _child(0, "A"))
     process_registry.completion_queue.get_nowait()
     with ad._records_lock:

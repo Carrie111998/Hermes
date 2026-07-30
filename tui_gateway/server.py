@@ -8448,10 +8448,16 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
             evt.get("suppressed", 0),
         )
     if evt_type == "async_delegation":
-        # Async-delegation completions have no process session_id; without
-        # this the fallthrough keys every one as ("", "async_delegation")
-        # and the second completion's status update is suppressed forever.
-        return (evt.get("delegation_id", ""), evt_type)
+        # Child-scoped batches may deliver several ready rows together and the
+        # remaining rows later. Include the exact durable key set so a later
+        # portion of the same delegation is not visually suppressed.
+        raw_keys = evt.get("delivery_event_keys")
+        if isinstance(raw_keys, (list, tuple)):
+            event_keys = tuple(str(key) for key in raw_keys if key)
+        else:
+            event_key = str(evt.get("delivery_event_key") or "")
+            event_keys = (event_key,) if event_key else ()
+        return (evt.get("delegation_id", ""), evt_type, event_keys)
     return (evt_sid, evt_type)
 
 
@@ -8713,6 +8719,7 @@ def _notification_poller_loop(
                         )
                         _route_action = "dropped"
                     else:
+                        evt = process_registry.collect_ready_after_turn_siblings(evt)
                         _evt_sid = evt.get("session_id", "")
                         if (
                             evt.get("type") == "completion"
@@ -8837,6 +8844,7 @@ def _notification_poller_loop(
                     )
                 continue
 
+            evt = process_registry.collect_ready_after_turn_siblings(evt)
             _evt_sid = evt.get("session_id", "")
             if (
                 evt.get("type") == "completion"

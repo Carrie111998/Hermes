@@ -37,9 +37,19 @@ delegate_task(tasks=[
 running child. `result_delivery` controls only when an already-completed result
 is shown to the parent model:
 
-- **`after_turn` (default):** preserves the existing behavior. A single result,
-  or one consolidated batch result, is delivered as a separate synthetic turn
-  after the foreground turn ends.
+- **`after_turn` (default):** at each available turn boundary, every completed
+  but undelivered child from the batch is grouped into one synthetic turn. It
+  never waits for unfinished siblings: if 1/3 is ready, that result is delivered;
+  if two more are ready at a later boundary, those two are grouped into the next
+  turn.
+
+:::note Ready-set invariant
+At one delivery boundary, one batch produces exactly one envelope containing
+all of its currently completed, undelivered child rows. The envelope is claimed
+and acknowledged atomically. Unfinished siblings are never waited on; children
+that finish later form the ready-set at a later boundary.
+:::
+
 - **`inject`:** intended for auditors, reviewers, and dependent work that can
   change what the parent should do now. Each ready child is appended to the
   conversation at the next safe boundary, after all tool results from the
@@ -149,7 +159,7 @@ delegate_task(
 
 ## Batch Mode Details
 
-When a top-level agent provides a `tasks` array, Hermes returns one background handle and runs the subagents in parallel. With the default `after_turn` delivery it posts one consolidated result after every child finishes. With `inject`, each child summary can re-enter independently as soon as it is ready. An orchestrator subagent waits for its batch in the current turn so it can synthesize the results.
+When a top-level agent provides a `tasks` array, Hermes returns one background handle and runs the subagents in parallel. With the default `after_turn` delivery, every ready child at an available turn boundary is grouped into one result turn; unfinished siblings do not block it and appear in a later ready-set. With `inject`, each child summary can re-enter independently as soon as it is ready. An orchestrator subagent waits for its batch in the current turn so it can synthesize the results.
 
 - **Maximum concurrency:** 3 tasks by default (configurable via `delegation.max_concurrent_children` or the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var; floor of 1, no hard ceiling). Batches larger than the limit return a tool error rather than being silently truncated.
 - **Thread pool:** Uses `ThreadPoolExecutor` with the configured concurrency limit as max workers

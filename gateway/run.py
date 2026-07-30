@@ -20934,8 +20934,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
             producer_id = str(evt.get("delegation_id") or "")
-            event_key = str(evt.get("delivery_event_key") or "")
-            return (evt_type, producer_id, event_key) if producer_id else None
+            raw_keys = evt.get("delivery_event_keys")
+            if isinstance(raw_keys, (list, tuple)):
+                event_identity: object = tuple(str(key) for key in raw_keys if key)
+            else:
+                event_identity = str(evt.get("delivery_event_key") or "")
+            return (evt_type, producer_id, event_identity) if producer_id else None
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
             started_at = evt.get("started_at")
@@ -21162,44 +21166,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # so requeue anything that isn't ours.
                 requeue = []
                 async_events = []
-                while not _pr.completion_queue.empty():
-                    try:
-                        evt = _pr.completion_queue.get_nowait()
-                    except Exception:
-                        break
-                    if evt.get("type") == "async_delegation":
-                        async_events.append(evt)
-                    else:
-                        requeue.append(evt)
-                for evt in requeue:
-                    _pr.completion_queue.put(evt)
+                with _pr.completion_routing_lock:
+                    while not _pr.completion_queue.empty():
+                        try:
+                            evt = _pr.completion_queue.get_nowait()
+                        except Exception:
+                            break
+                        if evt.get("type") == "async_delegation":
+                            async_events.append(evt)
+                        else:
+                            requeue.append(evt)
+                    for evt in requeue:
+                        _pr.completion_queue.put(evt)
+                from tools.async_delegation import coalesce_ready_after_turn_events
+
+                async_events = coalesce_ready_after_turn_events(async_events)
                 for evt in async_events:
                     self._enrich_async_delegation_routing(evt)
-                    # Gateway busy-session deferral for 'inject' events:
-                    # if the parent session is currently running another
-                    # turn, leave the inject queued so the conversation
-                    # loop's safe-boundary drain can pick it up when the
-                    # turn finishes. This keeps inject from being claimed
-                    # away from the active parent. 'after_turn' events are
-                    # always delivered here (the legacy path).
+                    # Busy-session routing:
+                    # - inject for the matching active turn stays queued for the
+                    #   conversation loop's safe-boundary drain;
+                    # - after_turn stays queued until that foreground turn ends.
+                    # A requeued after-turn envelope is re-coalescible, so siblings
+                    # that finish meanwhile join the same next-boundary delivery.
                     _rd = str(evt.get("result_delivery") or "after_turn").strip().lower()
-                    if _rd == "inject":
-                        _route_key = str(evt.get("session_key") or "").strip()
-                        _event_turn_id = str(evt.get("parent_turn_id") or "")
-                        _running_parent = self._running_agents.get(_route_key)
-                        if _running_parent is _AGENT_PENDING_SENTINEL:
-                            _pr.completion_queue.put(evt)
-                            continue
-                        if (
-                            _running_parent is not None
-                            and _event_turn_id
-                            and str(
-                                getattr(_running_parent, "_active_turn_id", "") or ""
-                            )
-                            == _event_turn_id
-                        ):
-                            _pr.completion_queue.put(evt)
-                            continue
+                    _route_key = str(evt.get("session_key") or "").strip()
+                    _event_turn_id = str(evt.get("parent_turn_id") or "")
+                    _running_parent = getattr(self, "_running_agents", {}).get(
+                        _route_key
+                    )
+                    if _running_parent is _AGENT_PENDING_SENTINEL:
+                        _pr.completion_queue.put(evt)
+                        continue
+                    if _rd == "after_turn" and _running_parent is not None:
+                        _pr.completion_queue.put(evt)
+                        continue
+                    if (
+                        _rd == "inject"
+                        and _running_parent is not None
+                        and _event_turn_id
+                        and str(
+                            getattr(_running_parent, "_active_turn_id", "") or ""
+                        )
+                        == _event_turn_id
+                    ):
+                        _pr.completion_queue.put(evt)
+                        continue
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
