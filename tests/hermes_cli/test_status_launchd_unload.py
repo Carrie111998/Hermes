@@ -158,10 +158,13 @@ class TestStatusLaunchdUnloadWarning:
         assert "plist found but service is not loaded into launchd" in out, (
             f"expected unload warning in status output, got:\n{out}"
         )
-        assert "launchctl bootstrap gui/$(id -u)" in out, (
-            f"expected fix command in status output, got:\n{out}"
+        assert "hermes gateway start" in out, (
+            f"expected repair hint in status output, got:\n{out}"
         )
-        assert str(isolated_status_env.plist) in out
+        assert str(isolated_status_env.plist) not in out, (
+            f"status must not echo raw plist path when routing through the CLI; "
+            f"got:\n{out}"
+        )
 
     def test_warning_suppressed_when_launchd_is_running(
         self, monkeypatch, capsys, isolated_status_env
@@ -237,6 +240,38 @@ class TestStatusLaunchdUnloadWarning:
         out = capsys.readouterr().out
         assert "plist found but service is not loaded" not in out, (
             f"warning must not fire on Linux even with plist/unload state; got:\n{out}"
+        )
+
+    def test_warning_does_not_recommend_raw_launchctl_command(
+        self, monkeypatch, capsys, isolated_status_env
+    ):
+        """Regression: status must not suggest a raw ``launchctl bootstrap``
+        command for repair. The launchd domain (gui/<uid> vs user/<uid>) is
+        resolved by ``_launchd_domain()`` and depends on the session (Aqua vs
+        Background/SSH); hardcoding ``gui/<uid>`` misleads Background/SSH
+        users. The CLI (``hermes gateway start``) handles all the cases.
+
+        Surfaced by hermes-sweeper review on PR #73370:
+        https://github.com/NousResearch/hermes-agent/pull/73370
+        """
+        monkeypatch.setattr(sys, "platform", "darwin")
+        isolated_status_env.set_snapshot(
+            running=False,
+            manager="launchd",
+            service_installed=True,
+            service_running=False,
+        ).set_plist(exists=True).set_probe(running=False).install()
+
+        show_status(SimpleNamespace(all=False, deep=False))
+
+        out = capsys.readouterr().out
+        assert "launchctl bootstrap" not in out, (
+            f"status must not print a raw launchctl command — domain resolution "
+            f"is hermes's responsibility (see _launchd_domain()); got:\n{out}"
+        )
+        assert "launchctl bootout" not in out, (
+            f"status must not print a raw bootout command either — sticky domain "
+            f"resolution same reason; got:\n{out}"
         )
 
 

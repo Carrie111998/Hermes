@@ -520,7 +520,16 @@ def show_status(args):
                 plist = get_launchd_plist_path()
                 if plist.exists() and not _probe_launchd_service_running():
                     print(f"  {color('⚠', Colors.YELLOW)} launchd:      plist found but service is not loaded into launchd")
-                    print(f"  Fix:          launchctl bootstrap gui/$(id -u) {plist}")
+                    # Route the repair through the CLI: `launchd_start()`
+                    # (hermes_cli/gateway.py:4293) already handles
+                    # domain resolution (`_launchd_domain()` chooses
+                    # gui/<uid> in Aqua, user/<uid> in Background/SSH),
+                    # plist regeneration, stale-already-loaded EIO retry,
+                    # and domain-unsupported fallbacks. Raw
+                    # `launchctl bootstrap gui/<uid>` misleads
+                    # Background/SSH users (issue surfaced by hermes-sweeper
+                    # review on PR #73370).
+                    print(f"  Repair:       hermes gateway start")
     except Exception:
         if _is_termux():
             print(f"  Status:       {color('unknown', Colors.DIM)}")
