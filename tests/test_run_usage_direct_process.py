@@ -118,3 +118,65 @@ def test_real_aiagent_conversation_lifecycle_writes_direct_receipt(tmp_path, mon
         assert receipt["outcome"] == "completed"
     finally:
         reset_hermes_home_override(token)
+
+
+def test_real_aiagent_codex_responses_lifecycle_writes_usage_receipt(tmp_path, monkeypatch):
+    from hermes_cli.lifecycle import finalize_session
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from run_agent import AIAgent
+
+    token = set_hermes_home_override(tmp_path)
+    monkeypatch.setenv("HERMES_RUN_ID", "e2e-codex-run")
+    try:
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                request = json.loads(self.rfile.read(length))
+                events = [
+                    {"type": "response.created", "response": {"id": "resp-local", "model": "fake/codex-model"}},
+                    {"type": "response.output_text.delta", "delta": "codex-done"},
+                    {"type": "response.completed", "response": {"id": "resp-local", "model": "fake/codex-model", "usage": {"input_tokens": 11, "output_tokens": 5, "total_tokens": 16}}},
+                ]
+                body = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events) + b"data: [DONE]\n\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+
+            def log_message(self, format, *args):  # noqa: A002, ANN001
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            agent = AIAgent(
+                api_key="test-key",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                provider="openai-codex",
+                model="fake/codex-model",
+                api_mode="codex_responses",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_id="e2e-codex-session",
+                platform="cli",
+            )
+            result = agent.run_conversation("hello")
+            assert result["final_response"] == "codex-done"
+            finalize_session(session_id="e2e-codex-session", platform="cli", completed=True)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        receipt = UsageLedger(tmp_path / "state.db").get_run("e2e-codex-run")
+        assert receipt["input_tokens"] == 11
+        assert receipt["output_tokens"] == 5
+        assert receipt["model"] == "fake/codex-model"
+        assert receipt["provider"] == "openai-codex"
+        assert receipt["outcome"] == "completed"
+    finally:
+        reset_hermes_home_override(token)

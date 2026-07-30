@@ -50,8 +50,8 @@ CREATE TABLE IF NOT EXISTS usage_runs (
     updated_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS usage_events (
-    event_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES usage_runs(run_id) ON DELETE CASCADE,
+    event_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     session_id TEXT,
     turn_id TEXT,
@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS usage_events (
     retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
     model TEXT,
     provider TEXT,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    PRIMARY KEY (run_id, event_id)
 );
 CREATE TABLE IF NOT EXISTS usage_turns (
     run_id TEXT NOT NULL REFERENCES usage_runs(run_id) ON DELETE CASCADE,
@@ -86,17 +87,11 @@ CREATE TABLE IF NOT EXISTS usage_diagnostics (
     detail TEXT,
     created_at REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_usage_runs_board ON usage_runs(board, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_usage_runs_task ON usage_runs(task_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_usage_runs_task_run ON usage_runs(task_run_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_usage_runs_session ON usage_runs(session_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_usage_events_run ON usage_events(run_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_usage_run_models_run ON usage_run_models(run_id, model, provider);
 CREATE INDEX IF NOT EXISTS idx_usage_diagnostics_run ON usage_diagnostics(run_id, created_at);
 """
 
-_PROCESS_ID = str(os.getpid())
-_PROCESS_INVOCATION_ID = os.environ.get("HERMES_RUN_ID", "").strip() or f"proc-{_PROCESS_ID}-{uuid.uuid4().hex}"
+_PROCESS_ID = f"proc-{os.getpid()}-{uuid.uuid4().hex}"
+_PROCESS_INVOCATION_ID = _PROCESS_ID
 _CURRENT_SESSION: ContextVar[str | None] = ContextVar("hermes_usage_session", default=None)
 _LEDGER_CACHE: dict[str, "UsageLedger"] = {}
 _LEDGER_CACHE_LOCK = threading.Lock()
@@ -122,6 +117,11 @@ def process_run_id() -> str:
         return f"task-run:{kanban_run}"
     explicit = os.environ.get("HERMES_RUN_ID", "").strip()
     return explicit or _PROCESS_INVOCATION_ID
+
+
+def process_invocation_id() -> str:
+    """Return a unique identity for this interpreter invocation."""
+    return _PROCESS_INVOCATION_ID
 
 
 def run_id_for_session(session_id: str | None = None) -> str:
@@ -197,6 +197,8 @@ class UsageLedger:
         self._dropped: dict[tuple[str | None, str], int] = {}
         self._incomplete_runs: dict[str, int] = {}
         self._diagnostic_limit = 256
+        self._global_incomplete = False
+        self._global_diagnostics: dict[str, int] = {}
         self._queue_cond = threading.Condition()
         self._writer: threading.Thread | None = None
         self._writer_stop = False
@@ -216,34 +218,145 @@ class UsageLedger:
     def _ensure_schema(self) -> None:
         with self._connection() as connection:
             connection.executescript(_USAGE_SCHEMA)
+            self._migrate_usage_events(connection)
             cols = {row["name"] for row in connection.execute("PRAGMA table_info(usage_runs)")}
-            if "task_run_id" not in cols:
-                connection.execute("ALTER TABLE usage_runs ADD COLUMN task_run_id INTEGER")
-            model_cols = {row["name"]: row["notnull"] for row in connection.execute("PRAGMA table_info(usage_run_models)")}
-            if model_cols and not model_cols.get("provider"):
-                connection.execute("ALTER TABLE usage_run_models RENAME TO usage_run_models_legacy")
-                connection.execute("""CREATE TABLE usage_run_models (
+            optional_columns = {
+                "task_run_id": "task_run_id INTEGER",
+                "session_id": "session_id TEXT",
+                "task_id": "task_id TEXT",
+                "board": "board TEXT",
+                "model": "model TEXT",
+                "provider": "provider TEXT",
+                "input_tokens": "input_tokens INTEGER NOT NULL DEFAULT 0",
+                "output_tokens": "output_tokens INTEGER NOT NULL DEFAULT 0",
+                "cost_usd": "cost_usd REAL NOT NULL DEFAULT 0",
+                "turn_count": "turn_count INTEGER NOT NULL DEFAULT 0",
+                "tool_call_count": "tool_call_count INTEGER NOT NULL DEFAULT 0",
+                "elapsed": "elapsed REAL",
+                "outcome": "outcome TEXT",
+                "retry_count": "retry_count INTEGER NOT NULL DEFAULT 0",
+                "failure_reason": "failure_reason TEXT",
+                "ended_at": "ended_at REAL",
+            }
+            for name, definition in optional_columns.items():
+                if name not in cols:
+                    connection.execute(f"ALTER TABLE usage_runs ADD COLUMN {definition}")
+            self._migrate_usage_run_models(connection)
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_runs_board ON usage_runs(board, started_at DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_runs_task ON usage_runs(task_id, started_at DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_runs_task_run ON usage_runs(task_run_id, started_at DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_runs_session ON usage_runs(session_id, started_at DESC)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_run ON usage_events(run_id, created_at)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_events_event ON usage_events(event_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_run_models_run ON usage_run_models(run_id, model, provider)")
+
+    @staticmethod
+    def _migrate_usage_events(connection: sqlite3.Connection) -> None:
+        columns = connection.execute("PRAGMA table_info(usage_events)").fetchall()
+        names = {row[1] for row in columns}
+        primary_key = [row[1] for row in columns if row[5]]
+        if primary_key != ["event_id"]:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("ALTER TABLE usage_events RENAME TO usage_events_legacy")
+            connection.execute(
+                """CREATE TABLE usage_events (
                     run_id TEXT NOT NULL REFERENCES usage_runs(run_id) ON DELETE CASCADE,
-                    model TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'unknown',
+                    event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    session_id TEXT,
+                    turn_id TEXT,
+                    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+                    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+                    cost_usd REAL NOT NULL DEFAULT 0 CHECK (cost_usd >= 0),
+                    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+                    model TEXT,
+                    provider TEXT,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (run_id, event_id)
+                )"""
+            )
+            source = {
+                "run_id": "run_id",
+                "event_id": "event_id",
+                "event_type": "event_type",
+                "session_id": "session_id" if "session_id" in names else "NULL",
+                "turn_id": "turn_id" if "turn_id" in names else "NULL",
+                "input_tokens": "input_tokens" if "input_tokens" in names else "0",
+                "output_tokens": "output_tokens" if "output_tokens" in names else "0",
+                "cost_usd": "cost_usd" if "cost_usd" in names else "0",
+                "retry_count": "retry_count" if "retry_count" in names else "0",
+                "model": "model" if "model" in names else "NULL",
+                "provider": "provider" if "provider" in names else "NULL",
+                "created_at": "created_at" if "created_at" in names else "0",
+            }
+            target_columns = ", ".join(source)
+            source_columns = ", ".join(source.values())
+            connection.execute(
+                f"INSERT INTO usage_events({target_columns}) SELECT {source_columns} FROM usage_events_legacy"
+            )
+            connection.execute("DROP TABLE usage_events_legacy")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_usage_run_models(connection: sqlite3.Connection) -> None:
+        columns = connection.execute("PRAGMA table_info(usage_run_models)").fetchall()
+        if not columns:
+            return
+        names = {row[1] for row in columns}
+        primary_key = [row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]]
+        provider_not_null = any(row[1] == "provider" and row[3] for row in columns)
+        if names >= {"run_id", "model", "provider"} and provider_not_null and primary_key == ["run_id", "model", "provider"]:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("ALTER TABLE usage_run_models RENAME TO usage_run_models_legacy")
+            connection.execute(
+                """CREATE TABLE usage_run_models (
+                    run_id TEXT NOT NULL REFERENCES usage_runs(run_id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT 'unknown',
                     input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
                     output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
                     cost_usd REAL NOT NULL DEFAULT 0 CHECK (cost_usd >= 0),
                     event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count >= 0),
-                    PRIMARY KEY (run_id, model, provider))""")
-                connection.execute("""INSERT INTO usage_run_models
-                    (run_id, model, provider, input_tokens, output_tokens, cost_usd, event_count)
-                    SELECT run_id, model, COALESCE(NULLIF(provider, ''), 'unknown'),
-                           SUM(input_tokens), SUM(output_tokens), SUM(cost_usd), SUM(event_count)
-                    FROM usage_run_models_legacy GROUP BY run_id, model, COALESCE(NULLIF(provider, ''), 'unknown')""")
-                connection.execute("DROP TABLE usage_run_models_legacy")
-                connection.execute("CREATE INDEX IF NOT EXISTS idx_usage_run_models_run ON usage_run_models(run_id, model, provider)")
+                    PRIMARY KEY (run_id, model, provider)
+                )"""
+            )
+            provider_expr = "COALESCE(NULLIF(provider, ''), 'unknown')" if "provider" in names else "'unknown'"
+            connection.execute(
+                f"""INSERT INTO usage_run_models(
+                    run_id, model, provider, input_tokens, output_tokens, cost_usd, event_count
+                ) SELECT run_id, model, {provider_expr},
+                    SUM(input_tokens), SUM(output_tokens), SUM(cost_usd), SUM(event_count)
+                FROM usage_run_models_legacy
+                GROUP BY run_id, model, {provider_expr}"""
+            )
+            connection.execute("DROP TABLE usage_run_models_legacy")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    def _mark_global_incomplete(self, reason: str) -> None:
+        self._global_incomplete = True
+        if reason in self._global_diagnostics or len(self._global_diagnostics) < self._diagnostic_limit:
+            self._global_diagnostics[reason] = self._global_diagnostics.get(reason, 0) + 1
 
     def _record_drop(self, run_id: str | None, kind: str) -> None:
         key = (run_id, kind)
         if key in self._dropped or len(self._dropped) < self._diagnostic_limit:
             self._dropped[key] = self._dropped.get(key, 0) + 1
+        else:
+            self._mark_global_incomplete("diagnostic_capacity_exhausted")
         if run_id and (run_id in self._incomplete_runs or len(self._incomplete_runs) < self._diagnostic_limit):
             self._incomplete_runs[run_id] = self._incomplete_runs.get(run_id, 0) + 1
+        else:
+            self._mark_global_incomplete("run_capacity_exhausted")
 
     def _enqueue(self, fn: Callable[..., Any], *args: Any, critical: bool = False, **kwargs: Any) -> bool:
         operation: Operation = (fn, args, kwargs)
@@ -280,9 +393,14 @@ class UsageLedger:
                 with self._queue_cond:
                     if len(self._failed_operations) < self._queue_limit:
                         self._failed_operations.append(operation)
-                    key = (operation[2].get("run_id"), "writer_failure")
-                    if key in self._dropped or len(self._dropped) < self._diagnostic_limit:
-                        self._dropped[key] = self._dropped.get(key, 0) + 1
+                        key = (operation[2].get("run_id"), "writer_failure")
+                        if key in self._dropped or len(self._dropped) < self._diagnostic_limit:
+                            self._dropped[key] = self._dropped.get(key, 0) + 1
+                        else:
+                            self._mark_global_incomplete("diagnostic_capacity_exhausted")
+                    else:
+                        self._mark_global_incomplete("failed_buffer_full")
+                        self._record_drop(operation[2].get("run_id"), "failed_buffer_full")
                 logger.warning("usage ledger write failed; continuing runtime", exc_info=True)
             finally:
                 with self._queue_cond:
@@ -312,15 +430,21 @@ class UsageLedger:
                 still_failed.append(operation)
         if still_failed:
             with self._queue_cond:
-                for operation in still_failed[: self._queue_limit - len(self._failed_operations)]:
+                available = self._queue_limit - len(self._failed_operations)
+                for operation in still_failed[:available]:
                     self._failed_operations.append(operation)
                     self._record_drop(operation[2].get("run_id"), "persistent_writer_failure")
+                for operation in still_failed[available:]:
+                    self._mark_global_incomplete("failed_buffer_full")
+                    self._record_drop(operation[2].get("run_id"), "failed_buffer_full")
 
     def _persist_diagnostics(self) -> None:
         with self._queue_cond:
             dropped = self._dropped
             self._dropped = {}
-        if not dropped:
+            global_diagnostics = self._global_diagnostics
+            self._global_diagnostics = {}
+        if not dropped and not global_diagnostics:
             return
         with self._connection() as connection:
             now = time.time()
@@ -328,6 +452,11 @@ class UsageLedger:
                 connection.execute(
                     "INSERT INTO usage_diagnostics(run_id, diagnostic_type, count, detail, created_at) VALUES (?, ?, ?, ?, ?)",
                     (run_id, "dropped_event", count, kind, now),
+                )
+            for reason, count in global_diagnostics.items():
+                connection.execute(
+                    "INSERT INTO usage_diagnostics(run_id, diagnostic_type, count, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (None, "usage_incomplete_global", count, reason, now),
                 )
 
     def finalize_run(self, *, run_id: str, outcome: str | None = None,
@@ -338,7 +467,12 @@ class UsageLedger:
         self._replay_failed_sync()
         self._replay_failed_sync()
         with self._queue_cond:
-            complete = drained and not self._queue and not self._writer_busy and not self._failed_operations and run_id not in self._incomplete_runs
+            complete = (
+                drained and not self._queue and not self._writer_busy
+                and not self._failed_operations
+                and not self._global_incomplete
+                and run_id not in self._incomplete_runs
+            )
         if not complete:
             self._record_drop(run_id, "incomplete_finalization")
             try:

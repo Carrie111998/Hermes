@@ -68,10 +68,10 @@ def test_card_cost_requires_explicit_board(tmp_path):
     assert "--board" in result.stderr
 
 
-def test_report_all_selected_profiles_adds_source_and_retains_duplicate_ids(tmp_path, capsys, monkeypatch):
+def test_report_all_selected_profiles_deduplicates_identical_global_run_ids(tmp_path, capsys, monkeypatch):
     first = tmp_path / "default.db"
     second = tmp_path / "reviewer.db"
-    UsageLedger(first).start_run(run_id="direct-a", process_id="1", session_id="s1")
+    UsageLedger(first).start_run(run_id="direct-a", process_id="1", session_id="s", started_at=1)
     UsageLedger(second).start_run(run_id="direct-b", process_id="2", session_id="s2")
     monkeypatch.setattr(
         run_usage_report,
@@ -82,10 +82,31 @@ def test_report_all_selected_profiles_adds_source_and_retains_duplicate_ids(tmp_
     row = json.loads(capsys.readouterr().out)[0]
     assert row["source_profile"] == "default"
 
-    UsageLedger(second).start_run(run_id="direct-a", process_id="3", session_id="s3")
+    UsageLedger(second).start_run(run_id="direct-a", process_id="3", session_id="s", started_at=1)
     assert run_usage_report.main(["--all-profiles", "--run-id", "direct-a"]) == 0
     rows = json.loads(capsys.readouterr().out)
-    assert [row["identity"] for row in rows] == [["default", "direct-a"], ["reviewer", "direct-a"]]
+    assert len(rows) == 1
+    assert rows[0]["source_profile"] == "default"
+    assert rows[0]["source_profiles"] == ["default", "reviewer"]
+
+
+def test_report_all_profiles_rejects_conflicting_duplicate_global_run_ids(tmp_path, capsys, monkeypatch):
+    first = tmp_path / "default.db"
+    second = tmp_path / "reviewer.db"
+    UsageLedger(first).start_run(run_id="conflict", process_id="1")
+    UsageLedger(second).start_run(run_id="conflict", process_id="2")
+    UsageLedger(second).record_model_usage(
+        run_id="conflict", event_id="event", session_id="s", turn_id="t",
+        model="m", provider="p", input_tokens=9,
+    )
+    monkeypatch.setattr(
+        run_usage_report,
+        "_selected_ledgers",
+        lambda args: [("default", first), ("reviewer", second)],
+    )
+
+    assert run_usage_report.main(["--all-profiles", "--run-id", "conflict"]) == 2
+    assert "conflicting duplicate" in capsys.readouterr().err
 
 
 def test_all_profiles_maps_root_default_and_named_profiles_once(tmp_path, capsys, monkeypatch):
@@ -93,8 +114,8 @@ def test_all_profiles_maps_root_default_and_named_profiles_once(tmp_path, capsys
     named = root / "profiles" / "reviewer"
     named.mkdir(parents=True)
     root.mkdir(exist_ok=True)
-    UsageLedger(root / "state.db").start_run(run_id="same", process_id="default")
-    UsageLedger(named / "state.db").start_run(run_id="same", process_id="reviewer")
+    UsageLedger(root / "state.db").start_run(run_id="same", process_id="default", started_at=1)
+    UsageLedger(named / "state.db").start_run(run_id="same", process_id="reviewer", started_at=1)
     monkeypatch.setattr(run_usage_report, "get_default_hermes_root", lambda: root)
     monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [
         type("P", (), {"name": "default", "path": root})(),
@@ -102,9 +123,9 @@ def test_all_profiles_maps_root_default_and_named_profiles_once(tmp_path, capsys
     ])
     assert run_usage_report.main(["--all-profiles", "--run-id", "same"]) == 0
     rows = json.loads(capsys.readouterr().out)
-    assert [(row["source_profile"], row["process_id"]) for row in rows] == [
-        ("default", "default"), ("reviewer", "reviewer")
-    ]
+    assert len(rows) == 1
+    assert rows[0]["source_profile"] == "default"
+    assert rows[0]["source_profiles"] == ["default", "reviewer"]
 
 
 def test_card_query_joins_exact_task_run_usage(tmp_path, capsys):

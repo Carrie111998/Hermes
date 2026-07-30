@@ -11,6 +11,32 @@ from hermes_constants import get_default_hermes_root
 from agent.run_usage_ledger import UsageLedger, default_ledger_path
 
 
+def _run_fingerprint(row: dict) -> str:
+    """Fingerprint accounting data, excluding ledger-local attribution."""
+    comparable = {
+        key: value for key, value in row.items()
+        if key not in {"identity", "source_profile", "source_profiles", "process_id", "updated_at"}
+    }
+    return json.dumps(comparable, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _deduplicate_global_runs(rows: list[dict]) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["run_id"]), []).append(row)
+    deduplicated: list[dict] = []
+    for run_id, candidates in grouped.items():
+        candidates.sort(key=lambda row: (str(row.get("source_profile") or ""), str(row.get("process_id") or "")))
+        fingerprints = {_run_fingerprint(row) for row in candidates}
+        if len(fingerprints) > 1:
+            profiles = ", ".join(str(row.get("source_profile") or "unknown") for row in candidates)
+            raise ValueError(f"conflicting duplicate run_id {run_id!r} across profiles: {profiles}")
+        winner = dict(candidates[0])
+        winner["source_profiles"] = sorted({str(row.get("source_profile") or "unknown") for row in candidates})
+        deduplicated.append(winner)
+    return deduplicated
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Report Hermes model/tool usage by run, process, session, profile, or card.")
     parser.add_argument("--db", type=Path, default=None, help="one explicit state database path")
@@ -104,10 +130,8 @@ def main(argv: list[str] | None = None) -> int:
                     source_profile=source_profile,
                     include_unassigned=args.include_unassigned,
                 ))
+        rows = _deduplicate_global_runs(rows)
         for row in rows:
-            # ``run_id`` is only unique inside one profile. Preserve the
-            # composite identity explicitly rather than rejecting valid
-            # duplicate IDs from independent profile-local ledgers.
             row["identity"] = [row["source_profile"], row["run_id"]]
         rows.sort(key=lambda row: (row.get("started_at") or 0, row["source_profile"], row["run_id"]))
         print(json.dumps(rows, indent=2, sort_keys=True))

@@ -88,6 +88,113 @@ def test_model_usage_callback_is_idempotent_for_duplicate_event(tmp_path):
     assert receipt["retry_count"] == 1
 
 
+def test_event_identity_is_scoped_to_run(tmp_path):
+    ledger = UsageLedger(tmp_path / "state.db")
+
+    assert ledger.record_model_usage(
+        run_id="run-a", event_id="provider-request-1", session_id="s-a",
+        turn_id="t-a", model="m", provider="p", input_tokens=2,
+    )
+    assert ledger.record_model_usage(
+        run_id="run-b", event_id="provider-request-1", session_id="s-b",
+        turn_id="t-b", model="m", provider="p", input_tokens=3,
+    )
+    assert not ledger.record_model_usage(
+        run_id="run-a", event_id="provider-request-1", session_id="s-a",
+        turn_id="t-a", model="m", provider="p", input_tokens=2,
+    )
+
+    assert ledger.get_run("run-a")["input_tokens"] == 2
+    assert ledger.get_run("run-b")["input_tokens"] == 3
+
+
+def test_legacy_global_event_id_migrates_to_composite_identity(tmp_path):
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE usage_runs (
+                run_id TEXT PRIMARY KEY, process_id TEXT NOT NULL,
+                started_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE usage_events (
+                event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL, session_id TEXT, turn_id TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                model TEXT, provider TEXT, created_at REAL NOT NULL
+            );
+            INSERT INTO usage_runs VALUES ('run-a', 'proc-a', 1, 1);
+            INSERT INTO usage_runs VALUES ('run-b', 'proc-b', 1, 1);
+            INSERT INTO usage_events VALUES
+                ('request-1', 'run-a', 'model', 's-a', 't-a', 2, 1, 0.1, 0, 'm', 'p', 1);
+            INSERT INTO usage_events VALUES
+                ('request-2', 'run-b', 'model', 's-b', 't-b', 3, 1, 0.2, 0, 'm', 'p', 2);
+            """
+        )
+        connection.commit()
+
+    ledger = UsageLedger(db_path)
+    with sqlite3.connect(db_path) as connection:
+        columns = connection.execute("PRAGMA table_info(usage_events)").fetchall()
+        pk = {row[1]: row[5] for row in columns if row[5]}
+        rows = connection.execute(
+            "SELECT run_id, event_id FROM usage_events ORDER BY run_id"
+        ).fetchall()
+    assert pk == {"run_id": 1, "event_id": 2}
+    assert rows == [("run-a", "request-1"), ("run-b", "request-2")]
+    assert ledger.record_model_usage(
+        run_id="run-b", event_id="request-1", session_id="s-b",
+        turn_id="t-c", model="m", provider="p", input_tokens=4,
+    )
+
+
+def test_legacy_model_table_migration_is_atomic_idempotent_and_indexed(tmp_path):
+    db_path = tmp_path / "legacy-models.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE usage_runs (
+                run_id TEXT PRIMARY KEY, process_id TEXT NOT NULL,
+                started_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            CREATE TABLE usage_events (
+                event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL, created_at REAL NOT NULL
+            );
+            CREATE TABLE usage_run_models (
+                run_id TEXT NOT NULL, model TEXT NOT NULL,
+                provider TEXT,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (run_id, model, provider)
+            );
+            INSERT INTO usage_runs VALUES ('run-a', 'proc-a', 1, 1);
+            INSERT INTO usage_run_models VALUES ('run-a', 'm', NULL, 2, 3, 0.4, 1);
+            INSERT INTO usage_run_models VALUES ('run-a', 'm', NULL, 5, 7, 0.6, 2);
+            """
+        )
+        connection.commit()
+
+    UsageLedger(db_path)
+    UsageLedger(db_path)
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT run_id, model, provider, input_tokens, output_tokens, cost_usd, event_count FROM usage_run_models"
+        ).fetchone()
+        indexes = connection.execute("PRAGMA index_list(usage_run_models)").fetchall()
+        legacy = connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='usage_run_models_legacy'"
+        ).fetchone()[0]
+    assert row == ("run-a", "m", "unknown", 7, 10, 1.0, 3)
+    assert any(index[1] == "idx_usage_run_models_run" for index in indexes)
+    assert legacy == 0
+
+
 def test_usage_receipt_keeps_card_optional_and_reports_non_card_identity(tmp_path):
     ledger = UsageLedger(tmp_path / "state.db")
     ledger.start_run(
@@ -265,6 +372,57 @@ def test_writer_exception_is_replayed_during_finalization(tmp_path):
     assert receipt["cost_usd"] == 0.5
 
 
+def test_persistent_writer_failure_fails_closed_and_persists_diagnostic(tmp_path):
+    ledger = UsageLedger(tmp_path / "state.db")
+    ledger.start_run(run_id="persistent", process_id="p")
+
+    def always_fail(**_kwargs):
+        raise sqlite3.OperationalError("persistent failure")
+
+    ledger._record_event = always_fail
+    assert ledger.queue_model_usage(
+        run_id="persistent", event_id="api-1", session_id="s", turn_id="t",
+        model="m", provider="p", input_tokens=3,
+    )
+    assert not ledger.finalize_run(run_id="persistent", outcome="completed")
+    with sqlite3.connect(tmp_path / "state.db") as connection:
+        diagnostics = connection.execute(
+            "SELECT diagnostic_type, detail FROM usage_diagnostics"
+        ).fetchall()
+    assert any(detail == "persistent_writer_failure" for _, detail in diagnostics)
+
+
+def test_diagnostic_capacity_exhaustion_sets_global_fail_closed_sentinel(tmp_path):
+    ledger = UsageLedger(tmp_path / "state.db")
+    ledger._diagnostic_limit = 2
+    for run_id in ("run-1", "run-2", "run-3"):
+        ledger.start_run(run_id=run_id, process_id=run_id)
+        ledger._record_drop(run_id, "queue_saturated")
+
+    assert not ledger.finalize_run(run_id="run-1", outcome="completed")
+    assert not ledger.finalize_run(run_id="run-3", outcome="completed")
+    with sqlite3.connect(tmp_path / "state.db") as connection:
+        diagnostics = connection.execute(
+            "SELECT diagnostic_type, detail FROM usage_diagnostics"
+        ).fetchall()
+    assert any(kind == "usage_incomplete_global" for kind, _ in diagnostics)
+
+
+def test_failed_operation_buffer_overflow_sets_global_fail_closed_sentinel(tmp_path):
+    ledger = UsageLedger(tmp_path / "state.db", queue_size=1)
+    ledger.start_run(run_id="buffer", process_id="p")
+    with ledger._queue_cond:
+        ledger._failed_operations.append((lambda: None, (), {}))
+    ledger._mark_global_incomplete("failed_buffer_full")
+    ledger._record_drop("buffer", "failed_buffer_full")
+
+    assert not ledger.finalize_run(run_id="buffer", outcome="completed")
+    with sqlite3.connect(tmp_path / "state.db") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM usage_diagnostics WHERE diagnostic_type='usage_incomplete_global'"
+        ).fetchone()[0] == 1
+
+
 def test_model_breakdown_is_deterministic_and_marks_mixed_runs(tmp_path):
     ledger = UsageLedger(tmp_path / "state.db")
     ledger.record_model_usage(
@@ -311,6 +469,14 @@ def test_session_run_identity_is_process_distinct_and_task_env_wins(monkeypatch)
     assert run_id_for_session("same-session") == "explicit"
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     assert run_id_for_session("same-session") == "task-run:42"
+
+
+def test_process_identity_is_not_a_reusable_bare_pid():
+    from agent.run_usage_ledger import process_invocation_id
+
+    process_id = process_invocation_id()
+    assert process_id.startswith("proc-")
+    assert not process_id.isdigit()
 
 
 def test_kanban_link_rejects_mismatched_authoritative_task_run(tmp_path):

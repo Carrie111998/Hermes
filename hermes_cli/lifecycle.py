@@ -25,6 +25,7 @@ def _observe_run_usage(hook_name: str, event: dict[str, Any]) -> None:
             bind_session,
             current_source_profile,
             current_task_run_id,
+            process_invocation_id,
             process_ledger,
             run_id_for_session,
         )
@@ -42,7 +43,7 @@ def _observe_run_usage(hook_name: str, event: dict[str, Any]) -> None:
         provider = str(event.get("provider") or "") or None
         common = {
             "run_id": run_id,
-            "process_id": str(os.getpid()),
+            "process_id": process_invocation_id(),
             "task_run_id": task_run_id,
             "session_id": session_id,
             "task_id": task_id,
@@ -75,7 +76,7 @@ def _observe_run_usage(hook_name: str, event: dict[str, Any]) -> None:
                     run_id=run_id,
                     event_id=f"{run_id}:tool:{tool_call_id}",
                     session_id=session_id,
-                    process_id=str(os.getpid()),
+                    process_id=process_invocation_id(),
                     task_id=task_id,
                     board=board,
                     task_run_id=task_run_id,
@@ -94,7 +95,7 @@ def _observe_run_usage(hook_name: str, event: dict[str, Any]) -> None:
                     session_id=session_id,
                     model=model,
                     provider=provider,
-                    process_id=str(os.getpid()),
+                    process_id=process_invocation_id(),
                     task_id=task_id,
                     board=board,
                     task_run_id=task_run_id,
