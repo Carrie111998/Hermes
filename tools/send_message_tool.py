@@ -446,7 +446,7 @@ def _handle_send(args):
         return json.dumps({
             "error": "All MEDIA attachments were rejected by the delivery path policy",
             "rejected_media": rejected,
-            "hint": "Write deliverable files under $HERMES_HOME/output/ or another configured MEDIA allow directory.",
+            "hint": "Write deliverable files under $HERMES_HOME/cache/documents/ or another configured MEDIA allow directory.",
         }, ensure_ascii=False)
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 

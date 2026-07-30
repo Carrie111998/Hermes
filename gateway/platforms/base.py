@@ -5868,7 +5868,8 @@ class BasePlatformAdapter(ABC):
                         response = (
                             "⚠️ The file was generated, but its path is not authorized "
                             "for attachment delivery, so it was not uploaded.\n"
-                            "Write the file under $HERMES_HOME/output/ and try again."
+                            "Write the file under $HERMES_HOME/cache/documents/ "
+                            "or a configured MEDIA allow directory and try again."
                         )
 
                 # Do NOT deduplicate MEDIA tags against prior turns here.
