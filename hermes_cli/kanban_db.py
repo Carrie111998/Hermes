@@ -4081,11 +4081,14 @@ def _map_workflow_auto_blocks(
     from hermes_cli import wf_engine
 
     for task_id in dict.fromkeys(task_ids):
-        task = get_task(conn, task_id)
-        if task is None or not task.workflow_template_id:
-            continue
-        reason = task.last_failure_error or "workflow worker circuit breaker tripped"
         try:
+            task = get_task(conn, task_id)
+            if task is None or not task.workflow_template_id:
+                continue
+            reason = (
+                task.last_failure_error
+                or "workflow worker circuit breaker tripped"
+            )
             wf_engine.exception(conn, task_id, reason)
         except Exception as exc:
             with write_txn(conn):

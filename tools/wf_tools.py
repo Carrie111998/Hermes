@@ -313,10 +313,14 @@ def _handle_signal(args: dict, **_kw: Any) -> str:
         instance_corr = _engine_function("correlation")(conn, task_id)
         if corr != instance_corr:
             return _error("wf_signal corr must exactly match the assigned workflow")
+        # Worker-ledgered events occupy a dedicated source/id namespace.
+        # They can never squat an engine timer id or a gateway delivery id.
+        worker_source = f"worker:{source}"
+        worker_external_id = f"wf-worker:{task_id}:{external_id}"
         event_id = _engine_function("ingest_event")(
             conn,
-            source=source,
-            external_id=external_id,
+            source=worker_source,
+            external_id=worker_external_id,
             payload=payload,
             corr=corr,
             event_type=event_type,

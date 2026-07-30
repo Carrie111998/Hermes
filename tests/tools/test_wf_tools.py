@@ -259,12 +259,45 @@ def test_signal_uses_metadata_and_reports_duplicate(monkeypatch, workflow_worker
     assert first == {"ok": True, "event_id": 23, "duplicate": False}
     assert second == {"ok": True, "event_id": None, "duplicate": True}
     assert calls[0] == {
-        "source": "email",
-        "external_id": "mail-1",
+        "source": "worker:email",
+        "external_id": f"wf-worker:{workflow_worker}:mail-1",
         "payload": payload,
         "corr": {"ref": "tools-1"},
         "event_type": "mail.received",
     }
+
+
+def test_signal_namespaces_engine_reserved_source_and_external_id(
+    monkeypatch,
+    workflow_worker,
+):
+    from tools import wf_tools as wt
+
+    calls = []
+
+    def ingest(conn, **kwargs):
+        calls.append(kwargs)
+        return 31
+
+    monkeypatch.setattr(wt.wf_engine, "ingest_event", ingest)
+    external_id = f"wf:{workflow_worker}:start:1:12345"
+    result = json.loads(
+        wt._handle_signal(
+            {
+                "source": "timer",
+                "payload": {
+                    "external_id": external_id,
+                    "event_type": "timer",
+                },
+                "corr": {"ref": "tools-1"},
+            }
+        )
+    )
+    assert result["ok"] is True
+    assert calls[0]["source"] == "worker:timer"
+    assert calls[0]["external_id"] == (
+        f"wf-worker:{workflow_worker}:{external_id}"
+    )
 
 
 def test_signal_rejects_corr_outside_assigned_instance(
