@@ -13,6 +13,7 @@ handling, and fail-closed behavior so the parity cannot regress.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -111,6 +112,32 @@ def test_exec_approval_view_accepts_role_allowlist():
     assert view._check_auth(_interaction(99999, role_ids=[42])) is True
     # Neither user nor role match: reject
     assert view._check_auth(_interaction(99999, role_ids=[7])) is False
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_view_resolves_exact_request_id():
+    view = ExecApprovalView(
+        session_key="sess-1",
+        request_id="approval-second",
+        allowed_user_ids={"11111"},
+    )
+    interaction = SimpleNamespace(
+        message=SimpleNamespace(embeds=[]),
+        response=SimpleNamespace(
+            edit_message=AsyncMock(),
+            send_message=AsyncMock(),
+        ),
+        user=SimpleNamespace(display_name="Owner", id=11111, roles=[]),
+    )
+
+    with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+        await view._resolve(interaction, "once", object(), "Approved once")
+
+    resolve.assert_called_once_with(
+        "sess-1",
+        "once",
+        request_id="approval-second",
+    )
 
 
 def test_slash_confirm_view_accepts_role_allowlist():
@@ -277,4 +304,3 @@ def test_other_views_not_admin_gated():
         session_key="s", confirm_id="c", allowed_user_ids={"11111"}
     )
     assert sc._check_auth(_interaction(11111)) is True
-

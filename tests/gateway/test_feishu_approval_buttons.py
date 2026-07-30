@@ -144,14 +144,42 @@ class TestFeishuExecApproval:
                 chat_id="oc_12345",
                 command="echo test",
                 session_key="my-session-key",
+                metadata={"approval_request_id": "approval-feishu"},
             )
 
         assert len(adapter._approval_state) == 1
-        approval_id = list(adapter._approval_state.keys())[0]
+        approval_id = "approval-feishu"
         state = adapter._approval_state[approval_id]
         assert state["session_key"] == "my-session-key"
+        assert state["request_id"] == "approval-feishu"
         assert state["message_id"] == "msg_002"
         assert state["chat_id"] == "oc_12345"
+
+    @pytest.mark.asyncio
+    async def test_resolves_exact_approval_request(self):
+        adapter = _make_adapter()
+        adapter._allowed_group_users = {"ou_owner"}
+        adapter._approval_state["approval-second"] = {
+            "session_key": "session-key",
+            "request_id": "approval-second",
+            "message_id": "msg-002",
+            "chat_id": "oc_12345",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            await adapter._resolve_approval(
+                "approval-second",
+                "once",
+                "Owner",
+                open_id="ou_owner",
+                chat_id="oc_12345",
+            )
+
+        resolve.assert_called_once_with(
+            "session-key",
+            "once",
+            request_id="approval-second",
+        )
 
 
 # ===========================================================================
@@ -445,5 +473,4 @@ class TestResolveUpdatePrompt:
 
         assert (tmp_path / ".hermes" / ".update_response").read_text() == "y"
         assert 1 not in adapter._update_prompt_state
-
 

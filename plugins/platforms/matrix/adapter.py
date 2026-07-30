@@ -448,11 +448,13 @@ class _MatrixApprovalPrompt:
         session_key: str,
         chat_id: str,
         message_id: str,
+        request_id: str = "",
         resolved: bool = False,
         requester_user_id: str | None = None,
         expires_at: float | None = None,
     ):
         self.session_key = session_key
+        self.request_id = request_id
         self.chat_id = chat_id
         self.message_id = message_id
         self.resolved = resolved
@@ -2247,6 +2249,7 @@ class MatrixAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         requester_user_id = str((metadata or {}).get("requester_user_id") or "") or None
+        request_id = str((metadata or {}).get("approval_request_id") or "")
         scope_choices = ""
         if smart_denied:
             scope_choices = "Smart DENY: owner override applies to this one operation only.\n"
@@ -2275,14 +2278,12 @@ class MatrixAdapter(BasePlatformAdapter):
 
         prompt = _MatrixApprovalPrompt(
             session_key=session_key,
+            request_id=request_id,
             chat_id=chat_id,
             message_id=result.message_id,
             requester_user_id=requester_user_id,
             expires_at=time.monotonic() + max(self._approval_timeout_seconds, 0),
         )
-        old_event = self._approval_prompt_by_session.get(session_key)
-        if old_event:
-            self._approval_prompts_by_event.pop(old_event, None)
         self._approval_prompts_by_event[result.message_id] = prompt
         self._approval_prompt_by_session[session_key] = result.message_id
 
@@ -3610,11 +3611,19 @@ class MatrixAdapter(BasePlatformAdapter):
                 try:
                     from tools.approval import resolve_gateway_approval
 
-                    count = resolve_gateway_approval(prompt.session_key, choice)
+                    if prompt.request_id:
+                        count = resolve_gateway_approval(
+                            prompt.session_key,
+                            choice,
+                            request_id=prompt.request_id,
+                        )
+                    else:
+                        count = resolve_gateway_approval(prompt.session_key, choice)
                     if count:
                         prompt.resolved = True
                         self._approval_prompts_by_event.pop(reacts_to, None)
-                        self._approval_prompt_by_session.pop(prompt.session_key, None)
+                        if self._approval_prompt_by_session.get(prompt.session_key) == reacts_to:
+                            self._approval_prompt_by_session.pop(prompt.session_key, None)
                         logger.info(
                             "Matrix reaction resolved %d approval(s) for session %s "
                             "(choice=%s, user=%s)",
@@ -3763,7 +3772,8 @@ class MatrixAdapter(BasePlatformAdapter):
     ) -> None:
         prompt.resolved = True
         self._approval_prompts_by_event.pop(target_event_id, None)
-        self._approval_prompt_by_session.pop(prompt.session_key, None)
+        if self._approval_prompt_by_session.get(prompt.session_key) == target_event_id:
+            self._approval_prompt_by_session.pop(prompt.session_key, None)
         await self._redact_bot_approval_reactions(room_id, prompt)
         await self._send_invalid_reaction_feedback(
             room_id,

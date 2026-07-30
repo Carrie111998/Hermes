@@ -1502,8 +1502,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._media_batch_state = FeishuBatchState()
         self._pending_media_batches = self._media_batch_state.events
         self._pending_media_batch_tasks = self._media_batch_state.tasks
-        # Exec approval button state (approval_id → {session_key, message_id, chat_id})
-        self._approval_state: Dict[int, Dict[str, str]] = {}
+        # Exec approval button state (request_id → pending approval metadata)
+        self._approval_state: Dict[str, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
         # Update prompt button state (prompt_id → {session_key, message_id, chat_id})
         self._update_prompt_state: Dict[int, Dict[str, str]] = {}
@@ -2024,7 +2024,8 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            approval_id = next(self._approval_counter)
+            request_id = str((metadata or {}).get("approval_request_id") or "")
+            approval_id = request_id or uuid.uuid4().hex
 
             def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
                 return {
@@ -2071,6 +2072,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if result.success:
                 self._approval_state[approval_id] = {
                     "session_key": session_key,
+                    "request_id": request_id,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
                 }
@@ -2873,7 +2875,15 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         try:
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(state["session_key"], choice)
+            request_id = state.get("request_id")
+            if request_id:
+                count = resolve_gateway_approval(
+                    state["session_key"],
+                    choice,
+                    request_id=request_id,
+                )
+            else:
+                count = resolve_gateway_approval(state["session_key"], choice)
             logger.info(
                 "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count, state["session_key"], choice, user_name,

@@ -951,6 +951,7 @@ class SlackAdapter(BasePlatformAdapter):
         # be workspace-scoped markers (team_id, ts) in multi-workspace mode.
         self._approval_resolved: Dict[Any, bool] = {}
         self._APPROVAL_RESOLVED_MAX = 1000
+        self._approval_request_state: Dict[str, str] = {}
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
         self._clarify_resolved: Dict[Any, bool] = {}
@@ -6365,6 +6366,8 @@ class SlackAdapter(BasePlatformAdapter):
             chat_id, team_id=self._metadata_team_id(metadata)
         )
         try:
+            request_id = str((metadata or {}).get("approval_request_id") or "")
+            button_value = request_id or session_key
             thread_ts = self._resolve_thread_ts(None, metadata)
 
             # Slack hard-caps a section block's text at 3000 chars; an
@@ -6387,7 +6390,7 @@ class SlackAdapter(BasePlatformAdapter):
                     "text": {"type": "plain_text", "text": "Allow Once"},
                     "style": "primary",
                     "action_id": "hermes_approve_once",
-                    "value": session_key,
+                    "value": button_value,
                 },
             ]
             if not smart_denied and allow_session:
@@ -6395,21 +6398,21 @@ class SlackAdapter(BasePlatformAdapter):
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Allow Session"},
                     "action_id": "hermes_approve_session",
-                    "value": session_key,
+                    "value": button_value,
                 })
                 if allow_permanent:
                     actions.append({
                         "type": "button",
                         "text": {"type": "plain_text", "text": "Always Allow"},
                         "action_id": "hermes_approve_always",
-                        "value": session_key,
+                        "value": button_value,
                     })
             actions.append({
                 "type": "button",
                 "text": {"type": "plain_text", "text": "Deny"},
                 "style": "danger",
                 "action_id": "hermes_deny",
-                "value": session_key,
+                "value": button_value,
             })
             blocks = [
                 {
@@ -6439,6 +6442,12 @@ class SlackAdapter(BasePlatformAdapter):
                 self._approval_resolved[
                     self._workspace_message_marker(team_id, msg_ts)
                 ] = False
+                if request_id:
+                    self._approval_request_state[request_id] = session_key
+                    while len(self._approval_request_state) > self._APPROVAL_RESOLVED_MAX:
+                        self._approval_request_state.pop(
+                            next(iter(self._approval_request_state))
+                        )
                 self._trim_oldest_dict_entries(
                     self._approval_resolved, self._APPROVAL_RESOLVED_MAX
                 )
@@ -6848,7 +6857,7 @@ class SlackAdapter(BasePlatformAdapter):
 
         team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
-        session_key = action.get("value", "")
+        request_id = action.get("value", "")
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
@@ -6901,13 +6910,25 @@ class SlackAdapter(BasePlatformAdapter):
         if self._approval_resolved.pop(approval_key, True):
             return
 
+        session_key = self._approval_request_state.pop(request_id, "")
+        exact_request = bool(session_key)
+        if not session_key:
+            session_key = request_id
+
         # Resolve the approval FIRST — this unblocks the agent thread. Render
         # after, so a click that lands past the approval timeout (count == 0)
         # shows "expired" instead of falsely claiming the command was approved.
         try:
             from tools.approval import resolve_gateway_approval
 
-            count = resolve_gateway_approval(session_key, choice)
+            if exact_request:
+                count = resolve_gateway_approval(
+                    session_key,
+                    choice,
+                    request_id=request_id,
+                )
+            else:
+                count = resolve_gateway_approval(session_key, choice)
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count,

@@ -93,6 +93,7 @@ class TestTelegramExecApproval:
             command="rm -rf /important",
             session_key="agent:main:telegram:group:12345:99",
             description="dangerous deletion",
+            metadata={"approval_request_id": "approval-telegram"},
         )
 
         assert result.success is True
@@ -104,6 +105,10 @@ class TestTelegramExecApproval:
         assert "rm -rf /important" in kwargs["text"]
         assert "dangerous deletion" in kwargs["text"]
         assert kwargs["reply_markup"] is not None  # InlineKeyboardMarkup
+        assert adapter._approval_state["approval-telegram"] == {
+            "request_id": "approval-telegram",
+            "session_key": "agent:main:telegram:group:12345:99",
+        }
 
 
     @pytest.mark.asyncio
@@ -215,12 +220,15 @@ class TestTelegramApprovalCallback:
         rest of a long-running turn after a button click.
         """
         adapter = _make_adapter()
-        adapter._approval_state[5] = "agent:main:telegram:group:12345:99"
+        adapter._approval_state["approval-second"] = {
+            "request_id": "approval-second",
+            "session_key": "agent:main:telegram:group:12345:99",
+        }
         adapter.pause_typing_for_chat("12345")
         assert "12345" in adapter._typing_paused
 
         query = AsyncMock()
-        query.data = "ea:once:5"
+        query.data = "ea:once:approval-second"
         query.message = MagicMock()
         query.message.chat_id = 12345
         query.from_user = MagicMock()
@@ -234,9 +242,14 @@ class TestTelegramApprovalCallback:
         context = MagicMock()
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval", return_value=1):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
                 await adapter._handle_callback_query(update, context)
 
+        resolve.assert_called_once_with(
+            "agent:main:telegram:group:12345:99",
+            "once",
+            request_id="approval-second",
+        )
         assert "12345" not in adapter._typing_paused
 
 
@@ -359,4 +372,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-

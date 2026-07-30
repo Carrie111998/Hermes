@@ -4,7 +4,7 @@ import json
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -259,6 +259,71 @@ class TestTeamsAdapterInit:
             _make_config(client_id="id", client_secret="secret", tenant_id="tenant", port="abc")
         )
         assert adapter._port == 3978
+
+
+class TestTeamsApprovalBinding:
+    @pytest.mark.asyncio
+    async def test_card_action_resolves_exact_request_id(self, monkeypatch):
+        adapter = TeamsAdapter(
+            _make_config(client_id="id", client_secret="secret", tenant_id="tenant")
+        )
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                from_=SimpleNamespace(id="owner"),
+                value=SimpleNamespace(
+                    action=SimpleNamespace(
+                        data={
+                            "hermes_action": "approve_once",
+                            "request_id": "approval-second",
+                            "session_key": "session-key",
+                        }
+                    )
+                ),
+            )
+        )
+
+        with (
+            patch("tools.approval.has_blocking_approval", return_value=True),
+            patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve,
+        ):
+            response = await adapter._on_card_action(ctx)
+
+        assert response.status == 200
+        resolve.assert_called_once_with(
+            "session-key",
+            "once",
+            request_id="approval-second",
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_card_action_keeps_fifo_resolution(self, monkeypatch):
+        adapter = TeamsAdapter(
+            _make_config(client_id="id", client_secret="secret", tenant_id="tenant")
+        )
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                from_=SimpleNamespace(id="owner"),
+                value=SimpleNamespace(
+                    action=SimpleNamespace(
+                        data={
+                            "hermes_action": "deny",
+                            "session_key": "session-key",
+                        }
+                    )
+                ),
+            )
+        )
+
+        with (
+            patch("tools.approval.has_blocking_approval", return_value=True),
+            patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve,
+        ):
+            response = await adapter._on_card_action(ctx)
+
+        assert response.status == 200
+        resolve.assert_called_once_with("session-key", "deny")
 
 
 # ---------------------------------------------------------------------------
@@ -712,5 +777,3 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", str(doc))
         assert result.success
         adapter._app.send.assert_awaited_once()
-
-

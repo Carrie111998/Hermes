@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -2152,13 +2153,33 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # resolves every pending approval in the session.
 
 
+# Keep IDs short enough for the tightest native transport. Telegram callback
+# data is capped at 64 bytes and adds an ``ea:<choice>:`` prefix.
+_APPROVAL_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")
+
+
+def is_valid_approval_request_id(value: object) -> bool:
+    """Return whether *value* is safe for approval transports and APIs."""
+    return (
+        isinstance(value, str)
+        and _APPROVAL_REQUEST_ID_RE.fullmatch(value) is not None
+    )
+
+
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "request_id", "result", "reason")
 
     def __init__(self, data: dict):
+        self.data = dict(data or {})
+        candidate = self.data.get("request_id")
+        self.request_id = (
+            candidate
+            if is_valid_approval_request_id(candidate)
+            else uuid.uuid4().hex
+        )
+        self.data["request_id"] = self.request_id
         self.event = threading.Event()
-        self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
@@ -2197,13 +2218,14 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             request_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
     When *resolve_all* is True every pending approval in the session is
     resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    is resolved (FIFO), unless *request_id* targets one exact entry.
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
@@ -2218,6 +2240,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if resolve_all:
             targets = list(queue)
             queue.clear()
+        elif request_id:
+            targets = []
+            for index, entry in enumerate(queue):
+                if entry.request_id == request_id:
+                    targets = [queue.pop(index)]
+                    break
+            if not targets:
+                return 0
         else:
             targets = [queue.pop(0)]
         if not queue:
@@ -2235,6 +2265,12 @@ def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def pending_approval_count(session_key: str) -> int:
+    """Return the number of pending approval entries for a session."""
+    with _lock:
+        return len(_gateway_queues.get(session_key, ()))
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -3293,7 +3329,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     # Notify the user (bridges sync agent thread → async gateway)
     try:
-        notify_cb(approval_data)
+        notify_cb(entry.data)
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
