@@ -1660,9 +1660,9 @@ KANBAN_BLOCK_SCHEMA = {
                 "type": "string",
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
-                    "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
-                    "Omit only if none apply."
+                    "Why you're blocked. 'dependency' remains blocked until "
+                    "an explicit unblock after the dependency clears; the "
+                    "others surface to a human. Omit only if none apply."
                 ),
             },
             "board": _board_schema_prop(),

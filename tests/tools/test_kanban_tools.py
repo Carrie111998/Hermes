@@ -295,6 +295,66 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
         conn.close()
 
 
+def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
+    """`dependency` and `needs_input` represent a genuine external blocker
+    the worker cannot resolve itself — these remain ungated.
+
+    `dependency` is a terminal blocked completion and cannot be retried until
+    an explicit unblock authorizes it."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block({"reason": "waiting on another task", "kind": "dependency"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_goal_mode_allows_needs_input_kind(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block({"reason": "need a decision from the user", "kind": "needs_input"})
+    d = json.loads(out)
+    assert d.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_non_goal_mode_task_unaffected_by_new_gate(worker_env):
+    """The new gate only applies to goal_mode tasks — plain tasks must keep
+    blocking freely with no kind, exactly as before this fix."""
+    from tools import kanban_tools as kt
+    out = kt._handle_block({"reason": "need clarification"})
+    assert json.loads(out).get("ok") is True
+
+
+def test_heartbeat_happy_path(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_heartbeat({"note": "progress"})
+    d = json.loads(out)
+    assert d["ok"] is True
+
+
+def test_heartbeat_without_note(worker_env):
+    """note is optional."""
+    from tools import kanban_tools as kt
+    out = kt._handle_heartbeat({})
+    d = json.loads(out)
+    assert d["ok"] is True
+
+
 def test_heartbeat_extends_claim_expires(worker_env):
     """The kanban_heartbeat tool MUST extend claim_expires, not just
     update last_heartbeat_at — otherwise long-running workers loop the

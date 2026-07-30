@@ -29,6 +29,8 @@ landed via #28754 / #28781 ahead of this fix.
 
 from __future__ import annotations
 
+import concurrent.futures
+import subprocess
 import time
 from pathlib import Path
 
@@ -76,6 +78,109 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+
+
+def test_dependency_wait_is_sticky_until_explicit_unblock(kanban_home: Path) -> None:
+    """A dependency block is a terminal worker outcome, not a retry request.
+
+    A worker may discover a dependency that is not represented by a Kanban
+    parent edge (for example, an external lane or a dependency cycle). Such a
+    task must not be auto-promoted merely because its local parent set is empty.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="waiting on an external lane")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="external lane still owns the dependency",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "dependency"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.claim_task(conn, tid) is None
+
+        assert kb.unblock_task(conn, tid)
+        unblocked = kb.get_task(conn, tid)
+        assert unblocked is not None
+        assert unblocked.status == "ready"
+
+
+def test_dispatcher_cannot_race_retry_of_dependency_block(kanban_home: Path) -> None:
+    """Concurrent promotion ticks cannot resurrect a dependency-blocked run."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dependency race")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="dependency cycle",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+
+    def promote_then_claim(_index: int):
+        with kb.connect() as conn:
+            return kb.recompute_ready(conn), kb.claim_task(conn, tid)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(pool.map(promote_then_claim, range(16)))
+
+    assert all(promoted == 0 for promoted, _claim in outcomes)
+    assert all(claim is None for _promoted, claim in outcomes)
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+
+
+def test_dependency_block_completion_releases_owner_once_after_worker_exit(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocked completion closes the run; its reaper releases one exact lease."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dependency owner release")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="dependency wait",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+        ended_run = kb.get_run(conn, claimed.current_run_id)
+        assert ended_run is not None
+        assert ended_run.outcome == "blocked"
+
+    alive = iter([True, False])
+    releases = []
+    monkeypatch.setattr(
+        kb,
+        "_worker_identity_is_alive",
+        lambda _pid, _start: next(alive),
+    )
+    monkeypatch.setattr(kb.time, "sleep", lambda _interval: None)
+
+    def fake_run(argv, **kwargs):
+        releases.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(kb.subprocess, "run", fake_run)
+    assert kb._wait_for_pid_exit_and_run_release(
+        pid=456,
+        process_start_time="exact-start",
+        release_argv=["factory-lane", "release-owner", "HER-118"],
+    ) is True
+    assert len(releases) == 1
 
 
 # ---------------------------------------------------------------------------

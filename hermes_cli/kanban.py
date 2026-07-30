@@ -630,8 +630,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_block.add_argument(
         "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
         help=(
-            "Typed block reason. 'dependency' waits in todo (auto-promoted "
-            "when parents finish, no human); 'needs_input'/'capability' go to "
+            "Typed block reason. 'dependency' remains blocked until an "
+            "explicit unblock; 'needs_input'/'capability' go to "
             "blocked for a human; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
             "triage to break unblock loops. Omit for a generic block."
