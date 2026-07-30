@@ -2836,6 +2836,7 @@ def _quiesce_posix_gateways_for_update(
 
     try:
         from gateway.drain_control import (
+            drain_requested,
             drain_request_path,
             write_drain_request,
         )
@@ -2861,7 +2862,11 @@ def _quiesce_posix_gateways_for_update(
         for proc in processes:
             home = Path(proc.path)
             marker = drain_request_path(home)
-            if not marker.exists():
+            # Preserve an active operator/NAS drain, but replace a marker from
+            # an earlier machine epoch: gateways deliberately ignore that
+            # stale file, so merely observing its presence would never quiesce
+            # the live process.
+            if not marker.exists() or not drain_requested(home=home):
                 write_drain_request(
                     principal="hermes-update",
                     home=home,
@@ -3477,10 +3482,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     )
                     _venv_guard_exclude.update(_quiesced_pids)
                     # A dashboard supervisor is not a gateway and has no
-                    # gateway drain state. Keep the verified ancestor
-                    # exclusion used by the supported dashboard update flow.
-                    # A gateway supervisor is excluded only if quiesced.
-                    if _supervisor_pid not in _gateway_pids:
+                    # gateway drain state. Exclude it only when the dashboard
+                    # launcher attests that its HTTP/WebSocket admission gate
+                    # reached idle before spawning this updater. A gateway
+                    # supervisor is excluded only if its drain was confirmed.
+                    _dashboard_quiesced = (
+                        os.environ.get(
+                            "_HERMES_UPDATE_SUPERVISOR_QUIESCED",
+                            "",
+                        )
+                        == "dashboard"
+                    )
+                    if (
+                        _supervisor_pid not in _gateway_pids
+                        and _dashboard_quiesced
+                    ):
                         _venv_guard_exclude.add(_supervisor_pid)
                     if _posix_gateway_quiesce:
                         import atexit as _atexit

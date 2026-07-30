@@ -7,7 +7,9 @@ contract and the CLI-config parity (servers/keys written via the API are
 visible to the CLI data layer), not specific catalog values.
 """
 
+import asyncio
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -987,7 +989,72 @@ def test_spawn_update_identifies_dashboard_supervisor(monkeypatch, tmp_path):
         return _FakeProc()
 
     monkeypatch.setattr(ws.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", True)
 
     ws._spawn_hermes_action(["update"], "hermes-update")
 
     assert captured["env"]["_HERMES_UPDATE_SUPERVISOR_PID"] == str(os.getpid())
+    assert (
+        captured["env"]["_HERMES_UPDATE_SUPERVISOR_QUIESCED"]
+        == "dashboard"
+    )
+
+
+def test_spawn_update_requires_dashboard_quiesce(monkeypatch, tmp_path):
+    import hermes_cli.web_server as ws
+
+    monkeypatch.setattr(ws, "_ACTION_LOG_DIR", tmp_path)
+    monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", False)
+    popen = MagicMock()
+    monkeypatch.setattr(ws.subprocess, "Popen", popen)
+
+    with pytest.raises(RuntimeError, match="before dashboard quiesce"):
+        ws._spawn_hermes_action(["update"], "hermes-update")
+
+    popen.assert_not_called()
+    assert not (tmp_path / ws._ACTION_LOG_FILES["hermes-update"]).exists()
+
+
+def test_dashboard_quiesce_allows_only_update_status(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    client, _header = _client()
+    monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", True)
+    ws._ACTION_PROCS.pop("hermes-update", None)
+
+    assert client.get("/api/config").status_code == 503
+    assert (
+        client.get("/api/actions/hermes-update/status").status_code
+        == 200
+    )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_closes_and_drains_websockets():
+    import hermes_cli.web_server as ws
+
+    ws._end_dashboard_update_quiesce()
+    ws._DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS.clear()
+    closed = asyncio.Event()
+    registered = asyncio.Event()
+
+    class _FakeWebSocket:
+        async def close(self, **_kwargs):
+            closed.set()
+
+    async def _serve_websocket():
+        assert ws._register_dashboard_update_websocket(_FakeWebSocket())
+        registered.set()
+        await closed.wait()
+
+    websocket_task = asyncio.create_task(_serve_websocket())
+    await registered.wait()
+    try:
+        await ws._begin_dashboard_update_quiesce(timeout=0.5)
+        await websocket_task
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+        assert ws._DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS == {}
+    finally:
+        ws._end_dashboard_update_quiesce()
+        if not websocket_task.done():
+            websocket_task.cancel()

@@ -502,6 +502,7 @@ def test_venv_holder_guard_runs_on_posix(capsys):
 
 def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
     monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
     seen = []
     supervisor = SimpleNamespace(pid=555)
     fake_psutil = types.SimpleNamespace(
@@ -524,6 +525,34 @@ def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
 
     assert result == "past_guard", capsys.readouterr().out
     assert seen == [{555, 666}]
+
+
+def test_venv_holder_guard_does_not_trust_unquiesced_dashboard_supervisor(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.delenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", raising=False)
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return [(555, "python", "venv/bin/python -m hermes_cli.main serve")]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [set()]
 
 
 def test_venv_holder_guard_does_not_exclude_unquiesced_gateway_supervisor(
@@ -622,3 +651,83 @@ def test_quiesce_posix_gateway_confirms_live_drain_state_before_exclusion(
     cli_main._release_posix_gateway_quiesce(token)
 
     assert not marker.exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_refreshes_stale_drain_marker(
+    _winp, tmp_path
+):
+    from gateway.drain_control import drain_request_path
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    marker = drain_request_path(profile_home)
+    marker.write_text('{"epoch":"stale"}', encoding="utf-8")
+
+    def read_live_state(_path):
+        assert '"principal": "hermes-update"' in marker.read_text(
+            encoding="utf-8"
+        )
+        return {
+            "pid": 555,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        }
+
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=1,
+    ), patch(
+        "gateway.drain_control.drain_requested",
+        return_value=False,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        side_effect=read_live_state,
+    ):
+        token = cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert token is not None
+    assert token["created_homes"] == [profile_home]
+    cli_main._release_posix_gateway_quiesce(token)
+    assert not marker.exists()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_preserves_active_operator_drain(
+    _winp, tmp_path
+):
+    from gateway.drain_control import drain_request_path
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    marker = drain_request_path(profile_home)
+    marker.write_text('{"principal":"operator"}', encoding="utf-8")
+
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=1,
+    ), patch(
+        "gateway.drain_control.drain_requested",
+        return_value=True,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        return_value={
+            "pid": 555,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        },
+    ):
+        token = cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert token is not None
+    assert token["created_homes"] == []
+    cli_main._release_posix_gateway_quiesce(token)
+    assert marker.read_text(encoding="utf-8") == '{"principal":"operator"}'
