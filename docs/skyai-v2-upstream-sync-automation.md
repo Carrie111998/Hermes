@@ -62,7 +62,7 @@ customer data. Repeated identical results are marked as duplicates.
 
 ## Daily Discord Summary
 
-A separate daily reporting automation reads the previous 24 hours of private
+A separate daily reporting job reads the previous 24 hours of private
 structured reports and sends one bounded Bulgarian summary to the explicitly
 configured internal Discord target. It uses:
 
@@ -97,9 +97,16 @@ deploy, change runtime state, or retry failed delivery.
 
 ## Scheduler Contract
 
-The scheduler runs every three hours with bounded timing jitter. Its only job
-is to invoke the exact deterministic candidate command and report the generated
-status.
+The scheduler runs on the always-on Muncho operational host, independently of
+an operator workstation. Every three hours it invokes this exact deterministic
+candidate rail. A separate daily reporting service reads only sanitized
+structured results and sends one bounded report through the existing Hermes
+transport to the configured internal Discord channel.
+
+The sync service has no model/provider or Discord credential access. The
+reporting service has no GitHub credential access. Neither service creates
+Codex tasks/threads. Delivery is attempted once; a failed delivery is recorded
+without a retry loop, and the next normal daily run remains eligible.
 
 The scheduler is not authority for:
 
