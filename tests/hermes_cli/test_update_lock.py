@@ -17,6 +17,8 @@ disk.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 
 import pytest
@@ -199,6 +201,32 @@ class TestHandoffFromOrchestratingUpdater:
         lock.release()
         assert marker.exists(), "the parent still needs its marker after our stage ends"
         assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
+
+    @pytest.mark.skipif(os.name != "nt", reason="legacy staged updater is Windows-only")
+    def test_legacy_child_recognizes_live_parent_without_handoff_env(
+        self, marker, monkeypatch
+    ):
+        """Older staged updaters omit the handoff env but remain our parent."""
+        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+        monkeypatch.delenv(HANDOFF_PID_ENV, raising=False)
+        code = """
+import sys
+from pathlib import Path
+from hermes_cli.update_lock import UpdateLock
+
+lock = UpdateLock(path=Path(sys.argv[1]))
+raise SystemExit(0 if lock.acquire() and not lock.acquired else 1)
+"""
+
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(marker)],
+            cwd=os.getcwd(),
+            env=os.environ.copy(),
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert marker.exists(), "the legacy parent still owns the marker"
 
     def test_handoff_pid_that_is_not_the_live_holder_grants_nothing(self, marker, monkeypatch):
         """The env var alone must not bypass the lock."""

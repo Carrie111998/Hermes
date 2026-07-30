@@ -127,6 +127,24 @@ def _handoff_pid() -> int | None:
     return pid if pid > 0 else None
 
 
+def _is_legacy_updater_ancestor(pid: int) -> bool:
+    """Return whether an older Windows updater owns our ancestor process.
+
+    Staged ``hermes-setup.exe`` binaries from before the explicit handoff env
+    fix still hold the shared marker and spawn this update as a descendant.
+    Treat only that real ancestor relationship as an implicit handoff; an
+    unrelated live updater remains blocked.
+    """
+    if os.name != "nt" or pid <= 0:
+        return False
+    try:
+        import psutil
+
+        return any(parent.pid == pid for parent in psutil.Process().parents())
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class UpdateHolder:
     """A confirmed-live update currently holding the lock."""
@@ -202,14 +220,16 @@ class UpdateLock:
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
 
-        A live holder whose pid matches :data:`HANDOFF_PID_ENV` is our own
-        orchestrating parent (the Tauri updater spawning `hermes update` as a
-        stage): we run under ITS claim rather than refusing or re-writing the
-        marker, and ``release`` leaves the parent's marker untouched.
+        A live holder whose pid matches :data:`HANDOFF_PID_ENV` — or, for an
+        older Windows updater, is proven to be our ancestor — is our own
+        orchestrator. We run under ITS claim rather than refusing or re-writing
+        the marker, and ``release`` leaves the parent's marker untouched.
         """
         existing = read_live_update(path=self.path)
         if existing is not None:
-            if existing.pid == _handoff_pid():
+            if existing.pid == _handoff_pid() or _is_legacy_updater_ancestor(
+                existing.pid
+            ):
                 return True
             self.holder = existing
             return False
