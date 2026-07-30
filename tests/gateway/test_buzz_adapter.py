@@ -440,9 +440,12 @@ class TestBuzzAdapterLifecycle:
             lambda platform, key: released.append((platform, key)),
         )
         adapter = _make_adapter()
-        adapter._lock_key = "wss://relay.example:" + SELF_PUBKEY
+        lock = "wss://relay.example:" + SELF_PUBKEY
+        adapter._lock_key = lock
+        adapter._platform_lock_scope = "buzz"
+        adapter._platform_lock_identity = lock
         await adapter.disconnect()
-        assert released == [("buzz", "wss://relay.example:" + SELF_PUBKEY)]
+        assert released == [("buzz", lock)]
         assert adapter._lock_key is None
 
     @pytest.mark.asyncio
@@ -451,7 +454,9 @@ class TestBuzzAdapterLifecycle:
         import gateway.status as gateway_status
 
         monkeypatch.setattr(
-            gateway_status, "acquire_scoped_lock", lambda platform, key: False
+            gateway_status,
+            "acquire_scoped_lock",
+            lambda platform, key, metadata=None: (False, {"pid": 99999}),
         )
         adapter = _make_adapter()
         adapter.cli_path = "/fake/buzz"
@@ -464,6 +469,7 @@ class TestBuzzAdapterLifecycle:
         adapter._run_cli = cli
         assert await adapter.connect() is False
         assert adapter._lock_key is None
+        assert adapter._platform_lock_identity is None
 
 
 # ── Credentials / requirements ────────────────────────────────────────────
