@@ -43,6 +43,7 @@ def _touch(path: Path) -> Path:
     [
         ".env",
         ".anthropic_oauth.json",
+        "cache/bws_cache.enc.json",
         "mcp-tokens/tok.json",
         "pairing/telegram-approved.json",
         "state.db",

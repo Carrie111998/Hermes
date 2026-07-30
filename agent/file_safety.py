@@ -91,7 +91,7 @@ def build_write_denied_paths(home: str) -> set[str]:
         "/etc/passwd",
         "/etc/shadow",
     ]
-    # Sibling (and all named) profiles: .env / PKCE stores stay hard-denied
+    # Sibling (and all named) profiles: still-hard-denied credential stores
     # everywhere under <root>/profiles/*/, not just the active HERMES_HOME.
     try:
         profiles_dir = hermes_root / "profiles"
@@ -100,6 +100,7 @@ def build_write_denied_paths(home: str) -> set[str]:
                 if entry.is_dir():
                     paths.append(str(entry / ".env"))
                     paths.append(str(entry / ".anthropic_oauth.json"))
+                    paths.append(str(entry / "cache" / "bws_cache.enc.json"))
     except Exception:
         pass
     return {os.path.realpath(p) for p in paths}
