@@ -152,7 +152,9 @@ configured elsewhere — e.g. `${HOME}/foo` or `${MY_PROVIDER_TOKEN}`.
 
 Note this is distinct from `${INSTALL_DIR}` in catalog manifests, which is
 substituted at install-time with the path the catalog cloned the entry's
-repo into.
+repo into. Catalog manifests can also use `${EXE_SUFFIX}` in
+`transport.command` or `transport.args`; it expands to `.exe` on Windows and
+to an empty string on other platforms.
 
 ### Updating tool selection later
 
