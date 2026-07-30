@@ -4,7 +4,7 @@ Build evidence-bound product and opportunity packets for Hermes. **Advisory only
 
 | | |
 |--|--|
-| Author | Daniel Meyer (@scrimshawlife-ctrl), Applied Alchemy Labs |
+| Author | Zero State (@scrimshawlife-ctrl), Applied Alchemy Labs |
 | Install (after merge) | `hermes skills install official/productivity/neon-genie` |
 | Hub (latest) | `hermes skills install scrimshawlife-ctrl/Neon-Genie-Hermes/skills/neon-genie` |
 | Upstream | https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes |

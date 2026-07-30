@@ -2,7 +2,7 @@
 name: neon-genie
 description: Build evidence-bound product and opportunity packets.
 version: 3.23.0
-author: Daniel Meyer (@scrimshawlife-ctrl), Applied Alchemy Labs / Zero State
+author: Zero State (@scrimshawlife-ctrl), Applied Alchemy Labs
 license: MIT
 platforms: [linux, macos, windows]
 dependencies: []

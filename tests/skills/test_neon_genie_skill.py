@@ -68,10 +68,10 @@ def test_description_hardline(frontmatter: dict) -> None:
 
 def test_author_credits_contributor_first(frontmatter: dict) -> None:
     author = str(frontmatter.get("author") or "")
-    assert "Daniel Meyer" in author
+    assert "Zero State" in author
     assert "scrimshawlife-ctrl" in author
-    # Contributor name before org label
-    assert author.lower().index("daniel") < author.lower().index("alchemy")
+    # Contributor handle/org credit first
+    assert author.lower().index("zero state") < author.lower().index("alchemy")
 
 
 def test_name_and_platforms(frontmatter: dict) -> None:
