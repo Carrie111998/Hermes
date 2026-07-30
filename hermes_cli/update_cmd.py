@@ -3179,6 +3179,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if scripts_dir is not None:
             concurrent = _m()._detect_concurrent_hermes_instances(scripts_dir)
             if concurrent:
+                # Desktop mode: use two-stage update instead of blocking
+                if getattr(args, "desktop", False):
+                    _do_desktop_two_stage_update(args, concurrent, scripts_dir)
+                    return
                 print(_format_concurrent_instances_message(concurrent, scripts_dir))
                 sys.exit(2)
 
@@ -3210,6 +3214,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if _m()._is_windows() and not getattr(args, "force_venv", False):
         _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
+            # Desktop mode: use two-stage update
+            if getattr(args, "desktop", False):
+                # _do_desktop_two_stage_update would have handled this at the
+                # earlier hermes.exe guard; but if --force bypassed that guard,
+                # catch it here for the venv holders.
+                print("  Desktop mode detected — switching to two-stage update.")
+                _do_desktop_two_stage_update(args, [], None)
+                return
             print(_format_venv_python_holders_message(_venv_holders))
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(2)
@@ -5084,3 +5096,46 @@ def _service_restart_sec(
                     pass
                 break
     return total if matched else default
+
+
+def _do_desktop_two_stage_update(args, concurrent: list, scripts_dir) -> None:
+    """Desktop-aware two-stage update on Windows.
+
+    Instead of blocking when another hermes.exe is running (the Desktop
+    app's backend), this pulls the source code now, then spawns a
+    detached batch script that waits for all Hermes processes to exit
+    before doing the pip/uv dependency sync.
+
+    Requires ``D:\\hermes\\_update_helper.py`` to exist.
+    """
+    print()
+    print("╔════════════════════════════════════════════════════╗")
+    print("║  Desktop Mode: Two-Stage Update                   ║")
+    print("║                                                    ║")
+    print("║  Stage 1: Downloading source code updates now...   ║")
+    print("║  Stage 2: Will sync deps after you close Desktop.  ║")
+    print("╚════════════════════════════════════════════════════╝")
+    print()
+
+    helper = Path("D:/hermes/_update_helper.py")
+    if not helper.is_file():
+        print("  ✗ Helper not found at D:\\hermes\\_update_helper.py")
+        print()
+        print("  Please create it or run update manually after closing Desktop:")
+        print("    hermes update")
+        sys.exit(2)
+
+    branch = getattr(args, "branch", None) or "main"
+    cmd = [str(helper)]
+    if branch != "main":
+        cmd.extend(["--branch", branch])
+
+    result = subprocess.run(
+        [sys.executable] + cmd,
+        capture_output=False,
+        cwd=Path("D:/hermes"),
+    )
+    if result.returncode != 0:
+        print("  ✗ Desktop update failed. See output above.")
+        sys.exit(2)
+    sys.exit(0)
