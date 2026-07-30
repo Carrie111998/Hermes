@@ -3650,6 +3650,86 @@ def _safe_attachment_name(raw: str) -> str:
     return name[:200]
 
 
+def _seal_human_gate_attachments(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Snapshot gate attachments into read-only, digest-addressed paths.
+
+    Attachment metadata is only an authorization input if the path names the
+    exact bytes the worker will receive. Before recording human approval, copy
+    every legacy/mutable path into a per-task ``.authorized/<sha256>/<id>/``
+    location and point the row at that snapshot. The caller already holds the
+    board write transaction, so metadata and the authorization fingerprint see
+    one coherent set. Returns the number of rewritten rows, or ``None`` when a
+    source cannot be sealed (authorization must then fail closed).
+    """
+    prepared: list[tuple[int, Path, int]] = []
+    for attachment in list_attachments(conn, task_id):
+        source = Path(attachment.stored_path).expanduser()
+        try:
+            if source.stat().st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+                return None
+            data = source.read_bytes()
+        except OSError:
+            return None
+        if len(data) > KANBAN_ATTACHMENT_MAX_BYTES:
+            return None
+        digest = hashlib.sha256(data).hexdigest()
+        try:
+            safe_name = _safe_attachment_name(attachment.filename)
+        except ValueError:
+            return None
+        destination = (
+            task_attachments_dir(task_id, board=board)
+            / ".authorized"
+            / digest
+            / str(attachment.id)
+            / safe_name
+        ).resolve()
+        try:
+            if source.resolve() == destination:
+                if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+                    return None
+                destination.chmod(0o444)
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+                    return None
+            else:
+                tmp = destination.with_name(
+                    f".{destination.name}.{secrets.token_hex(8)}.tmp"
+                )
+                try:
+                    with tmp.open("xb") as handle:
+                        handle.write(data)
+                    tmp.chmod(0o444)
+                    os.replace(tmp, destination)
+                finally:
+                    tmp.unlink(missing_ok=True)
+            destination.chmod(0o444)
+        except OSError:
+            return None
+        prepared.append((attachment.id, destination, len(data)))
+
+    for attachment_id, destination, size in prepared:
+        conn.execute(
+            "UPDATE task_attachments SET stored_path = ?, size = ? WHERE id = ?",
+            (str(destination), size, attachment_id),
+        )
+    if prepared:
+        _append_event(
+            conn,
+            task_id,
+            "human_gate_attachments_sealed",
+            {"count": len(prepared)},
+        )
+    return len(prepared)
+
+
 def _collision_free_path(dest_dir: Path, safe_name: str) -> Path:
     """Return a path under ``dest_dir`` that doesn't clobber an existing file.
 
@@ -6196,11 +6276,12 @@ def authorize_human_gate(
     *,
     reason: str,
     session: Any,
+    board: Optional[str] = None,
 ) -> bool:
     """Authorize an initial gate from a verified dashboard human session."""
-    from hermes_cli.dashboard_auth import Session
+    from hermes_cli.dashboard_auth import Session, is_verified_session
 
-    if not isinstance(session, Session):
+    if not isinstance(session, Session) or not is_verified_session(session):
         return False
     provider = session.provider.strip() if isinstance(session.provider, str) else ""
     user_id = session.user_id.strip() if isinstance(session.user_id, str) else ""
@@ -6233,6 +6314,7 @@ def authorize_human_gate(
             "user_id": user_id,
             "session_expires_at": session_expires_at,
         },
+        board=board,
     )
 
 
@@ -6241,22 +6323,24 @@ def _unblock_task(
     task_id: str,
     *,
     reason: Optional[str],
-    authorization: Optional[dict[str, Any]],
+    authorization: Optional[Mapping[str, Any]],
+    board: Optional[str] = None,
 ) -> bool:
     """Shared unblock transition; ``authorization`` is trusted provenance."""
     now = int(time.time())
     normalized_reason = reason.strip() if isinstance(reason, str) else ""
     with write_txn(conn):
         human_gate = _has_unresolved_human_gate(conn, task_id)
+        if human_gate:
+            if not authorization or not normalized_reason:
+                return False
+            if _seal_human_gate_attachments(conn, task_id, board=board) is None:
+                return False
         task_fingerprint = (
             _human_gate_task_fingerprint(conn, task_id) if human_gate else None
         )
         if human_gate:
-            if (
-                not authorization
-                or not normalized_reason
-                or task_fingerprint is None
-            ):
+            if task_fingerprint is None:
                 return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
@@ -6858,13 +6942,23 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         if target_common == repo_common:
             return
     target.parent.mkdir(parents=True, exist_ok=True)
+    # ``git worktree add`` normally runs the repository's post-checkout hook.
+    # Materialization occurs before the final task-definition CAS, so allowing
+    # repository-controlled hooks here would execute code in that gap. Disable
+    # hooks for this setup operation; the worker starts only after final CAS.
+    cmd = [
+        "git",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-C",
+        str(repo_root),
+        "worktree",
+        "add",
+    ]
     if _git_branch_exists(repo_root, branch_name):
-        cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
+        cmd.extend((str(target), branch_name))
     else:
-        cmd = [
-            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
-        ]
+        cmd.extend(("-b", branch_name, str(target), "HEAD"))
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -10150,20 +10244,42 @@ def add_notify_sub(
     schema default 0. A cursor of 0 on an already-active task made the
     gateway notifier replay every historical terminal event on its next
     tick — and with many stale subs, a single boot-time burst of 100+
-    messages (issue #29905). Subscribers only want events that occur
-    AFTER they subscribe; the gateway/tool auto-subscribe paths run at
-    task creation, where the snapshot is 0 anyway.
+    messages (issue #29905). The one exception is an unresolved initial human
+    gate: creation emits its canonical ``blocked`` event before auto-subscribe
+    can insert the row, so the cursor rewinds to expose that single pending
+    gate once. Historical terminal events and ordinary sticky blocks remain
+    caught up.
     """
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     with write_txn(conn):
+        cursor_row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        current_event_id = int(cursor_row["max_id"] or 0) if cursor_row else 0
+        task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task_row is not None
+            and task_row["status"] == "blocked"
+            and _has_unresolved_human_gate(conn, task_id)
+        ):
+            blocked_row = conn.execute(
+                "SELECT MAX(id) AS id FROM task_events "
+                "WHERE task_id = ? AND kind = 'blocked'",
+                (task_id,),
+            ).fetchone()
+            if blocked_row is not None and blocked_row["id"] is not None:
+                current_event_id = max(0, int(blocked_row["id"]) - 1)
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, chat_type, thread_id, user_id,
                  notifier_profile, delivery_metadata, created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -10175,7 +10291,7 @@ def add_notify_sub(
                 notifier_profile,
                 metadata_json,
                 now,
-                task_id,
+                current_event_id,
             ),
         )
         if chat_type:

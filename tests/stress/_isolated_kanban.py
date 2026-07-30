@@ -7,20 +7,17 @@ from pathlib import Path
 from types import ModuleType
 
 
-_KANBAN_PATH_OVERRIDES = (
-    "HERMES_KANBAN_DB",
-    "HERMES_KANBAN_BOARD",
-    "HERMES_KANBAN_HOME",
-    "HERMES_KANBAN_WORKSPACES_ROOT",
-    "HERMES_KANBAN_ATTACHMENTS_ROOT",
-)
-
-
 def configure_temp_kanban_env(hermes_home: str) -> Path:
-    """Pin the process to ``hermes_home`` and discard inherited board pins."""
-    root = Path(hermes_home).resolve()
-    for key in _KANBAN_PATH_OVERRIDES:
-        os.environ.pop(key, None)
+    """Pin the process to ``hermes_home`` and discard inherited worker state.
+
+    Clear the whole Kanban namespace rather than a fixed selector list so a
+    newly-added DB/path pin or runtime knob cannot make a stress script touch
+    live state or silently change its race parameters.
+    """
+    for key in tuple(os.environ):
+        if key.startswith("HERMES_KANBAN_") or key == "HERMES_DELEGATED_CHILD_CONTEXT":
+            os.environ.pop(key, None)
+    root = Path(hermes_home).expanduser().resolve()
     os.environ["HERMES_HOME"] = str(root)
     os.environ["HOME"] = str(root)
     return root

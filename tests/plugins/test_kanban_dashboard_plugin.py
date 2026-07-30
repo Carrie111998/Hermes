@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.dashboard_auth import Session
+from hermes_cli.dashboard_auth.base import _attest_verified_session
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +77,7 @@ def authenticated_client(kanban_home):
 
     @app.middleware("http")
     async def verified_session(request, call_next):
-        request.state.session = Session(
+        request.state.session = _attest_verified_session(Session(
             user_id="user-123",
             email="operator@example.com",
             display_name="Test Operator",
@@ -85,7 +86,7 @@ def authenticated_client(kanban_home):
             access_token="verified-access-token",
             expires_at=9_999_999_999,
             refresh_token="refresh-token",
-        )
+        ))
         return await call_next(request)
 
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")

@@ -39,6 +39,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.dashboard_auth import Session
+from hermes_cli.dashboard_auth.base import _attest_verified_session
 
 
 @pytest.fixture
@@ -61,7 +62,7 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _human_session() -> Session:
+def _raw_human_session() -> Session:
     return Session(
         user_id="user-123",
         email="operator@example.com",
@@ -72,6 +73,29 @@ def _human_session() -> Session:
         expires_at=9_999_999_999,
         refresh_token="refresh-token",
     )
+
+
+def _human_session() -> Session:
+    return _attest_verified_session(_raw_human_session())
+
+
+def test_unverified_session_object_cannot_authorize_human_gate(
+    kanban_home: Path,
+) -> None:
+    """Constructing the public Session DTO is not middleware verification."""
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="caller supplied a plausible session DTO",
+            session=_raw_human_session(),
+        ) is False
+        task = kb.get_task(conn, gate)
+        assert task is not None
+        assert task.status == "blocked"
+        assert "human_gate_authorized" not in _event_kinds(conn, gate)
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +471,44 @@ def test_authorization_fingerprint_binds_attachment_bytes(
             session=_human_session(),
         )
 
-        attachment.write_bytes(b"tampered bytes")
+        sealed = kb.list_attachments(conn, gate)[0]
+        assert Path(sealed.stored_path) != attachment
+        assert Path(sealed.stored_path).read_bytes() == b"approved bytes"
+
+        # Only the digest-addressed snapshot is worker-visible. Mutating the
+        # caller's original path cannot change the authorized input.
+        attachment.write_bytes(b"tampered original bytes")
+
+        claimed = kb.claim_task(conn, gate, claimer="dispatcher")
+        assert claimed is not None
+
+
+def test_authorization_fingerprint_relocks_if_sealed_attachment_is_tampered(
+    kanban_home: Path,
+) -> None:
+    attachment = kanban_home / "approved-instructions.txt"
+    attachment.write_bytes(b"approved bytes")
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+        kb.add_attachment(
+            conn,
+            gate,
+            filename=attachment.name,
+            stored_path=str(attachment),
+            content_type="text/plain",
+            size=attachment.stat().st_size,
+            uploaded_by="operator",
+        )
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved attached instructions",
+            session=_human_session(),
+        )
+
+        sealed_path = Path(kb.list_attachments(conn, gate)[0].stored_path)
+        sealed_path.chmod(0o644)
+        sealed_path.write_bytes(b"tampered sealed bytes")
 
         assert kb.claim_task(conn, gate, claimer="dispatcher") is None
         task = kb.get_task(conn, gate)
@@ -501,6 +562,56 @@ def test_dispatch_revalidates_authorization_after_claim_before_spawn(
         ).fetchone()
         assert run is not None
         assert (run["status"], run["outcome"]) == ("blocked", "blocked")
+
+
+def test_stale_authorization_relock_reaches_notification_cursor(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+        kb.add_notify_sub(
+            conn,
+            task_id=gate,
+            platform="telegram",
+            chat_id="operator-chat",
+        )
+        _, initial = kb.unseen_events_for_sub(
+            conn,
+            task_id=gate,
+            platform="telegram",
+            chat_id="operator-chat",
+            kinds=["blocked"],
+        )
+        assert [event.kind for event in initial] == ["blocked"]
+        kb.advance_notify_cursor(
+            conn,
+            task_id=gate,
+            platform="telegram",
+            chat_id="operator-chat",
+            new_cursor=initial[-1].id,
+        )
+
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved exact current instructions",
+            session=_human_session(),
+        )
+        kb.add_comment(conn, gate, "operator", "changed after authorization")
+
+        assert kb.claim_task(conn, gate, claimer="dispatcher") is None
+        _, relock = kb.unseen_events_for_sub(
+            conn,
+            task_id=gate,
+            platform="telegram",
+            chat_id="operator-chat",
+            kinds=["blocked"],
+        )
+        assert [event.kind for event in relock] == ["blocked"]
+        assert relock[0].payload == {
+            "reason": "human_gate_not_authorized",
+            "source": "claim",
+        }
 
 
 def test_dispatch_runtime_materialization_preserves_valid_authorization(
@@ -688,7 +799,7 @@ def test_human_gate_authorization_event_precedes_unblocked_with_verified_princip
 def test_expired_dashboard_session_cannot_authorize_human_gate(
     kanban_home: Path,
 ) -> None:
-    expired = Session(
+    expired = _attest_verified_session(Session(
         user_id="user-123",
         email="operator@example.com",
         display_name="Test Operator",
@@ -697,7 +808,7 @@ def test_expired_dashboard_session_cannot_authorize_human_gate(
         access_token="expired-token",
         expires_at=1,
         refresh_token="refresh-token",
-    )
+    ))
     with kb.connect() as conn:
         gate, _ = _initial_gate(conn)
         assert kb.authorize_human_gate(

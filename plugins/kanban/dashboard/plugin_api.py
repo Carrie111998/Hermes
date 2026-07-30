@@ -908,6 +908,7 @@ def update_task(
                             task_id,
                             reason=payload.block_reason or "",
                             session=getattr(request.state, "session", None),
+                            board=board,
                         )
                     else:
                         ok = kanban_db.unblock_task(conn, task_id)
