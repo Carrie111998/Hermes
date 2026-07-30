@@ -17361,7 +17361,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str):
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
@@ -17375,7 +17375,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     if not task_id:
-        return
+        return None
 
     from hermes_cli import kanban_db as _kb
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
@@ -17391,18 +17391,20 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         except Exception:
             pass
     if task is None:
-        return
+        return None
 
     goal_parts = [task.title or ""]
     if task.body:
         goal_parts.append(task.body)
     goal_text = "\n\n".join(p for p in goal_parts if p).strip()
     if not goal_text:
-        return
+        return None
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
-    def _run_turn(prompt: str) -> str:
+    def _run_turn(prompt: str):
+        from hermes_cli.runtime_outcomes import outcome_for_worker_result
+
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
@@ -17413,6 +17415,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             and cli.agent.session_id != cli.session_id
         ):
             cli.session_id = cli.agent.session_id
+        if isinstance(result, dict):
+            outcome = outcome_for_worker_result(result)
+            if outcome.is_transient:
+                return outcome
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
@@ -17439,7 +17445,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             except Exception:
                 pass
 
-    _run_loop(
+    return _run_loop(
         task_id=task_id,
         goal_text=goal_text,
         run_turn=_run_turn,
@@ -17913,7 +17919,15 @@ def main(
                             and _worker_outcome.counts_against_goal_budget
                         ):
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                _goal_loop_result = _run_kanban_goal_loop_q(cli, response)
+                                if (
+                                    isinstance(_goal_loop_result, dict)
+                                    and _goal_loop_result.get("runtime_outcome") is not None
+                                ):
+                                    result = dict(result) if isinstance(result, dict) else {}
+                                    result["failed"] = True
+                                    result["runtime_outcome"] = _goal_loop_result["runtime_outcome"].to_dict()
+                                    result["failure_reason"] = _goal_loop_result["runtime_outcome"].kind
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 

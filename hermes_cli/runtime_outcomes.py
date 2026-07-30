@@ -45,6 +45,12 @@ class RuntimeOutcome:
         return cls("launcher_transport_failure", True, False, reason, "launcher", False)
 
     @classmethod
+    def judge_transport_failure(
+        cls, reason: str = "goal judge transport failure"
+    ) -> "RuntimeOutcome":
+        return cls("judge_transport_failure", True, False, reason, "goal_judge", False)
+
+    @classmethod
     def ex_tempfail(cls, reason: str = "worker exited EX_TEMPFAIL") -> "RuntimeOutcome":
         return cls("ex_tempfail", True, False, reason, "worker", False)
 
@@ -96,6 +102,8 @@ def outcome_for_provider_reason(reason: Any) -> RuntimeOutcome:
 
 def outcome_for_worker_result(result: Any) -> RuntimeOutcome:
     """Normalize a quiet worker result before exit and goal-loop handling."""
+    if isinstance(result, dict) and result.get("runtime_outcome") is not None:
+        return RuntimeOutcome.from_value(result["runtime_outcome"])
     if not isinstance(result, dict) or not result.get("failed"):
         return RuntimeOutcome("completed", False, False, "completed", "worker")
     return outcome_for_provider_reason(result.get("failure_reason"))
