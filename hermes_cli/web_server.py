@@ -18520,6 +18520,7 @@ _BUILTIN_DASHBOARD_THEMES = [
     {"name": "default-large", "label": "Hermes Teal (Large)", "description": "Hermes Teal with bigger fonts and roomier spacing"},
     {"name": "nous-blue",     "label": "Nous Blue",           "description": "Light mode — vivid Nous-blue accents on cream canvas"},
     {"name": "midnight",      "label": "Midnight",            "description": "Deep blue-violet with cool accents"},
+    {"name": "void",          "label": "Void",                "description": "Cosmic midnight with electric blue and magenta starlight"},
     {"name": "ember",     "label": "Ember",          "description": "Warm crimson and bronze — forge vibes"},
     {"name": "mono",      "label": "Mono",           "description": "Clean grayscale — minimal and focused"},
     {"name": "cyberpunk", "label": "Cyberpunk",      "description": "Neon green on black — matrix terminal"},

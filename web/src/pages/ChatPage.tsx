@@ -157,10 +157,11 @@ function terminalTierWidthPx(host: HTMLElement | null): number {
 }
 
 function terminalFontSizeForWidth(layoutWidthPx: number): number {
-  if (layoutWidthPx < 300) return 7;
-  if (layoutWidthPx < 360) return 8;
-  if (layoutWidthPx < 420) return 9;
-  if (layoutWidthPx < 520) return 10;
+  // Keep ordinary phone widths readable. The TUI already switches to its
+  // compact layout as columns disappear, so shrinking glyphs below 10px on a
+  // 320–420px host buys little while making transcripts difficult to read.
+  if (layoutWidthPx < 300) return 9;
+  if (layoutWidthPx < 420) return 10;
   if (layoutWidthPx < 720) return 11;
   if (layoutWidthPx < 1024) return 12;
   return 14;
@@ -1937,7 +1938,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         </div>
       )}
 
-      <div className="flex min-h-0 flex-1 flex-col gap-2 lg:flex-row lg:gap-3">
+      <div className="hermes-chat-layout flex min-h-0 flex-1 flex-col gap-2 lg:flex-row lg:gap-3">
         <div
           className={cn(
             // Open-conversation column: vertical flex. Transcript host is the
@@ -2162,7 +2163,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             id="chat-side-panel"
             role="complementary"
             aria-label={modelToolsLabel}
-            className="flex min-h-0 shrink-0 flex-col gap-3 overflow-hidden lg:h-full lg:w-60"
+            className="hermes-chat-rail flex min-h-0 shrink-0 flex-col gap-3 overflow-hidden lg:h-full lg:w-60"
           >
             {/* Model picker — keeps the rail thin. */}
             <div className="shrink-0">

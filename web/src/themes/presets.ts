@@ -79,6 +79,70 @@ export const midnightTheme: DashboardTheme = {
   },
 };
 
+/** Cosmic dark theme derived from deep-space storm colors. */
+export const voidTheme: DashboardTheme = {
+  name: "void",
+  label: "Void",
+  description: "Cosmic midnight with electric blue and magenta starlight",
+  palette: {
+    background: { hex: "#060816", alpha: 1 },
+    midground: { hex: "#f2edff", alpha: 1 },
+    foreground: { hex: "#ffffff", alpha: 0 },
+    warmGlow: "rgba(255, 72, 170, 0.3)",
+    noiseOpacity: 0.65,
+  },
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: `"Inter", ${SYSTEM_SANS}`,
+    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`,
+    fontUrl:
+      "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap",
+    letterSpacing: "-0.006em",
+  },
+  layout: {
+    ...DEFAULT_LAYOUT,
+    radius: "0.875rem",
+  },
+  terminalBackground: "#070813",
+  terminalForeground: "#f2edff",
+  colorOverrides: {
+    card: "rgba(12, 13, 34, 0.74)",
+    cardForeground: "#f2edff",
+    popover: "rgba(10, 11, 29, 0.97)",
+    popoverForeground: "#f2edff",
+    primary: "#ff55ae",
+    primaryForeground: "#090a18",
+    secondary: "rgba(82, 94, 180, 0.16)",
+    secondaryForeground: "#e8e4ff",
+    muted: "rgba(122, 132, 205, 0.12)",
+    mutedForeground: "#aaa7c9",
+    accent: "rgba(67, 146, 255, 0.16)",
+    accentForeground: "#f7f4ff",
+    border: "rgba(190, 183, 255, 0.16)",
+    input: "rgba(190, 183, 255, 0.2)",
+    ring: "#ba79ff",
+    success: "#53d8c5",
+    warning: "#ffc56e",
+  },
+  seriesColors: {
+    inputTokenAccent: "#4b9dff",
+    outputTokenAccent: "#ff55ae",
+  },
+  swatchColors: ["#060816", "#ff55ae", "#328fff"],
+  componentStyles: {
+    header: {
+      background: "rgba(6, 8, 22, 0.82)",
+      borderImage:
+        "linear-gradient(90deg, transparent, rgba(126, 105, 255, 0.3), rgba(255, 85, 174, 0.24), transparent) 1",
+    },
+    sidebar: {
+      background: "rgba(5, 7, 19, 0.9)",
+      borderImage:
+        "linear-gradient(180deg, rgba(75, 157, 255, 0.28), rgba(255, 85, 174, 0.2), transparent 85%) 1",
+    },
+  },
+};
+
 export const emberTheme: DashboardTheme = {
   name: "ember",
   label: "Ember",
@@ -233,6 +297,7 @@ export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   "default-large": defaultLargeTheme,
   "nous-blue": nousBlueTheme,
   midnight: midnightTheme,
+  void: voidTheme,
   ember: emberTheme,
   mono: monoTheme,
   cyberpunk: cyberpunkTheme,

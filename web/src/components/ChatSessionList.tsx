@@ -222,7 +222,7 @@ export function ChatSessionList({
   return (
     <aside
       className={cn(
-        "flex h-full w-full min-w-0 shrink-0 flex-col overflow-hidden",
+        "hermes-chat-session-list flex h-full w-full min-w-0 shrink-0 flex-col overflow-hidden",
         className,
       )}
     >
