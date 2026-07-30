@@ -1,6 +1,6 @@
 ---
 name: idea-to-design
-description: "Collaborative design dialogue before any implementation. Use before creating features, building components, adding functionality, or modifying behavior. Hard gate: no code until design is approved."
+description: 'Collaborative design dialogue before any implementation. Use before creating features, building components, adding functionality, or modifying behavior. Hard gate: no code until design is approved.'
 version: 1.0.0
 author: Hermes Agent (adapted from obra/superpowers brainstorming)
 license: MIT
@@ -47,6 +47,7 @@ Explore project context → Ask clarifying questions → Propose 2-3 approaches
 ## The Process
 
 **Understanding the idea:**
+
 - Check out the current project state first (files, docs, recent commits)
 - Before asking detailed questions, assess scope: if the request describes multiple independent subsystems, flag this immediately
 - If the project is too large for a single spec, help the user decompose into sub-projects
@@ -55,30 +56,38 @@ Explore project context → Ask clarifying questions → Propose 2-3 approaches
 - Only one question per message — if a topic needs more exploration, break it into multiple questions
 
 **Presenting the design:**
+
 - Present design sections one at a time, scaled to complexity
 - Each section ends with an explicit approval check
 - For simple projects, design can be a few sentences
 
 **Spec format:**
+
 ```markdown
 # Design: [Topic]
 
 ## Objective
+
 [What we're building and why]
 
 ## Approach
+
 [Chosen approach with rationale]
 
 ## Alternatives Considered
+
 [2-3 alternatives with why they were rejected]
 
 ## Architecture
+
 [Key components and their relationships]
 
 ## Risks
+
 [Known risks and mitigation strategies]
 
 ## Open Questions
+
 [Anything unresolved that needs human input]
 ```
 

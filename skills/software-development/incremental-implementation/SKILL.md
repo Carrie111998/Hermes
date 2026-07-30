@@ -1,6 +1,6 @@
 ---
 name: incremental-implementation
-description: "Deliver changes incrementally across files. Use when implementing any feature or change that touches more than one file, or when a task feels too big to land in one step."
+description: 'Deliver changes incrementally across files. Use when implementing any feature or change that touches more than one file, or when a task feels too big to land in one step.'
 version: 1.0.0
 author: Hermes Agent (adapted from obra/superpowers)
 license: MIT
@@ -31,6 +31,7 @@ Before touching code, list every file that needs to change and what changes in e
 ### 2. One Change at a Time
 
 For each file:
+
 1. Make the minimal change
 2. Run relevant tests
 3. Verify the change works in isolation
@@ -47,6 +48,7 @@ For each file:
 ### 4. Review Checkpoints
 
 After every 3-5 commits:
+
 - Review the cumulative diff
 - Check for consistency across files
 - Verify the feature is coming together as designed
@@ -54,12 +56,12 @@ After every 3-5 commits:
 
 ## Anti-Patterns
 
-| Don't | Do |
-|---|---|
-| Change 5 files, then test | Change 1 file, test, commit, repeat |
-| "I'll clean it up later" | Clean up now, before the next change |
-| One giant commit | One commit per logical change |
-| Skip tests "to save time" | Tests save time by catching issues early |
+| Don't                          | Do                                        |
+| ------------------------------ | ----------------------------------------- |
+| Change 5 files, then test      | Change 1 file, test, commit, repeat       |
+| "I'll clean it up later"       | Clean up now, before the next change      |
+| One giant commit               | One commit per logical change             |
+| Skip tests "to save time"      | Tests save time by catching issues early  |
 | Refactor while adding features | Separate refactors into their own commits |
 
 ## Hermes Integration

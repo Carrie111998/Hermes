@@ -1,6 +1,6 @@
 ---
 name: executing-plans
-description: "Execute a written implementation plan task-by-task with review checkpoints. Use when you have a plan and are ready to implement."
+description: 'Execute a written implementation plan task-by-task with review checkpoints. Use when you have a plan and are ready to implement.'
 version: 1.0.0
 author: Hermes Agent (adapted from obra/superpowers)
 license: MIT
@@ -20,6 +20,7 @@ Load plan, review critically, execute all tasks, report when complete.
 ## The Process
 
 ### Step 1: Load and Review Plan
+
 1. Read plan file with `read_file`
 2. Review critically — identify any questions or concerns about the plan
 3. If concerns: Raise them with your human partner before starting
@@ -28,6 +29,7 @@ Load plan, review critically, execute all tasks, report when complete.
 ### Step 2: Execute Tasks
 
 For each task:
+
 1. Mark as in_progress
 2. Follow each step exactly (plan has bite-sized steps)
 3. Run verifications as specified
@@ -36,6 +38,7 @@ For each task:
 ### Step 3: Complete Development
 
 After all tasks complete and verified:
+
 - Run the full test suite
 - Review the diff for unintended changes
 - Present completion summary
@@ -43,6 +46,7 @@ After all tasks complete and verified:
 ## When to Stop and Ask for Help
 
 **STOP executing immediately when:**
+
 - Hit a blocker (missing dependency, test fails, instruction unclear)
 - Plan has critical gaps preventing starting
 - You don't understand an instruction
@@ -53,6 +57,7 @@ After all tasks complete and verified:
 ## When to Revisit Earlier Steps
 
 **Return to Review (Step 1) when:**
+
 - Partner updates the plan based on your feedback
 - Fundamental approach needs rethinking
 
@@ -68,6 +73,7 @@ After all tasks complete and verified:
 - For Hermes Agent development, always use `scripts/run_tests.sh`
 
 ## Remember
+
 - Review plan critically first
 - Follow plan steps exactly
 - Don't skip verifications

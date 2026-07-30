@@ -1,6 +1,6 @@
 ---
 name: loopy
-description: "Discover, find, compare, audit, repair, adapt, craft, run, debrief, save, and prepare repeatable AI-agent loops. Use when analyzing code for recurring work, finding published loops, or turning goals into bounded loops."
+description: 'Discover, find, compare, audit, repair, adapt, craft, run, debrief, save, and prepare repeatable AI-agent loops. Use when analyzing code for recurring work, finding published loops, or turning goals into bounded loops.'
 version: 1.0.0
 author: Hermes Agent (adapted from cobusgreyling/loop-engineering)
 license: MIT
@@ -49,6 +49,7 @@ Use available repository and thread-history tools to inspect the real evidence. 
 Assume the user is new to loops. Make this a conversation, not a form: ask one short question at a time in everyday language, incorporate each answer, and do not repeat questions the user already answered.
 
 Start with:
+
 1. "What are you trying to accomplish?"
 2. "What would a successful result look like?"
 3. "When should it run: when you ask, on a schedule, or after something happens?"

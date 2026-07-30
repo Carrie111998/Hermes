@@ -31,7 +31,7 @@ Stop at the first rung that holds:
 6. **Can it be one line?** One line.
 7. **Only then:** the minimum code that works.
 
-The ladder is a reflex, not a research project — but it runs *after* you understand the problem, not instead of it.
+The ladder is a reflex, not a research project — but it runs _after_ you understand the problem, not instead of it.
 
 **Bug fix = root cause, not symptom.** A report names a symptom. Before you edit, grep every caller of the function you're about to touch. The lazy fix IS the root-cause fix. Fix it once, where all callers route through.
 
@@ -45,11 +45,11 @@ The ladder is a reflex, not a research project — but it runs *after* you under
 
 ## Intensity Levels
 
-| Level | Behavior |
-|---|---|
-| **lite** | Question abstractions; still write reasonable code |
-| **full** (default) | Aggressively minimize; push back on scope; prefer deletion |
-| **ultra** | Everything above + single-file solutions, no new deps, bash one-liners when possible |
+| Level              | Behavior                                                                             |
+| ------------------ | ------------------------------------------------------------------------------------ |
+| **lite**           | Question abstractions; still write reasonable code                                   |
+| **full** (default) | Aggressively minimize; push back on scope; prefer deletion                           |
+| **ultra**          | Everything above + single-file solutions, no new deps, bash one-liners when possible |
 
 ## Hermes Integration
 

@@ -1,6 +1,6 @@
 ---
 name: agent-self-evaluation
-description: "Self-rate output on 5 axes (accuracy, completeness, clarity, actionability, conciseness) after completing non-trivial tasks. Produces a structured 1-5 scorecard with improvement suggestions."
+description: 'Self-rate output on 5 axes (accuracy, completeness, clarity, actionability, conciseness) after completing non-trivial tasks. Produces a structured 1-5 scorecard with improvement suggestions.'
 version: 1.0.0
 author: Hermes Agent (adapted from ECC)
 license: MIT
@@ -25,13 +25,13 @@ After completing a complex task, pause to rate your output against a structured 
 
 ## The 5 Evaluation Axes
 
-| Axis | Question | What it catches |
-|---|---|---|
-| **Accuracy** | Are the facts, claims, and outputs correct? | Hallucinations, wrong API names, incorrect syntax, false statements |
-| **Completeness** | Did it cover everything the user asked for? | Missed edge cases, unhandled error paths, forgotten requirements |
-| **Clarity** | Is the explanation understandable and well-structured? | Confusing explanations, jargon, missing context, rambling |
-| **Actionability** | Can the user act on the output immediately? | Vague suggestions, missing steps, no verification path |
-| **Conciseness** | Did it use the minimum words/tokens needed? | Redundancy, over-explanation, filler content |
+| Axis              | Question                                               | What it catches                                                     |
+| ----------------- | ------------------------------------------------------ | ------------------------------------------------------------------- |
+| **Accuracy**      | Are the facts, claims, and outputs correct?            | Hallucinations, wrong API names, incorrect syntax, false statements |
+| **Completeness**  | Did it cover everything the user asked for?            | Missed edge cases, unhandled error paths, forgotten requirements    |
+| **Clarity**       | Is the explanation understandable and well-structured? | Confusing explanations, jargon, missing context, rambling           |
+| **Actionability** | Can the user act on the output immediately?            | Vague suggestions, missing steps, no verification path              |
+| **Conciseness**   | Did it use the minimum words/tokens needed?            | Redundancy, over-explanation, filler content                        |
 
 ## Scoring Scale
 
@@ -50,12 +50,14 @@ Every score below 5 MUST cite specific evidence. A score of 3 cannot just say "c
 ## Workflow
 
 ### Step 1: Collect the Raw Material
+
 - The original user request
 - Your final response/output
 - Any tool outputs that verify correctness (test results, exit codes, lint output)
 - Any user feedback received during the task
 
 ### Step 2: Score Each Axis Independently
+
 Work through the 5 axes one at a time. Score each axis fresh — don't pre-average.
 
 ### Step 3: Produce the Evaluation Report
@@ -77,7 +79,9 @@ Top improvements:
 ```
 
 ### Step 4: Apply the Improvement
+
 If any axis scored 3 or below:
+
 - State what you would do differently
 - If gap is fixable in < 30 seconds, fix it now
 - If gap requires rework, flag it explicitly

@@ -1,6 +1,6 @@
 ---
 name: writing-plans
-description: "Write comprehensive implementation plans from specs. Use when you have a spec or requirements for a multi-step task, before touching code."
+description: 'Write comprehensive implementation plans from specs. Use when you have a spec or requirements for a multi-step task, before touching code.'
 version: 1.0.0
 author: Hermes Agent (adapted from obra/superpowers)
 license: MIT
@@ -41,6 +41,7 @@ A task is the smallest unit that carries its own test cycle and is worth a fresh
 ## Bite-Sized Task Granularity
 
 **Each step is one action (2-5 minutes):**
+
 - "Write the failing test" - step
 - "Run it to make sure it fails" - step
 - "Implement the minimal code to make the test pass" - step
@@ -70,44 +71,51 @@ include this section.]
 
 ## Task Structure
 
-```markdown
+````markdown
 ### Task N: [Component Name]
 
 **Files:**
+
 - Create: `exact/path/to/file.py`
 - Modify: `exact/path/to/existing.py:123-145`
 - Test: `tests/exact/path/to/test.py`
 
 **Interfaces:**
+
 - Consumes: [what this task uses from earlier tasks — exact signatures]
 - Produces: [what later tasks rely on — exact function names, parameter and return types]
 
 - [ ] **Step 1: Write the failing test**
+
 ```python
 def test_specific_behavior():
     result = function(input)
     assert result == expected
 ```
+````
 
 - [ ] **Step 2: Run test to verify it fails**
-Run: `pytest tests/path/test.py::test_name -v`
-Expected: FAIL
+      Run: `pytest tests/path/test.py::test_name -v`
+      Expected: FAIL
 
 - [ ] **Step 3: Write minimal implementation**
+
 ```python
 def function(input):
     return expected
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
-Run: `pytest tests/path/test.py::test_name -v`
-Expected: PASS
+      Run: `pytest tests/path/test.py::test_name -v`
+      Expected: PASS
 
 - [ ] **Step 5: Commit**
+
 ```bash
 git add tests/path/test.py src/path/file.py
 git commit -m "feat: add specific feature"
 ```
+
 ```
 
 ## No Placeholders
@@ -150,3 +158,4 @@ After saving the plan, offer execution choice:
 - Use `terminal` for git commands
 - Use `delegate_task` for subagent-driven execution
 - For Hermes Agent development, always use `scripts/run_tests.sh` (never raw `pytest`)
+```

@@ -1,6 +1,6 @@
 ---
 name: ci-fix
-description: "Diagnose and fix GitHub Actions CI failures. Inspects workflow runs and logs, identifies root causes, implements minimal fixes, and pushes to a fix branch."
+description: 'Diagnose and fix GitHub Actions CI failures. Inspects workflow runs and logs, identifies root causes, implements minimal fixes, and pushes to a fix branch.'
 version: 1.0.0
 author: Hermes Agent (adapted from Warp/ci-fix)
 license: MIT

@@ -1,6 +1,6 @@
 ---
 name: blueprint
-description: "Turn a one-line objective into a step-by-step construction plan for multi-session, multi-agent engineering projects. Each step has a self-contained context brief so a fresh agent can execute it cold."
+description: 'Turn a one-line objective into a step-by-step construction plan for multi-session, multi-agent engineering projects. Each step has a self-contained context brief so a fresh agent can execute it cold.'
 version: 1.0.0
 author: Hermes Agent (adapted from community)
 license: MIT
@@ -38,7 +38,7 @@ Blueprint runs a 5-phase pipeline:
 
 Each step in the plan includes:
 
-```markdown
+````markdown
 ### Step N: [Title]
 
 **Context Brief:** [What a fresh agent needs to know — no prior steps required]
@@ -46,22 +46,28 @@ Each step in the plan includes:
 **Dependencies:** [Which steps must complete first]
 
 **Tasks:**
+
 - [ ] [Specific, verifiable task]
 - [ ] [Specific, verifiable task]
 
 **Verification:**
+
 ```bash
 # Exact commands to verify this step is done
 ```
+````
 
 **Exit Criteria:** [How to know this step is complete]
+
 ```
 
 ## Examples
 
 ### Basic usage
 ```
+
 /blueprint "migrate database to PostgreSQL"
+
 ```
 
 Produces a plan with steps like:
@@ -73,7 +79,9 @@ Produces a plan with steps like:
 
 ### Multi-agent project
 ```
+
 /blueprint "extract LLM providers into a plugin system"
+
 ```
 
 Produces a plan with dependency graph showing which steps can run in parallel.
@@ -86,3 +94,4 @@ Produces a plan with dependency graph showing which steps can run in parallel.
 - Use `executing-plans` for step-by-step execution
 - Use `delegate_task` with batch mode for parallel steps
 - Use `memory` tool to track plan state across sessions
+```

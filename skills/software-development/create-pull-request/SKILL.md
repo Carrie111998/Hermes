@@ -1,6 +1,6 @@
 ---
 name: create-pull-request
-description: "Create a GitHub pull request following project conventions. Use when asked to create a PR, submit changes for review, or open a pull request."
+description: 'Create a GitHub pull request following project conventions. Use when asked to create a PR, submit changes for review, or open a pull request.'
 version: 1.0.0
 author: Hermes Agent (adapted from oz-skills)
 license: MIT
@@ -72,20 +72,25 @@ If the repo has a `.github/PULL_REQUEST_TEMPLATE.md`, follow it. Otherwise:
 
 ```markdown
 ## What changed
+
 [Brief description]
 
 ## Why
+
 [Context and motivation]
 
 ## Testing
+
 - [ ] Unit tests pass
 - [ ] Integration tests pass
 - [ ] Manual testing complete
 
 ## Screenshots (if UI change)
+
 [before/after]
 
 ## Checklist
+
 - [ ] Tests added/updated
 - [ ] Documentation updated
 - [ ] Breaking changes documented

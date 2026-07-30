@@ -28,7 +28,7 @@ Before touching code, infer what the user actually wants:
 
 ### Output a one-line "Design Read" before generating
 
-*"Reading this as: <page kind> for <audience>, with a <vibe> language, leaning toward <design system>."*
+_"Reading this as: <page kind> for <audience>, with a <vibe> language, leaning toward <design system>."_
 
 ### Anti-Default Discipline
 
@@ -36,11 +36,11 @@ Do not default to: AI-purple gradients, centered hero over dark mesh, three equa
 
 ## 1. The Three Dials
 
-| Dial | 1 | 10 |
-|---|---|---|
-| **DESIGN_VARIANCE** | Perfect Symmetry | Artsy Chaos |
-| **MOTION_INTENSITY** | Static | Cinematic/Physics |
-| **VISUAL_DENSITY** | Art Gallery/Airy | Cockpit/Packed Data |
+| Dial                 | 1                | 10                  |
+| -------------------- | ---------------- | ------------------- |
+| **DESIGN_VARIANCE**  | Perfect Symmetry | Artsy Chaos         |
+| **MOTION_INTENSITY** | Static           | Cinematic/Physics   |
+| **VISUAL_DENSITY**   | Art Gallery/Airy | Cockpit/Packed Data |
 
 **Baseline:** 8 / 6 / 4. Override based on design read.
 

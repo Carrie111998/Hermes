@@ -1,6 +1,6 @@
 ---
 name: hallmark
-description: "Anti-AI-slop design skill for greenfield pages, audits, redesigns, and design extraction. Use when building new apps, landing pages, redesigning, or invoking hallmark by name."
+description: 'Anti-AI-slop design skill for greenfield pages, audits, redesigns, and design extraction. Use when building new apps, landing pages, redesigning, or invoking hallmark by name.'
 version: 1.1.0
 author: Hermes Agent (adapted from hallmark)
 license: MIT
@@ -23,12 +23,12 @@ The differentiator: Hallmark insists on **structural variety**, not just visual 
 
 Hallmark has one default behaviour and three explicit verbs.
 
-| Invocation | What it does |
-|---|---|
-| *(default)* | The user asked you to design or build something new. Follow the **Design flow** below. |
-| `hallmark audit <target>` | Read the target, score it against the anti-pattern list, return a ranked punch list. **Do not edit.** |
-| `hallmark redesign <target>` | Take the target's content and intent, then redesign the visual structure inside the existing implementation boundaries. Preserve existing routes, component ownership, copy intent, brand, and information architecture. |
-| `hallmark study <screenshot or URL>` | Extract the DNA — macrostructure, archetypes, type-pairing, colour anchor — and produce a diagnosis report. |
+| Invocation                           | What it does                                                                                                                                                                                                             |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| _(default)_                          | The user asked you to design or build something new. Follow the **Design flow** below.                                                                                                                                   |
+| `hallmark audit <target>`            | Read the target, score it against the anti-pattern list, return a ranked punch list. **Do not edit.**                                                                                                                    |
+| `hallmark redesign <target>`         | Take the target's content and intent, then redesign the visual structure inside the existing implementation boundaries. Preserve existing routes, component ownership, copy intent, brand, and information architecture. |
+| `hallmark study <screenshot or URL>` | Extract the DNA — macrostructure, archetypes, type-pairing, colour anchor — and produce a diagnosis report.                                                                                                              |
 
 ## Six Disciplines (apply across all verbs)
 
@@ -49,6 +49,7 @@ Hallmark has one default behaviour and three explicit verbs.
 ### 0. Pre-flight scan
 
 If the project already has code, read it before asking the user anything. Scan for:
+
 - **Font stack** — `package.json` for font deps, Tailwind config, CSS imports
 - **Palette** — OKLCH/HSL/hex in `:root`, Tailwind `theme.extend.colors`, design tokens
 - **Microinteraction stance** — `framer-motion`, `gsap`, `motion` in deps = "motion-on"
@@ -60,6 +61,7 @@ Emit findings before proceeding. Preserve existing tokens; introduce macrostruct
 ### 1. Genre detection
 
 Classify the brief into one of four genres:
+
 - **Editorial** — content-first, strong typography, minimal chrome
 - **Modern-minimal** — clean, spacious, geometric
 - **Atmospheric** — moody, immersive, background-driven

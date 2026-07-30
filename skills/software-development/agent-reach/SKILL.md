@@ -1,6 +1,6 @@
 ---
 name: agent-reach
-description: "15-platform internet research router: Twitter/X, Reddit, XiaoHongShu, Bilibili, YouTube, LinkedIn, GitHub, V2EX, RSS, and more. Use when researching topics across social platforms, searching for discussions, or looking up anything on the web beyond basic search."
+description: '15-platform internet research router: Twitter/X, Reddit, XiaoHongShu, Bilibili, YouTube, LinkedIn, GitHub, V2EX, RSS, and more. Use when researching topics across social platforms, searching for discussions, or looking up anything on the web beyond basic search.'
 version: 1.0.0
 author: Hermes Agent (adapted from Panniantong/Agent-Reach)
 license: MIT
@@ -25,14 +25,14 @@ metadata:
 
 ## Routing Table
 
-| User intent | Category | Hermes Tool |
-|---|---|---|
-| Web / code search | search | `web_search` or `terminal: agent-reach search` |
-| XiaoHongShu / Twitter / Bilibili / V2EX / Reddit / Facebook / Instagram | social | `terminal: agent-reach social` |
-| Jobs / LinkedIn | career | `terminal: agent-reach career` |
-| GitHub / code | dev | `terminal: gh` or `web_search` |
-| Web pages / articles / RSS | web | `web_extract` or `terminal: curl` |
-| YouTube / Bilibili / podcast transcripts | video | `terminal: yt-dlp` or `web_extract` |
+| User intent                                                             | Category | Hermes Tool                                    |
+| ----------------------------------------------------------------------- | -------- | ---------------------------------------------- |
+| Web / code search                                                       | search   | `web_search` or `terminal: agent-reach search` |
+| XiaoHongShu / Twitter / Bilibili / V2EX / Reddit / Facebook / Instagram | social   | `terminal: agent-reach social`                 |
+| Jobs / LinkedIn                                                         | career   | `terminal: agent-reach career`                 |
+| GitHub / code                                                           | dev      | `terminal: gh` or `web_search`                 |
+| Web pages / articles / RSS                                              | web      | `web_extract` or `terminal: curl`              |
+| YouTube / Bilibili / podcast transcripts                                | video    | `terminal: yt-dlp` or `web_extract`            |
 
 ## Zero-Config Quick Commands
 
@@ -101,17 +101,17 @@ When the user asks to research a topic:
 
 When the user mentions a specific platform:
 
-| Platform | Command |
-|---|---|
-| Twitter/X | `twitter search "query" -n 10` |
-| Reddit | `opencli reddit search "query" -f yaml` |
-| XiaoHongShu | `opencli xiaohongshu search "query" -f yaml` |
-| Bilibili | `bili search "query" --type video -n 5` |
-| YouTube | `yt-dlp --write-sub --skip-download -o "/tmp/%(id)s" "URL"` |
-| LinkedIn | `opencli linkedin search "query" -f yaml` |
-| GitHub | `gh search repos "query" --sort stars --limit 10` |
-| V2EX | `curl -s "https://www.v2ex.com/api/topics/hot.json"` |
-| RSS | `curl -s "FEED_URL"` or `web_extract` |
+| Platform    | Command                                                     |
+| ----------- | ----------------------------------------------------------- |
+| Twitter/X   | `twitter search "query" -n 10`                              |
+| Reddit      | `opencli reddit search "query" -f yaml`                     |
+| XiaoHongShu | `opencli xiaohongshu search "query" -f yaml`                |
+| Bilibili    | `bili search "query" --type video -n 5`                     |
+| YouTube     | `yt-dlp --write-sub --skip-download -o "/tmp/%(id)s" "URL"` |
+| LinkedIn    | `opencli linkedin search "query" -f yaml`                   |
+| GitHub      | `gh search repos "query" --sort stars --limit 10`           |
+| V2EX        | `curl -s "https://www.v2ex.com/api/topics/hot.json"`        |
+| RSS         | `curl -s "FEED_URL"` or `web_extract`                       |
 
 ### 3. Parallel Collection
 

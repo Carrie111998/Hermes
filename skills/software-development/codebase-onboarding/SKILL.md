@@ -1,6 +1,6 @@
 ---
 name: codebase-onboarding
-description: "Analyze an unfamiliar codebase and generate a structured onboarding guide with architecture map, key entry points, conventions, and a starter guide. Use when joining a new project or exploring a repo for the first time."
+description: 'Analyze an unfamiliar codebase and generate a structured onboarding guide with architecture map, key entry points, conventions, and a starter guide. Use when joining a new project or exploring a repo for the first time.'
 version: 1.0.0
 author: Hermes Agent (adapted from ECC)
 license: MIT
@@ -38,6 +38,7 @@ Gather raw signals without reading every file. Run these in parallel:
 ### Phase 2: Architecture Mapping
 
 Identify:
+
 - **Tech Stack** — Language(s), framework(s), database(s), build tools
 - **Module Map** — How code is organized, key directories, dependency flow
 - **Entry Points** — Main function, API routes, CLI commands, background jobs
@@ -52,28 +53,36 @@ Write to `docs/onboarding.md`:
 # [Project Name] — Onboarding Guide
 
 ## Quick Start
+
 [Commands to install, build, and run]
 
 ## Architecture Overview
+
 [High-level diagram in text, key components]
 
 ## Key Directories
+
 | Directory | Purpose |
-|---|---|
+| --------- | ------- |
 
 ## Important Files
+
 [Critical config files, entry points, shared utilities]
 
 ## Conventions
+
 [Naming, file organization, commit style, PR process]
 
 ## Testing
+
 [Test frameworks, how to run, coverage expectations]
 
 ## Common Tasks
+
 [How to add a route, how to add a migration, how to deploy]
 
 ## Gotchas
+
 [Non-obvious things that trip up newcomers]
 ```
 

@@ -50,17 +50,17 @@ git diff --stat origin/main...HEAD
 
 Then check:
 
-| Area | What to check |
-|---|---|
-| **Auth** | Are new endpoints protected? Token expiry? Session handling? |
-| **Data** | Migrations reversible? Backups configured? No accidental data loss? |
-| **Secrets** | Any hardcoded keys? `.env.example` updated? Rotation procedures? |
-| **Errors** | Error handling on every boundary? User-safe messages? Logging? |
-| **Performance** | New N+1 queries? Unbounded collections? Missing indexes? |
-| **Dependencies** | New packages vetted? Version pinned? Security advisories? |
-| **Config** | Feature flags? Environment-specific config? Graceful degradation? |
-| **Observability** | Logging on key paths? Metrics? Alerting thresholds? |
-| **Rollback** | Can this be rolled back? Data migration reversible? Downtime? |
+| Area              | What to check                                                       |
+| ----------------- | ------------------------------------------------------------------- |
+| **Auth**          | Are new endpoints protected? Token expiry? Session handling?        |
+| **Data**          | Migrations reversible? Backups configured? No accidental data loss? |
+| **Secrets**       | Any hardcoded keys? `.env.example` updated? Rotation procedures?    |
+| **Errors**        | Error handling on every boundary? User-safe messages? Logging?      |
+| **Performance**   | New N+1 queries? Unbounded collections? Missing indexes?            |
+| **Dependencies**  | New packages vetted? Version pinned? Security advisories?           |
+| **Config**        | Feature flags? Environment-specific config? Graceful degradation?   |
+| **Observability** | Logging on key paths? Metrics? Alerting thresholds?                 |
+| **Rollback**      | Can this be rolled back? Data migration reversible? Downtime?       |
 
 ## Output Format
 
