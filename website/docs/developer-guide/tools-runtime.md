@@ -213,6 +213,7 @@ The terminal system supports multiple backends:
 - singularity
 - modal
 - daytona
+- agent-sandbox
 
 It also supports:
 

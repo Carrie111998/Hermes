@@ -376,6 +376,28 @@ terminal:
 
 **Disk limit:** Daytona enforces a 10 GiB maximum. Requests above this are capped with a warning.
 
+### AgentSandbox
+
+Runs commands in an isolated [agent sandbox](https://github.com/kubernetes-sigs/agent-sandbox) pod.
+
+```yaml
+terminal:
+  backend: agent-sandbox
+  cwd: /app
+  timeout: 180
+  container_persistent: true
+  agent_sandbox_namespace: default
+  agent_sandbox_warmpool: python-sandbox-warmpool
+  agent_sandbox_connection_config:
+    name: SandboxLocalTunnelConnectionConfig
+    port_forward_ready_timeout: 30
+    server_port: 8888
+    router_namespace: default
+  lifetime_seconds: 300
+```
+
+**Requirements:** Running cluster with installed [k8s-agent-sandbox CRDs and Router](https://github.com/kubernetes-sigs/agent-sandbox#installation). Also deployed SandboxTemplate and SandboxWarmpool ([here is an example](https://github.com/kubernetes-sigs/agent-sandbox/tree/main/examples/python-runtime-sandbox#python-runtime-sandbox)).
+
 ### Singularity/Apptainer Backend
 
 Runs commands in a [Singularity/Apptainer](https://apptainer.org) container. Designed for HPC clusters and shared machines where Docker isn't available.
