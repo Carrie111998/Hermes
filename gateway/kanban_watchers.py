@@ -995,11 +995,15 @@ class GatewayKanbanWatchersMixin:
             return
 
         # Top-level safety net (#72396): the dispatcher watcher runs as a
-        # supervised asyncio task, and on Windows (especially under pythonw.exe
-        # / Scheduled Tasks) an unhandled exception here can vanish the entire
-        # gateway process with zero trace.  This guard ensures any unexpected
-        # failure is logged and the singleton lock is released before the task
-        # exits.
+        # supervised asyncio task (_spawn_supervised), and on Windows
+        # (especially under pythonw.exe / Scheduled Tasks) an unhandled
+        # exception here can vanish the entire gateway process with zero trace.
+        # This guard logs the failure and releases the singleton lock before
+        # **re-raising** so that _spawn_supervised's _done callback sees the
+        # exception and restarts the watcher with capped exponential backoff
+        # (maintaining supervised recovery). A clean return would defeat that:
+        # _spawn_supervised treats a normal exit as deliberate shutdown and
+        # never restarts — see PR #72434 follow-up.
         try:
             await self._kanban_dispatcher_loop(_kb, kanban_cfg)
         except asyncio.CancelledError:
@@ -1008,16 +1012,12 @@ class GatewayKanbanWatchersMixin:
             raise
         except Exception:
             logger.exception(
-                "kanban dispatcher: unhandled error — releasing lock and exiting; "
-                "the gateway will continue but kanban dispatch will be disabled "
-                "until restart."
+                "kanban dispatcher: unhandled error — releasing lock and re-raising; "
+                "_spawn_supervised will restart this watcher with backoff."
             )
             _release_singleton_lock(self._kanban_dispatcher_lock_handle)
             self._kanban_dispatcher_lock_handle = None
-            # Return cleanly so _spawn_supervised sees a normal exit (no
-            # exception) and does not busy-restart a watcher that keeps
-            # failing at the same point.
-            return
+            raise
 
     async def _kanban_dispatcher_loop(
         self, _kb: object, kanban_cfg: dict,
@@ -1175,10 +1175,13 @@ class GatewayKanbanWatchersMixin:
             self._kanban_dispatcher_lock_handle = None
             raise
         except Exception:
-            logger.exception("kanban dispatcher: error during startup delay")
+            logger.exception(
+                "kanban dispatcher: error during startup delay — re-raising; "
+                "_spawn_supervised will restart this watcher with backoff."
+            )
             _release_singleton_lock(self._kanban_dispatcher_lock_handle)
             self._kanban_dispatcher_lock_handle = None
-            return
+            raise
 
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
         # queue is non-empty but spawns are 0 for N consecutive ticks —

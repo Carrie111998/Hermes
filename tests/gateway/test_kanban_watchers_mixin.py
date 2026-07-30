@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
 KANBAN_METHODS = [
@@ -67,3 +69,40 @@ def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     h3, st3 = _acquire_singleton_lock(lock)
     assert st3 == "held" and h3 is not None
     _release_singleton_lock(h3)
+
+
+class TestDispatcherExceptionPropagation:
+    """Regression: dispatcher watcher must re-raise exceptions so that
+    _spawn_supervised sees the exception and restarts the watcher.
+    A clean return defeats the supervisor — see PR #72434 follow-up."""
+
+    @pytest.mark.asyncio
+    async def test_outer_handler_re_raises_exception(self):
+        """When _kanban_dispatcher_loop raises, _kanban_dispatcher_watcher
+        must propagate the exception (not swallow it with a clean return)."""
+        from unittest.mock import MagicMock, patch
+
+        from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+
+        mixin = MagicMock()
+        mixin._kanban_dispatcher_lock_handle = MagicMock()
+
+        async def fake_loop(_kb, kanban_cfg):
+            raise RuntimeError("simulated dispatcher crash")
+
+        mixin._kanban_dispatcher_loop = fake_loop
+
+        with patch(
+            "gateway.kanban_watchers._acquire_singleton_lock",
+            return_value=(MagicMock(), "held"),
+        ), patch(
+            "gateway.kanban_watchers._release_singleton_lock",
+        ), patch.dict(
+            "sys.modules",
+            {"hermes_cli": MagicMock(kanban_db=MagicMock())},
+        ):
+            with pytest.raises(RuntimeError, match="simulated dispatcher crash"):
+                await GatewayKanbanWatchersMixin._kanban_dispatcher_watcher(mixin)
+
+        # Verify the lock handle was cleared before re-raising
+        assert mixin._kanban_dispatcher_lock_handle is None
