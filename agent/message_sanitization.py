@@ -287,6 +287,58 @@ def _close_unclosed_json_structures(raw: str) -> str:
     return raw + "".join("}" if ch == "{" else "]" for ch in reversed(stack))
 
 
+def _unmatched_trailing_closer_index(raw: str) -> int:
+    """Index of a trailing ``}``/``]`` that closes nothing, or -1.
+
+    Companion to :func:`_close_unclosed_json_structures` for the opposite
+    problem: a payload carrying one closer too many.  Shares the same
+    string/escape tracking, so a delimiter inside a string *value* is not
+    mistaken for structure -- the ``str.count`` version this replaces saw the
+    brace in ``{"s":"{","x":[1]}}`` and concluded the braces were balanced, so
+    it never removed the genuinely excess ``}`` and a recoverable payload
+    degraded to ``"{}"``.
+
+    Only reports a closer that is the payload's LAST token.  An excess closer
+    in the middle (``{"a": [1]]}``) is deliberately left alone: the caller
+    repairs by dropping the character it is told about, and dropping the tail
+    there would take a legitimate closer with it and mangle the payload.  Those
+    stay unparseable and fall through to ``"{}"``, exactly as before.
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    unmatched = -1
+    last_token = -1
+    for i, ch in enumerate(raw):
+        if in_string:
+            last_token = i
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch in _JSON_WHITESPACE:
+            continue
+        last_token = i
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+            else:
+                unmatched = i
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+            else:
+                unmatched = i
+    return unmatched if unmatched >= 0 and unmatched == last_token else -1
+
+
 def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     """Attempt to repair malformed tool_call argument JSON.
 
@@ -334,18 +386,17 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     fixed = _strip_trailing_commas(fixed)
     # 2. Close unclosed structures, innermost first (string-aware)
     fixed = _close_unclosed_json_structures(fixed)
-    # 3. Remove excess closing braces/brackets (bounded to 50 iterations)
+    # 3. Remove excess closing braces/brackets (bounded to 50 iterations),
+    #    string-aware so a delimiter inside a value is not counted as structure
     for _ in range(50):
         try:
             json.loads(fixed)
             break
         except (json.JSONDecodeError, ValueError, RecursionError):
-            if fixed.endswith('}') and fixed.count('}') > fixed.count('{'):
-                fixed = fixed[:-1]
-            elif fixed.endswith(']') and fixed.count(']') > fixed.count('['):
-                fixed = fixed[:-1]
-            else:
+            drop = _unmatched_trailing_closer_index(fixed)
+            if drop < 0:
                 break
+            fixed = fixed[:drop] + fixed[drop + 1:]
 
     try:
         json.loads(fixed)

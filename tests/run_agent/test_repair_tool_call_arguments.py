@@ -230,6 +230,31 @@ class TestRepairToolCallArguments:
         result = _repair_tool_call_arguments('{"a": [1, 2,], "b": {"c": 3,},}', "t")
         assert json.loads(result) == {"a": [1, 2], "b": {"c": 3}}
 
+    # -- Excess-closer trimming is string-aware too --
+
+    def test_excess_trailing_closer_with_delimiter_inside_string(self):
+        """A brace inside a value made raw counts look balanced.
+
+        The excess `}` was therefore never removed and a payload one character
+        from valid degraded to "{}".
+        """
+        result = _repair_tool_call_arguments('{"s":"{","x":[1]}}', "t")
+        assert json.loads(result) == {"s": "{", "x": [1]}
+
+    def test_excess_trailing_closer_with_closing_delimiter_in_string(self):
+        result = _repair_tool_call_arguments('{"s":"}", "x":[1]}}', "t")
+        assert json.loads(result) == {"s": "}", "x": [1]}
+
+    def test_excess_closer_mid_payload_is_left_unrepairable(self):
+        """Only a trailing excess closer is dropped.
+
+        In `{"a": [1]]}` the stray `]` is not the last token, so trimming the
+        tail would remove the legitimate `}` and mangle the payload.  It stays
+        unparseable and falls through to "{}" instead.
+        """
+        assert _repair_tool_call_arguments('{"a": [1]]}', "t") == "{}"
+        assert _repair_tool_call_arguments('{"a": [1, 2]], "b": 3}', "t") == "{}"
+
     # -- Never-raises contract --
 
     def test_pathological_nesting_does_not_raise(self):
