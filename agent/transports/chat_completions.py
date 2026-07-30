@@ -271,6 +271,53 @@ class ChatCompletionsTransport(ProviderTransport):
                             copied_tool_calls[tc_idx] = copied_tc
                 if copied_tool_calls is not None:
                     mutable_msg()["tool_calls"] = copied_tool_calls
+
+        # Final wire-boundary guard: a turn that still carried payload when the
+        # pre-call sanitizer vetted it can become wire-EMPTY here, because the
+        # stripping above removes fields that only the Responses transport can
+        # replay. The reachable case is a codex commentary turn (content:"" by
+        # design, text living in ``codex_message_items``): ``_msg_has_payload``
+        # counts the carrier as payload, so ``repair_empty_non_final_messages``
+        # leaves it alone — then this method drops the carrier and a bare
+        # ``{"role": "assistant", "content": ""}`` goes out. A session that ran
+        # on Codex/Responses and is then continued on an OpenAI-compatible
+        # provider (model switch to Moonshot/Kimi, DeepSeek, …) replays that
+        # shell mid-transcript and the provider 400s every subsequent request
+        # ("message at position N must not be empty") until it scrolls out.
+        #
+        # Repair by substitution, not deletion — same policy (and placeholder)
+        # as ``repair_empty_non_final_messages``: dropping a mid-transcript
+        # turn breaks role alternation and tool-call pairing. Only non-final
+        # assistant turns are touched; an empty FINAL assistant message is a
+        # legal prefill and is left exactly as-is.
+        if len(sanitized) >= 2:
+            from agent.agent_runtime_helpers import (
+                _INTERRUPTED_PLACEHOLDER,
+                _msg_has_payload,
+            )
+
+            last_idx = len(sanitized) - 1
+            healed_wire_empty = 0
+            for idx, msg in enumerate(sanitized):
+                if (
+                    idx != last_idx
+                    and isinstance(msg, dict)
+                    and msg.get("role") == "assistant"
+                    and not _msg_has_payload(msg)
+                ):
+                    patched = dict(msg)
+                    patched["content"] = _INTERRUPTED_PLACEHOLDER
+                    sanitized[idx] = patched
+                    healed_wire_empty += 1
+            if healed_wire_empty:
+                import logging
+
+                logging.getLogger(__name__).debug(
+                    "chat-completions wire guard: substituted placeholder "
+                    "content on %d assistant turn(s) that became empty after "
+                    "internal-field stripping (would 400 strict providers)",
+                    healed_wire_empty,
+                )
         return sanitized
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
