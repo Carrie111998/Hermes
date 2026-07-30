@@ -599,6 +599,34 @@ def _sudo_stdin_block_result(description: str) -> dict:
     }
 
 
+def check_unconditional_command_guards(command: str) -> dict:
+    """Apply command blocks that no approval or bypass may override."""
+    is_hardline, hardline_desc = detect_hardline_command(command)
+    if is_hardline:
+        logger.warning(
+            "Hardline block: %s (command: %s)", hardline_desc, command[:200]
+        )
+        return _hardline_block_result(hardline_desc)
+
+    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
+    if is_sudo_guess:
+        logger.warning(
+            "Sudo stdin guard block: %s (command: %s)",
+            sudo_guess_desc,
+            command[:200],
+        )
+        return _sudo_stdin_block_result(sudo_guess_desc)
+
+    deny_pattern = _match_user_deny_rule(command)
+    if deny_pattern is not None:
+        logger.warning(
+            "User deny rule %r blocked command: %s", deny_pattern, command[:200]
+        )
+        return _user_deny_block_result(deny_pattern)
+
+    return {"approved": True, "message": None}
+
+
 # =========================================================================
 # Dangerous command patterns
 # =========================================================================
@@ -3351,34 +3379,9 @@ def check_all_command_guards(command: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
-    # Hardline floor: unconditional block for catastrophic commands
-    # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
-    # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
-    # no session-level setting can bypass it.
-    is_hardline, hardline_desc = detect_hardline_command(command)
-    if is_hardline:
-        logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
-        return _hardline_block_result(hardline_desc)
-
-    # == Sudo stdin guard ==
-    # Like the hardline floor above, this is unconditional: there is never a
-    # legitimate reason for the agent to pipe passwords to sudo -S when no
-    # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
-    # check so even yolo/smart approval/mode=off cannot bypass it.
-    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
-    if is_sudo_guess:
-        logger.warning("Sudo stdin guard block: %s (command: %s)",
-                       sudo_guess_desc, command[:200])
-        return _sudo_stdin_block_result(sudo_guess_desc)
-
-    # User-defined deny rules (approvals.deny in config.yaml): like the
-    # hardline floor, these fire BEFORE the yolo / mode=off bypass — a deny
-    # rule is the user saying "never, even under yolo".
-    deny_pattern = _match_user_deny_rule(command)
-    if deny_pattern is not None:
-        logger.warning("User deny rule %r blocked command: %s",
-                       deny_pattern, command[:200])
-        return _user_deny_block_result(deny_pattern)
+    unconditional_guard = check_unconditional_command_guards(command)
+    if not unconditional_guard["approved"]:
+        return unconditional_guard
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.

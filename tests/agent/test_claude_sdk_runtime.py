@@ -341,6 +341,22 @@ def _make_session(script=None, connect_exc=None, **kwargs):
 
 
 class TestSession:
+    @staticmethod
+    def _native_bash_permission_result(
+        monkeypatch, approvals, approval_callback, command="printf ok"
+    ):
+        import asyncio
+        import hermes_cli.config as cfg
+
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        monkeypatch.setattr(cfg, "load_config", lambda: {"approvals": approvals})
+        permission_callback = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            approval_callback=approval_callback,
+            include_hermes_tools=False,
+        ).build_option_fields()["can_use_tool"]
+        return asyncio.run(permission_callback("Bash", {"command": command}, None))
+
     def test_happy_turn(self):
         script = [
             AssistantMessage(
@@ -560,6 +576,18 @@ class TestSession:
         assert isinstance(result, PermissionResultAllow)
         approval_callback.assert_called_once()
 
+    def test_manual_approval_delegates_safe_native_bash_once(self, monkeypatch):
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultAllow
+        approval_callback = MagicMock(return_value="once")
+
+        result = self._native_bash_permission_result(
+            monkeypatch, {"mode": "manual"}, approval_callback
+        )
+
+        assert isinstance(result, PermissionResultAllow)
+        approval_callback.assert_called_once()
+
     def test_approval_required_auto_allows_native_write_when_approvals_off(
         self, monkeypatch
     ):
@@ -640,6 +668,128 @@ class TestSession:
         result = asyncio.run(callback("Bash", {"command": "rm -rf /"}, None))
         assert isinstance(result, PermissionResultDeny)
         assert "hardline" in result.message
+        approval_callback.assert_not_called()
+
+    def test_approvals_off_auto_allows_safe_native_bash_without_callback(
+        self, monkeypatch
+    ):
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultAllow
+        approval_callback = MagicMock(
+            side_effect=AssertionError("approvals.mode=off must not prompt")
+        )
+
+        result = self._native_bash_permission_result(
+            monkeypatch, {"mode": "off"}, approval_callback
+        )
+
+        assert isinstance(result, PermissionResultAllow)
+        approval_callback.assert_not_called()
+
+    def test_manual_approval_cannot_override_native_bash_hardline_floor(
+        self, monkeypatch
+    ):
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultDeny
+        approval_callback = MagicMock(return_value="once")
+
+        result = self._native_bash_permission_result(
+            monkeypatch, {"mode": "manual"}, approval_callback, "rm -rf /"
+        )
+
+        assert isinstance(result, PermissionResultDeny)
+        assert "hardline" in result.message
+        approval_callback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("command", "approvals"),
+        [
+            ("echo guess | sudo -S id", {"mode": "manual"}),
+            ("echo forbidden", {"mode": "manual", "deny": ["echo forbidden"]}),
+        ],
+    )
+    def test_manual_approval_cannot_override_other_native_bash_guard_floors(
+        self, monkeypatch, command, approvals
+    ):
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultDeny
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+        approval_callback = MagicMock(return_value="once")
+
+        result = self._native_bash_permission_result(
+            monkeypatch, approvals, approval_callback, command
+        )
+
+        assert isinstance(result, PermissionResultDeny)
+        approval_callback.assert_not_called()
+
+    @pytest.mark.parametrize("malformed_guard", [None, {}, {"approved": "yes"}])
+    def test_native_bash_malformed_guard_result_fails_closed(
+        self, monkeypatch, malformed_guard
+    ):
+        import asyncio
+
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultDeny
+        import hermes_cli.config as cfg
+        import tools.approval as approval
+
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        monkeypatch.setattr(
+            cfg, "load_config", lambda: {"approvals": {"mode": "manual"}}
+        )
+        monkeypatch.setattr(
+            approval,
+            "check_unconditional_command_guards",
+            lambda command: malformed_guard,
+            raising=False,
+        )
+        approval_callback = MagicMock(return_value="once")
+        callback = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            approval_callback=approval_callback,
+            include_hermes_tools=False,
+        ).build_option_fields()["can_use_tool"]
+
+        result = asyncio.run(callback("Bash", {"command": "printf ok"}, None))
+
+        assert isinstance(result, PermissionResultDeny)
+        assert "failed closed" in result.message
+        approval_callback.assert_not_called()
+
+    def test_native_bash_guard_exception_fails_closed(self, monkeypatch):
+        import asyncio
+
+        pytest.importorskip("claude_agent_sdk")
+        from claude_agent_sdk import PermissionResultDeny
+        import hermes_cli.config as cfg
+        import tools.approval as approval
+
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        monkeypatch.setattr(
+            cfg, "load_config", lambda: {"approvals": {"mode": "manual"}}
+        )
+
+        def raise_guard_error(command):
+            raise RuntimeError("guard failed")
+
+        monkeypatch.setattr(
+            approval,
+            "check_unconditional_command_guards",
+            raise_guard_error,
+            raising=False,
+        )
+        approval_callback = MagicMock(return_value="once")
+        callback = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            approval_callback=approval_callback,
+            include_hermes_tools=False,
+        ).build_option_fields()["can_use_tool"]
+
+        result = asyncio.run(callback("Bash", {"command": "printf ok"}, None))
+
+        assert isinstance(result, PermissionResultDeny)
+        assert "failed closed" in result.message
         approval_callback.assert_not_called()
 
     def test_auto_keeps_accept_edits_without_permission_callback(self, monkeypatch):

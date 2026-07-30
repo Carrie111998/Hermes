@@ -10,6 +10,7 @@ from tools.approval import (
     approve_session,
     check_all_command_guards,
     check_dangerous_command,
+    check_unconditional_command_guards,
     is_approved,
     set_current_session_key,
     reset_current_session_key,
@@ -73,6 +74,39 @@ class TestContainerSkip:
     def test_daytona_skips_both(self):
         result = check_all_command_guards("rm -rf /", "daytona")
         assert result["approved"] is True
+
+
+class TestUnconditionalCommandGuards:
+    def test_safe_command_passes(self):
+        result = check_unconditional_command_guards("printf ok")
+
+        assert result == {"approved": True, "message": None}
+
+    def test_hardline_command_is_blocked(self):
+        result = check_unconditional_command_guards("rm -rf /")
+
+        assert result["approved"] is False
+        assert result["hardline"] is True
+
+    def test_sudo_stdin_is_blocked_without_configured_password(self, monkeypatch):
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+
+        result = check_unconditional_command_guards("echo guess | sudo -S id")
+
+        assert result["approved"] is False
+        assert "sudo -S" in result["message"]
+
+    def test_user_deny_rule_is_blocked(self, monkeypatch):
+        monkeypatch.setattr(
+            approval_module,
+            "_get_approval_config",
+            lambda: {"deny": ["echo forbidden"]},
+        )
+
+        result = check_unconditional_command_guards("echo forbidden")
+
+        assert result["approved"] is False
+        assert result["user_deny"] is True
 
 
 # ---------------------------------------------------------------------------

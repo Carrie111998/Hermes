@@ -975,9 +975,9 @@ class ClaudeAgentSdkSession:
         """Bridge SDK permission requests onto Hermes' fail-closed policy.
 
         Native read-only denies every expansion request. With Hermes approvals
-        off, ordinary requests are allowed without a prompt while Bash still
-        crosses the existing pre-bypass guard floor. Other modes delegate to
-        Hermes' approval callback and deny if that callback fails."""
+        off, ordinary requests are allowed without a prompt. Native Bash always
+        crosses the existing pre-bypass guard floor before other modes delegate
+        to Hermes' approval callback. Callback and guard failures deny."""
         approval_callback = self._approval_callback
 
         async def _can_use_tool(tool_name: str, tool_input: dict, context: Any):
@@ -993,29 +993,39 @@ class ClaudeAgentSdkSession:
                     message="native read-only permission expansion denied"
                 )
 
-            if _approvals_mode_off():
-                if tool_name == "Bash":
-                    command = tool_input.get("command")
-                    if not isinstance(command, str):
-                        return PermissionResultDeny(
-                            message="native Bash request has no string command"
-                        )
-                    from tools.approval import check_all_command_guards
+            if tool_name == "Bash":
+                command = tool_input.get("command")
+                if not isinstance(command, str):
+                    return PermissionResultDeny(
+                        message="native Bash request has no string command"
+                    )
+                try:
+                    from tools.approval import check_unconditional_command_guards
 
-                    try:
-                        guard = await asyncio.to_thread(
-                            check_all_command_guards, command, "local"
+                    guard = await asyncio.to_thread(
+                        check_unconditional_command_guards, command
+                    )
+                except Exception:
+                    logger.exception("Hermes guard failed on native Bash request")
+                    return PermissionResultDeny(
+                        message="Hermes Bash guard failed closed"
+                    )
+                if not isinstance(guard, dict) or type(guard.get("approved")) is not bool:
+                    logger.error("Hermes guard returned invalid native Bash result: %r", guard)
+                    return PermissionResultDeny(
+                        message="Hermes Bash guard returned an invalid result and failed closed"
+                    )
+                if not guard["approved"]:
+                    message = guard.get("message")
+                    return PermissionResultDeny(
+                        message=(
+                            message
+                            if isinstance(message, str) and message
+                            else "native Bash request blocked"
                         )
-                    except Exception:
-                        logger.exception("Hermes guard failed on native Bash request")
-                        return PermissionResultDeny(
-                            message="Hermes Bash guard failed closed"
-                        )
-                    if not guard.get("approved"):
-                        return PermissionResultDeny(
-                            message=guard.get("message")
-                            or "native Bash request blocked"
-                        )
+                    )
+
+            if _approvals_mode_off():
                 return PermissionResultAllow()
 
             if approval_callback is None:
