@@ -48,6 +48,13 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
 
 const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
 
+function isNestedSessionRowDragHandleTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    Boolean(target.closest('[data-session-row-actions], [data-session-row-main]'))
+  )
+}
+
 function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
   const { unit, value } = coarseElapsed(Date.now() - seconds * 1000)
 
@@ -89,6 +96,32 @@ function SidebarSessionRowImpl({
   // True when a clarify prompt in this session is waiting on the user.
   const needsInput = useStore($attentionSessionIds).includes(session.id)
 
+  const rowDragActivationProps =
+    reorderable && dragHandleProps
+      ? {
+          onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => {
+            if (!isNestedSessionRowDragHandleTarget(event.target)) {
+              dragHandleProps.onKeyDown?.(event)
+            }
+          },
+          onMouseDown: (event: React.MouseEvent<HTMLElement>) => {
+            if (!isNestedSessionRowDragHandleTarget(event.target)) {
+              dragHandleProps.onMouseDown?.(event)
+            }
+          },
+          onPointerDown: (event: React.PointerEvent<HTMLElement>) => {
+            if (!isNestedSessionRowDragHandleTarget(event.target)) {
+              dragHandleProps.onPointerDown?.(event)
+            }
+          },
+          onTouchStart: (event: React.TouchEvent<HTMLElement>) => {
+            if (!isNestedSessionRowDragHandleTarget(event.target)) {
+              dragHandleProps.onTouchStart?.(event)
+            }
+          }
+        }
+      : undefined
+
   return (
     <SessionContextMenu
       onArchive={onArchive}
@@ -121,6 +154,7 @@ function SidebarSessionRowImpl({
               <Button
                 aria-label={r.sessionActions}
                 className="size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
+                data-session-row-actions
                 size="icon"
                 variant="ghost"
               >
@@ -138,6 +172,7 @@ function SidebarSessionRowImpl({
           dragging && 'z-10 cursor-grabbing bg-(--ui-sidebar-surface-background)',
           className
         )}
+        data-session-row-chrome
         data-working={isWorking ? 'true' : undefined}
         onPointerDown={event => {
           // Reorder drags belong to dnd-kit (the grab handle); the ⋯ actions
@@ -147,7 +182,14 @@ function SidebarSessionRowImpl({
           // (never native HTML5 DnD: no macOS snap-back, Esc aborts
           // instantly). Sub-threshold releases stay ordinary clicks, so
           // resume / pin / open-in-window are untouched.
-          if ((event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')) {
+          // Reorderable rows activate a dnd-kit reorder from the whole visible
+          // row chrome (not just the tiny grabber), so the session-reference
+          // drag is suppressed for the entire row -- the two DnD systems must
+          // not fight over the same gesture.
+          if (
+            reorderable ||
+            (event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')
+          ) {
             return
           }
 
@@ -161,12 +203,14 @@ function SidebarSessionRowImpl({
         onPointerLeave={cancelPrewarm}
         ref={ref}
         style={style}
+        {...rowDragActivationProps}
         {...rest}
       >
         {sessionShowsRunningArc({ isWorking, needsInput }) && (
           <span aria-hidden="true" className="arc-border arc-row" />
         )}
         <SidebarRowBody
+          {...(reorderable ? dragHandleProps : undefined)}
           className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
           // Middle-click = open in a new tab (browser muscle memory). Swallow
           // the mousedown so Chromium doesn't enter autoscroll mode.
@@ -178,6 +222,7 @@ function SidebarSessionRowImpl({
               openSession(session.id, () => undefined, 'tab')
             }
           }}
+          data-session-row-main
           onClick={event => {
             const mod = event.metaKey || event.ctrlKey
 
