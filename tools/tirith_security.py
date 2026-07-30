@@ -31,7 +31,6 @@ import subprocess
 import tarfile
 import tempfile
 import threading
-import threading
 import time
 import urllib.request
 
@@ -127,7 +126,7 @@ def _record_tirith_crash() -> None:
     _crash_count += 1
     if _crash_count >= _CRASH_LIMIT:
         _circuit_open = True
-        _circuit_open_at = time.time()
+        _circuit_open_at = time.monotonic()
         logger.warning(
             "tirith circuit breaker opened after %d consecutive failures; "
             "disabling for the rest of the process",
@@ -761,10 +760,10 @@ def check_command_security(command: str) -> dict:
         with _breaker_lock:
             if not _circuit_open:
                 pass  # another thread's probe already closed the breaker
-            elif time.time() - _circuit_open_at < _CIRCUIT_RETRY_S:
+            elif time.monotonic() - _circuit_open_at < _CIRCUIT_RETRY_S:
                 return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
             else:
-                _circuit_open_at = time.time()  # claim: single-flight for this TTL window
+                _circuit_open_at = time.monotonic()  # claim: single-flight for this TTL window
                 logger.info(
                     "tirith circuit breaker half-open: probing after %ds", _CIRCUIT_RETRY_S
                 )

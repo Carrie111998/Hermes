@@ -46,7 +46,7 @@ def _breaker_sandbox(monkeypatch):
 def _open_breaker(age_s=None):
     ts._crash_count = ts._CRASH_LIMIT
     ts._circuit_open = True
-    ts._circuit_open_at = time.time() - (
+    ts._circuit_open_at = time.monotonic() - (
         ts._CIRCUIT_RETRY_S + 1 if age_s is None else age_s
     )
 
@@ -138,7 +138,7 @@ def test_failed_probe_rearms_timer(monkeypatch):
         raise OSError("binary gone")
 
     monkeypatch.setattr(ts.subprocess, "run", boom)
-    before = time.time()
+    before = time.monotonic()
     out = ts.check_command_security("x")
     assert out["action"] == "allow"
     assert ts._circuit_open is True
