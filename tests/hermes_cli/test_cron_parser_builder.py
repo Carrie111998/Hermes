@@ -8,6 +8,7 @@ god-file Phase 2 extraction.
 from __future__ import annotations
 
 import argparse
+import pytest
 
 from hermes_cli.subcommands.cron import build_cron_parser
 
@@ -48,3 +49,9 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_restore_rejects_raw_snapshot_argument():
+    parser = _build()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["cron", "restore", "jobid", "--snapshot", "secret-snapshot"])

@@ -7,7 +7,6 @@ import ``main`` (cycle avoidance).
 
 from __future__ import annotations
 
-import argparse
 from typing import Callable
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
@@ -169,9 +168,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_restore = cron_subparsers.add_parser("restore", help="Atomically restore a canonical job snapshot")
     cron_restore.add_argument("job_id", help="Job ID to restore")
-    snapshot_group = cron_restore.add_mutually_exclusive_group(required=True)
-    snapshot_group.add_argument("--snapshot", help=argparse.SUPPRESS)
-    snapshot_group.add_argument("--snapshot-stdin", action="store_true", help="Read bounded canonical JSON from stdin")
+    cron_restore.add_argument("--snapshot-stdin", action="store_true", help="Read bounded canonical JSON from stdin")
     cron_restore.add_argument("--json", action="store_true", help="Emit canonical JSON")
 
     # lifecycle actions

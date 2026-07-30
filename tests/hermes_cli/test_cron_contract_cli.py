@@ -35,12 +35,13 @@ def test_cli_rejects_impossible_shapes_without_mutation(tmp_path):
     assert not jobs.exists() or jobs.read_text(encoding="utf-8") in {"[]", ""}
 
 
-def test_cli_rejects_disagreeing_restore_aliases_without_mutation(tmp_path):
+def test_cli_rejects_raw_snapshot_argument_without_mutation(tmp_path):
     home = tmp_path / ".hermes"
     (home / "cron").mkdir(parents=True)
-    snapshot = '{"id":"job-1","name":"x","enabled":true,"state":"scheduled","schedule":"every 5m","next_run_at":"2026-01-01T00:00:00","repeat":null,"delivery":"local","deliver":"telegram:1","skills":[],"no_agent":true,"script":"watch.sh","prompt":null}'
-    result = run_cli(home, "restore", "job-1", "--snapshot", snapshot, "--json")
+    secret_snapshot = "secret-snapshot-never-in-argv"
+    result = run_cli(home, "restore", "job-1", "--snapshot", secret_snapshot, "--json")
     assert result.returncode != 0
+    assert "unrecognized arguments:" in result.stderr
     jobs = home / "cron" / "jobs.json"
     assert not jobs.exists() or jobs.read_text(encoding="utf-8") == "[]"
 

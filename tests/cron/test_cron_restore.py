@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import sys
@@ -85,7 +86,12 @@ def test_restore_preserves_explicit_nulls_and_notifies_provider(temp_home, monke
     monkeypatch.setattr(jobs, "restore_job", lambda job_id, value: value)
     monkeypatch.setattr(cron_cli, "_canonical_job", lambda value: value)
     from argparse import Namespace
-    assert cron_cli.cron_restore(Namespace(job_id=snapshot["id"], snapshot=json.dumps(snapshot),
-                                            snapshot_stdin=False, json=True)) == 0
+    monkeypatch.setattr(
+        cron_cli.sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(json.dumps(snapshot).encode("utf-8"))),
+    )
+    assert cron_cli.cron_restore(Namespace(job_id=snapshot["id"],
+                                            snapshot_stdin=True, json=True)) == 0
     assert calls == [1]
     assert read_rows() == [snapshot]
