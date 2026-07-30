@@ -428,7 +428,13 @@ def _update_args(**overrides):
     return SimpleNamespace(**defaults)
 
 
-def _run_update_until_guard(args, *, is_windows=True, detector=None):
+def _run_update_until_guard(
+    args,
+    *,
+    is_windows=True,
+    detector=None,
+    quiesce_token=None,
+):
     """Drive _cmd_update_impl just far enough to hit the venv-holder guard.
 
     Everything before the guard is stubbed; the guard firing is observed via
@@ -449,6 +455,12 @@ def _run_update_until_guard(args, *, is_windows=True, detector=None):
         cli_main, "_pause_windows_gateways_for_update", return_value=None
     ), patch.object(
         cli_main, "_resume_windows_gateways_after_update"
+    ), patch.object(
+        cli_main,
+        "_quiesce_posix_gateways_for_update",
+        return_value=quiesce_token,
+    ), patch.object(
+        cli_main, "_release_posix_gateway_quiesce"
     ), patch.object(
         cli_main,
         "_detect_venv_python_processes",
@@ -507,10 +519,40 @@ def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
             _update_args(force=False, force_venv=False),
             is_windows=False,
             detector=detect,
+            quiesce_token={"pids": {555, 666}, "created_homes": []},
         )
 
     assert result == "past_guard", capsys.readouterr().out
     assert seen == [{555, 666}]
+
+
+def test_venv_holder_guard_does_not_exclude_unquiesced_gateway_supervisor(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    seen = []
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(
+            parents=lambda: [SimpleNamespace(pid=555)]
+        )
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        return [(555, "python", "venv/bin/python -m hermes_cli.main gateway run")]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[555]
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [set()]
 
 
 def test_venv_holder_guard_rejects_non_ancestor_supervisor(monkeypatch, capsys):
@@ -538,3 +580,45 @@ def test_venv_holder_guard_rejects_non_ancestor_supervisor(monkeypatch, capsys):
     assert result == "past_guard", capsys.readouterr().out
     assert seen == [set()]
     find_gateways.assert_not_called()
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_confirms_live_drain_state_before_exclusion(
+    _winp, tmp_path
+):
+    from gateway.drain_control import drain_request_path
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    marker = drain_request_path(profile_home)
+
+    def read_live_state(_path):
+        # The real marker write must happen before the PID becomes eligible
+        # for exclusion from the process guard.
+        assert marker.exists()
+        return {
+            "pid": 555,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        }
+
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=1,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        side_effect=read_live_state,
+    ):
+        token = cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert token is not None
+    assert token["pids"] == {555}
+    assert marker.exists()
+
+    cli_main._release_posix_gateway_quiesce(token)
+
+    assert not marker.exists()

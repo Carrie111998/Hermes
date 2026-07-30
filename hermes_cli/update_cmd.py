@@ -2821,6 +2821,112 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     lines.append("  (or use `hermes update --force-venv` to proceed anyway at your own risk)")
     return "\n".join(lines)
 
+def _quiesce_posix_gateways_for_update(
+    gateway_pids: set[int],
+) -> dict | None:
+    """Drain mapped POSIX gateways before excluding them from the venv guard.
+
+    The external-drain marker makes each gateway refuse new work while its
+    aggregate active-work count reaches zero.  Only PIDs whose persisted
+    runtime state confirms that boundary are returned as safe exclusions.
+    Existing operator/NAS drain markers are preserved and never cleared here.
+    """
+    if _m()._is_windows() or not gateway_pids:
+        return None
+
+    try:
+        from gateway.drain_control import (
+            drain_request_path,
+            write_drain_request,
+        )
+        from gateway.status import read_runtime_status
+        from hermes_cli.gateway import (
+            _get_restart_drain_timeout,
+            find_profile_gateway_processes,
+        )
+    except Exception as exc:
+        logger.debug("Could not load POSIX gateway quiesce helpers: %s", exc)
+        return None
+
+    processes = [
+        proc
+        for proc in find_profile_gateway_processes()
+        if int(proc.pid) in gateway_pids
+    ]
+    if not processes:
+        return None
+
+    created_homes: list[Path] = []
+    try:
+        for proc in processes:
+            home = Path(proc.path)
+            marker = drain_request_path(home)
+            if not marker.exists():
+                write_drain_request(
+                    principal="hermes-update",
+                    home=home,
+                )
+                created_homes.append(home)
+    except Exception as exc:
+        logger.debug("Could not request pre-update gateway drain: %s", exc)
+        _m()._release_posix_gateway_quiesce({"created_homes": created_homes})
+        return None
+
+    try:
+        timeout = max(float(_get_restart_drain_timeout()), 1.0) + 2.0
+    except Exception:
+        timeout = 62.0
+    deadline = _time.monotonic() + timeout
+    remaining = {int(proc.pid): Path(proc.path) for proc in processes}
+    while remaining and _time.monotonic() < deadline:
+        for pid, home in list(remaining.items()):
+            state = read_runtime_status(home / "gateway_state.json") or {}
+            try:
+                state_pid = int(state.get("pid", 0) or 0)
+                active_agents = int(state.get("active_agents", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if (
+                state_pid == pid
+                and state.get("gateway_state") == "draining"
+                and active_agents == 0
+            ):
+                remaining.pop(pid, None)
+        if remaining:
+            _time.sleep(0.25)
+
+    if remaining:
+        logger.warning(
+            "Gateways did not reach the pre-update quiesce boundary: %s",
+            sorted(remaining),
+        )
+        _m()._release_posix_gateway_quiesce({"created_homes": created_homes})
+        return None
+
+    return {
+        "pids": {int(proc.pid) for proc in processes},
+        "created_homes": created_homes,
+    }
+
+def _release_posix_gateway_quiesce(token: dict | None) -> None:
+    """Clear only update-owned external-drain markers."""
+    if not token:
+        return
+    try:
+        from gateway.drain_control import clear_drain_request
+    except Exception:
+        return
+    homes = token.pop("created_homes", [])
+    for home in homes:
+        try:
+            clear_drain_request(home=Path(home))
+        except Exception:
+            logger.debug(
+                "Could not clear pre-update gateway drain marker for %s",
+                home,
+                exc_info=True,
+            )
+
 def _pause_windows_gateways_for_update() -> dict | None:
     """Stop running Windows gateways before mutating the checkout or venv.
 
@@ -3340,6 +3446,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # survive the rewrite and mix old in-memory modules with new files. Refuse
     # rather than race. Deliberately NOT bypassed by plain --force; only the
     # explicit --force-venv escape hatch skips this coherence boundary.
+    _posix_gateway_quiesce = None
     if not getattr(args, "force_venv", False):
         _venv_guard_exclude: set[int] = set()
         try:
@@ -3353,28 +3460,46 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     int(parent.pid) for parent in psutil.Process().parents()
                 }
                 if _supervisor_pid in _ancestor_pids:
-                    _venv_guard_exclude.add(_supervisor_pid)
-                    # A dashboard/gateway-triggered update already has an
-                    # explicit supervised lifecycle and restarts the complete
-                    # gateway fleet after installation. Treat every PID from
-                    # the existing gateway discovery contract as part of that
-                    # lifecycle so a second profile/service does not make the
-                    # supported update surface self-block. Other venv Python
-                    # processes remain guarded.
+                    # A dashboard/gateway-triggered update has an explicit
+                    # supervised lifecycle, but gateway processes are safe to
+                    # exclude only after they refuse new work and report zero
+                    # active work. The post-install path restarts the fleet.
                     from hermes_cli.gateway import find_gateway_pids
 
-                    _venv_guard_exclude.update(
+                    _gateway_pids = {
                         int(pid) for pid in find_gateway_pids(all_profiles=True)
+                    }
+                    _posix_gateway_quiesce = (
+                        _m()._quiesce_posix_gateways_for_update(_gateway_pids)
                     )
+                    _quiesced_pids = set(
+                        (_posix_gateway_quiesce or {}).get("pids", set())
+                    )
+                    _venv_guard_exclude.update(_quiesced_pids)
+                    # A dashboard supervisor is not a gateway and has no
+                    # gateway drain state. Keep the verified ancestor
+                    # exclusion used by the supported dashboard update flow.
+                    # A gateway supervisor is excluded only if quiesced.
+                    if _supervisor_pid not in _gateway_pids:
+                        _venv_guard_exclude.add(_supervisor_pid)
+                    if _posix_gateway_quiesce:
+                        import atexit as _atexit
+
+                        _atexit.register(
+                            _m()._release_posix_gateway_quiesce,
+                            _posix_gateway_quiesce,
+                        )
         except Exception:
             # A supervisor claim is never trusted when ancestry cannot be
             # verified (psutil missing, AccessDenied, process exited, etc.).
-            pass
+            _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
+            _posix_gateway_quiesce = None
         _venv_holders = _m()._detect_venv_python_processes(
             exclude_pids=_venv_guard_exclude
         )
         if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
+            _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(2)
 
@@ -5088,6 +5213,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
 
+        _m()._release_posix_gateway_quiesce(_posix_gateway_quiesce)
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
 
         # Warn if legacy Hermes gateway unit files are still installed.
