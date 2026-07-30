@@ -7,6 +7,7 @@ helper as a compatibility fallback for existing profiles.
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import re
@@ -22,6 +23,9 @@ CLI:
   hermes harness new --title "My task" --workspace /path/to/repo --mode "Implement changes"
   hermes harness check /path/to/intake.md
   hermes harness prompt /path/to/intake.md
+  hermes harness kanban create /path/to/intake.md --triage
+  hermes harness evidence <task-id> --output evidence.md
+  hermes harness gc-template --output weekly-harness-gc.md
 
 Helper resolution:
   bundled skill script first, then ~/.hermes/bin/hermes-harness
@@ -126,6 +130,36 @@ def _setup_harness_cli(parser) -> None:
     prompt_p.add_argument("--output", "-o", default="", help="Write prompt to this file instead of stdout")
     prompt_p.add_argument("--force", action="store_true", help="Overwrite output file if it exists")
 
+    kanban_p = sub.add_parser("kanban", help="Bridge Harness intake into Kanban lifecycle")
+    kanban_sub = kanban_p.add_subparsers(dest="harness_kanban_action")
+
+    kanban_create = kanban_sub.add_parser("create", help="Create a Kanban triage card from a filled intake form")
+    kanban_create.add_argument("file", help="Filled intake markdown file")
+    kanban_create.add_argument("--assignee", default="architect", help="Kanban assignee/profile (default: architect)")
+    kanban_create.add_argument("--workspace", default="", help="Override workspace; defaults to the intake form workspace")
+    kanban_create.add_argument("--triage", action="store_true", default=True, help="Park card in triage (default)")
+    kanban_create.add_argument("--no-triage", dest="triage", action="store_false", help="Create directly in todo/runnable state")
+    kanban_create.add_argument("--dry-run", action="store_true", help="Print the hermes kanban command instead of running it")
+    kanban_create.add_argument("--json", action="store_true", help="Emit JSON from hermes kanban create when running")
+
+    kanban_decompose = kanban_sub.add_parser("decompose", help="Create or print implementation/review child-card commands")
+    kanban_decompose.add_argument("task_id", help="Parent Kanban task id")
+    kanban_decompose.add_argument("--worker", default="loop-worker", help="Worker profile for implementation card")
+    kanban_decompose.add_argument("--reviewer", default="loop-reviewer", help="Reviewer profile for review card")
+    kanban_decompose.add_argument("--workspace", default="worktree", help="Workspace hint for implementation card")
+    kanban_decompose.add_argument("--branch", default="", help="Branch name for implementation worktree tasks")
+    kanban_decompose.add_argument("--execute", action="store_true", help="Actually create child cards; default is dry-run")
+    kanban_decompose.add_argument("--json", action="store_true", help="Emit JSON from hermes kanban create when executing")
+
+    evidence_p = sub.add_parser("evidence", help="Generate a Harness Evidence markdown report for a Kanban task or workspace")
+    evidence_p.add_argument("task_id", nargs="?", default="", help="Optional Kanban task id to include via hermes kanban show")
+    evidence_p.add_argument("--workspace", default="", help="Repo/workspace to inspect; defaults to cwd")
+    evidence_p.add_argument("--output", "-o", default="", help="Write evidence markdown to this file")
+
+    gc_p = sub.add_parser("gc-template", help="Write a weekly Harness GC / drift-review checklist template")
+    gc_p.add_argument("--output", "-o", default="", help="Write template to this file instead of stdout")
+    gc_p.add_argument("--board", default="hermes-engineering-loop", help="Target board slug to mention in the template")
+
     parser.set_defaults(func=_handle_harness_cli)
 
 
@@ -134,6 +168,13 @@ def _handle_harness_cli(args) -> None:
     if not action:
         print(HELP_TEXT)
         raise SystemExit(0)
+
+    if action == "kanban":
+        raise SystemExit(_handle_harness_kanban_cli(args))
+    if action == "evidence":
+        raise SystemExit(_handle_harness_evidence_cli(args))
+    if action == "gc-template":
+        raise SystemExit(_handle_harness_gc_template_cli(args))
 
     argv: list[str] = [action]
     if action == "classify":
@@ -178,6 +219,247 @@ def _handle_harness_cli(args) -> None:
         raise SystemExit(2)
     raise SystemExit(_run_helper(argv))
 
+
+
+INTAKE_TITLE = re.compile(r"^- Task title:[ \t]*(.*)$", re.MULTILINE)
+INTAKE_WORKSPACE = re.compile(r"^- Workspace / repo:[ \t]*(.*)$", re.MULTILINE)
+INTAKE_PROBLEM = re.compile(r"^- Problem / request:[ \t]*(.*)$", re.MULTILINE)
+INTAKE_ACCEPTANCE = re.compile(r"^\s*\d+\.[ \t]+(.+)$", re.MULTILINE)
+INTAKE_RISK = re.compile(r"^\s*- \[x\][ \t]+(.+)$", re.MULTILINE | re.IGNORECASE)
+
+
+def _read_text(path: str | Path) -> str:
+    return Path(path).expanduser().resolve().read_text(encoding="utf-8")
+
+
+def _first(pattern: re.Pattern[str], content: str, default: str = "") -> str:
+    match = pattern.search(content)
+    return match.group(1).strip() if match else default
+
+
+def _parse_intake_summary(path: str | Path) -> dict[str, Any]:
+    intake_path = Path(path).expanduser().resolve()
+    content = _read_text(intake_path)
+    title = _first(INTAKE_TITLE, content) or intake_path.stem
+    workspace = _first(INTAKE_WORKSPACE, content)
+    problem = _first(INTAKE_PROBLEM, content)
+    acceptance = [m.group(1).strip() for m in INTAKE_ACCEPTANCE.finditer(content) if m.group(1).strip()]
+    risks = [m.group(1).strip() for m in INTAKE_RISK.finditer(content) if m.group(1).strip()]
+    return {
+        "path": str(intake_path),
+        "title": title,
+        "workspace": workspace,
+        "problem": problem,
+        "acceptance": acceptance,
+        "risks": risks,
+    }
+
+
+def _run_capture(command: list[str], *, cwd: str | None = None) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+    except FileNotFoundError as exc:
+        return 127, "", str(exc)
+    return int(proc.returncode), proc.stdout.strip(), proc.stderr.strip()
+
+
+def _kanban_body_from_intake(summary: dict[str, Any]) -> str:
+    lines = [
+        "## Harness Intake",
+        "",
+        f"Source intake: `{summary['path']}`",
+        f"Workspace: `{summary.get('workspace') or '<unspecified>'}`",
+        "",
+        "### Problem",
+        summary.get("problem") or "<unspecified>",
+        "",
+        "### Acceptance criteria",
+    ]
+    acceptance = summary.get("acceptance") or []
+    lines.extend(f"- {item}" for item in acceptance) if acceptance else lines.append("- <unspecified>")
+    lines.extend(["", "### Risk surface"])
+    risks = summary.get("risks") or []
+    lines.extend(f"- {item}" for item in risks) if risks else lines.append("- <unspecified>")
+    lines.extend([
+        "",
+        "### Lifecycle policy",
+        "- Keep this card in triage until scope, affected paths, validation commands, rollback/recovery, and evidence are explicit.",
+        "- Do not dispatch implementation workers from this bridge unless a human explicitly promotes/decomposes the card.",
+        "- Attach Harness Evidence before marking done.",
+    ])
+    return "\n".join(lines)
+
+
+def _handle_harness_kanban_cli(args) -> int:
+    subaction = getattr(args, "harness_kanban_action", None)
+    if subaction == "create":
+        summary = _parse_intake_summary(getattr(args, "file"))
+        workspace = getattr(args, "workspace", "") or summary.get("workspace") or "scratch"
+        command = [
+            "hermes", "kanban", "create", summary["title"],
+            "--body", _kanban_body_from_intake(summary),
+            "--assignee", getattr(args, "assignee", "architect") or "architect",
+            "--workspace", workspace,
+            "--skill", "harness-agenting-engineering",
+            "--skill", "hermes-engineering-loop",
+            "--idempotency-key", f"harness-intake:{summary['path']}",
+        ]
+        if getattr(args, "triage", True):
+            command.append("--triage")
+        if getattr(args, "json", False):
+            command.append("--json")
+        if getattr(args, "dry_run", False):
+            print(json.dumps({"command": command, "intake": summary}, ensure_ascii=False, indent=2))
+            return 0
+        code, out, err = _run_capture(command)
+        if out:
+            print(out)
+        if err:
+            print(err)
+        return code
+    if subaction == "decompose":
+        parent = getattr(args, "task_id")
+        workspace = getattr(args, "workspace", "worktree") or "worktree"
+        branch = getattr(args, "branch", "")
+        worker_cmd = [
+            "hermes", "kanban", "create", f"Implement Harness task {parent}",
+            "--parent", parent,
+            "--assignee", getattr(args, "worker", "loop-worker") or "loop-worker",
+            "--workspace", workspace,
+            "--body", "Implement the parent Harness intake in an isolated worktree. Preserve scope and attach verification evidence before completion.",
+            "--skill", "harness-agenting-engineering",
+            "--skill", "hermes-engineering-loop",
+        ]
+        if branch:
+            worker_cmd.extend(["--branch", branch])
+        reviewer_cmd = [
+            "hermes", "kanban", "create", f"Review Harness task {parent}",
+            "--parent", parent,
+            "--assignee", getattr(args, "reviewer", "loop-reviewer") or "loop-reviewer",
+            "--workspace", "scratch",
+            "--body", "Review only. Check spec compliance, scope control, tests/evidence, Hermes invariants, and safety boundaries. Do not implement changes in this review card.",
+            "--skill", "harness-agenting-engineering",
+            "--skill", "hermes-engineering-loop",
+            "--initial-status", "blocked",
+        ]
+        if getattr(args, "json", False):
+            worker_cmd.append("--json")
+            reviewer_cmd.append("--json")
+        if not getattr(args, "execute", False):
+            print(json.dumps({"dry_run": True, "commands": [worker_cmd, reviewer_cmd]}, ensure_ascii=False, indent=2))
+            return 0
+        results = []
+        for command in (worker_cmd, reviewer_cmd):
+            code, out, err = _run_capture(command)
+            results.append({"command": command, "exit_code": code, "stdout": out, "stderr": err})
+            if out:
+                print(out)
+            if err:
+                print(err)
+            if code != 0:
+                return code
+        return 0
+    print("Usage: hermes harness kanban {create,decompose} ...")
+    return 2
+
+
+def _handle_harness_evidence_cli(args) -> int:
+    workspace = Path(getattr(args, "workspace", "") or os.getcwd()).expanduser().resolve()
+    task_id = getattr(args, "task_id", "") or ""
+    stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "## Harness Evidence",
+        "",
+        f"Generated: {stamp}",
+        f"Workspace: `{workspace}`",
+    ]
+    if task_id:
+        code, out, err = _run_capture(["hermes", "kanban", "show", task_id, "--json"])
+        lines.extend(["", "### Kanban task", ""])
+        if code == 0 and out:
+            lines.append("```json")
+            lines.append(out)
+            lines.append("```")
+        else:
+            lines.append(f"Unable to read Kanban task `{task_id}` with `hermes kanban show --json`.")
+            if err:
+                lines.append(f"Error: `{err}`")
+    for heading, cmd in [
+        ("Git HEAD", ["git", "rev-parse", "--short", "HEAD"]),
+        ("Git status", ["git", "status", "--short"]),
+        ("Diff stat", ["git", "diff", "--stat"]),
+    ]:
+        code, out, err = _run_capture(cmd, cwd=str(workspace))
+        lines.extend(["", f"### {heading}", "", "```text"])
+        lines.append(out if out else ("<empty>" if code == 0 else err or f"exit {code}"))
+        lines.append("```")
+    lines.extend([
+        "",
+        "### Required completion notes",
+        "- Spec compliance:",
+        "- Automated verification:",
+        "- Manual/negative checks:",
+        "- Rollback or recovery:",
+        "- Retention decision:",
+    ])
+    content = "\n".join(lines) + "\n"
+    output = getattr(args, "output", "")
+    if output:
+        target = Path(output).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        print(target)
+    else:
+        print(content)
+    return 0
+
+
+def _handle_harness_gc_template_cli(args) -> int:
+    board = getattr(args, "board", "hermes-engineering-loop") or "hermes-engineering-loop"
+    stamp = _dt.datetime.now().strftime("%Y-%m-%d")
+    content = f"""## Weekly Harness GC / Drift Review
+
+Date: {stamp}
+Board: `{board}`
+Assignee: reviewer / architect
+
+### Scope
+
+Create/update Kanban triage cards for drift. Do not auto-repair, auto-restart services, delete state, modify credentials, or dispatch implementation workers from this GC pass.
+
+### Checks
+
+- [ ] Blocked Kanban tasks older than policy window have current evidence and owner.
+- [ ] Done Harness tasks include evidence, validation commands, and rollback/recovery notes.
+- [ ] Profile-local plugins or scripts that are relied on operationally are solidified into repo/skill tap or explicitly marked local-only.
+- [ ] `docs/CONTRACTS.md`, `AGENTS.md`, and Harness docs still point to valid commands and current contracts.
+- [ ] Skills patched repeatedly are consolidated and still load successfully.
+- [ ] Temporary scripts/reports are either archived, promoted, or deleted with human approval.
+- [ ] WebUI Harness gate was run for WebUI-facing changes.
+- [ ] PR/body handoffs include Contract Routing and Verification when publication is used.
+
+### Evidence commands
+
+```bash
+hermes kanban boards switch {board}
+hermes kanban list --status blocked
+hermes kanban list --archived
+hermes harness evidence --workspace /path/to/repo --output /tmp/harness-evidence.md
+```
+
+### Output
+
+For each drift finding, create a triage card with evidence, affected paths, risk level, and human-gated recommendation. Leave destructive actions blocked until explicitly approved.
+"""
+    output = getattr(args, "output", "")
+    if output:
+        target = Path(output).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        print(target)
+    else:
+        print(content)
+    return 0
 
 ENGINEERING_KEYWORDS = re.compile(
     r"("

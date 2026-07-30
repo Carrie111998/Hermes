@@ -304,7 +304,23 @@ hermes harness new --title "My task" --workspace /path/to/repo --mode "Implement
 hermes harness check /path/to/intake.md
 hermes harness prompt /path/to/intake.md
 hermes harness prompt /path/to/intake.md --allow-incomplete --output /path/to/prompt.txt --force
+
+# Lifecycle bridge: intake -> Kanban triage -> worker/reviewer plan -> evidence -> GC
+hermes harness kanban create /path/to/intake.md --triage --json
+hermes harness kanban create /path/to/intake.md --dry-run --json
+hermes harness kanban decompose <task-id> --workspace worktree --branch wt/<task-id>
+hermes harness kanban decompose <task-id> --execute  # explicit only; default is dry-run
+hermes harness evidence <task-id> --workspace /path/to/repo --output /path/to/evidence.md
+hermes harness gc-template --output /path/to/weekly-harness-gc.md
 ```
+
+Lifecycle command safety boundaries:
+
+- `kanban create` turns a filled intake into a Kanban card and defaults to `--triage`, with an idempotency key derived from the intake path.
+- `kanban decompose` defaults to dry-run and prints implementation/review child-card commands; it only creates cards when `--execute` is explicit.
+- Review child cards are created blocked by default so a reviewer can check spec compliance and evidence without silently starting implementation.
+- `evidence` captures Kanban task JSON when available plus Git HEAD/status/diff-stat and completion note placeholders.
+- `gc-template` writes a weekly drift review checklist; it must not auto-repair, auto-restart services, delete state, modify credentials, or dispatch workers.
 
 It also registers the in-session plugin slash command:
 

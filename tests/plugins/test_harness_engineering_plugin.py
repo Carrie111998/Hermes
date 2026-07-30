@@ -148,3 +148,125 @@ def test_register_exposes_harness_command_and_gateway_hook():
     assert ctx.register_command.call_args.args[0] == "intake"
     ctx.register_hook.assert_called_once()
     assert ctx.register_hook.call_args.args[0] == "pre_gateway_dispatch"
+
+
+
+def _filled_intake(tmp_path):
+    intake = tmp_path / "intake.md"
+    intake.write_text(
+        """# Harness / Agenting Engineering Task Intake
+
+- Task title: Close lifecycle loop
+- Workspace / repo: /repo/ws
+- Problem / request: Bridge intake to Kanban and evidence.
+
+## 0. Submission mode
+- [x] Implement changes
+
+## 2. Acceptance criteria
+1. Kanban card can be created from intake.
+2. Evidence report can be generated.
+
+## 3. Risk surface
+- [x] Plugins / hooks / tools
+
+## 6. Verification evidence required before done
+Run plugin unit tests.
+""",
+        encoding="utf-8",
+    )
+    return intake
+
+
+def test_harness_kanban_create_dry_run_from_intake(tmp_path, capsys):
+    plugin = _load_plugin()
+    intake = _filled_intake(tmp_path)
+
+    code = plugin._handle_harness_kanban_cli(
+        SimpleNamespace(
+            harness_kanban_action="create",
+            file=str(intake),
+            assignee="architect",
+            workspace="",
+            triage=True,
+            dry_run=True,
+            json=True,
+        )
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert '"hermes"' in out
+    assert '"kanban"' in out
+    assert '"create"' in out
+    assert '"Close lifecycle loop"' in out
+    assert '"--triage"' in out
+    assert "harness-intake:" in out
+
+
+def test_harness_kanban_decompose_defaults_to_dry_run(capsys):
+    plugin = _load_plugin()
+
+    code = plugin._handle_harness_kanban_cli(
+        SimpleNamespace(
+            harness_kanban_action="decompose",
+            task_id="t123",
+            worker="loop-worker",
+            reviewer="loop-reviewer",
+            workspace="worktree:/tmp/wt",
+            branch="wt/t123",
+            execute=False,
+            json=False,
+        )
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert '"dry_run": true' in out
+    assert '"--parent"' in out
+    assert '"t123"' in out
+    assert '"--initial-status"' in out
+    assert '"blocked"' in out
+
+
+def test_harness_evidence_writes_report(tmp_path, monkeypatch):
+    plugin = _load_plugin()
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    out = tmp_path / "evidence.md"
+
+    def fake_run(command, cwd=None):
+        if command[:2] == ["git", "rev-parse"]:
+            return 0, "abc1234", ""
+        if command[:2] == ["git", "status"]:
+            return 0, "", ""
+        if command[:2] == ["git", "diff"]:
+            return 0, " plugins/harness_engineering/__init__.py | 10 +", ""
+        return 0, "{}", ""
+
+    monkeypatch.setattr(plugin, "_run_capture", fake_run)
+
+    code = plugin._handle_harness_evidence_cli(
+        SimpleNamespace(task_id="t123", workspace=str(workspace), output=str(out))
+    )
+
+    assert code == 0
+    content = out.read_text(encoding="utf-8")
+    assert "## Harness Evidence" in content
+    assert "abc1234" in content
+    assert "Required completion notes" in content
+
+
+def test_harness_gc_template_documents_non_mutating_boundary(tmp_path):
+    plugin = _load_plugin()
+    out = tmp_path / "gc.md"
+
+    code = plugin._handle_harness_gc_template_cli(
+        SimpleNamespace(output=str(out), board="hermes-engineering-loop")
+    )
+
+    assert code == 0
+    content = out.read_text(encoding="utf-8")
+    assert "Weekly Harness GC" in content
+    assert "Do not auto-repair" in content
+    assert "hermes-engineering-loop" in content
