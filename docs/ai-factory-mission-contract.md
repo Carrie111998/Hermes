@@ -114,9 +114,38 @@ python scripts/linear_loop.py tick --apply        # un tick réel
 python scripts/linear_loop.py ensure-labels --apply
 ```
 
+Cycle complet d'une issue, vu de Linear :
+
+| État Linear | Ce qui vient de se passer |
+|---|---|
+| `Todo` + `agent-ready` | Jean a autorisé le travail — seul geste humain du cycle |
+| `In Progress` + `agent-building` | La boucle a confié la mission ; le commentaire nomme le codeur et la branche |
+| `In Review` + `agent-review` | Le codeur a fini ; Jean reçoit « GO pour merger ? » |
+| `Done` | La branche est entrée dans `main` : la boucle l'a détecté, a fermé l'issue et libéré le worktree |
+| `agent-blocked` | Soit le codeur attend une décision, soit l'issue portait déjà un travail terminé |
+
 Garde-fous de la boucle :
 
 - **Sans `--apply`, rien n'est muté** — ni Linear, ni le kanban.
+- **Le worktree de mission vit sous la racine où les profils Code ont le droit
+  d'écrire**, jamais sous `<runtime>/.worktrees/` : le défaut du kanban place le
+  worktree dans le dépôt lui-même, c'est-à-dire dans le code qui gouverne le
+  codeur. HER-112 s'est bloquée là-dessus au premier run réel.
+- **Un blocage remonte à Jean**, une seule fois, avec la raison exacte. Sans ce
+  relais, un worker qui s'arrête proprement reste invisible et son issue affiche
+  « en cours » indéfiniment.
+- **Une issue déjà traitée est suspendue, pas refaite.** Toute carte `done`
+  portant sa clé, ou une mission déjà clôturée, vaut preuve d'antériorité — le
+  cas HER-95 et ses dix cartes terminées.
+- **La fermeture au merge exige un travail réel.** Une branche sans le moindre
+  commit est mécaniquement ancêtre de `main` : sans cette vérification, une
+  mission stérile fermerait son issue.
+- **Migrations : écrites, jamais exécutées.** Le hook raisonne en propriétaire de
+  répertoire ; il bloque `sqlite3 <chemin hors worktree>` mais ne peut rien
+  contre un `alembic upgrade` qui ne nomme aucun fichier. Ce qui protège
+  aujourd'hui, c'est l'absence d'identifiants de base dans les profils Code —
+  un rempart de fait, à re-vérifier avant d'ouvrir la boucle à un dépôt qui
+  embarque son propre `.env`.
 - **Un codeur libre = une mission.** Une carte `blocked` n'occupe pas un
   codeur (sinon un blocage le gèlerait indéfiniment), mais elle retient son
   issue : celle-ci n'est jamais redistribuée tant que la carte vit.
