@@ -3916,14 +3916,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                 }))
 
+            # Relay ``reasoning.available`` previews as ``delta.reasoning_content``
+            # chunks (see ``_emit``). Filtered so tool-lifecycle events (already
+            # covered by ``_on_tool_start``/``_on_tool_complete``) aren't duplicated.
+            def _on_reasoning(event_type, tool_name=None, preview=None, args=None, **kwargs):
+                if event_type == "reasoning.available" and preview:
+                    _stream_q.put(("__reasoning__", preview))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
-            #
-            # ``tool_progress_callback`` is intentionally not wired here:
-            # it would duplicate every emit because ``run_agent`` fires it
-            # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
-            # The structured callbacks are strictly richer (they carry
-            # the tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -3931,6 +3932,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                tool_progress_callback=_on_reasoning,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
@@ -3949,6 +3951,12 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
+        _reasoning_parts: List[str] = []
+
+        def _on_reasoning(event_type, tool_name=None, preview=None, args=None, **kwargs):
+            if event_type == "reasoning.available" and preview:
+                _reasoning_parts.append(preview)
+
         async def _compute_completion():
             return await self._run_agent(
                 user_message=user_message,
@@ -3956,6 +3964,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                tool_progress_callback=_on_reasoning,
                 **agent_overrides,
                 route=route,
             )
@@ -4049,6 +4058,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        reasoning_text = "\n\n".join(_reasoning_parts).strip()
+        if reasoning_text:
+            response_data["choices"][0]["message"]["reasoning_content"] = reasoning_text
         if is_partial or is_failed or not completed:
             response_data["hermes"] = {
                 "completed": completed,
@@ -4117,12 +4129,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                Tagged tuples ``("__reasoning__", text)`` are sent as a
+                standard ``delta.reasoning_content`` chunk — the same
+                field name DeepSeek/Moonshot/OpenRouter use for thinking
+                traces — so OpenAI-SDK clients can opt into rendering the
+                model's reasoning without it leaking into ``content``.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__reasoning__":
+                    reasoning_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": item[1]}, "finish_reason": None}],
+                    }
+                    await response.write(f"data: {json.dumps(reasoning_chunk)}\n\n".encode())
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
