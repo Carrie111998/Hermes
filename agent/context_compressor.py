@@ -5267,13 +5267,18 @@ This compaction should PRIORITISE preserving all information related to the focu
         messages: List[Dict[str, Any]],
         head_end: int,
         tail_start: int,
-    ) -> None:
+    ) -> bool:
         """Re-summarize the rolling summary + remaining middle in one shot.
 
         This is a lightweight batch compaction on just the summary and the
         remaining un-compacted region \u2014 NOT the full transcript.  It replaces
         the rolling summary with a fresh, compact version and advances the
         cursor to *tail_start*.
+
+        Returns True when the auxiliary call produced a fresh summary. The
+        caller MUST NOT splice on False: the rolling summary is then still the
+        old one, which does not describe the range about to be removed, so
+        committing would delete messages nothing has summarized.
         """
         middle_content = self._serialize_one_exchange(messages, head_end, tail_start)
         fresh_summary = self._micro_summarize_one(middle_content)
@@ -5284,6 +5289,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "Micro-compaction defrag: rolling summary re-summarized "
                 "(%d chars)", len(fresh_summary),
             )
+            return True
+        return False
 
     def _micro_compact(
         self,
@@ -5352,8 +5359,28 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Check for defrag trigger
         if self._needs_defrag():
-            self._defrag_rolling_summary(messages, exchange_start, compress_end)
-            result = self._splice_micro_compact_result(messages, exchange_start, compress_end)
+            if not self._defrag_rolling_summary(messages, exchange_start, compress_end):
+                # The summarizer gave us nothing, so the rolling summary still
+                # describes only what it did before this pass. Splicing now
+                # would drop the whole middle in exchange for a marker that
+                # does not cover it. Leave the transcript alone and let a
+                # later turn retry.
+                self._emit_micro_compaction_telemetry(
+                    outcome="defrag_failed",
+                    messages_before=_messages_before,
+                    messages_after=_messages_before,
+                    tokens_before=_tokens_before,
+                    tokens_after=_tokens_before,
+                    duration_ms=_elapsed_ms(),
+                )
+                return messages
+            # Defrag absorbs the entire middle rather than a single exchange,
+            # so unlike the per-turn path its range spans real user turns.
+            # Keep them verbatim: what the user asked is the one thing a
+            # summary cannot reconstruct.
+            result = self._splice_micro_compact_result(
+                messages, exchange_start, compress_end, preserve_user_turns=True
+            )
             self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
             self._sync_micro_compact_to_db(result)
             self._micro_compact_consecutive_failures = 0
@@ -5579,12 +5606,56 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "compacted messages until the next batch compression"
             )
 
+    @staticmethod
+    def _micro_marker_role(
+        messages: List[Dict[str, Any]],
+        splice_start: int,
+        splice_end: int,
+        retained: List[Dict[str, Any]],
+    ) -> str:
+        """Pick a marker role that alternates with both surviving neighbours.
+
+        Batch compaction already does this (see ``compress``): choose a role
+        that differs from the last message before the summary and the first
+        one after it. Micro-compaction pinned the marker to ``user`` instead,
+        which put it directly after the real user turn that opened the
+        absorbed exchange. ``repair_message_sequence`` merges consecutive user
+        rows before every request by folding the second into the first and
+        dropping it, so the marker -- and the ``_compressed_summary`` flag that
+        supersede, cursor resolution and resume all depend on -- was destroyed
+        on the very next API call, and the repair persisted that.
+
+        ``assistant`` is the usual answer: an exchange starts at the assistant
+        message, so the preceding row is a user turn. Falls back to ``user``
+        when the neighbours make ``assistant`` collide, which is the safer
+        collision to have -- consecutive user rows merge and keep their text,
+        while a stray assistant row can be read back as model output.
+        """
+        prev_role = (
+            messages[splice_start - 1].get("role") if splice_start > 0 else None
+        )
+        # Whatever lands immediately after the marker: a retained user turn on
+        # the defrag path, otherwise the first message past the spliced range.
+        if retained:
+            next_role = "user"
+        else:
+            next_role = (
+                messages[splice_end].get("role")
+                if splice_end < len(messages)
+                else None
+            )
+        for candidate in ("assistant", "user"):
+            if candidate != prev_role and candidate != next_role:
+                return candidate
+        return "user"
+
     def _splice_micro_compact_result(
         self,
         messages: List[Dict[str, Any]],
         splice_start: int,
         splice_end: int,
         supersede: bool = True,
+        preserve_user_turns: bool = False,
     ) -> List[Dict[str, Any]]:
         """Replace *messages[splice_start:splice_end]* with a summary marker.
 
@@ -5592,6 +5663,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         ``_compressed_summary`` metadata flag so downstream consumers
         (resume, handoff, /compress) handle it identically to batch
         compaction summaries.
+
+        When *preserve_user_turns* is set, real user messages inside the
+        spliced range are kept verbatim after the marker instead of being
+        replaced by it. The per-turn path never needs this (an exchange starts
+        at the assistant message, so the range holds no user turns), but the
+        defrag path absorbs the whole middle and would otherwise swallow them.
         """
         summary_text = self._micro_compact_rolling_summary
         if not summary_text.strip():
@@ -5604,14 +5681,38 @@ This compaction should PRIORITISE preserving all information related to the focu
         content += summary_text.strip()
         content += f"\n\n{_SUMMARY_END_MARKER}"
 
+        absorbed = messages[splice_start:splice_end]
+        retained = (
+            [
+                m for m in absorbed
+                if isinstance(m, dict)
+                and m.get("role") == "user"
+                and not m.get(COMPRESSED_SUMMARY_METADATA_KEY)
+            ]
+            if preserve_user_turns
+            else []
+        )
+
         summary_msg = {
-            "role": "user",
+            "role": self._micro_marker_role(messages, splice_start, splice_end, retained),
             "content": content,
             COMPRESSED_SUMMARY_METADATA_KEY: True,
-            COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: True,
+            # Provenance (#64650), not a constant: this says whether the text
+            # being summarized actually held a user turn. The per-turn path
+            # starts at the assistant message and never absorbs one, so
+            # claiming True there tells the zero-user guard a user request
+            # survives in the summary when none does.
+            COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: any(
+                isinstance(m, dict) and m.get("role") == "user" for m in absorbed
+            ),
         }
 
-        result = messages[:splice_start] + [summary_msg] + messages[splice_end:]
+        result = (
+            messages[:splice_start]
+            + [summary_msg]
+            + retained
+            + messages[splice_end:]
+        )
 
         # The rolling summary is cumulative: this marker already contains
         # everything every earlier micro-compaction marker held. Leaving those

@@ -71,7 +71,11 @@ class TestMicroCompaction:
         assert len(markers) == 1
         assert "ROLLING SUMMARY" in markers[0]["content"]
         # The marker stands in for a user turn, like batch compaction's does.
-        assert markers[0]["role"] == "user"
+        # The marker must alternate with BOTH neighbours, exactly as batch
+        # compaction picks its summary role. Pinning it to "user" put it
+        # straight after a real user turn, and the pre-send alternation repair
+        # then merged the two and threw the marker's metadata away.
+        assert markers[0]["role"] == "assistant"
 
     def test_disabled_is_a_no_op(self):
         cc = _compressor()
@@ -472,6 +476,117 @@ class TestMicroCompaction:
 
         assert cc._micro_compact_passes == 4
         assert cc._micro_compact_tokens_saved_total > 0
+
+    def test_marker_survives_the_pre_send_alternation_repair(self):
+        """The marker must still be a marker after the pre-request repair.
+
+        ``conversation_loop`` runs ``repair_message_sequence_with_cursor``
+        before every API call, and its pass 2 merges consecutive user rows by
+        folding the second into the first and dropping the second dict. A
+        marker emitted straight after a real user turn is therefore absorbed
+        into that turn and loses ``_compressed_summary`` -- which is what
+        supersede, cursor resolution and resume rehydration all key off. The
+        repair also rewrites ``messages[:]`` in place, so the loss persists.
+        """
+        from unittest.mock import MagicMock
+
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        cc = _compressor()
+        result = cc._micro_compact(list(_conversation(exchanges=8)))
+        assert len(_summary_markers(result)) == 1
+
+        repair_message_sequence(MagicMock(), result)
+
+        assert len(_summary_markers(result)) == 1, (
+            "marker metadata was destroyed by the pre-send alternation repair"
+        )
+
+    def test_repeated_passes_survive_the_repair_between_turns(self):
+        """Simulate the real loop: pass, repair, pass, repair...
+
+        Single-pass assertions hid the original accumulation bug, and the
+        stress harness never ran the pre-send repair, so it could not have
+        caught the marker being merged away either. Drive both together.
+        """
+        from unittest.mock import MagicMock
+
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        cc = _compressor()
+        messages = _conversation(exchanges=12)
+        agent = MagicMock()
+        previous = len(messages)
+
+        for turn in range(6):
+            messages = cc._micro_compact(list(messages))
+            repair_message_sequence(agent, messages)
+            markers = _summary_markers(messages)
+            assert len(markers) <= 1, f"turn {turn}: markers stacked ({len(markers)})"
+            assert len(messages) <= previous, (
+                f"turn {turn}: transcript grew {previous} -> {len(messages)}"
+            )
+            previous = len(messages)
+
+        # The summary must still be discoverable after all that repairing --
+        # supersede, cursor resolution and resume rehydration key off it.
+        assert len(_summary_markers(messages)) == 1
+
+    def test_marker_never_sits_next_to_a_same_role_neighbour(self):
+        cc = _compressor()
+        result = cc._micro_compact(list(_conversation(exchanges=8)))
+
+        idx = next(
+            i for i, m in enumerate(result)
+            if m.get(COMPRESSED_SUMMARY_METADATA_KEY)
+        )
+        role = result[idx]["role"]
+        if idx > 0:
+            assert result[idx - 1]["role"] != role, "marker collides with predecessor"
+        if idx + 1 < len(result):
+            assert result[idx + 1]["role"] != role, "marker collides with successor"
+
+    def test_failed_defrag_commits_nothing(self):
+        """A defrag whose summarizer fails must not splice.
+
+        ``_defrag_rolling_summary`` leaves the rolling summary untouched when
+        the auxiliary call returns nothing, but the splice used to run anyway
+        -- replacing the whole middle with a marker built from the OLD summary,
+        which by definition does not describe the messages just removed.
+        """
+        cc = _compressor()
+        cc._micro_compact_rolling_summary = "PRIOR SUMMARY " + "x" * 20_000
+        cc._micro_compact_defrag_threshold_tokens = 10
+        cc._micro_summarize_one = lambda _t: ""  # summarizer fails
+        messages = _conversation(exchanges=8)
+
+        assert cc._needs_defrag() is True
+        result = cc._micro_compact(list(messages))
+
+        assert result == messages, "failed defrag committed a lossy splice"
+        assert cc._micro_compact_rolling_summary.startswith("PRIOR SUMMARY")
+
+    def test_defrag_preserves_user_turns_verbatim(self):
+        """Defrag absorbs the whole middle -- user turns must survive it.
+
+        The per-turn path starts each exchange at the assistant message, so it
+        never touches user turns. Defrag splices ``[start:compress_end]``, a
+        range that spans them, and the raw replacement dropped every one.
+        """
+        cc = _compressor(summary="FRESH DEFRAGGED SUMMARY")
+        cc._micro_compact_rolling_summary = "PRIOR SUMMARY " + "x" * 20_000
+        cc._micro_compact_defrag_threshold_tokens = 10
+        messages = _conversation(exchanges=8)
+        originals = [m["content"] for m in messages if m["role"] == "user"]
+
+        result = cc._micro_compact(list(messages))
+
+        survivors = [
+            m["content"] for m in result
+            if m.get("role") == "user" and not m.get(COMPRESSED_SUMMARY_METADATA_KEY)
+        ]
+        missing = [u for u in originals if u not in survivors]
+        assert not missing, f"defrag dropped user turns: {missing}"
 
     def test_defrag_triggers_once_the_rolling_summary_grows(self):
         cc = _compressor(summary="FRESH DEFRAGGED SUMMARY")
