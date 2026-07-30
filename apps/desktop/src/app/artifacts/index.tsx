@@ -211,7 +211,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     [currentFilePage, visibleFileArtifacts]
   )
 
-  // Rotating placeholder nudges from real data  Esearch matches file paths and
+  // Rotating placeholder nudges from real data — search matches file paths and
   // session titles, not just labels; show it.
   const searchHints = useMemo(() => {
     if (!artifacts?.length) {
@@ -247,7 +247,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     async (href: string) => {
       try {
         // A gateway-local file resolves to file:// in remote mode (the file
-        // lives on the gateway, not this disk). Opening that locally fails  E        // and an OAuth remote connection has no query token to build a download
+        // lives on the gateway, not this disk). Opening that locally fails —         // and an OAuth remote connection has no query token to build a download
         // URL. Fetch the bytes over the authenticated fs bridge instead.
         if (isRemoteGateway() && /^file:/i.test(href)) {
           await downloadGatewayMediaFile(href)
@@ -278,7 +278,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   }, [])
 
   // Stable ctx: recreating it (or its onOpenChat closure) every render made
-  // every artifact cell re-render whenever the page did  Eand a link cell's
+  // every artifact cell re-render whenever the page did — and a link cell's
   // async title fetch re-rendered the page repeatedly. openArtifact is already
   // a useCallback; navigate is stable, so onOpenChat can be too.
   const openChat = useCallback((sessionId: string) => openSession(sessionId, navigate), [navigate])

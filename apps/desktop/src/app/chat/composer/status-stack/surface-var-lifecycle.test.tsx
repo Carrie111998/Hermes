@@ -8,7 +8,7 @@ import { $goalsBySession, type SessionGoal } from '@/store/goals'
 
 import { ComposerStatusStack } from './index'
 
-// The stack measures itself into a surface var  Ejsdom has no ResizeObserver.
+// The stack measures itself into a surface var — jsdom has no ResizeObserver.
 class ResizeObserverStub {
   observe() {}
   unobserve() {}
@@ -25,7 +25,7 @@ const goal = (): SessionGoal => ({ status: 'active', title: 'ship the feature', 
  * Regression: when the stack collapses (its last item finishes), React removes
  * the stack div BEFORE the layout-effect cleanup runs. Resolving the surface
  * from the ref at cleanup time then walks a DETACHED node, misses
- * [data-chat-surface], and clears the document root instead  Ethe stale height
+ * [data-chat-surface], and clears the document root instead — the stale height
  * stays on the surface and keeps inflating the thread's bottom clearance
  * (`--thread-last-message-clearance`) until the next publish. The effect must
  * capture its surface root while the node is still attached.
@@ -63,7 +63,7 @@ describe('ComposerStatusStack surface-var lifecycle', () => {
 
     const { surface } = renderOnSurface()
 
-    // jsdom measures 0  Ethe value is irrelevant, the target element is not.
+    // jsdom measures 0 — the value is irrelevant, the target element is not.
     expect(surface.style.getPropertyValue(STATUS_STACK_VAR)).toBe('0px')
     expect(document.documentElement.style.getPropertyValue(STATUS_STACK_VAR)).toBe('')
   })
