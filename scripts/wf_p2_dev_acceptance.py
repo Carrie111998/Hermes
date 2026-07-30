@@ -165,9 +165,11 @@ def main() -> None:
     args = parser.parse_args()
 
     suffix = uuid.uuid4().hex[:10]
-    template_id = f"p2-synthetic-{suffix}"
     with kb.connect(board=args.board) as conn:
-        wf_engine.register_template(conn, _spec(template_id))
+        template_id, _ = wf_engine.register_template(
+            conn,
+            _spec(f"p2-synthetic-{suffix}"),
+        )
         happy_task = _new_instance(
             conn,
             template_id,
