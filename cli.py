@@ -9571,6 +9571,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if canonical not in {"resume", "sessions"}:
             self._pending_resume_sessions = None
 
+        # Registry-driven dispatch.  Commands whose CommandDef carries
+        # ``cli_handler`` are invoked straight from the registry, so adding one
+        # is a single edit in hermes_cli/commands.py rather than a registry
+        # entry plus an elif branch here (the drift that made /whoami and
+        # /indicator dead commands — see issue #74594).
+        if _cmd_def is not None and _cmd_def.cli_handler:
+            getattr(self, _cmd_def.cli_handler)(cmd_original)
+            return True
+
         if canonical in {"quit", "exit"}:
             # Parse --delete flag: /exit --delete also removes the current
             # session's transcripts + SQLite history. Ported from
@@ -9587,8 +9596,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.show_help()
         elif canonical == "profile":
             self._handle_profile_command()
-        elif canonical == "tools":
-            self._handle_tools_command(cmd_original)
         elif canonical == "toolsets":
             self.show_toolsets()
         elif canonical == "config":
@@ -9743,30 +9750,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
             self.new_session(title=title)
-        elif canonical == "resume":
-            self._handle_resume_command(cmd_original)
-        elif canonical == "sessions":
-            self._handle_sessions_command(cmd_original)
-        elif canonical == "model":
-            self._handle_model_switch(cmd_original)
-        elif canonical == "codex-runtime":
-            self._handle_codex_runtime(cmd_original)
-
-        elif canonical == "personality":
-            # Use original case (handler lowercases the personality name itself)
-            self._handle_personality_command(cmd_original)
-        elif canonical == "pet":
-            self._handle_pet_command(cmd_original)
-
-        elif canonical == "hatch":
-            self._handle_hatch_command(cmd_original)
         elif canonical == "retry":
             retry_msg = self.retry_last()
             if retry_msg and hasattr(self, '_pending_input'):
                 # Re-queue the message so process_loop sends it to the agent
                 self._pending_input.put(retry_msg)
-        elif canonical == "prompt":
-            self._handle_prompt_compose_command(cmd_original)
         elif canonical == "undo":
             # Parse optional turn count: "/undo" → 1, "/undo 3" → 3.
             _undo_n = 1
@@ -9791,35 +9779,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ) is None:
                 return True  # confirmation cancelled — command handled, keep REPL alive
             self.undo_last(_undo_n)
-        elif canonical == "branch":
-            self._handle_branch_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
-        elif canonical == "cron":
-            self._handle_cron_command(cmd_original)
-        elif canonical == "suggestions":
-            self._handle_suggestions_command(cmd_original)
-        elif canonical == "blueprint":
-            self._handle_blueprint_command(cmd_original)
-        elif canonical == "curator":
-            self._handle_curator_command(cmd_original)
-        elif canonical == "kanban":
-            self._handle_kanban_command(cmd_original)
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)
-        elif canonical == "learn":
-            self._handle_learn_command(cmd_original)
-        elif canonical == "init":
-            self._handle_init_command(cmd_original)
-        elif canonical == "memory":
-            self._handle_memory_command(cmd_original)
         elif canonical == "platforms":
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
-        elif canonical == "context":
-            self._show_context_breakdown(cmd_original)
         elif canonical == "egress":
             from hermes_cli.slash_exec import CommandContext, execute_command
 
@@ -9831,40 +9799,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
             self._console_print(f"  Status bar {state}")
-        elif canonical == "diff":
-            self._handle_diff_command(cmd_original)
-        elif canonical == "battery":
-            self._handle_battery_command(cmd_original)
-        elif canonical == "timestamps":
-            self._handle_timestamps_command(cmd_original)
         elif canonical == "verbose":
             self._toggle_verbose()
-        elif canonical == "focus":
-            self._handle_focus_command(cmd_original)
-        elif canonical == "footer":
-            self._handle_footer_command(cmd_original)
         elif canonical == "yolo":
             self._toggle_yolo()
-        elif canonical == "approvals":
-            self._handle_approvals_command(cmd_original)
-        elif canonical == "reasoning":
-            self._handle_reasoning_command(cmd_original)
-        elif canonical == "fast":
-            self._handle_fast_command(cmd_original)
-        elif canonical == "compress":
-            self._manual_compress(cmd_original)
-        elif canonical == "usage":
-            self._handle_usage_command(cmd_original)
         elif canonical == "subscription":
             self._show_subscription()
-        elif canonical == "topup":
-            self._show_billing(cmd_original)
-        elif canonical == "insights":
-            self._show_insights(cmd_original)
-        elif canonical == "copy":
-            self._handle_copy_command(cmd_original)
-        elif canonical == "debug":
-            self._handle_debug_command(cmd_original)
         elif canonical == "update":
             if self._handle_update_command():
                 return False
@@ -9874,24 +9814,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _print_version_info(check_updates=True)
         elif canonical == "paste":
             self._handle_paste_command()
-        elif canonical == "image":
-            self._handle_image_command(cmd_original)
         elif canonical == "reload":
             from hermes_cli.config import reload_env
             count = reload_env()
             print(f"  Reloaded .env ({count} var(s) updated)")
-        elif canonical == "reload-mcp":
-            # Interactive reload: confirm first (unless the user has opted out).
-            # The auto-reload path (file watcher) calls _reload_mcp directly
-            # without this confirmation.
-            self._confirm_and_reload_mcp(cmd_original)
         elif canonical == "reload-skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._reload_skills()
-        elif canonical == "bundles":
-            self._handle_bundles_command(cmd_original)
-        elif canonical == "browser":
-            self._handle_browser_command(cmd_original)
         elif canonical == "plugins":
             try:
                 # Discover from disk (bundled + user), matching `hermes plugins
@@ -9956,18 +9885,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     print("  Enable/disable: hermes plugins enable/disable <name>")
             except Exception as e:
                 print(f"Plugin system error: {e}")
-        elif canonical == "rollback":
-            self._handle_rollback_command(cmd_original)
-        elif canonical == "snapshot":
-            self._handle_snapshot_command(cmd_original)
         elif canonical == "stop":
             self._handle_stop_command()
         elif canonical == "agents":
             self._handle_agents_command()
-        elif canonical == "journey":
-            self._handle_journey_command(cmd_original)
-        elif canonical == "background":
-            self._handle_background_command(cmd_original)
         elif canonical == "queue":
             # Extract prompt after "/queue " or "/q "
             parts = cmd_original.split(None, 1)
@@ -10004,8 +9925,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # No active run — treat as a normal next-turn message.
                 self._pending_input.put(payload)
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
-        elif canonical == "goal":
-            self._handle_goal_command(cmd_original)
         elif canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
             # default MoA preset, then restore the prior model. To *switch* to a
@@ -10042,16 +9961,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._pending_moa_disable_after_turn = True
             self._pending_agent_seed = payload
             _cprint(f"  MoA one-shot queued with preset {preset}; previous model will be restored after this turn.")
-        elif canonical == "subgoal":
-            self._handle_subgoal_command(cmd_original)
-        elif canonical == "skin":
-            self._handle_skin_command(cmd_original)
-        elif canonical == "voice":
-            self._handle_voice_command(cmd_original)
-        elif canonical == "wake":
-            self._handle_wake_command(cmd_original)
-        elif canonical == "busy":
-            self._handle_busy_command(cmd_original)
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
