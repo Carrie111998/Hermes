@@ -91,11 +91,58 @@ describe('custom theme lifecycle', () => {
     expect(uniqueCustomThemeName('Warm Paper', first.name)).toBe(first.name)
   })
 
-  it('starts a new custom theme with the warm neutral Light and Dark palettes', () => {
+  it('copies both palettes from the active built-in theme', () => {
     const draft = definition()
 
-    expect(draft.light).toEqual(DEFAULT_CUSTOM_LIGHT_PALETTE)
-    expect(draft.dark).toEqual(DEFAULT_CUSTOM_DARK_PALETTE)
+    expect(draft.light).toEqual({
+      accent: nousTheme.colors.midground!.toLowerCase(),
+      background: nousTheme.colors.background.toLowerCase(),
+      foreground: nousTheme.colors.foreground.toLowerCase(),
+      contrast: 38
+    })
+    expect(draft.dark).toEqual({
+      accent: (nousTheme.darkColors ?? nousTheme.colors).midground!.toLowerCase(),
+      background: (nousTheme.darkColors ?? nousTheme.colors).background.toLowerCase(),
+      foreground: (nousTheme.darkColors ?? nousTheme.colors).foreground.toLowerCase(),
+      contrast: 38
+    })
+  })
+
+  it('copies palettes from a backend theme that is not installed as a user theme', () => {
+    const source = {
+      ...nousTheme,
+      name: 'backend-paper',
+      label: 'Backend Paper'
+    }
+
+    const lightColors = {
+      ...source.colors,
+      background: '#fff4dc',
+      foreground: '#2b2118',
+      midground: '#a34f31'
+    }
+
+    const darkColors = {
+      ...(source.darkColors ?? source.colors),
+      background: '#17120f',
+      foreground: '#f7eee7',
+      midground: '#db8666'
+    }
+
+    const draft = createCustomThemeDefinition({ source, lightColors, darkColors })
+
+    expect(draft.light).toEqual({
+      accent: '#a34f31',
+      background: '#fff4dc',
+      foreground: '#2b2118',
+      contrast: 38
+    })
+    expect(draft.dark).toEqual({
+      accent: '#db8666',
+      background: '#17120f',
+      foreground: '#f7eee7',
+      contrast: 38
+    })
   })
 
   it('resets both palettes without discarding theme identity or appearance options', () => {

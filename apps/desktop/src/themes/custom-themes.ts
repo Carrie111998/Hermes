@@ -3,7 +3,7 @@ import { atom } from 'nanostores'
 import { contrastRatio, ensureContrast, mix, normalizeHex, readableOn } from './color'
 import { DEFAULT_TYPOGRAPHY } from './presets'
 import type { DesktopTheme, DesktopThemeColors } from './types'
-import { installUserTheme, isUserTheme, removeUserTheme, resolveTheme } from './user-themes'
+import { installUserTheme, removeUserTheme, resolveTheme } from './user-themes'
 
 const CUSTOM_THEMES_KEY = 'hermes-desktop-custom-theme-definitions-v1'
 const CUSTOM_THEME_VERSION = 1
@@ -277,18 +277,16 @@ export function createCustomThemeDefinition({
   darkColors: DesktopThemeColors
   label?: string
 }): CustomThemeDefinition {
-  const preserveSourcePalettes = isUserTheme(source.name)
-
   return {
     version: CUSTOM_THEME_VERSION,
     name: uniqueCustomThemeName(label),
     label,
     baseTheme: source.name,
-    // New themes start from the product's warm neutral Light/Dark pair.
-    // Imported user themes are the exception: "copy and customize" preserves
-    // their original pairing instead of silently replacing either palette.
-    light: preserveSourcePalettes ? paletteSeedFrom(lightColors) : { ...DEFAULT_CUSTOM_LIGHT_PALETTE },
-    dark: preserveSourcePalettes ? paletteSeedFrom(darkColors) : { ...DEFAULT_CUSTOM_DARK_PALETTE },
+    // "Create custom theme" is a copy operation regardless of where the
+    // active theme came from. Reset remains the explicit way back to Hermes'
+    // warm neutral authoring defaults.
+    light: paletteSeedFrom(lightColors),
+    dark: paletteSeedFrom(darkColors),
     fontSans: source.typography?.fontSans ?? DEFAULT_TYPOGRAPHY.fontSans,
     fontMono: source.typography?.fontMono ?? DEFAULT_TYPOGRAPHY.fontMono,
     translucentSidebar: false
