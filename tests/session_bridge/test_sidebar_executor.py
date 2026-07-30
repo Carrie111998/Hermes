@@ -26,7 +26,11 @@ from session_bridge.sidebar import (
     build_registration_prompt,
     sidebar_bridge_id,
 )
-from session_bridge.sidebar_placement import SidebarPlacement, SidebarPlacementError
+from session_bridge.sidebar_placement import (
+    SidebarPlacement,
+    SidebarPlacementError,
+    resolve_sidebar_placement,
+)
 from session_bridge.sidebar_executor import (
     CodexAppServerSidebarDelivery,
     NativeCreateAmbiguous,
@@ -334,6 +338,32 @@ def test_codex_delivery_rejects_malformed_placement_before_create_dispatch(
     assert client.calls == []
 
 
+def test_codex_delivery_rejects_duplicate_equivalent_roots_before_create_dispatch() -> None:
+    client = FakeCodexAppServerClient({"thread/start": []})
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+    placement = SidebarPlacement(
+        inbox_cwd="C:/Users/diego/.hermes",
+        local_host="local",
+        runtime_workspace_roots=(
+            "C:/Users/diego/.hermes",
+            "c:\\USERS\\diego\\.hermes",
+        ),
+        placement_generation=1,
+    )
+
+    with pytest.raises(NativeCreateRejected) as caught:
+        delivery.create_thread(
+            prompt="registration happens later",
+            candidate=_candidate(SOURCE_1, cwd="C:/Users/diego/.hermes"),
+            placement=placement,
+            recovery_key=RECOVERY_KEY,
+            deadline=105.0,
+        )
+
+    assert caught.value.code == "inbox_unavailable"
+    assert client.calls == []
+
+
 def test_codex_delivery_rejects_returned_source_cwd_as_ambiguous() -> None:
     client = FakeCodexAppServerClient({
         "thread/start": [
@@ -376,6 +406,40 @@ def test_sidebar_executor_settles_placement_failure_before_reservation() -> None
     )
 
     result = executor.run_once()
+
+    assert result == SidebarExecutionResult(
+        status="retry",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        error_code="inbox_unavailable",
+    )
+    assert native.create_calls == 0
+    assert not any(event[0] == "reserve" for event in events)
+
+
+def test_sidebar_executor_maps_invalid_resolver_home_to_inbox_unavailable(
+    tmp_path,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    inbox = tmp_path / ".hermes"
+    source = tmp_path / "source"
+    inbox.mkdir()
+    source.mkdir()
+    store = FakeStore(events, [_job(SOURCE_1)])
+    native = FakeNative(events)
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+        placement_resolver=lambda _candidate: resolve_sidebar_placement(
+            configured_inbox_cwd=str(inbox),
+            hermes_home=str(inbox) + "\\.",
+            placement_generation=1,
+            source_cwd=str(source),
+        ),
+    ).run_once()
 
     assert result == SidebarExecutionResult(
         status="retry",
@@ -489,6 +553,42 @@ def test_sidebar_executor_rejects_malformed_placement_before_native_paths(
         [_job(SOURCE_1, thread_id=THREAD_1 if prebound else None)],
     )
     native = FakeNative(events)
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+        placement_resolver=lambda _candidate: placement,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="retry",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        error_code="inbox_unavailable",
+    )
+    assert native.create_calls == 0
+    assert not any(event[0] in {"reserve", "recover", "read"} for event in events)
+
+
+def test_sidebar_executor_rejects_duplicate_equivalent_roots_before_reservation() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        candidate_override=_candidate(SOURCE_1, cwd="C:/Users/diego/.hermes"),
+    )
+    native = FakeNative(events)
+    placement = SidebarPlacement(
+        inbox_cwd="C:/Users/diego/.hermes",
+        local_host="local",
+        runtime_workspace_roots=(
+            "C:/Users/diego/.hermes",
+            "c:\\USERS\\diego\\.hermes",
+        ),
+        placement_generation=1,
+    )
 
     result = _executor(
         store,
@@ -1303,14 +1403,14 @@ class FakeClock:
         self.now += seconds
 
 
-def _candidate(source: str) -> SidebarCandidate:
+def _candidate(source: str, *, cwd: str = "C:/source") -> SidebarCandidate:
     return SidebarCandidate(
         source_session_id=source,
         provider=Provider.CLAUDE,
         bridge_id=sidebar_bridge_id(source),
         title=f"[Claude] {source}",
-        cwd="C:/source",
-        git_root="C:/source",
+        cwd=cwd,
+        git_root=cwd,
         git_branch="main",
         git_head="a" * 40,
         worktree_id=None,

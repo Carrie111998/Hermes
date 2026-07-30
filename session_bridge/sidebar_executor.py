@@ -1752,7 +1752,10 @@ def _validated_sidebar_placement(
         if len(roots) == 1:
             if not _filesystem_equivalent(inbox_cwd, candidate.cwd):
                 raise SidebarPlacementError("inbox_unavailable")
-        elif not _filesystem_equivalent(roots[1], candidate.cwd):
+        elif (
+            _filesystem_equivalent(roots[0], roots[1])
+            or not _filesystem_equivalent(roots[1], candidate.cwd)
+        ):
             raise SidebarPlacementError("inbox_unavailable")
     except (AttributeError, TypeError, ValueError) as exc:
         raise SidebarPlacementError("inbox_unavailable") from exc

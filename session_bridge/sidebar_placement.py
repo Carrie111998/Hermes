@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
 import ntpath
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
 
 _WIN32_COMPONENT_FORBIDDEN = frozenset('<>:"|?*')
+_UNC_SHARE_COMPONENT_FORBIDDEN = _WIN32_COMPONENT_FORBIDDEN | frozenset("[]+=;,")
 _RESERVED_WINDOWS_COMPONENT_NAMES = frozenset(
     {
         "con",
@@ -16,6 +18,9 @@ _RESERVED_WINDOWS_COMPONENT_NAMES = frozenset(
         *(f"lpt{number}" for number in range(1, 10)),
     }
 )
+_MAX_UNC_SERVER_LENGTH = 253
+_MAX_UNC_SERVER_LABEL_LENGTH = 63
+_MAX_UNC_SHARE_LENGTH = 80
 
 
 class SidebarPlacementError(ValueError):
@@ -71,7 +76,12 @@ def ordinary_windows_path_identity(value: object) -> str | None:
             return None
         components = [part for part in tail.lstrip("\\").split("\\") if part]
         if is_unc_qualified:
-            components = [*unc_parts, *components]
+            server, share = unc_parts
+            if not (
+                _is_ordinary_unc_server(server)
+                and _is_ordinary_unc_share(share)
+            ):
+                return None
         if any(not _is_ordinary_windows_component(component) for component in components):
             return None
         return identity
@@ -79,11 +89,47 @@ def ordinary_windows_path_identity(value: object) -> str | None:
         return None
 
 
-def _is_ordinary_windows_component(component: str) -> bool:
+def _is_ordinary_unc_server(component: str) -> bool:
+    if not component or len(component) > _MAX_UNC_SERVER_LENGTH:
+        return False
+    if component.startswith("[") and component.endswith("]"):
+        try:
+            ipaddress.IPv6Address(component[1:-1])
+        except ValueError:
+            return False
+        return True
+    try:
+        ipaddress.IPv4Address(component)
+    except ValueError:
+        pass
+    else:
+        return True
+    labels = component.split(".")
+    return all(
+        0 < len(label) <= _MAX_UNC_SERVER_LABEL_LENGTH
+        and not label.startswith("-")
+        and not label.endswith("-")
+        and all(character.isalnum() or character == "-" for character in label)
+        for label in labels
+    )
+
+
+def _is_ordinary_unc_share(component: str) -> bool:
+    return len(component) <= _MAX_UNC_SHARE_LENGTH and _is_ordinary_windows_component(
+        component,
+        forbidden=_UNC_SHARE_COMPONENT_FORBIDDEN,
+    )
+
+
+def _is_ordinary_windows_component(
+    component: str,
+    *,
+    forbidden: frozenset[str] = _WIN32_COMPONENT_FORBIDDEN,
+) -> bool:
     return (
         not component.endswith((".", " "))
         and not any(
-            ord(character) <= 31 or character in _WIN32_COMPONENT_FORBIDDEN
+            ord(character) <= 31 or character in forbidden
             for character in component
         )
         and component.split(".", 1)[0].casefold()
@@ -122,8 +168,15 @@ def resolve_sidebar_placement(
 
 
 def _resolve_canonical_inbox(configured_inbox_cwd: str, hermes_home: Path | str) -> Path:
-    if not isinstance(configured_inbox_cwd, str) or not configured_inbox_cwd:
-        raise SidebarPlacementError("inbox_unavailable")
+    raw_inbox_identity = _raw_windows_path_identity(
+        configured_inbox_cwd,
+        error_code="inbox_unavailable",
+    )
+    raw_home_identity = _raw_windows_path_identity(
+        hermes_home,
+        allow_path=True,
+        error_code="inbox_unavailable",
+    )
     try:
         configured_path = Path(configured_inbox_cwd)
         if not configured_path.is_absolute():
@@ -132,21 +185,26 @@ def _resolve_canonical_inbox(configured_inbox_cwd: str, hermes_home: Path | str)
         home = Path(hermes_home).resolve(strict=True)
     except (OSError, RuntimeError, TypeError, ValueError):
         raise SidebarPlacementError("inbox_unavailable") from None
+    inbox_identity = ordinary_windows_path_identity(str(inbox))
+    home_identity = ordinary_windows_path_identity(str(home))
     if (
         not inbox.is_dir()
         or not home.is_dir()
-        or configured_inbox_cwd != str(inbox)
-        or _windows_identity(inbox) != _windows_identity(home)
-        or ordinary_windows_path_identity(str(inbox)) is None
-        or ordinary_windows_path_identity(str(home)) is None
+        or inbox_identity is None
+        or home_identity is None
+        or raw_inbox_identity != inbox_identity
+        or raw_home_identity != home_identity
+        or inbox_identity != home_identity
     ):
         raise SidebarPlacementError("inbox_unavailable")
     return inbox
 
 
 def _resolve_source(source_cwd: str) -> Path:
-    if not isinstance(source_cwd, str):
-        raise SidebarPlacementError("source_identity_mismatch")
+    raw_source_identity = _raw_windows_path_identity(
+        source_cwd,
+        error_code="source_identity_mismatch",
+    )
     try:
         source_path = Path(source_cwd)
         if not source_path.is_absolute():
@@ -156,7 +214,8 @@ def _resolve_source(source_cwd: str) -> Path:
         raise SidebarPlacementError("source_identity_mismatch") from None
     if not source.is_dir():
         raise SidebarPlacementError("source_identity_mismatch")
-    if ordinary_windows_path_identity(str(source)) is None:
+    source_identity = ordinary_windows_path_identity(str(source))
+    if source_identity is None or raw_source_identity != source_identity:
         raise SidebarPlacementError("source_identity_mismatch")
     return source
 
@@ -165,4 +224,22 @@ def _windows_identity(path: Path) -> str:
     identity = ordinary_windows_path_identity(str(path))
     if identity is None:
         raise ValueError("path has no ordinary Windows identity")
+    return identity
+
+
+def _raw_windows_path_identity(
+    value: object,
+    *,
+    error_code: str,
+    allow_path: bool = False,
+) -> str:
+    if type(value) is str:
+        raw_path = value
+    elif allow_path and isinstance(value, Path):
+        raw_path = str(value)
+    else:
+        raise SidebarPlacementError(error_code)
+    identity = ordinary_windows_path_identity(raw_path)
+    if identity is None:
+        raise SidebarPlacementError(error_code)
     return identity

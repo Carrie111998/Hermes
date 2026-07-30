@@ -19,10 +19,14 @@ from session_bridge.sidebar_placement import (
         ("C:/Users/diego/.hermes", "c:\\users\\diego\\.hermes"),
         ("c:\\USERS\\diego\\.hermes", "c:\\users\\diego\\.hermes"),
         ("\\\\server\\share\\workspace", "\\\\server\\share\\workspace"),
+        ("\\\\host.example\\public-share\\workspace", "\\\\host.example\\public-share\\workspace"),
+        ("\\\\192.0.2.1\\public\\workspace", "\\\\192.0.2.1\\public\\workspace"),
+        ("\\\\[2001:db8::1]\\public\\workspace", "\\\\[2001:db8::1]\\public\\workspace"),
         (
             "\\\\servidor東京\\shareüber\\workspace",
             "\\\\servidor東京\\shareüber\\workspace",
         ),
+        ("\\\\server\\" + "s" * 80 + "\\workspace", "\\\\server\\" + "s" * 80 + "\\workspace"),
         ("C:/workspace/東京/über", "c:\\workspace\\東京\\über"),
     ],
 )
@@ -87,6 +91,11 @@ def test_ordinary_windows_path_identity_rejects_win32_invalid_components(
         "bad<server",
         "bad>server",
         "bad|server",
+        "bad server",
+        "bad_server",
+        "-badserver",
+        "badserver-",
+        "s" * 64,
         "bad\x00server",
         "bad\x07server",
         "bad\x1fserver",
@@ -107,6 +116,12 @@ def test_ordinary_windows_path_identity_rejects_invalid_unc_server(
         "bad<share",
         "bad>share",
         "bad|share",
+        "bad[share",
+        "bad]share",
+        "bad+share",
+        "bad=share",
+        "bad;share",
+        "bad,share",
         "bad\x00share",
         "bad\x07share",
         "bad\x1fshare",
@@ -116,6 +131,10 @@ def test_ordinary_windows_path_identity_rejects_invalid_unc_share(
     share: str,
 ) -> None:
     assert ordinary_windows_path_identity(f"\\\\server\\{share}\\workspace") is None
+
+
+def test_ordinary_windows_path_identity_rejects_unc_share_over_80_characters() -> None:
+    assert ordinary_windows_path_identity("\\\\server\\" + "s" * 81 + "\\workspace") is None
 
 
 def test_resolve_sidebar_placement_keeps_source_out_of_identity(tmp_path: Path) -> None:
@@ -148,7 +167,7 @@ def test_resolve_sidebar_placement_accepts_stated_positional_signature(
     inbox.mkdir()
     source.mkdir()
 
-    placement = resolve_sidebar_placement(str(inbox), inbox, 1, str(source))
+    placement = resolve_sidebar_placement(str(inbox), str(inbox), 1, str(source))
 
     assert placement.runtime_workspace_roots == (
         str(inbox.resolve()),
@@ -181,6 +200,96 @@ def test_resolve_sidebar_placement_rejects_invalid_hermes_home_type(
     with pytest.raises(SidebarPlacementError, match="^inbox_unavailable$"):
         resolve_sidebar_placement(
             str(inbox), None, 1, str(source)  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "path_builder",
+    (
+        lambda path: "\\\\?\\C:\\invalid",
+        lambda path: "\\\\.\\C:\\invalid",
+        lambda path: str(path) + "\\.",
+        lambda path: str(path) + "\\",
+        lambda path: str(path) + ".",
+        lambda path: str(path) + " ",
+    ),
+    ids=("device_verbatim", "device_dot", "dot_segment", "trailing_separator", "trailing_dot", "trailing_space"),
+)
+def test_resolve_sidebar_placement_rejects_raw_noncanonical_configured_inbox(
+    tmp_path: Path,
+    path_builder,
+) -> None:
+    inbox = tmp_path / ".hermes"
+    source = tmp_path / "source"
+    inbox.mkdir()
+    source.mkdir()
+
+    with pytest.raises(SidebarPlacementError, match="^inbox_unavailable$"):
+        resolve_sidebar_placement(
+            configured_inbox_cwd=path_builder(inbox),
+            hermes_home=inbox,
+            placement_generation=1,
+            source_cwd=str(source),
+        )
+
+
+@pytest.mark.parametrize(
+    "path_builder",
+    (
+        lambda path: "\\\\?\\C:\\invalid",
+        lambda path: "\\\\.\\C:\\invalid",
+        lambda path: str(path) + "\\.",
+        lambda path: str(path) + "\\",
+        lambda path: str(path) + ".",
+        lambda path: str(path) + " ",
+    ),
+    ids=("device_verbatim", "device_dot", "dot_segment", "trailing_separator", "trailing_dot", "trailing_space"),
+)
+def test_resolve_sidebar_placement_rejects_raw_noncanonical_hermes_home(
+    tmp_path: Path,
+    path_builder,
+) -> None:
+    inbox = tmp_path / ".hermes"
+    source = tmp_path / "source"
+    inbox.mkdir()
+    source.mkdir()
+
+    with pytest.raises(SidebarPlacementError, match="^inbox_unavailable$"):
+        resolve_sidebar_placement(
+            configured_inbox_cwd=str(inbox),
+            hermes_home=path_builder(inbox),
+            placement_generation=1,
+            source_cwd=str(source),
+        )
+
+
+@pytest.mark.parametrize(
+    "path_builder",
+    (
+        lambda path: "\\\\?\\C:\\invalid",
+        lambda path: "\\\\.\\C:\\invalid",
+        lambda path: str(path) + "\\.",
+        lambda path: str(path) + "\\",
+        lambda path: str(path) + ".",
+        lambda path: str(path) + " ",
+    ),
+    ids=("device_verbatim", "device_dot", "dot_segment", "trailing_separator", "trailing_dot", "trailing_space"),
+)
+def test_resolve_sidebar_placement_rejects_raw_noncanonical_source(
+    tmp_path: Path,
+    path_builder,
+) -> None:
+    inbox = tmp_path / ".hermes"
+    source = tmp_path / "source"
+    inbox.mkdir()
+    source.mkdir()
+
+    with pytest.raises(SidebarPlacementError, match="^source_identity_mismatch$"):
+        resolve_sidebar_placement(
+            configured_inbox_cwd=str(inbox),
+            hermes_home=inbox,
+            placement_generation=1,
+            source_cwd=path_builder(source),
         )
 
 
@@ -272,16 +381,17 @@ def test_resolve_sidebar_placement_normalizes_windows_equivalents_and_deduplicat
     inbox = tmp_path / ".hermes"
     inbox.mkdir()
     configured_inbox = str(inbox.resolve())
+    equivalent_inbox = configured_inbox.upper().replace("\\", "/")
     equivalent_home = configured_inbox.upper().replace("\\", "/")
     equivalent_source = configured_inbox.upper().replace("\\", "/")
 
-    assert equivalent_home != configured_inbox
+    assert equivalent_inbox != configured_inbox
     assert _windows_identity(Path(configured_inbox)) == _windows_identity(
         Path(equivalent_home)
     )
 
     placement = resolve_sidebar_placement(
-        configured_inbox_cwd=configured_inbox,
+        configured_inbox_cwd=equivalent_inbox,
         hermes_home=equivalent_home,
         placement_generation=1,
         source_cwd=equivalent_source,
