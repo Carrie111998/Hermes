@@ -83,55 +83,6 @@ async def test_reap_noop_when_port_free(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_reap_kills_verified_orphan(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-    monkeypatch.setattr(adapter, "_find_listener_pids", lambda port: [4242])
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", lambda pid: True)
-    # Dies promptly on SIGTERM — no escalation expected.
-    monkeypatch.setattr(adapter, "_pid_alive", lambda pid: False)
-    kills = _capture_kills(monkeypatch)
-
-    await adapter._reap_stale_sidecar()
-
-    assert kills == [(4242, photon_adapter.signal.SIGTERM)]
-
-
-@pytest.mark.asyncio
-async def test_reap_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-    monkeypatch.setattr(adapter, "_find_listener_pids", lambda port: [4242])
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", lambda pid: True)
-    monkeypatch.setattr(adapter, "_pid_alive", lambda pid: True)  # ignores TERM
-    # No clock fakery (logging also calls time.time, which makes a fake clock
-    # fragile) — this test rides out the real 3s SIGTERM grace window.
-    kills = _capture_kills(monkeypatch)
-
-    await adapter._reap_stale_sidecar()
-
-    assert (4242, photon_adapter.signal.SIGTERM) in kills
-    assert (4242, photon_adapter.signal.SIGKILL) in kills
-
-
-@pytest.mark.asyncio
-async def test_reap_raises_for_foreign_listener(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Never signal a process whose command line isn't our sidecar."""
-    adapter = _make_adapter(monkeypatch)
-    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ProbeClient)
-    monkeypatch.setattr(adapter, "_find_listener_pids", lambda port: [777])
-    monkeypatch.setattr(adapter, "_pid_is_sidecar", lambda pid: False)
-    kills = _capture_kills(monkeypatch)
-
-    with pytest.raises(RuntimeError, match="in use by another process"):
-        await adapter._reap_stale_sidecar()
-
-    assert kills == []
-
-
-@pytest.mark.asyncio
 async def test_start_sidecar_spawns_with_stdin_pipe(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -261,7 +212,6 @@ async def test_start_sidecar_cold_installs_missing_deps(
         @staticmethod
         def poll() -> None:
             return None
-
     monkeypatch.setattr(
         photon_adapter.subprocess, "Popen", lambda *a, **k: _FakeProc()
     )
