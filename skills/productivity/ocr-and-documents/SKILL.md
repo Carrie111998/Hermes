@@ -34,15 +34,9 @@ In Python, use a raw Windows path or forward-slash drive form; never `/c/...`:
 path = r"C:\Users\David\Downloads\Valicen brandbook.pdf"   # or "C:/Users/David/Downloads/Valicen brandbook.pdf"
 ```
 
-Bulletproof fallback: you already have `read_file`, which reads the bytes regardless of path form. Parse those bytes directly and skip the filesystem entirely:
+If a native tool still can't open the path (spaces or non-ASCII characters), copy the file to a simple temp path first and open that instead.
 
-```python
-import io, pypdf                       # pre-installed
-data = <bytes from read_file>
-text = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(io.BytesIO(data)).pages)
-```
-
-**Pre-installed in Hermes's venv (do NOT pip install):** `pymupdf` (import as `fitz` or `pymupdf`), `pypdf`, `pdfplumber`, `pdfminer.six`. If `import fitz` raises `ModuleNotFoundError`, you are in the wrong interpreter — use the venv Python at `venv\Scripts\python.exe`, not a system Python.
+**Extraction libraries:** `pymupdf` (import as `fitz` or `pymupdf`), plus `pypdf`, `pdfplumber`, and `pdfminer.six`. These are not part of a stock Hermes install — install what you need first: `pip install pymupdf pypdf pdfplumber pdfminer.six`. On Windows, install into the Hermes venv (`venv\Scripts\python.exe -m pip install ...`), not a system Python. If `import fitz` raises `ModuleNotFoundError`, the package isn't installed or you're in the wrong interpreter.
 
 ## Step 1: Remote URL Available?
 
