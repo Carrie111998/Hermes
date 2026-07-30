@@ -277,6 +277,10 @@ _MAX_TOOL_WORKERS = 8
 # every top-level ``_``-prefixed key before the request leaves the process, so
 # this never reaches a strict OpenAI-compatible gateway.
 _DB_PERSISTED_MARKER = "_db_persisted"
+_DB_PERSISTENCE_UNIT_ID = "_db_persistence_unit_id"
+_DB_PERSISTENCE_MESSAGE_KEY = "_db_persistence_message_key"
+_DB_PERSISTENCE_ORDINAL = "_db_persistence_ordinal"
+_DB_PERSISTENCE_TIMESTAMP = "_db_persistence_timestamp"
 
 
 # Guard so the OpenRouter metadata pre-warm thread is only spawned once per
@@ -2100,33 +2104,19 @@ class AIAgent:
                 ):
                     _scan_start += 1
 
-            # Collect this flush's new rows and write them in ONE transaction
-            # at the end of the scan (see append_messages_batch).
-            _batch_rows: List[Dict[str, Any]] = []
-            _batch_msgs: List[Dict] = []
-            for _msg_idx in range(_scan_start, len(messages)):
-                msg = messages[_msg_idx]
-                if not isinstance(msg, dict):
-                    continue
-                # Never write ephemeral recovery scaffolding to the session
-                # store. The flush is append-only (it only advances
-                # _last_flushed_db_idx via identity tracking), so a synthetic
-                # message committed by a mid-turn persist cannot be un-written
-                # when the end-of-turn drop removes it from the in-memory list —
-                # the resumed transcript would then replay synthetic
-                # "(empty)"/nudge/thinking-prefill turns as if they were genuine
-                # context. Skip regardless of position: an answered nudge leaves
-                # the synthetic pair buried mid-list, not just at the tail.
-                if _is_ephemeral_scaffolding(msg):
-                    continue
-                if msg.get(_DB_PERSISTED_MARKER):
-                    continue
-                # Already-durable messages: either carried over from the loaded
-                # history copy, or seeded by a caller. Stamp them so future
-                # flushes skip them without consulting any id() set again.
-                if id(msg) in history_ids or id(msg) in seed_ids:
-                    msg[_DB_PERSISTED_MARKER] = True
-                    continue
+            from hermes_state import SessionDBBatchMessage
+
+            pending_messages = []
+
+            def _row_timestamp_for(msg: Dict[str, Any]):
+                row_timestamp = msg.get("timestamp")
+                if row_timestamp is not None:
+                    return row_timestamp
+                if msg.get(_DB_PERSISTENCE_TIMESTAMP) is None:
+                    msg[_DB_PERSISTENCE_TIMESTAMP] = time.time()
+                return msg.get(_DB_PERSISTENCE_TIMESTAMP)
+
+            def _build_batch_message(msg: Dict[str, Any], msg_idx: int) -> SessionDBBatchMessage:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 # api_content sidecar: the exact bytes sent to the API when
@@ -2136,7 +2126,7 @@ class AIAgent:
                 _row_api_content = msg.get("api_content")
                 if not isinstance(_row_api_content, str):
                     _row_api_content = None
-                _row_timestamp = msg.get("timestamp")
+                _row_timestamp = _row_timestamp_for(msg)
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). A multimodal override is a complete
                 # clean replacement for an API-local noted payload. Preserve the
@@ -2148,7 +2138,7 @@ class AIAgent:
                 # preserve the API-local override by recognizing the same dict.
                 pending_cli_message = getattr(self, "_pending_cli_user_message", None)
                 is_current_turn_user = (
-                    _ov_idx == _msg_idx or msg is pending_cli_message
+                    _ov_idx == msg_idx or msg is pending_cli_message
                 )
                 if is_current_turn_user and msg.get("role") == "user":
                     # Preflight compaction can re-anchor the override index at
@@ -2222,48 +2212,111 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                _batch_rows.append({
-                    "role": role,
-                    "content": content,
-                    "tool_name": msg.get("tool_name"),
-                    "tool_calls": tool_calls_data,
-                    "tool_call_id": msg.get("tool_call_id"),
-                    "finish_reason": msg.get("finish_reason"),
-                    # Reasoning/codex fields are role-gated (assistant-only)
-                    # inside _insert_message_rows — pass through untouched.
-                    "reasoning": msg.get("reasoning"),
-                    "reasoning_content": msg.get("reasoning_content"),
-                    "reasoning_details": msg.get("reasoning_details"),
-                    "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                    "codex_message_items": msg.get("codex_message_items"),
-                    "timestamp": _row_timestamp,
-                    "api_content": _row_api_content,
-                    "display_kind": (
+                return SessionDBBatchMessage(
+                    persistence_unit_id=msg[_DB_PERSISTENCE_UNIT_ID],
+                    persistence_message_key=msg[_DB_PERSISTENCE_MESSAGE_KEY],
+                    persistence_ordinal=msg[_DB_PERSISTENCE_ORDINAL],
+                    role=role,
+                    content=content,
+                    timestamp=_row_timestamp,
+                    tool_name=msg.get("tool_name"),
+                    tool_calls=tool_calls_data,
+                    tool_call_id=msg.get("tool_call_id"),
+                    finish_reason=msg.get("finish_reason"),
+                    reasoning=msg.get("reasoning") if role == "assistant" else None,
+                    reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
+                    reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
+                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    api_content=_row_api_content,
+                    display_kind=(
                         "hidden"
                         if msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
                         and not msg.get("_compressed_summary_has_user_turn")
                         else msg.get("display_kind")
                     ),
-                    "display_metadata": msg.get("display_metadata"),
-                })
-                _batch_msgs.append(msg)
-            # One transaction for the whole turn's new rows (typically 3-8
-            # messages): one BEGIN IMMEDIATE / commit — and, off WAL, one
-            # fsync — instead of one per row. All-or-nothing pairs exactly
-            # with the marker stamping below: on failure NO rows landed and
-            # NO markers were stamped, so the next flush re-scans and
-            # re-writes the whole tail (same recovery contract as before,
-            # minus the partial-prefix case that could double-pay counters).
-            if _batch_rows:
+                    display_metadata=msg.get("display_metadata"),
+                )
+
+            def _assign_new_unit(unit_items):
+                unit_id = uuid.uuid4().hex
+                for ordinal, (_msg_idx, unit_msg) in enumerate(unit_items):
+                    unit_msg.setdefault(_DB_PERSISTENCE_UNIT_ID, unit_id)
+                    unit_msg.setdefault(_DB_PERSISTENCE_MESSAGE_KEY, uuid.uuid4().hex)
+                    unit_msg.setdefault(_DB_PERSISTENCE_ORDINAL, ordinal)
+                    if (
+                        unit_msg.get("timestamp") is None
+                        and unit_msg.get(_DB_PERSISTENCE_TIMESTAMP) is None
+                    ):
+                        unit_msg[_DB_PERSISTENCE_TIMESTAMP] = time.time()
+
+            for _msg_idx in range(_scan_start, len(messages)):
+                msg = messages[_msg_idx]
+                if not isinstance(msg, dict):
+                    continue
+                # Never write ephemeral recovery scaffolding to the session
+                # store. The flush is append-only (it only advances
+                # _last_flushed_db_idx via identity tracking), so a synthetic
+                # message committed by a mid-turn persist cannot be un-written
+                # when the end-of-turn drop removes it from the in-memory list —
+                # the resumed transcript would then replay synthetic
+                # "(empty)"/nudge/thinking-prefill turns as if they were genuine
+                # context. Skip regardless of position: an answered nudge leaves
+                # the synthetic pair buried mid-list, not just at the tail.
+                if _is_ephemeral_scaffolding(msg):
+                    continue
+                if msg.get(_DB_PERSISTED_MARKER):
+                    continue
+                # Already-durable messages: either carried over from the loaded
+                # history copy, or seeded by a caller. Stamp them so future
+                # flushes skip them without consulting any id() set again.
+                if id(msg) in history_ids or id(msg) in seed_ids:
+                    msg[_DB_PERSISTED_MARKER] = True
+                    continue
+                pending_messages.append((_msg_idx, msg))
+
+            # Persist one logical unit at a time: normally the whole new tail,
+            # but after a failed write we must replay an already-keyed unit
+            # before appending any newly-seen unkeyed messages behind it.
+            while pending_messages:
+                _keyed_idx = next(
+                    (
+                        idx
+                        for idx, (_msg_idx, pending_msg) in enumerate(pending_messages)
+                        if pending_msg.get(_DB_PERSISTENCE_UNIT_ID)
+                    ),
+                    None,
+                )
+                if _keyed_idx is None:
+                    unit_items = list(pending_messages)
+                    _assign_new_unit(unit_items)
+                else:
+                    unit_items = []
+                    _unit_id = pending_messages[_keyed_idx][1].get(_DB_PERSISTENCE_UNIT_ID)
+                    _cursor = _keyed_idx
+                    while (
+                        _cursor < len(pending_messages)
+                        and pending_messages[_cursor][1].get(_DB_PERSISTENCE_UNIT_ID) == _unit_id
+                    ):
+                        unit_items.append(pending_messages[_cursor])
+                        _cursor += 1
+                batch_messages = [
+                    _build_batch_message(unit_msg, unit_idx)
+                    for unit_idx, unit_msg in unit_items
+                ]
                 self._session_db.append_messages_batch(
-                    session_id=self.session_id,
-                    messages=_batch_rows,
+                    self.session_id,
+                    batch_messages,
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
                 )
-                for _written in _batch_msgs:
-                    _written[_DB_PERSISTED_MARKER] = True
+                for _unit_idx, unit_msg in unit_items:
+                    unit_msg[_DB_PERSISTED_MARKER] = True
+                pending_messages = [
+                    item for item in pending_messages
+                    if not item[1].get(_DB_PERSISTED_MARKER)
+                ]
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
@@ -2978,6 +3031,18 @@ class AIAgent:
                 if "content" in msg:
                     msg = dict(msg)
                     msg["content"] = self._redact_message_content(msg.get("content"))
+                if isinstance(msg, dict):
+                    msg = {
+                        key: value
+                        for key, value in msg.items()
+                        if key not in {
+                            _DB_PERSISTED_MARKER,
+                            _DB_PERSISTENCE_UNIT_ID,
+                            _DB_PERSISTENCE_MESSAGE_KEY,
+                            _DB_PERSISTENCE_ORDINAL,
+                            _DB_PERSISTENCE_TIMESTAMP,
+                        }
+                    }
                 cleaned.append(msg)
 
             # Guard: never overwrite a larger session log with fewer messages.

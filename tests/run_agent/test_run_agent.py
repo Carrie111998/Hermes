@@ -88,6 +88,45 @@ def test_persist_user_message_override_rewrites_text_turns(agent):
     assert messages == [{"role": "user", "content": "hello"}]
 
 
+def _prime_batch_flush_agent(agent, session_db):
+    agent._session_db = session_db
+    agent._session_db_created = True
+    agent.session_id = "session-123"
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+    agent._persist_disabled = False
+    agent._session_persist_lock = threading.RLock()
+    agent._session_json_enabled = False
+    agent._db_flush_scan_prefix = None
+
+
+class _RecordingBatchDB:
+    def __init__(self, outcomes=None):
+        self.calls = []
+        self._outcomes = list(outcomes or [])
+        self.flush_token_counts = MagicMock()
+
+    def append_messages_batch(self, session_id, messages, *, compression_lock_holder=None):
+        batch = list(messages)
+        self.calls.append(
+            {
+                "session_id": session_id,
+                "messages": batch,
+                "compression_lock_holder": compression_lock_holder,
+            }
+        )
+        if self._outcomes:
+            outcome = self._outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return SimpleNamespace(inserted_count=len(batch), duplicate_count=0)
+
+
 
 
 
@@ -103,17 +142,16 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
     ]
     agent._session_db = MagicMock()
-    agent._session_db_created = True
-    agent.session_id = "session-123"
-    agent._last_flushed_db_idx = 0
+    _prime_batch_flush_agent(agent, agent._session_db)
     agent._persist_user_message_idx = 0
     agent._persist_user_message_override = clean_content
     agent._persist_user_message_timestamp = None
 
     agent._flush_messages_to_session_db([{"role": "user", "content": api_content}], [])
 
-    batch = agent._session_db.append_messages_batch.call_args.kwargs["messages"]
-    assert batch[0]["content"] == "Describe this screenshot\n[screenshot]"
+    batch_write = agent._session_db.append_messages_batch.call_args.args[1]
+    assert len(batch_write) == 1
+    assert batch_write[0].content == "Describe this screenshot\n[screenshot]"
     assert api_content[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
 
 
@@ -127,42 +165,21 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
             self.calls = 0
             self._lock = threading.Lock()
 
-        def append_message(self, **kwargs):
+        def append_messages_batch(self, _session_id, messages, *, compression_lock_holder=None):
             with self._lock:
                 self.calls += 1
                 first = self.calls == 1
             if first:
                 self.entered.set()
                 assert self.release.wait(timeout=5)
-            self.rows.append(kwargs["content"])
-
-        def append_messages_batch(self, session_id, messages, **kwargs):
-            with self._lock:
-                self.calls += 1
-                first = self.calls == 1
-            if first:
-                self.entered.set()
-                assert self.release.wait(timeout=5)
-            for m in messages:
-                self.rows.append(m["content"])
-            return list(range(1, len(messages) + 1))
+            self.rows.extend(msg.content for msg in messages)
+            return SimpleNamespace(inserted_count=len(self.rows), duplicate_count=0)
 
         def flush_token_counts(self):
             return None
 
     db = _BarrierDB()
-    agent._session_db = db
-    agent._session_db_created = True
-    agent.session_id = "session-123"
-    agent._last_flushed_db_idx = 0
-    agent._flushed_db_message_ids = set()
-    agent._flushed_db_message_session_id = None
-    agent._persist_user_message_idx = None
-    agent._persist_user_message_override = None
-    agent._persist_user_message_timestamp = None
-    agent._persist_disabled = False
-    agent._session_persist_lock = threading.RLock()
-    agent._session_json_enabled = False
+    _prime_batch_flush_agent(agent, db)
 
     message = {"role": "user", "content": "exactly once"}
     normal = threading.Thread(target=lambda: agent._persist_session([message], []))
@@ -180,6 +197,108 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
     assert not normal.is_alive()
     assert not direct.is_alive()
     assert db.rows == ["exactly once"]
+
+
+def test_flush_messages_to_session_db_batch_marks_only_after_success_and_freezes_private_identity(agent):
+    db = _RecordingBatchDB()
+    _prime_batch_flush_agent(agent, db)
+    message = {"role": "user", "content": "hello batch"}
+
+    result = agent._flush_messages_to_session_db([message], [])
+
+    assert result is True
+    assert message[run_agent._DB_PERSISTED_MARKER] is True
+    assert run_agent._DB_PERSISTENCE_UNIT_ID in message
+    assert run_agent._DB_PERSISTENCE_MESSAGE_KEY in message
+    assert run_agent._DB_PERSISTENCE_TIMESTAMP in message
+    assert "timestamp" not in message
+    assert len(db.calls) == 1
+    assert len(db.calls[0]["messages"]) == 1
+    batch_msg = db.calls[0]["messages"][0]
+    assert batch_msg.persistence_unit_id == message[run_agent._DB_PERSISTENCE_UNIT_ID]
+    assert batch_msg.persistence_message_key == message[run_agent._DB_PERSISTENCE_MESSAGE_KEY]
+    assert batch_msg.persistence_ordinal == 0
+    assert batch_msg.timestamp == message[run_agent._DB_PERSISTENCE_TIMESTAMP]
+
+
+def test_flush_messages_to_session_db_failure_preserves_persistence_message_key_and_suppresses_token_drain(agent):
+    db = _RecordingBatchDB(outcomes=[RuntimeError("db down")])
+    _prime_batch_flush_agent(agent, db)
+    message = {"role": "user", "content": "hello failure"}
+
+    result = agent._persist_session([message], [])
+
+    assert result is False
+    assert run_agent._DB_PERSISTED_MARKER not in message
+    assert run_agent._DB_PERSISTENCE_UNIT_ID in message
+    assert run_agent._DB_PERSISTENCE_MESSAGE_KEY in message
+    assert run_agent._DB_PERSISTENCE_TIMESTAMP in message
+    assert agent._db_flush_scan_prefix is None
+    assert agent._last_flushed_db_idx == 0
+    db.flush_token_counts.assert_not_called()
+
+
+def test_flush_messages_to_session_db_retry_reuses_persistence_message_key_and_timestamp(agent):
+    db = _RecordingBatchDB(
+        outcomes=[
+            RuntimeError("first failure"),
+            SimpleNamespace(inserted_count=1, duplicate_count=0),
+        ]
+    )
+    _prime_batch_flush_agent(agent, db)
+    message = {"role": "user", "content": "retry me"}
+
+    first = agent._flush_messages_to_session_db([message], [])
+    first_key = message[run_agent._DB_PERSISTENCE_MESSAGE_KEY]
+    first_unit = message[run_agent._DB_PERSISTENCE_UNIT_ID]
+    first_ts = message[run_agent._DB_PERSISTENCE_TIMESTAMP]
+
+    second = agent._flush_messages_to_session_db([message], [])
+
+    assert first is False
+    assert second is True
+    assert len(db.calls) == 2
+    assert db.calls[0]["messages"][0].persistence_message_key == first_key
+    assert db.calls[1]["messages"][0].persistence_message_key == first_key
+    assert db.calls[0]["messages"][0].persistence_unit_id == first_unit
+    assert db.calls[1]["messages"][0].persistence_unit_id == first_unit
+    assert db.calls[0]["messages"][0].timestamp == first_ts
+    assert db.calls[1]["messages"][0].timestamp == first_ts
+    assert message[run_agent._DB_PERSISTED_MARKER] is True
+
+
+def test_flush_messages_to_session_db_retries_old_batch_before_new_unkeyed_messages(agent):
+    db = _RecordingBatchDB(
+        outcomes=[
+            RuntimeError("first failure"),
+            SimpleNamespace(inserted_count=2, duplicate_count=0),
+            SimpleNamespace(inserted_count=1, duplicate_count=0),
+        ]
+    )
+    _prime_batch_flush_agent(agent, db)
+    messages = [
+        {"role": "user", "content": "old user"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+
+    assert agent._flush_messages_to_session_db(messages, []) is False
+    failed_unit = messages[0][run_agent._DB_PERSISTENCE_UNIT_ID]
+    failed_keys = [m[run_agent._DB_PERSISTENCE_MESSAGE_KEY] for m in messages]
+
+    messages.append({"role": "user", "content": "new tail"})
+    assert agent._flush_messages_to_session_db(messages, []) is True
+
+    assert len(db.calls) == 3
+    retried_batch = db.calls[1]["messages"]
+    new_batch = db.calls[2]["messages"]
+    assert [msg.persistence_message_key for msg in retried_batch] == failed_keys
+    assert all(msg.persistence_unit_id == failed_unit for msg in retried_batch)
+    assert len(new_batch) == 1
+    assert new_batch[0].persistence_unit_id != failed_unit
+    assert new_batch[0].persistence_message_key == messages[2][run_agent._DB_PERSISTENCE_MESSAGE_KEY]
+    assert messages[0][run_agent._DB_PERSISTED_MARKER] is True
+    assert messages[1][run_agent._DB_PERSISTED_MARKER] is True
+    assert messages[2][run_agent._DB_PERSISTED_MARKER] is True
 
 
 def test_persist_session_does_not_clear_inflight_marker_when_db_flush_fails(agent):
@@ -5743,8 +5862,7 @@ class TestPersistUserMessageOverride:
 
     def test_persist_session_rewrites_current_turn_user_message(self, agent):
         agent._session_db = MagicMock()
-        agent.session_id = "session-123"
-        agent._last_flushed_db_idx = 0
+        _prime_batch_flush_agent(agent, agent._session_db)
         agent._persist_user_message_idx = 0
         agent._persist_user_message_override = "Hello there"
         messages = [
@@ -5770,10 +5888,8 @@ class TestPersistUserMessageOverride:
             "2-3 sentences max. No code blocks or markdown.] Hello there"
         )
         # But the DB write must get the override.
-        batch = agent._session_db.append_messages_batch.call_args_list[0].kwargs[
-            "messages"
-        ]
-        assert batch[0]["content"] == "Hello there"
+        first_db_write = agent._session_db.append_messages_batch.call_args.args[1][0]
+        assert first_db_write.content == "Hello there"
 
 
 class TestReasoningReplayForStrictProviders:
