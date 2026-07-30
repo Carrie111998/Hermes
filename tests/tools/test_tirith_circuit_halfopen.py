@@ -13,6 +13,8 @@ import pytest
 
 import tools.tirith_security as ts
 
+_real_time = time.time
+
 
 class _Result:
     def __init__(self, code, stdout=""):
@@ -153,3 +155,35 @@ def test_block_verdict_resets_crash_streak(monkeypatch):
     out = ts.check_command_security("x")
     assert out["action"] == "block"
     assert ts._crash_count == 0
+
+
+def test_backwards_wall_clock_jump_does_not_wedge_breaker(monkeypatch):
+    """An NTP/DST correction must not hold the breaker open past its TTL.
+
+    The retry window is measured with time.monotonic(). Measured against
+    time.time() instead, a backwards wall-clock step between opening the
+    breaker and the next call makes the elapsed comparison negative, so the
+    breaker stays open for the length of the correction — on a host that
+    steps its clock back an hour, tirith stays disabled for an hour.
+
+    The breaker is aged in whatever clock the implementation itself stored,
+    so this test is clock-agnostic by construction: it is exactly due to
+    probe either way, and only the wall-clock jump distinguishes them.
+    """
+    ts._crash_count = ts._CRASH_LIMIT
+    ts._circuit_open = True
+    ts._circuit_open_at = 0.0
+    ts._record_tirith_crash()  # stamp _circuit_open_at with the real clock
+    ts._circuit_open_at -= ts._CIRCUIT_RETRY_S + 1  # now exactly due to probe
+
+    monkeypatch.setattr(time, "time", lambda: _real_time() - 3600.0)
+
+    spawns = []
+    monkeypatch.setattr(
+        ts.subprocess, "run", lambda *a, **k: spawns.append(1) or _Result(0)
+    )
+    out = ts.check_command_security("echo hi")
+
+    assert spawns == [1], "breaker stayed open past its TTL after the clock stepped back"
+    assert out["action"] == "allow"
+    assert ts._circuit_open is False
