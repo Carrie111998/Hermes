@@ -27,7 +27,6 @@ import { emitGatewayEvent } from '@/contrib/events'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
-import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
 import { playWakeSound } from '@/lib/wake-sound'
 import { $billingSettingsRequest } from '@/store/billing-block'
@@ -63,6 +62,7 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
+import { $sessionTiles } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord } from '@/store/wake-word'
 import { isSecondaryWindow } from '@/store/windows'
@@ -106,6 +106,10 @@ import { TitlebarControls } from '../shell/titlebar-controls'
 import { UpdatesOverlay } from '../updates-overlay'
 
 import { ContribWiringContext } from './context'
+import {
+  resolveMessagingTranscriptTarget,
+  resolveOpenMessagingStoredSessionIds
+} from './hooks/refresh-messaging-transcript'
 import { useBackgroundSync } from './hooks/use-background-sync'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { usePetBridge } from './hooks/use-pet-bridge'
@@ -169,6 +173,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const messagingSessions = useStore($messagingSessions)
+  const sessionTiles = useStore($sessionTiles)
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const profileScope = useStore($profileScope)
 
@@ -347,44 +352,57 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     [activeSessionIdRef, selectedStoredSessionIdRef, updateSessionState]
   )
 
-  // Refresh the open messaging transcript (inbound platform turns arrive via
-  // the background gateway, not the desktop websocket). Signature-gated so a
-  // no-change poll doesn't churn the thread.
-  const refreshActiveMessagingTranscript = useCallback(async () => {
-    const storedSessionId = selectedStoredSessionIdRef.current
-    const runtimeSessionId = activeSessionIdRef.current
+  // Refresh every open messaging transcript (primary view + session tiles).
+  // Inbound platform turns arrive via the background gateway, not the desktop
+  // websocket. Signatures are keyed per stored session so multiple open
+  // messaging tiles cannot suppress one another.
+  const refreshOpenMessagingTranscripts = useCallback(async () => {
+    const currentMessagingSessions = $messagingSessions.get()
 
-    if (!storedSessionId || !runtimeSessionId || busyRef.current) {
-      return
-    }
+    const openStoredSessionIds = resolveOpenMessagingStoredSessionIds({
+      messagingSessions: currentMessagingSessions,
+      selectedStoredSessionId: selectedStoredSessionIdRef.current,
+      sessionTiles: $sessionTiles.get()
+    })
 
-    const stored = $messagingSessions.get().find(s => sessionMatchesStoredId(s, storedSessionId))
+    await Promise.all(
+      openStoredSessionIds.map(async selectedSessionId => {
+        const target = resolveMessagingTranscriptTarget({
+          getRuntimeIdForStoredSession,
+          isRuntimeBusy: runtimeSessionId => Boolean(sessionStateByRuntimeIdRef.current.get(runtimeSessionId)?.busy),
+          messagingSessions: currentMessagingSessions,
+          selectedStoredSessionId: selectedSessionId
+        })
 
-    if (!stored || !isMessagingSource(stored.source)) {
-      return
-    }
+        if (!target) {
+          return
+        }
 
-    try {
-      const latest = await getSessionMessages(storedSessionId, stored.profile)
-      const signatureKey = `${stored.profile ?? 'default'}:${storedSessionId}`
-      const sig = sessionMessagesSignature(latest.messages)
+        const { profile, runtimeSessionId, storedSessionId } = target
 
-      if (messagingTranscriptSignatureRef.current.get(signatureKey) === sig) {
-        return
-      }
+        try {
+          const latest = await getSessionMessages(storedSessionId, profile)
+          const signatureKey = `${profile ?? 'default'}:${storedSessionId}`
+          const sig = sessionMessagesSignature(latest.messages)
 
-      messagingTranscriptSignatureRef.current.set(signatureKey, sig)
-      const messages = toChatMessages(latest.messages)
+          if (messagingTranscriptSignatureRef.current.get(signatureKey) === sig) {
+            return
+          }
 
-      updateSessionState(
-        runtimeSessionId,
-        state => ({ ...state, messages: preserveLocalAssistantErrors(messages, state.messages) }),
-        storedSessionId
-      )
-    } catch {
-      // Non-fatal: next poll or manual refresh can hydrate.
-    }
-  }, [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState])
+          messagingTranscriptSignatureRef.current.set(signatureKey, sig)
+          const messages = toChatMessages(latest.messages)
+
+          updateSessionState(
+            runtimeSessionId,
+            state => ({ ...state, messages: preserveLocalAssistantErrors(messages, state.messages) }),
+            storedSessionId
+          )
+        } catch {
+          // Non-fatal: next poll or manual refresh can hydrate.
+        }
+      })
+    )
+  }, [getRuntimeIdForStoredSession, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef, updateSessionState])
 
   const { handleGatewayEvent } = useMessageStream({
     activeGatewayProfile,
@@ -734,11 +752,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
   }, [gatewayState, requestGateway])
 
-  // Only the open messaging transcript needs its own poll — local chats are
-  // live over the websocket already.
+  // Only open messaging transcripts need their own poll — local chats are live
+  // over the websocket already. Session tiles intentionally don't update the
+  // primary selected-session atom, so include them explicitly.
   const activeIsMessaging =
-    !!selectedStoredSessionId &&
-    isMessagingSource(messagingSessions.find(s => sessionMatchesStoredId(s, selectedStoredSessionId))?.source)
+    resolveOpenMessagingStoredSessionIds({ messagingSessions, selectedStoredSessionId, sessionTiles }).length > 0
 
   // Keep app data live while the gateway is open (on-connect reseed + the
   // cron / messaging / transcript visibility polls + fresh-draft reseed).
@@ -748,7 +766,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeSessionId,
     freshDraftReady,
     gatewayState,
-    refreshActiveMessagingTranscript,
+    refreshActiveMessagingTranscript: refreshOpenMessagingTranscripts,
     refreshCronJobs,
     refreshCurrentModel,
     refreshHermesConfig,
