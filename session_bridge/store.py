@@ -3942,6 +3942,170 @@ class SessionBridgeStore:
         )
         return tuple(sources if limit is None else sources[:limit])
 
+    def list_claude_visibility_codex_sources(
+        self, after: float, limit: int | None
+    ) -> tuple[SidebarSource, ...]:
+        """Reconstruct full indexed Codex sources for visibility discovery."""
+
+        cutoff = _finite_number(after, "Claude visibility candidate cutoff")
+        if limit is not None and (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError(
+                "Claude visibility candidate limit must be between 1 and 1000"
+            )
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            rows = conn.execute(
+                """SELECT s.id AS session_id, s.source, s.title, s.cwd,
+                          s.started_at, s.git_branch, s.git_repo_root,
+                          e.provider, e.native_id, e.native_path, e.native_status,
+                          e.last_native_cursor, e.last_native_hash,
+                          e.last_indexed_at, e.parser_version, e.origin_kind,
+                          e.origin_bridge_id, activity.value_json AS activity_value_json
+                     FROM external_sessions AS e
+                     JOIN sessions AS s ON s.id = e.session_id
+                     JOIN session_bridge_state AS activity
+                       ON activity.key = ? || e.session_id
+                    WHERE e.provider = ?
+                      AND CAST(json_extract(
+                          activity.value_json, '$.last_active'
+                      ) AS REAL) >= ?
+                    ORDER BY CAST(json_extract(
+                        activity.value_json, '$.last_active'
+                    ) AS REAL) DESC, s.id""",
+                (
+                    "session-bridge:external-activity:",
+                    Provider.CODEX.value,
+                    cutoff,
+                ),
+            ).fetchall()
+            messages: dict[str, list[ProjectedMessage]] = {
+                row["session_id"]: [] for row in rows
+            }
+            seen_message_keys: dict[str, set[tuple[str, int]]] = {
+                row["session_id"]: set() for row in rows
+            }
+            session_ids = list(messages)
+            for start in range(0, len(session_ids), _MESSAGE_KEY_QUERY_CHUNK):
+                batch = session_ids[start : start + _MESSAGE_KEY_QUERY_CHUNK]
+                placeholders = ",".join("?" for _ in batch)
+                message_rows = conn.execute(
+                    f"""SELECT message.session_id, map.native_event_id,
+                               map.ordinal, message.role, message.content,
+                               message.timestamp, message.id
+                          FROM external_message_map AS map
+                          JOIN messages AS message ON message.id = map.message_id
+                         WHERE map.session_id IN ({placeholders})
+                           AND message.role = 'user'
+                           AND (message.active = 1 OR message.compacted = 1)
+                         ORDER BY message.session_id, message.timestamp,
+                                  map.native_event_id, map.ordinal, message.id""",
+                    batch,
+                ).fetchall()
+                for message in message_rows:
+                    session_id = message["session_id"]
+                    native_event_id = message["native_event_id"]
+                    ordinal = int(message["ordinal"])
+                    key = (native_event_id, ordinal)
+                    if (
+                        not isinstance(native_event_id, str)
+                        or not native_event_id
+                        or key in seen_message_keys[session_id]
+                    ):
+                        raise ValueError(
+                            "invalid indexed Codex message identity"
+                        )
+                    seen_message_keys[session_id].add(key)
+                    decoded = self.db._decode_content(message["content"])
+                    messages[session_id].append(
+                        ProjectedMessage(
+                            native_event_id=native_event_id,
+                            ordinal=ordinal,
+                            role=message["role"],
+                            content=decoded if isinstance(decoded, str) else None,
+                            timestamp=float(message["timestamp"]),
+                        )
+                    )
+
+        sources: list[SidebarSource] = []
+        identities: set[str] = set()
+        native_ids: set[str] = set()
+        for row in rows:
+            native_id = row["native_id"]
+            if not isinstance(native_id, str) or not native_id.strip():
+                raise ValueError("invalid indexed Codex native identity")
+            source_session_id = canonical_session_id(Provider.CODEX, native_id)
+            if (
+                row["session_id"] != source_session_id
+                or row["source"] != Provider.CODEX.value
+                or row["provider"] != Provider.CODEX.value
+                or source_session_id in identities
+                or native_id in native_ids
+            ):
+                raise ValueError("conflicting indexed Codex session identity")
+            identities.add(source_session_id)
+            native_ids.add(native_id)
+            last_active = _decode_external_activity(row["activity_value_json"])
+            if last_active < cutoff:
+                raise ValueError("indexed Codex activity ordering is invalid")
+            sources.append(
+                SidebarSource(
+                    source_session_id=source_session_id,
+                    projection=SessionProjection(
+                        provider=Provider.CODEX,
+                        native_id=native_id,
+                        title=row["title"],
+                        cwd=row["cwd"],
+                        started_at=float(row["started_at"]),
+                        last_active=last_active,
+                        messages=tuple(messages[source_session_id]),
+                        native_path=row["native_path"],
+                        native_status=row["native_status"],
+                        native_cursor=row["last_native_cursor"],
+                        native_hash=row["last_native_hash"],
+                        parser_version=int(row["parser_version"]),
+                        origin_kind=OriginKind(row["origin_kind"]),
+                        origin_bridge_id=row["origin_bridge_id"],
+                        git_branch=row["git_branch"],
+                    ),
+                    git_root=row["git_repo_root"],
+                    git_head=None,
+                    worktree_id=None,
+                    automation_only=False,
+                    subagent_only=False,
+                    indexed_at=float(row["last_indexed_at"]),
+                )
+            )
+        sources.sort(
+            key=lambda source: (
+                -source.projection.last_active,
+                source.source_session_id,
+            )
+        )
+        return tuple(sources if limit is None else sources[:limit])
+
+    def list_claude_visibility_source_ids(self) -> frozenset[str]:
+        """Return sources already represented by a Claude visibility job."""
+
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            rows = conn.execute(
+                """SELECT DISTINCT source_session_id
+                     FROM session_claude_visibility_jobs"""
+            ).fetchall()
+        source_ids: set[str] = set()
+        for row in rows:
+            source_session_id = row["source_session_id"]
+            if not isinstance(source_session_id, str) or not source_session_id.strip():
+                raise ValueError("invalid Claude visibility source identity")
+            source_ids.add(source_session_id)
+        return frozenset(source_ids)
+
     def _recorded_worktree_snapshots(
         self, source_session_ids: Sequence[str]
     ) -> dict[str, WorktreeSnapshot]:

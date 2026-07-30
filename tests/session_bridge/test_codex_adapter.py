@@ -18,10 +18,12 @@ from session_bridge.codex_adapter import CodexSourceAdapter, CodexThreadSummary
 from session_bridge.models import (
     BridgeMarkerPayload,
     OriginKind,
+    ProjectedMessage,
     Provider,
+    SessionProjection,
     encode_bridge_marker,
 )
-from session_bridge.store import SessionBridgeStore
+from session_bridge.store import SessionBridgeStore, SidebarSource
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "codex"
@@ -633,6 +635,291 @@ class TestInventory:
         assert source.git_head == "abc123"
         assert source.automation_only is False
         assert source.subagent_only is False
+
+    def test_visibility_reuses_indexed_projection_and_only_hydrates_unknown_native(
+        self,
+    ) -> None:
+        def entry(
+            native_id: str,
+            updated: int,
+            *,
+            source: object = "vscode",
+        ) -> dict[str, object]:
+            return {
+                "id": native_id,
+                "name": native_id,
+                "preview": f"preview for {native_id}",
+                "path": f"C:/codex/sessions/{native_id}.jsonl",
+                "cwd": f"C:/work/{native_id}",
+                "createdAt": updated - 10,
+                "updatedAt": updated,
+                "source": source,
+            }
+
+        indexed_projection = SessionProjection(
+            provider=Provider.CODEX,
+            native_id="indexed",
+            title="Indexed title",
+            cwd="C:/work/indexed",
+            started_at=100.0,
+            last_active=400.0,
+            messages=(
+                ProjectedMessage(
+                    native_event_id="indexed-user",
+                    ordinal=0,
+                    role="user",
+                    content="Indexed full request",
+                    timestamp=110.0,
+                ),
+            ),
+            native_path="C:/codex/sessions/indexed.jsonl",
+            native_status="active",
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge:indexed",
+        )
+        indexed = SidebarSource(
+            source_session_id="codex:indexed",
+            projection=indexed_projection,
+            git_root="C:/indexed-root",
+            git_head="indexed-head",
+            worktree_id="indexed-worktree",
+            automation_only=False,
+            subagent_only=False,
+        )
+        client = FakeInitializingClient({
+            "thread/list": [
+                {
+                    "data": [
+                        entry("indexed", 400),
+                        entry(
+                            "unindexed-subagent",
+                            350,
+                            source={"subAgent": "review"},
+                        ),
+                        entry("unindexed-native", 300),
+                    ]
+                },
+                {"data": []},
+            ],
+            "thread/read": [
+                {
+                    "thread": {
+                        **entry("unindexed-native", 300),
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "native-user",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": "Hydrate only this request",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ],
+        })
+
+        sources = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(
+            after=250,
+            state_db_only=True,
+            indexed_sources={"indexed": indexed},
+            known_visibility_source_ids=frozenset(),
+        )
+
+        by_id = {source.projection.native_id: source for source in sources}
+        assert set(by_id) == {"indexed", "unindexed-subagent", "unindexed-native"}
+        assert by_id["indexed"].projection.messages == indexed_projection.messages
+        assert by_id["indexed"].projection.last_active == 400.0
+        assert (
+            by_id["indexed"].projection.origin_kind
+            is OriginKind.BRIDGE_PLACEHOLDER
+        )
+        assert by_id["indexed"].git_root == "C:/indexed-root"
+        assert by_id["unindexed-subagent"].subagent_only is True
+        assert by_id["unindexed-native"].projection.messages[0].content == (
+            "Hydrate only this request"
+        )
+        assert [call[0] for call in client.calls] == [
+            "thread/list",
+            "thread/list",
+            "thread/read",
+        ]
+
+    def test_visibility_exact_reads_new_or_stale_indexed_native_sources(self) -> None:
+        def entry(native_id: str, updated: int) -> dict[str, object]:
+            return {
+                "id": native_id,
+                "name": native_id,
+                "preview": f"preview for {native_id}",
+                "path": f"C:/codex/sessions/{native_id}.jsonl",
+                "cwd": f"C:/work/{native_id}",
+                "createdAt": updated - 10,
+                "updatedAt": updated,
+                "source": "vscode",
+            }
+
+        def indexed_source(
+            native_id: str,
+            last_active: float,
+            *,
+            parser_version: int = 1,
+        ) -> SidebarSource:
+            return SidebarSource(
+                source_session_id=f"codex:{native_id}",
+                projection=SessionProjection(
+                    provider=Provider.CODEX,
+                    native_id=native_id,
+                    title=f"Indexed {native_id}",
+                    cwd=f"C:/work/{native_id}",
+                    started_at=100.0,
+                    last_active=last_active,
+                    messages=(
+                        ProjectedMessage(
+                            native_event_id=f"{native_id}-cached-user",
+                            ordinal=0,
+                            role="user",
+                            content=f"Cached request for {native_id}",
+                            timestamp=110.0,
+                        ),
+                    ),
+                    native_path=f"C:/codex/sessions/{native_id}.jsonl",
+                    native_status="active",
+                    parser_version=parser_version,
+                    origin_kind=OriginKind.NATIVE,
+                ),
+                git_root=None,
+                git_head=None,
+                worktree_id=None,
+                automation_only=False,
+                subagent_only=False,
+            )
+
+        known = indexed_source("known", 400.0)
+        new = indexed_source("new", 350.0)
+        stale = indexed_source("stale", 200.0)
+        old_parser = indexed_source("old-parser", 275.0, parser_version=0)
+        client = FakeInitializingClient({
+            "thread/list": [
+                {
+                    "data": [
+                        entry("known", 400),
+                        entry("new", 350),
+                        entry("stale", 300),
+                        entry("old-parser", 275),
+                    ]
+                },
+                {"data": []},
+            ],
+            "thread/read": [
+                {
+                    "thread": {
+                        **entry("new", 350),
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "new-live-user",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": "Freshly confirm the new source",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                },
+                {
+                    "thread": {
+                        **entry("stale", 300),
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "stale-live-user",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": "Refresh the stale source",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                },
+                {
+                    "thread": {
+                        **entry("old-parser", 275),
+                        "turns": [
+                            {
+                                "items": [
+                                    {
+                                        "type": "userMessage",
+                                        "id": "old-parser-live-user",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": "Refresh the old parser source",
+                                            }
+                                        ],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                },
+            ],
+        })
+
+        sources = CodexSourceAdapter(
+            client, marker_secret=SECRET
+        ).list_claude_visibility_sources(
+            after=250,
+            state_db_only=True,
+            indexed_sources={
+                "known": known,
+                "new": new,
+                "stale": stale,
+                "old-parser": old_parser,
+            },
+            known_visibility_source_ids=frozenset({"codex:known"}),
+        )
+
+        by_id = {source.projection.native_id: source for source in sources}
+        assert by_id["known"].projection.messages[0].content == (
+            "Cached request for known"
+        )
+        assert by_id["new"].projection.messages[0].content == (
+            "Freshly confirm the new source"
+        )
+        assert by_id["stale"].projection.messages[0].content == (
+            "Refresh the stale source"
+        )
+        assert by_id["old-parser"].projection.messages[0].content == (
+            "Refresh the old parser source"
+        )
+        assert [call[0] for call in client.calls] == [
+            "thread/list",
+            "thread/list",
+            "thread/read",
+            "thread/read",
+            "thread/read",
+        ]
 
     def test_manual_visibility_uses_preview_when_full_read_times_out(self) -> None:
         row = {

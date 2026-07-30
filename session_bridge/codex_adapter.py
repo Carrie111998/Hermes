@@ -847,9 +847,14 @@ class CodexSourceAdapter:
         return summaries
 
     def list_claude_visibility_sources(
-        self, *, after: float, state_db_only: bool = False
+        self,
+        *,
+        after: float,
+        state_db_only: bool = False,
+        indexed_sources: Mapping[str, Any] | None = None,
+        known_visibility_source_ids: frozenset[str] = frozenset(),
     ) -> tuple[Any, ...]:
-        """Read every active and archived native Codex thread without bridge state."""
+        """Read active and archived Codex sources with optional indexed reuse."""
 
         cutoff = float(after)
         if not math.isfinite(cutoff):
@@ -881,24 +886,113 @@ class CodexSourceAdapter:
             combined.values(), key=lambda item: (-item.last_active, item.native_id)
         )
         summaries = self._refresh_trusted_origins(summaries)
+        from .claude_visibility import evaluate_claude_visibility
         from .store import SidebarSource
 
         sources: list[SidebarSource] = []
         for summary in summaries:
-            try:
-                projection, reconciled = self._read_sidebar_thread_details(
-                    summary, deadline=None
+            source_session_id = canonical_session_id(
+                Provider.CODEX, summary.native_id
+            )
+            cached = (
+                indexed_sources.get(summary.native_id)
+                if indexed_sources is not None
+                else None
+            )
+            if cached is not None:
+                cached_projection = cached.projection
+                if (
+                    cached.source_session_id != source_session_id
+                    or cached_projection.provider is not Provider.CODEX
+                    or cached_projection.native_id != summary.native_id
+                ):
+                    raise ValueError("indexed Codex source identity mismatch")
+                cache_is_current = (
+                    cached_projection.parser_version == _PARSER_VERSION
+                    and float(cached_projection.last_active)
+                    == float(summary.last_active)
                 )
-            except TimeoutError:
+                origin_kind, origin_bridge_id = self._reconcile_trusted_origin(
+                    summary,
+                    cached_projection.origin_kind,
+                    cached_projection.origin_bridge_id,
+                )
+                cached_projection = replace(
+                    cached_projection,
+                    title=summary.title
+                    if summary.title is not None
+                    else cached_projection.title,
+                    cwd=summary.cwd
+                    if summary.cwd is not None
+                    else cached_projection.cwd,
+                    started_at=summary.started_at,
+                    last_active=summary.last_active,
+                    native_path=summary.native_path
+                    if summary.native_path is not None
+                    else cached_projection.native_path,
+                    native_status="archived" if summary.archived else "active",
+                    origin_kind=origin_kind,
+                    origin_bridge_id=origin_bridge_id,
+                    git_branch=summary.git_branch
+                    if summary.git_branch is not None
+                    else cached_projection.git_branch,
+                )
+                cached = replace(
+                    cached,
+                    projection=cached_projection,
+                    git_root=summary.git_root
+                    if summary.git_root is not None
+                    else cached.git_root,
+                    git_head=summary.git_head
+                    if summary.git_head is not None
+                    else cached.git_head,
+                    worktree_id=summary.worktree_id
+                    if summary.worktree_id is not None
+                    else cached.worktree_id,
+                    automation_only=summary.automation_only,
+                    subagent_only=(
+                        summary.subagent_only
+                        or _starts_with_codex_delegation(cached_projection)
+                    ),
+                )
+                if cache_is_current and summary.source_kind is not None:
+                    exclusion = evaluate_claude_visibility(
+                        cached_projection,
+                        automation_only=cached.automation_only,
+                        subagent_only=cached.subagent_only,
+                    )
+                    if (
+                        exclusion != "eligible"
+                        or source_session_id in known_visibility_source_ids
+                    ):
+                        sources.append(cached)
+                        continue
+            structurally_excluded = (
+                summary.source_kind is not None
+                and (
+                    summary.automation_only
+                    or summary.subagent_only
+                    or summary.trusted_origin_bridge_id is not None
+                )
+            )
+            if structurally_excluded:
                 projection = self._project_state_db_summary(summary)
                 reconciled = summary
+            else:
+                try:
+                    projection, reconciled = self._read_sidebar_thread_details(
+                        summary, deadline=None
+                    )
+                except TimeoutError:
+                    if indexed_sources is not None:
+                        raise
+                    projection = self._project_state_db_summary(summary)
+                    reconciled = summary
             if reconciled.source_kind is None:
                 raise ValueError("Codex thread source kind is missing")
             sources.append(
                 SidebarSource(
-                    source_session_id=canonical_session_id(
-                        Provider.CODEX, reconciled.native_id
-                    ),
+                    source_session_id=source_session_id,
                     projection=projection,
                     git_root=reconciled.git_root,
                     git_head=reconciled.git_head,
