@@ -556,8 +556,11 @@ class WorkflowEngine:
                 # Backward compat: convert old list format to dict
                 all_attachments = {str(i): p for i, p in enumerate(all_attachments)}
             if node.attachment is not None:
-                # Look up by name
-                fpath = all_attachments.get(node.attachment)
+                # Look up by name — supports "name" or "attachments.name"
+                att_key = node.attachment
+                if att_key.startswith("attachments."):
+                    att_key = att_key[len("attachments."):]
+                fpath = all_attachments.get(att_key)
                 attachments_to_attach = [fpath] if fpath else []
             else:
                 # Attach all (first-layer behavior)
