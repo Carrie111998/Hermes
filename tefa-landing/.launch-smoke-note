@@ -1,0 +1,6 @@
+Launch-hardening smoke validation (2026-07-30)
+
+- General Store source templates and generated HTML match after cross-link resolution.
+- No General Store source or generated page contains buyer-facing "real checkout, paid by card", "Place order", "Add to cart", or plain "Cart" action labels.
+- ESA source templates and generated HTML each expose "General Store Preview" labels in navigation and footer.
+- LAUNCH_AUDIT.md and README launch status agree on the current recommendation: hold public launch, prepare ESA-only release, keep General Store outside the buyer path.
