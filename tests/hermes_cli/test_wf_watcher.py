@@ -1,0 +1,320 @@
+"""Synthetic acceptance coverage for the gateway workflow watcher."""
+
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from hermes_cli import kanban_db, wf_engine, wf_watcher
+
+
+NOW = 1_785_100_000
+
+
+def _spec(timer: dict | None = None) -> dict:
+    waits: list[dict] = [
+        {
+            "kind": "event",
+            "types": ["observed"],
+            "schema": "observation-v1",
+            "advance_to": "done",
+        }
+    ]
+    if timer:
+        waits.append({"kind": "timer", **timer})
+    return {
+        "id": "watcher-test",
+        "entity": "entity",
+        "correlation_keys": ["entity"],
+        "disambiguators": [],
+        "create_on": [],
+        "steps": [
+            {"key": "start", "advance_to": "wait"},
+            {"key": "wait", "waits": waits},
+            {"key": "done"},
+        ],
+    }
+
+
+def _board(tmp_path, monkeypatch, timer: dict | None = None):
+    monkeypatch.setattr(wf_engine, "_now", lambda: NOW)
+    path = tmp_path / "workflow.sqlite"
+    conn = kanban_db.connect(path)
+    template_id, _ = wf_engine.register_template(conn, _spec(timer))
+    task_id = wf_engine.create_instance(
+        conn,
+        template_id=template_id,
+        entity_key="entity-1",
+        corr={"entity": "entity-1"},
+        vars={},
+        source_event_id=None,
+    )
+    conn.execute("UPDATE tasks SET tenant = 'tenant' WHERE id = ?", (task_id,))
+    setup = wf_engine.ingest_event(
+        conn,
+        source="synthetic",
+        external_id="setup",
+        payload={},
+        corr={},
+        event_type="setup",
+    )
+    assert setup is not None
+    wf_engine.advance(conn, task_id, to_step="wait", event_id=setup)
+    return path, conn, task_id
+
+
+def _row(conn: sqlite3.Connection, sql: str, *params):
+    return conn.execute(sql, params).fetchone()
+
+
+def test_due_timer_applies_once_and_event_race_cancels_timer(tmp_path, monkeypatch):
+    _path, conn, task_id = _board(
+        tmp_path,
+        monkeypatch,
+        {"after": 30, "action": "advance", "advance_to": "done"},
+    )
+    try:
+        due = _row(
+            conn,
+            "SELECT timer_at FROM wf_wait WHERE task_id = ? AND kind = 'timer'",
+            task_id,
+        )[0]
+        first = wf_watcher.run_tick(conn, due)
+        second = wf_watcher.run_tick(conn, due + 60)
+
+        assert len(first.timers_fired) == 1
+        assert first.timer_results == ("applied",)
+        assert second.timers_fired == ()
+        assert tuple(_row(
+            conn,
+            "SELECT current_step_key, status FROM tasks WHERE id = ?",
+            task_id,
+        )) == ("done", "ready")
+        assert _row(
+            conn,
+            "SELECT status FROM wf_wait WHERE task_id = ? AND kind = 'timer'",
+            task_id,
+        )[0] == "satisfied"
+    finally:
+        conn.close()
+
+    # The opposite side of the race: an observed state wins first and
+    # supersedes the due timer before the watcher scans it.
+    race_path = tmp_path / "race"
+    race_path.mkdir()
+    _path, conn, task_id = _board(
+        race_path,
+        monkeypatch,
+        {"after": 30, "action": "advance", "advance_to": "done"},
+    )
+    try:
+        event_id = wf_engine.ingest_event(
+            conn,
+            source="state_poll",
+            external_id="state-won",
+            payload={},
+            corr={"entity": "entity-1"},
+            event_type="observed",
+        )
+        assert event_id is not None
+        assert wf_engine.match_event(conn, event_id).kind == "matched"
+        assert wf_engine.apply_event(
+            conn, event_id, task_id, expected_step="wait"
+        ).kind == "applied"
+        due = NOW + 30
+        result = wf_watcher.run_tick(conn, due)
+        assert result.timers_fired == ()
+        assert _row(
+            conn,
+            "SELECT status FROM wf_wait WHERE task_id = ? AND kind = 'timer'",
+            task_id,
+        )[0] == "superseded"
+    finally:
+        conn.close()
+
+
+def test_chase_cap_escalates_and_double_ticks_noop(tmp_path, monkeypatch):
+    _path, conn, task_id = _board(
+        tmp_path,
+        monkeypatch,
+        {
+            "after": 10,
+            "action": "chase",
+            "max_fires": 3,
+            "then": "escalate",
+            "advance_to": "wait",
+        },
+    )
+    try:
+        due = NOW + 10
+        results = [
+            wf_watcher.run_tick(conn, due),
+            wf_watcher.run_tick(conn, due + 10),
+            wf_watcher.run_tick(conn, due + 20),
+        ]
+        assert [result.timer_results for result in results] == [
+            ("chase",),
+            ("chase",),
+            ("exception",),
+        ]
+        assert _row(
+            conn,
+            "SELECT state FROM wf_instance WHERE task_id = ?",
+            task_id,
+        )[0] == "exception"
+        assert _row(
+            conn,
+            "SELECT COUNT(*) FROM wf_outbox WHERE task_id = ? AND action = 'chase'",
+            task_id,
+        )[0] == 3
+        assert wf_watcher.run_tick(conn, due + 1_000).timers_fired == ()
+        assert _row(
+            conn,
+            "SELECT COUNT(*) FROM wf_event WHERE source = 'timer'",
+        )[0] == 3
+        assert _row(
+            conn,
+            """
+            SELECT COUNT(*) FROM task_events
+             WHERE task_id = ? AND kind = 'blocked'
+               AND json_extract(payload, '$.source') = 'workflow_chase_cap'
+            """,
+            task_id,
+        )[0] == 1
+    finally:
+        conn.close()
+
+
+def test_stuck_deadline_enters_resumable_exception(tmp_path, monkeypatch):
+    _path, conn, task_id = _board(
+        tmp_path,
+        monkeypatch,
+        {"after": 60, "action": "deadline", "advance_to": "done"},
+    )
+    try:
+        result = wf_watcher.run_tick(conn, NOW + 60)
+        assert result.timer_results == ("exception",)
+        assert _row(
+            conn,
+            "SELECT state FROM wf_instance WHERE task_id = ?",
+            task_id,
+        )[0] == "exception"
+        assert _row(
+            conn,
+            "SELECT status FROM tasks WHERE id = ?",
+            task_id,
+        )[0] == "blocked"
+    finally:
+        conn.close()
+
+
+def test_read_only_tenant_probe_ingests_applies_and_dedupes(tmp_path, monkeypatch):
+    _path, conn, task_id = _board(tmp_path, monkeypatch)
+    seen = []
+
+    def probe(targets):
+        seen.append(targets)
+        with pytest.raises(TypeError):
+            targets[0].corr["entity"] = "mutated"
+        return [
+            wf_watcher.ProbeObservation(
+                external_id="probe:entity-1:observed",
+                event_type="observed",
+                corr={"entity": "entity-1"},
+                payload={"observed": True},
+            )
+        ]
+
+    with pytest.raises(ValueError, match="read_only=True"):
+        wf_watcher.register_state_probe("tenant", probe, read_only=False)
+    wf_watcher.register_state_probe("tenant", probe, read_only=True)
+    try:
+        first = wf_watcher.run_tick(conn, NOW)
+        second = wf_watcher.run_tick(conn, NOW + 60)
+        assert len(seen) == 2
+        assert len(first.poll_events) == 1
+        assert first.applied_events == first.poll_events
+        assert second.poll_events == ()
+        assert second.poll_duplicates == 1
+        assert tuple(_row(
+            conn,
+            "SELECT source, status FROM wf_event WHERE id = ?",
+            first.poll_events[0],
+        )) == ("state_poll", "applied")
+        assert _row(
+            conn,
+            "SELECT current_step_key FROM tasks WHERE id = ?",
+            task_id,
+        )[0] == "done"
+    finally:
+        wf_watcher.unregister_state_probe("tenant")
+        conn.close()
+
+
+def test_sweeper_redrives_stuck_intake_and_restart_catches_overdue_timer(
+    tmp_path, monkeypatch
+):
+    path, conn, task_id = _board(
+        tmp_path,
+        monkeypatch,
+        {"after": 30, "action": "advance", "advance_to": "done"},
+    )
+    stuck = wf_engine.ingest_event(
+        conn,
+        source="synthetic",
+        external_id="stuck-intake",
+        payload={},
+        corr={"entity": "entity-1"},
+        event_type="observed",
+    )
+    assert stuck is not None
+    first = wf_watcher.run_tick(conn, NOW)
+    assert stuck in first.applied_events
+    conn.close()
+
+    # A fresh connection represents a restarted gateway.  The timer lost the
+    # event race and was superseded durably, so restart catch-up cannot revive
+    # it or double-apply the stage.
+    restarted = kanban_db.connect(path)
+    try:
+        after_restart = wf_watcher.run_tick(restarted, NOW + 3_600)
+        assert after_restart.timers_fired == ()
+        assert _row(
+            restarted,
+            "SELECT current_step_key FROM tasks WHERE id = ?",
+            task_id,
+        )[0] == "done"
+        assert _row(
+            restarted,
+            "SELECT COUNT(*) FROM wf_transition WHERE task_id = ? AND step_key = 'wait'",
+            task_id,
+        )[0] == 1
+    finally:
+        restarted.close()
+
+
+def test_restart_catchup_fires_timer_missed_while_gateway_was_down(
+    tmp_path, monkeypatch
+):
+    path, conn, task_id = _board(
+        tmp_path,
+        monkeypatch,
+        {"after": 30, "action": "advance", "advance_to": "done"},
+    )
+    conn.close()
+
+    restarted = kanban_db.connect(path)
+    try:
+        catchup = wf_watcher.run_tick(restarted, NOW + 3_600)
+        repeated = wf_watcher.run_tick(restarted, NOW + 3_601)
+        assert len(catchup.timers_fired) == 1
+        assert catchup.timer_results == ("applied",)
+        assert repeated.timers_fired == ()
+        assert _row(
+            restarted,
+            "SELECT current_step_key FROM tasks WHERE id = ?",
+            task_id,
+        )[0] == "done"
+    finally:
+        restarted.close()
