@@ -149,65 +149,96 @@ def list_subagent_picker_providers(*, refresh: bool = False) -> list[dict[str, A
     )
 
 
+def _canonical_picker_provider(model_config: Any, full_config: dict[str, Any]) -> str:
+    """Return the runtime-addressable provider selected by the full picker.
+
+    The manual custom-endpoint flow temporarily writes ``model.provider=custom``
+    plus ``model.base_url`` and then saves a named ``custom_providers`` entry.
+    Delegation must persist that entry's canonical ``custom:<name>`` slug; bare
+    ``custom`` is ambiguous when more than one endpoint exists.
+    """
+
+    if not isinstance(model_config, dict):
+        return ""
+    provider = str(model_config.get("provider") or "").strip()
+    if provider != "custom":
+        return provider
+
+    from hermes_cli.config import get_compatible_custom_providers
+    from hermes_cli.providers import custom_provider_slug
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    selected_url = normalize_route_base_url(model_config.get("base_url"))
+    if not selected_url:
+        raise ValueError("Custom model selection did not persist an endpoint URL")
+    for entry in get_compatible_custom_providers(full_config):
+        if not isinstance(entry, dict):
+            continue
+        if normalize_route_base_url(entry.get("base_url")) != selected_url:
+            continue
+        identity = str(entry.get("provider_key") or entry.get("name") or "").strip()
+        if identity:
+            return custom_provider_slug(identity)
+    raise ValueError(
+        "Custom endpoint was selected but no matching saved custom provider was found"
+    )
+
+
 def select_subagent_model_interactively(
     *, refresh: bool = False
 ) -> Optional[SubagentModelStatus]:
-    """Run the shell CLI picker using Hermes' dependency-free curses UI."""
+    """Run the complete ``hermes model`` flow for the delegation target.
 
-    from hermes_cli.curses_ui import curses_radiolist
+    Provider logins, credentials, custom-provider additions, and auxiliary
+    configuration are deliberately retained.  The active primary model route
+    and auth provider are restored before the confirmed selection is committed
+    under ``delegation.*``.
+    """
 
-    providers = [
-        row for row in list_subagent_picker_providers(refresh=refresh) if row.get("slug")
-    ]
-    status = get_subagent_model_status()
-    provider_labels = [
-        "Inherit parent model (reset override)",
-        *[
-            f"{row.get('name') or row.get('slug')} ({len(row.get('models') or [])} models)"
-            for row in providers
-        ],
-    ]
-    selected_provider_index = 0
-    if not status.inherits_parent:
-        selected_provider_index = next(
-            (
-                index
-                for index, row in enumerate(providers, start=1)
-                if str(row.get("slug") or "") == status.provider
-            ),
-            0,
-        )
+    import copy
 
-    provider_index = curses_radiolist(
-        "Select subagent provider:",
-        provider_labels,
-        selected=selected_provider_index,
-        cancel_returns=-1,
-        searchable=True,
-        search_labels=provider_labels,
+    from hermes_cli.auth import capture_model_selection
+    from hermes_cli.config import load_config
+    from hermes_cli.fallback_cmd import (
+        _restore_auth_active_provider,
+        _restore_model_cfg,
+        _snapshot_auth_active_provider,
     )
-    if provider_index < 0:
-        return None
-    if provider_index == 0:
-        return reset_subagent_model()
+    from hermes_cli.main import select_provider_and_model
 
-    row = providers[provider_index - 1]
-    selected_provider = str(row.get("slug") or "")
-    models = [str(model) for model in row.get("models") or [] if str(model).strip()]
-    if not models:
-        raise ValueError(f"No authenticated models available for provider '{selected_provider}'")
+    if refresh:
+        try:
+            from hermes_cli.models import clear_provider_models_cache
 
-    selected_model_index = 0
-    if status.provider == selected_provider and status.model in models:
-        selected_model_index = models.index(status.model)
-    model_index = curses_radiolist(
-        "Select subagent model:",
-        models,
-        selected=selected_model_index,
-        cancel_returns=-1,
-        searchable=True,
-        search_labels=models,
-    )
-    if model_index < 0:
+            clear_provider_models_cache()
+        except Exception:
+            pass
+
+    before_config = load_config()
+    model_before = copy.deepcopy(before_config.get("model"))
+    active_provider_before = _snapshot_auth_active_provider()
+    selected_config: Optional[dict[str, Any]] = None
+    selections: list[str] = []
+
+    print()
+    print("  Select the provider + model to use for subagents.")
+    print("  This is the full `hermes model` setup flow: provider login and custom")
+    print("  provider additions are kept; your active primary model is unchanged.")
+    print()
+
+    try:
+        with capture_model_selection() as selections:
+            select_provider_and_model()
+        if selections:
+            selected_config = copy.deepcopy(load_config())
+    finally:
+        _restore_model_cfg(model_before)
+        _restore_auth_active_provider(active_provider_before)
+
+    if not selections or selected_config is None:
         return None
-    return set_subagent_model(models[model_index], provider=selected_provider)
+
+    model_config = selected_config.get("model")
+    selected_model = selections[-1]
+    selected_provider = _canonical_picker_provider(model_config, selected_config)
+    return set_subagent_model(selected_model, provider=selected_provider or None)

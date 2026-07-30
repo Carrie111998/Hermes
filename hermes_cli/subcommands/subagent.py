@@ -36,8 +36,11 @@ def build_subagent_parser(subparsers, *, cmd_subagent: Callable) -> None:
         help="Select or reset the subagent model",
         description=(
             "Pin all subagents to a specific model, or reset to inherit "
-            "the parent model.  The delegation provider/model is read on "
-            "every child spawn — no restart needed."
+            "the parent model. With no model argument, opens the complete "
+            "`hermes model` provider setup flow, including login and custom "
+            "endpoint creation. Shared provider additions are retained while "
+            "the active primary model remains unchanged. The delegation "
+            "provider/model is read on every child spawn — no restart needed."
         ),
     )
     model_parser.add_argument(
@@ -58,6 +61,6 @@ def build_subagent_parser(subparsers, *, cmd_subagent: Callable) -> None:
     model_parser.add_argument(
         "--refresh",
         action="store_true",
-        help="Refresh provider model catalogs before opening the picker",
+        help="Refresh provider model catalogs before opening the full setup picker",
     )
     model_parser.set_defaults(func=cmd_subagent)

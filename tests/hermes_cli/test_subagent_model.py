@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -125,130 +126,146 @@ def test_failed_resolution_does_not_write_config(monkeypatch):
         subagent_model.set_subagent_model("private-model", provider="missing")
 
 
-def test_interactive_picker_uses_core_curses_without_inquirer(monkeypatch):
-    import builtins
+def _memory_config(monkeypatch, initial):
+    import copy
 
-    inherited = subagent_model.SubagentModelStatus(
-        model=None,
-        provider=None,
-        inherits_parent=True,
-    )
-    pinned = subagent_model.SubagentModelStatus(
-        model="model-b",
-        provider="provider-a",
-        inherits_parent=False,
-    )
-    answers = iter([1, 1])
-    picker_calls = []
-    set_calls = []
+    state = copy.deepcopy(initial)
 
+    def load_config():
+        return copy.deepcopy(state)
+
+    def save_config(value):
+        state.clear()
+        state.update(copy.deepcopy(value))
+
+    monkeypatch.setattr("hermes_cli.config.load_config", load_config)
+    monkeypatch.setattr("hermes_cli.config.save_config", save_config)
+    return state
+
+
+def _stub_auth_restore(monkeypatch):
+    from hermes_cli import fallback_cmd
+
+    restored = []
+    monkeypatch.setattr(fallback_cmd, "_snapshot_auth_active_provider", lambda: "parent-auth")
     monkeypatch.setattr(
-        subagent_model,
-        "list_subagent_picker_providers",
-        lambda **_kwargs: [
-            {
-                "slug": "provider-a",
-                "name": "Provider A",
-                "models": ["model-a", "model-b"],
-            }
-        ],
+        fallback_cmd,
+        "_restore_auth_active_provider",
+        lambda value: restored.append(value),
     )
-    monkeypatch.setattr(subagent_model, "get_subagent_model_status", lambda: inherited)
+    return restored
+
+
+def test_full_picker_keeps_setup_side_effects_and_restores_primary(monkeypatch):
+    import copy
+
+    from hermes_cli import auth, main as hermes_main
+
+    primary = {"default": "same-model", "provider": "parent-provider"}
+    state = _memory_config(
+        monkeypatch,
+        {"model": primary, "delegation": {"max_spawn_depth": 2}},
+    )
+    restored_auth = _stub_auth_restore(monkeypatch)
+    set_calls = []
+    pinned = subagent_model.SubagentModelStatus(
+        "same-model", "openrouter", False
+    )
+
+    def fake_full_picker():
+        # Explicitly selecting the same model still counts as a selection.
+        auth._save_model_choice("same-model")
+        updated = copy.deepcopy(state)
+        updated["model"]["provider"] = "openrouter"
+        updated["providers"] = {"new-provider": {"api_key": "${NEW_KEY}"}}
+        from hermes_cli.config import save_config
+
+        save_config(updated)
+
+    monkeypatch.setattr(hermes_main, "select_provider_and_model", fake_full_picker)
     monkeypatch.setattr(
         subagent_model,
         "set_subagent_model",
         lambda model, provider=None: set_calls.append((model, provider)) or pinned,
     )
 
-    def fake_picker(title, items, **kwargs):
-        picker_calls.append((title, items, kwargs))
-        return next(answers)
+    assert subagent_model.select_subagent_model_interactively() == pinned
+    assert set_calls == [("same-model", "openrouter")]
+    assert state["model"] == primary
+    assert state["providers"] == {"new-provider": {"api_key": "${NEW_KEY}"}}
+    assert restored_auth == ["parent-auth"]
 
-    monkeypatch.setattr("hermes_cli.curses_ui.curses_radiolist", fake_picker)
-    real_import = builtins.__import__
 
-    def reject_undeclared_picker(name, *args, **kwargs):
-        if name == "InquirerPy":
-            raise AssertionError("interactive picker must not import undeclared InquirerPy")
-        return real_import(name, *args, **kwargs)
+def test_full_picker_cancel_keeps_setup_changes_without_pinning(monkeypatch):
+    import copy
 
-    monkeypatch.setattr(builtins, "__import__", reject_undeclared_picker)
+    from hermes_cli import main as hermes_main
+
+    primary = {"default": "parent-model", "provider": "parent-provider"}
+    state = _memory_config(monkeypatch, {"model": primary})
+    restored_auth = _stub_auth_restore(monkeypatch)
+
+    def fake_cancelled_picker():
+        updated = copy.deepcopy(state)
+        updated["providers"] = {"authenticated-only": {"key_env": "AUTH_KEY"}}
+        from hermes_cli.config import save_config
+
+        save_config(updated)
+
+    monkeypatch.setattr(hermes_main, "select_provider_and_model", fake_cancelled_picker)
+    assert subagent_model.select_subagent_model_interactively() is None
+    assert state["model"] == primary
+    assert state["providers"] == {"authenticated-only": {"key_env": "AUTH_KEY"}}
+    assert restored_auth == ["parent-auth"]
+
+
+def test_full_picker_adds_custom_provider_and_pins_canonical_slug(monkeypatch):
+    import copy
+
+    from hermes_cli import auth, main as hermes_main
+
+    primary = {"default": "parent-model", "provider": "parent-provider"}
+    state = _memory_config(monkeypatch, {"model": primary})
+    restored_auth = _stub_auth_restore(monkeypatch)
+    set_calls = []
+    pinned = subagent_model.SubagentModelStatus(
+        "moon-model", "custom:terra-to-moon", False
+    )
+
+    def fake_custom_picker():
+        auth._save_model_choice("moon-model")
+        updated = copy.deepcopy(state)
+        updated["model"].update(
+            {
+                "provider": "custom",
+                "base_url": "https://moon.example/v1/",
+                "api_mode": "chat_completions",
+            }
+        )
+        updated["custom_providers"] = [
+            {
+                "name": "Terra to Moon",
+                "base_url": "https://moon.example/v1",
+                "model": "moon-model",
+            }
+        ]
+        from hermes_cli.config import save_config
+
+        save_config(updated)
+
+    monkeypatch.setattr(hermes_main, "select_provider_and_model", fake_custom_picker)
+    monkeypatch.setattr(
+        subagent_model,
+        "set_subagent_model",
+        lambda model, provider=None: set_calls.append((model, provider)) or pinned,
+    )
 
     assert subagent_model.select_subagent_model_interactively() == pinned
-    assert set_calls == [("model-b", "provider-a")]
-    assert [call[0] for call in picker_calls] == [
-        "Select subagent provider:",
-        "Select subagent model:",
-    ]
-    assert all(call[2]["searchable"] is True for call in picker_calls)
-
-
-def test_interactive_picker_first_choice_resets_to_parent(monkeypatch):
-    pinned = subagent_model.SubagentModelStatus(
-        model="model-a",
-        provider="provider-a",
-        inherits_parent=False,
-    )
-    inherited = subagent_model.SubagentModelStatus(None, None, True)
-    reset_calls = []
-
-    monkeypatch.setattr(
-        subagent_model,
-        "list_subagent_picker_providers",
-        lambda **_kwargs: [
-            {"slug": "provider-a", "name": "Provider A", "models": ["model-a"]}
-        ],
-    )
-    monkeypatch.setattr(subagent_model, "get_subagent_model_status", lambda: pinned)
-    monkeypatch.setattr(
-        subagent_model,
-        "reset_subagent_model",
-        lambda: reset_calls.append(True) or inherited,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.curses_ui.curses_radiolist",
-        lambda *_args, **_kwargs: 0,
-    )
-    monkeypatch.setattr(
-        subagent_model,
-        "set_subagent_model",
-        lambda *_args, **_kwargs: pytest.fail("reset must not select a model"),
-    )
-
-    assert subagent_model.select_subagent_model_interactively() == inherited
-    assert reset_calls == [True]
-
-
-def test_interactive_picker_cancel_returns_none_without_writing(monkeypatch):
-    pinned = subagent_model.SubagentModelStatus(
-        model="model-a",
-        provider="provider-a",
-        inherits_parent=False,
-    )
-    monkeypatch.setattr(
-        subagent_model,
-        "list_subagent_picker_providers",
-        lambda **_kwargs: [
-            {"slug": "provider-a", "name": "Provider A", "models": ["model-a"]}
-        ],
-    )
-    monkeypatch.setattr(subagent_model, "get_subagent_model_status", lambda: pinned)
-    monkeypatch.setattr(
-        "hermes_cli.curses_ui.curses_radiolist",
-        lambda *_args, **_kwargs: -1,
-    )
-    monkeypatch.setattr(
-        subagent_model,
-        "reset_subagent_model",
-        lambda: pytest.fail("cancel must not reset the override"),
-    )
-    monkeypatch.setattr(
-        subagent_model,
-        "set_subagent_model",
-        lambda *_args, **_kwargs: pytest.fail("cancel must not select a model"),
-    )
-
-    assert subagent_model.select_subagent_model_interactively() is None
+    assert set_calls == [("moon-model", "custom:terra-to-moon")]
+    assert state["model"] == primary
+    custom_providers = cast(list[dict[str, Any]], state["custom_providers"])
+    assert custom_providers[0]["name"] == "Terra to Moon"
+    assert restored_auth == ["parent-auth"]
 
 
 def test_shell_interactive_cancel_reports_cancelled(monkeypatch, capsys):
