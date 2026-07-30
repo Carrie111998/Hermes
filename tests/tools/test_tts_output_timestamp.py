@@ -12,12 +12,17 @@ import re
 
 class TestDefaultOutputTimestampResolution:
     def test_default_output_path_uses_microsecond_timestamp(self):
-        """The source must build default filenames with a %f component."""
+        """The source must build default filenames with a %f component.
+
+        Asserted against ``_attempt_tts_provider``, which owns the per-provider
+        output-path construction (the fallback chain in #65752 made the path a
+        per-attempt concern, so it moved out of ``text_to_speech_tool``).
+        """
         import inspect
 
         from tools import tts_tool
 
-        src = inspect.getsource(tts_tool.text_to_speech_tool)
+        src = inspect.getsource(tts_tool._attempt_tts_provider)
         assert "%Y%m%d_%H%M%S_%f" in src, (
             "default TTS output timestamp lost its microsecond component — "
             "concurrent calls in the same second would collide again (#43911)"
