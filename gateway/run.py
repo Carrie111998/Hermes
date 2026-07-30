@@ -1536,10 +1536,12 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
             continue
         if role not in {"tool", "function"}:
             continue
+        # Skip MEDIA: text scanning for tool/function results — they
+        # contain paths from tool output BEFORE delivery, so including
+        # them causes false-positive dedup that prevents the current
+        # turn's media from ever being sent (#74928).
+        # image_generate JSON payload path below is unaffected.
         content = str(msg.get("content", "") or "")
-        if "MEDIA:" in content:
-            _add_text_media_paths(content)
-            continue
         cid = str(msg.get("tool_call_id") or msg.get("call_id") or "")
         if tool_name_by_call_id.get(cid) == "image_generate":
             try:
