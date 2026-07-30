@@ -25,11 +25,11 @@ class FakeBackend:
         self.captured.append(("get_all", {"filters": filters, "page": page, "page_size": page_size}))
         return self._all_results
 
-    def add(self, messages, *, user_id, agent_id, infer=False, metadata=None):
+    def add(self, messages, *, user_id, agent_id, infer=False, metadata=None, run_id=None, **kwargs):
         self.captured.append((
             "add",
             messages,
-            {"user_id": user_id, "agent_id": agent_id, "infer": infer, "metadata": metadata},
+            {"user_id": user_id, "agent_id": agent_id, "infer": infer, "metadata": metadata, "run_id": run_id},
         ))
         return {"status": "PENDING", "event_id": "evt-test-123"}
 
@@ -160,6 +160,7 @@ class TestMem0Prefetch:
         provider.initialize("test-session")
         provider._user_id = "u123"
         provider._agent_id = "hermes"
+        provider._prefetch_top_k = 10  # reset from default 15 so test assertions are stable
         provider._backend = backend
         return provider
 

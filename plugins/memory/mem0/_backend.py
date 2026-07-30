@@ -311,7 +311,11 @@ class OSSBackend(Mem0Backend):
         return self._memory.add(messages, **kwargs)
 
     def update(self, memory_id: str, text: str) -> dict:
-        self._memory.update(memory_id, data=text)
+        try:
+            self._memory.update(memory_id, data=text)
+        except Exception as exc:
+            logger.exception("OSSBackend.update failed for memory_id=%s: %s", memory_id, exc)
+            raise
         return {"result": "Memory updated.", "memory_id": memory_id}
 
     def delete(self, memory_id: str) -> dict:

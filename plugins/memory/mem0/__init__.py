@@ -502,6 +502,14 @@ class Mem0MemoryProvider(MemoryProvider):
             atexit.register(self._shutdown_backend)
             self._atexit_registered = True
 
+    def _is_oss_backend(self) -> bool:
+        """Return True only when the active backend is the local OSSBackend."""
+        try:
+            from ._backend import OSSBackend
+            return isinstance(self._backend, OSSBackend)
+        except Exception:
+            return False
+
     def _read_filters(self) -> Dict[str, Any]:
         # Scoped to user_id only — by design — so recall surfaces memories
         # written from any gateway/agent under this principal. Writes attach
@@ -576,11 +584,12 @@ class Mem0MemoryProvider(MemoryProvider):
                 results = backend.search(
                     query, filters=self._read_filters(), top_k=self._prefetch_top_k, rerank=False,
                 )
-                results = _apply_staleness_weight(
-                    results or [],
-                    vacations=self._vacations,
-                    grace_days=self._decay_grace_days,
-                )
+                if self._is_oss_backend():
+                    results = _apply_staleness_weight(
+                        results or [],
+                        vacations=self._vacations,
+                        grace_days=self._decay_grace_days,
+                    )
                 lines = [r.get("memory", "") for r in results if r.get("memory")]
                 if lines:
                     body = "## Mem0 Memory\n" + "\n".join(f"- {l}" for l in lines)
@@ -619,9 +628,9 @@ class Mem0MemoryProvider(MemoryProvider):
         if self._backend is None or self._is_breaker_open():
             return
 
-        # Allow sprint-scoped ingestion via MEM0_RUN_ID env var so all
-        # background turn syncs are tagged with the active sprint/run ID.
-        run_id: str | None = os.environ.get("MEM0_RUN_ID") or None
+        # run_scope is a mem0.json behavioral setting that tags background turn
+        # syncs with a sprint/session scope ID for filtered recall.
+        run_id: str | None = (self._config or {}).get("run_scope") or None
 
         def _sync():
             backend = self._backend
@@ -776,11 +785,12 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_success()
                 if not results:
                     return json.dumps({"result": "No relevant memories found."})
-                results = _apply_staleness_weight(
-                    results,
-                    vacations=self._vacations,
-                    grace_days=self._decay_grace_days,
-                )
+                if self._is_oss_backend():
+                    results = _apply_staleness_weight(
+                        results,
+                        vacations=self._vacations,
+                        grace_days=self._decay_grace_days,
+                    )
                 items = [{"id": r.get("id"), "memory": r.get("memory", ""),
                           "score": r.get("score", 0)} for r in results]
                 return json.dumps({"results": items, "count": len(items)})
