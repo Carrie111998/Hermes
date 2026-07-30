@@ -68,6 +68,8 @@ class MirrorsConfig:
 
 @dataclass(frozen=True)
 class SidebarConfig:
+    inbox_cwd: str | None = None
+    placement_generation: int = 1
     enabled: bool = False
     continuous: bool = False
     backfill_days: int = 30
@@ -150,6 +152,8 @@ class BridgeConfig:
                 "readable_preview_enabled",
                 "legacy_hydration_enabled",
                 "preview_budget_chars",
+                "inbox_cwd",
+                "placement_generation",
             }),
             scope="session_bridge.sidebar",
         )
@@ -355,6 +359,23 @@ class BridgeConfig:
             ),
         )
         sidebar_defaults = cls().sidebar
+        inbox_cwd = sidebar.get("inbox_cwd", sidebar_defaults.inbox_cwd)
+        if inbox_cwd is not None and (
+            not isinstance(inbox_cwd, str) or not inbox_cwd
+        ):
+            raise ValueError(
+                "session_bridge.sidebar.inbox_cwd must be a non-empty string"
+            )
+        placement_generation = _toml_int(
+            sidebar.get(
+                "placement_generation", sidebar_defaults.placement_generation
+            ),
+            "session_bridge.sidebar.placement_generation",
+        )
+        if placement_generation != 1:
+            raise ValueError(
+                "session_bridge.sidebar.placement_generation must be exactly 1"
+            )
         lease_seconds = _toml_int(
             sidebar.get("lease_seconds", sidebar_defaults.lease_seconds),
             "session_bridge.sidebar.lease_seconds",
@@ -368,6 +389,8 @@ class BridgeConfig:
         if max_attempts != 5:
             raise ValueError("session_bridge.sidebar.max_attempts must be exactly 5")
         sidebar_config = SidebarConfig(
+            inbox_cwd=inbox_cwd,
+            placement_generation=placement_generation,
             enabled=_toml_bool(
                 sidebar.get("enabled", sidebar_defaults.enabled),
                 "session_bridge.sidebar.enabled",

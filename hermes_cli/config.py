@@ -1101,6 +1101,13 @@ def _ensure_hermes_home_managed(home: Path):
 # Config loading/saving
 # =============================================================================
 
+def _sidebar_default_inbox_cwd() -> str | None:
+    try:
+        return str(get_hermes_home())
+    except RuntimeError:
+        return None
+
+
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
@@ -3316,6 +3323,8 @@ DEFAULT_CONFIG = {
 
     "session_bridge": {
         "sidebar": {
+            "inbox_cwd": _sidebar_default_inbox_cwd(),
+            "placement_generation": 1,
             "enabled": False,
             "continuous": False,
             "backfill_days": 30,

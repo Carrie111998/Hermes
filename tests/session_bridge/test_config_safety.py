@@ -175,6 +175,8 @@ def test_live_characterization_gate_rejects_near_match_environment_names(
 
 
 _SIDEBAR_DEFAULTS = {
+    "inbox_cwd": None,
+    "placement_generation": 1,
     "enabled": False,
     "continuous": False,
     "backfill_days": 30,
@@ -209,7 +211,15 @@ def _load_with_sidebar(
 def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert DEFAULT_CONFIG["session_bridge"] == {"sidebar": _SIDEBAR_DEFAULTS}
+    assert DEFAULT_CONFIG["session_bridge"] == {
+        "sidebar": {
+            **_SIDEBAR_DEFAULTS,
+            "inbox_cwd": DEFAULT_CONFIG["session_bridge"]["sidebar"]["inbox_cwd"],
+        }
+    }
+    assert DEFAULT_CONFIG["session_bridge"]["sidebar"]["inbox_cwd"] is None or isinstance(
+        DEFAULT_CONFIG["session_bridge"]["sidebar"]["inbox_cwd"], str
+    )
     assert asdict(SidebarConfig()) == _SIDEBAR_DEFAULTS
     assert not any("SIDEBAR" in name for name in _ENV_NAMES)
 
@@ -221,9 +231,13 @@ def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
 
 
 def test_sidebar_config_loads_only_from_config_yaml(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    inbox = tmp_path / ".hermes"
     configured = {
+        "inbox_cwd": str(inbox),
+        "placement_generation": 1,
         "enabled": True,
         "continuous": True,
         "backfill_days": 14,
@@ -240,6 +254,29 @@ def test_sidebar_config_loads_only_from_config_yaml(
     config = _load_with_sidebar(monkeypatch, configured)
 
     assert asdict(config.sidebar) == configured
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("inbox_cwd", "", "inbox_cwd must be a non-empty string"),
+        ("inbox_cwd", 1, "inbox_cwd must be a non-empty string"),
+        ("placement_generation", True, "placement_generation must be an integer"),
+        (
+            "placement_generation",
+            2,
+            "placement_generation must be exactly 1",
+        ),
+    ),
+)
+def test_sidebar_config_rejects_invalid_placement_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        _load_with_sidebar(monkeypatch, {**_SIDEBAR_DEFAULTS, field: value})
 
 
 def test_unknown_sidebar_config_key_is_rejected(
