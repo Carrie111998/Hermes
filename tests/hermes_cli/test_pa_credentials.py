@@ -33,6 +33,7 @@ from hermes_cli.pa_credentials import (
     UnsafeProbeError,
     create_pa_credentials_watcher,
     validate_handoff_url,
+    load_agent_pubkey,
     load_runtime_credentials,
 )
 
@@ -672,6 +673,7 @@ def test_runtime_loader_rejects_non_success_or_unexpected_envelopes(
 
 def test_runtime_loader_resolves_sealed_bedrock_value_before_bearer_probe(
     tmp_path: Path,
+    caplog,
 ):
     source = tmp_path / "sealed-export.json"
     token = _jwt(datetime(2026, 10, 29, tzinfo=UTC))
@@ -717,11 +719,56 @@ def test_runtime_loader_resolves_sealed_bedrock_value_before_bearer_probe(
     assert result.healthy is True
     assert result.expires_at == datetime(2026, 10, 29, tzinfo=UTC)
 
-    with pytest.raises(
-        CredentialContractError,
-        match="sealed by-value material requires a configured resolver",
-    ):
-        load_runtime_credentials(source)
+    assert load_runtime_credentials(source) == []
+    assert "sealed by-value material requires a configured resolver" in caplog.text
+
+
+def test_runtime_loader_isolates_one_malformed_row(tmp_path: Path, caplog):
+    source = tmp_path / "mixed-export.json"
+    source.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "data": [
+                    {
+                        "id": "bad-row",
+                        "driver_key": "bearer-jwt",
+                        "material_mode": "by-value",
+                        "material_envelope": "",
+                        "probe_cadence_seconds": 300,
+                        "probe_non_destructive": True,
+                        "probe_safety_contract": {"operation": "local"},
+                    },
+                    {
+                        "id": "good-row",
+                        "driver_key": "human-browser-session",
+                        "material_mode": "by-reference",
+                        "host_id": "synthetic-host",
+                        "reference_locator": "synthetic/profile",
+                        "probe_cadence_seconds": 30,
+                        "probe_non_destructive": True,
+                        "probe_safety_contract": {"operation": "local"},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    records = load_runtime_credentials(source)
+    assert [record.credential_id for record in records] == ["good-row"]
+    assert "bad-row" in caplog.text
+
+
+def test_agent_pubkey_uses_carbon_auth_host_path(tmp_path: Path, monkeypatch):
+    private_path = tmp_path / "keys" / "auth.key"
+    private_path.parent.mkdir()
+    private_path.write_text("private-not-read", encoding="utf-8")
+    (private_path.parent / "public.key").write_text(
+        "synthetic-public-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PCL_CARBON_AUTH_KEY_PATH", str(private_path))
+    assert load_agent_pubkey("synthetic-agent") == "synthetic-public-key"
 
 
 def test_exact_runtime_export_envelope_preserves_metadata_and_watches(

@@ -884,10 +884,48 @@ def load_runtime_credentials(
     if "data" not in payload or not isinstance(payload["data"], list):
         raise CredentialContractError("credential export envelope data must be a list")
     rows = payload["data"]
-    return [
-        CredentialRecord.from_row(row, by_value_resolver=by_value_resolver)
-        for row in rows
-    ]
+    records: list[CredentialRecord] = []
+    for index, row in enumerate(rows):
+        try:
+            records.append(
+                CredentialRecord.from_row(
+                    row,
+                    by_value_resolver=by_value_resolver,
+                )
+            )
+        except Exception as exc:
+            row_id = row.get("id", "unknown") if isinstance(row, Mapping) else "unknown"
+            logger.error(
+                "PA credential export row %s (%s) rejected; continuing other rows: %s",
+                index,
+                row_id,
+                exc,
+            )
+    return records
+
+
+def load_agent_pubkey(agent_slug: str) -> str:
+    """Read the Carbon Auth public key from the agent host's canonical path."""
+    if not agent_slug.strip():
+        raise CredentialContractError("agent_slug is required for Carbon Auth")
+    override = os.getenv("PCL_CARBON_AUTH_KEY_PATH", "").strip()
+    private_path = (
+        Path(override.replace("<agent>", agent_slug))
+        if override
+        else Path("/etc") / agent_slug / "auth.key"
+    )
+    public_path = private_path.parent / "public.key"
+    try:
+        value = public_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise CredentialContractError(
+            f"agent public key is unavailable at {public_path}"
+        ) from exc
+    if not value:
+        raise CredentialContractError(
+            f"agent public key is empty at {public_path}"
+        )
+    return value
 
 
 class CredentialWatcher:
@@ -1142,7 +1180,7 @@ class CredentialWatcher:
             )
         request = CarbonAuthRequest(
             agent_id=record.agent_slug or "hermes-runtime",
-            agent_pubkey=record.agent_pubkey,
+            agent_pubkey=record.agent_pubkey or load_agent_pubkey(record.agent_slug),
             portal=record.portal,
             reason=record.reason,
             urgency=record.urgency,
@@ -1219,5 +1257,6 @@ __all__ = [
     "configured_handoff_signer_from_environment",
     "create_pa_credentials_watcher",
     "load_runtime_credentials",
+    "load_agent_pubkey",
     "validate_handoff_url",
 ]
