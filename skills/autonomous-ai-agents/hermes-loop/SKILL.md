@@ -1,8 +1,8 @@
 ---
 name: hermes-loop
-description: "Kanban software factory loop: human freeze, scoped build, SHA-tied review, humans merge. Multi-hour/day trains as linked one-day units. Use for factory-spec, factory-build, factory-review workflows on Hermes kanban."
+description: "Runs human-gated software work on Hermes kanban."
 version: 1.0.0
-author: Hermes Agent contributors
+author: Joel Brilliant (@joelbrilliant), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -11,26 +11,20 @@ metadata:
     related_skills: [hermes-agent]
 ---
 
-# Hermes-loop
+# Hermes-loop Skill
 
-Turn Hermes kanban into a software factory for multi-hour and multi-day work trains.
+Turn Hermes kanban into a software factory for multi-hour and multi-day
+work trains with human freeze and SHA-tied review. It does not merge code,
+replace human approval, or use the kernel review column.
 
-**Roles (nouns, not people):**
-- **spec-orchestrator** — research, interview, file the packet, own the root card, spawn build/review tasks
-- **builder** — implement one unit inside the packet
-- **reviewer** — adversarial review of one handoff at one git SHA
-- **human** — freeze packets into `ready`, merge code
-
-Load the matching procedure under `references/` for the role you are playing. Shared invariants live in `references/protocol.md` only — do not fork them into three copies.
-
-## When to use
+## When to Use
 
 - You want a queue that survives crashes and restarts (kanban + gateway dispatcher)
 - Work is larger than one chat turn but can be sliced into day-or-less units
 - You need human freeze before agents spend build tokens
 - You need SHA-tied review evidence before a human merges
 
-## Prerequisites (checked)
+## Prerequisites
 
 1. Gateway running if you want automatic dispatch of `ready` tasks
 2. **`kanban.auto_decompose: false`** while using triage freeze (default true will fan-out packets before human approval)
@@ -42,18 +36,14 @@ hermes config set kanban.auto_decompose false
 hermes gateway status   # or start
 ```
 
-## Quick cycle
+## How to Run
 
-1. Spec-orchestrator files root packet in **`triage`** with full AC/NG/packet version/repo (template: `templates/packet.md`).
-2. **Human freezes** the unchanged packet: direct status move `triage` → `ready` (dashboard drag, or API status write). Do **not** run Specify or Decompose on the approved packet.
-3. Spec-orchestrator (or dispatcher) creates an ordinary **build** child task (worktree), not kernel status tricks.
-4. Builder implements only AC-N, preserves NG-N, returns `templates/build-handoff.md` with **full git SHA**.
-5. Spec-orchestrator creates a **separate ordinary review task** (reviewer profile). **Never use the kernel `review` column** for Hermes-loop v1.
-6. Reviewer returns `templates/review-verdict.md` tied to that full SHA. Fixer mode off — no push, no merge.
-7. Changes requested → new build-fix task → new review task.
-8. **Human merges** only when latest verdict full SHA equals PR head SHA (and CI policy is satisfied). Agents never merge.
+1. Read `references/protocol.md` for the shared invariants.
+2. Load the reference for your current role.
+3. Use the matching template for the packet, build handoff, or review verdict.
+4. Keep every worker unit to one day or less and link it to the root packet.
 
-## Procedures
+## Quick Reference
 
 | Role | File |
 |------|------|
@@ -62,7 +52,41 @@ hermes gateway status   # or start
 | Builder | `references/build.md` |
 | Reviewer | `references/review.md` |
 
-## Hard limits
+| Artifact | Template |
+|----------|----------|
+| Frozen packet | `templates/packet.md` |
+| Build evidence | `templates/build-handoff.md` |
+| Review verdict | `templates/review-verdict.md` |
+
+Roles are nouns, not people:
+
+- **spec-orchestrator** researches, files the packet, owns the root card, and creates build and review tasks
+- **builder** implements one unit inside the packet
+- **reviewer** adversarially reviews one handoff at one git SHA
+- **human** freezes packets into `ready` and merges code
+
+## Procedure
+
+1. Spec-orchestrator files the root packet in **`triage`** with full AC,
+   NG, packet version, and repository using `templates/packet.md`.
+2. **Human freezes** the unchanged packet with a direct status move from
+   `triage` to `ready`. Do **not** run Specify or Decompose on the approved
+   packet.
+3. Spec-orchestrator or dispatcher creates an ordinary **build** child task
+   in a worktree, not a kernel status shortcut.
+4. Builder implements only AC-N, preserves NG-N, and returns
+   `templates/build-handoff.md` with the **full git SHA**.
+5. Spec-orchestrator creates a **separate ordinary review task** with the
+   reviewer profile. **Never use the kernel `review` column** for
+   Hermes-loop v1.
+6. Reviewer returns `templates/review-verdict.md` tied to that full SHA.
+   Fixer mode stays off, with no push and no merge.
+7. If changes are requested, create a new build-fix task followed by a new
+   review task.
+8. **Human merges** only when the latest verdict SHA equals the PR head SHA
+   and CI policy is satisfied. Agents never merge.
+
+## Pitfalls
 
 - No agent merge, auto-merge, deploy, credential changes, or destructive ops outside the packet
 - No kernel kanban `review` status for this loop
@@ -70,7 +94,18 @@ hermes gateway status   # or start
 - Missing required CI → human review path, never auto-approve
 - Forge labels (if used) are optional projections, never authority
 - Pre-freeze packets stay in **`triage`** (parent-free `todo` auto-readies)
+- Do not copy shared invariants into each role file. Keep them in
+  `references/protocol.md`.
+- A multi-day effort is a graph of one-day-or-less worker units, not one
+  immortal chat session. Heartbeats and reclaim keep workers honest, while
+  the board remains the memory.
 
-## Long trains
+## Verification
 
-A multi-day effort is a **graph of one-day-or-less worker units**, not one immortal chat session. Heartbeats and reclaim keep workers honest; the board is the memory.
+- Confirm `kanban.auto_decompose` is `false` before moving a packet to
+  `ready`.
+- Confirm the frozen packet version is unchanged before creating build
+  tasks.
+- Confirm every build handoff and review verdict names the full commit SHA.
+- Confirm the latest verdict SHA equals the PR head SHA.
+- Confirm required CI passes before the human merge path.

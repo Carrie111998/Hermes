@@ -1,6 +1,7 @@
 """Hermetic contract tests for the bundled hermes-loop skill."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +28,26 @@ def test_skill_layout_and_frontmatter():
     assert (SKILL_DIR / "templates").is_dir()
     for name in ("packet.md", "build-handoff.md", "review-verdict.md"):
         assert (TEMPLATES / name).is_file()
+
+
+def test_frontmatter_description_contract():
+    text = _read(SKILL_MD)
+    match = re.search(r'^description: "(.*)"$', text, re.MULTILINE)
+    assert match is not None
+    description = match.group(1)
+    assert len(description) <= 60
+    assert description.endswith(".")
+    assert description.count(".") == 1
+    assert "?" not in description and "!" not in description
+
+
+def test_human_contributor_is_credited_first():
+    text = _read(SKILL_MD)
+    match = re.search(r"^author: (.*)$", text, re.MULTILINE)
+    assert match is not None
+    author = match.group(1)
+    assert author.startswith("Joel Brilliant (@joelbrilliant)")
+    assert author.endswith("Hermes Agent")
 
 
 def test_manual_freeze_and_triage_rules():
