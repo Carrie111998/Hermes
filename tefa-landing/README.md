@@ -1,5 +1,11 @@
 # Vendor storefront landing page
 
+## Current launch status
+
+**Recommendation: hold public launch and prepare an ESA-only release.** General Store remains a development preview and must not appear to accept real orders or payments. The ESA path is the priority, but its public placeholders, illustrative pricing, stand-in product-detail routing, and operator-light quote flow must be completed before customer launch.
+
+See [LAUNCH_AUDIT.md](LAUNCH_AUDIT.md) for the keep / improve / trim / hide-relabel matrix, remaining blockers, and launch gates.
+
 A self-contained storefront page for families spending TEFA and other state education
 funds with MMM Investment. `index.html` is the deliverable: one file, no build step to
 view it, no network requests at all. Open it in a browser, upload it to any static host,
