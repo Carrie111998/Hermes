@@ -1583,13 +1583,18 @@ class SessionStore:
 
     @staticmethod
     def _routing_payload_signature(entry_dict: Dict[str, Any]) -> str:
-        """Order-insensitive signature of a routing payload for change detection.
+        """Order-insensitive JSON signature for routing change detection.
 
         Computed identically at load (baseline capture) and at save (live
         comparison) so an entry that was loaded and never mutated compares
         equal and is not re-upserted over a sibling's concurrent update.
+        Round-trip through the normal JSON encoder first: metadata accepts any
+        JSON-serializable mapping, including mixed integer/string keys that
+        ``sort_keys=True`` cannot compare directly. The round-trip also matches
+        the canonical table's JSON object-key coercion semantics.
         """
-        return json.dumps(entry_dict, sort_keys=True)
+        normalized = json.loads(json.dumps(entry_dict))
+        return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
     def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
         """Serialize all whole-index writers through one durable write lock."""

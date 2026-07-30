@@ -1372,6 +1372,27 @@ class TestGatewayRoutingTable:
         assert rehydrated.model_override == {"model": "test-model"}
         restarted._db.close()
 
+    def test_mixed_json_mapping_keys_persist_to_canonical_store(self, tmp_path):
+        """Change detection accepts every mapping the JSON encoder accepts."""
+        config = GatewayConfig(write_sessions_json=False)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = store.get_or_create_session(self._source())
+
+        assert store.set_session_metadata(
+            entry.session_key,
+            "mixed_mapping",
+            {1: "integer key", "2": "string key"},
+        )
+        assert store._db is not None
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        assert restarted.get_session_metadata(
+            entry.session_key, "mixed_mapping"
+        ) == {"1": "integer key", "2": "string key"}
+        assert restarted._db is not None
+        restarted._db.close()
+
     def test_write_sessions_json_false_stops_producing_file(self, tmp_path):
         config = GatewayConfig(write_sessions_json=False)
         store = SessionStore(sessions_dir=tmp_path, config=config)
