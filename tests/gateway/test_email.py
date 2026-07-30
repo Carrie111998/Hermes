@@ -20,7 +20,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock, AsyncMock, call
 
 from gateway.platforms.base import SendResult
 
@@ -549,7 +549,7 @@ class TestThreadContext(unittest.TestCase):
         }
 
         asyncio.run(adapter._dispatch_message(msg_data))
-        ctx = adapter._thread_context.get("user@test.com")
+        ctx = adapter._thread_context.get("<original@test.com>")
         self.assertIsNotNone(ctx)
         self.assertEqual(ctx["subject"], "Project question")
         self.assertEqual(ctx["message_id"], "<original@test.com>")
@@ -557,10 +557,12 @@ class TestThreadContext(unittest.TestCase):
     def test_reply_uses_re_prefix(self):
         """Reply subject should have Re: prefix."""
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {
-            "subject": "Project question",
-            "message_id": "<original@test.com>",
-        }
+        adapter._store_thread_context(
+            sender="user@test.com",
+            subject="Project question",
+            message_id="<original@test.com>",
+            references="",
+        )
 
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
@@ -578,10 +580,12 @@ class TestThreadContext(unittest.TestCase):
     def test_reply_does_not_double_re(self):
         """If subject already has Re:, don't add another."""
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {
-            "subject": "Re: Project question",
-            "message_id": "<reply@test.com>",
-        }
+        adapter._store_thread_context(
+            sender="user@test.com",
+            subject="Re: Project question",
+            message_id="<reply@test.com>",
+            references="",
+        )
 
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
@@ -606,6 +610,258 @@ class TestThreadContext(unittest.TestCase):
             send_call = mock_server.send_message.call_args[0][0]
             self.assertEqual(send_call["Subject"], "Re: Hermes Agent")
             self.assertIn("Date", send_call)
+
+    def test_reverse_order_replies_from_same_sender_keep_their_threads(self):
+        """Explicit reply ids must not use sender-latest context."""
+        import asyncio
+        adapter = self._make_adapter()
+        adapter.handle_message = AsyncMock()
+
+        first = {
+            "uid": b"11",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "First thread",
+            "message_id": "<first@test.com>",
+            "in_reply_to": "",
+            "references": "<root-first@test.com>",
+            "body": "First",
+            "attachments": [],
+            "date": "Wed, 30 Jul 2026 10:00:00 +0800",
+        }
+        second = {
+            **first,
+            "uid": b"12",
+            "subject": "Second thread",
+            "message_id": "<second@test.com>",
+            "references": "<root-second@test.com>",
+            "body": "Second",
+        }
+        with patch.dict(os.environ, {"EMAIL_ALLOWED_USERS": ""}):
+            asyncio.run(adapter._dispatch_message(first))
+            asyncio.run(adapter._dispatch_message(second))
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            adapter._send_email(
+                "user@test.com", "second reply", "<second@test.com>"
+            )
+            adapter._send_email(
+                "user@test.com", "first reply", "<first@test.com>"
+            )
+
+        second_reply, first_reply = [
+            call.args[0] for call in mock_server.send_message.call_args_list
+        ]
+        self.assertEqual(second_reply["Subject"], "Re: Second thread")
+        self.assertEqual(second_reply["In-Reply-To"], "<second@test.com>")
+        self.assertEqual(
+            second_reply["References"],
+            "<root-second@test.com> <second@test.com>",
+        )
+        self.assertEqual(first_reply["Subject"], "Re: First thread")
+        self.assertEqual(first_reply["In-Reply-To"], "<first@test.com>")
+        self.assertEqual(
+            first_reply["References"],
+            "<root-first@test.com> <first@test.com>",
+        )
+
+    def test_thread_context_has_deterministic_cap(self):
+        adapter = self._make_adapter()
+        adapter._thread_context_max = 2
+        for index in range(3):
+            adapter._store_thread_context(
+                sender="user@test.com",
+                subject=f"Thread {index}",
+                message_id=f"<message-{index}@test.com>",
+                references="",
+            )
+
+        self.assertEqual(
+            list(adapter._thread_context),
+            ["<message-1@test.com>", "<message-2@test.com>"],
+        )
+
+
+class TestWorkflowIngressTap(unittest.TestCase):
+    """Workflow ledger intake must happen before conversational handling."""
+
+    def _message(self):
+        return {
+            "uid": b"20",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "Booking status",
+            "message_id": "<workflow@test.com>",
+            "in_reply_to": "<parent@test.com>",
+            "references": "<root@test.com> <parent@test.com>",
+            "body": "Raw inbound body\nwith a second line.",
+            "attachments": [],
+            "date": "Wed, 30 Jul 2026 11:00:00 +0800",
+        }
+
+    def _make_adapter(self, callback=None):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.email import EmailAdapter
+        return EmailAdapter(
+            PlatformConfig(enabled=True),
+            workflow_ingress_callback=callback,
+        )
+
+    def test_callback_envelope_and_order(self):
+        import asyncio
+        import tempfile
+
+        order = []
+        envelopes = []
+
+        async def callback(envelope):
+            order.append("callback")
+            envelopes.append(envelope)
+
+        with tempfile.TemporaryDirectory() as hermes_home, patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": hermes_home,
+                "EMAIL_ADDRESS": "hermes@test.com",
+                "EMAIL_PASSWORD": "secret",
+                "EMAIL_IMAP_HOST": "imap.test.com",
+                "EMAIL_SMTP_HOST": "smtp.test.com",
+                "EMAIL_ALLOWED_USERS": "",
+            },
+        ):
+            adapter = self._make_adapter(callback)
+
+            async def handle_message(_event):
+                order.append("handle")
+
+            adapter.handle_message = handle_message
+            asyncio.run(adapter._dispatch_message(self._message()))
+            body_path = Path(envelopes[0]["body_ref"])
+            body_exists = body_path.exists()
+            persisted_body = body_path.read_text()
+
+        self.assertEqual(order, ["callback", "handle"])
+        self.assertEqual(
+            set(envelopes[0]),
+            {
+                "source",
+                "external_id",
+                "sender",
+                "subject",
+                "date",
+                "in_reply_to",
+                "references",
+                "body_ref",
+            },
+        )
+        self.assertEqual(envelopes[0]["source"], "email")
+        self.assertEqual(envelopes[0]["external_id"], "<workflow@test.com>")
+        self.assertEqual(envelopes[0]["sender"], "user@test.com")
+        self.assertEqual(envelopes[0]["subject"], "Booking status")
+        self.assertEqual(
+            envelopes[0]["date"], "Wed, 30 Jul 2026 11:00:00 +0800"
+        )
+        self.assertEqual(envelopes[0]["in_reply_to"], "<parent@test.com>")
+        self.assertEqual(
+            envelopes[0]["references"],
+            "<root@test.com> <parent@test.com>",
+        )
+        self.assertNotIn("body", envelopes[0])
+        self.assertTrue(body_exists)
+        self.assertEqual(persisted_body, self._message()["body"])
+
+    def test_callback_failure_prevents_conversational_handling(self):
+        import asyncio
+        import tempfile
+
+        async def callback(_envelope):
+            raise RuntimeError("ledger unavailable")
+
+        with tempfile.TemporaryDirectory() as hermes_home, patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": hermes_home,
+                "EMAIL_ADDRESS": "hermes@test.com",
+                "EMAIL_PASSWORD": "secret",
+                "EMAIL_IMAP_HOST": "imap.test.com",
+                "EMAIL_SMTP_HOST": "smtp.test.com",
+                "EMAIL_ALLOWED_USERS": "",
+            },
+        ):
+            adapter = self._make_adapter(callback)
+            adapter.handle_message = AsyncMock()
+
+            with self.assertRaisesRegex(RuntimeError, "ledger unavailable"):
+                asyncio.run(adapter._dispatch_message(self._message()))
+
+        adapter.handle_message.assert_not_awaited()
+        self.assertNotIn("<workflow@test.com>", adapter._thread_context)
+
+    def test_no_callback_still_handles_conversation(self):
+        import asyncio
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as hermes_home, patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": hermes_home,
+                "EMAIL_ADDRESS": "hermes@test.com",
+                "EMAIL_PASSWORD": "secret",
+                "EMAIL_IMAP_HOST": "imap.test.com",
+                "EMAIL_SMTP_HOST": "smtp.test.com",
+                "EMAIL_ALLOWED_USERS": "",
+            },
+        ):
+            adapter = self._make_adapter()
+            adapter.handle_message = AsyncMock()
+            asyncio.run(adapter._dispatch_message(self._message()))
+            workflow_dir = Path(hermes_home) / "workflow"
+
+        adapter.handle_message.assert_awaited_once()
+        self.assertFalse(workflow_dir.exists())
+
+    def test_missing_message_id_uses_deterministic_digest(self):
+        from gateway.platforms.email import EmailAdapter
+        message = self._message()
+        message["message_id"] = ""
+        first = EmailAdapter._stable_external_id(message)
+        second = EmailAdapter._stable_external_id(dict(message))
+        self.assertEqual(first, second)
+        self.assertRegex(
+            first,
+            r"^<email-sha256-[0-9a-f]{64}@hermes\.local>$",
+        )
+
+    def test_body_store_repairs_truncated_content_addressed_file(self):
+        import hashlib
+        import tempfile
+        from gateway.platforms.email import EmailAdapter
+
+        body = "complete workflow body"
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as hermes_home, patch.dict(
+            os.environ,
+            {"HERMES_HOME": hermes_home},
+        ):
+            body_dir = (
+                Path(hermes_home)
+                / "workflow"
+                / "ingress"
+                / "email"
+                / "bodies"
+            )
+            body_dir.mkdir(parents=True)
+            body_path = body_dir / f"{digest}.txt"
+            body_path.write_text("truncated")
+
+            body_ref = EmailAdapter._persist_workflow_body(body)
+
+            self.assertEqual(Path(body_ref), body_path)
+            self.assertEqual(body_path.read_text(), body)
+            self.assertEqual(body_path.stat().st_mode & 0o777, 0o600)
 
 
 class TestSendMethods(unittest.TestCase):
@@ -706,6 +962,78 @@ class TestSendMethods(unittest.TestCase):
         finally:
             os.unlink(tmp_path)
 
+    def test_document_uses_explicit_reply_context(self):
+        """Document sends must not fall back to the sender's latest message."""
+        import asyncio
+        import tempfile
+        adapter = self._make_adapter()
+        adapter._store_thread_context(
+            sender="user@test.com",
+            subject="Older document thread",
+            message_id="<document-old@test.com>",
+            references="<document-root@test.com>",
+        )
+        adapter._store_thread_context(
+            sender="user@test.com",
+            subject="Latest unrelated thread",
+            message_id="<document-new@test.com>",
+            references="",
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            f.write(b"document")
+            tmp_path = f.name
+        try:
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+                result = asyncio.run(
+                    adapter.send_document(
+                        "user@test.com",
+                        tmp_path,
+                        reply_to="<document-old@test.com>",
+                    )
+                )
+
+            self.assertTrue(result.success)
+            sent = mock_server.send_message.call_args.args[0]
+            self.assertEqual(sent["Subject"], "Re: Older document thread")
+            self.assertEqual(sent["In-Reply-To"], "<document-old@test.com>")
+            self.assertEqual(
+                sent["References"],
+                "<document-root@test.com> <document-old@test.com>",
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_multi_attachment_uses_explicit_reply_metadata(self):
+        """Batched attachment sends resolve an explicit metadata anchor."""
+        adapter = self._make_adapter()
+        adapter._store_thread_context(
+            sender="user@test.com",
+            subject="Attachment thread",
+            message_id="<attachment@test.com>",
+            references="<attachment-root@test.com>",
+        )
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            adapter._send_email_with_attachments(
+                "user@test.com",
+                "files",
+                [],
+                metadata={"reply_to_message_id": "<attachment@test.com>"},
+            )
+
+        sent = mock_server.send_message.call_args.args[0]
+        self.assertEqual(sent["Subject"], "Re: Attachment thread")
+        self.assertEqual(sent["In-Reply-To"], "<attachment@test.com>")
+        self.assertEqual(
+            sent["References"],
+            "<attachment-root@test.com> <attachment@test.com>",
+        )
+
     def test_send_typing_is_noop(self):
         """send_typing should do nothing for email."""
         import asyncio
@@ -717,7 +1045,12 @@ class TestSendMethods(unittest.TestCase):
         """get_chat_info should return email address as chat info."""
         import asyncio
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {"subject": "Test", "message_id": "<m@t>"}
+        adapter._store_thread_context(
+            sender="user@test.com",
+            subject="Test",
+            message_id="<m@t>",
+            references="",
+        )
 
         info = asyncio.run(
             adapter.get_chat_info("user@test.com")
@@ -845,10 +1178,16 @@ class TestFetchNewMessages(unittest.TestCase):
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
             results = adapter._fetch_new_messages()
 
-        # Only UID 3 should be fetched (1 and 2 already seen)
+        # Only UID 3 should be fetched (1 and 2 already seen). Fetching alone
+        # must not mark it handled; that happens only after dispatch succeeds.
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["sender_addr"], "user@test.com")
-        self.assertIn(b"3", adapter._seen_uids)
+        self.assertNotIn(b"3", adapter._seen_uids)
+        fetch_call = next(
+            call for call in mock_imap.uid.call_args_list
+            if call.args[0] == "fetch"
+        )
+        self.assertEqual(fetch_call.args[2], "(BODY.PEEK[])")
 
     def test_fetch_no_unseen_messages(self):
         """No unseen messages returns empty list."""
@@ -897,6 +1236,83 @@ class TestFetchNewMessages(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["sender_addr"], "john@test.com")
         self.assertEqual(results[0]["sender_name"], "John Doe")
+
+    def test_fetch_retains_references_header(self):
+        adapter = self._make_adapter()
+        raw_email = MIMEText("Hello", "plain", "utf-8")
+        raw_email["From"] = "user@test.com"
+        raw_email["Subject"] = "Re: Test"
+        raw_email["Message-ID"] = "<current@test.com>"
+        raw_email["In-Reply-To"] = "<parent@test.com>"
+        raw_email["References"] = "<root@test.com> <parent@test.com>"
+
+        mock_imap = MagicMock()
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                return ("OK", [(b"1", raw_email.as_bytes())])
+            return ("NO", [])
+
+        mock_imap.uid.side_effect = uid_handler
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            results = adapter._fetch_new_messages()
+
+        self.assertEqual(results[0]["in_reply_to"], "<parent@test.com>")
+        self.assertEqual(
+            results[0]["references"], "<root@test.com> <parent@test.com>"
+        )
+
+    def test_fetch_automated_sender_is_terminally_marked_seen(self):
+        adapter = self._make_adapter()
+        raw_email = MIMEText("Automated", "plain", "utf-8")
+        raw_email["From"] = "noreply@test.com"
+        raw_email["Subject"] = "Notification"
+        raw_email["Message-ID"] = "<auto@test.com>"
+
+        mock_imap = MagicMock()
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"7"])
+            if command == "fetch":
+                return ("OK", [(b"7", raw_email.as_bytes())])
+            if command == "store":
+                return ("OK", [b""])
+            return ("NO", [])
+
+        mock_imap.uid.side_effect = uid_handler
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            first = adapter._fetch_new_messages()
+            second = adapter._fetch_new_messages()
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertIn(b"7", adapter._seen_uids)
+        fetch_calls = [
+            call for call in mock_imap.uid.call_args_list
+            if call.args[0] == "fetch"
+        ]
+        self.assertEqual(len(fetch_calls), 1)
+        self.assertIn(
+            call("store", b"7", "+FLAGS", r"(\Seen)"),
+            mock_imap.uid.call_args_list,
+        )
+
+    def test_mark_message_seen_uses_uid_store(self):
+        adapter = self._make_adapter()
+        mock_imap = MagicMock()
+        mock_imap.uid.return_value = ("OK", [b""])
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            marked = adapter._mark_message_seen(b"42")
+
+        self.assertTrue(marked)
+        mock_imap.uid.assert_called_once_with(
+            "store", b"42", "+FLAGS", r"(\Seen)"
+        )
+        mock_imap.logout.assert_called_once()
 
 
 class TestPollLoop(unittest.TestCase):
@@ -947,6 +1363,45 @@ class TestPollLoop(unittest.TestCase):
 
         self.assertEqual(len(dispatched), 1)
         self.assertEqual(dispatched[0]["subject"], "Inbox Test")
+
+    def test_check_inbox_failure_leaves_message_unseen_and_continues_batch(self):
+        """One failed ledger tap must not lose or block unrelated messages."""
+        import asyncio
+        adapter = self._make_adapter()
+        messages = [
+            {"uid": b"1", "subject": "fails"},
+            {"uid": b"2", "subject": "works"},
+        ]
+        dispatched = []
+
+        async def mock_dispatch(msg_data):
+            dispatched.append(msg_data["uid"])
+            if msg_data["uid"] == b"1":
+                raise RuntimeError("ledger unavailable")
+
+        adapter._fetch_new_messages = MagicMock(return_value=messages)
+        adapter._dispatch_message = mock_dispatch
+        adapter._mark_message_seen = MagicMock(return_value=True)
+
+        asyncio.run(adapter._check_inbox())
+
+        self.assertEqual(dispatched, [b"1", b"2"])
+        adapter._mark_message_seen.assert_called_once_with(b"2")
+        self.assertNotIn(b"1", adapter._seen_uids)
+        self.assertIn(b"2", adapter._seen_uids)
+
+    def test_check_inbox_remembers_success_when_seen_store_fails(self):
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._fetch_new_messages = MagicMock(
+            return_value=[{"uid": b"9", "subject": "handled"}]
+        )
+        adapter._dispatch_message = AsyncMock()
+        adapter._mark_message_seen = MagicMock(return_value=False)
+
+        asyncio.run(adapter._check_inbox())
+
+        self.assertIn(b"9", adapter._seen_uids)
 
 
 class TestSendEmailStandalone(unittest.TestCase):
