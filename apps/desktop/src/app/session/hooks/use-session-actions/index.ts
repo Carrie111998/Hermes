@@ -794,10 +794,17 @@ export function useSessionActions({
                   // persisted transcript opens a second window for a live event.
                   const overtaken = state.busyRevision !== busyRevisionAtActivate
 
+                  const messages = overtaken
+                    ? preserveLocalPendingTurnMessages(
+                        reconcileResumeMessages(activatedMessages, state.messages),
+                        state.messages
+                      )
+                    : activatedMessages
+
                   return {
                     ...state,
                     ...(runtimeInfo ?? {}),
-                    messages: activatedMessages,
+                    messages,
                     busy: overtaken ? state.busy : effectiveRunning,
                     awaitingResponse: overtaken ? state.awaitingResponse : effectiveRunning
                   }

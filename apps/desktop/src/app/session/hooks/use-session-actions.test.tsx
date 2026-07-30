@@ -36,6 +36,7 @@ import {
   setSessions
 } from '@/store/session'
 import { $sessionTiles } from '@/store/session-states'
+import type { SessionResumeResponse } from '@/types/hermes'
 
 import { sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
@@ -1085,6 +1086,74 @@ describe('resumeSession busy ordering guard', () => {
     // dropped the session out of $workingSessionIds mid-turn.
     expect(committed.busy).toBe(true)
     expect(committed.awaitingResponse).toBe(true)
+  })
+
+  it('keeps a prompt that starts while the persisted transcript is awaited', async () => {
+    const refs = warmCache({ busy: false, busyRevision: 3 })
+    const activation = deferred<SessionResumeResponse>()
+    const persisted = deferred<Awaited<ReturnType<typeof getSessionMessages>>>()
+
+    setSessions([storedSession({ message_count: 2 })])
+    vi.mocked(getSessionMessages).mockReturnValue(persisted.promise)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return activation.promise as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        requestGateway={requestGateway}
+        {...refs}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    const resumePromise = resume!('stored-1', true)
+
+    await act(async () => {
+      activation.resolve({
+        info: {},
+        message_count: 0,
+        messages: [],
+        resumed: 'stored-1',
+        running: false,
+        session_id: 'runtime-live'
+      })
+      await Promise.resolve()
+    })
+
+    const live = refs.sessionStateByRuntimeIdRef.current.get('runtime-live')!
+    refs.sessionStateByRuntimeIdRef.current.set('runtime-live', {
+      ...live,
+      awaitingResponse: true,
+      busy: true,
+      busyRevision: live.busyRevision + 1,
+      messages: [
+        ...live.messages,
+        {
+          id: 'user-live-prompt',
+          parts: [{ text: 'new prompt during persisted read', type: 'text' }],
+          pending: true,
+          role: 'user'
+        }
+      ]
+    })
+
+    persisted.resolve({
+      messages: [{ content: 'earlier turn', role: 'user', timestamp: 1 }],
+      session_id: 'stored-1'
+    } as never)
+    await resumePromise
+
+    const committed = refs.sessionStateByRuntimeIdRef.current.get('runtime-live')!
+    expect(committed.busy).toBe(true)
+    expect(committed.awaitingResponse).toBe(true)
+    expect(committed.messages.some(message => message.id === 'user-live-prompt')).toBe(true)
   })
 
   it('still clears busy when no live event overtook the snapshot', async () => {
