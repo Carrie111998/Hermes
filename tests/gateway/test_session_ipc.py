@@ -302,6 +302,34 @@ async def test_active_route_steer_fallback_uses_bounded_fifo_queue():
 
 
 @pytest.mark.asyncio
+async def test_active_route_queue_mutation_runs_on_gateway_event_loop(
+    monkeypatch,
+):
+    runner, adapter = _runner(_entry())
+    runner._running_agents[SESSION_KEY] = SimpleNamespace(
+        steer=Mock(return_value=False)
+    )
+    event_loop_thread = threading.get_ident()
+    mutation_threads = []
+    original_enqueue = runner._enqueue_internal_fifo_event
+
+    def record_enqueue(*args, **kwargs):
+        mutation_threads.append(threading.get_ident())
+        return original_enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runner,
+        "_enqueue_internal_fifo_event",
+        record_enqueue,
+    )
+
+    proof = await _inject(runner, "Queue on the owning loop")
+
+    assert proof["disposition"] == "queued"
+    assert mutation_threads == [event_loop_thread]
+
+
+@pytest.mark.asyncio
 async def test_internal_task_uses_separate_fifo_and_queue_full_preserves_user_media():
     runner, adapter = _runner(_entry())
     runner._running_agents[SESSION_KEY] = SimpleNamespace(steer=Mock(return_value=False))
@@ -391,6 +419,26 @@ def test_concurrent_user_and_ipc_admission_never_exceeds_busy_queue_cap(monkeypa
     assert not ipc_thread.is_alive()
     assert original_depth(SESSION_KEY, adapter=adapter) <= runner._BUSY_QUEUE_MAX_PENDING
     assert len(ipc_result) == 1
+
+
+def test_internal_enqueue_reports_its_own_committed_mutation(monkeypatch):
+    runner, adapter = _runner(_entry())
+    event = _new_gateway_session_ipc_event(
+        text="exact internal task",
+        message_type=MessageType.TEXT,
+        source=_source(),
+        internal=True,
+    )
+    monkeypatch.setattr(runner, "_queue_depth", Mock(return_value=0))
+
+    accepted = runner._enqueue_internal_fifo_event(
+        SESSION_KEY,
+        event,
+        adapter,
+    )
+
+    assert accepted is True
+    assert adapter._pending_messages[SESSION_KEY] is event
 
 
 def test_trusted_slash_task_survives_drain_as_inert_text_while_user_slash_is_blocked():
@@ -1212,4 +1260,69 @@ def test_named_profile_inject_uses_default_multiplexer_socket(tmp_path, capsys):
         message="Route this exactly",
         hermes_home=default_home,
     )
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_stale_named_profile_socket_falls_back_to_default_multiplexer(
+    tmp_path, capsys
+):
+    active_socket = tmp_path / "named" / "run" / "gateway-session.sock"
+    active_socket.parent.mkdir(parents=True)
+    active_socket.touch()
+    default_home = tmp_path / "default"
+    default_socket = default_home / "run" / "gateway-session.sock"
+    default_socket.parent.mkdir(parents=True)
+    default_socket.touch()
+    success = {
+        "ok": True,
+        "profile": "jasper",
+        "session_key": SESSION_KEY,
+        "session_id": SESSION_ID,
+        "disposition": "queued",
+    }
+    inject_mock = Mock(
+        side_effect=[
+            SessionIPCRequestError(
+                "gateway_unavailable",
+                "named socket refused connection",
+            ),
+            success,
+        ]
+    )
+
+    def socket_path(home=None):
+        return default_socket if home == default_home else active_socket
+
+    with (
+        patch(
+            "hermes_cli.profiles.get_active_profile_name",
+            return_value="jasper",
+        ),
+        patch(
+            "hermes_constants.get_default_hermes_root",
+            return_value=default_home,
+        ),
+        patch(
+            "gateway.session_ipc.gateway_session_socket_path",
+            side_effect=socket_path,
+        ),
+        patch(
+            "gateway.session_ipc.inject_gateway_session",
+            inject_mock,
+        ),
+    ):
+        _gateway_command_inner(
+            SimpleNamespace(
+                gateway_command="inject",
+                session_key=SESSION_KEY,
+                expected_session_id=SESSION_ID,
+                idempotency_key="multiplex-task-stale-socket",
+                message="Route this exactly",
+            )
+        )
+
+    assert [call.kwargs["hermes_home"] for call in inject_mock.call_args_list] == [
+        None,
+        default_home,
+    ]
     assert json.loads(capsys.readouterr().out)["ok"] is True

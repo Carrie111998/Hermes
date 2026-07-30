@@ -211,6 +211,28 @@ class TestActiveTurnRedirect:
 
         assert calls == ["interrupt"]
 
+    def test_codex_app_server_steer_reaches_native_session(self):
+        agent = _bare_agent()
+        calls = []
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = type(
+            "_CodexSession",
+            (),
+            {
+                "request_steer": (
+                    lambda self, text: calls.append(text) or True
+                )
+            },
+        )()
+        agent._open_steer_admission()
+
+        assert agent.steer(
+            "/restart trusted task",
+            _gateway_session_ipc=True,
+        )
+        assert calls == ["/restart trusted task"]
+        assert agent._pending_steer is None
+
 
     def test_redirect_during_tool_execution_uses_safe_steer_boundary(self):
         agent = _bare_agent()

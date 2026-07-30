@@ -7387,6 +7387,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 pending_slot[session_key] = queued_event
 
+    def _merge_pending_event(
+        self,
+        adapter: Any,
+        session_key: str,
+        event: "MessageEvent",
+        *,
+        merge_text: bool = False,
+    ) -> None:
+        """Merge a user/media follow-up under the shared pending-slot lock."""
+        with self._busy_queue_guard():
+            merge_pending_message_event(
+                adapter._pending_messages,
+                session_key,
+                event,
+                merge_text=merge_text,
+            )
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -8442,9 +8459,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> bool:
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             return False
-        before = self._queue_depth(session_key, adapter=adapter)
-        self._enqueue_fifo(session_key, event, adapter)
-        return self._queue_depth(session_key, adapter=adapter) == before + 1
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if pending_slot is None:
+            return False
+        if session_key in pending_slot:
+            self._session_state(
+                session_key
+            ).conversation.queued_events.append(event)
+        else:
+            pending_slot[session_key] = event
+        # The caller owns this mutation under _busy_queue_guard; do not infer
+        # success from the aggregate depth, which sibling admissions can also
+        # change before a second measurement.
+        return True
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -11809,6 +11836,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         return bool(adapter.accept_internal_task(event, session_key))
 
+    async def _enqueue_internal_task_on_loop(
+        self,
+        adapter: Any,
+        event: MessageEvent,
+        session_key: str,
+        cancelled: threading.Event,
+    ) -> bool:
+        """Serialize the busy-queue mutation with ordinary gateway dispatch."""
+        if cancelled.is_set():
+            return False
+        return self._enqueue_internal_fifo_event(
+            session_key,
+            event,
+            adapter,
+        )
+
     def _inject_exact_session_sync(
         self,
         *,
@@ -11967,7 +12010,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             with mutation_gate:
                 ensure_not_cancelled()
                 if session_key in getattr(self, "_running_agents", {}):
-                    if not self._enqueue_internal_fifo_event(session_key, event, adapter):
+                    accepted = asyncio.run_coroutine_threadsafe(
+                        self._enqueue_internal_task_on_loop(
+                            adapter,
+                            event,
+                            session_key,
+                            cancelled,
+                        ),
+                        event_loop,
+                    ).result()
+                    if not accepted:
                         raise SessionIPCRequestError(
                             "queue_full",
                             f"Pending queue is full for exact route {session_key!r}",
@@ -13907,7 +13959,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
                 )
-                adapter._pending_messages[quick_key] = queued_event
+                self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
@@ -13930,7 +13982,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
             )
-            adapter._pending_messages[quick_key] = queued_event
+            self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
@@ -14422,7 +14474,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    self._merge_pending_event(adapter, _quick_key, event)
                 return None
 
             _telegram_followup_grace = float(
@@ -14447,8 +14499,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if self._busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
+                        self._merge_pending_event(
+                            adapter,
                             _quick_key,
                             event,
                             merge_text=True,
@@ -14468,8 +14520,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
+                    self._merge_pending_event(
+                        adapter,
                         _quick_key,
                         event,
                         merge_text=True,
@@ -24689,7 +24741,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._merge_pending_event(
+                            adapter,
+                            session_key,
+                            pending_event,
+                        )
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}

@@ -3112,6 +3112,11 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            # Codex owns its internal tool loop. Its native turn/steer request
+            # is the only live-turn admission path; the Hermes pending-tool
+            # slot below is never drained by this runtime.
+            return self.redirect(cleaned)
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
