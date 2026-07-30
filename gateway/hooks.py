@@ -102,8 +102,12 @@ class HookRegistry:
         """
         self._register_builtin_hooks()
 
-        hooks_dir = self._hooks_dir if self._hooks_dir is not None else HOOKS_DIR
-        if not hooks_dir.exists():
+        hooks_dir = (
+            self._hooks_dir
+            if self._hooks_dir is not None
+            else get_hermes_home() / "hooks"
+        )
+        if not hooks_dir.is_dir():
             return
 
         for hook_dir in sorted(hooks_dir.iterdir()):
