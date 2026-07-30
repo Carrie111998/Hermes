@@ -419,3 +419,81 @@ class TestAllowlistConcurrency:
 
         assert len(tmp_paths_seen) == 2
         assert tmp_paths_seen[0] != tmp_paths_seen[1]
+
+
+class TestInlineShellHooks:
+    """doctor must not report a healthy inline `sh -c '…'` hook as missing.
+
+    Regression for #69257. The body of an inline hook is a single shlex
+    token, so ``_command_script_path``'s "token containing /" heuristic
+    matched the body itself — a path used inside the script, or a plain
+    ``2>/dev/null`` redirect — and doctor printed "script missing or not
+    executable" for hooks that fire correctly.
+    """
+
+    # The exact command from the issue report.
+    ISSUE_COMMAND = (
+        """sh -c 'if [ -n "$X" ]; then something 2>/dev/null; else echo "{}"; fi'"""
+    )
+
+    def test_issue_repro_is_not_reported_as_a_missing_script(self):
+        assert shell_hooks._command_script_path(self.ISSUE_COMMAND) == (
+            shell_hooks.INLINE_SHELL_SENTINEL
+        )
+        assert shell_hooks.script_is_executable(self.ISSUE_COMMAND) is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sh -c 'echo hi'",
+            "bash -c 'echo hi'",
+            "/bin/bash -c 'echo hi'",
+            "sudo sh -c 'echo hi'",
+            "env FOO=bar sh -c 'echo hi'",
+            # Bundled option forms are as common as a bare -c.
+            "bash -lc 'echo hi'",
+            "zsh -fc 'echo hi'",
+            "bash -ec 'echo hi'",
+        ],
+    )
+    def test_inline_forms_are_recognized(self, command):
+        assert shell_hooks.inline_shell_interpreter(command) is not None
+        assert shell_hooks._command_script_path(command) == (
+            shell_hooks.INLINE_SHELL_SENTINEL
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python3 /path/hook.py",
+            "/usr/bin/env bash /path/hook.sh",
+            "/path/hook.sh",
+            # A shell without -c is an ordinary command, not an inline hook.
+            "bash --version",
+            "sh /path/hook.sh",
+        ],
+    )
+    def test_file_based_commands_are_untouched(self, command):
+        assert shell_hooks.inline_shell_interpreter(command) is None
+        assert shell_hooks._command_script_path(command) != (
+            shell_hooks.INLINE_SHELL_SENTINEL
+        )
+
+    def test_unavailable_interpreter_still_fails(self):
+        """A typo must not pass doctor just because it looks inline."""
+        assert shell_hooks.script_is_executable("bsh -c 'echo hi'") is False
+        assert shell_hooks.script_is_executable("nonesuch-shell -c 'echo hi'") is False
+
+    def test_inline_hook_has_no_mtime_to_drift(self):
+        """No script file means no drift tracking — and no crash."""
+        assert shell_hooks.script_mtime_iso(self.ISSUE_COMMAND) is None
+
+    def test_real_file_hook_still_requires_the_file(self, tmp_path):
+        """The file-based path keeps its existing behavior."""
+        missing = tmp_path / "nope.sh"
+        assert shell_hooks.script_is_executable(f"bash {missing}") is False
+
+        real = tmp_path / "hook.sh"
+        real.write_text("#!/bin/sh\necho '{}'\n")
+        real.chmod(0o755)
+        assert shell_hooks.script_is_executable(str(real)) is True

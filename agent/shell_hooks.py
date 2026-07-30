@@ -112,6 +112,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -805,6 +806,77 @@ _SCRIPT_EXTENSIONS: Tuple[str, ...] = (
 )
 
 
+# Shells that take a command body via a ``-c``-bearing flag. An inline hook
+# has no script file, so the path heuristic below must not treat its body as
+# one.
+_INLINE_SHELLS: Tuple[str, ...] = (
+    "sh", "bash", "dash", "zsh", "ksh", "ash", "busybox",
+)
+
+# Returned by :func:`_command_script_path` for an inline shell hook. Not a
+# real path — callers that stat it (``script_mtime_iso``) correctly get
+# nothing back, because there is no file whose mtime could drift.
+INLINE_SHELL_SENTINEL = "<inline-shell>"
+
+
+def inline_shell_interpreter(command: str) -> Optional[str]:
+    """Return the shell token when *command* is an inline ``sh -c '…'`` hook.
+
+    Recognizes ``sudo`` and ``env KEY=VALUE`` prefixes, absolute interpreters
+    (``/bin/bash -c``), and bundled option forms — ``-lc``, ``-fc`` and
+    ``-ec`` are as common as a bare ``-c`` and must not fall through to the
+    path heuristic. Returns ``None`` for anything else.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+
+    index = 0
+    while index < len(parts):
+        token = parts[index]
+        if token == "sudo":
+            index += 1
+            continue
+        if token == "env":
+            index += 1
+            # Skip NAME=VALUE assignments; stop at the real argv[0].
+            while index < len(parts) and re.match(r"^[A-Za-z_]\w*=", parts[index]):
+                index += 1
+            continue
+        break
+
+    # Need an interpreter AND a following flag.
+    if index >= len(parts) - 1:
+        return None
+    interpreter = parts[index]
+    if os.path.basename(interpreter) not in _INLINE_SHELLS:
+        return None
+    flag = parts[index + 1]
+    if not flag.startswith("-") or flag == "--" or "c" not in flag[1:]:
+        return None
+    return interpreter
+
+
+def _interpreter_is_available(interpreter: str) -> bool:
+    """Return whether *interpreter* can actually be executed.
+
+    An explicit path is checked directly; a bare name goes through ``PATH``
+    with the usual POSIX locations as a fallback, since a hook spawned by the
+    gateway may not inherit the interactive shell's ``PATH``.
+    """
+    if os.sep in interpreter or interpreter.startswith("~"):
+        expanded = os.path.expanduser(interpreter)
+        return os.path.isfile(expanded) and os.access(expanded, os.X_OK)
+    if shutil.which(interpreter):
+        return True
+    for base in ("/bin", "/usr/bin", "/usr/local/bin"):
+        candidate = os.path.join(base, interpreter)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return True
+    return False
+
+
 def _command_script_path(command: str) -> str:
     """Return the script path from ``command`` for doctor / drift checks.
 
@@ -812,7 +884,14 @@ def _command_script_path(command: str) -> str:
     containing ``/`` or leading ``~``, then the first token.  Handles
     ``python3 /path/hook.py``, ``/usr/bin/env bash hook.sh``, and the
     common bare-path form.
+
+    An inline ``sh -c '…'`` hook resolves to :data:`INLINE_SHELL_SENTINEL`
+    instead. Its body arrives as a single shlex token, so any ``/`` inside it
+    — a path used by the script, a ``2>/dev/null`` redirect — was mistaken for
+    the script path, and doctor reported "script missing" for a healthy hook.
     """
+    if inline_shell_interpreter(command) is not None:
+        return INLINE_SHELL_SENTINEL
     try:
         parts = shlex.split(command)
     except ValueError:
@@ -893,7 +972,14 @@ def script_is_executable(command: str) -> bool:
     executable.  For interpreter-prefixed commands (``python3
     /path/hook.py``, ``/usr/bin/env bash hook.sh``) the script just has
     to be readable — the interpreter doesn't care about the ``X_OK``
-    bit.  Mirrors what ``_spawn`` would actually do at runtime."""
+    bit.  Mirrors what ``_spawn`` would actually do at runtime.
+
+    An inline ``sh -c '…'`` hook has no script to stat, so it is healthy iff
+    its *interpreter* is reachable — a typo like ``bsh -c '…'`` must still
+    fail rather than pass by default."""
+    inline = inline_shell_interpreter(command)
+    if inline is not None:
+        return _interpreter_is_available(inline)
     path = _command_script_path(command)
     if not path:
         return False
