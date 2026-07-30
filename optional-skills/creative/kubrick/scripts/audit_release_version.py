@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Audit Kubrick release-version declarations against the VERSION manifest."""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+TARGETS = {
+    "SKILL.md": re.compile(r"^version:\s*([^\s]+)", re.MULTILINE),
+    "README.md": re.compile(r"<em>(0\.\d+\.\d+)\s+—"),
+    "CHANGELOG.md": re.compile(r"^## \[(0\.\d+\.\d+)\]", re.MULTILINE),
+    "docs/RELEASE-NOTES-v0.13.md": re.compile(r"^# Kubrick v(0\.\d+\.\d+) Release Notes", re.MULTILINE),
+}
+
+REQUIRED_CURRENT_REFERENCES = {
+    "README.md": ["docs/ROADMAP-v0.13.md", "docs/RELEASE-NOTES-v0.13.md"],
+    "SKILL.md": ["docs/ROADMAP-v0.13.md", "docs/RELEASE-NOTES-v0.13.md"],
+    "docs/RELEASE-CHECKLIST-v0.13.md": ["v0.13.0"],
+}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output")
+    parser.add_argument("--strict", action="store_true")
+    args = parser.parse_args()
+
+    expected = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    declarations: dict[str, str | None] = {}
+    mismatches: list[dict[str, object]] = []
+
+    for relative, pattern in TARGETS.items():
+        path = ROOT / relative
+        if not path.exists():
+            declarations[relative] = None
+            mismatches.append({"file": relative, "expected": expected, "observed": None, "reason": "missing file"})
+            continue
+        text = path.read_text(encoding="utf-8")
+        match = pattern.search(text)
+        observed = match.group(1) if match else None
+        declarations[relative] = observed
+        if observed != expected:
+            mismatches.append({"file": relative, "expected": expected, "observed": observed, "reason": "version mismatch"})
+
+    reference_checks: dict[str, dict[str, bool]] = {}
+    for relative, required_values in REQUIRED_CURRENT_REFERENCES.items():
+        path = ROOT / relative
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        checks = {value: value in text for value in required_values}
+        reference_checks[relative] = checks
+        for value, present in checks.items():
+            if not present:
+                mismatches.append(
+                    {
+                        "file": relative,
+                        "expected": value,
+                        "observed": None,
+                        "reason": "missing current release reference",
+                    }
+                )
+
+    report = {
+        "status": "READY" if not mismatches else "NOT_READY",
+        "expected_version": expected,
+        "declarations": declarations,
+        "reference_checks": reference_checks,
+        "mismatches": mismatches,
+        "tag_allowed": not mismatches,
+    }
+    rendered = json.dumps(report, indent=2)
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered, encoding="utf-8")
+    print(rendered)
+    raise SystemExit(1 if args.strict and mismatches else 0)
+
+
+if __name__ == "__main__":
+    main()
