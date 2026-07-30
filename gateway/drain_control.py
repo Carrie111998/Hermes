@@ -137,6 +137,8 @@ def write_drain_request(
     principal: str = "drain-control",
     suppress_notification: bool = False,
     home: Optional[Path] = None,
+    request_id: Optional[str] = None,
+    owner_pid: Optional[int] = None,
 ) -> dict[str, Any]:
     """Write the begin-drain marker. Returns the payload written.
 
@@ -166,6 +168,10 @@ def write_drain_request(
         "epoch": current_instantiation_epoch(),
         "suppress_notification": bool(suppress_notification),
     }
+    if request_id:
+        payload["request_id"] = str(request_id)
+    if owner_pid is not None:
+        payload["owner_pid"] = int(owner_pid)
     atomic_json_write(drain_request_path(home), payload)
     return payload
 

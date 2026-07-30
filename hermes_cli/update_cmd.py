@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import time as _time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -2838,9 +2839,10 @@ def _quiesce_posix_gateways_for_update(
         from gateway.drain_control import (
             drain_requested,
             drain_request_path,
+            read_drain_request,
             write_drain_request,
         )
-        from gateway.status import read_runtime_status
+        from gateway.status import _pid_exists, read_runtime_status
         from hermes_cli.gateway import (
             _get_restart_drain_timeout,
             find_profile_gateway_processes,
@@ -2857,24 +2859,57 @@ def _quiesce_posix_gateways_for_update(
     if not processes:
         return None
 
-    created_homes: list[Path] = []
+    created_markers: list[dict] = []
     try:
         for proc in processes:
             home = Path(proc.path)
             marker = drain_request_path(home)
+            body = read_drain_request(home=home) or {}
+            is_active = marker.exists() and drain_requested(home=home)
+            is_update_marker = body.get("principal") == "hermes-update"
+            try:
+                owner_pid = int(body.get("owner_pid", 0) or 0)
+            except (TypeError, ValueError):
+                owner_pid = 0
+            request_id = str(body.get("request_id") or "")
+            owned_by_this_update = bool(
+                is_update_marker
+                and owner_pid == os.getpid()
+                and request_id
+            )
+            orphaned_update_marker = bool(
+                is_update_marker
+                and not owned_by_this_update
+                and (owner_pid <= 0 or not _pid_exists(owner_pid))
+            )
             # Preserve an active operator/NAS drain, but replace a marker from
             # an earlier machine epoch: gateways deliberately ignore that
             # stale file, so merely observing its presence would never quiesce
-            # the live process.
-            if not marker.exists() or not drain_requested(home=home):
-                write_drain_request(
+            # the live process. Also reclaim a marker left by a terminated
+            # updater; a live updater's PID keeps its marker externally owned.
+            if owned_by_this_update:
+                created_markers.append(
+                    {"home": home, "request_id": request_id}
+                )
+            elif not is_active or orphaned_update_marker:
+                request_id = uuid.uuid4().hex
+                payload = write_drain_request(
                     principal="hermes-update",
                     home=home,
+                    request_id=request_id,
+                    owner_pid=os.getpid(),
                 )
-                created_homes.append(home)
+                created_markers.append(
+                    {
+                        "home": home,
+                        "request_id": payload["request_id"],
+                    }
+                )
     except Exception as exc:
         logger.debug("Could not request pre-update gateway drain: %s", exc)
-        _m()._release_posix_gateway_quiesce({"created_homes": created_homes})
+        _m()._release_posix_gateway_quiesce(
+            {"created_markers": created_markers}
+        )
         return None
 
     try:
@@ -2905,12 +2940,14 @@ def _quiesce_posix_gateways_for_update(
             "Gateways did not reach the pre-update quiesce boundary: %s",
             sorted(remaining),
         )
-        _m()._release_posix_gateway_quiesce({"created_homes": created_homes})
+        _m()._release_posix_gateway_quiesce(
+            {"created_markers": created_markers}
+        )
         return None
 
     return {
         "pids": {int(proc.pid) for proc in processes},
-        "created_homes": created_homes,
+        "created_markers": created_markers,
     }
 
 def _release_posix_gateway_quiesce(token: dict | None) -> None:
@@ -2918,13 +2955,24 @@ def _release_posix_gateway_quiesce(token: dict | None) -> None:
     if not token:
         return
     try:
-        from gateway.drain_control import clear_drain_request
+        from gateway.drain_control import (
+            clear_drain_request,
+            read_drain_request,
+        )
     except Exception:
         return
-    homes = token.pop("created_homes", [])
-    for home in homes:
+    markers = token.pop("created_markers", [])
+    for owned_marker in markers:
+        home = Path(owned_marker["home"])
+        request_id = str(owned_marker.get("request_id") or "")
         try:
-            clear_drain_request(home=Path(home))
+            body = read_drain_request(home=home)
+            if (
+                body is not None
+                and body.get("principal") == "hermes-update"
+                and str(body.get("request_id") or "") == request_id
+            ):
+                clear_drain_request(home=home)
         except Exception:
             logger.debug(
                 "Could not clear pre-update gateway drain marker for %s",
