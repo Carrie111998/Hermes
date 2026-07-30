@@ -1619,6 +1619,76 @@ class TestNewEndpoints:
             config["platform_toolsets"]["discord"]
         )
 
+    def test_channel_capabilities_save_an_exact_configurable_boundary(self):
+        """The GUI writes the exact configurable boundary plus native tools."""
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        resp = self.client.get("/api/tools/channels")
+        assert resp.status_code == 200
+        rows = {row["platform"]: row for row in resp.json()}
+        assert "email" in rows
+        assert rows["email"]["toolsets"]
+        assert {row["name"] for row in rows["email"]["toolsets"]} >= {
+            "memory",
+            "web",
+        }
+
+        resp = self.client.put(
+            "/api/tools/channels/email",
+            json={
+                "toolsets": ["memory", "web"],
+                "mcp_mode": "none",
+                "mcp_servers": [],
+            },
+        )
+        assert resp.status_code == 200
+        channel = resp.json()["channel"]
+        assert channel["explicit"] is True
+        assert channel["mcp"]["mode"] == "none"
+
+        config = load_config()
+        assert set(config["platform_toolsets"]["email"]) == {
+            "memory",
+            "no_mcp",
+            "web",
+        }
+        implicit = {row["name"] for row in channel["implicit_toolsets"]}
+        assert _get_platform_tools(config, "email") == {"memory", "web"} | implicit
+
+    def test_channel_capabilities_mcp_allowlist_is_effective(self):
+        """Selected MCP servers are channel-scoped instead of defaulting global."""
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        config = load_config()
+        config["mcp_servers"] = {
+            "alpha": {"command": "alpha", "enabled": True},
+            "beta": {"command": "beta", "enabled": True},
+        }
+        save_config(config)
+
+        resp = self.client.put(
+            "/api/tools/channels/qqbot",
+            json={
+                "toolsets": ["web"],
+                "mcp_mode": "allowlist",
+                "mcp_servers": ["beta"],
+            },
+        )
+        assert resp.status_code == 200
+        channel = resp.json()["channel"]
+        assert channel["mcp"] == {
+            "mode": "allowlist",
+            "available": ["alpha", "beta"],
+            "selected": ["beta"],
+            "effective": ["beta"],
+        }
+
+        config = load_config()
+        assert "beta" in _get_platform_tools(config, "qqbot")
+        assert "alpha" not in _get_platform_tools(config, "qqbot")
+
 
     def test_get_toolset_config_returns_provider_matrix(self):
         """GET .../config returns provider rows with structured env_vars."""
