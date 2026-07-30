@@ -43,6 +43,7 @@ vi.mock('@/hermes', () => ({
 
 const {
   maybeNotifyUpdateAvailable,
+  checkUpdates,
   checkBackendUpdates,
   $backendUpdateStatus,
   applyBackendUpdate,
@@ -56,7 +57,9 @@ const {
   resetUpdateApplyState,
   startUpdatePoller,
   stopUpdatePoller,
-  $updateStatus
+  $updateStatus,
+  $updateTrack,
+  setUpdateTrack
 } = await import('./updates')
 
 const { setConnection } = await import('./session')
@@ -122,6 +125,83 @@ describe('maybeNotifyUpdateAvailable', () => {
   it('does nothing when already up to date', () => {
     maybeNotifyUpdateAvailable(status({ behind: 0 }))
     expect(notifySpy).not.toHaveBeenCalled()
+  })
+
+  it('names an official release instead of describing commit changes', () => {
+    maybeNotifyUpdateAvailable(
+      status({ distanceUnit: 'releases', targetRelease: 'v2026.7.20', track: 'release' })
+    )
+
+    expect(notifySpy.mock.calls[0]?.[0]).toMatchObject({
+      message: 'v2026.7.20 is ready to install.',
+      title: 'New Hermes release'
+    })
+  })
+
+  it('keeps Fast Track and release-track snoozes independent', () => {
+    maybeNotifyUpdateAvailable(status({ track: 'main' }))
+    lastToast().onDismiss()
+    notifySpy.mockClear()
+
+    maybeNotifyUpdateAvailable(
+      status({ distanceUnit: 'releases', targetRelease: 'v2026.7.20', track: 'release' })
+    )
+
+    expect(notifySpy).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('setUpdateTrack', () => {
+  const checkMock = vi.fn()
+  const setTrackMock = vi.fn()
+
+  beforeEach(() => {
+    checkMock.mockReset().mockResolvedValue(status({ behind: 0, track: 'release' }))
+    setTrackMock.mockReset().mockImplementation(async (track: 'main' | 'release') => ({ track }))
+    dismissSpy.mockClear()
+    $updateStatus.set(status({ track: 'main' }))
+    $updateTrack.set('main')
+    ;(globalThis as unknown as { window: unknown }).window = {
+      hermesDesktop: { updates: { check: checkMock, setTrack: setTrackMock } }
+    }
+  })
+
+  afterEach(() => {
+    delete (globalThis as unknown as { window?: unknown }).window
+  })
+
+  it('persists the track, clears stale status, and checks the new source', async () => {
+    await setUpdateTrack('release')
+
+    expect(setTrackMock).toHaveBeenCalledWith('release')
+    expect($updateTrack.get()).toBe('release')
+    expect(checkMock).toHaveBeenCalledTimes(1)
+    expect($updateStatus.get()?.track).toBe('release')
+    expect(dismissSpy).toHaveBeenCalledWith('desktop-update-available')
+  })
+
+  it('ignores an older check that finishes after the track changes', async () => {
+    let resolveOldCheck: ((value: DesktopUpdateStatus) => void) | undefined
+
+    const oldCheck = new Promise<DesktopUpdateStatus>(resolve => {
+      resolveOldCheck = resolve
+    })
+
+    checkMock
+      .mockReset()
+      .mockReturnValueOnce(oldCheck)
+      .mockResolvedValueOnce(status({ behind: 0, track: 'release' }))
+
+    const checkingOldTrack = checkUpdates()
+    const changingTrack = setUpdateTrack('release')
+
+    await changingTrack
+    resolveOldCheck?.(status({ behind: 7, track: 'main', targetSha: 'stale-main' }))
+    await checkingOldTrack
+
+    expect(checkMock).toHaveBeenCalledTimes(2)
+    expect($updateTrack.get()).toBe('release')
+    expect($updateStatus.get()).toMatchObject({ behind: 0, track: 'release' })
   })
 })
 
@@ -355,6 +435,7 @@ describe('applyUpdates terminal state', () => {
     dismissSpy.mockClear()
     applyMock.mockReset()
     resetUpdateApplyState()
+    $updateStatus.set(status({ track: 'main' }))
     $updateOverlayOpen.set(true)
     ;(globalThis as unknown as { window: unknown }).window = {
       hermesDesktop: { updates: { apply: applyMock } }
@@ -376,6 +457,25 @@ describe('applyUpdates terminal state', () => {
     expect($updateApply.get().applying).toBe(true)
     expect($updateOverlayOpen.get()).toBe(true)
     expect(notifySpy).not.toHaveBeenCalled()
+  })
+
+  it('hands the exact checked release tag and sha to Electron', async () => {
+    applyMock.mockResolvedValue({ ok: true, handedOff: true })
+    $updateStatus.set(
+      status({
+        distanceUnit: 'releases',
+        targetRelease: 'v2026.7.20',
+        targetSha: '0123456789abcdef0123456789abcdef01234567',
+        track: 'release'
+      })
+    )
+
+    await applyUpdates()
+
+    expect(applyMock).toHaveBeenCalledWith({
+      targetRelease: 'v2026.7.20',
+      targetSha: '0123456789abcdef0123456789abcdef01234567'
+    })
   })
 
   it('closes the overlay + toasts when updated but not relaunched in place', async () => {

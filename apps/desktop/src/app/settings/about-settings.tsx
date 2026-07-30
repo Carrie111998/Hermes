@@ -12,13 +12,16 @@ import {
   $updateApply,
   $updateChecking,
   $updateStatus,
+  $updateTrack,
   checkUpdates,
   openUpdatesWindow,
   refreshDesktopVersion,
+  refreshUpdateTrack,
+  setUpdateTrack,
   startActiveUpdate
 } from '@/store/updates'
 
-import { ListRow, SectionHeading, SettingsContent } from './primitives'
+import { ListRow, SectionHeading, SettingsContent, ToggleRow } from './primitives'
 import { UninstallSection } from './uninstall-section'
 
 const RELEASE_NOTES_URL = 'https://github.com/NousResearch/hermes-agent/releases'
@@ -52,7 +55,9 @@ export function AboutSettings() {
   const status = useStore($updateStatus)
   const apply = useStore($updateApply)
   const checking = useStore($updateChecking)
+  const track = useStore($updateTrack)
   const [justChecked, setJustChecked] = useState(false)
+  const [trackSaving, setTrackSaving] = useState(false)
 
   // The version atom is loaded once at app boot, which makes About show a
   // stale number after a self-update (the running binary is current, the
@@ -60,6 +65,7 @@ export function AboutSettings() {
   // reflects the running build.
   useEffect(() => {
     void refreshDesktopVersion()
+    void refreshUpdateTrack()
   }, [])
 
   const behind = status?.behind ?? 0
@@ -70,6 +76,16 @@ export function AboutSettings() {
     setJustChecked(false)
     const next = await checkUpdates()
     setJustChecked(Boolean(next))
+  }
+
+  const handleFastTrackChange = async (enabled: boolean) => {
+    setTrackSaving(true)
+
+    try {
+      await setUpdateTrack(enabled ? 'main' : 'release')
+    } finally {
+      setTrackSaving(false)
+    }
   }
 
   let statusLine: string
@@ -85,7 +101,10 @@ export function AboutSettings() {
     statusLine = a.installing
     statusTone = 'available'
   } else if (behind > 0) {
-    statusLine = a.updateReady(behind)
+    statusLine =
+      status?.track === 'release'
+        ? a.releaseUpdateReady(status.targetRelease ?? '')
+        : a.updateReady(behind)
     statusTone = 'available'
   } else if (status) {
     statusLine = a.onLatest
@@ -172,8 +191,20 @@ export function AboutSettings() {
 
         <ListRow
           description={a.automaticUpdatesDesc}
-          hint={a.branchCommit(status?.branch ?? 'unknown', status?.currentSha?.slice(0, 7) ?? 'unknown')}
+          hint={
+            track === 'release'
+              ? a.releaseTrackHint(status?.currentRelease ?? version?.appVersion ?? a.unknownVersion)
+              : a.branchCommit(status?.branch ?? 'main', status?.currentSha?.slice(0, 7) ?? a.unknownVersion)
+          }
           title={a.automaticUpdates}
+        />
+
+        <ToggleRow
+          checked={track === 'main'}
+          description={a.fastTrackDesc}
+          disabled={trackSaving || applying}
+          label={a.fastTrack}
+          onChange={enabled => void handleFastTrackChange(enabled)}
         />
 
         <UninstallSection />
