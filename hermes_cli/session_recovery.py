@@ -239,34 +239,33 @@ def _disk_space_preflight(
 def _copy_source_bundle(source: Path, snapshot_dir: Path) -> tuple[Path, list[str]]:
     """Copy the source DB bundle aside so SQLite never opens the original.
 
-    Refuses when a connection to *source* is live in this process. Copying a
-    database file is an ``open()``/``close()`` on it, and ``close()`` cancels
-    every POSIX advisory lock the process holds on that file -- including a
-    running VACUUM's EXCLUSIVE lock (see ``hermes_cli.sqlite_safe_read``).
-    Recovery normally runs as its own short-lived CLI process against an
-    offline/quarantined file, so this should never fire; the check keeps this
-    path consistent with ``hermes_state._backup_db_file``, which refuses the
-    same situation, rather than leaving two policies for one hazard.
-    """
-    from hermes_cli.sqlite_safe_read import has_live_connection
+    The whole copy runs inside ``offline_file_access``, which holds the
+    connection-lifecycle lock for its duration. Checking for a live connection
+    and *then* copying would be a check/use race: a connection could open in
+    that window, and the copy's ``close()`` would cancel its POSIX advisory
+    locks -- the failure class ``hermes_cli.sqlite_safe_read`` exists to
+    prevent (see #71724). Holding the lock means no connection can appear
+    mid-copy, across the main file and every sidecar.
 
-    if has_live_connection(source):
-        raise SessionRecoverySafetyError(
-            f"Refusing to snapshot {source}: a connection to it is still open "
-            "in this process, and copying the file would cancel that "
-            "connection's POSIX locks. Close all database handles (stop the "
-            "gateway/dashboard) and re-run."
-        )
+    Recovery normally runs as its own short-lived CLI process against an
+    offline/quarantined file, so the refusal should never fire; the guard
+    keeps this path consistent with ``hermes_state._backup_db_file``.
+    """
+    from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
 
     snapshot_source = snapshot_dir / source.name
     copied: list[str] = []
-    for suffix in _SIDECAR_SUFFIXES:
-        source_part = _sidecar_path(source, suffix)
-        if not source_part.exists():
-            continue
-        destination_part = _sidecar_path(snapshot_source, suffix)
-        shutil.copy2(source_part, destination_part)
-        copied.append(destination_part.name)
+    try:
+        with offline_file_access(source, what="snapshot"):
+            for suffix in _SIDECAR_SUFFIXES:
+                source_part = _sidecar_path(source, suffix)
+                if not source_part.exists():
+                    continue
+                destination_part = _sidecar_path(snapshot_source, suffix)
+                shutil.copy2(source_part, destination_part)
+                copied.append(destination_part.name)
+    except LiveConnectionError as exc:
+        raise SessionRecoverySafetyError(str(exc)) from exc
     return snapshot_source, copied
 
 
@@ -751,7 +750,59 @@ def _copy_state_meta_salvage(
     progress_cb: Optional[ProgressCallback],
     source_rows: Optional[int],
 ) -> dict[str, Any]:
-    """Salvage readable user metadata while regenerating derived FTS state."""
+    """Salvage readable user metadata while regenerating derived FTS state.
+
+    Requires both ``key`` and ``value``, matching the non-partial
+    :func:`_copy_state_meta`. A damaged ``state_meta`` can retain one column
+    and lose the other; without this check a missing ``key`` raised
+    ``ValueError`` from ``columns.index("key")`` and aborted the entire
+    partial recovery, and a missing ``value`` would have copied key-only rows
+    while reporting the table complete.
+
+    Status matters here. An unusable-but-PRESENT table reports ``failed``, not
+    ``missing``: verification only escalates ``failed``/``partial`` into a
+    warning + ``loss_detected``, so reporting ``missing`` would silently drop
+    real metadata and still claim ``complete=True``. ``missing`` is reserved
+    for a table that genuinely is not there. Either way ``state_meta`` is
+    optional, so ``--allow-partial`` records the loss and carries on
+    recovering sessions and messages.
+    """
+    source_columns = _table_columns(source, "state_meta")
+    destination_columns = _table_columns(destination, "state_meta")
+    if not source_columns:
+        # Genuinely absent from the source — nothing was lost.
+        return {
+            "mode": "rowid_range_salvage",
+            "source_meta_rows": source_rows,
+            "copied_rows": 0,
+            "columns": ["key", "value"],
+            "excluded_keys": sorted(_GENERATED_META_KEYS),
+            "status": "missing",
+        }
+    if not {"key", "value"}.issubset(source_columns):
+        # Present but unusable: this IS data loss and must be reported.
+        return {
+            "mode": "rowid_range_salvage",
+            "source_meta_rows": source_rows,
+            "copied_rows": 0,
+            "columns": ["key", "value"],
+            "excluded_keys": sorted(_GENERATED_META_KEYS),
+            "status": "failed",
+            "error": (
+                "source state_meta exists but is missing the key/value "
+                f"columns (found: {', '.join(source_columns) or 'none'})"
+            ),
+        }
+    if not {"key", "value"}.issubset(destination_columns):
+        return {
+            "mode": "rowid_range_salvage",
+            "source_meta_rows": source_rows,
+            "copied_rows": 0,
+            "columns": ["key", "value"],
+            "excluded_keys": sorted(_GENERATED_META_KEYS),
+            "status": "failed",
+            "error": "destination state_meta schema is incomplete",
+        }
 
     def keep_user_meta(
         row: tuple[Any, ...],
@@ -774,13 +825,96 @@ def _copy_state_meta_salvage(
     return result
 
 
+def _reconstruct_missing_sessions(
+    destination: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Recreate placeholder session rows for salvaged orphaned messages.
+
+    When the ``sessions`` b-tree is damaged worse than ``messages``, salvage
+    can recover the conversation text while recovering few or none of the
+    session rows that own it. Deleting those messages as "orphans" throws away
+    the only readable copy of the user's data — the exact opposite of what
+    ``--allow-partial`` is for. A real report (July 2026) copied 20,817 of
+    20,824 messages and then removed every one of them, producing an output
+    with 0 sessions and 0 messages.
+
+    Instead, synthesize a minimal session row per orphaned ``session_id``
+    (only ``id``/``source``/``started_at`` are NOT NULL) so the messages stay
+    reachable and foreign keys hold. ``started_at`` is taken from the earliest
+    surviving message so ordering stays sane. Rows are marked with
+    ``source='recovered'`` and a ``title`` that says so, because a fabricated
+    session must never be mistaken for an original.
+    """
+    result: dict[str, Any] = {"sessions_reconstructed": 0, "messages_retained": 0}
+    if not _table_columns(destination, "sessions"):
+        return result
+    if not _table_columns(destination, "messages"):
+        return result
+
+    orphaned = destination.execute(
+        "SELECT m.session_id, MIN(m.timestamp), COUNT(*) "
+        "FROM messages AS m "
+        "WHERE m.session_id IS NOT NULL AND NOT EXISTS ("
+        "SELECT 1 FROM sessions WHERE sessions.id = m.session_id) "
+        "GROUP BY m.session_id"
+    ).fetchall()
+    if not orphaned:
+        return result
+
+    title_sequence = 1
+    for session_id, first_timestamp, message_count in orphaned:
+        started_at = float(first_timestamp) if first_timestamp is not None else 0.0
+        while True:
+            title = (
+                f"[recovered {title_sequence}] "
+                "session metadata was unreadable"
+            )
+            title_sequence += 1
+            if (
+                destination.execute(
+                    "SELECT 1 FROM sessions WHERE title = ? LIMIT 1",
+                    (title,),
+                ).fetchone()
+                is None
+            ):
+                break
+
+        cursor = destination.execute(
+            "INSERT INTO sessions "
+            "(id, source, started_at, title, message_count) "
+            "VALUES (?, 'recovered', ?, ?, ?)",
+            (
+                session_id,
+                started_at,
+                title,
+                int(message_count),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise sqlite3.IntegrityError(
+                f"failed to reconstruct missing session {session_id!r}"
+            )
+        result["sessions_reconstructed"] += 1
+        result["messages_retained"] += int(message_count)
+    return result
+
+
 def _cleanup_partial_orphans(
     destination: sqlite3.Connection,
 ) -> dict[str, Any]:
-    """Remove references to sessions that could not be salvaged."""
+    """Reconcile references to sessions that could not be salvaged.
+
+    Messages are never discarded for lack of a session row: their owning
+    session is reconstructed as a placeholder first (see
+    :func:`_reconstruct_missing_sessions`). Only rows that remain orphaned
+    after that — and rows in tables carrying no recoverable user content —
+    are removed.
+    """
 
     result: dict[str, Any] = {
         "sessions_parent_cleared": 0,
+        "sessions_reconstructed": 0,
+        "messages_retained": 0,
         "messages_removed": 0,
         "session_model_usage_removed": 0,
         "compression_locks_removed": 0,
@@ -788,6 +922,12 @@ def _cleanup_partial_orphans(
     }
     destination.execute("BEGIN IMMEDIATE")
     try:
+        # Rebuild owners BEFORE any orphan deletion so salvaged conversation
+        # text is never dropped for want of a session row.
+        rebuilt = _reconstruct_missing_sessions(destination)
+        result["sessions_reconstructed"] = rebuilt["sessions_reconstructed"]
+        result["messages_retained"] = rebuilt["messages_retained"]
+
         parent_count = int(
             destination.execute(
                 "SELECT COUNT(*) FROM sessions AS child "
@@ -839,8 +979,15 @@ def _cleanup_partial_orphans(
     except BaseException:
         destination.execute("ROLLBACK")
         raise
-    result["total_removed_or_relinked"] = sum(
-        int(value) for value in result.values()
+    # Only destructive/relinking actions belong in this total. The
+    # reconstruction counters describe data RETAINED, so summing them here
+    # would report saving the user's messages as if it were losing them.
+    result["total_removed_or_relinked"] = (
+        int(result["sessions_parent_cleared"])
+        + int(result["messages_removed"])
+        + int(result["session_model_usage_removed"])
+        + int(result["compression_locks_removed"])
+        + int(result["telegram_dm_topic_bindings_removed"])
     )
     return result
 
@@ -947,13 +1094,33 @@ def _verify_recovered_database(
                 else:
                     verification["errors"].append(message)
 
+        cleanup = orphan_cleanup or {}
+        rebuilt_sessions = int(cleanup.get("sessions_reconstructed") or 0)
+        retained_messages = int(cleanup.get("messages_retained") or 0)
+        removed_messages = int(cleanup.get("messages_removed") or 0)
+        # A wholly unreadable sessions b-tree is recoverable when every output
+        # parent was rebuilt from the surviving messages and none were dropped.
+        # This is still data loss, but it is not structural verification failure.
+        sessions_fully_reconstructed = bool(
+            rebuilt_sessions > 0
+            and counts.get("sessions") == rebuilt_sessions
+            and counts.get("messages") == retained_messages
+            and removed_messages == 0
+        )
+
         for table, table_report in copy_report.items():
             status = table_report.get("status")
             if status not in {"failed", "partial"}:
                 continue
             message = f"{table} copy status is {status}"
             if allow_partial and (
-                status == "partial" or table not in {"sessions", "messages"}
+                status == "partial"
+                or table not in {"sessions", "messages"}
+                or (
+                    table == "sessions"
+                    and status == "failed"
+                    and sessions_fully_reconstructed
+                )
             ):
                 verification["warnings"].append(message)
                 verification["loss_detected"] = True
@@ -967,6 +1134,20 @@ def _verify_recovered_database(
             if orphan_count:
                 verification["warnings"].append(
                     f"{orphan_count} orphaned reference(s) were removed or relinked"
+                )
+                verification["loss_detected"] = True
+            rebuilt_sessions = int(
+                orphan_cleanup.get("sessions_reconstructed") or 0
+            )
+            if rebuilt_sessions:
+                retained = int(orphan_cleanup.get("messages_retained") or 0)
+                # Not a clean recovery: the conversation text survived but its
+                # session metadata did not, so these rows are placeholders.
+                verification["warnings"].append(
+                    f"{rebuilt_sessions} session(s) could not be salvaged and "
+                    f"were reconstructed as placeholders to retain "
+                    f"{retained} message(s); their metadata (title, model, "
+                    "timestamps, cost) is lost"
                 )
                 verification["loss_detected"] = True
 
