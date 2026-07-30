@@ -4123,11 +4123,16 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
+            error = f"Provider authentication failed: {str(exc)[:300]}"
             return {
-                "final_response": f"⚠️ Provider authentication failed: {exc}",
+                "final_response": f"⚠️ {error}",
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
+                "failed": True,
+                "completed": False,
+                "error": error,
+                "agent_persisted": False,
             }
 
         pr = self._runner._provider_routing
@@ -22763,6 +22768,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
+                "failed": True,
+                "completed": False,
+                "agent_persisted": False,
             }
 
         proxy_url = self._get_proxy_url()
@@ -22772,6 +22780,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
+                "failed": True,
+                "completed": False,
+                "agent_persisted": False,
             }
 
         proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
@@ -22898,6 +22909,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
+                            "failed": True,
+                            "completed": False,
+                            "agent_persisted": False,
                         }
 
                     # Parse SSE stream
@@ -22958,6 +22972,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "failed": True,
+                    "completed": False,
+                    "agent_persisted": False,
                 }
             # Partial response — return what we got
         finally:
