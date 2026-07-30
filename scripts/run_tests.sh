@@ -91,14 +91,33 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-exec env -i \
-  PATH="$PATH" \
-  HOME="$HOME" \
-  TZ=UTC \
-  LANG=C.UTF-8 \
-  LC_ALL=C.UTF-8 \
-  PYTHONHASHSEED=0 \
-  ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
-  ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
-  ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
+CLEAN_ENV=(
+  "PATH=$PATH"
+  "HOME=$HOME"
+  "TZ=UTC"
+  "LANG=C.UTF-8"
+  "LC_ALL=C.UTF-8"
+  "PYTHONHASHSEED=0"
+)
+
+# Native Windows Python ignores HOME when resolving Path.home(). Preserve only
+# the caller's Windows home identity: USERPROFILE when available, otherwise
+# the complete HOMEDRIVE/HOMEPATH pair.
+if [ -n "${USERPROFILE:-}" ]; then
+  CLEAN_ENV+=("USERPROFILE=$USERPROFILE")
+elif [ -n "${HOMEDRIVE:-}" ] && [ -n "${HOMEPATH:-}" ]; then
+  CLEAN_ENV+=("HOMEDRIVE=$HOMEDRIVE" "HOMEPATH=$HOMEPATH")
+fi
+
+if [ -n "${HERMES_RUN_SLOW_PET_TESTS:-}" ]; then
+  CLEAN_ENV+=("HERMES_RUN_SLOW_PET_TESTS=$HERMES_RUN_SLOW_PET_TESTS")
+fi
+if [ -n "$EXTRA_PYTHONPATH" ]; then
+  CLEAN_ENV+=("PYTHONPATH=$EXTRA_PYTHONPATH")
+fi
+if [ -n "$EXTRA_PYTEST_PLUGINS" ]; then
+  CLEAN_ENV+=("PYTEST_PLUGINS=$EXTRA_PYTEST_PLUGINS")
+fi
+
+exec env -i "${CLEAN_ENV[@]}" \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"

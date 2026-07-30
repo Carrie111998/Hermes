@@ -38,6 +38,14 @@ _HANDOFF_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-isolation-probe"
 _HANDOFF_DIR.mkdir(exist_ok=True)
 
 
+def test_canonical_runner_provides_a_resolvable_home() -> None:
+    """The wrapper's clean environment must still support ``Path.home()``."""
+    home = Path.home()
+
+    assert home.is_absolute()
+    assert home.exists()
+
+
 def _handoff_path_for(nonce: str) -> Path:
     return _HANDOFF_DIR / f"grandchild-{nonce}.json"
 
