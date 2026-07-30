@@ -4,13 +4,18 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { afterEach, test } from 'vitest'
+import simpleGit from 'simple-git'
+import { afterEach, test, vi } from 'vitest'
 
 import { gitFor, repoStatus, resolveRenamePath, reviewRevert } from './git-review-ops'
+
+vi.mock('simple-git', { spy: true })
 
 const tempDirs: string[] = []
 
 afterEach(() => {
+  vi.clearAllMocks()
+
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { force: true, recursive: true })
   }
@@ -180,6 +185,50 @@ test('reviewRevert removes new files before the first commit', async () => {
   assert.deepEqual(await reviewRevert(dir, null, 'git'), { ok: true })
   assert.equal(fs.existsSync(path.join(dir, 'staged.txt')), false)
   assert.equal(fs.existsSync(path.join(dir, 'loose.txt')), false)
+})
+
+test('reviewRevert all does not require HEAD during reset', async () => {
+  const dir = makeTempDir()
+
+  const raw = vi.fn(async args => {
+    if (args[0] === 'reset' && args.includes('HEAD')) {
+      throw new Error("fatal: ambiguous argument 'HEAD'")
+    }
+
+    return ''
+  })
+
+  vi.mocked(simpleGit).mockReturnValueOnce({ raw } as any)
+
+  assert.deepEqual(await reviewRevert(dir, null, 'git'), { ok: true })
+  assert.deepEqual(
+    raw.mock.calls.map(([args]) => args),
+    [
+      ['reset', '-q'],
+      ['rev-parse', '--verify', '--quiet', 'HEAD'],
+      ['clean', '-fd', '--', '.']
+    ]
+  )
+})
+
+test('reviewRevert surfaces ls-tree failures when HEAD exists', async () => {
+  const dir = makeTempDir()
+
+  const raw = vi.fn(async args => {
+    if (args[0] === 'rev-parse') {
+      return 'deadbeef\n'
+    }
+
+    if (args[0] === 'ls-tree') {
+      throw new Error('injected ls-tree failure')
+    }
+
+    return ''
+  })
+
+  vi.mocked(simpleGit).mockReturnValueOnce({ raw } as any)
+
+  await assert.rejects(() => reviewRevert(dir, 'tracked.txt', 'git'), /injected ls-tree failure/)
 })
 
 test('reviewRevert rejects on a git failure instead of reporting success', async () => {

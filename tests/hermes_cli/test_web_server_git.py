@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import web_server
+from hermes_cli import web_git, web_server
 
 pytest.importorskip("starlette.testclient")
 from starlette.testclient import TestClient
@@ -154,6 +154,51 @@ def test_revert_removes_new_files_before_the_first_commit(client, tmp_path):
 
     assert not (fresh / "staged.txt").exists()
     assert not (fresh / "loose.txt").exists()
+
+
+def test_revert_all_does_not_require_head_during_reset(client, tmp_path, monkeypatch):
+    """Newer Git rejects an explicit HEAD in an unborn repo; bare reset does not."""
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    _git(fresh, "init", "-q")
+    (fresh / "staged.txt").write_text("staged\n")
+    (fresh / "loose.txt").write_text("loose\n")
+    _git(fresh, "add", "staged.txt")
+
+    real_git = web_git._git
+
+    def reject_unborn_head_reset(cwd, args, **kwargs):
+        if args[:3] == ["reset", "-q", "HEAD"]:
+            return 128, "", "fatal: ambiguous argument 'HEAD'"
+        return real_git(cwd, args, **kwargs)
+
+    monkeypatch.setattr(web_git, "_git", reject_unborn_head_reset)
+
+    response = client.post(
+        "/api/git/review/revert", json={"path": str(fresh), "file": None}
+    )
+
+    assert response.json() == {"ok": True}
+    assert not (fresh / "staged.txt").exists()
+    assert not (fresh / "loose.txt").exists()
+
+
+def test_revert_surfaces_ls_tree_failure_when_head_exists(client, repo, monkeypatch):
+    real_git = web_git._git
+
+    def fail_ls_tree(cwd, args, **kwargs):
+        if args and args[0] == "ls-tree":
+            return 1, "", "injected ls-tree failure"
+        return real_git(cwd, args, **kwargs)
+
+    monkeypatch.setattr(web_git, "_git", fail_ls_tree)
+
+    response = client.post(
+        "/api/git/review/revert", json={"path": str(repo), "file": "a.txt"}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "injected ls-tree failure"
 
 
 def test_revert_reports_a_git_failure_instead_of_ok(client, tmp_path):
