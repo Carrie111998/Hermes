@@ -99,6 +99,7 @@ def _task_snapshot(conn, task_id: str) -> dict:
         "step": row["current_step_key"],
         "instance_state": row["state"],
         "runs": [dict(run) for run in runs],
+        "event_kinds": [event.kind for event in kb.list_events(conn, task_id)],
     }
 
 
@@ -153,6 +154,9 @@ def _exercise_exit_path(
         time.sleep(0.1)
     snapshot = _task_snapshot(conn, task_id)
     if (snapshot["status"], snapshot["instance_state"]) != ("blocked", "exception"):
+        raise RuntimeError(json.dumps(snapshot, sort_keys=True))
+    expected_event = "protocol_violation" if returncode == 0 else "crashed"
+    if expected_event not in snapshot["event_kinds"]:
         raise RuntimeError(json.dumps(snapshot, sort_keys=True))
     return snapshot
 
