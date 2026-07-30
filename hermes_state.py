@@ -851,16 +851,23 @@ def apply_database_pragmas(
     *,
     db_label: str = "state.db",
 ) -> None:
-    """Apply optional WAL-sizing PRAGMAs from ``config.yaml``.
+    """Apply optional performance and WAL-sizing PRAGMAs from ``config.yaml``.
 
-    Reads the ``database:`` section and applies ``wal_autocheckpoint``
-    and ``journal_size_limit`` when set to integer values.  The journal
-    mode itself is NOT handled here — ``database.journal_mode`` is owned
-    by :func:`resolve_journal_mode` inside :func:`apply_wal_with_fallback`,
-    which layers the operator setting under all the safety guards
-    (never live-downgrading an on-disk WAL DB, filesystem fallback,
-    WAL-reset-bug gating).  Keeping a single owner prevents a second,
-    unguarded journal-mode switch path.
+    Reads the ``database:`` section and applies configurable PRAGMAs when set
+    to integer values.  The journal mode itself is NOT handled here —
+    ``database.journal_mode`` is owned by :func:`resolve_journal_mode` inside
+    :func:`apply_wal_with_fallback`, which layers the operator setting under
+    all the safety guards (never live-downgrading an on-disk WAL DB,
+    filesystem fallback, WAL-reset-bug gating).
+
+    Supported keys under ``database:`` in config.yaml:
+
+    * ``cache_size`` — negative value = KiB, positive = pages
+      (e.g. ``-262144`` = 256 MB page cache)
+    * ``mmap_size`` — max bytes for memory-mapped I/O (0 = disabled)
+    * ``temp_store`` — 0=DEFAULT(file), 1=FILE, 2=MEMORY, 3=ALWAYS
+    * ``wal_autocheckpoint`` — WAL auto-checkpoint threshold in pages
+    * ``journal_size_limit`` — max journal/WAL size in bytes
 
     Best-effort: config load or pragma failures are ignored so DB init
     never breaks on a malformed ``database:`` section.
@@ -873,7 +880,15 @@ def apply_database_pragmas(
     except Exception:
         return
 
-    for pragma_name in ("wal_autocheckpoint", "journal_size_limit"):
+    # Performance PRAGMAs (applied to ALL connection types: writer, read_only,
+    # and WAL per-thread readers).
+    for pragma_name in (
+        "cache_size",
+        "mmap_size",
+        "temp_store",
+        "wal_autocheckpoint",
+        "journal_size_limit",
+    ):
         raw_value = cfg_get(cfg, "database", pragma_name, default=None)
         if raw_value is None:
             continue
@@ -1855,6 +1870,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                apply_database_pragmas(self._conn, db_label="state.db")
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1913,6 +1929,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
                 )
                 apply_database_pragmas(self._conn, db_label="state.db")
+                self._conn.execute("PRAGMA cache_size=-8000")
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=NORMAL")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
@@ -2035,6 +2054,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 isolation_level=None,
             )
             conn.row_factory = sqlite3.Row
+            apply_database_pragmas(conn, db_label="state.db")
             # Load the CJK tokenizer extension on this connection so
             # messages_fts_cjk queries work on the read path. The .so
             # registers the tokenizer in the connection's in-memory
