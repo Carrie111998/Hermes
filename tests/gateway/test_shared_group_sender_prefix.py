@@ -404,7 +404,9 @@ def _runner_with_adapter():
     adapter = _PendingStubAdapter()
     runner.adapters = {Platform.TELEGRAM: adapter}
     adapter.set_pending_event_queue_handler(
-        lambda session_key, event: runner._enqueue_fifo(session_key, event, adapter)
+        lambda session_key, event: runner._queue_or_replace_pending_event(
+            session_key, event, adapter
+        )
     )
     return runner, adapter
 
@@ -442,6 +444,50 @@ def test_queue_or_replace_pending_event_fifos_cross_sender_media():
         assert _fragments_of(turn.text) <= expected, (
             f"turn attributed to {identity!r} carries another sender's content: {turn.text!r}"
         )
+
+
+@pytest.mark.parametrize("alice_tail_kind", ["photo", "text"])
+def test_queue_or_replace_pending_event_preserves_a_b_a_arrival_order(
+    alice_tail_kind,
+):
+    """A later Alice follow-up must not jump ahead of Bob's refused FIFO turn."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:a-b-a-runner"
+    alice_head = _photo_event(
+        _alice_source(), "/tmp/a-1.jpg", message_id="a1"
+    )
+    bob = _photo_event(_bob_source(), "/tmp/b-1.jpg", message_id="b1")
+    alice_tail = (
+        _photo_event(_alice_source(), "/tmp/a-2.jpg", message_id="a2")
+        if alice_tail_kind == "photo"
+        else _text_event("alice tail", _alice_source(), message_id="a2")
+    )
+
+    for event in (alice_head, bob, alice_tail):
+        runner._queue_or_replace_pending_event(session_key, event)
+
+    assert [turn.message_id for turn in _queued_turns(runner, adapter, session_key)] == [
+        "a1",
+        "b1",
+        "a2",
+    ]
+
+
+def test_queue_or_replace_pending_event_merges_contiguous_media_at_fifo_tail():
+    """An adjacent Bob photo burst may merge, but only behind Alice's head."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:tail-album"
+
+    for event in (
+        _photo_event(_alice_source(), "/tmp/a-1.jpg", message_id="a1"),
+        _photo_event(_bob_source(), "/tmp/b-1.jpg", message_id="b1"),
+        _photo_event(_bob_source(), "/tmp/b-2.jpg", message_id="b2"),
+    ):
+        runner._queue_or_replace_pending_event(session_key, event)
+
+    turns = _queued_turns(runner, adapter, session_key)
+    assert [turn.message_id for turn in turns] == ["a1", "b1"]
+    assert turns[1].media_urls == ["/tmp/b-1.jpg", "/tmp/b-2.jpg"]
 
 
 def test_busy_photo_followup_from_other_sender_does_not_join_album():
@@ -503,6 +549,67 @@ async def test_adapter_busy_refusal_reaches_runner_fifo_and_drains_separately():
     assert _all_media(next_turn) == ["/tmp/b-1.jpg"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alice_tail_kind", ["photo", "text"])
+async def test_adapter_busy_path_preserves_a_b_a_arrival_order(alice_tail_kind):
+    """The real adapter busy path must respect an already-occupied runner tail."""
+    runner, adapter = _runner_with_adapter()
+    adapter.config.extra["group_sessions_per_user"] = False
+
+    async def _unused_handler(event):
+        return None
+
+    adapter.set_message_handler(_unused_handler)
+    source = _alice_source()
+    session_key = build_session_key(source, group_sessions_per_user=False)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    events = [
+        _photo_event(source, "/tmp/a-1.jpg", message_id="a1"),
+        _photo_event(_bob_source(), "/tmp/b-1.jpg", message_id="b1"),
+        (
+            _photo_event(_alice_source(), "/tmp/a-2.jpg", message_id="a2")
+            if alice_tail_kind == "photo"
+            else _text_event("alice tail", _alice_source(), message_id="a2")
+        ),
+    ]
+
+    for event in events:
+        await adapter.handle_message(event)
+
+    assert [turn.message_id for turn in _queued_turns(runner, adapter, session_key)] == [
+        "a1",
+        "b1",
+        "a2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_without_runner_keeps_legacy_same_sender_album_semantics():
+    """Standalone adapters still merge same-sender photos without runner wiring."""
+    adapter = _PendingStubAdapter()
+    adapter.config.extra["group_sessions_per_user"] = False
+
+    async def _unused_handler(event):
+        return None
+
+    adapter.set_message_handler(_unused_handler)
+    source = _alice_source()
+    session_key = build_session_key(source, group_sessions_per_user=False)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(
+        _photo_event(source, "/tmp/a-1.jpg", message_id="a1")
+    )
+    await adapter.handle_message(
+        _photo_event(_alice_source(), "/tmp/a-2.jpg", message_id="a2")
+    )
+
+    assert adapter._pending_messages[session_key].media_urls == [
+        "/tmp/a-1.jpg",
+        "/tmp/a-2.jpg",
+    ]
+
+
 def test_cross_sender_refusal_at_busy_cap_remains_reachable():
     """A refused merge must survive even when the ordinary busy queue is full."""
     runner, adapter = _runner_with_adapter()
@@ -545,6 +652,30 @@ async def test_three_sender_queue_debounce_never_loses_latest_sender():
     if state is not None:
         reachable.append(state.event)
     assert any(turn is carol for turn in reachable)
+
+
+@pytest.mark.asyncio
+async def test_queue_text_debounce_preserves_a_b_a_arrival_order():
+    """A debounced Alice tail must not merge into Alice's head past Bob."""
+    runner, adapter = _runner_with_adapter()
+    adapter._busy_text_mode = "queue"
+    adapter._busy_text_debounce_seconds = 60.0
+    adapter._busy_text_hard_cap_seconds = 60.0
+    session_key = "telegram:group:a-b-a-debounce"
+
+    for event in (
+        _text_event("alice head", _alice_source(), message_id="a1"),
+        _text_event("bob middle", _bob_source(), message_id="b1"),
+        _text_event("alice tail", _alice_source(), message_id="a2"),
+    ):
+        await adapter._queue_text_debounce(session_key, event)
+    await adapter._flush_text_debounce_now(session_key)
+
+    assert [turn.message_id for turn in _queued_turns(runner, adapter, session_key)] == [
+        "a1",
+        "b1",
+        "a2",
+    ]
 
 
 def test_get_pending_message_only_consumes_and_never_promotes_fifo():

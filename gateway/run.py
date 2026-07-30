@@ -8287,8 +8287,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
-        adapter = self._adapter_for_source(event.source)
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        adapter: Any = None,
+    ) -> None:
+        adapter = adapter or self._adapter_for_source(event.source)
         if not adapter:
             return
         # #28503 — Previously this called ``merge_pending_message_event``
@@ -8296,11 +8301,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the single pending slot when consecutive text messages arrived
         # in ``busy_input_mode: queue``. Route through the FIFO
         # infrastructure shared with ``/queue`` so each follow-up gets
-        # its own turn in arrival order. Photo bursts still merge into
-        # the head slot via ``merge_pending_message_event`` (album
-        # semantics); everything else appends to the overflow tail.
+        # its own turn in arrival order. Contiguous photo/media bursts still
+        # merge at the canonical queue tail (album semantics); everything else
+        # appends without overtaking an existing overflow item.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        _q_state = self._peek_session_state(session_key)
+        overflow = _q_state.conversation.queued_events if _q_state else []
+        if overflow:
+            tail = overflow[-1]
+            if (
+                getattr(tail, "message_type", None) == MessageType.PHOTO
+                or event.message_type == MessageType.PHOTO
+                or bool(getattr(tail, "media_urls", None))
+                or bool(getattr(event, "media_urls", None))
+            ):
+                tail_slot = {session_key: tail}
+                if merge_pending_message_event(
+                    tail_slot,
+                    session_key,
+                    event,
+                    merge_text=event.message_type == MessageType.TEXT,
+                ):
+                    return
+                # A cross-sender media refusal remains lossless even at the
+                # ordinary busy cap, but must append after the current tail.
+                self._enqueue_fifo(session_key, event, adapter)
+                return
+            if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+                logger.warning(
+                    "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
+                return
+            self._enqueue_fifo(session_key, event, adapter)
+            return
         if existing is not None and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
@@ -10640,7 +10676,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if callable(_set_pending_queue):
                 _set_pending_queue(
-                    lambda session_key, event, _adapter=adapter: self._enqueue_fifo(
+                    lambda session_key, event, _adapter=adapter: self._queue_or_replace_pending_event(
                         session_key, event, _adapter
                     )
                 )
@@ -11750,7 +11786,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if callable(_set_pending_queue):
                         _set_pending_queue(
-                            lambda session_key, event, _adapter=adapter: self._enqueue_fifo(
+                            lambda session_key, event, _adapter=adapter: self._queue_or_replace_pending_event(
                                 session_key, event, _adapter
                             )
                         )
@@ -12707,7 +12743,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _set_pending_queue = getattr(adapter, "set_pending_event_queue_handler", None)
         if callable(_set_pending_queue):
             _set_pending_queue(
-                lambda session_key, event, _adapter=adapter: self._enqueue_fifo(
+                lambda session_key, event, _adapter=adapter: self._queue_or_replace_pending_event(
                     session_key, event, _adapter
                 )
             )

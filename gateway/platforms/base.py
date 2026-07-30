@@ -3410,6 +3410,16 @@ class BasePlatformAdapter(ABC):
             )
         handler(session_key, event)
 
+    def _queue_pending_event_with_runner(
+        self, session_key: str, event: MessageEvent
+    ) -> bool:
+        """Let the runner place an event in its canonical FIFO when available."""
+        handler = getattr(self, "_pending_event_queue_handler", None)
+        if handler is None:
+            return False
+        handler(session_key, event)
+        return True
+
     def set_reaction_handler(
         self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
     ) -> None:
@@ -5276,20 +5286,6 @@ class BasePlatformAdapter(ABC):
             await self._flush_text_debounce_now(session_key)
             state = store.get(session_key)
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
-                existing_pending = self._pending_messages.get(session_key)
-                if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
-                    # Same-sender by the check above, so the cross-sender guard
-                    # in merge_pending_message_event cannot refuse here.
-                    absorbed = merge_pending_message_event(
-                        self._pending_messages,
-                        session_key,
-                        event,
-                        merge_text=True,
-                    )
-                    if not absorbed:
-                        self._queue_refused_pending_event(session_key, event)
-                    return
-
                 # The occupied head prevented the older sender's debounce
                 # state from flushing. Preserve arrival order by handing that
                 # older state to the runner FIFO before starting a fresh burst
@@ -5367,6 +5363,8 @@ class BasePlatformAdapter(ABC):
         state = store.pop(session_key, None)
         if state is None:
             return False
+        if self._queue_pending_event_with_runner(session_key, state.event):
+            return True
         # Guarded above: the pending slot is either empty or same-sender. Keep a
         # defensive FIFO handoff so future guard changes cannot drop the event.
         absorbed = merge_pending_message_event(
@@ -5842,6 +5840,8 @@ class BasePlatformAdapter(ABC):
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
+                if self._queue_pending_event_with_runner(session_key, event):
+                    return
                 if not merge_pending_message_event(self._pending_messages, session_key, event):
                     # Keep the pending turn's attribution intact and transfer
                     # the refused event to the runner's canonical FIFO.
@@ -5864,6 +5864,8 @@ class BasePlatformAdapter(ABC):
                     self.name,
                     session_key,
                 )
+                if self._queue_pending_event_with_runner(session_key, event):
+                    return
                 if not merge_pending_message_event(
                     self._pending_messages,
                     session_key,
