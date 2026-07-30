@@ -41,12 +41,14 @@ def busy_input_hint_gateway(mode: str) -> str:
     """
     if mode == "queue":
         return (
+            # 【中文】"消息已排队，不会中断当前任务。可发送 /busy interrupt 切换模式"
             "💡 First-time tip — I queued your message instead of interrupting. "
             "Send `/busy interrupt` to make new messages stop the current task "
             "immediately, or `/busy status` to check. This notice won't appear again."
         )
     if mode == "steer":
         return (
+            # 【中文】"消息已注入当前运行中，将在下一次工具调用后到达。可发送 /busy interrupt 切换"
             "💡 First-time tip — I steered your message into the current run; "
             "it will arrive after the next tool call instead of interrupting. "
             "Send `/busy interrupt` or `/busy queue` to change this, or "
@@ -54,12 +56,14 @@ def busy_input_hint_gateway(mode: str) -> str:
         )
     if mode == "redirect":
         return (
+            # 【中文】"已重定向当前任务，已完成的内容不会丢失。可用 /stop 取消任务"
             "💡 First-time tip — I redirected the current run using your message. "
             "Completed work stays in context, and `/stop` still cancels the task. "
             "Send `/busy queue` to wait for a separate turn, or `/busy status` "
             "to check. This notice won't appear again."
         )
     return (
+        # 【中文】"已中断当前任务来回复你。可发送 /busy queue 将后续消息排队"
         "💡 First-time tip — I just interrupted my current task to answer you. "
         "Send `/busy queue` to queue follow-ups for after the current task instead, "
         "`/busy steer` to inject them mid-run without interrupting, or "
@@ -71,23 +75,27 @@ def busy_input_hint_cli(mode: str) -> str:
     """CLI version of the busy-input hint (plain text, no markdown)."""
     if mode == "queue":
         return (
+            # 【中文】"消息已排队，将在下一轮处理。可用 /busy interrupt 切换"
             "(tip) Your message was queued for the next turn. "
             "Use /busy interrupt to make Enter stop the current run instead, "
             "or /busy steer to inject mid-run. This tip only shows once."
         )
     if mode == "steer":
         return (
+            # 【中文】"消息已注入当前运行中。可用 /busy interrupt 或 /busy queue 切换"
             "(tip) Your message was steered into the current run; it arrives "
             "after the next tool call. Use /busy interrupt or /busy queue to "
             "change this. This tip only shows once."
         )
     if mode == "redirect":
         return (
+            # 【中文】"已重定向当前任务，已完成的工作不会丢失。可用 /stop 取消"
             "(tip) Your correction redirected the current run without discarding "
             "completed work. Use /stop to cancel or /busy queue to wait for a "
             "separate turn. This tip only shows once."
         )
     return (
+        # 【中文】"消息已中断当前任务。可用 /busy queue 将后续消息排队"
         "(tip) Your message interrupted the current run. "
         "Use /busy queue to queue messages for the next turn instead, "
         "or /busy steer to inject mid-run. This tip only shows once."
@@ -96,6 +104,7 @@ def busy_input_hint_cli(mode: str) -> str:
 
 def tool_progress_hint_gateway() -> str:
     return (
+        # 【中文】"工具运行时间较长，正在实时输出进度。可用 /verbose 切换显示模式"
         "💡 First-time tip — that tool took a while and I'm streaming every step. "
         "If the progress messages feel noisy, send `/verbose` to cycle modes "
         "(all → new → off). This notice won't appear again."
@@ -104,6 +113,7 @@ def tool_progress_hint_gateway() -> str:
 
 def tool_progress_hint_cli() -> str:
     return (
+        # 【中文】"工具运行时间较长。可用 /verbose 切换进度显示模式"
         "(tip) That tool ran for a while. Use /verbose to cycle tool-progress "
         "display modes (all -> new -> off -> verbose). This tip only shows once."
     )
