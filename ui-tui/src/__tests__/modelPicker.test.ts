@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { providerIndexAfterClearingFilter } from '../components/modelPicker.js'
+import {
+  modelPickerPersistenceCopy,
+  modelPickerSelectionArgument,
+  providerIndexAfterClearingFilter
+} from '../components/modelPicker.js'
 import type { ModelOptionProvider } from '../gatewayTypes.js'
 
 const provider = (slug: string, name = slug): ModelOptionProvider => ({ name, slug })
@@ -48,5 +52,25 @@ describe('ModelPicker provider filtering', () => {
     ]
 
     expect(providerIndexAfterClearingFilter(rows, p)).toBe(0)
+  })
+})
+
+describe('ModelPicker persistence target', () => {
+  it('labels and emits durable delegation config without a fake session flag', () => {
+    expect(modelPickerPersistenceCopy('delegation', false)).toBe('persist: delegation config')
+    expect(modelPickerSelectionArgument('sub-model', 'custom:lab', 'delegation', false)).toBe(
+      'sub-model --provider custom:lab'
+    )
+  })
+
+  it('preserves the existing main-model session/global contract', () => {
+    expect(modelPickerPersistenceCopy('model', false)).toBe('persist: session · ^g toggle')
+    expect(modelPickerPersistenceCopy('model', true)).toBe('persist: global · ^g toggle')
+    expect(modelPickerSelectionArgument('main-model', 'nous', 'model', false)).toBe(
+      'main-model --provider nous --tui-session'
+    )
+    expect(modelPickerSelectionArgument('main-model', 'nous', 'model', true)).toBe(
+      'main-model --provider nous --global'
+    )
   })
 })

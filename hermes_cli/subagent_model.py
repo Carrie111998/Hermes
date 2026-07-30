@@ -1,11 +1,11 @@
-"""Shared subagent-model selection semantics for every Hermes surface.
+"""Shared subagent model and reasoning semantics for every Hermes surface.
 
-The override is profile-scoped and persisted only as
-``delegation.model`` / ``delegation.provider``.  Model/provider resolution is
-not reimplemented here: all typed and picker selections go through the same
-``model_switch.switch_model`` pipeline as ``/model`` so aliases, configured
-providers, credentials, catalog validation, and provider-specific
-normalization cannot drift between surfaces.
+The profile-scoped overrides live under ``delegation``. Model/provider
+resolution is not reimplemented here: all typed and picker selections go
+through the same ``model_switch.switch_model`` pipeline as ``/model`` so
+aliases, credentials, catalog validation, and provider-specific normalization
+cannot drift between surfaces. Reasoning values use the runtime's canonical
+``parse_reasoning_effort`` contract so UI state and child construction agree.
 """
 
 from __future__ import annotations
@@ -21,6 +21,31 @@ class SubagentModelStatus:
     model: Optional[str]
     provider: Optional[str]
     inherits_parent: bool
+
+
+@dataclass(frozen=True)
+class SubagentReasoningStatus:
+    """Persisted child reasoning override; no effort means inherit parent."""
+
+    effort: Optional[str]
+    inherits_parent: bool
+
+
+def _reasoning_status_from_config(config: dict[str, Any]) -> SubagentReasoningStatus:
+    delegation = config.get("delegation")
+    if not isinstance(delegation, dict) or "reasoning_effort" not in delegation:
+        return SubagentReasoningStatus(None, True)
+
+    from hermes_constants import parse_reasoning_effort
+
+    parsed = parse_reasoning_effort(delegation.get("reasoning_effort"))
+    if parsed is None:
+        # Match child construction: an empty/invalid legacy value has no
+        # override effect and therefore inherits the parent's reasoning.
+        return SubagentReasoningStatus(None, True)
+    if not parsed.get("enabled", True):
+        return SubagentReasoningStatus("none", False)
+    return SubagentReasoningStatus(str(parsed["effort"]), False)
 
 
 def _status_from_config(config: dict[str, Any]) -> SubagentModelStatus:
@@ -41,6 +66,12 @@ def get_subagent_model_status() -> SubagentModelStatus:
     from hermes_cli.config import load_config
 
     return _status_from_config(load_config())
+
+
+def get_subagent_reasoning_status() -> SubagentReasoningStatus:
+    from hermes_cli.config import load_config
+
+    return _reasoning_status_from_config(load_config())
 
 
 def _persist_override(model: Optional[str], provider: Optional[str]) -> SubagentModelStatus:
@@ -123,6 +154,53 @@ def reset_subagent_model() -> SubagentModelStatus:
     """Remove only model/provider; preserve every other delegation setting."""
 
     return _persist_override(None, None)
+
+
+def _persist_reasoning(effort: Optional[str]) -> SubagentReasoningStatus:
+    """Persist or clear only the child reasoning override."""
+
+    from hermes_cli.config import load_config, save_config
+
+    config = load_config()
+    delegation = config.get("delegation")
+    if not isinstance(delegation, dict):
+        delegation = {}
+    else:
+        delegation = dict(delegation)
+
+    if effort is None:
+        delegation.pop("reasoning_effort", None)
+    else:
+        delegation["reasoning_effort"] = effort
+
+    if delegation:
+        config["delegation"] = delegation
+    else:
+        config.pop("delegation", None)
+    save_config(config)
+    return _reasoning_status_from_config(config)
+
+
+def set_subagent_reasoning_effort(effort: str) -> SubagentReasoningStatus:
+    """Validate, canonicalize, and persist child reasoning effort."""
+
+    from hermes_constants import parse_reasoning_effort
+
+    raw = str(effort or "").strip()
+    parsed = parse_reasoning_effort(raw)
+    if parsed is None:
+        raise ValueError(
+            "Invalid subagent reasoning effort. Expected one of: "
+            "none, minimal, low, medium, high, xhigh, max, ultra"
+        )
+    canonical = "none" if not parsed.get("enabled", True) else str(parsed["effort"])
+    return _persist_reasoning(canonical)
+
+
+def reset_subagent_reasoning_effort() -> SubagentReasoningStatus:
+    """Make future children inherit the parent's reasoning configuration."""
+
+    return _persist_reasoning(None)
 
 
 def list_subagent_picker_providers(*, refresh: bool = False) -> list[dict[str, Any]]:

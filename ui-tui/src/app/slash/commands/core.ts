@@ -8,6 +8,7 @@ import type {
   ConfigGetValueResponse,
   ConfigSetResponse,
   DelegationModelResponse,
+  DelegationReasoningResponse,
   SessionSaveResponse,
   SessionStatusResponse,
   SessionSteerResponse,
@@ -778,6 +779,9 @@ export const coreCommands: SlashCommand[] = [
           ? 'inherits parent'
           : `${r?.model ?? '(none)'}${r?.provider ? ` (provider: ${r.provider})` : ''}`
 
+      const formatReasoning = (r: DelegationReasoningResponse) =>
+        r?.inherits_parent ? 'inherits parent' : (r?.effort ?? '(none)')
+
       const raw = arg.trim()
 
       if (!raw) {
@@ -785,14 +789,57 @@ export const coreCommands: SlashCommand[] = [
           .rpc<DelegationModelResponse>('delegation.model', {})
           .then(ctx.guarded<DelegationModelResponse>(r => ctx.transcript.sys(`subagent model: ${format(r)}`)))
           .catch(ctx.guardedErr)
+        ctx.gateway
+          .rpc<DelegationReasoningResponse>('delegation.reasoning', {})
+          .then(
+            ctx.guarded<DelegationReasoningResponse>(r =>
+              ctx.transcript.sys(`subagent reasoning: ${formatReasoning(r)}`)
+            )
+          )
+          .catch(ctx.guardedErr)
 
         return
       }
 
       const [verb = '', ...tail] = raw.split(/\s+/)
 
+      if (verb.toLowerCase() === 'reasoning') {
+        const effort = tail.join(' ').trim()
+        const resetReasoning = new Set(['reset', 'clear', 'default', 'inherit']).has(effort.toLowerCase())
+
+        if (!effort) {
+          ctx.gateway
+            .rpc<DelegationReasoningResponse>('delegation.reasoning', {})
+            .then(
+              ctx.guarded<DelegationReasoningResponse>(r =>
+                ctx.transcript.sys(`subagent reasoning: ${formatReasoning(r)}`)
+              )
+            )
+            .catch(ctx.guardedErr)
+
+          return
+        }
+
+        ctx.gateway
+          .rpc<DelegationReasoningResponse>('delegation.reasoning', resetReasoning ? { reset: true } : { effort })
+          .then(
+            ctx.guarded<DelegationReasoningResponse>(r =>
+              ctx.transcript.sys(
+                resetReasoning
+                  ? `subagent reasoning reset → ${formatReasoning(r)}`
+                  : `subagent reasoning → ${formatReasoning(r)} (new subagents)`
+              )
+            )
+          )
+          .catch(ctx.guardedErr)
+
+        return
+      }
+
       if (verb.toLowerCase() !== 'model') {
-        ctx.transcript.sys('usage: /subagent model [model|reset] [--provider name] [--refresh]')
+        ctx.transcript.sys(
+          'usage: /subagent <model [model|reset] [--provider name] [--refresh] | reasoning [effort|reset]>'
+        )
 
         return
       }

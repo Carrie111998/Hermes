@@ -18,6 +18,7 @@ const MIN_WIDTH = 40
 const MAX_WIDTH = 90
 
 type Stage = 'provider' | 'key' | 'model' | 'disconnect'
+export type ModelPickerPersistenceTarget = 'delegation' | 'model'
 
 type ProviderRow = { name: string; provider: ModelOptionProvider }
 
@@ -32,6 +33,29 @@ export function providerIndexAfterClearingFilter(
   return providerRows.findIndex(row => row.provider.slug === provider.slug)
 }
 
+export function modelPickerSelectionArgument(
+  model: string,
+  provider: string,
+  target: ModelPickerPersistenceTarget,
+  persistGlobal: boolean
+) {
+  const scope = target === 'delegation' ? '' : persistGlobal ? ' --global' : ` ${TUI_SESSION_MODEL_FLAG}`
+
+  return `${model} --provider ${provider}${scope}`
+}
+
+export function modelPickerPersistenceCopy(
+  target: ModelPickerPersistenceTarget,
+  persistGlobal: boolean,
+  allowPersistGlobal = true
+) {
+  if (target === 'delegation') {
+    return 'persist: delegation config'
+  }
+
+  return `persist: ${persistGlobal ? 'global' : 'session'}${allowPersistGlobal ? ' · ^g toggle' : ' only'}`
+}
+
 export function ModelPicker({
   allowPersistGlobal = true,
   gw,
@@ -39,6 +63,7 @@ export function ModelPicker({
   maxWidth,
   onCancel,
   onSelect,
+  persistenceTarget = 'model',
   sessionId,
   t
 }: ModelPickerProps) {
@@ -55,6 +80,7 @@ export function ModelPicker({
   const [keyError, setKeyError] = useState('')
   // Type-to-filter query, scoped per stage (cleared on stage change).
   const [filter, setFilter] = useState('')
+  const canPersistGlobal = persistenceTarget === 'model' && allowPersistGlobal
 
   const { stdout } = useStdout()
   // Pin the picker to a stable width so the FloatBox parent (which shrinks-
@@ -384,9 +410,7 @@ export function ModelPicker({
       const model = models[modelIdx]
 
       if (provider && model) {
-        onSelect(
-          `${model} --provider ${provider.slug}${allowPersistGlobal && persistGlobal ? ' --global' : ` ${TUI_SESSION_MODEL_FLAG}`}`
-        )
+        onSelect(modelPickerSelectionArgument(model, provider.slug, persistenceTarget, persistGlobal))
       } else {
         setStage('provider')
       }
@@ -414,7 +438,7 @@ export function ModelPicker({
     // Persist-global toggle moved to Ctrl+G so 'g' can be typed into the
     // filter. With Ctrl held, @hermes/ink reports `ch` as the key name ('g'),
     // not the raw control byte (see input-event.ts: input = ctrl ? name : seq).
-    if (allowPersistGlobal && key.ctrl && ch === 'g') {
+    if (canPersistGlobal && key.ctrl && ch === 'g') {
       setPersistGlobal(v => !v)
 
       return
@@ -621,8 +645,7 @@ export function ModelPicker({
         </Text>
 
         <Text color={t.color.muted} wrap="truncate-end">
-          persist: {allowPersistGlobal ? (persistGlobal ? 'global' : 'session') : 'session'}
-          {allowPersistGlobal ? ' · ^g toggle' : ' only'}
+          {modelPickerPersistenceCopy(persistenceTarget, persistGlobal, canPersistGlobal)}
         </Text>
         <OverlayHint t={t}>↑/↓ select · Enter choose · ^d disconnect · Esc clear/back · q close</OverlayHint>
       </Box>
@@ -688,8 +711,7 @@ export function ModelPicker({
       </Text>
 
       <Text color={t.color.muted} wrap="truncate-end">
-        persist: {allowPersistGlobal ? (persistGlobal ? 'global' : 'session') : 'session'}
-        {allowPersistGlobal ? ' · ^g toggle' : ' only'}
+        {modelPickerPersistenceCopy(persistenceTarget, persistGlobal, canPersistGlobal)}
       </Text>
       <OverlayHint t={t}>
         {models.length ? '↑/↓ select · Enter switch · Esc clear/back · q close' : 'Esc back · q close'}
@@ -705,6 +727,7 @@ interface ModelPickerProps {
   maxWidth?: number
   onCancel: () => void
   onSelect: (value: string) => void
+  persistenceTarget?: ModelPickerPersistenceTarget
   sessionId: string | null
   t: Theme
 }

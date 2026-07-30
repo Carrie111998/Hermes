@@ -75,11 +75,57 @@ beforeEach(() => {
     tasks: [{ task: 'vision', provider: 'auto', model: '', base_url: '' }]
   })
   getMoaModels.mockResolvedValue(null)
-  getDelegateModelInfo.mockResolvedValue({ model: null, provider: null, inherits_parent: true })
-  setDelegateModel.mockImplementation(async (body: { model?: string; provider?: string; reset?: boolean }) =>
-    body.reset
-      ? { model: null, provider: null, inherits_parent: true }
-      : { model: body.model ?? null, provider: body.provider ?? null, inherits_parent: false }
+  getDelegateModelInfo.mockResolvedValue({
+    model: null,
+    provider: null,
+    inherits_parent: true,
+    reasoning_effort: null,
+    inherits_parent_reasoning: true
+  })
+  setDelegateModel.mockImplementation(
+    async (body: {
+      model?: string
+      provider?: string
+      reasoning_effort?: string
+      reset?: boolean
+      reset_reasoning?: boolean
+    }) => {
+      if (body.reasoning_effort) {
+        return {
+          model: null,
+          provider: null,
+          inherits_parent: true,
+          reasoning_effort: body.reasoning_effort,
+          inherits_parent_reasoning: false
+        }
+      }
+
+      if (body.reset_reasoning) {
+        return {
+          model: null,
+          provider: null,
+          inherits_parent: true,
+          reasoning_effort: null,
+          inherits_parent_reasoning: true
+        }
+      }
+
+      return body.reset
+        ? {
+            model: null,
+            provider: null,
+            inherits_parent: true,
+            reasoning_effort: null,
+            inherits_parent_reasoning: true
+          }
+        : {
+            model: body.model ?? null,
+            provider: body.provider ?? null,
+            inherits_parent: false,
+            reasoning_effort: null,
+            inherits_parent_reasoning: true
+          }
+    }
   )
   setModelAssignment.mockResolvedValue({ provider: 'nous', model: 'hermes-4', gateway_tools: [] })
   getRecommendedDefaultModel.mockResolvedValue({ provider: 'nous', model: 'hermes-4', free_tier: null })
@@ -139,6 +185,19 @@ describe('ModelSettings', () => {
     )
     fireEvent.click(await screen.findByRole('button', { name: 'Inherit parent' }))
     await waitFor(() => expect(setDelegateModel).toHaveBeenCalledWith({ reset: true }))
+  })
+
+  it('sets and resets reasoning for newly spawned subagents', async () => {
+    await renderModelSettings()
+
+    const reasoning = await screen.findByRole('combobox', { name: 'Subagent reasoning' })
+    fireEvent.click(reasoning)
+    fireEvent.click(await screen.findByRole('option', { name: 'High' }))
+    await waitFor(() => expect(setDelegateModel).toHaveBeenCalledWith({ reasoning_effort: 'high' }))
+
+    fireEvent.click(await screen.findByRole('combobox', { name: 'Subagent reasoning' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'Inherit parent' }))
+    await waitFor(() => expect(setDelegateModel).toHaveBeenCalledWith({ reset_reasoning: true }))
   })
 
   it('renders a model-only subagent override instead of inheritance', async () => {

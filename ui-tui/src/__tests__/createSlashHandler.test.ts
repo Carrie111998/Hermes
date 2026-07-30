@@ -48,6 +48,28 @@ describe('createSlashHandler', () => {
     expect(ctx.gateway.rpc).not.toHaveBeenCalled()
   })
 
+  it('shows both model and reasoning status for /subagent', async () => {
+    const rpc = vi.fn((...args: unknown[]) => {
+      const method = String(args[0] ?? '')
+
+      return Promise.resolve(
+        method === 'delegation.model'
+          ? { model: 'child-model', provider: 'child-provider', inherits_parent: false }
+          : { effort: 'high', inherits_parent: false }
+      )
+    })
+
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/subagent')).toBe(true)
+    expect(rpc).toHaveBeenCalledWith('delegation.model', {})
+    expect(rpc).toHaveBeenCalledWith('delegation.reasoning', {})
+    await vi.waitFor(() => {
+      expect(ctx.transcript.sys).toHaveBeenCalledWith('subagent model: child-model (provider: child-provider)')
+      expect(ctx.transcript.sys).toHaveBeenCalledWith('subagent reasoning: high')
+    })
+  })
+
   it('resets the subagent override through delegation.model', async () => {
     const rpc = vi.fn(() => Promise.resolve({ model: null, provider: null, inherits_parent: true }))
     const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
@@ -56,6 +78,28 @@ describe('createSlashHandler', () => {
     expect(rpc).toHaveBeenCalledWith('delegation.model', { reset: true })
     await vi.waitFor(() => {
       expect(ctx.transcript.sys).toHaveBeenCalledWith('subagent model reset → inherits parent')
+    })
+  })
+
+  it('sets persistent subagent reasoning through delegation.reasoning', async () => {
+    const rpc = vi.fn(() => Promise.resolve({ effort: 'high', inherits_parent: false }))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/subagent reasoning high')).toBe(true)
+    expect(rpc).toHaveBeenCalledWith('delegation.reasoning', { effort: 'high' })
+    await vi.waitFor(() => {
+      expect(ctx.transcript.sys).toHaveBeenCalledWith('subagent reasoning → high (new subagents)')
+    })
+  })
+
+  it('resets only subagent reasoning inheritance', async () => {
+    const rpc = vi.fn(() => Promise.resolve({ effort: null, inherits_parent: true }))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/subagent reasoning reset')).toBe(true)
+    expect(rpc).toHaveBeenCalledWith('delegation.reasoning', { reset: true })
+    await vi.waitFor(() => {
+      expect(ctx.transcript.sys).toHaveBeenCalledWith('subagent reasoning reset → inherits parent')
     })
   })
 

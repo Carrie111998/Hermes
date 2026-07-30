@@ -4552,7 +4552,7 @@ def cmd_status(args):
 
 
 def cmd_subagent(args):
-    """Inspect or pin the subagent model.
+    """Inspect or configure the subagent model and reasoning.
 
     Dispatches on ``args.subagent_command``:
 
@@ -4561,17 +4561,23 @@ def cmd_subagent(args):
         hermes subagent model <model>       # validated direct selection
         hermes subagent model reset         # inherit parent
         hermes subagent model --reset       # inherit parent (flag form)
+        hermes subagent reasoning high      # fixed child effort
+        hermes subagent reasoning reset     # inherit parent reasoning
     """
     from hermes_cli.subagent_model import (
         get_subagent_model_status,
+        get_subagent_reasoning_status,
         reset_subagent_model,
+        reset_subagent_reasoning_effort,
         select_subagent_model_interactively,
         set_subagent_model,
+        set_subagent_reasoning_effort,
     )
 
     sub = getattr(args, "subagent_command", None)
     if sub in {None, ""}:
         _print_subagent_status(get_subagent_model_status())
+        _print_subagent_reasoning_status(get_subagent_reasoning_status())
         return
     if sub == "model":
         model_arg = getattr(args, "model", None)
@@ -4597,8 +4603,29 @@ def cmd_subagent(args):
             return
         _print_subagent_status(status, action="Selected")
         return
+    if sub == "reasoning":
+        effort_arg = getattr(args, "effort", None)
+        positional_reset = (
+            isinstance(effort_arg, str)
+            and effort_arg.strip().lower() in {"clear", "default", "inherit", "reset"}
+        )
+        if getattr(args, "reset", False) or positional_reset:
+            _print_subagent_reasoning_status(
+                reset_subagent_reasoning_effort(), action="Reset"
+            )
+            return
+        if effort_arg:
+            _print_subagent_reasoning_status(
+                set_subagent_reasoning_effort(effort_arg), action="Set"
+            )
+            return
+        _print_subagent_reasoning_status(get_subagent_reasoning_status())
+        return
 
-    print("usage: hermes subagent [model [<model>|--reset|--refresh]]")
+    print(
+        "usage: hermes subagent "
+        "[model [<model>|--reset|--refresh] | reasoning [<effort>|--reset]]"
+    )
 
 
 def _print_subagent_status(status, action=None):
@@ -4619,6 +4646,14 @@ def _print_subagent_status(status, action=None):
         print(f"  {action} subagent model: {label}")
     else:
         print(f"  Subagent model: {label}")
+
+
+def _print_subagent_reasoning_status(status, action=None):
+    label = "inherits parent" if status.inherits_parent else (status.effort or "(none)")
+    if action:
+        print(f"  {action} subagent reasoning: {label}")
+    else:
+        print(f"  Subagent reasoning: {label}")
 
 
 def cmd_cron(args):

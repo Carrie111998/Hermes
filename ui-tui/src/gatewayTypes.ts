@@ -574,6 +574,11 @@ export interface DelegationModelResponse {
   inherits_parent: boolean
 }
 
+export interface DelegationReasoningResponse {
+  effort: null | string
+  inherits_parent: boolean
+}
+
 export interface DelegationPauseResponse {
   paused?: boolean
 }

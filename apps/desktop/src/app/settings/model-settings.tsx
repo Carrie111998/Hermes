@@ -333,6 +333,11 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       ? JSON.stringify([delegateModel.provider ?? '', delegateModel.model])
       : DELEGATE_INHERIT_VALUE
 
+  const delegateReasoningValue =
+    delegateModel && delegateModel.inherits_parent_reasoning === false && delegateModel.reasoning_effort
+      ? delegateModel.reasoning_effort
+      : DELEGATE_INHERIT_VALUE
+
   // Radix renders a blank trigger when the controlled value has no matching
   // item. Keep a missing saved provider visible in the main selector while
   // leaving it out of the real inventory used for readiness/setup metadata.
@@ -540,6 +545,28 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       if (profileEpoch.current !== epoch) {
         return
       }
+      setDelegateModelState(result)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setApplying(false)
+    }
+  }, [])
+
+  const applyDelegateReasoning = useCallback(async (value: string) => {
+    const epoch = profileEpoch.current
+    setApplying(true)
+    setError('')
+
+    try {
+      const result = await setDelegateModel(
+        value === DELEGATE_INHERIT_VALUE ? { reset_reasoning: true } : { reasoning_effort: value }
+      )
+
+      if (profileEpoch.current !== epoch) {
+        return
+      }
+
       setDelegateModelState(result)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -999,6 +1026,27 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
             ))}
           </SelectContent>
         </Select>
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-muted-foreground">{m.reasoning}</span>
+          <Select
+            disabled={applying || !delegateModel}
+            onValueChange={value => void applyDelegateReasoning(value)}
+            value={delegateReasoningValue}
+          >
+            <SelectTrigger aria-label="Subagent reasoning" className={cn('min-w-40', CONTROL_TEXT)}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={DELEGATE_INHERIT_VALUE}>{m.delegateReset}</SelectItem>
+              {REASONING_EFFORT_VALUES.map(value => (
+                <SelectItem key={value} value={value}>
+                  {value === 'none' ? m.reasoningOff : t.shell.modelOptions[value]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <span className="text-muted-foreground">Applies to newly spawned subagents.</span>
+        </div>
       </section>
 
       <section>

@@ -257,6 +257,7 @@ export function FloatingOverlays({
             maxWidth={width}
             onCancel={() => patchOverlayState({ modelPicker: false })}
             onSelect={subagentTarget ? onSubagentModelSelect : onModelSelect}
+            persistenceTarget={subagentTarget ? 'delegation' : 'model'}
             sessionId={sid}
             t={theme}
           />

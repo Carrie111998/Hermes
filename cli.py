@@ -9164,9 +9164,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         from hermes_cli.subagent_model import (
             get_subagent_model_status,
+            get_subagent_reasoning_status,
             list_subagent_picker_providers,
             reset_subagent_model,
+            reset_subagent_reasoning_effort,
             set_subagent_model,
+            set_subagent_reasoning_effort,
         )
         from hermes_cli.model_switch import parse_model_flags_detailed
 
@@ -9175,12 +9178,41 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             status = get_subagent_model_status()
             label = "inherits parent" if status.inherits_parent else f"{status.model} ({status.provider or 'auto'})"
             _cprint(f"  Subagent model: {label}")
-            _cprint("  Usage: /subagent model [model|reset] [--provider name]")
+            reasoning = get_subagent_reasoning_status()
+            reasoning_label = "inherits parent" if reasoning.inherits_parent else reasoning.effort
+            _cprint(f"  Subagent reasoning: {reasoning_label}")
+            _cprint(
+                "  Usage: /subagent <model [model|reset] [--provider name] "
+                "| reasoning [effort|reset]>"
+            )
             return
 
         verb, _, model_args = raw.partition(" ")
+        if verb.lower() == "reasoning":
+            reasoning_arg = model_args.strip()
+            if not reasoning_arg:
+                status = get_subagent_reasoning_status()
+                label = "inherits parent" if status.inherits_parent else status.effort
+                _cprint(f"  Subagent reasoning: {label}")
+                return
+            if reasoning_arg.lower() in {"reset", "clear", "default", "inherit"}:
+                reset_subagent_reasoning_effort()
+                _cprint("  ✓ Subagent reasoning reset: inherits parent")
+                return
+            try:
+                status = set_subagent_reasoning_effort(reasoning_arg)
+            except ValueError as exc:
+                _cprint(f"  ✗ {exc}")
+                return
+            _cprint(f"  ✓ Subagent reasoning: {status.effort}")
+            _cprint("    Saved to config.yaml (delegation.reasoning_effort)")
+            _cprint("    Applies to newly spawned subagents")
+            return
         if verb.lower() != "model":
-            _cprint("  Usage: /subagent model [model|reset] [--provider name]")
+            _cprint(
+                "  Usage: /subagent <model [model|reset] [--provider name] "
+                "| reasoning [effort|reset]>"
+            )
             return
         model_args = model_args.strip()
         if model_args.lower() in {"reset", "clear", "default"}:

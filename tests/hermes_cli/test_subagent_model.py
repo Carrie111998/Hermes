@@ -493,3 +493,200 @@ def test_tui_gateway_rpc_uses_shared_subagent_core(monkeypatch):
     }
     assert calls == [("alias", "target")]
     assert handler("reset", {"reset": True})["result"]["inherits_parent"] is True
+
+
+def test_tui_gateway_reasoning_rpc_uses_shared_subagent_core(monkeypatch):
+    from tui_gateway import server
+
+    inherited = subagent_model.SubagentReasoningStatus(None, True)
+    explicit = subagent_model.SubagentReasoningStatus("high", False)
+    calls: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(subagent_model, "get_subagent_reasoning_status", lambda: inherited)
+    monkeypatch.setattr(
+        subagent_model,
+        "set_subagent_reasoning_effort",
+        lambda effort: calls.append(("set", effort)) or explicit,
+    )
+    monkeypatch.setattr(
+        subagent_model,
+        "reset_subagent_reasoning_effort",
+        lambda: calls.append(("reset", None)) or inherited,
+    )
+
+    handler = server._methods["delegation.reasoning"]
+    assert handler("read", {})["result"] == {
+        "effort": None,
+        "inherits_parent": True,
+    }
+    assert handler("set", {"effort": "high"})["result"] == {
+        "effort": "high",
+        "inherits_parent": False,
+    }
+    assert handler("reset", {"reset": True})["result"]["inherits_parent"] is True
+    assert calls == [("set", "high"), ("reset", None)]
+
+
+def test_desktop_rest_model_and_reasoning_resets_are_independent(monkeypatch):
+    from hermes_cli import web_server
+
+    state = _memory_config(
+        monkeypatch,
+        {
+            "delegation": {
+                "model": "sub-model",
+                "provider": "openrouter",
+            }
+        },
+    )
+
+    explicit = web_server.set_delegate_model({"reasoning_effort": "high"})
+    assert explicit == {
+        "model": "sub-model",
+        "provider": "openrouter",
+        "inherits_parent": False,
+        "reasoning_effort": "high",
+        "inherits_parent_reasoning": False,
+    }
+
+    model_reset = web_server.set_delegate_model({"reset": True})
+    assert model_reset["inherits_parent"] is True
+    assert model_reset["reasoning_effort"] == "high"
+    assert state == {"delegation": {"reasoning_effort": "high"}}
+
+    reasoning_reset = web_server.set_delegate_model({"reset_reasoning": True})
+    assert reasoning_reset["inherits_parent_reasoning"] is True
+    assert state == {}
+
+
+def test_desktop_rest_rejects_mixed_model_and_reasoning_mutation(monkeypatch):
+    from fastapi import HTTPException
+    from hermes_cli import web_server
+
+    state = _memory_config(
+        monkeypatch,
+        {"delegation": {"model": "sub-model", "provider": "openrouter"}},
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        web_server.set_delegate_model(
+            {
+                "reset": True,
+                "reasoning_effort": "high",
+            }
+        )
+
+    assert exc_info.value.status_code == 400
+    assert state == {
+        "delegation": {
+            "model": "sub-model",
+            "provider": "openrouter",
+        }
+    }
+
+
+def test_reasoning_status_distinguishes_explicit_off_from_inheritance(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"delegation": {"reasoning_effort": "none"}},
+    )
+
+    assert subagent_model.get_subagent_reasoning_status() == (
+        subagent_model.SubagentReasoningStatus(
+            effort="none",
+            inherits_parent=False,
+        )
+    )
+
+
+def test_set_reasoning_canonicalizes_alias_and_preserves_model_override(monkeypatch):
+    state = _memory_config(
+        monkeypatch,
+        {
+            "delegation": {
+                "model": "sub-model",
+                "provider": "custom:sub-endpoint",
+                "max_spawn_depth": 2,
+            }
+        },
+    )
+
+    status = subagent_model.set_subagent_reasoning_effort("disabled")
+
+    assert status == subagent_model.SubagentReasoningStatus(
+        effort="none",
+        inherits_parent=False,
+    )
+    assert state == {
+        "delegation": {
+            "model": "sub-model",
+            "provider": "custom:sub-endpoint",
+            "max_spawn_depth": 2,
+            "reasoning_effort": "none",
+        }
+    }
+
+
+def test_reset_reasoning_preserves_model_provider_and_other_delegation(monkeypatch):
+    state = _memory_config(
+        monkeypatch,
+        {
+            "delegation": {
+                "model": "sub-model",
+                "provider": "openrouter",
+                "reasoning_effort": "high",
+                "max_concurrent_children": 3,
+            }
+        },
+    )
+
+    status = subagent_model.reset_subagent_reasoning_effort()
+
+    assert status.inherits_parent is True
+    assert status.effort is None
+    assert state == {
+        "delegation": {
+            "model": "sub-model",
+            "provider": "openrouter",
+            "max_concurrent_children": 3,
+        }
+    }
+
+
+def test_invalid_reasoning_effort_does_not_write_config(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config",
+        lambda _value: pytest.fail("invalid reasoning effort must not persist"),
+    )
+
+    with pytest.raises(ValueError, match="Invalid subagent reasoning effort"):
+        subagent_model.set_subagent_reasoning_effort("turbo")
+
+
+def test_shell_reasoning_set_and_reset_are_independent(monkeypatch, capsys):
+    from hermes_cli import main as hermes_main
+
+    explicit = subagent_model.SubagentReasoningStatus("high", False)
+    inherited = subagent_model.SubagentReasoningStatus(None, True)
+    calls: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        subagent_model,
+        "set_subagent_reasoning_effort",
+        lambda effort: calls.append(("set", effort)) or explicit,
+    )
+    monkeypatch.setattr(
+        subagent_model,
+        "reset_subagent_reasoning_effort",
+        lambda: calls.append(("reset", None)) or inherited,
+    )
+
+    hermes_main.cmd_subagent(
+        SimpleNamespace(subagent_command="reasoning", effort="high", reset=False)
+    )
+    hermes_main.cmd_subagent(
+        SimpleNamespace(subagent_command="reasoning", effort="inherit", reset=False)
+    )
+
+    assert calls == [("set", "high"), ("reset", None)]
+    output = capsys.readouterr().out
+    assert "Set subagent reasoning: high" in output
+    assert "Reset subagent reasoning: inherits parent" in output

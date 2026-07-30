@@ -2828,6 +2828,34 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("delegation.reasoning")
+def _(rid, params: dict) -> dict:
+    """Read, set, or reset the reasoning override for future subagents."""
+    if bool(params.get("reset")):
+        from hermes_cli.subagent_model import reset_subagent_reasoning_effort
+
+        status = reset_subagent_reasoning_effort()
+    elif str(params.get("effort") or "").strip():
+        from hermes_cli.subagent_model import set_subagent_reasoning_effort
+
+        try:
+            status = set_subagent_reasoning_effort(str(params["effort"]))
+        except ValueError as exc:
+            return _err(rid, 4000, str(exc))
+    else:
+        from hermes_cli.subagent_model import get_subagent_reasoning_status
+
+        status = get_subagent_reasoning_status()
+
+    return _ok(
+        rid,
+        {
+            "effort": status.effort,
+            "inherits_parent": status.inherits_parent,
+        },
+    )
+
+
 @method("subagent.interrupt")
 def _(rid, params: dict) -> dict:
     from tools.delegate_tool import interrupt_subagent

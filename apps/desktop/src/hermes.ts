@@ -1537,7 +1537,9 @@ export function getDelegateModelInfo(): Promise<DelegateModelResponse> {
 export function setDelegateModel(body: {
   model?: string
   provider?: string
+  reasoning_effort?: string
   reset?: boolean
+  reset_reasoning?: boolean
 }): Promise<DelegateModelResponse> {
   return window.hermesDesktop.api<DelegateModelResponse>({
     ...profileScoped(),

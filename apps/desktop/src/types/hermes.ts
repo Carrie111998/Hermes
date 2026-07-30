@@ -1398,4 +1398,7 @@ export interface DelegateModelResponse {
   /** True when neither delegation.model nor delegation.provider is set —
    *  subagents inherit the parent model. */
   inherits_parent: boolean
+  /** Null means future children inherit the parent's reasoning config. */
+  reasoning_effort: null | string
+  inherits_parent_reasoning: boolean
 }

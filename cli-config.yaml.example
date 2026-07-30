@@ -1254,6 +1254,8 @@ delegation:
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
+  # reasoning_effort: "medium"                # Child reasoning: none|minimal|low|medium|high|xhigh|max|ultra.
+  #                                           # Omit to inherit the parent agent's reasoning configuration.
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)

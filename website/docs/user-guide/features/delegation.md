@@ -149,15 +149,18 @@ You can configure a different model for subagents via `config.yaml` — useful f
 delegation:
   model: "google/gemini-flash-2.0"    # Cheaper model for subagents
   provider: "openrouter"              # Optional: route subagents to a different provider
+  reasoning_effort: "high"             # Optional: independent child reasoning level
 ```
 
 If omitted, subagents use the same model as the parent. You can manage this target without editing YAML:
 
 - Shell: `hermes subagent model` opens the complete `hermes model` provider setup flow, including provider login and **Custom endpoint** creation. Shared setup changes are retained — for example, a new custom endpoint becomes available in the primary model picker — while the active primary model and auth route remain unchanged. The confirmed provider/model is assigned to subagents. `hermes subagent model --reset` removes only the delegation override.
-- Classic CLI and TUI: `/subagent model` opens their existing model picker; `/subagent model reset` restores inheritance.
+- Classic CLI and TUI: `/subagent model` opens their existing model picker; `/subagent model reset` restores inheritance. The TUI picker explicitly reports **persist: delegation config** because this target is profile-scoped rather than session-scoped.
 - Desktop: **Settings → Model → Subagent model** uses the same provider/model catalog and includes an **Inherit parent model** option.
 
 Every surface resolves aliases, provider credentials, and provider-specific model names through the same model-switch core before atomically saving `delegation.model` and `delegation.provider`. Changes apply to newly spawned children; existing subagents keep the model they started with.
+
+Reasoning is an independent override for future children. Use `hermes subagent reasoning <level>` in the shell, `/subagent reasoning <level>` in the Classic CLI or TUI, or the **Reasoning** selector beside **Subagent model** in Desktop. Valid levels match the parent control: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. `none` explicitly disables child reasoning; `reasoning reset` (or **Inherit parent**) removes only `delegation.reasoning_effort` and restores parent inheritance. Model reset and reasoning reset do not affect each other. Running children keep the reasoning configuration they started with; the next child reads the updated value without a restart.
 
 ## Inherited Tool Access
 

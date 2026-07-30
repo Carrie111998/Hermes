@@ -6086,17 +6086,29 @@ def get_delegate_model_info(profile: Optional[str] = None):
     """
     try:
         with _profile_scope(profile):
-            from hermes_cli.subagent_model import get_subagent_model_status
+            from hermes_cli.subagent_model import (
+                get_subagent_model_status,
+                get_subagent_reasoning_status,
+            )
 
             status = get_subagent_model_status()
+            reasoning = get_subagent_reasoning_status()
             return {
                 "model": status.model,
                 "provider": status.provider,
                 "inherits_parent": status.inherits_parent,
+                "reasoning_effort": reasoning.effort,
+                "inherits_parent_reasoning": reasoning.inherits_parent,
             }
     except Exception:
         _log.exception("GET /api/model/delegate failed")
-        return {"model": None, "provider": None, "inherits_parent": True}
+        return {
+            "model": None,
+            "provider": None,
+            "inherits_parent": True,
+            "reasoning_effort": None,
+            "inherits_parent_reasoning": True,
+        }
 
 
 @app.post("/api/model/delegate")
@@ -6108,13 +6120,25 @@ def set_delegate_model(
 
     Body shapes:
       - {"model": "sonnet", "provider": "anthropic"} → pin
-      - {"reset": true}                               → remove override
+      - {"reset": true}                               → remove model override
+      - {"reasoning_effort": "high"}                 → set child reasoning
+      - {"reset_reasoning": true}                     → inherit parent reasoning
     """
     try:
         with _profile_scope(profile):
             reset = bool(body.get("reset"))
+            reset_reasoning = bool(body.get("reset_reasoning"))
             model = str(body.get("model") or "").strip()
             provider = str(body.get("provider") or "").strip()
+            reasoning_effort = str(body.get("reasoning_effort") or "").strip()
+
+            model_mutation = reset or bool(model)
+            reasoning_mutation = reset_reasoning or bool(reasoning_effort)
+            if model_mutation and reasoning_mutation:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Update subagent model and reasoning in separate requests",
+                )
 
             if reset:
                 from hermes_cli.subagent_model import reset_subagent_model
@@ -6124,15 +6148,29 @@ def set_delegate_model(
                 from hermes_cli.subagent_model import set_subagent_model
 
                 status = set_subagent_model(model, provider=provider or None)
-            else:
-                from hermes_cli.subagent_model import get_subagent_model_status
+            if reset_reasoning:
+                from hermes_cli.subagent_model import reset_subagent_reasoning_effort
 
-                status = get_subagent_model_status()
+                reset_subagent_reasoning_effort()
+            elif reasoning_effort:
+                from hermes_cli.subagent_model import set_subagent_reasoning_effort
+
+                set_subagent_reasoning_effort(reasoning_effort)
+
+            from hermes_cli.subagent_model import (
+                get_subagent_model_status,
+                get_subagent_reasoning_status,
+            )
+
+            status = get_subagent_model_status()
+            reasoning = get_subagent_reasoning_status()
 
             return {
                 "model": status.model,
                 "provider": status.provider,
                 "inherits_parent": status.inherits_parent,
+                "reasoning_effort": reasoning.effort,
+                "inherits_parent_reasoning": reasoning.inherits_parent,
             }
     except HTTPException:
         raise
