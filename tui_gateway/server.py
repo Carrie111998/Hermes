@@ -155,6 +155,7 @@ _scheduled_agent_builds: dict[str, object] = {}
 _starting_agent_builds: set[str] = set()
 _scheduled_auto_continues: dict[str, tuple[object, Any]] = {}
 _starting_auto_continues: set[str] = set()
+_deferred_ws_orphan_reaps: set[str] = set()
 _active_tui_maintenance = 0
 _tui_update_quiesced = False
 _prompt_lock = threading.Lock()
@@ -351,12 +352,20 @@ def end_update_quiesce() -> None:
             (sid, target)
             for sid, (_token, target) in _scheduled_auto_continues.items()
         ]
+        pending_orphan_reaps = list(_deferred_ws_orphan_reaps)
         _scheduled_agent_builds.clear()
         _scheduled_auto_continues.clear()
+        _deferred_ws_orphan_reaps.clear()
     for sid in pending_builds:
         _schedule_agent_build(sid, delay=0.0)
     for sid, target in pending_continues:
         _schedule_auto_continue_kickoff(sid, target)
+    for sid in pending_orphan_reaps:
+        threading.Thread(
+            target=_run_ws_orphan_reap,
+            args=(sid,),
+            daemon=True,
+        ).start()
     # A one-shot cap/orphan/lease sweep may have fired while updates were
     # paused. Re-run the consolidated maintenance pass now so pausing remains
     # lossless without letting teardown work cross the update boundary.
@@ -994,14 +1003,27 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         return
 
     def _reap() -> None:
-        with _tui_maintenance_scope() as admitted:
-            if not admitted:
-                return
-            _reap_ws_orphan_if_still_detached(sid)
+        _run_ws_orphan_reap(sid)
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
     timer.daemon = True
     timer.start()
+
+
+def _run_ws_orphan_reap(sid: str) -> None:
+    """Run or defer one grace-expired WebSocket orphan check."""
+    global _active_tui_maintenance
+
+    with _update_quiesce_lock:
+        if _tui_update_quiesced:
+            _deferred_ws_orphan_reaps.add(sid)
+            return
+        _active_tui_maintenance += 1
+    try:
+        _reap_ws_orphan_if_still_detached(sid)
+    finally:
+        with _update_quiesce_lock:
+            _active_tui_maintenance = max(_active_tui_maintenance - 1, 0)
 
 
 def _reap_ws_orphan_if_still_detached(sid: str) -> None:

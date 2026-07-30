@@ -633,6 +633,24 @@ def test_active_tui_work_includes_tui_maintenance(server):
     assert server.has_active_tui_work() is False
 
 
+def test_update_quiesce_replays_missed_ws_orphan_reap(server, monkeypatch):
+    reaped = threading.Event()
+    monkeypatch.setattr(
+        server,
+        "_reap_ws_orphan_if_still_detached",
+        lambda sid: reaped.set(),
+    )
+
+    server.begin_update_quiesce()
+    server._run_ws_orphan_reap("detached")
+    assert reaped.is_set() is False
+    assert "detached" in server._deferred_ws_orphan_reaps
+
+    server.end_update_quiesce()
+    assert reaped.wait(timeout=0.5) is True
+    assert "detached" not in server._deferred_ws_orphan_reaps
+
+
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
 def test_completion_handlers_are_pool_routed(completion_method, server):
     """complete.path/complete.slash must run on the pool, never the reader thread.
