@@ -45,13 +45,30 @@ def get_hermes_home() -> Path:
 
 
 MEM0_CONFIG = get_hermes_home() / "mem0.json"
-SIMILARITY_THRESHOLD = 0.92
 SCROLL_LIMIT = 100
 
-# Module-level constants — overridden by CLI flags in main()
-QDRANT_URL: str | None = None        # None means "use embedded path mode"
-QDRANT_PATH: str | None = None       # Set when running in embedded/local mode
-COLLECTION = "hermes_memories"
+# ---------------------------------------------------------------------------
+# Runtime configuration — populated by main() after CLI parsing.
+# Functions read from this namespace instead of bare module globals so that
+# the script can be imported and tested without side-effects.
+# ---------------------------------------------------------------------------
+
+class _Cfg:  # noqa: N801  (intentionally lowercase-ish for internal use)
+    """Mutable runtime config set once in main() and read by all helpers."""
+    qdrant_url: str | None = None   # None → embedded (local-path) mode
+    qdrant_path: str | None = None  # Set when running embedded Qdrant
+    collection: str = "hermes_memories"
+    threshold: float = 0.92
+
+
+_cfg = _Cfg()
+
+# ---------------------------------------------------------------------------
+# Default values for argparse — these are the initial values before CLI parsing.
+# All runtime code reads from _cfg, not from these constants.
+# ---------------------------------------------------------------------------
+_DEFAULT_THRESHOLD = _cfg.threshold
+_DEFAULT_COLLECTION = _cfg.collection
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +131,7 @@ def _config_qdrant_url(cfg: dict) -> str | None:
 
 def _is_embedded_mode() -> bool:
     """Return True when the script should use qdrant-client with path= (embedded)."""
-    return QDRANT_PATH is not None
+    return _cfg.qdrant_path is not None
 
 
 def _require_qdrant_client():
@@ -134,9 +151,9 @@ def _require_qdrant_client():
 def _get_qdrant_client():
     """Return a QdrantClient configured for the active mode (embedded or HTTP)."""
     QdrantClient = _require_qdrant_client()
-    if QDRANT_PATH:
-        return QdrantClient(path=QDRANT_PATH)
-    return QdrantClient(url=QDRANT_URL)
+    if _cfg.qdrant_path:
+        return QdrantClient(path=_cfg.qdrant_path)
+    return QdrantClient(url=_cfg.qdrant_url)
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +161,7 @@ def _get_qdrant_client():
 # ---------------------------------------------------------------------------
 
 def api_get(path, timeout=60):
-    req = urllib.request.Request(f"{QDRANT_URL}{path}", method="GET")
+    req = urllib.request.Request(f"{_cfg.qdrant_url}{path}", method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
@@ -152,7 +169,7 @@ def api_get(path, timeout=60):
 def api_post(path, body, timeout=120):
     data = json.dumps(body).encode()
     req = urllib.request.Request(
-        f"{QDRANT_URL}{path}",
+        f"{_cfg.qdrant_url}{path}",
         data=data,
         method="POST",
         headers={"Content-Type": "application/json"},
@@ -167,7 +184,7 @@ def api_delete_points(point_ids: list) -> bool:
         return True
     body = {"points": point_ids}
     try:
-        result = api_post(f"/collections/{COLLECTION}/points/delete", body)
+        result = api_post(f"/collections/{_cfg.collection}/points/delete", body)
         status = result.get("result", {}).get("status", "unknown")
         return status == "acknowledged"
     except urllib.error.URLError as exc:
@@ -213,7 +230,7 @@ def _scroll_all_points_embedded() -> list:
     while True:
         try:
             result, next_offset = client.scroll(
-                collection_name=COLLECTION,
+                collection_name=_cfg.collection,
                 scroll_filter=None,
                 limit=SCROLL_LIMIT,
                 offset=offset,
@@ -257,7 +274,7 @@ def _scroll_all_points_http() -> list:
             body["offset"] = offset
 
         try:
-            result = api_post(f"/collections/{COLLECTION}/points/scroll", body)
+            result = api_post(f"/collections/{_cfg.collection}/points/scroll", body)
         except urllib.error.URLError as exc:
             print(f"[ERROR] Qdrant scroll failed: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -307,7 +324,7 @@ def find_duplicates(points, target_user_id):
             a = eligible[i]
             b = eligible[j]
             score = cosine_similarity(a["vector"], b["vector"])
-            if score >= SIMILARITY_THRESHOLD:
+            if score >= _cfg.threshold:
                 pairs.append((score, a, b))
 
     # Sort highest similarity first
@@ -374,7 +391,7 @@ def print_report(groups, pairs, total_memories):
     print()
     print("=" * 72)
     print("  mem0 Near-Duplicate Memory Report")
-    print(f"  Collection: {COLLECTION}  |  Threshold: {SIMILARITY_THRESHOLD}")
+    print(f"  Collection: {_cfg.collection}  |  Threshold: {_cfg.threshold}")
     print("=" * 72)
 
     if not groups:
@@ -409,7 +426,7 @@ def print_report(groups, pairs, total_memories):
     print()
     print("=" * 72)
     print(f"  Summary: Found {len(groups)} duplicate group(s) across {total_memories} total memories")
-    print(f"  (Examined {len(pairs)} near-duplicate pair(s) at threshold >= {SIMILARITY_THRESHOLD})")
+    print(f"  (Examined {len(pairs)} near-duplicate pair(s) at threshold >= {_cfg.threshold})")
     print("=" * 72)
     print()
 
@@ -446,7 +463,7 @@ def delete_points(point_ids: list) -> bool:
         try:
             from qdrant_client.models import PointIdsList
             client.delete(
-                collection_name=COLLECTION,
+                collection_name=_cfg.collection,
                 points_selector=PointIdsList(points=point_ids),
             )
             return True
@@ -618,8 +635,8 @@ def main():
     parser.add_argument(
         "--threshold",
         type=float,
-        default=SIMILARITY_THRESHOLD,
-        help=f"Cosine similarity threshold for duplicate detection (default: {SIMILARITY_THRESHOLD}).",
+        default=_DEFAULT_THRESHOLD,
+        help=f"Cosine similarity threshold for duplicate detection (default: {_DEFAULT_THRESHOLD}).",
     )
     args = parser.parse_args()
 
@@ -644,12 +661,11 @@ def main():
         # No URL: use embedded mode
         resolved_path = args.qdrant_path or str(get_hermes_home() / "mem0_qdrant")
 
-    # Wire into module-level constants used by helpers
-    globals()["QDRANT_URL"] = resolved_url
-    globals()["QDRANT_PATH"] = resolved_path
-    globals()["COLLECTION"] = args.collection
-    if args.threshold != SIMILARITY_THRESHOLD:
-        globals()["SIMILARITY_THRESHOLD"] = args.threshold
+    # Wire resolved settings into the module-level _cfg object used by helpers
+    _cfg.qdrant_url = resolved_url
+    _cfg.qdrant_path = resolved_path
+    _cfg.collection = args.collection
+    _cfg.threshold = args.threshold
 
     # Logging
     if resolved_path:
