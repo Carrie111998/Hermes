@@ -9762,6 +9762,22 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
   // transient backend errors on a perfectly healthy install, and deleting the
   // marker in that case stranded the app in first-run setup with no way back
   // (#72166). The explicit flag carries the intent instead.
+  //
+  // Before going nuclear, check if the backend process is still alive — a
+  // transient WebSocket failure (GIL stall, event loop hiccup) should NOT
+  // trigger a destructive reinstall (#74874).  If the process is alive,
+  // do a soft teardown (close WS, keep the backend running) and let the
+  // renderer's reconnect backoff retry.  Only force-reinstall when the
+  // backend process is genuinely dead.
+  const hermesProcess = backendConnectionState.getProcess()
+  const backendAlive = hermesProcess && !hermesProcess.killed
+
+  if (backendAlive) {
+    rememberLog('[bootstrap] repair requested but backend process is still alive; soft-reset connection instead of reinstalling')
+    resetHermesConnection({ soft: true })
+    return { ok: true, action: 'soft-reset' }
+  }
+
   rememberLog('[bootstrap] repair requested by renderer; forcing reinstall + clearing latched failure')
 
   bootstrapRepairRequested = true
