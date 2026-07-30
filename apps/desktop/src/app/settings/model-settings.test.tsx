@@ -141,6 +141,23 @@ describe('ModelSettings', () => {
     await waitFor(() => expect(setDelegateModel).toHaveBeenCalledWith({ reset: true }))
   })
 
+  it('renders a model-only subagent override instead of inheritance', async () => {
+    getDelegateModelInfo.mockResolvedValueOnce({
+      model: 'legacy-model',
+      provider: null,
+      inherits_parent: false
+    })
+
+    await renderModelSettings()
+
+    const selected = await screen.findByText('auto — legacy-model')
+    const trigger = selected.closest('[role="combobox"]')
+    expect(trigger).not.toBeNull()
+    expect(trigger?.textContent).not.toContain('Inherit parent model')
+    expect(await screen.findByRole('button', { name: 'Inherit parent' })).not.toBeNull()
+    expect(setDelegateModel).not.toHaveBeenCalled()
+  })
+
   it.each(['custom', 'local', 'custom:lab'])(
     'opens local endpoint setup when %s has no inventory row',
     async provider => {

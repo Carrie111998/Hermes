@@ -313,25 +313,24 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
           value: JSON.stringify([provider.slug, model])
         }))
       )
-    if (
-      delegateModel &&
-      !delegateModel.inherits_parent &&
-      delegateModel.model &&
-      delegateModel.provider &&
-      !options.some(option => option.model === delegateModel.model && option.provider === delegateModel.provider)
-    ) {
-      options.unshift({
-        label: `${delegateModel.provider} — ${delegateModel.model}`,
-        model: delegateModel.model,
-        provider: delegateModel.provider,
-        value: JSON.stringify([delegateModel.provider, delegateModel.model])
-      })
+
+    if (delegateModel && !delegateModel.inherits_parent && delegateModel.model) {
+      const provider = delegateModel.provider ?? ''
+
+      if (!options.some(option => option.model === delegateModel.model && option.provider === provider)) {
+        options.unshift({
+          label: `${provider || 'auto'} — ${delegateModel.model}`,
+          model: delegateModel.model,
+          provider,
+          value: JSON.stringify([provider, delegateModel.model])
+        })
+      }
     }
     return options
   }, [delegateModel, providers])
   const delegateModelValue =
-    delegateModel && !delegateModel.inherits_parent && delegateModel.model && delegateModel.provider
-      ? JSON.stringify([delegateModel.provider, delegateModel.model])
+    delegateModel && !delegateModel.inherits_parent && delegateModel.model
+      ? JSON.stringify([delegateModel.provider ?? '', delegateModel.model])
       : DELEGATE_INHERIT_VALUE
 
   // Radix renders a blank trigger when the controlled value has no matching
