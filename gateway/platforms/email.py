@@ -25,8 +25,8 @@ import logging
 import os
 import re
 import smtplib
+import stat
 import ssl
-import tempfile
 import uuid
 from collections import OrderedDict
 from email.header import decode_header
@@ -71,6 +71,12 @@ _AUTOMATED_HEADERS = {
 
 # Gmail-safe max length per email body
 MAX_MESSAGE_LENGTH = 50_000
+_DEFAULT_WORKFLOW_BODY_MAX_BYTES = 1_048_576
+_WORKFLOW_BODY_MAX_CONFIG_KEYS = (
+    "workflow_ingress_max_body_bytes",
+    "workflow_body_max_bytes",
+    "max_body_bytes",
+)
 
 # Supported image extensions for inline detection
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -292,6 +298,20 @@ class EmailAdapter(BasePlatformAdapter):
         self._sender_latest_context: "OrderedDict[str, str]" = OrderedDict()
         self._thread_context_max: int = 1000
         self._workflow_ingress_callback = workflow_ingress_callback
+        configured_body_limit = next(
+            (
+                extra[key]
+                for key in _WORKFLOW_BODY_MAX_CONFIG_KEYS
+                if key in extra and extra[key] is not None
+            ),
+            _DEFAULT_WORKFLOW_BODY_MAX_BYTES,
+        )
+        try:
+            self._workflow_body_max_bytes = int(configured_body_limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("workflow body size limit must be an integer") from exc
+        if self._workflow_body_max_bytes <= 0:
+            raise ValueError("workflow body size limit must be positive")
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -340,44 +360,57 @@ class EmailAdapter(BasePlatformAdapter):
         """Extract only syntactically safe RFC message ids from a References value."""
         return re.findall(r"<[^<>\s]+>", str(value or "").replace("\r", "").replace("\n", ""))
 
-    @staticmethod
-    def _persist_workflow_body(body: str) -> str:
-        """Persist an inbound body in the active Hermes profile and return its ref."""
+    def _persist_workflow_body(self, body: str) -> str:
+        """Persist a bounded, immutable inbound body and return its reference."""
         body_bytes = body.encode("utf-8")
+        if len(body_bytes) > self._workflow_body_max_bytes:
+            raise ValueError(
+                "workflow email body exceeds the configured maximum "
+                f"of {self._workflow_body_max_bytes} bytes"
+            )
         body_digest = hashlib.sha256(body_bytes).hexdigest()
         body_dir = get_hermes_home() / "workflow" / "ingress" / "email" / "bodies"
         body_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         body_path = body_dir / f"{body_digest}.txt"
-        if body_path.exists():
-            try:
-                if hashlib.sha256(body_path.read_bytes()).hexdigest() == body_digest:
-                    return str(body_path)
-            except OSError:
-                # Rewrite through the atomic path below.
-                pass
-
-        temp_path: Optional[Path] = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=body_dir,
-                prefix=f".{body_digest}.",
-                suffix=".tmp",
-                delete=False,
-            ) as body_file:
-                temp_path = Path(body_file.name)
+            fd = os.open(
+                body_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            existing_stat = os.stat(body_path, follow_symlinks=False)
+            if not stat.S_ISREG(existing_stat.st_mode):
+                raise ValueError(f"workflow body path is not a regular file: {body_path}")
+            existing_fd = os.open(
+                body_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                with os.fdopen(existing_fd, "rb") as existing_file:
+                    if existing_file.read() != body_bytes:
+                        raise ValueError(f"workflow body content mismatch: {body_path}")
+                    os.fchmod(existing_file.fileno(), 0o600)
+            except Exception:
+                try:
+                    os.close(existing_fd)
+                except OSError:
+                    pass
+                raise
+            return str(body_path)
+
+        try:
+            with os.fdopen(fd, "wb") as body_file:
                 body_file.write(body_bytes)
                 body_file.flush()
                 os.fsync(body_file.fileno())
-            temp_path.chmod(0o600)
-            os.replace(temp_path, body_path)
-            temp_path = None
-        finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink()
-                except FileNotFoundError:
-                    pass
+            os.chmod(body_path, 0o600)
+        except Exception:
+            try:
+                body_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
         return str(body_path)
 
     async def _record_workflow_ingress(

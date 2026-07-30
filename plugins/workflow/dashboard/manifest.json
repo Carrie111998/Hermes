@@ -1,0 +1,15 @@
+{
+  "name": "workflow",
+  "label": "Workflow",
+  "description": "Workflow operations board, graph, and action queue",
+  "icon": "GitBranch",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/workflow",
+    "position": "after:kanban"
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
