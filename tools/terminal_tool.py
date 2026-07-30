@@ -1842,6 +1842,66 @@ def is_persistent_env(task_id: str) -> bool:
 
 
 
+def _cleanup_detached_environment(
+    task_id: str, env: Any, *, force_remove: bool = False
+) -> None:
+    """Release one environment already detached from the active registry."""
+    with _creation_locks_lock:
+        _creation_locks.pop(task_id, None)
+
+    try:
+        from tools.file_tools import clear_file_ops_cache
+
+        clear_file_ops_cache(task_id)
+    except ImportError:
+        pass
+
+    if env is None:
+        return
+
+    try:
+        if hasattr(env, "cleanup"):
+            import inspect
+
+            sig = inspect.signature(env.cleanup)
+            if "force_remove" in sig.parameters:
+                env.cleanup(force_remove=force_remove)
+            else:
+                env.cleanup()
+        elif hasattr(env, "stop"):
+            env.stop()
+        elif hasattr(env, "terminate"):
+            env.terminate()
+
+        logger.info("Manually cleaned up environment for task: %s", task_id)
+    except Exception as e:
+        error_str = str(e)
+        if "404" in error_str or "not found" in error_str.lower():
+            logger.info("Environment for task %s already cleaned up", task_id)
+        else:
+            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+
+
+def cleanup_ssh_environments() -> int:
+    """Atomically detach and clean only cached SSH environments."""
+    with _env_lock:
+        detached = [
+            (task_id, env)
+            for task_id, env in _active_environments.items()
+            if isinstance(env, _SSHEnvironment)
+        ]
+        for task_id, _env in detached:
+            _active_environments.pop(task_id, None)
+            _last_activity.pop(task_id, None)
+
+    for task_id, env in detached:
+        _cleanup_detached_environment(task_id, env)
+
+    if detached:
+        logger.info("Cleaned %d cached SSH environment(s)", len(detached))
+    return len(detached)
+
+
 def cleanup_all_environments():
     """Clean up ALL active environments. Use with caution."""
     task_ids = list(_active_environments.keys())
@@ -1891,50 +1951,12 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     only the orphan reaper at next startup reclaims them.
     """
     # Remove from tracking dicts while holding the lock, but defer the
-    # actual (potentially slow) env.cleanup() call to outside the lock
-    # so other tool calls aren't blocked.
-    env = None
+    # actual (potentially slow) cleanup call to outside the lock.
     with _env_lock:
         env = _active_environments.pop(task_id, None)
         _last_activity.pop(task_id, None)
 
-    # Clean up per-task creation lock
-    with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
-
-    # Invalidate stale file_ops cache entry
-    try:
-        from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
-    except ImportError:
-        pass
-
-    if env is None:
-        return
-
-    try:
-        if hasattr(env, 'cleanup'):
-            # Pass force_remove only if the env's cleanup() accepts it
-            # (DockerEnvironment after issue #20561; other backends don't).
-            import inspect
-            sig = inspect.signature(env.cleanup)
-            if "force_remove" in sig.parameters:
-                env.cleanup(force_remove=force_remove)
-            else:
-                env.cleanup()
-        elif hasattr(env, 'stop'):
-            env.stop()
-        elif hasattr(env, 'terminate'):
-            env.terminate()
-
-        logger.info("Manually cleaned up environment for task: %s", task_id)
-
-    except Exception as e:
-        error_str = str(e)
-        if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
-        else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+    _cleanup_detached_environment(task_id, env, force_remove=force_remove)
 
 
 def _atexit_cleanup():
@@ -2838,10 +2860,41 @@ def terminal_tool(
                     
                     logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
                                  max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+
+                    # Auto-evict stale SSH environments on connection failures.
+                    error_str = str(e)
+                    _ssh_conn_errors = (
+                        "ssh connection failed",
+                        "connection refused",
+                        "connection timed out",
+                        "no route to host",
+                        "host is unreachable",
+                    )
+                    if env_type == "ssh" and any(
+                        msg in error_str.lower() for msg in _ssh_conn_errors
+                    ):
+                        try:
+                            cleanup_vm(effective_task_id)
+                            logger.info(
+                                "Evicted stale SSH environment for task %s",
+                                effective_task_id[:8],
+                            )
+                        except Exception as cleanup_error:
+                            logger.debug(
+                                "Failed to evict stale SSH environment for task %s: %s",
+                                effective_task_id[:8],
+                                cleanup_error,
+                            )
+                        error_str += (
+                            "\n\nHINT: The SSH connection is stale (the remote host may have restarted)."
+                            "\nUpdate the configured SSH host and port if they changed, then run"
+                            "\n/reload. The next command will create a fresh SSH connection."
+                        )
+
                     return json.dumps({
                         "output": "",
                         "exit_code": -1,
-                        "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
+                        "error": f"Command execution failed: {type(e).__name__}: {error_str}"
                     }, ensure_ascii=False)
                 
                 # Got a result

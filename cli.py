@@ -9891,9 +9891,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "image":
             self._handle_image_command(cmd_original)
         elif canonical == "reload":
-            from hermes_cli.config import reload_env
-            count = reload_env()
+            from hermes_cli.env_reload import reload_env_with_ssh_invalidation
+
+            count, cleaned = reload_env_with_ssh_invalidation()
             print(f"  Reloaded .env ({count} var(s) updated)")
+            if cleaned:
+                print(f"  Cleared {cleaned} cached SSH environment(s)")
         elif canonical == "reload-mcp":
             # Interactive reload: confirm first (unless the user has opted out).
             # The auto-reload path (file watcher) calls _reload_mcp directly

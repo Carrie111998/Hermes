@@ -234,9 +234,10 @@ def _(rid, params: dict) -> dict:
 @method("reload.env")
 def _(rid, params: dict) -> dict:
     """Re-read ``~/.hermes/.env`` into the gateway process via
-    ``hermes_cli.config.reload_env``, matching classic CLI's ``/reload``
-    handler.  Newly added API keys take effect on the next agent call
-    without restarting the TUI.
+    ``hermes_cli.env_reload.reload_env_with_ssh_invalidation``, matching
+    classic CLI's ``/reload`` handler. Newly added API keys take effect on the
+    next agent call without restarting the TUI; changed SSH settings also
+    invalidate cached SSH backends without disturbing other environments.
 
     The credential pool / provider routing for any *already-constructed*
     agent does not auto-rebuild — that's the same behaviour as classic
@@ -244,10 +245,13 @@ def _(rid, params: dict) -> dict:
     should follow with ``/new``.
     """
     try:
-        from hermes_cli.config import reload_env
+        from hermes_cli.env_reload import reload_env_with_ssh_invalidation
 
-        count = reload_env()
-        return _ok(rid, {"updated": int(count)})
+        count, cleaned = reload_env_with_ssh_invalidation()
+        result = {"updated": int(count)}
+        if cleaned:
+            result["ssh_environments_cleared"] = int(cleaned)
+        return _ok(rid, result)
     except Exception as e:
         return _err(rid, 5015, str(e))
 
