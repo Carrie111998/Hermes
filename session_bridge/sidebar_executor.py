@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 import hmac
 import math
-import os
 import re
 import sqlite3
 import threading
@@ -26,7 +25,8 @@ from .sidebar import (
 from .sidebar_placement import (
     SidebarPlacement,
     SidebarPlacementError,
-    ordinary_windows_path_identity,
+    filesystem_path_identity,
+    placement_paths_equivalent,
 )
 from .store import (
     SIDEBAR_FATAL_ERRORS,
@@ -238,7 +238,7 @@ class CodexAppServerSidebarDelivery:
             returned_cwd = _required_text(thread.get("cwd"), "created Codex cwd")
             if not hmac.compare_digest(
                 returned_recovery_key, expected_recovery_key
-            ) or not _filesystem_equivalent(returned_cwd, placement.inbox_cwd):
+            ) or not placement_paths_equivalent(returned_cwd, placement.inbox_cwd):
                 raise ValueError("thread/start response identity mismatch")
         except (AttributeError, TypeError, ValueError) as exc:
             raise NativeCreateAmbiguous() from exc
@@ -1129,6 +1129,19 @@ class SidebarExecutor:
                     error_code="broker_time_budget",
                 )
         assert thread_id is not None
+        if not thread_was_created_here:
+            prebound_error = self._validate_existing_thread_placement(
+                thread_id,
+                expected_cwd=placement.inbox_cwd,
+                operation_deadline=operation_deadline,
+            )
+            if prebound_error is not None:
+                return self._settle(
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    thread_id=thread_id,
+                    error_code=prebound_error,
+                )
         try:
             self._store.bind_sidebar_thread(
                 lease_token=lease_token,
@@ -1231,7 +1244,7 @@ class SidebarExecutor:
                 error_code="source_identity_mismatch",
             )
 
-        if verified.projection is not None and not _filesystem_equivalent(
+        if verified.projection is not None and not placement_paths_equivalent(
             verified.projection.cwd,
             placement.inbox_cwd,
         ):
@@ -1450,7 +1463,7 @@ class SidebarExecutor:
                     return "native_task_not_indexed"
                 if state.thread_id != thread_id:
                     return "codex_thread_conflict"
-                if not _filesystem_equivalent(state.cwd, expected_cwd):
+                if not placement_paths_equivalent(state.cwd, expected_cwd):
                     return "placement_mismatch"
                 if not isinstance(state.status, NativeThreadStatus):
                     return "native_task_not_indexed"
@@ -1464,6 +1477,32 @@ class SidebarExecutor:
             if now >= read_deadline:
                 return "native_task_not_indexed"
             self._sleep(min(self._poll_interval, read_deadline - now))
+
+    def _validate_existing_thread_placement(
+        self,
+        thread_id: str,
+        *,
+        expected_cwd: str,
+        operation_deadline: float,
+    ) -> str | None:
+        try:
+            state = self._native.read_thread_state(
+                thread_id=thread_id,
+                deadline=operation_deadline,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            return "native_task_not_indexed"
+        if not isinstance(state, NativeThreadState):
+            return "native_task_not_indexed"
+        if state.thread_id != thread_id:
+            return "codex_thread_conflict"
+        if not placement_paths_equivalent(state.cwd, expected_cwd):
+            return "placement_mismatch"
+        if not isinstance(state.status, NativeThreadStatus):
+            return "native_task_not_indexed"
+        return None
 
     def _settle(
         self,
@@ -1729,7 +1768,7 @@ def _validated_sidebar_placement(
         raise SidebarPlacementError("inbox_unavailable")
     try:
         inbox_cwd = _required_text(placement.inbox_cwd, "sidebar inbox cwd")
-        if ordinary_windows_path_identity(inbox_cwd) is None:
+        if filesystem_path_identity(inbox_cwd) is None:
             raise SidebarPlacementError("inbox_unavailable")
         if (
             placement.local_host != "local"
@@ -1741,20 +1780,20 @@ def _validated_sidebar_placement(
         if type(roots) is not tuple or len(roots) not in {1, 2}:
             raise SidebarPlacementError("inbox_unavailable")
         if any(
-            ordinary_windows_path_identity(
+            filesystem_path_identity(
                 _required_text(root, "sidebar runtime workspace root")
             ) is None
             for root in roots
         ):
             raise SidebarPlacementError("inbox_unavailable")
-        if not _filesystem_equivalent(roots[0], inbox_cwd):
+        if not placement_paths_equivalent(roots[0], inbox_cwd):
             raise SidebarPlacementError("inbox_unavailable")
         if len(roots) == 1:
-            if not _filesystem_equivalent(inbox_cwd, candidate.cwd):
+            if not placement_paths_equivalent(inbox_cwd, candidate.cwd):
                 raise SidebarPlacementError("inbox_unavailable")
         elif (
-            _filesystem_equivalent(roots[0], roots[1])
-            or not _filesystem_equivalent(roots[1], candidate.cwd)
+            placement_paths_equivalent(roots[0], roots[1])
+            or not placement_paths_equivalent(roots[1], candidate.cwd)
         ):
             raise SidebarPlacementError("inbox_unavailable")
     except (AttributeError, TypeError, ValueError) as exc:
@@ -1770,17 +1809,6 @@ def _finite_time(value: object) -> float:
     ):
         raise ValueError("sidebar executor clock is malformed")
     return float(value)
-
-
-def _filesystem_equivalent(left: object, right: object) -> bool:
-    if type(left) is not str or type(right) is not str or not left or not right:
-        return False
-    try:
-        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
-            os.path.abspath(right)
-        )
-    except (OSError, ValueError):
-        return False
 
 
 __all__ = [

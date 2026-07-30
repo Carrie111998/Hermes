@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ipaddress
 import ntpath
+import os
 from dataclasses import dataclass
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
+from typing import Literal
 
 
 _WIN32_COMPONENT_FORBIDDEN = frozenset('<>:"|?*')
@@ -16,6 +18,12 @@ _RESERVED_WINDOWS_COMPONENT_NAMES = frozenset(
         "nul",
         *(f"com{number}" for number in range(1, 10)),
         *(f"lpt{number}" for number in range(1, 10)),
+        "com¹",
+        "com²",
+        "com³",
+        "lpt¹",
+        "lpt²",
+        "lpt³",
     }
 )
 _MAX_UNC_SHARE_LENGTH = 80
@@ -39,6 +47,49 @@ class SidebarPlacement:
     local_host: str
     runtime_workspace_roots: tuple[str] | tuple[str, str]
     placement_generation: int
+
+
+def filesystem_path_identity(
+    value: object,
+    *,
+    platform: Literal["windows", "posix"] | None = None,
+) -> str | None:
+    """Return the canonical, host-platform filesystem identity without I/O."""
+
+    selected_platform = platform or ("windows" if os.name == "nt" else "posix")
+    if selected_platform == "windows":
+        return ordinary_windows_path_identity(value)
+    if selected_platform == "posix":
+        return _ordinary_posix_path_identity(value)
+    return None
+
+
+def placement_paths_equivalent(
+    left: object,
+    right: object,
+    *,
+    platform: Literal["windows", "posix"] | None = None,
+) -> bool:
+    left_identity = filesystem_path_identity(left, platform=platform)
+    right_identity = filesystem_path_identity(right, platform=platform)
+    return left_identity is not None and left_identity == right_identity
+
+
+def _ordinary_posix_path_identity(value: object) -> str | None:
+    if type(value) is not str or not value or "\x00" in value:
+        return None
+    if value == "/":
+        return value
+    if (
+        not value.startswith("/")
+        or value.startswith("//")
+        or value.endswith("/")
+    ):
+        return None
+    components = value[1:].split("/")
+    if any(component in {"", ".", ".."} for component in components):
+        return None
+    return value
 
 
 def ordinary_windows_path_identity(value: object) -> str | None:
@@ -73,7 +124,6 @@ def ordinary_windows_path_identity(value: object) -> str | None:
         if (
             not (is_drive_qualified or is_unc_qualified)
             or identity != ntpath.normcase(canonical)
-            or PureWindowsPath(canonical).is_reserved()
         ):
             return None
         components = [part for part in tail.lstrip("\\").split("\\") if part]
@@ -236,8 +286,8 @@ def resolve_sidebar_placement(
         raise SidebarPlacementError("source_identity_mismatch")
     source = _resolve_source(source_cwd)
 
-    inbox_identity = ordinary_windows_path_identity(str(inbox))
-    source_identity = ordinary_windows_path_identity(str(source))
+    inbox_identity = filesystem_path_identity(str(inbox))
+    source_identity = filesystem_path_identity(str(source))
     if inbox_identity is None:
         raise SidebarPlacementError("inbox_unavailable")
     if source_identity is None:
@@ -254,11 +304,11 @@ def resolve_sidebar_placement(
 
 
 def _resolve_canonical_inbox(configured_inbox_cwd: str, hermes_home: Path | str) -> Path:
-    raw_inbox_identity = _raw_windows_path_identity(
+    raw_inbox_identity = _raw_filesystem_path_identity(
         configured_inbox_cwd,
         error_code="inbox_unavailable",
     )
-    raw_home_identity = _raw_windows_path_identity(
+    raw_home_identity = _raw_filesystem_path_identity(
         hermes_home,
         allow_path=True,
         error_code="inbox_unavailable",
@@ -271,8 +321,8 @@ def _resolve_canonical_inbox(configured_inbox_cwd: str, hermes_home: Path | str)
         home = Path(hermes_home).resolve(strict=True)
     except (OSError, RuntimeError, TypeError, ValueError):
         raise SidebarPlacementError("inbox_unavailable") from None
-    inbox_identity = ordinary_windows_path_identity(str(inbox))
-    home_identity = ordinary_windows_path_identity(str(home))
+    inbox_identity = filesystem_path_identity(str(inbox))
+    home_identity = filesystem_path_identity(str(home))
     if (
         not inbox.is_dir()
         or not home.is_dir()
@@ -287,7 +337,7 @@ def _resolve_canonical_inbox(configured_inbox_cwd: str, hermes_home: Path | str)
 
 
 def _resolve_source(source_cwd: str) -> Path:
-    raw_source_identity = _raw_windows_path_identity(
+    raw_source_identity = _raw_filesystem_path_identity(
         source_cwd,
         error_code="source_identity_mismatch",
     )
@@ -300,7 +350,7 @@ def _resolve_source(source_cwd: str) -> Path:
         raise SidebarPlacementError("source_identity_mismatch") from None
     if not source.is_dir():
         raise SidebarPlacementError("source_identity_mismatch")
-    source_identity = ordinary_windows_path_identity(str(source))
+    source_identity = filesystem_path_identity(str(source))
     if source_identity is None or raw_source_identity != source_identity:
         raise SidebarPlacementError("source_identity_mismatch")
     return source
@@ -313,7 +363,7 @@ def _windows_identity(path: Path) -> str:
     return identity
 
 
-def _raw_windows_path_identity(
+def _raw_filesystem_path_identity(
     value: object,
     *,
     error_code: str,
@@ -325,7 +375,7 @@ def _raw_windows_path_identity(
         raw_path = str(value)
     else:
         raise SidebarPlacementError(error_code)
-    identity = ordinary_windows_path_identity(raw_path)
+    identity = filesystem_path_identity(raw_path)
     if identity is None:
         raise SidebarPlacementError(error_code)
     return identity

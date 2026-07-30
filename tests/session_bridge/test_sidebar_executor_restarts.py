@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -29,11 +30,14 @@ from session_bridge.sidebar_executor import (
     NativeThreadStatus,
     SidebarExecutor,
 )
+from session_bridge.sidebar_placement import SidebarPlacement
 from session_bridge.store import SessionBridgeStore
 
 
 _MARKER_SECRET = b"sidebar-executor-restart-test-secret"
 _THREAD_ID = "88888888-8888-4888-8888-888888888888"
+_INBOX_CWD = "C:/workspace/inbox" if os.name == "nt" else "/srv/session-inbox"
+_SOURCE_CWD = "C:/workspace/project" if os.name == "nt" else "/srv/session-project"
 
 
 @dataclass
@@ -81,10 +85,12 @@ class _NativeDelivery:
         *,
         prompt: str,
         candidate: SidebarCandidate,
+        placement: SidebarPlacement,
         recovery_key: str,
         deadline: float,
     ) -> str:
         assert deadline > self._clock()
+        assert placement.inbox_cwd == _INBOX_CWD
         marker = next(
             line.removeprefix("Signed marker: ")
             for line in prompt.splitlines()
@@ -155,7 +161,7 @@ class _NativeDelivery:
         return NativeThreadState(
             thread_id=thread_id,
             status=NativeThreadStatus.IDLE,
-            cwd="C:/workspace/project",
+            cwd=_INBOX_CWD,
         )
 
     def rename_thread(
@@ -198,7 +204,7 @@ class _Verifier:
         deadline: float,
     ) -> str | None:
         assert deadline > 0
-        assert expected_cwd == "C:/workspace/project"
+        assert expected_cwd == _INBOX_CWD
         matches = [
             thread_id
             for thread_id, key in self._world.recovery_keys.items()
@@ -471,8 +477,8 @@ def _seed_store(path: Path, clock: _Clock) -> tuple[SessionDB, SessionBridgeStor
             provider=Provider.HERMES,
             bridge_id=sidebar_bridge_id("restart-source"),
             title="[Hermes] restart source",
-            cwd="C:/workspace/project",
-            git_root="C:/workspace/project",
+            cwd=_SOURCE_CWD,
+            git_root=_SOURCE_CWD,
             git_branch="feature/restart-safety",
             git_head="a" * 40,
             worktree_id="restart-worktree",
@@ -502,6 +508,12 @@ def _executor(
             world,
             store.delegate if isinstance(store, _CommitResponseLossStore) else store,
             clock,
+        ),
+        placement_resolver=lambda _candidate: SidebarPlacement(
+            inbox_cwd=_INBOX_CWD,
+            local_host="local",
+            runtime_workspace_roots=(_INBOX_CWD, _SOURCE_CWD),
+            placement_generation=1,
         ),
         marker_secret=_MARKER_SECRET,
         clock=clock,

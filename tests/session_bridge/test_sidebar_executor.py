@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import math
+import os
 import sqlite3
 import threading
 from typing import Any, Callable, cast
@@ -56,13 +57,15 @@ THREAD_2 = "22222222-2222-4222-8222-222222222222"
 TURN_1 = "33333333-3333-4333-8333-333333333333"
 SECRET = b"sidebar-executor-test-secret"
 RECOVERY_KEY = "hermes-session-bridge-create-v1:" + "a" * 64
+INBOX_CWD = "C:/Users/diego/.hermes" if os.name == "nt" else "/srv/session-inbox"
+SOURCE_CWD = "C:/source" if os.name == "nt" else "/srv/session-source"
 
 
 def _placement() -> SidebarPlacement:
     return SidebarPlacement(
-        inbox_cwd="C:/Users/diego/.hermes",
+        inbox_cwd=INBOX_CWD,
         local_host="local",
-        runtime_workspace_roots=("C:/Users/diego/.hermes", "C:/source"),
+        runtime_workspace_roots=(INBOX_CWD, SOURCE_CWD),
         placement_generation=1,
     )
 
@@ -170,7 +173,7 @@ def _persisted_registration(
     return {
         "thread": {
             "id": thread_id,
-            "cwd": "C:/source",
+            "cwd": SOURCE_CWD,
             "status": {"type": "idle"},
             "turns": [
                 {
@@ -195,7 +198,7 @@ def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
             {
                 "thread": {
                     "id": THREAD_1,
-                    "cwd": "C:/Users/diego/.hermes",
+                    "cwd": INBOX_CWD,
                     "threadSource": RECOVERY_KEY,
                 }
             }
@@ -216,8 +219,8 @@ def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
     assert client.calls[0] == (
         "thread/start",
         {
-            "cwd": "C:/Users/diego/.hermes",
-            "runtimeWorkspaceRoots": ["C:/Users/diego/.hermes", "C:/source"],
+            "cwd": INBOX_CWD,
+            "runtimeWorkspaceRoots": [INBOX_CWD, SOURCE_CWD],
             "threadSource": RECOVERY_KEY,
         },
         5.0,
@@ -228,57 +231,57 @@ def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
     "placement",
     [
         SidebarPlacement(
-            inbox_cwd="C:/Users/diego/.hermes",
+            inbox_cwd=INBOX_CWD,
             local_host="local",
-            runtime_workspace_roots=("C:/source",),
+            runtime_workspace_roots=(SOURCE_CWD,),
             placement_generation=1,
         ),
         SidebarPlacement(
-            inbox_cwd="C:/Users/diego/.hermes",
+            inbox_cwd=INBOX_CWD,
             local_host="local",
             runtime_workspace_roots=(
-                "C:/Users/diego/.hermes",
+                INBOX_CWD,
                 42,
             ),  # type: ignore[arg-type]
             placement_generation=1,
         ),
         SidebarPlacement(
-            inbox_cwd="C:/Users/diego/.hermes",
+            inbox_cwd=INBOX_CWD,
             local_host="local",
-            runtime_workspace_roots=("C:/Users/diego/.hermes", "C:/source"),
+            runtime_workspace_roots=(INBOX_CWD, SOURCE_CWD),
             placement_generation=True,  # type: ignore[arg-type]
         ),
         SidebarPlacement(
             inbox_cwd="relative/inbox",
             local_host="local",
-            runtime_workspace_roots=("relative/inbox", "C:/source"),
+            runtime_workspace_roots=("relative/inbox", SOURCE_CWD),
             placement_generation=1,
         ),
         SidebarPlacement(
-            inbox_cwd="C:/Users/diego/.hermes",
+            inbox_cwd=INBOX_CWD,
             local_host="local",
-            runtime_workspace_roots=("C:/Users/diego/.hermes", "relative/source"),
+            runtime_workspace_roots=(INBOX_CWD, "relative/source"),
             placement_generation=1,
         ),
         SidebarPlacement(
-            inbox_cwd="C:/Users/diego/.hermes",
+            inbox_cwd=INBOX_CWD,
             local_host="local",
             runtime_workspace_roots=(
-                "C:/Users/diego/../diego/.hermes",
-                "C:/source",
+                f"{INBOX_CWD}/../session-inbox",
+                SOURCE_CWD,
             ),
             placement_generation=1,
         ),
         SidebarPlacement(
             inbox_cwd="\\Users\\diego\\.hermes",
             local_host="local",
-            runtime_workspace_roots=("\\Users\\diego\\.hermes", "C:/source"),
+            runtime_workspace_roots=("\\Users\\diego\\.hermes", SOURCE_CWD),
             placement_generation=1,
         ),
         SidebarPlacement(
             inbox_cwd="/Users/diego/.hermes",
             local_host="local",
-            runtime_workspace_roots=("/Users/diego/.hermes", "C:/source"),
+            runtime_workspace_roots=("/Users/diego/.hermes", SOURCE_CWD),
             placement_generation=1,
         ),
         SidebarPlacement(
@@ -286,7 +289,7 @@ def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
             local_host="local",
             runtime_workspace_roots=(
                 "\\\\?\\C:\\Users\\diego\\.hermes",
-                "C:/source",
+                SOURCE_CWD,
             ),
             placement_generation=1,
         ),
@@ -295,7 +298,7 @@ def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
             local_host="local",
             runtime_workspace_roots=(
                 "\\\\?\\UNC\\server\\share\\inbox",
-                "C:/source",
+                SOURCE_CWD,
             ),
             placement_generation=1,
         ),
@@ -304,7 +307,7 @@ def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
             local_host="local",
             runtime_workspace_roots=(
                 "\\\\.\\pipe\\session-inbox",
-                "C:/source",
+                SOURCE_CWD,
             ),
             placement_generation=1,
         ),
@@ -313,7 +316,7 @@ def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
             local_host="local",
             runtime_workspace_roots=(
                 "\\\\server\\pipe\\session-inbox",
-                "C:/source",
+                SOURCE_CWD,
             ),
             placement_generation=1,
         ),
@@ -342,11 +345,11 @@ def test_codex_delivery_rejects_duplicate_equivalent_roots_before_create_dispatc
     client = FakeCodexAppServerClient({"thread/start": []})
     delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
     placement = SidebarPlacement(
-        inbox_cwd="C:/Users/diego/.hermes",
+        inbox_cwd=INBOX_CWD,
         local_host="local",
         runtime_workspace_roots=(
-            "C:/Users/diego/.hermes",
-            "c:\\USERS\\diego\\.hermes",
+            INBOX_CWD,
+            INBOX_CWD,
         ),
         placement_generation=1,
     )
@@ -354,7 +357,7 @@ def test_codex_delivery_rejects_duplicate_equivalent_roots_before_create_dispatc
     with pytest.raises(NativeCreateRejected) as caught:
         delivery.create_thread(
             prompt="registration happens later",
-            candidate=_candidate(SOURCE_1, cwd="C:/Users/diego/.hermes"),
+            candidate=_candidate(SOURCE_1, cwd=INBOX_CWD),
             placement=placement,
             recovery_key=RECOVERY_KEY,
             deadline=105.0,
@@ -370,7 +373,7 @@ def test_codex_delivery_rejects_returned_source_cwd_as_ambiguous() -> None:
             {
                 "thread": {
                     "id": THREAD_1,
-                    "cwd": "C:/source",
+                    "cwd": SOURCE_CWD,
                     "threadSource": RECOVERY_KEY,
                 }
             }
@@ -387,7 +390,7 @@ def test_codex_delivery_rejects_returned_source_cwd_as_ambiguous() -> None:
             deadline=105.0,
         )
 
-    assert client.calls[0][1]["cwd"] == "C:/Users/diego/.hermes"
+    assert client.calls[0][1]["cwd"] == INBOX_CWD
 
 
 def test_sidebar_executor_settles_placement_failure_before_reservation() -> None:
@@ -457,18 +460,18 @@ def test_sidebar_executor_maps_invalid_resolver_home_to_inbox_unavailable(
             SidebarPlacement(
                 inbox_cwd="relative/inbox",
                 local_host="local",
-                runtime_workspace_roots=("relative/inbox", "C:/source"),
+                runtime_workspace_roots=("relative/inbox", SOURCE_CWD),
                 placement_generation=1,
             ),
             False,
         ),
         (
             SidebarPlacement(
-                inbox_cwd="C:/Users/diego/.hermes",
+                inbox_cwd=INBOX_CWD,
                 local_host="local",
                 runtime_workspace_roots=(
-                    "C:/Users/diego/.hermes",
-                    "C:/source/../source",
+                    INBOX_CWD,
+                    f"{SOURCE_CWD}/../session-source",
                 ),
                 placement_generation=1,
             ),
@@ -478,7 +481,7 @@ def test_sidebar_executor_maps_invalid_resolver_home_to_inbox_unavailable(
             SidebarPlacement(
                 inbox_cwd="\\Users\\diego\\.hermes",
                 local_host="local",
-                runtime_workspace_roots=("\\Users\\diego\\.hermes", "C:/source"),
+                runtime_workspace_roots=("\\Users\\diego\\.hermes", SOURCE_CWD),
                 placement_generation=1,
             ),
             False,
@@ -487,7 +490,7 @@ def test_sidebar_executor_maps_invalid_resolver_home_to_inbox_unavailable(
             SidebarPlacement(
                 inbox_cwd="/Users/diego/.hermes",
                 local_host="local",
-                runtime_workspace_roots=("/Users/diego/.hermes", "C:/source"),
+                runtime_workspace_roots=("/Users/diego/.hermes", SOURCE_CWD),
                 placement_generation=1,
             ),
             False,
@@ -498,7 +501,7 @@ def test_sidebar_executor_maps_invalid_resolver_home_to_inbox_unavailable(
                 local_host="local",
                 runtime_workspace_roots=(
                     "\\\\?\\C:\\Users\\diego\\.hermes",
-                    "C:/source",
+                    SOURCE_CWD,
                 ),
                 placement_generation=1,
             ),
@@ -510,7 +513,7 @@ def test_sidebar_executor_maps_invalid_resolver_home_to_inbox_unavailable(
                 local_host="local",
                 runtime_workspace_roots=(
                     "\\\\?\\UNC\\server\\share\\inbox",
-                    "C:/source",
+                    SOURCE_CWD,
                 ),
                 placement_generation=1,
             ),
@@ -522,7 +525,7 @@ def test_sidebar_executor_maps_invalid_resolver_home_to_inbox_unavailable(
                 local_host="local",
                 runtime_workspace_roots=(
                     "\\\\.\\pipe\\session-inbox",
-                    "C:/source",
+                    SOURCE_CWD,
                 ),
                 placement_generation=1,
             ),
@@ -534,7 +537,7 @@ def test_sidebar_executor_maps_invalid_resolver_home_to_inbox_unavailable(
                 local_host="local",
                 runtime_workspace_roots=(
                     "\\\\server\\pipe\\session-inbox",
-                    "C:/source",
+                    SOURCE_CWD,
                 ),
                 placement_generation=1,
             ),
@@ -577,15 +580,15 @@ def test_sidebar_executor_rejects_duplicate_equivalent_roots_before_reservation(
     store = FakeStore(
         events,
         [_job(SOURCE_1)],
-        candidate_override=_candidate(SOURCE_1, cwd="C:/Users/diego/.hermes"),
+        candidate_override=_candidate(SOURCE_1, cwd=INBOX_CWD),
     )
     native = FakeNative(events)
     placement = SidebarPlacement(
-        inbox_cwd="C:/Users/diego/.hermes",
+        inbox_cwd=INBOX_CWD,
         local_host="local",
         runtime_workspace_roots=(
-            "C:/Users/diego/.hermes",
-            "c:\\USERS\\diego\\.hermes",
+            INBOX_CWD,
+            INBOX_CWD,
         ),
         placement_generation=1,
     )
@@ -1403,7 +1406,7 @@ class FakeClock:
         self.now += seconds
 
 
-def _candidate(source: str, *, cwd: str = "C:/source") -> SidebarCandidate:
+def _candidate(source: str, *, cwd: str = SOURCE_CWD) -> SidebarCandidate:
     return SidebarCandidate(
         source_session_id=source,
         provider=Provider.CLAUDE,
@@ -1696,7 +1699,7 @@ class FakeNative:
         statuses: list[str | None] | None = None,
         rename_error: Exception | None = None,
         read_thread_id: str | None = None,
-        read_cwd: str = "C:/Users/diego/.hermes",
+        read_cwd: str = INBOX_CWD,
         after_create: Callable[[], None] | None = None,
         register_error: Exception | None = None,
         preflight_error: Exception | None = None,
@@ -1730,7 +1733,7 @@ class FakeNative:
         recovery_key: str,
         deadline: float,
     ) -> str:
-        assert candidate.cwd == "C:/source"
+        assert candidate.cwd == SOURCE_CWD
         assert placement == _placement()
         assert "Signed marker:" in prompt
         assert recovery_key.startswith("hermes-session-bridge-create-v1:")
@@ -1836,6 +1839,7 @@ def test_recovered_exact_id_is_verified_renamed_and_committed_without_create() -
     assert [event[0] for event in events] == [
         "claim",
         "candidate",
+        "read",
         "bind",
         "register",
         "read",
@@ -1843,7 +1847,7 @@ def test_recovered_exact_id_is_verified_renamed_and_committed_without_create() -
         "rename",
         "commit",
     ]
-    assert events[3][3] is False
+    assert events[4][3] is False
 
 
 def test_verified_projection_is_indexed_before_lineage_commit() -> None:
@@ -1870,6 +1874,7 @@ def test_verified_projection_is_indexed_before_lineage_commit() -> None:
     assert [event[0] for event in events] == [
         "claim",
         "candidate",
+        "read",
         "bind",
         "register",
         "read",
@@ -2225,11 +2230,12 @@ def test_existing_create_reservation_recovers_exact_tagged_thread_without_create
     assert result.status == "visible"
     assert result.thread_id == THREAD_1
     assert native.create_calls == 0
-    assert [event[0] for event in events][:5] == [
+    assert [event[0] for event in events][:6] == [
         "claim",
         "candidate",
         "find",
         "recover",
+        "read",
         "bind",
     ]
 
@@ -2583,15 +2589,15 @@ def test_read_until_idle_timeout_is_retryable_and_never_renames() -> None:
 
     assert result.error_code == "native_task_not_indexed"
     assert result.status == "retry"
-    assert sum(event[0] == "read" for event in events) == 3
+    assert sum(event[0] == "read" for event in events) == 4
     assert not any(event[0] in {"verify", "rename", "commit"} for event in events)
 
 
 @pytest.mark.parametrize(
     ("read_thread_id", "read_cwd", "expected_code"),
     [
-        (THREAD_2, "C:/Users/diego/.hermes", "codex_thread_conflict"),
-        (THREAD_1, "C:/different-source", "placement_mismatch"),
+        (THREAD_2, INBOX_CWD, "codex_thread_conflict"),
+        (THREAD_1, "/different-source", "placement_mismatch"),
     ],
 )
 def test_native_read_identity_mismatch_is_fatal(
@@ -2614,14 +2620,18 @@ def test_native_read_identity_mismatch_is_fatal(
     assert result.status == "failed"
     assert result.error_code == expected_code
     assert store.failures == [expected_code]
+    assert not any(event[0] in {"bind", "register"} for event in events)
     assert not any(event[0] in {"verify", "rename", "commit"} for event in events)
 
 
-def test_native_read_accepts_filesystem_equivalent_cwd() -> None:
+def test_native_read_accepts_platform_equivalent_cwd() -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()
     store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
-    native = FakeNative(events, read_cwd="c:\\Users\\diego\\.hermes\\.")
+    native = FakeNative(
+        events,
+        read_cwd=("c:\\Users\\diego\\.hermes" if os.name == "nt" else INBOX_CWD),
+    )
     executor = _executor(store, FakeVerifier(events), native, clock)
 
     result = executor.run_once()
@@ -2639,7 +2649,7 @@ def test_terminal_native_state_fails_without_polling() -> None:
 
     assert result.status == "retry"
     assert result.error_code == "native_task_not_indexed"
-    assert sum(event[0] == "read" for event in events) == 1
+    assert sum(event[0] == "read" for event in events) == 2
 
 
 def test_rename_failure_retries_without_commit_or_replacement() -> None:

@@ -8,7 +8,9 @@ import pytest
 from session_bridge.sidebar_placement import (
     SidebarPlacementError,
     _windows_identity,
+    filesystem_path_identity,
     ordinary_windows_path_identity,
+    placement_paths_equivalent,
     resolve_sidebar_placement,
 )
 
@@ -83,6 +85,48 @@ def test_ordinary_windows_path_identity_rejects_nonfilesystem_spellings(
     value: str,
 ) -> None:
     assert ordinary_windows_path_identity(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("/srv/session-inbox", "/srv/session-inbox"),
+        ("/srv/Session-Inbox", "/srv/Session-Inbox"),
+        ("/", "/"),
+    ],
+)
+def test_filesystem_path_identity_uses_canonical_case_sensitive_posix_spelling(
+    value: str,
+    expected: str,
+) -> None:
+    assert filesystem_path_identity(value, platform="posix") == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "relative/path",
+        "C:/Users/diego/.hermes",
+        "\\\\server\\share\\inbox",
+        "/srv/./session-inbox",
+        "/srv/../session-inbox",
+        "/srv//session-inbox",
+        "/srv/session-inbox/",
+        "/srv/session\x00inbox",
+    ],
+)
+def test_filesystem_path_identity_rejects_noncanonical_or_windows_posix_spellings(
+    value: str,
+) -> None:
+    assert filesystem_path_identity(value, platform="posix") is None
+
+
+def test_placement_paths_equivalent_is_case_sensitive_on_posix() -> None:
+    assert not placement_paths_equivalent(
+        "/srv/Session-Inbox",
+        "/srv/session-inbox",
+        platform="posix",
+    )
 
 
 @pytest.mark.parametrize(
