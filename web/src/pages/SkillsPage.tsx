@@ -424,7 +424,7 @@ export default function SkillsPage() {
                 />
                 <PanelItem
                   icon={ShieldCheck}
-                  label={t.skills.channels}
+                  label={t.skills.channels ?? "Channel abilities"}
                   active={view === "channels"}
                   onClick={() => {
                     setView("channels");
