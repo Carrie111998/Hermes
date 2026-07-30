@@ -705,6 +705,8 @@ session_reset:
   mode: none           # "none", "idle", "daily", or "both"
   idle_minutes: 1440   # Inactivity timeout in minutes (used by "idle"/"both")
   at_hour: 4           # Daily reset hour, 0-23 local time (used by "daily"/"both")
+  # Restore the expired session when the next message explicitly continues it.
+  auto_resume_previous_if_contextual: false
 
 # Maximum number of simultaneously active chat sessions across CLI, TUI,
 # dashboard chat, and messaging gateway. Set to null, 0, or omit to allow

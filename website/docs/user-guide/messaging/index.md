@@ -262,6 +262,7 @@ session_reset:
   mode: idle        # "idle", "daily", "both", or "none" (default)
   idle_minutes: 1440  # for idle/both: minutes of inactivity before reset
   at_hour: 4          # for daily/both: hour of day (0-23, local time)
+  auto_resume_previous_if_contextual: false
 ```
 
 | Mode | Description |
@@ -270,6 +271,11 @@ session_reset:
 | `daily` | Reset at a specific hour each day |
 | `idle` | Reset after N minutes of inactivity |
 | `both` | Whichever triggers first |
+
+Set `auto_resume_previous_if_contextual: true` to restore the just-expired
+session when the next user message is an explicit reply or a conservative
+continuation such as “please continue.” Independent requests still start in
+the fresh session. This opt-in applies only to idle and daily resets.
 
 A live background process (started with `terminal(background=true)`) normally
 protects its session from resetting so output isn't lost. To stop a forgotten

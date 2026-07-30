@@ -478,6 +478,11 @@ class TestSessionStoreSwitchSession:
 
         target_session_id = "old_session_abc"
         db.create_session(target_session_id, source="feishu", user_id="user-1")
+        db.append_message(
+            session_id=target_session_id,
+            role="user",
+            content="Continue the prior transcript",
+        )
         db.end_session(target_session_id, end_reason="user_exit")
         assert db.get_session(target_session_id)["ended_at"] is not None
 
@@ -485,10 +490,28 @@ class TestSessionStoreSwitchSession:
 
         assert switched is not None
         assert switched.session_id == target_session_id
-        assert db.get_session(current_session_id)["end_reason"] == "session_switch"
+        transient = db.get_session(current_session_id)
+        assert transient["ended_at"] is not None
+        assert transient["end_reason"] == "session_switch"
         resumed = db.get_session(target_session_id)
         assert resumed["ended_at"] is None
         assert resumed["end_reason"] is None
+
+        # Re-open the persisted SessionStore mapping: the restored transcript,
+        # not the transient fresh session, must be active after a real switch.
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            reopened_store = SessionStore(
+                sessions_dir=tmp_path / "sessions", config=config
+            )
+        reopened_store._db = db
+        reopened_store._loaded = False
+        reopened_entry = reopened_store.get_or_create_session(source)
+
+        assert reopened_entry.session_id == target_session_id
+        transcript = reopened_store.load_transcript(target_session_id)
+        assert [(row["role"], row["content"]) for row in transcript] == [
+            ("user", "Continue the prior transcript")
+        ]
         db.close()
 
 
