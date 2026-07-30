@@ -2,7 +2,7 @@
 
 ## Status
 
-Resolved and validated in a packaged Windows Desktop build.
+Resolved. The primary runtime-refresh path was validated in a packaged Windows Desktop build; subsequent review hardening for pagination, lineage rotation, reconnect busy state, and asynchronous races was validated by focused tests, type checking, lint, and a production build.
 
 This was a **Desktop renderer bug**, not a missing messaging capability and not a QQBot ingestion failure. Hermes already had runtime background synchronization for messaging conversations, but its transcript refresh target was limited to the primary chat surface. Messaging conversations opened as session tiles were omitted.
 
@@ -17,7 +17,7 @@ The bug was caused by a state-scope mismatch:
 - therefore, a messaging session visible in a tile could be absent from the refresh target set;
 - the refresh callback also used the primary runtime and its global busy guard instead of resolving the target tile's runtime and busy state.
 
-The fix makes open messaging transcripts explicit: collect messaging sessions from both the primary chat and all open session tiles, resolve each stored session to its own runtime and profile, skip only the target runtime when it is busy, and update that runtime's renderer cache.
+The fix makes open messaging transcripts explicit: collect direct runtime bindings from both the primary chat and all open session tiles, resolve each surface's stored-session metadata and profile, skip only target runtimes whose authoritative state is busy, and update each matching renderer cache. Exact metadata fallback, lineage grouping, and post-request revalidation cover restored or compressed sessions that are not represented by the current sidebar page.
 
 ## User-visible symptoms
 
@@ -163,32 +163,35 @@ A session tile is deliberately isolated from the primary chat atoms. Focusing or
 
 ## Fix design
 
-### 1. Resolve all open messaging stored sessions
+### 1. Enumerate open renderer surfaces directly
 
-`resolveOpenMessagingStoredSessionIds()` builds a deduplicated target list from:
+`resolveOpenTranscriptSurfaces()` collects:
 
-- the primary selected stored session;
-- every open `$sessionTiles` entry.
+- the primary selected stored session together with its active runtime ID;
+- every open `$sessionTiles` entry together with that tile's own runtime ID.
 
-It retains only rows whose source is recognized as messaging.
+It deduplicates identical runtime bindings and does not infer a tile runtime through the stored-to-runtime reverse map. This matters after compression, when a durable tile can retain the lineage-root ID while its live runtime has rotated to a continuation-tip ID.
 
-### 2. Resolve each target independently
+`resolveOpenMessagingCandidateIds()` is the lightweight poll gate. It checks both the capped messaging page and the known session cache, excludes sessions already known to be local, and retains only known messaging rows or unresolved open candidates for exact metadata resolution.
 
-`resolveMessagingTranscriptTarget()` maps each stored session to:
+### 2. Resolve metadata and lineage independently
 
-- its owning profile;
-- its bound runtime session ID;
-- its target runtime's busy state.
+`resolveMessagingTranscriptTargets()` reads each target runtime's current stored ID, checks the current session caches, and falls back to the existing exact-ID `resolveStoredSession()` path for restored, search-opened, project-opened, or older sessions outside the sidebar's recent window. It then:
 
-An unrelated busy primary runtime no longer blocks an idle messaging tile.
+- keeps only sources recognized as messaging;
+- preserves the owning profile;
+- canonicalizes the live stored-session tip;
+- groups root/tip aliases by profile and lineage root while preserving every renderer runtime that must be updated.
 
-### 3. Refresh each transcript into its own cache entry
+### 3. Use authoritative busy state and revalidate after I/O
 
-The wiring callback fetches all eligible open messaging transcripts and commits each result with `updateSessionState(runtimeSessionId, ..., storedSessionId)`. This preserves the Desktop invariant that background work updates its own cache without stealing the foreground.
+The wiring reads `$sessionStates` before the cache ref because reconnect hydration publishes the authoritative busy snapshot to that atom. An unrelated busy primary runtime no longer blocks an idle messaging tile, while a target runtime restored as busy is not polled.
 
-### 4. Keep signatures scoped per stored session
+After each stored-message read, `refreshMessagingTranscriptTarget()` rechecks request generation, open-surface membership, runtime identity, and busy state. A delayed response therefore cannot overwrite a newer poll, a running turn, a closed tile, or a runtime rebound to another session.
 
-The no-change signature remains keyed by profile and stored-session ID. Multiple open messaging tiles cannot suppress each other's updates.
+### 4. Refresh every renderer runtime without cross-suppression
+
+One canonical transcript read can update every renderer runtime displaying that lineage. No-change signatures are scoped per runtime ID, so a current primary view cannot suppress a stale tile (or vice versa). The commit uses the authoritative full session state as the cache-update base before calling `updateSessionState(runtimeSessionId, ..., storedSessionId)`.
 
 ### 5. Preserve the existing synchronization mechanism
 
@@ -197,24 +200,29 @@ The fix does not add another timer, websocket path, global store, or transport-s
 ## Changed files
 
 - `apps/desktop/src/app/contrib/hooks/refresh-messaging-transcript.ts`
-  - resolves open messaging stored sessions;
-  - resolves each stored session to its own runtime/profile target.
+  - enumerates direct primary/tile runtime surfaces;
+  - resolves paginated metadata and canonical lineage targets;
+  - guards asynchronous commits and per-runtime signatures.
 - `apps/desktop/src/app/contrib/hooks/refresh-messaging-transcript.test.ts`
-  - covers a messaging tile while the primary view is non-messaging;
-  - covers per-runtime busy selection;
-  - covers deduplication.
+  - covers capped-sidebar misses and exact metadata fallback;
+  - covers direct runtime binding and root/tip alias grouping;
+  - covers authoritative busy state, stale-response suppression, and per-runtime signatures.
 - `apps/desktop/src/app/contrib/wiring.tsx`
   - includes `$sessionTiles` in the background-refresh target set;
-  - refreshes and commits each target independently.
+  - reads authoritative runtime state and commits each still-valid target independently.
 
 ## Regression tests
 
 The focused behavior tests assert these contracts:
 
-1. A messaging tile remains a refresh target while the primary view is a non-messaging session.
-2. The target messaging runtime is refreshed even when an unrelated primary runtime is busy.
-3. The same stored session is not refreshed twice when represented in both the primary view and a tile.
-4. Existing background-sync and route-resume behavior remains green.
+1. A messaging tile remains a refresh candidate while the primary view is a non-messaging session.
+2. An open tile outside the capped messaging sidebar page is resolved by exact stored-session ID.
+3. Primary and tile surfaces use their direct runtime bindings instead of a rotation-sensitive reverse lookup.
+4. Root/tip aliases are grouped by lineage while every renderer runtime remains an update destination.
+5. A target published as busy is not resolved or fetched, and a runtime that becomes busy during I/O rejects the response.
+6. A delayed older response cannot overwrite a newer response.
+7. Transcript signatures are independent per renderer runtime.
+8. Existing background-sync and session-state behavior remains green.
 
 The verification commands are:
 
@@ -223,7 +231,8 @@ cd apps/desktop
 npx vitest run \
   src/app/contrib/hooks/refresh-messaging-transcript.test.ts \
   src/app/contrib/hooks/use-background-sync.test.ts \
-  src/app/session/hooks/use-route-resume.test.tsx
+  src/app/session/hooks/use-route-resume.test.tsx \
+  src/store/session-states.test.ts
 npm run typecheck
 npx eslint \
   src/app/contrib/wiring.tsx \
@@ -232,9 +241,18 @@ npx eslint \
 npm run build
 ```
 
+Current follow-up verification results:
+
+- focused Vitest selection: 4 files, 49 tests passed;
+- Desktop type checking: passed;
+- targeted ESLint: passed with no warnings;
+- full Desktop lint: exit code 0, with 67 pre-existing warnings outside the changed files;
+- production build: passed, including renderer, Electron main/preload, native dependency staging, and dist assertion;
+- complete Desktop Vitest run: 3,890 passed, 22 failed, and 3 skipped. The failures match the previously reproduced unchanged Windows/MSYS baseline: 19 platform/environment cases plus one locale-dependent time label and two Billing copy assertions. No changed or newly added test file failed.
+
 ## Production end-to-end validation
 
-The final acceptance test used the normal production Windows Desktop profile and one continuously running formal Desktop instance.
+The primary runtime-refresh acceptance test used the normal production Windows Desktop profile and one continuously running formal Desktop instance.
 
 Conditions:
 
@@ -254,20 +272,22 @@ Result:
 
 Before that validation, the packaged renderer artifact was checked against the tested build by SHA-256. The packaged `app.asar` renderer entry matched the build output.
 
+After that acceptance, an independent review identified additional edge cases involving the capped messaging sidebar page, root/tip alias rotation, reconnect-published busy state, and overlapping asynchronous polls. Those follow-up guards were verified with dedicated RED/GREEN regression tests, Desktop type checking, targeted and full lint, and a fresh production build. The continuously running formal Desktop instance was intentionally not reinstalled or restarted solely to repeat the already-passed primary acceptance sequence.
+
 All credentials, pairing codes, user identifiers, connection details, local paths, and real session IDs are intentionally omitted or represented as `[REDACTED]`.
 
 ## Risk assessment
 
 The change is narrow:
 
-- it runs only while at least one messaging transcript is open;
+- it runs only while at least one known messaging transcript or unresolved open candidate exists;
 - it reuses the existing cadence and invalidation events;
 - it skips busy target runtimes;
-- it signature-gates unchanged transcripts;
-- it deduplicates sessions represented in more than one surface;
+- it signature-gates unchanged transcripts per renderer runtime;
+- it groups root/tip aliases while preserving all visible renderer destinations;
 - errors remain non-fatal and retry on the next existing refresh opportunity.
 
-The only expected increase is one stored-message read per distinct open, idle messaging transcript on a refresh tick.
+The only expected increase is one stored-message read per distinct open, idle messaging lineage on a refresh tick. An uncached open surface may also perform the existing exact-ID metadata lookup once before source filtering.
 
 ## Follow-up recommendations
 

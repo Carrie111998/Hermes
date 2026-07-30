@@ -62,7 +62,7 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
-import { $sessionTiles } from '@/store/session-states'
+import { $sessionStates, $sessionTiles } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord } from '@/store/wake-word'
 import { isSecondaryWindow } from '@/store/windows'
@@ -96,6 +96,7 @@ import { usePreviewRouting } from '../session/hooks/use-preview-routing'
 import { usePromptActions } from '../session/hooks/use-prompt-actions'
 import { useRouteResume } from '../session/hooks/use-route-resume'
 import { useSessionActions } from '../session/hooks/use-session-actions'
+import { resolveStoredSession } from '../session/hooks/use-session-actions/utils'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
 import { startWorkspaceSession } from '../session/workspace-session-target'
@@ -107,8 +108,11 @@ import { UpdatesOverlay } from '../updates-overlay'
 
 import { ContribWiringContext } from './context'
 import {
-  resolveMessagingTranscriptTarget,
-  resolveOpenMessagingStoredSessionIds
+  refreshMessagingTranscriptTarget,
+  resolveAuthoritativeRuntimeState,
+  resolveMessagingTranscriptTargets,
+  resolveOpenMessagingCandidateIds,
+  resolveOpenTranscriptSurfaces
 } from './hooks/refresh-messaging-transcript'
 import { useBackgroundSync } from './hooks/use-background-sync'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
@@ -146,7 +150,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // context (the sticky toast). The shell owns `navigate`, so it consumes the
   // intent counter here; the ref skips the initial mount value.
   const billingSettingsSeenRef = useRef(0)
-  const messagingTranscriptSignatureRef = useRef(new Map<string, string>())
+  const messagingTranscriptGenerationRef = useRef(new Map<string, number>())
+  const messagingTranscriptSignatureByRuntimeRef = useRef(new Map<string, string>())
   // Stable identity for the whole callback surface (see WiringActions). Mutated
   // in place each render so memoized surfaces never re-render on churn.
   const actionsRef = useRef<WiringActions | null>(null)
@@ -352,57 +357,71 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     [activeSessionIdRef, selectedStoredSessionIdRef, updateSessionState]
   )
 
-  // Refresh every open messaging transcript (primary view + session tiles).
-  // Inbound platform turns arrive via the background gateway, not the desktop
-  // websocket. Signatures are keyed per stored session so multiple open
-  // messaging tiles cannot suppress one another.
+  // Messaging sessions are written by background gateway adapters rather than
+  // this renderer's stream, so reconcile every open messaging transcript from
+  // storage. Tiles own independent renderer state and never select the primary
+  // session. Resolve their direct runtime bindings and exact metadata (the
+  // sidebar is capped), then guard each async commit against lineage rotation,
+  // reconnect busy state, tile closure/rebind, and newer overlapping polls.
   const refreshOpenMessagingTranscripts = useCallback(async () => {
-    const currentMessagingSessions = $messagingSessions.get()
+    const getCurrentRuntimeState = (runtimeSessionId: string) =>
+      resolveAuthoritativeRuntimeState(
+        runtimeSessionId,
+        $sessionStates.get(),
+        sessionStateByRuntimeIdRef.current
+      )
 
-    const openStoredSessionIds = resolveOpenMessagingStoredSessionIds({
-      messagingSessions: currentMessagingSessions,
-      selectedStoredSessionId: selectedStoredSessionIdRef.current,
-      sessionTiles: $sessionTiles.get()
+    const getOpenSurfaces = () =>
+      resolveOpenTranscriptSurfaces({
+        activeRuntimeSessionId: activeSessionIdRef.current,
+        selectedStoredSessionId: selectedStoredSessionIdRef.current,
+        sessionTiles: $sessionTiles.get()
+      })
+
+    const targets = await resolveMessagingTranscriptTargets({
+      getRuntimeState: getCurrentRuntimeState,
+      resolveStoredSession,
+      sessionRows: [...$messagingSessions.get(), ...$sessions.get()],
+      surfaces: getOpenSurfaces()
     })
 
     await Promise.all(
-      openStoredSessionIds.map(async selectedSessionId => {
-        const target = resolveMessagingTranscriptTarget({
-          getRuntimeIdForStoredSession,
-          isRuntimeBusy: runtimeSessionId => Boolean(sessionStateByRuntimeIdRef.current.get(runtimeSessionId)?.busy),
-          messagingSessions: currentMessagingSessions,
-          selectedStoredSessionId: selectedSessionId
-        })
-
-        if (!target) {
-          return
-        }
-
-        const { profile, runtimeSessionId, storedSessionId } = target
-
+      targets.map(async target => {
         try {
-          const latest = await getSessionMessages(storedSessionId, profile)
-          const signatureKey = `${profile ?? 'default'}:${storedSessionId}`
-          const sig = sessionMessagesSignature(latest.messages)
+          await refreshMessagingTranscriptTarget({
+            commit: (runtimeSessionId, _checkedState, latest) => {
+              // Reconnect hydration publishes authoritative state directly to
+              // the atom. Use that full snapshot as the cache-update base so a
+              // stale ref cannot re-publish obsolete busy/transcript state.
+              const currentState = getCurrentRuntimeState(runtimeSessionId)
 
-          if (messagingTranscriptSignatureRef.current.get(signatureKey) === sig) {
-            return
-          }
+              if (!currentState) {
+                return
+              }
 
-          messagingTranscriptSignatureRef.current.set(signatureKey, sig)
-          const messages = toChatMessages(latest.messages)
+              const messages = toChatMessages(latest.messages)
 
-          updateSessionState(
-            runtimeSessionId,
-            state => ({ ...state, messages: preserveLocalAssistantErrors(messages, state.messages) }),
-            storedSessionId
-          )
+              updateSessionState(
+                runtimeSessionId,
+                () => ({ ...currentState, messages: preserveLocalAssistantErrors(messages, currentState.messages) }),
+                target.storedSessionId
+              )
+            },
+            generationByTarget: messagingTranscriptGenerationRef.current,
+            getCurrentRuntimeState,
+            getSignature: latest => sessionMessagesSignature(latest.messages),
+            isRuntimeOpen: runtimeSessionId =>
+              getOpenSurfaces().some(surface => surface.runtimeSessionId === runtimeSessionId),
+            loadTranscript: () => getSessionMessages(target.storedSessionId, target.profile),
+            signatureByRuntimeId: messagingTranscriptSignatureByRuntimeRef.current,
+            target
+          })
         } catch {
           // Non-fatal: next poll or manual refresh can hydrate.
         }
       })
     )
-  }, [getRuntimeIdForStoredSession, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef, updateSessionState])
+  }, [activeSessionIdRef, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef, updateSessionState])
 
   const { handleGatewayEvent } = useMessageStream({
     activeGatewayProfile,
@@ -755,14 +774,19 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Only open messaging transcripts need their own poll — local chats are live
   // over the websocket already. Session tiles intentionally don't update the
   // primary selected-session atom, so include them explicitly.
-  const activeIsMessaging =
-    resolveOpenMessagingStoredSessionIds({ messagingSessions, selectedStoredSessionId, sessionTiles }).length > 0
+  const hasMessagingRefreshCandidate =
+    resolveOpenMessagingCandidateIds({
+      knownSessions: $sessions.get(),
+      messagingSessions,
+      selectedStoredSessionId,
+      sessionTiles
+    }).length > 0
 
   // Keep app data live while the gateway is open (on-connect reseed + the
   // cron / messaging / transcript visibility polls + fresh-draft reseed).
   useBackgroundSync({
     activeGatewayProfile,
-    activeIsMessaging,
+    activeIsMessaging: hasMessagingRefreshCandidate,
     activeSessionId,
     freshDraftReady,
     gatewayState,
