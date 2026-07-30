@@ -362,10 +362,11 @@ def build_memory_context_block(raw_context: str) -> str:
 
 
 class MemoryManager:
-    """Orchestrates the built-in provider plus at most one external provider.
+    """Orchestrates the built-in provider plus zero or more external providers.
 
-    The builtin provider is always first. Only one non-builtin (external)
-    provider is allowed.  Failures in one provider never block the other.
+    The builtin provider is always first. One or more non-builtin (external)
+    providers may run simultaneously in ``memory.providers`` list order (==
+    injection/priority order). Failures in one provider never block the others.
     """
 
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
@@ -410,7 +411,21 @@ class MemoryManager:
         registered providers for prefetch, sync, tool routing, system-prompt
         contribution, and lifecycle, so registration is unconditional here —
         the reserved-core-tool-name guard below is the only gate.
+
+        De-dup: a provider whose ``name`` is already registered is skipped
+        (order-preserving — the FIRST registration wins its priority slot). This
+        closes the double-register/double-inject class when a partial-migration
+        config lists the same provider twice (``providers: [honcho, honcho]``)
+        or a caller merges the legacy singular field into the list. The manager
+        owns this invariant so no individual caller has to de-dup first.
         """
+        if any(p.name == provider.name for p in self._providers):
+            logger.debug(
+                "Memory provider '%s' already registered; skipping duplicate "
+                "(order-preserving — first registration keeps its priority slot).",
+                provider.name,
+            )
+            return
         self._providers.append(provider)
 
         # Core tool names are reserved — a memory provider must never register

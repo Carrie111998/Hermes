@@ -516,6 +516,13 @@ class TestUserInstalledProviderCli:
             "plugins.memory._get_user_plugins_dir",
             lambda: tmp_path / "plugins",
         )
+        # discover_plugin_cli_commands() now resolves the ORDERED active set via
+        # the plural reader (#5688 multi-provider). Patch the plural seam; keep
+        # the singular shim patched too for any legacy caller under test.
+        monkeypatch.setattr(
+            "plugins.memory._get_active_memory_providers",
+            lambda: [name],
+        )
         monkeypatch.setattr(
             "plugins.memory._get_active_memory_provider",
             lambda: name,

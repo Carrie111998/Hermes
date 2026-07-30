@@ -16472,6 +16472,7 @@ def _merged_plugins_hub() -> Dict[str, Any]:
         _discover_all_plugins,
         _get_current_context_engine,
         _get_current_memory_provider,
+        _get_current_memory_providers,
         _discover_context_engines,
         _get_disabled_set,
         _get_enabled_set,
@@ -16574,6 +16575,9 @@ def _merged_plugins_hub() -> Dict[str, Any]:
         "orphan_dashboard_plugins": orphan_dashboard,
         "providers": {
             "memory_provider": _normalize_memory_provider_name(_get_current_memory_provider()),
+            "memory_providers": [
+                _normalize_memory_provider_name(p) for p in _get_current_memory_providers()
+            ],
             "memory_options": memory_providers,
             "context_engine": _get_current_context_engine(),
             "context_options": context_engines,

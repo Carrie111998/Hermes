@@ -133,56 +133,61 @@ _EXTERNAL_PREFIX = "_external/"
 
 
 def _collect_memory_provider_external_paths() -> List[Path]:
-    """Return existing absolute paths the active memory provider stores
+    """Return existing absolute paths the active memory providers store
     outside HERMES_HOME, resolved from config only (no network, no init).
 
-    Reads ``memory.provider`` from config, loads just that provider, and asks
-    it for ``backup_paths()``. Returns an empty list when no external provider
-    is active or the provider can't be loaded — backup must never fail because
-    of a flaky plugin.
+    Reads the ordered ``memory.providers`` list (legacy singular
+    ``memory.provider`` fallback), loads each active provider, and asks each for
+    ``backup_paths()``. Returns an empty list when no external provider is active
+    or none can be loaded — backup must never fail because of a flaky plugin.
+    Iterating ALL active providers (not just the singular field) is the #5688
+    data-loss fix: when 2+ providers are active the canonical setter blanks
+    ``memory.provider``, so a singular-only read here backed up ZERO external
+    paths — silently dropping provider state from every backup.
     """
     try:
-        from plugins.memory import _get_active_memory_provider, load_memory_provider
+        from plugins.memory import _get_active_memory_providers, load_memory_provider
     except Exception:
         return []
 
     try:
-        active = _get_active_memory_provider()
+        active_list = _get_active_memory_providers()
     except Exception:
-        active = None
-    if not active:
-        return []
-
-    try:
-        provider = load_memory_provider(active)
-    except Exception:
-        provider = None
-    if provider is None:
-        return []
-
-    try:
-        declared = provider.backup_paths() or []
-    except Exception as exc:
-        logger.warning("backup_paths() failed for memory provider %r: %s", active, exc)
+        active_list = []
+    if not active_list:
         return []
 
     out: List[Path] = []
     seen: set = set()
-    for raw in declared:
+    for active in active_list:
         try:
-            p = Path(raw).expanduser()
+            provider = load_memory_provider(active)
         except Exception:
+            provider = None
+        if provider is None:
             continue
-        if not p.exists():
-            continue
+
         try:
-            resolved = p.resolve()
-        except (OSError, ValueError):
+            declared = provider.backup_paths() or []
+        except Exception as exc:
+            logger.warning("backup_paths() failed for memory provider %r: %s", active, exc)
             continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        out.append(p)
+
+        for raw in declared:
+            try:
+                p = Path(raw).expanduser()
+            except Exception:
+                continue
+            if not p.exists():
+                continue
+            try:
+                resolved = p.resolve()
+            except (OSError, ValueError):
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            out.append(p)
     return out
 
 
