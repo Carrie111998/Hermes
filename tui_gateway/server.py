@@ -181,7 +181,10 @@ def _get_tui_hook_registry(hermes_home: Optional[str] = None) -> HookRegistry:
             if resolved not in _tui_hook_registries:
                 hooks_dir = _Path(resolved) / "hooks"
                 registry = HookRegistry(hooks_dir=hooks_dir)
-                registry.discover_and_load()
+                try:
+                    registry.discover_and_load()
+                except Exception as e:
+                    logger.error("Failed to discover and load hooks: %s", e)
                 _tui_hook_registries[resolved] = registry
     return _tui_hook_registries[resolved]
 _cfg_cache: dict | None = None
@@ -12347,7 +12350,12 @@ def _run_prompt_submit(
                     "message": text if isinstance(text, str) else "",
                 }
                 _registry = _get_tui_hook_registry()
-                _pre_route_results = asyncio.run(_registry.emit_collect("message:pre_route", _pre_route_ctx))
+                _pre_route_results = asyncio.run(
+                    asyncio.wait_for(
+                        _registry.emit_collect("message:pre_route", _pre_route_ctx),
+                        timeout=5.0,
+                    )
+                )
                 for _pr in _pre_route_results:
                     if not isinstance(_pr, dict):
                         continue
