@@ -141,6 +141,18 @@ def _photo_event(source, url, caption="", message_id="p"):
     )
 
 
+def _empty_media_photo_event(source, caption="", message_id="p"):
+    """A PHOTO whose adapter could not retain the downloaded attachment."""
+    return MessageEvent(
+        text=caption,
+        message_type=MessageType.PHOTO,
+        source=source,
+        message_id=message_id,
+        media_urls=[],
+        media_types=[],
+    )
+
+
 def _sender_identity(source):
     """Identity used to attribute a turn: stable alt id preferred."""
     if source is None:
@@ -490,6 +502,68 @@ def test_queue_or_replace_pending_event_merges_contiguous_media_at_fifo_tail():
     assert turns[1].media_urls == ["/tmp/b-1.jpg", "/tmp/b-2.jpg"]
 
 
+def test_queue_or_replace_pending_event_preserves_empty_media_photo_after_head():
+    """A failed photo download must not replace the occupied head slot."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:empty-photo-head"
+    source = _alice_source()
+    events = [
+        _text_event("first", source, message_id="a1"),
+        _empty_media_photo_event(source, caption="photo caption", message_id="a2"),
+    ]
+
+    for event in events:
+        runner._queue_or_replace_pending_event(session_key, event)
+
+    assert [turn.message_id for turn in _queued_turns(runner, adapter, session_key)] == [
+        "a1",
+        "a2",
+    ]
+
+
+def test_queue_or_replace_pending_event_preserves_empty_media_photo_after_tail():
+    """A failed photo download must not disappear behind an occupied FIFO tail."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:empty-photo-tail"
+    events = [
+        _text_event("alice head", _alice_source(), message_id="a1"),
+        _text_event("bob tail", _bob_source(), message_id="b1"),
+        _empty_media_photo_event(
+            _bob_source(), caption="photo caption", message_id="b2"
+        ),
+    ]
+
+    for event in events:
+        runner._queue_or_replace_pending_event(session_key, event)
+
+    assert [turn.message_id for turn in _queued_turns(runner, adapter, session_key)] == [
+        "a1",
+        "b1",
+        "b2",
+    ]
+
+
+def test_queue_or_replace_pending_event_preserves_empty_media_photo_in_dm():
+    """The tail replacement outcome must also remain lossless for one DM sender."""
+    runner, adapter = _runner_with_adapter()
+    source = _alice_source(chat_type="dm")
+    session_key = build_session_key(source)
+    events = [
+        _text_event("first", source, message_id="m1"),
+        _text_event("second", source, message_id="m2"),
+        _empty_media_photo_event(source, caption="photo caption", message_id="m3"),
+    ]
+
+    for event in events:
+        runner._queue_or_replace_pending_event(session_key, event)
+
+    assert [turn.message_id for turn in _queued_turns(runner, adapter, session_key)] == [
+        "m1",
+        "m2",
+        "m3",
+    ]
+
+
 def test_busy_photo_followup_from_other_sender_does_not_join_album():
     """Alice's album stays Alice's; Bob's photo becomes a separate turn."""
     runner, adapter = _runner_with_adapter()
@@ -580,6 +654,37 @@ async def test_adapter_busy_path_preserves_a_b_a_arrival_order(alice_tail_kind):
         "a1",
         "b1",
         "a2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_busy_path_preserves_empty_media_photo_at_fifo_tail():
+    """The real busy adapter path must retain PHOTO metadata after download failure."""
+    runner, adapter = _runner_with_adapter()
+    adapter.config.extra["group_sessions_per_user"] = False
+
+    async def _unused_handler(event):
+        return None
+
+    adapter.set_message_handler(_unused_handler)
+    source = _alice_source()
+    session_key = build_session_key(source, group_sessions_per_user=False)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    events = [
+        _text_event("alice head", source, message_id="a1"),
+        _text_event("bob tail", _bob_source(), message_id="b1"),
+        _empty_media_photo_event(
+            _bob_source(), caption="download failed", message_id="b2"
+        ),
+    ]
+
+    for event in events:
+        await adapter.handle_message(event)
+
+    assert [turn.message_id for turn in _queued_turns(runner, adapter, session_key)] == [
+        "a1",
+        "b1",
+        "b2",
     ]
 
 

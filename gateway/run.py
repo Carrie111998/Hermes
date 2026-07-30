@@ -8323,6 +8323,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
                 ):
+                    if tail_slot.get(session_key) is tail:
+                        return
+                    # The helper may report success by replacing its slot
+                    # rather than mutating the existing event. ``tail_slot``
+                    # is only a probe around the real FIFO tail, so retain the
+                    # replacement as its own turn instead of discarding it.
+                    self._enqueue_fifo(session_key, event, adapter)
                     return
                 # A cross-sender media refusal remains lossless even at the
                 # ordinary busy cap, but must append after the current tail.
@@ -8353,6 +8360,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             ):
+                if adapter._pending_messages.get(session_key) is existing:
+                    return
+                # Slot replacement would overtake and silently discard the
+                # occupied head. Restore the head and queue the incoming event
+                # as the next turn instead.
+                adapter._pending_messages[session_key] = existing
+                self._enqueue_fifo(session_key, event, adapter)
                 return
             # Refusal transfers ownership back to this caller. It must bypass
             # the ordinary busy-queue cap: the refusal itself must never cost
