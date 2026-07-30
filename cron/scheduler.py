@@ -2225,7 +2225,7 @@ def _kill_script_process_tree(proc: subprocess.Popen) -> None:
     pid = proc.pid
     if sys.platform == "win32":
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -2233,7 +2233,13 @@ def _kill_script_process_tree(proc: subprocess.Popen) -> None:
                 creationflags=windows_hide_flags(),
                 stdin=subprocess.DEVNULL,
             )
-            return
+            if result.returncode == 0:
+                return
+            details = (result.stderr or result.stdout or "").strip()
+            logger.debug(
+                "taskkill tree-kill of cron script pid %s exited %s: %s",
+                pid, result.returncode, details,
+            )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
             logger.debug("taskkill tree-kill of cron script pid %s failed: %s", pid, exc)
     else:

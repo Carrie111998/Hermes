@@ -697,6 +697,26 @@ class TestKillScriptProcessTree:
         assert captured["argv"] == ["taskkill", "/PID", "4242", "/T", "/F"]
         assert killed == [], "taskkill succeeded; no fallback kill expected"
 
+    def test_windows_nonzero_taskkill_falls_back_to_direct_kill(self, monkeypatch):
+        """taskkill can *run* and still fail (access denied, stale PID);
+        a non-zero exit must not be treated as a completed tree kill."""
+        from cron import scheduler as sched_mod
+
+        def fake_run(argv, **kwargs):
+            return SimpleNamespace(returncode=1, stdout="", stderr="Access is denied.")
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
+        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+
+        proc = _FakePopen()
+        killed = []
+        proc.kill = lambda: killed.append(True)
+
+        sched_mod._kill_script_process_tree(proc)
+
+        assert killed == [True], "non-zero taskkill must fall back to proc.kill()"
+
     def test_refuses_to_killpg_the_schedulers_own_group(self, monkeypatch):
         """If start_new_session ever failed, killpg would signal the gateway."""
         from cron import scheduler as sched_mod
