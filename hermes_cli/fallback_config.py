@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from agent.secret_scope import get_secret as _get_secret
+
 
 def _normalized_base_url(value: Any) -> str:
     if not isinstance(value, str):
@@ -27,7 +29,11 @@ def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
         return inline
     key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
     if key_env:
-        return os.getenv(key_env, "").strip() or None
+        # Use secret_scope-aware resolution so that multiplexed gateways
+        # (multiple profiles sharing one process) read the active profile's
+        # credential instead of the raw process environment (#74311).
+        val = _get_secret(key_env, "")
+        return val.strip() or None
     return None
 
 
