@@ -118,10 +118,21 @@ MESSAGE_DEDUP_TTL_SECONDS = 300
 def _is_stale_session_ret(
     ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
 ) -> bool:
-    """True when iLink returns a stale-session variant of ret/errcode -2."""
+    """True when iLink returns the known stale-session ret/errcode -2."""
     if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
         return False
-    return (errmsg or "").strip().lower() in {"unknown error", "prepare failed"}
+    return (errmsg or "").strip().lower() == "unknown error"
+
+
+def _is_stale_context_token_ret(
+    ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
+) -> bool:
+    """True when an outbound send reports a stale ``context_token``."""
+    if _is_stale_session_ret(ret, errcode, errmsg):
+        return True
+    if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
+        return False
+    return (errmsg or "").strip().lower() == "prepare failed"
 
 
 MEDIA_IMAGE = 1
@@ -330,9 +341,13 @@ class ContextTokenStore:
         self._cache[self._key(account_id, user_id)] = token
         self._persist(account_id)
 
-    def delete(self, account_id: str, user_id: str) -> None:
-        self._cache.pop(self._key(account_id, user_id), None)
+    def delete(self, account_id: str, user_id: str, expected_token: str) -> bool:
+        key = self._key(account_id, user_id)
+        if self._cache.get(key) != expected_token:
+            return False
+        self._cache.pop(key, None)
         self._persist(account_id)
+        return True
 
     def _persist(self, account_id: str) -> None:
         prefix = f"{account_id}:"
@@ -1764,17 +1779,16 @@ class WeixinAdapter(BasePlatformAdapter):
         *,
         chat_id: str,
         chunk: str,
-        context_token: Optional[str],
         client_id: str,
     ) -> None:
         """Send a single text chunk with per-chunk retry and backoff.
 
-        On session-expired errors (errcode -14), automatically retries
-        *without* ``context_token`` — iLink accepts tokenless sends as a
-        degraded fallback, which keeps cron-initiated push messages working
-        even when no user message has refreshed the session recently.
+        On session-expired or stale-context errors, automatically retries
+        *without* ``context_token``.  The recovery send does not consume the
+        configured transient retry budget.
         """
         async with self._send_text_gate:
+            context_token = self._token_store.get(self._account_id, chat_id)
             await self._send_text_chunk_locked(
                 chat_id=chat_id,
                 chunk=chunk,
@@ -1792,7 +1806,8 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> None:
         """Send a text chunk while holding the adapter-wide outbound text gate."""
         last_error: Optional[Exception] = None
-        for attempt in range(self._send_chunk_retries + 1):
+        attempt = 0
+        while attempt <= self._send_chunk_retries:
             if self._rate_limit_cooldown_remaining() > 0:
                 raise self._rate_limit_error()
             try:
@@ -1813,21 +1828,26 @@ class WeixinAdapter(BasePlatformAdapter):
                         is_session_expired = (
                             ret == SESSION_EXPIRED_ERRCODE
                             or errcode == SESSION_EXPIRED_ERRCODE
-                            or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
+                            or _is_stale_context_token_ret(
+                                ret,
+                                errcode,
+                                resp.get("errmsg"),
+                            )
                         )
                         # Session expired — strip token and retry once
                         if is_session_expired and context_token:
-                            self._token_store.delete(self._account_id, chat_id)
+                            stale_token = context_token
+                            context_token = None
+                            self._token_store.delete(
+                                self._account_id,
+                                chat_id,
+                                stale_token,
+                            )
                             logger.warning(
                                 "[%s] session expired for %s; retrying without context_token",
                                 self.name, _safe_id(chat_id),
                             )
-                            return await self._send_text_chunk_locked(
-                                chat_id=chat_id,
-                                chunk=chunk,
-                                context_token=None,
-                                client_id=client_id,
-                            )
+                            continue
                         # Rate limit (-2) — backoff and retry
                         is_rate_limited = (
                             ret == RATE_LIMIT_ERRCODE
@@ -1852,6 +1872,7 @@ class WeixinAdapter(BasePlatformAdapter):
                                 self.name, _safe_id(chat_id), wait,
                             )
                             await asyncio.sleep(wait)
+                            attempt += 1
                             continue
                         errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
                         raise RuntimeError(
@@ -1875,6 +1896,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 )
                 if wait > 0:
                     await asyncio.sleep(wait)
+                attempt += 1
         assert last_error is not None
         raise last_error
 
@@ -1930,11 +1952,9 @@ class WeixinAdapter(BasePlatformAdapter):
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
-                context_token = self._token_store.get(self._account_id, chat_id)
                 await self._send_text_chunk(
                     chat_id=chat_id,
                     chunk=chunk,
-                    context_token=context_token,
                     client_id=client_id,
                 )
                 last_message_id = client_id

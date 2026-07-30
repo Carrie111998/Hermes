@@ -294,6 +294,102 @@ class TestWeixinChunkDelivery:
             for call in send_message_mock.await_args_list
         ] == ["ctx-token", None, None]
 
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_failed_stale_recovery_does_not_restart_with_original_token(
+        self,
+        send_message_mock,
+        tmp_path,
+    ):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 1
+        adapter._send_chunk_retry_delay_seconds = 0
+        adapter._token_store = weixin.ContextTokenStore(str(tmp_path))
+        adapter._token_store.set(adapter._account_id, "wxid_test123", "ctx-token")
+        send_message_mock.side_effect = [
+            {"ret": -2, "errmsg": "prepare failed"},
+            RuntimeError("tokenless recovery failed"),
+            RuntimeError("tokenless retry failed"),
+            {"ret": 0},
+        ]
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is False
+        assert [
+            call.kwargs["context_token"]
+            for call in send_message_mock.await_args_list
+        ] == ["ctx-token", None, None]
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_stale_response_does_not_delete_newer_context_token(
+        self,
+        send_message_mock,
+        tmp_path,
+    ):
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 0
+        adapter._token_store = weixin.ContextTokenStore(str(tmp_path))
+        adapter._token_store.set(adapter._account_id, "wxid_test123", "ctx-token")
+
+        async def refresh_before_stale_response(*args, **kwargs):
+            if kwargs["context_token"] == "ctx-token":
+                adapter._token_store.set(
+                    adapter._account_id,
+                    "wxid_test123",
+                    "fresh-token",
+                )
+                return {"ret": -2, "errmsg": "prepare failed"}
+            return {"ret": 0}
+
+        send_message_mock.side_effect = refresh_before_stale_response
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        assert adapter._token_store.get(
+            adapter._account_id,
+            "wxid_test123",
+        ) == "fresh-token"
+
+        restored_store = weixin.ContextTokenStore(str(tmp_path))
+        restored_store.restore(adapter._account_id)
+        assert restored_store.get(
+            adapter._account_id,
+            "wxid_test123",
+        ) == "fresh-token"
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_context_token_is_loaded_after_send_gate_is_acquired(
+        self,
+        send_message_mock,
+        tmp_path,
+    ):
+        adapter = self._connected_adapter()
+        adapter._token_store = weixin.ContextTokenStore(str(tmp_path))
+        adapter._token_store.set(adapter._account_id, "wxid_test123", "old-token")
+        send_message_mock.return_value = {"ret": 0}
+
+        async def send_after_refresh():
+            await adapter._send_text_gate.acquire()
+            try:
+                send_task = asyncio.create_task(
+                    adapter.send("wxid_test123", "hello")
+                )
+                await asyncio.sleep(0)
+                adapter._token_store.set(
+                    adapter._account_id,
+                    "wxid_test123",
+                    "fresh-token",
+                )
+            finally:
+                adapter._send_text_gate.release()
+            return await send_task
+
+        result = asyncio.run(send_after_refresh())
+
+        assert result.success is True
+        assert send_message_mock.await_args.kwargs["context_token"] == "fresh-token"
+
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_repeated_rate_limits_open_circuit_for_followup_sends(self, send_message_mock, sleep_mock):
@@ -553,8 +649,13 @@ class TestIsStaleSessionRet:
     """Regression test for #17228: distinguish stale-session ret=-2 from rate-limit ret=-2."""
 
 
-    def test_ret_minus_2_with_prepare_failed_is_stale(self):
-        assert weixin._is_stale_session_ret(-2, None, "prepare failed") is True
+    def test_prepare_failed_is_only_an_outbound_context_token_signal(self):
+        assert weixin._is_stale_session_ret(-2, None, "prepare failed") is False
+        assert weixin._is_stale_context_token_ret(
+            -2,
+            None,
+            "prepare failed",
+        ) is True
 
 
     def test_ret_minus_2_with_freq_limit_is_not_stale(self):
@@ -575,7 +676,10 @@ class TestContextTokenStore:
         store.set("account-a", "peer-b", "fresh-token")
         store.set("account-b", "peer-a", "other-account-token")
 
-        store.delete("account-a", "peer-a")
+        assert store.delete("account-a", "peer-a", "replacement-token") is False
+        assert store.get("account-a", "peer-a") == "stale-token"
+
+        assert store.delete("account-a", "peer-a", "stale-token") is True
 
         assert store.get("account-a", "peer-a") is None
         assert store.get("account-a", "peer-b") == "fresh-token"
