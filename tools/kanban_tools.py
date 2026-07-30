@@ -33,6 +33,7 @@ import logging
 import os
 from typing import Any, Optional
 
+from agent.delegation_context import is_delegated_child_process_context
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
@@ -269,6 +270,8 @@ def _goal_judge_available() -> bool:
 #   - Rate-limited to one DB write per 60s per-process; runtime activity
 #     can tick on every chunk/tool result and we don't need that resolution.
 #   - No-op outside dispatcher-spawned worker context (no ``HERMES_KANBAN_TASK``).
+#   - No-op inside delegated children, which share the worker's process env but
+#     do not own its Kanban claim.
 #   - No durable note on these auto-heartbeats; that's reserved for the
 #     explicit tool which carries a model-supplied note.
 
@@ -298,6 +301,8 @@ def heartbeat_current_worker_from_env() -> bool:
     the worst case is one extra DB write per race, which is harmless.
     """
     global _auto_heartbeat_last_attempt
+    if is_delegated_child_process_context():
+        return False
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
