@@ -390,6 +390,17 @@ class TestEventBridge:
         assert len(b.list_pending_approvals()) == 0
 
 
+    def test_last_poll_timestamp_updates_are_monotonic(self):
+        from mcp_serve import EventBridge
+
+        bridge = EventBridge()
+        session_key = "agent:main:telegram:dm:lock-test"
+
+        bridge._set_last_poll_timestamp(session_key, 10.0)
+        bridge._set_last_poll_timestamp(session_key, 5.0)
+
+        assert bridge._get_last_poll_timestamp(session_key) == 10.0
+
 
 # ---------------------------------------------------------------------------
 # 3. END-TO-END TESTS — call MCP tools through FastMCP server
