@@ -83,6 +83,18 @@ _TRUST_MAX       =  1.0
 
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+_RE_SINGLE_CAP   = re.compile(r'\b([A-Z][a-z]+)\b')  # single-word proper nouns
+_RE_HYPHENATED   = re.compile(r'\b([A-Z][a-z]+(?:-[A-Za-z][a-z]*)+)\b')  # hyphenated names
+# Conservative stoplist for single-cap extraction: sentence-initial function
+# words that would pollute entity bindings.
+_ENTITY_STOPWORDS: frozenset[str] = frozenset({
+    "A", "An", "The", "This", "That", "These", "Those",
+    "It", "He", "She", "They", "We", "You", "I",
+    "In", "On", "At", "To", "For", "With", "From", "By",
+    "As", "Of", "And", "But", "Or", "Not", "No",
+    "Is", "Are", "Was", "Were", "Be", "Been",
+    "If", "So", "Than", "Then", "Also",
+})
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
 _RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
 _RE_AKA          = re.compile(
@@ -449,9 +461,11 @@ class MemoryStore:
 
         Rules applied (in order):
         1. Capitalized multi-word phrases  e.g. "John Doe"
-        2. Double-quoted terms             e.g. "Python"
-        3. Single-quoted terms             e.g. 'pytest'
-        4. AKA patterns                    e.g. "Guido aka BDFL" -> two entities
+        2. Single capitalized words        e.g. "Python"
+        3. Hyphenated capitalized phrases  e.g. "Pi-hole"
+        4. Double-quoted terms
+        5. Single-quoted terms
+        6. AKA patterns                    e.g. "Guido aka BDFL"
 
         Returns a deduplicated list preserving first-seen order.
         """
@@ -465,6 +479,14 @@ class MemoryStore:
                 candidates.append(stripped)
 
         for m in _RE_CAPITALIZED.finditer(text):
+            _add(m.group(1))
+
+        for m in _RE_SINGLE_CAP.finditer(text):
+            word = m.group(1)
+            if word not in _ENTITY_STOPWORDS:
+                _add(word)
+
+        for m in _RE_HYPHENATED.finditer(text):
             _add(m.group(1))
 
         for m in _RE_DOUBLE_QUOTE.finditer(text):

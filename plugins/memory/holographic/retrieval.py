@@ -136,21 +136,6 @@ class FactRetriever:
         entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
         probe_key = hrr.bind(entity_vec, role_entity)
 
-        # Try category-specific bank first, then all facts
-        if category:
-            bank_name = f"cat:{category}"
-            bank_row = conn.execute(
-                "SELECT vector FROM memory_banks WHERE bank_name = ?",
-                (bank_name,),
-            ).fetchone()
-            if bank_row:
-                bank_vec = hrr.bytes_to_phases(bank_row["vector"])
-                extracted = hrr.unbind(bank_vec, probe_key)
-                # Use extracted signal to score individual facts
-                return self._score_facts_by_vector(
-                    extracted, category=category, limit=limit
-                )
-
         # Score against individual fact vectors directly
         where = "WHERE hrr_vector IS NOT NULL"
         params: list = []
@@ -177,12 +162,8 @@ class FactRetriever:
         for row in rows:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
-            # Unbind probe key from fact to see if entity is structurally present
-            residual = hrr.unbind(fact_vec, probe_key)
-            # Compare residual against content signal
-            role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-            content_vec = hrr.bind(hrr.encode_text(fact["content"], self.hrr_dim), role_content)
-            sim = hrr.similarity(residual, content_vec)
+            # Direct similarity -- unbind does not compose through bundle
+            sim = hrr.similarity(fact_vec, probe_key)
             fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
             scored.append(fact)
 
@@ -232,26 +213,14 @@ class FactRetriever:
         if not rows:
             return self.search(entity, category=category, limit=limit)
 
-        # Score each fact by how much the entity's atom appears in its vector
-        # This catches both role-bound entity matches AND content word matches
+        # Score each fact by how much the entity atom appears in its vector
         scored = []
         for row in rows:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
-
-            # Check structural similarity: unbind entity from fact
-            residual = hrr.unbind(fact_vec, entity_vec)
-            # A high-similarity residual to ANY known role vector means this entity
-            # plays a structural role in the fact
-            role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
-            role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-
-            entity_role_sim = hrr.similarity(residual, role_entity)
-            content_role_sim = hrr.similarity(residual, role_content)
-            # Take the max — entity could appear in either role
-            best_sim = max(entity_role_sim, content_role_sim)
-
-            fact["score"] = (best_sim + 1.0) / 2.0 * fact["trust_score"]
+            # Direct similarity -- unbind does not compose through bundle
+            sim = hrr.similarity(fact_vec, entity_vec)
+            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -282,8 +251,7 @@ class FactRetriever:
         conn = self.store._conn
         role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
 
-        # For each entity, compute what the bank "remembers" about it
-        # by unbinding entity+role from each fact vector
+        # For each entity, build a role-bound probe key to check against facts
         entity_residuals = []
         for entity in entities:
             entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
@@ -313,10 +281,7 @@ class FactRetriever:
             return self.search(query, category=category, limit=limit)
 
         # Score each fact by how much EACH entity is structurally present.
-        # A fact scores high only if ALL entities have structural presence
-        # (AND semantics via min, vs OR which would use mean/max).
-        role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-
+        # AND semantics via min: all entities must be present for a high score.
         scored = []
         for row in rows:
             fact = dict(row)
@@ -324,8 +289,8 @@ class FactRetriever:
 
             entity_scores = []
             for probe_key in entity_residuals:
-                residual = hrr.unbind(fact_vec, probe_key)
-                sim = hrr.similarity(residual, role_content)
+                # Direct similarity -- unbind does not compose through bundle
+                sim = hrr.similarity(fact_vec, probe_key)
                 entity_scores.append(sim)
 
             min_sim = min(entity_scores)
