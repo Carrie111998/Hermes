@@ -122,7 +122,6 @@ class TestEnsureUv:
             def fake_install(target):
                 _make_executable(target)
             mock_install.side_effect = fake_install
-            mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.1.2")
 
             from hermes_cli.managed_uv import ensure_uv
             path = ensure_uv()

@@ -860,6 +860,12 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     try:
         from tools.mcp_oauth import force_interactive_oauth
 
+        # Fork advantage kept across upstream reauth rewrite: some MCP
+        # servers (Google Drive) allow tools/list without auth, so the
+        # 401-driven OAuth path never starts. Pre-registered clients must
+        # force an explicit login before the probe.
+        preregistered_client = _has_preregistered_oauth_client(server_config)
+
         _login_connect_timeout = server_config.get("connect_timeout")
         try:
             _login_connect_timeout = float(_login_connect_timeout)
@@ -867,9 +873,13 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             _login_connect_timeout = 0.0
         _login_connect_timeout = max(_login_connect_timeout, 315.0)
         with force_interactive_oauth():
-            tools = _probe_single_server(
-                name, server_config, connect_timeout=_login_connect_timeout
-            )
+            if preregistered_client:
+                _force_oauth_login(name, server_config)
+                tools = _probe_single_server(name, server_config)
+            else:
+                tools = _probe_single_server(
+                    name, server_config, connect_timeout=_login_connect_timeout
+                )
         # A clean probe is NOT proof of authentication. Some MCP servers
         # (notably Google's official Drive server) serve initialize +
         # tools/list WITHOUT auth, so the probe lists tools even when the

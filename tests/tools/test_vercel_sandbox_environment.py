@@ -221,7 +221,13 @@ def vercel_module(vercel_sdk, monkeypatch):
     monkeypatch.setattr("tools.credential_files.iter_cache_files", lambda **kwargs: [])
 
     module = importlib.import_module("tools.environments.vercel_sandbox")
-    return importlib.reload(module)
+    module = importlib.reload(module)
+    # CI sets HERMES_DISABLE_LAZY_INSTALLS=1 and does not always install the
+    # vercel extra; the fake SDK above is enough for unit tests.
+    monkeypatch.setattr(module, "_ensure_vercel_sdk", lambda: None)
+    module._sandbox_status_type.cache_clear()
+    module._terminal_sandbox_states.cache_clear()
+    return module
 
 
 @pytest.fixture()

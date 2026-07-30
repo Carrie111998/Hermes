@@ -147,7 +147,10 @@ class TestInboundMessageEvent:
         }
 
     def test_image_message_maps_to_photo(self, adapter):
-        adapter._download_media = AsyncMock(return_value=r"C:\tmp\line-image.png")
+        # Upstream API: _download_media returns (path, mime_type).
+        adapter._download_media = AsyncMock(
+            return_value=(r"C:\tmp\line-image.png", "image/jpeg")
+        )
 
         asyncio.run(adapter._handle_message_event(
             self._event_for({"id": "m-image", "type": "image"})
@@ -157,7 +160,7 @@ class TestInboundMessageEvent:
         assert event_obj.message_type is MessageType.PHOTO
         assert event_obj.text == "[image]"
         assert event_obj.media_urls == [r"C:\tmp\line-image.png"]
-        assert event_obj.media_types == ["image"]
+        assert event_obj.media_types == ["image/jpeg"]
 
     @pytest.mark.parametrize(
         ("message", "expected_type", "expected_text"),
@@ -181,7 +184,9 @@ class TestInboundMessageEvent:
     def test_supported_message_types_map_to_base_enum(
         self, adapter, message, expected_type, expected_text,
     ):
-        adapter._download_media = AsyncMock(return_value=r"C:\tmp\line-media.bin")
+        adapter._download_media = AsyncMock(
+            return_value=(r"C:\tmp\line-media.bin", "application/octet-stream")
+        )
 
         asyncio.run(adapter._handle_message_event(self._event_for(message)))
 

@@ -221,7 +221,11 @@ def test_sync_includes_hermes_probe_and_provider(monkeypatch, tmp_path: Path):
     assert payload["hermes_base_url"].endswith("/")
 
 
-def test_start_already_running_reseeds(monkeypatch):
+def test_start_already_running_reseeds(monkeypatch, tmp_path: Path):
+    repo = tmp_path / "airi"
+    repo.mkdir()
+    (repo / "package.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(core, "_repo", lambda values=None: repo)
     monkeypatch.setattr(core, "sync", lambda values=None, **_: json.dumps({"ok": True, "synced": True}))
     monkeypatch.setattr(core, "_ensure_rgba_icon", lambda repo: {"repaired": False})
     # Stale seed in state must not clobber a fresh CDP seed (dict merge order bug).
