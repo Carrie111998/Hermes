@@ -256,6 +256,12 @@ def _material_from_row(
         if host_id not in (None, "") or reference_locator not in (None, ""):
             raise CredentialContractError("by-value material cannot include host-bound fields")
         if isinstance(envelope, Mapping):
+            for required in ("ciphertext", "key_role"):
+                value = envelope.get(required)
+                if not isinstance(value, str) or not value.strip():
+                    raise CredentialContractError(
+                        f"sealed by-value material requires nonblank {required}"
+                    )
             if by_value_resolver is None:
                 raise CredentialContractError(
                     "sealed by-value material requires a configured resolver"
@@ -882,13 +888,14 @@ class CredentialWatcher:
         self.enabled = enabled
         self._task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
+        self._terminal_alerted: set[str] = set()
 
     @classmethod
     def from_environment(cls, **kwargs: Any) -> "CredentialWatcher":
+        by_value_resolver = kwargs.pop("by_value_resolver", None)
         path = os.getenv("PA_CREDENTIALS_FILE")
         if not path or not Path(path).is_file():
             return cls([], enabled=False, **kwargs)
-        by_value_resolver = kwargs.pop("by_value_resolver", None)
         return cls(
             load_runtime_credentials(
                 path,
@@ -957,6 +964,39 @@ class CredentialWatcher:
             now - record.last_probe_at
         ).total_seconds() >= self._cadence_seconds(record, driver)
 
+    @staticmethod
+    def _renewal_lead_seconds(record: CredentialRecord) -> float:
+        policy = record.escalation_policy
+        if isinstance(policy, Mapping):
+            value = policy.get("renewal_lead_seconds", 604800)
+        else:
+            value = 604800
+        try:
+            lead = float(value)
+        except (TypeError, ValueError) as exc:
+            raise CredentialContractError(
+                "escalation_policy.renewal_lead_seconds must be numeric"
+            ) from exc
+        if lead < 0:
+            raise CredentialContractError(
+                "escalation_policy.renewal_lead_seconds must not be negative"
+            )
+        return lead
+
+    def _expires_within_lead(
+        self,
+        record: CredentialRecord,
+        now: datetime,
+        driver: CredentialDriver,
+    ) -> bool:
+        return (
+            isinstance(driver, BearerJwtDriver)
+            and record.expires_at is not None
+            and record.expires_at <= now + timedelta(
+                seconds=self._renewal_lead_seconds(record)
+            )
+        )
+
     async def run_once(self) -> None:
         now = self.clock().astimezone(UTC)
         for record in self.credentials:
@@ -971,7 +1011,13 @@ class CredentialWatcher:
                 probe_completed = True
                 if result.expires_at is not None:
                     record.expires_at = result.expires_at.astimezone(UTC)
-                if result.healthy and not result.needs_reauth:
+                needs_reauth = (
+                    result.needs_reauth
+                    or not result.healthy
+                    or self._expires_within_lead(record, now, driver)
+                )
+                if not needs_reauth:
+                    self._terminal_alerted.discard(record.credential_id)
                     if record.reauth_state == ReauthState.PENDING_HUMAN:
                         record.transition(ReauthState.COMPLETED, now=now)
                     continue
@@ -1024,6 +1070,18 @@ class CredentialWatcher:
             ReauthState.COMPLETED,
             ReauthState.TIMED_OUT,
         }:
+            if record.credential_id not in self._terminal_alerted:
+                self._terminal_alerted.add(record.credential_id)
+                logger.error(
+                    "PA credential %s is unhealthy after terminal re-auth state %s",
+                    record.credential_id,
+                    record.reauth_state.value,
+                )
+                await _invoke_hook(
+                    self.on_escalation,
+                    record,
+                    ReauthResult(record.reauth_state),
+                )
             return
 
         result = await driver.begin_reauth(record)

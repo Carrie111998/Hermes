@@ -2100,11 +2100,7 @@ class GatewayRunner:
     async def _start_pa_credentials_watcher(self) -> None:
         """Start the optional PA credential watcher from the exported rows."""
         try:
-            from hermes_cli.pa_credentials import (
-                CarbonAuthV1Client,
-                create_pa_credentials_watcher,
-                configured_handoff_signer_from_environment,
-            )
+            from hermes_cli.pa_credentials import create_pa_credentials_watcher
 
             # Carbon Auth v1 stays behind the runtime credential file: merely
             # starting a gateway never sends a request.  A human-required row
@@ -2112,8 +2108,6 @@ class GatewayRunner:
             # configured bridge wrapped by the canonical signed-url validator;
             # no raw browser URL can enter this path.
             watcher = create_pa_credentials_watcher(
-                carbon_auth=CarbonAuthV1Client(),
-                handoff_signer=configured_handoff_signer_from_environment(),
                 on_escalation=self._on_pa_credential_escalation,
                 on_timeout=self._on_pa_credential_timeout,
             )

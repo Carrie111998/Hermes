@@ -31,6 +31,7 @@ from hermes_cli.pa_credentials import (
     ReauthStateMachine,
     SignedHandoffUrlSigner,
     UnsafeProbeError,
+    create_pa_credentials_watcher,
     validate_handoff_url,
     load_runtime_credentials,
 )
@@ -567,6 +568,47 @@ def test_one_bad_row_cannot_stop_other_credential_probes():
     asyncio.run(run())
 
 
+def test_bearer_expiry_lead_requests_reauth_before_itos_deadline():
+    async def run():
+        now = datetime(2026, 10, 23, tzinfo=UTC)
+        escalated = []
+        record = _record()
+        record.escalation_policy = {"renewal_lead_seconds": 7 * 24 * 60 * 60}
+        watcher = CredentialWatcher(
+            [record],
+            clock=lambda: now,
+            on_escalation=lambda row, result: escalated.append(row.credential_id),
+        )
+        await watcher.run_once()
+        assert record.expires_at == datetime(2026, 10, 29, tzinfo=UTC)
+        assert record.last_probe_status == "healthy"
+        # The local JWT driver cannot mutate material. It enters the async
+        # handoff path before expiry and fails closed when no adapters exist.
+        assert escalated == [record.credential_id]
+
+    asyncio.run(run())
+
+
+def test_terminal_unhealthy_state_escalates_once_instead_of_going_silent():
+    async def run():
+        current = [datetime(2026, 10, 30, tzinfo=UTC)]
+        escalated = []
+        record = _record(state=ReauthState.COMPLETED)
+        watcher = CredentialWatcher(
+            [record],
+            clock=lambda: current[0],
+            on_escalation=lambda row, result: escalated.append(
+                (row.credential_id, result.state)
+            ),
+        )
+        await watcher.run_once()
+        current[0] += timedelta(seconds=300)
+        await watcher.run_once()
+        assert escalated == [(record.credential_id, ReauthState.COMPLETED)]
+
+    asyncio.run(run())
+
+
 def test_watcher_loads_json_file_and_missing_file_disables_cleanly(
     tmp_path: Path, monkeypatch
 ):
@@ -768,7 +810,16 @@ def test_start_stop_owns_task_without_leak():
     asyncio.run(run())
 
 
-def test_gateway_start_path_injects_configured_pa_adapters(monkeypatch):
+def test_factory_cleanly_disables_without_export_file(monkeypatch):
+    monkeypatch.delenv("PA_CREDENTIALS_FILE", raising=False)
+    monkeypatch.delenv("PA_CREDENTIALS_MATERIAL_RESOLVER", raising=False)
+    monkeypatch.delenv("PA_CREDENTIALS_HANDOFF_SIGNER", raising=False)
+    watcher = create_pa_credentials_watcher()
+    assert watcher.enabled is False
+    assert watcher.credentials == []
+
+
+def test_gateway_start_path_delegates_adapter_wiring_to_factory(monkeypatch):
     # This invokes GatewayRunner's actual lifecycle method.  The adapter
     # constructors are replaced before it runs, so the test cannot touch
     # Carbon Auth or any client surface.
@@ -777,9 +828,6 @@ def test_gateway_start_path_injects_configured_pa_adapters(monkeypatch):
     import hermes_cli.pa_credentials as credentials
 
     captured: dict[str, object] = {}
-    carbon = object()
-    signer = object()
-
     class Watcher:
         started = False
 
@@ -793,12 +841,6 @@ def test_gateway_start_path_injects_configured_pa_adapters(monkeypatch):
         captured.update(kwargs)
         return watcher
 
-    monkeypatch.setattr(credentials, "CarbonAuthV1Client", lambda: carbon)
-    monkeypatch.setattr(
-        credentials,
-        "configured_handoff_signer_from_environment",
-        lambda: signer,
-    )
     monkeypatch.setattr(credentials, "create_pa_credentials_watcher", create)
 
     runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
@@ -807,7 +849,7 @@ def test_gateway_start_path_injects_configured_pa_adapters(monkeypatch):
 
     assert watcher.started is True
     assert runner._pa_credentials_watcher is watcher
-    assert captured["carbon_auth"] is carbon
-    assert captured["handoff_signer"] is signer
+    assert "carbon_auth" not in captured
+    assert "handoff_signer" not in captured
     assert callable(captured["on_escalation"])
     assert callable(captured["on_timeout"])
