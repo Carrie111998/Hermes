@@ -1,7 +1,6 @@
 # Kubrick Documentation
 
-Current release: **0.13.0** (see root `VERSION`).  
-**On main (Unreleased changelog):** operator intent router — `kubrick do <intent>` ([PR #28](https://github.com/scrimshawlife-ctrl/Kubrick/pull/28)).
+Current release: **0.14.0** (see root `VERSION`).
 
 ## Start here
 
@@ -18,7 +17,7 @@ Current release: **0.13.0** (see root `VERSION`).
 
 | Edition | Branch | Notes |
 |---|---|---|
-| **Hermes** | [`main`](https://github.com/scrimshawlife-ctrl/Kubrick/tree/main) | Canonical Hermes skill; intent router; v0.13+ compiler |
+| **Hermes** | [`main`](https://github.com/scrimshawlife-ctrl/Kubrick/tree/main) | Canonical Hermes skill; deterministic v0.14 contract |
 | **OpenClaw** | [`openclaw`](https://github.com/scrimshawlife-ctrl/Kubrick/tree/openclaw) | Agent Skill packaging by **Prabu** ([PR #1](https://github.com/scrimshawlife-ctrl/Kubrick/pull/1)); external state dir; doctor / portability tests |
 
 See [`OPENCLAW.md`](OPENCLAW.md) for install commands, credit, and what differs between editions.
@@ -42,13 +41,13 @@ python scripts/kubrick.py do <intent> [--action <action>] [flags]
 
 Legacy flat command names remain soft aliases. MCP exposes a single tool: `kubrick_do`.
 
-## Current release (v0.13)
+## Current release (v0.14)
 
 | Doc | Purpose |
 |---|---|
-| [`ROADMAP-v0.13.md`](ROADMAP-v0.13.md) | Shipped scope + next priorities |
-| [`RELEASE-NOTES-v0.13.md`](RELEASE-NOTES-v0.13.md) | What landed in 0.13.0 |
-| [`RELEASE-CHECKLIST-v0.13.md`](RELEASE-CHECKLIST-v0.13.md) | Release gates and tag procedure |
+| [`ROADMAP-v0.14.md`](ROADMAP-v0.14.md) | Shipped scope + next priorities |
+| [`RELEASE-NOTES-v0.14.md`](RELEASE-NOTES-v0.14.md) | What landed in 0.14.0 |
+| [`RELEASE-CHECKLIST-v0.14.md`](RELEASE-CHECKLIST-v0.14.md) | Release gates and tag procedure |
 
 Wave 2 ([#3](https://github.com/scrimshawlife-ctrl/Kubrick/issues/3)) and Wave 3 ([#4](https://github.com/scrimshawlife-ctrl/Kubrick/issues/4)) shipped via [PR #24](https://github.com/scrimshawlife-ctrl/Kubrick/pull/24).
 
@@ -56,6 +55,9 @@ Wave 2 ([#3](https://github.com/scrimshawlife-ctrl/Kubrick/issues/3)) and Wave 3
 
 | Doc | Notes |
 |---|---|
+| [`ROADMAP-v0.13.md`](ROADMAP-v0.13.md) | v0.13 Wave 2/3 and router context |
+| [`RELEASE-NOTES-v0.13.md`](RELEASE-NOTES-v0.13.md) | v0.13 release notes |
+| [`RELEASE-CHECKLIST-v0.13.md`](RELEASE-CHECKLIST-v0.13.md) | v0.13 release gates |
 | [`ROADMAP-v0.12.md`](ROADMAP-v0.12.md) | v0.12 status; points forward to 0.13 |
 | [`RELEASE-NOTES-v0.12.md`](RELEASE-NOTES-v0.12.md) | v0.12 compiler / storyboard / outcome learning |
 | [`RELEASE-CHECKLIST-v0.12.md`](RELEASE-CHECKLIST-v0.12.md) | v0.12 gates (historical) |
@@ -75,7 +77,7 @@ Wave 2 ([#3](https://github.com/scrimshawlife-ctrl/Kubrick/issues/3)) and Wave 3
 | [`../references/retrieval-and-continuity.md`](../references/retrieval-and-continuity.md) | Retrieval discipline |
 | [`../references/anti-slop-patterns.md`](../references/anti-slop-patterns.md) | Anti-slop gates |
 
-## Schemas (v0.13 additions)
+## Schemas
 
 | Schema | Purpose |
 |---|---|

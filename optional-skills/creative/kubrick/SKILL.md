@@ -1,7 +1,7 @@
 ---
 name: kubrick
 description: Builds continuity-safe cinematic stories and visuals.
-version: 0.13.0
+version: 0.14.0
 author: Daniel Meyer (@scrimshawlife-ctrl) / Applied Alchemy Labs
 license: MIT
 platforms: [linux, macos, windows]
@@ -224,3 +224,6 @@ python3 "$HERMES_SKILL_DIR/scripts/kubrick.py" do check --action eval
 
 A valid delivery states what was produced, what was preserved, what was not
 computable, and which optional integration or human authority is required next.
+
+Current release context: `docs/ROADMAP-v0.14.md` and
+`docs/RELEASE-NOTES-v0.14.md`.

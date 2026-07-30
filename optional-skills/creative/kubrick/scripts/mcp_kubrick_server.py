@@ -129,7 +129,7 @@ def handle(message: dict[str, Any]) -> None:
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kubrick-operators", "version": "0.13.0"},
+                "serverInfo": {"name": "kubrick-operators", "version": "0.14.0"},
                 "instructions": (
                     "Optional Kubrick operator surface. Use kubrick_do with intent "
                     "(and optional action/args). CLI remains authoritative for local work. "

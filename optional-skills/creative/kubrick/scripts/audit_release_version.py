@@ -10,18 +10,23 @@ from pathlib import Path
 from manifest_contract import load_manifest
 
 ROOT = Path(__file__).resolve().parent.parent
+EXPECTED_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+RELEASE_LINE = ".".join(EXPECTED_VERSION.split(".")[:2])
+RELEASE_NOTES = f"docs/RELEASE-NOTES-v{RELEASE_LINE}.md"
+RELEASE_ROADMAP = f"docs/ROADMAP-v{RELEASE_LINE}.md"
+RELEASE_CHECKLIST = f"docs/RELEASE-CHECKLIST-v{RELEASE_LINE}.md"
 
 TARGETS = {
     "SKILL.md": re.compile(r"^version:\s*([^\s]+)", re.MULTILINE),
     "README.md": re.compile(r"<em>(0\.\d+\.\d+)\s+—"),
     "CHANGELOG.md": re.compile(r"^## \[(0\.\d+\.\d+)\]", re.MULTILINE),
-    "docs/RELEASE-NOTES-v0.13.md": re.compile(r"^# Kubrick v(0\.\d+\.\d+) Release Notes", re.MULTILINE),
+    RELEASE_NOTES: re.compile(r"^# Kubrick v(0\.\d+\.\d+) Release Notes", re.MULTILINE),
 }
 
 REQUIRED_CURRENT_REFERENCES = {
-    "README.md": ["docs/ROADMAP-v0.13.md", "docs/RELEASE-NOTES-v0.13.md"],
-    "SKILL.md": ["docs/ROADMAP-v0.13.md", "docs/RELEASE-NOTES-v0.13.md"],
-    "docs/RELEASE-CHECKLIST-v0.13.md": ["v0.13.0"],
+    "README.md": [RELEASE_ROADMAP, RELEASE_NOTES],
+    "SKILL.md": [RELEASE_ROADMAP, RELEASE_NOTES],
+    RELEASE_CHECKLIST: [f"v{EXPECTED_VERSION}"],
 }
 
 
@@ -31,7 +36,7 @@ def main() -> None:
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
 
-    expected = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    expected = EXPECTED_VERSION
     declarations: dict[str, str | None] = {}
     mismatches: list[dict[str, object]] = []
 

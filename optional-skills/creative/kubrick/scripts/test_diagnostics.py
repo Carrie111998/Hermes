@@ -63,8 +63,11 @@ def test_missing_optional_dependency_is_exit_3() -> None:
     assert payload["context"]["package"] == "PyYAML"
 
 
-def test_not_computable_is_exit_4_and_embedded() -> None:
-    import yaml
+def test_not_computable_is_exit_4_and_embedded() -> bool:
+    try:
+        import yaml
+    except ImportError:
+        return False
 
     source = yaml.safe_load(
         (ROOT / "examples/authority-transfer-storyboard/brief.yaml").read_text(encoding="utf-8")
@@ -86,14 +89,16 @@ def test_not_computable_is_exit_4_and_embedded() -> None:
         receipt = json.loads((out / "compile-receipt.json").read_text(encoding="utf-8"))
         assert receipt["status"] == "NOT_COMPUTABLE"
         assert_diagnostic(receipt["diagnostic"], status="NOT_COMPUTABLE", exit_code=4)
+    return True
 
 
 def main() -> None:
     test_router_failures_are_structured_exit_2()
     test_human_router_error_remains_readable()
     test_missing_optional_dependency_is_exit_3()
-    test_not_computable_is_exit_4_and_embedded()
-    print("structured diagnostic failure matrix: PASS")
+    validation_case_ran = test_not_computable_is_exit_4_and_embedded()
+    profile = "validation" if validation_case_ran else "stdlib"
+    print(f"structured diagnostic failure matrix ({profile} profile): PASS")
 
 
 if __name__ == "__main__":

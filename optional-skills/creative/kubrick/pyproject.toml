@@ -1,6 +1,6 @@
 [project]
 name = "kubrick-skill"
-version = "0.13.0"
+version = "0.14.0"
 description = "Development metadata for the standalone Kubrick Hermes skill"
 requires-python = ">=3.10"
 dependencies = []

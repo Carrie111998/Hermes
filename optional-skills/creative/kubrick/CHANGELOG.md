@@ -4,6 +4,8 @@ Kubrick is the primary symbolic cinematic narrative engineering skill. It replac
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-30
+
 ### Added — Deterministic contract consolidation
 
 - Added `kubrick.manifest.yaml` as the stdlib-readable canonical Hermes registry for runtime profiles, intents, actions, aliases, recipes, schemas, providers, artifacts, authority classes, and exit codes.

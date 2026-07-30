@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Hermes-Native Symbolic Cinematic Engineering</strong><br>
-  <em>0.13.0 — Forge Feedback • Multi-Provider Adapters • Operator Surface</em>
+  <em>0.14.0 — Deterministic Contract Consolidation</em>
 </p>
 
 <p align="center">
@@ -156,9 +156,9 @@ Upstream PR (history): https://github.com/scrimshawlife-ctrl/Kubrick/pull/1
 | Full command table | [Operator Commands](#operator-commands) |
 | Design of the command surface | [`docs/superpowers/specs/2026-07-30-operator-intent-router-design.md`](docs/superpowers/specs/2026-07-30-operator-intent-router-design.md) |
 
-## 0.13.0 Highlights
+## 0.14.0 Highlights
 
-Wave 2 and Wave 3 of the production-hardening roadmap are **shipped on `main`** ([#3](https://github.com/scrimshawlife-ctrl/Kubrick/issues/3), [#4](https://github.com/scrimshawlife-ctrl/Kubrick/issues/4), [PR #24](https://github.com/scrimshawlife-ctrl/Kubrick/pull/24)).
+Kubrick v0.14 consolidates the standalone Hermes skill around one manifest, deterministic identities, structured diagnostics, semantic provider-preservation reports, and atomic installation. Wave 2 and Wave 3 remain intact beneath this contract layer.
 
 | Area | What landed |
 |---|---|
@@ -375,9 +375,9 @@ CI (`.github/workflows/hermes-evals.yml`) runs Hermes evals, outcome governance,
 | [`SKILL.md`](SKILL.md) | Canonical Hermes operating contract |
 | [`QUICKSTART.md`](QUICKSTART.md) | Installation and command routing |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
-| [`docs/ROADMAP-v0.13.md`](docs/ROADMAP-v0.13.md) | Current roadmap and next priorities |
-| [`docs/RELEASE-NOTES-v0.13.md`](docs/RELEASE-NOTES-v0.13.md) | v0.13 release notes |
-| [`docs/RELEASE-CHECKLIST-v0.13.md`](docs/RELEASE-CHECKLIST-v0.13.md) | Release gates and procedure |
+| [`docs/ROADMAP-v0.14.md`](docs/ROADMAP-v0.14.md) | Current roadmap and next priorities |
+| [`docs/RELEASE-NOTES-v0.14.md`](docs/RELEASE-NOTES-v0.14.md) | v0.14 release notes |
+| [`docs/RELEASE-CHECKLIST-v0.14.md`](docs/RELEASE-CHECKLIST-v0.14.md) | Release gates and procedure |
 | [`docs/README.md`](docs/README.md) | Docs index (incl. intent-router design/plan) |
 | [`docs/OPENCLAW.md`](docs/OPENCLAW.md) | OpenClaw Agent Skill edition (Prabu; branch `openclaw`) |
 | [`docs/superpowers/specs/2026-07-30-operator-intent-router-design.md`](docs/superpowers/specs/2026-07-30-operator-intent-router-design.md) | Operator intent-router design |
@@ -390,7 +390,7 @@ CI (`.github/workflows/hermes-evals.yml`) runs Hermes evals, outcome governance,
 | [`schemas/`](schemas/) | Machine-readable artifact contracts |
 | [`evals/`](evals/) | Regression and adversarial specifications |
 
-## Architecture (v0.13)
+## Architecture (v0.14)
 
 ```text
                     ┌─────────────────────┐
@@ -421,9 +421,9 @@ CI (`.github/workflows/hermes-evals.yml`) runs Hermes evals, outcome governance,
 
 ## Version
 
-**0.13.0 — Forge Feedback, Multi-Provider Adapters, and Operator Surface**
+**0.14.0 — Deterministic Contract Consolidation**
 
-Shipped on `main` via [PR #24](https://github.com/scrimshawlife-ctrl/Kubrick/pull/24). Issues [#3](https://github.com/scrimshawlife-ctrl/Kubrick/issues/3) and [#4](https://github.com/scrimshawlife-ctrl/Kubrick/issues/4) are closed.
+This release unifies the Hermes runtime contract, reproducibility identities, failure diagnostics, provider preservation, installer safety, and official-skill packaging. See the v0.14 release notes for verified gates and remaining post-release work.
 
 See [CHANGELOG.md](CHANGELOG.md) for full release history.
 

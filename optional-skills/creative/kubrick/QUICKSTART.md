@@ -1,6 +1,6 @@
 # Kubrick Quickstart
 
-Kubrick is a **standalone Hermes skill** on branch **`main`** (v0.13.0). Continuity Forge, MCP servers, model APIs, and external generation providers remain optional.
+Kubrick is a **standalone Hermes skill** on branch **`main`** (v0.14.0). Continuity Forge, MCP servers, model APIs, and external generation providers remain optional.
 
 **OpenClaw?** Use the permanent [`openclaw`](https://github.com/scrimshawlife-ctrl/Kubrick/tree/openclaw) branch (OpenClaw Agent Skill packaging by **Prabu**). See [`docs/OPENCLAW.md`](docs/OPENCLAW.md) — install target is `~/.openclaw/skills/kubrick`, not Hermes.
 
@@ -350,8 +350,8 @@ Shortcut: `python scripts/kubrick.py recipe verify` (runs `do check --action smo
 |---|---|
 | `README.md` | Public overview and architecture |
 | `SKILL.md` | Hermes operating contract |
-| `docs/ROADMAP-v0.13.md` | Current roadmap |
-| `docs/RELEASE-NOTES-v0.13.md` | What shipped in 0.13 |
+| `docs/ROADMAP-v0.14.md` | Current roadmap |
+| `docs/RELEASE-NOTES-v0.14.md` | What shipped in 0.14 |
 | `docs/README.md` | Full docs index |
 | `references/continuity-forge-integration.md` | Forge handoff + feedback |
 | `references/hermes-model-adapters.md` | Adapter invariants |
