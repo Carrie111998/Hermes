@@ -525,6 +525,7 @@ export interface DesktopConnectionConfig {
   sshPort: number | null
   sshKeyPath: string
   sshRemoteHermesPath: string
+  sshRemoteProfile: string
 }
 
 export interface DesktopConnectionConfigInput {
@@ -543,6 +544,7 @@ export interface DesktopConnectionConfigInput {
   sshPort?: number | null
   sshKeyPath?: string
   sshRemoteHermesPath?: string
+  sshRemoteProfile?: string
 }
 
 export interface DesktopConnectionTestResult {
