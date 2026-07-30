@@ -482,17 +482,31 @@ class MemoryStore:
                 unique_texts = {e for _, e in matches}
                 if len(unique_texts) > 1:
                     # Ambiguous substring match traps models into add() as a
-                    # fallback. If new_content already exists verbatim as its
-                    # own entry, say so explicitly so the agent does not create
-                    # a near-duplicate (#60089).
-                    if new_content in entries:
+                    # fallback. If new_content already exists as a *separate*
+                    # entry (not merely one of the ambiguous match texts), say
+                    # so and recommend a valid disambiguating replace (#60089).
+                    # Note: ``new_content in entries`` alone is true when
+                    # new_content is one of unique_texts — that case still needs
+                    # a more-specific old_text, not a "already exists" no-op.
+                    if (
+                        new_content in entries
+                        and new_content not in unique_texts
+                    ):
+                        # Empty operations=[] is rejected by apply_batch; give
+                        # a workable single replace with a distinctive snippet.
+                        sample = next(iter(unique_texts))
+                        snippet = sample[:80]
                         return {
                             "success": False,
                             "error": (
                                 f"Multiple entries matched '{old_text}', and "
                                 f"new_content already exists as its own entry "
-                                f"(no change needed). Prefer operations=[] to "
-                                f"disambiguate a replace, or skip the write."
+                                f"(no change needed if you meant a no-op). "
+                                f"To replace one matched entry with different "
+                                f"text, retry with a more specific old_text "
+                                f"(e.g. a longer unique substring of that "
+                                f"entry such as '{snippet}…'); "
+                                f"apply_batch requires non-empty operations."
                             ),
                             "matches": self._previews([e for _, e in matches]),
                             "current_entries": entries,
